@@ -178,6 +178,14 @@ fn validate_stable_id(label: &str, value: &str) -> PipelineResult<()> {
     Ok(())
 }
 
+/// Ceiling for [`PipelineLimits::max_redirects`].
+///
+/// Ten, matching `web.rs`'s and `egress.rs`'s own `MAX_REDIRECT_HOPS` and
+/// reqwest's default `Policy::limited(10)`, so no guard in this tree will follow a
+/// longer chain than any other. The pipeline's own default is 3 and stays there —
+/// this is the point past which a configuration is refused, not a recommendation.
+const MAX_REDIRECT_CHAIN: usize = 10;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PipelineLimits {
@@ -188,7 +196,20 @@ pub struct PipelineLimits {
     pub max_extracted_chars: usize,
     pub max_chunks: usize,
     pub max_chunk_chars: usize,
-    pub max_url_chars: usize,
+    /// Named for bytes because it is measured in bytes: the check is
+    /// `value.len()`, not `value.chars().count()`.
+    ///
+    /// It was `max_url_chars`, and the two differ the moment a URL carries a
+    /// multibyte character — a 2,048-character URL of three-byte glyphs is 6 KiB.
+    /// The byte reading is the one worth keeping, since bytes are what fill a
+    /// buffer and a log line, so the name moved to the measurement rather than the
+    /// measurement moving to the name: changing the comparison instead would have
+    /// *widened* what this accepts, which is not a thing to do by accident while
+    /// tidying a name. `serde` keeps the old spelling as an alias, because the
+    /// struct derives `Deserialize` for a config surface it does not have yet and
+    /// a rename should not become a breaking change the day it gets one.
+    #[serde(alias = "max_url_chars")]
+    pub max_url_bytes: usize,
     pub max_redirects: usize,
     pub max_query_chars: usize,
     pub max_results: usize,
@@ -206,7 +227,7 @@ impl Default for PipelineLimits {
             max_extracted_chars: 64 * 1024 * 1024,
             max_chunks: 100_000,
             max_chunk_chars: 16_000,
-            max_url_chars: 2_048,
+            max_url_bytes: 2_048,
             max_redirects: 3,
             max_query_chars: 8_192,
             max_results: 100,
@@ -225,11 +246,18 @@ impl PipelineLimits {
             || self.max_extracted_chars == 0
             || self.max_chunks == 0
             || self.max_chunk_chars < 64
-            || self.max_url_chars < 64
+            || self.max_url_bytes < 64
             || self.max_query_chars == 0
             || self.max_results == 0
             || self.max_ocr_pages == 0
             || self.max_diagnostic_candidates < self.max_results
+            // `max_redirects` was the one field of the thirteen that this gate
+            // never looked at, so any value at all was "consistent" — including one
+            // large enough that the `redirect_chain.len() > limits.max_redirects`
+            // check downstream can never fire, which turns a bound into a
+            // decoration. A ceiling rather than a range because zero is a coherent
+            // setting: refusing every redirect is a choice, not an inconsistency.
+            || self.max_redirects > MAX_REDIRECT_CHAIN
         {
             return Err(PipelineError::InvalidArgument(
                 "pipeline limits are internally inconsistent".to_string(),
@@ -637,7 +665,7 @@ impl UrlSourcePolicy {
         // carrying a `\r` were indistinguishable to anything downstream — and one
         // of those two is an injection attempt, not a mistake. The length test
         // stays first so the ordering of the original `||` is preserved.
-        if value.len() > limits.max_url_chars {
+        if value.len() > limits.max_url_bytes {
             return Err(url_refused_about(
                 EgressRule::UrlTooLong,
                 // Lengths only. The URL itself may carry userinfo, and a refusal
@@ -645,7 +673,7 @@ impl UrlSourcePolicy {
                 format!(
                     "{} bytes against a maximum of {}",
                     value.len(),
-                    limits.max_url_chars
+                    limits.max_url_bytes
                 ),
             ));
         }
@@ -4712,6 +4740,50 @@ mod tests {
         }
     }
 
+    /// `max_redirects` was the one field of the thirteen `validate` never read, so
+    /// any value at all passed as "consistent" — including one big enough that the
+    /// `redirect_chain.len() > limits.max_redirects` check downstream could never
+    /// fire, which is a bound that has stopped being one.
+    ///
+    /// Asserted in three parts because a ceiling has three interesting values, and
+    /// a test of only the middle one would pass for a gate that rejected
+    /// everything or nothing. Zero has to stay legal in particular: refusing every
+    /// redirect is a choice, and clamping it away would be the opposite mistake.
+    #[test]
+    fn validate_rejects_a_redirect_bound_that_could_never_fire() {
+        let at_ceiling = PipelineLimits {
+            max_redirects: MAX_REDIRECT_CHAIN,
+            ..PipelineLimits::default()
+        };
+        assert!(
+            at_ceiling.validate().is_ok(),
+            "the ceiling itself is a legal setting"
+        );
+
+        let none_at_all = PipelineLimits {
+            max_redirects: 0,
+            ..PipelineLimits::default()
+        };
+        assert!(
+            none_at_all.validate().is_ok(),
+            "following no redirects at all is a coherent configuration, not an \
+             inconsistency"
+        );
+
+        let past_ceiling = PipelineLimits {
+            max_redirects: MAX_REDIRECT_CHAIN + 1,
+            ..PipelineLimits::default()
+        };
+        assert!(
+            matches!(
+                past_ceiling.validate(),
+                Err(PipelineError::InvalidArgument(_))
+            ),
+            "a chain longer than every other guard in this tree admits must be \
+             refused here"
+        );
+    }
+
     fn test_limits() -> PipelineLimits {
         PipelineLimits {
             max_sources: 8,
@@ -4721,7 +4793,7 @@ mod tests {
             max_extracted_chars: 1024 * 1024,
             max_chunks: 1_000,
             max_chunk_chars: 1_024,
-            max_url_chars: 512,
+            max_url_bytes: 512,
             max_redirects: 2,
             max_query_chars: 512,
             max_results: 20,
@@ -5047,10 +5119,30 @@ mod tests {
             "`file:///etc/passwd` parses perfectly well, so this proves the scheme \
              rule fired and not `UrlMalformed`"
         );
-        let overlong = format!("https://example.com/{}", "x".repeat(limits.max_url_chars));
+        let overlong = format!("https://example.com/{}", "x".repeat(limits.max_url_bytes));
         assert_eq!(
             refused_rule(policy.validate(&overlong, &[public], &limits)),
             EgressRule::UrlTooLong
+        );
+        // The limit is bytes, which is what its name now says. A path of `é` — two
+        // bytes each — trips it at half as many characters, and pinning that here is
+        // what stops the comparison being "corrected" to `chars().count()` later:
+        // that would not be a tidy-up, it would widen this guard to accept a URL
+        // several times the byte length it was written to bound.
+        let multibyte = format!(
+            "https://example.com/{}",
+            "é".repeat(limits.max_url_bytes / 2)
+        );
+        assert!(
+            multibyte.chars().count() < limits.max_url_bytes,
+            "the fixture must be under the limit in characters, or it proves nothing"
+        );
+        assert_eq!(
+            refused_rule(policy.validate(&multibyte, &[public], &limits)),
+            EgressRule::UrlTooLong,
+            "{} characters but {} bytes must be refused on bytes",
+            multibyte.chars().count(),
+            multibyte.len()
         );
         // The other half of the condition that used to be one `if`: a control
         // character is an injection attempt, not an oversized URL, and `Url::parse`
