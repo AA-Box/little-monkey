@@ -1489,29 +1489,60 @@ impl ValidatedGrant {
         self.resolved_addresses(url).map(|_| ())
     }
 
+    /// Every address `url`'s host stands for, each one classified.
+    ///
+    /// # Why this matches on `Url::host()` and not `host_str()`
+    ///
+    /// `host_str` serializes an IPv6 literal *with* its brackets, so it answers
+    /// `"[::1]"`, and `("[::1]", port).to_socket_addrs()` does not parse that on
+    /// macOS or Linux — the literal never resolved and every IPv6-literal target
+    /// was refused as [`EgressRule::DnsResolutionFailed`] before the classifier
+    /// below was ever consulted. That failed closed, which is why it survived this
+    /// long, but "unresolvable" is not a policy verdict: it made the guard's IPv6
+    /// arms dead code on two of three platforms and left Windows — where the
+    /// bracketed host *does* resolve — as the only place they ran.
+    ///
+    /// `Url::host()` hands back the already-parsed [`url::Host`], where a literal
+    /// is a real [`IpAddr`] and there are no brackets to strip. This is the same
+    /// pattern `web.rs::classify_fetch_url` and `egress::is_loopback_target`
+    /// already use, and its comment there names this "bracket-handling class of
+    /// bug"; this file is now the third caller of the pattern rather than the last
+    /// holdout from it.
+    ///
+    /// A literal host is also not asked of the resolver at all any more, which is
+    /// how it should always have been: an address the caller already spelled out
+    /// cannot be rebound, so a lookup could only turn a known answer into a
+    /// different one.
     fn resolved_addresses(&self, url: &Url) -> Result<Vec<IpAddr>, EgressDenial> {
-        let host = url
-            .host_str()
-            .ok_or_else(|| EgressDenial::new(EgressRule::HostMissing))?;
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| EgressDenial::new(EgressRule::PortMissing))?;
-        let addresses: Vec<IpAddr> = (host, port)
-            .to_socket_addrs()
-            .map_err(|error| {
-                EgressDenial::about(
-                    EgressRule::DnsResolutionFailed,
-                    // The host, never the URL: a path or query on a browser target
-                    // is page-supplied and may carry a session token, and the host
-                    // is the whole of what failed to resolve.
-                    format!("browser DNS resolution failed for {host}: {error}"),
-                )
-            })?
-            .map(|address| address.ip())
-            .collect();
-        if addresses.is_empty() {
-            return Err(EgressDenial::about(EgressRule::DnsNoAddresses, host));
-        }
+        let addresses: Vec<IpAddr> = match url
+            .host()
+            .ok_or_else(|| EgressDenial::new(EgressRule::HostMissing))?
+        {
+            url::Host::Ipv4(address) => vec![IpAddr::V4(address)],
+            url::Host::Ipv6(address) => vec![IpAddr::V6(address)],
+            url::Host::Domain(host) => {
+                let port = url
+                    .port_or_known_default()
+                    .ok_or_else(|| EgressDenial::new(EgressRule::PortMissing))?;
+                let answers: Vec<IpAddr> = (host, port)
+                    .to_socket_addrs()
+                    .map_err(|error| {
+                        EgressDenial::about(
+                            EgressRule::DnsResolutionFailed,
+                            // The host, never the URL: a path or query on a browser
+                            // target is page-supplied and may carry a session token,
+                            // and the host is the whole of what failed to resolve.
+                            format!("browser DNS resolution failed for {host}: {error}"),
+                        )
+                    })?
+                    .map(|address| address.ip())
+                    .collect();
+                if answers.is_empty() {
+                    return Err(EgressDenial::about(EgressRule::DnsNoAddresses, host));
+                }
+                answers
+            }
+        };
         for address in &addresses {
             // Every refusal names the address that tripped it. A name can resolve
             // to several answers and any one of them is enough to refuse the whole
@@ -1543,13 +1574,18 @@ impl ValidatedGrant {
             let url = Url::parse(origin).map_err(|error| {
                 EgressDenial::about(EgressRule::UrlMalformed, error.to_string())
             })?;
-            let host = url
-                .host_str()
-                .ok_or_else(|| EgressDenial::new(EgressRule::HostMissing))?;
             // Literal IP hosts cannot be DNS-rebound and need no resolver rule.
-            if host.parse::<IpAddr>().is_ok() {
-                continue;
-            }
+            // Matched on the parsed host for the same reason
+            // [`Self::resolved_addresses`] is: `host_str().parse::<IpAddr>()` never
+            // recognises an IPv6 literal, because the brackets are still on it — so
+            // a granted `http://[::1]:11434` origin used to fall through to the
+            // hostname branch and emit a nonsense `MAP [::1] ...` rule for a host
+            // Chromium's resolver is never asked about.
+            let host = match url.host() {
+                Some(url::Host::Domain(host)) => host,
+                Some(_) => continue,
+                None => return Err(EgressDenial::new(EgressRule::HostMissing)),
+            };
             let address = self
                 .resolved_addresses(&url)?
                 .into_iter()
@@ -1673,6 +1709,34 @@ fn classify_v4(ip: Ipv4Addr) -> Option<EgressRule> {
 }
 
 /// The IPv6 half of [`classify_v4`], in the order the disjunction it replaced had.
+///
+/// # This half was dead code until IPv6 literals could resolve at all
+///
+/// [`ValidatedGrant::resolved_addresses`] used to hand `Url::host_str`'s bracketed
+/// `"[…]"` to `to_socket_addrs`, so on macOS and Linux no IPv6 literal ever got
+/// this far — it was refused as an unresolvable host first. That made the gap
+/// between this function and [`classify_v4`] invisible, and the gap was wide: the v4
+/// half refuses documentation, benchmarking and all of RFC 1918, while this half
+/// refused neither documentation nor benchmarking, covered only *half* of
+/// locally-scoped unicast (`fc00::/7` but not the `fec0::/10` that preceded it,
+/// because `0xffc0 == 0xfe80` stops at `febf`), left `fe00::/9` between the two
+/// unclassified, and called NAT64 public — `64:ff9b::7f00:1` *is* `127.0.0.1`, the
+/// same "a spelling is not a place" bypass the `::ffff:` and `::` forms are refused
+/// for.
+///
+/// Enumerating those one arm at a time is how the list got out of date in the first
+/// place, so the tail is an **allowlist**: global unicast is `2000::/3` and
+/// everything else is reserved, unassigned or special-use. The named arms stay
+/// because a refusal should say *which* class refused it, and because
+/// [`EgressRule::covered_by_private_network_grant`] reads those codes — but nothing
+/// new has to be added here when IANA assigns another range.
+///
+/// Rule codes are reused from the v4 counterparts, so an operator reading
+/// `egress.test-net` need not know which family tripped it. `fec0::/10` is the one
+/// exception and reports [`EgressRule::ReservedRange`] rather than the
+/// `UniqueLocalV6` its shape suggests, because that predicate covers `UniqueLocalV6`
+/// under a private-network grant and RFC 3879 deprecated `fec0::/10` with nothing
+/// assigned in it — so "a host the user actually runs could be here" is false.
 fn classify_v6(ip: Ipv6Addr) -> Option<EgressRule> {
     // First, because `classify_ip` checks `is_loopback` before reaching here so
     // `::1` is already handled — but `::127.0.0.1` is not loopback by that
@@ -1693,10 +1757,44 @@ fn classify_v6(ip: Ipv6Addr) -> Option<EgressRule> {
     if (ip.segments()[0] & 0xffc0) == 0xfe80 {
         return Some(EgressRule::LinkLocal); // fe80::/10
     }
-    // Last, and reporting whichever v4 rule the wrapped address trips rather than a
-    // rule of its own: `::ffff:10.0.0.1` is a private address, and calling it
-    // anything else would hide that from whoever reads the denial.
-    ip.to_ipv4_mapped().and_then(classify_v4)
+    // `ReservedRange` and **not** `UniqueLocalV6`, even though `fec0::/10` is where
+    // site-local unicast used to live. The two codes differ in one way that matters:
+    // `EgressRule::covered_by_private_network_grant` answers true for
+    // `UniqueLocalV6` and false for `ReservedRange`, because it answers the question
+    // "could a host the user actually runs be here?". RFC 3879 deprecated
+    // `fec0::/10` and nothing is assigned in it, so the honest answer is no — and
+    // labelling it `UniqueLocalV6` would make it reachable the moment this guard or
+    // a sibling consults that predicate.
+    if (ip.segments()[0] & 0xffc0) == 0xfec0 {
+        return Some(EgressRule::ReservedRange); // fec0::/10, deprecated site-local
+    }
+    if ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8 {
+        return Some(EgressRule::TestNet); // 2001:db8::/32, the v6 documentation range
+    }
+    if ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0002 && ip.segments()[2] == 0 {
+        return Some(EgressRule::Benchmarking); // 2001:2::/48
+    }
+    // Last, and an allowlist rather than one more blocklist arm.
+    //
+    // Everything above names a class so a refusal can say *which* class; this decides
+    // the default for everything unnamed, and in v6 the honest default is "refuse".
+    // Global unicast is `2000::/3` and every other range is reserved, unassigned or
+    // special-use — so a blocklist here is a list that has to grow every time IANA
+    // assigns something, and the arms above are the evidence that it does not get
+    // updated: `fc00::/7` was covered while `fe00::/9` between it and `fe80::/10` was
+    // not, and `64:ff9b::/96` (NAT64) classified as public even though
+    // `64:ff9b::7f00:1` *is* `127.0.0.1` — the same "a spelling is not a place"
+    // bypass the `::ffff:` and `::` forms above are refused for.
+    //
+    // Must stay after the mapped delegation, which reports whichever v4 rule the
+    // wrapped address trips rather than a rule of its own: `::ffff:10.0.0.1` is a
+    // private address, and calling it anything else would hide that from whoever
+    // reads the denial — while `::ffff:93.184.216.34` is a public one and must stay
+    // allowed.
+    ip.to_ipv4_mapped().map_or_else(
+        || ((ip.segments()[0] & 0xe000) != 0x2000).then_some(EgressRule::ReservedRange),
+        classify_v4,
+    )
 }
 
 struct CdpConnection {
@@ -3268,7 +3366,23 @@ mod tests {
             ("fd12:3456::1", EgressRule::UniqueLocalV6),
             ("fe80::1", EgressRule::LinkLocal),
             ("::1", EgressRule::Loopback),
-            // The mapped form keeps whichever rule its inner address trips.
+            // `ReservedRange` and not `UniqueLocalV6`: a private-network grant covers
+            // the latter and must not reach a range RFC 3879 deprecated.
+            ("fec0::1", EgressRule::ReservedRange),
+            ("2001:db8::1", EgressRule::TestNet),
+            ("2001:2::1", EgressRule::Benchmarking),
+            // Everything outside global unicast `2000::/3`, caught by the default
+            // rather than by an arm of its own — which is the point of making the
+            // default refuse. `fe00::/9` fell between `fc00::/7` and `fe80::/10`, and
+            // `64:ff9b::7f00:1` is NAT64 for `127.0.0.1`: a spelling, not a place.
+            ("fe00::1", EgressRule::ReservedRange),
+            ("64:ff9b::7f00:1", EgressRule::ReservedRange),
+            ("100::1", EgressRule::ReservedRange),
+            ("4000::1", EgressRule::ReservedRange),
+            // The mapped form keeps whichever rule its inner address trips, and that
+            // delegation has to win over the `2000::/3` default above — `::ffff:…`
+            // sits in `::/96`, so the default alone would call every mapped address
+            // reserved and hide the inner rule.
             ("::ffff:10.0.0.1", EgressRule::PrivateV4),
             ("::ffff:169.254.169.254", EgressRule::LinkLocal),
         ] {
@@ -3479,34 +3593,6 @@ mod tests {
         }
     }
 
-    /// The IPv4-**mapped** loopback form was classified as an ordinary public
-    /// navigation target: it is not `Ipv6Addr::is_loopback`, so it slipped past
-    /// [`classify_ip`]'s loopback check, and the v4 helper it then unwrapped into had
-    /// no loopback branch — because until that unwrap existed, nothing had ever
-    /// reached it with a loopback address.
-    ///
-    /// Sibling of the `::127.0.0.1` bug the shared `egress::is_ipv4_compatible`
-    /// predicate closed, and it survived that fix because the compatible form and the
-    /// mapped form are different ranges reached by different branches.
-    ///
-    /// # Whether it was reachable end to end depends on the platform
-    ///
-    /// `Url::host_str` serializes an IPv6 literal *with* its brackets, and
-    /// `("[::ffff:127.0.0.1]", port).to_socket_addrs()` is where the platforms part
-    /// company: macOS and Linux refuse to parse it, so the target is refused as a
-    /// resolution failure before the classifier is consulted, while **Windows
-    /// resolves it** — so on Windows this was a live bypass, and a granted
-    /// `http://[::ffff:127.0.0.1]` origin reached this machine's own loopback
-    /// services without the explicit per-run loopback grant that a plain
-    /// `127.0.0.1` requires. Elsewhere the same fix is defensive: a classifier must
-    /// not call a loopback address public whatever route reaches it, and a hostname
-    /// whose resolver answers with a mapped address is such a route.
-    ///
-    /// The classifier assertions below are the load-bearing half on every platform.
-    /// The `validate_navigation` half asserts the one invariant that holds on all of
-    /// them, and deliberately does not pin either platform's resolver behaviour as
-    /// the expected answer — an earlier version pinned the macOS verdict and failed
-    /// on Windows for a reason that was not a defect.
     /// Two different guards refusing, and the `guard` column keeping them apart.
     ///
     /// This is the column's whole justification. The four guards disagree about
@@ -3574,6 +3660,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// The IPv4-**mapped** loopback form was classified as an ordinary public
+    /// navigation target: it is not `Ipv6Addr::is_loopback`, so it slipped past
+    /// [`classify_ip`]'s loopback check, and the v4 helper it then unwrapped into had
+    /// no loopback branch — because until that unwrap existed, nothing had ever
+    /// reached it with a loopback address.
+    ///
+    /// Sibling of the `::127.0.0.1` bug the shared `egress::is_ipv4_compatible`
+    /// predicate closed, and it survived that fix because the compatible form and the
+    /// mapped form are different ranges reached by different branches.
+    ///
+    /// # This used to fork on the platform, and no longer does
+    ///
+    /// `Url::host_str` serializes an IPv6 literal *with* its brackets, and
+    /// `("[::ffff:127.0.0.1]", port).to_socket_addrs()` was where the platforms
+    /// parted company: macOS and Linux refused to parse it, so the target was refused
+    /// as a resolution failure before the classifier was consulted, while **Windows
+    /// resolved it** — so on Windows this was a live bypass, and a granted
+    /// `http://[::ffff:127.0.0.1]` origin reached this machine's own loopback
+    /// services without the explicit per-run loopback grant that a plain `127.0.0.1`
+    /// requires.
+    ///
+    /// This test therefore used to accept *either* verdict, because the resolver's
+    /// answer was the platform's and not this guard's. [`ValidatedGrant::resolved_addresses`]
+    /// no longer routes a literal through the resolver, so the classifier now decides
+    /// on every platform and there is one expected answer to assert. Keeping the
+    /// alternative would have meant a revert of that fix still passed here.
     #[test]
     fn the_ipv4_mapped_loopback_form_is_classified_as_loopback() {
         for text in ["::ffff:127.0.0.1", "::ffff:127.1.2.3"] {
@@ -3599,9 +3711,7 @@ mod tests {
         );
 
         // End to end, through the gate that actually decides a navigation. The origin
-        // is granted, so the only thing left to refuse it is the address — and on
-        // Windows, where the bracketed literal does resolve, this is the assertion
-        // that fails without the fix.
+        // is granted, so the only thing left to refuse it is the address.
         let grant = ValidatedGrant::new(BrowserGrant {
             allowed_origins: vec!["http://[::ffff:127.0.0.1]:11434".into()],
             allow_loopback: false,
@@ -3610,22 +3720,128 @@ mod tests {
         let denial = grant
             .validate_navigation("http://[::ffff:127.0.0.1]:11434/api/tags")
             .expect_err("loopback without a grant must never be allowed");
-        match denial.rule() {
-            // macOS and Linux: `to_socket_addrs` cannot parse the bracketed host, so
-            // the target is refused before the classifier is reached. Accepted rather
-            // than asserted, because it is this platform's resolver talking and not
-            // this guard's policy — and because it is a bug of its own, recorded in
-            // the roadmap: `web.rs` avoids it by matching on `Url::host()`, the parsed
-            // enum, and its own comment names this "bracket-handling class of bug".
-            EgressRule::DnsResolutionFailed => {}
-            // Windows: the host resolves, so the classifier decides — and it must say
-            // loopback. Any other rule, and above all `Ok`, is the bypass.
-            rule => assert_eq!(
-                rule,
-                EgressRule::Loopback,
-                "a resolvable mapped-loopback target must be refused as loopback"
-            ),
+        assert_eq!(
+            denial.rule(),
+            EgressRule::Loopback,
+            "the classifier must refuse this, on every platform: {denial}"
+        );
+    }
+
+    /// The bracket bug itself, from the outside: a granted IPv6-literal origin whose
+    /// address no rule refuses must be *allowed*.
+    ///
+    /// This is the one assertion the old code could not satisfy on macOS or Linux.
+    /// `Url::host_str` answered `"[2606:4700:4700::1111]"`, `to_socket_addrs` would
+    /// not parse the brackets, and the target came back refused as
+    /// [`EgressRule::DnsResolutionFailed`] — a resolution verdict standing in for a
+    /// policy one. It failed closed, so it was never a bypass; it was a guard whose
+    /// entire IPv6 half never ran, which is why the sibling test below has to exist.
+    ///
+    /// Also the counter-test for that sibling: it is what makes "refuse every IPv6
+    /// literal" an insufficient answer to this bug.
+    ///
+    /// Hermetic. A literal host is no longer handed to the resolver at all, so
+    /// nothing here touches DNS or the network — which is itself part of the claim,
+    /// since a lookup for an address the caller already spelled out could only
+    /// substitute a different answer for a known one.
+    #[test]
+    fn a_granted_public_ipv6_literal_is_reachable_now_that_its_brackets_are_gone() {
+        let grant = ValidatedGrant::new(BrowserGrant {
+            allowed_origins: vec!["http://[2606:4700:4700::1111]".into()],
+            allow_loopback: false,
+        })
+        .unwrap();
+        grant
+            .validate_navigation("http://[2606:4700:4700::1111]/page")
+            .expect("a public IPv6 literal is refused by no rule in this file");
+
+        // The same bug in this file's other bracket-blind line. A literal cannot be
+        // DNS-rebound, so it needs no `MAP` rule — but `host_str().parse::<IpAddr>()`
+        // never recognised one, so the origin used to fall through to the hostname
+        // path and pin a host Chromium's resolver is never asked about.
+        assert_eq!(
+            grant.chromium_resolver_rules().unwrap(),
+            "",
+            "a literal host needs no resolver rule, whatever family it is in"
+        );
+    }
+
+    /// Now that an IPv6 literal reaches [`classify_ip`] at all, every locally-scoped
+    /// or non-routable class has to be refused *by rule* — the resolution failure that
+    /// used to refuse them on macOS and Linux is gone, and it was never policy anyway.
+    ///
+    /// Each row asserts the exact rule, which is the whole point: an
+    /// [`EgressRule::DnsResolutionFailed`] here would mean the resolver had refused it
+    /// and the guard had never been consulted, and that is exactly the state this
+    /// change left behind if any of these classes were missing.
+    ///
+    /// # Five of these rows were holes until this change
+    ///
+    /// `fec0::/10`, `2001:db8::/32`, `2001:2::/48`, `fe00::/9` and `64:ff9b::/96`
+    /// classified as public. The first three had v4 counterparts [`classify_v4`]
+    /// refuses; `fe00::/9` fell in the gap between `fc00::/7` and `fe80::/10`; and
+    /// `64:ff9b::7f00:1` is NAT64 for `127.0.0.1`, whose counterpart is refused at
+    /// `classify_v4`'s loopback arm. Dormant while no IPv6 literal could resolve;
+    /// live the moment one could.
+    ///
+    /// The last three rows are not enumerated classes at all — they are the
+    /// `2000::/3` default, which is why the name says *every* rather than a count.
+    #[test]
+    fn every_scoped_ipv6_literal_is_refused_by_the_guard_and_not_by_the_resolver() {
+        for (literal, expected) in [
+            ("::1", EgressRule::Loopback),
+            ("::", EgressRule::Unspecified),
+            ("::127.0.0.1", EgressRule::Ipv4Compatible),
+            ("ff02::1", EgressRule::Multicast),
+            ("fd00::1", EgressRule::UniqueLocalV6),
+            ("fec0::1", EgressRule::ReservedRange),
+            ("fe80::1", EgressRule::LinkLocal),
+            ("2001:db8::1", EgressRule::TestNet),
+            ("2001:2::1", EgressRule::Benchmarking),
+            ("fe00::1", EgressRule::ReservedRange),
+            ("64:ff9b::7f00:1", EgressRule::ReservedRange),
+        ] {
+            let origin = format!("http://[{literal}]");
+            let grant = ValidatedGrant::new(BrowserGrant {
+                allowed_origins: vec![origin.clone()],
+                allow_loopback: false,
+            })
+            .unwrap();
+            let denial = grant
+                .validate_navigation(&format!("{origin}/page"))
+                .unwrap_err();
+            assert_eq!(
+                denial.rule(),
+                expected,
+                "{origin} is granted, so this guard's own {} is what must refuse it \
+                 — not the resolver: {denial}",
+                expected.code()
+            );
+            // The classifier's own message names the *bare* address, because it holds
+            // a parsed `IpAddr`; the resolution failure this replaced named the
+            // bracketed string it had been handed instead. Compared against std's
+            // `Display` rather than the source text, since neither serializer keeps
+            // an embedded-v4 spelling like `::127.0.0.1` intact.
+            let address: Ipv6Addr = literal.parse().expect("the test's own literal parses");
+            assert!(
+                denial
+                    .detail()
+                    .is_some_and(|detail| detail.starts_with(&address.to_string())),
+                "the refusal must name the address the classifier saw: {denial}"
+            );
         }
+
+        // Counter-test, so that "refuse every IPv6 literal" cannot pass this test:
+        // loopback is the one class an explicit per-run grant makes reachable, and it
+        // has to still be reachable through the very path that refuses it above.
+        let granted = ValidatedGrant::new(BrowserGrant {
+            allowed_origins: vec!["http://[::1]:11434".into()],
+            allow_loopback: true,
+        })
+        .unwrap();
+        granted
+            .validate_navigation("http://[::1]:11434/api/tags")
+            .expect("an explicit loopback grant still reaches ::1");
     }
 
     #[test]
