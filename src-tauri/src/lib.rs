@@ -1410,6 +1410,8 @@ pub fn run() {
             m7_companion::m7_job_cancel,
             generation_commands::generation_engine_status,
             generation_commands::generation_models,
+            generation_commands::generation_add_model,
+            generation_commands::generation_remove_model,
             generation_commands::generation_accept_license,
             generation_commands::generation_download_model,
             generation_commands::generation_cancel_download,

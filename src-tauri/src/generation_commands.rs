@@ -28,6 +28,9 @@ use crate::managed_runtime::{self, STABLE_DIFFUSION};
 use crate::AppState;
 
 const GALLERY_FILE: &str = "studio-gallery.json";
+/// The user's own model list. There is no built-in catalogue — this file is
+/// the whole registry, and it starts empty.
+const MODELS_FILE: &str = "studio-models.json";
 const ACCEPTED_LICENSES_FILE: &str = "studio-accepted-licenses.json";
 /// Keeps a corrupt or hand-edited gallery from being read without bound.
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
@@ -195,12 +198,60 @@ pub fn generation_engine_status(app: AppHandle) -> Result<GenerationEngineStatus
     })
 }
 
+/// Every model the user has added.
+fn registry(app: &AppHandle) -> Result<Vec<GenerationModelSpec>, String> {
+    read_state(app, MODELS_FILE)
+}
+
+fn find_registered(app: &AppHandle, id: &str) -> Result<GenerationModelSpec, String> {
+    registry(app)?
+        .into_iter()
+        .find(|spec| spec.id == id)
+        .ok_or_else(|| "That model is not in your library".to_string())
+}
+
+/// Adds or replaces a model. Slots are assigned by the caller — the app never
+/// guesses which file fills which slot, because guessing wrong produces an
+/// engine error that reads like a broken download rather than a wrong choice.
+#[tauri::command]
+pub fn generation_add_model(
+    app: AppHandle,
+    spec: GenerationModelSpec,
+) -> Result<Vec<GenerationModelSpec>, String> {
+    generation::validate_model_spec(&spec)?;
+    let mut models = registry(&app)?;
+    match models.iter_mut().find(|entry| entry.id == spec.id) {
+        Some(existing) => *existing = spec,
+        None => models.push(spec),
+    }
+    models.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    write_state(&app, MODELS_FILE, &models)?;
+    Ok(models)
+}
+
+/// Forgets a model. Files the app downloaded for it are removed; files the
+/// user pointed at on their own disk are left exactly where they are.
+#[tauri::command]
+pub fn generation_remove_model(app: AppHandle, model_id: String) -> Result<(), String> {
+    let spec = find_registered(&app, &model_id)?;
+    let mut models = registry(&app)?;
+    models.retain(|entry| entry.id != model_id);
+    write_state(&app, MODELS_FILE, &models)?;
+
+    let owned = model_root(&app)?.join(&spec.id);
+    if owned.is_dir() {
+        std::fs::remove_dir_all(&owned)
+            .map_err(|error| format!("Failed to remove {}: {error}", owned.display()))?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn generation_models(app: AppHandle) -> Result<Vec<GenerationModelView>, String> {
     let root = model_root(&app)?;
     let accepted: BTreeSet<String> = read_state(&app, ACCEPTED_LICENSES_FILE)?;
     let ram = total_ram_bytes();
-    Ok(generation::curated_models()
+    Ok(registry(&app)?
         .into_iter()
         .map(|spec| {
             let missing = spec.missing_components(&root);
@@ -226,7 +277,7 @@ pub fn generation_accept_license(app: AppHandle, license_id: String) -> Result<(
     if license_id.is_empty() || license_id.len() > 128 {
         return Err("Invalid license id".to_string());
     }
-    if !generation::curated_models()
+    if !registry(&app)?
         .iter()
         .any(|spec| spec.license.id == license_id)
     {
@@ -247,7 +298,7 @@ pub async fn generation_download_model(
     state: tauri::State<'_, AppState>,
     model_id: String,
 ) -> Result<(), String> {
-    let spec = generation::find_model(&model_id).ok_or("Unknown generation model")?;
+    let spec = find_registered(&app, &model_id)?;
     if spec.license.acceptance_required {
         let accepted: BTreeSet<String> = read_state(&app, ACCEPTED_LICENSES_FILE)?;
         if !accepted.contains(&spec.license.id) {
@@ -333,7 +384,7 @@ pub async fn generation_run(
     state: tauri::State<'_, AppState>,
     request: GenerationRequest,
 ) -> Result<GenerationEntry, String> {
-    let spec = generation::find_model(&request.model_id).ok_or("Unknown generation model")?;
+    let spec = find_registered(&app, &request.model_id)?;
     let request = generation::validate_request(&spec, &request)?;
     let root = model_root(&app)?;
     let binary = engine_binary(&app)?;

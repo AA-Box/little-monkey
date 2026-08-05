@@ -20,6 +20,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -49,7 +50,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(300);
 /// One `sd-server` command-line weight slot. The mapping to a flag is the
 /// entire model-specific surface: a new architecture picks different slots
 /// rather than needing different code.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentSlot {
     /// A single all-in-one checkpoint (`-m`), as SD1.x/SDXL ship.
@@ -89,7 +90,7 @@ impl ComponentSlot {
 }
 
 /// One downloadable weight file filling one slot.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelComponent {
     pub slot: ComponentSlot,
@@ -102,7 +103,7 @@ pub struct ModelComponent {
 /// The engine takes an absolute path per slot and does not care how the file
 /// got there, so a model the user already has on disk is a first-class source
 /// rather than a special case bolted onto the curated list.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ComponentSource {
     /// Fetched from Hugging Face into the app's own model directory.
@@ -217,7 +218,7 @@ impl GenerationTask {
 /// defines its Applicable Territory as worldwide *excluding* the EU, UK, South
 /// Korea and the USA, so the app must never mirror those weights and must show
 /// the terms before the user's own download.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LicenseGate {
     pub id: String,
@@ -230,25 +231,26 @@ pub struct LicenseGate {
 /// How a family rounds a requested clip length. Not cosmetic: asking for a
 /// count off the grid gets silently rewritten by the backend, so the UI has to
 /// round the same way or it promises a duration the clip will not have.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameGrid {
     /// Largest `4n + 1` at or below the request — the core video path's
     /// general normalization, used by Wan.
+    #[default]
     DownTo4nPlus1,
     /// Smallest `17k + 5` at or above the request, minimum 5 — MiniMax H3.
     UpTo17kPlus5,
 }
 
 /// Per-model starting point for the request fields a user does not set.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationDefaults {
     pub width: u32,
     pub height: u32,
     pub steps: u32,
     pub cfg_scale: f64,
-    pub sample_method: &'static str,
+    pub sample_method: String,
     /// `None` leaves the backend's own choice in place.
     pub flow_shift: Option<f64>,
     pub fps: u32,
@@ -256,7 +258,7 @@ pub struct GenerationDefaults {
     pub frame_grid: FrameGrid,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationModelSpec {
     pub id: String,
@@ -305,228 +307,100 @@ impl GenerationModelSpec {
     }
 }
 
-fn permissive_license(id: &str, name: &str, url: &str) -> LicenseGate {
-    LicenseGate {
-        id: id.to_string(),
-        name: name.to_string(),
-        url: url.to_string(),
-        excluded_territories: Vec::new(),
-        acceptance_required: false,
+/// Validates a user-defined model before it is stored or launched.
+///
+/// There is no built-in catalogue: every model in Studio was added by the
+/// person using it, either as files already on their disk or as a Hugging Face
+/// repo and file to fetch. This is the only gate between "what the user typed"
+/// and "arguments handed to an engine", so it is deliberately strict about the
+/// things that would otherwise fail deep inside the engine or, worse, silently.
+pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
+    if spec.id.trim().is_empty() || spec.id.len() > 128 {
+        return Err("A model needs an id".to_string());
     }
-}
-
-/// The shipped model set. Every entry's repo, file path and byte size was read
-/// off the Hugging Face API, and every flag combination comes from
-/// stable-diffusion.cpp's own documented invocations.
-pub fn curated_models() -> Vec<GenerationModelSpec> {
-    vec![
-        GenerationModelSpec {
-            id: "sdxl-base-1.0".to_string(),
-            name: "Stable Diffusion XL 1.0".to_string(),
-            family: "SDXL".to_string(),
-            tasks: vec![GenerationTask::TextToImage, GenerationTask::ImageToImage],
-            components: vec![ModelComponent::huggingface(
-                    ComponentSlot::Checkpoint,
-                    "stabilityai/stable-diffusion-xl-base-1.0",
-                    "sd_xl_base_1.0.safetensors",
-                    6_938_040_682,
-                )],
-            defaults: GenerationDefaults {
-                width: 1024,
-                height: 1024,
-                steps: 20,
-                cfg_scale: 7.0,
-                sample_method: "euler_a",
-                flow_shift: None,
-                fps: 1,
-                video_frames: 1,
-                frame_grid: FrameGrid::DownTo4nPlus1,
-            },
-            min_ram_bytes: 16 * 1024 * 1024 * 1024,
-            license: permissive_license(
-                "openrail-plus-plus-m",
-                "CreativeML Open RAIL++-M",
-                "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/main/LICENSE.md",
-            ),
-            extra_launch_args: Vec::new(),
-        },
-        GenerationModelSpec {
-            id: "wan2.2-ti2v-5b".to_string(),
-            name: "Wan 2.2 TI2V 5B".to_string(),
-            family: "Wan".to_string(),
-            tasks: vec![GenerationTask::TextToVideo, GenerationTask::ImageToVideo],
-            components: vec![
-                ModelComponent::huggingface(
-                    ComponentSlot::DiffusionModel,
-                    "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
-                    "split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
-                    10_003_000_000,
-                ),
-                ModelComponent::huggingface(
-                    ComponentSlot::Vae,
-                    "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
-                    "split_files/vae/wan2.2_vae.safetensors",
-                    1_411_000_000,
-                ),
-                ModelComponent::huggingface(
-                    ComponentSlot::T5xxl,
-                    "city96/umt5-xxl-encoder-gguf",
-                    "umt5-xxl-encoder-Q8_0.gguf",
-                    6_043_000_000,
-                ),
-            ],
-            defaults: GenerationDefaults {
-                width: 704,
-                height: 1280,
-                steps: 20,
-                cfg_scale: 6.0,
-                sample_method: "euler",
-                flow_shift: Some(3.0),
-                fps: 24,
-                video_frames: 33,
-                frame_grid: FrameGrid::DownTo4nPlus1,
-            },
-            min_ram_bytes: 16 * 1024 * 1024 * 1024,
-            license: permissive_license(
-                "apache-2.0",
-                "Apache 2.0",
-                "https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B/blob/main/LICENSE.txt",
-            ),
-            extra_launch_args: vec!["--diffusion-fa".to_string(), "--offload-to-cpu".to_string()],
-        },
-        GenerationModelSpec {
-            id: "minimax-h3-ref2va".to_string(),
-            name: "MiniMax H3 Ref2VA (video + audio)".to_string(),
-            family: "MiniMax H3".to_string(),
-            // The reference-conditioning this checkpoint is named for reaches
-            // the engine only through its CLI and C API: `sd-server`'s vid_gen
-            // route advertises `init_image` and `end_image` but no
-            // `ref_images`, so over HTTP it serves text- and image-driven
-            // video like any other H3 weight.
-            tasks: vec![GenerationTask::TextToVideo, GenerationTask::ImageToVideo],
-            components: vec![
-                ModelComponent::huggingface(
-                    ComponentSlot::DiffusionModel,
-                    "leejet/MiniMax-H3-GGUF",
-                    "minimax_h3_ref2va_pruned-Q4_K_M.gguf",
-                    11_420_663_904,
-                ),
-                ModelComponent::huggingface(
-                    ComponentSlot::Llm,
-                    "leejet/MiniMax-H3-GGUF",
-                    "qwen3vl_32b_minimax_h3-Q2_K_M.gguf",
-                    13_102_161_024,
-                ),
-                ModelComponent::huggingface(
-                    ComponentSlot::Vae,
-                    "Comfy-Org/MiniMax-H3",
-                    "vae/minimax_h3_video_vae_fp16.safetensors",
-                    5_207_808_496,
-                ),
-                ModelComponent::huggingface(
-                    ComponentSlot::AudioVae,
-                    "Comfy-Org/MiniMax-H3",
-                    "vae/minimax_h3_audio_vae_fp32.safetensors",
-                    605_254_808,
-                ),
-            ],
-            defaults: GenerationDefaults {
-                width: 864,
-                height: 480,
-                steps: 8,
-                cfg_scale: 1.0,
-                sample_method: "euler",
-                flow_shift: None,
-                fps: 24,
-                video_frames: 39,
-                frame_grid: FrameGrid::UpTo17kPlus5,
-            },
-            // Measured: 30.5 GB resident with --offload-to-cpu on a 52 GB M4 Pro.
-            min_ram_bytes: 36 * 1024 * 1024 * 1024,
-            license: LicenseGate {
-                id: "minimax-h3-community".to_string(),
-                name: "MiniMax H3 Community License".to_string(),
-                url: "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE".to_string(),
-                excluded_territories: vec![
-                    "European Union".to_string(),
-                    "United Kingdom".to_string(),
-                    "Republic of Korea".to_string(),
-                    "United States of America".to_string(),
-                ],
-                acceptance_required: true,
-            },
-            extra_launch_args: vec![
-                "--diffusion-fa".to_string(),
-                "--offload-to-cpu".to_string(),
-                "--rng".to_string(),
-                "cpu".to_string(),
-            ],
-        },
-        GenerationModelSpec {
-            id: "minimax-h3-fl2va".to_string(),
-            name: "MiniMax H3 (video + audio)".to_string(),
-            family: "MiniMax H3".to_string(),
-            tasks: vec![GenerationTask::TextToVideo, GenerationTask::ImageToVideo],
-            components: vec![
-                ModelComponent::huggingface(
-                    ComponentSlot::DiffusionModel,
-                    "leejet/MiniMax-H3-GGUF",
-                    "minimax_h3_fl2va_pruned-Q4_K_M.gguf",
-                    11_420_000_000,
-                ),
-                ModelComponent::huggingface(
-                    ComponentSlot::Llm,
-                    "leejet/MiniMax-H3-GGUF",
-                    "qwen3vl_32b_minimax_h3-Q2_K_M.gguf",
-                    13_100_000_000,
-                ),
-                ModelComponent::huggingface(
-                    ComponentSlot::Vae,
-                    "Comfy-Org/MiniMax-H3",
-                    "vae/minimax_h3_video_vae_fp16.safetensors",
-                    5_210_000_000,
-                ),
-                ModelComponent::huggingface(
-                    ComponentSlot::AudioVae,
-                    "Comfy-Org/MiniMax-H3",
-                    "vae/minimax_h3_audio_vae_fp32.safetensors",
-                    605_000_000,
-                ),
-            ],
-            defaults: GenerationDefaults {
-                width: 1344,
-                height: 768,
-                steps: 25,
-                cfg_scale: 1.0,
-                sample_method: "euler",
-                flow_shift: None,
-                // The core video path forces 24 fps for this family, and
-                // aligns length upward onto a 17k+5 grid: 56 frames is the
-                // third rung, about 2.3 s.
-                fps: 24,
-                video_frames: 56,
-                frame_grid: FrameGrid::UpTo17kPlus5,
-            },
-            min_ram_bytes: 48 * 1024 * 1024 * 1024,
-            license: LicenseGate {
-                id: "minimax-h3-community".to_string(),
-                name: "MiniMax H3 Community License".to_string(),
-                url: "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE".to_string(),
-                excluded_territories: vec![
-                    "European Union".to_string(),
-                    "United Kingdom".to_string(),
-                    "Republic of Korea".to_string(),
-                    "United States of America".to_string(),
-                ],
-                acceptance_required: true,
-            },
-            extra_launch_args: vec!["--offload-to-cpu".to_string(), "--rng".to_string(), "cpu".to_string()],
-        },
-    ]
-}
-
-pub fn find_model(id: &str) -> Option<GenerationModelSpec> {
-    curated_models().into_iter().find(|model| model.id == id)
+    // The id becomes a directory name under the app's model root, so it must
+    // not be able to climb out of it.
+    if !spec
+        .id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        || spec.id.starts_with('.')
+    {
+        return Err(
+            "A model id may only contain letters, digits, dots, dashes and underscores".to_string(),
+        );
+    }
+    if spec.name.trim().is_empty() || spec.name.len() > 200 {
+        return Err("A model needs a name".to_string());
+    }
+    if spec.tasks.is_empty() {
+        return Err("Pick at least one thing this model can do".to_string());
+    }
+    if spec.components.is_empty() {
+        return Err("A model needs at least one weight file".to_string());
+    }
+    let denoisers = spec
+        .components
+        .iter()
+        .filter(|component| {
+            matches!(
+                component.slot,
+                ComponentSlot::Checkpoint | ComponentSlot::DiffusionModel
+            )
+        })
+        .count();
+    if denoisers != 1 {
+        return Err(
+            "Exactly one file must be the checkpoint or the diffusion model".to_string(),
+        );
+    }
+    let mut slots = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for component in &spec.components {
+        if !slots.insert(component.slot) {
+            return Err(format!(
+                "Two files are both assigned to {}",
+                component.slot.flag()
+            ));
+        }
+        // Components land in one flat directory per model, so two files
+        // sharing a basename would overwrite each other.
+        if !names.insert(component.file_name().to_string()) {
+            return Err(format!("Two files are both named {}", component.file_name()));
+        }
+        match &component.source {
+            ComponentSource::HuggingFace { repo, file } => {
+                if repo.trim().is_empty() || file.trim().is_empty() {
+                    return Err("A downloaded file needs a repo and a path".to_string());
+                }
+                if repo.contains("..") || file.contains("..") {
+                    return Err("Repo and file paths may not contain ..".to_string());
+                }
+            }
+            ComponentSource::LocalFile { path } => {
+                if !Path::new(path).is_absolute() {
+                    return Err("A file on this machine needs an absolute path".to_string());
+                }
+            }
+        }
+    }
+    if spec.defaults.steps == 0 || spec.defaults.steps > MAX_STEPS {
+        return Err(format!("Steps must be between 1 and {MAX_STEPS}"));
+    }
+    if spec.defaults.fps == 0 || spec.defaults.fps > MAX_FPS {
+        return Err(format!("Frame rate must be between 1 and {MAX_FPS}"));
+    }
+    if spec.defaults.sample_method.trim().is_empty()
+        || spec.defaults.sample_method.len() > 64
+    {
+        return Err("A model needs a sampling method".to_string());
+    }
+    for argument in &spec.extra_launch_args {
+        if argument.trim().is_empty() || argument.len() > 256 {
+            return Err("Engine arguments must be short and non-empty".to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Builds the `sd-server` command line for a model. Every weight path is
@@ -1082,139 +956,48 @@ pub async fn cancel_job(client: &reqwest::Client, base_url: &str, job_id: &str) 
 mod tests {
     use super::*;
 
-    #[test]
-    fn every_curated_model_declares_a_usable_component_set() {
-        for model in curated_models() {
-            assert!(!model.tasks.is_empty(), "{}", model.id);
-            assert!(!model.components.is_empty(), "{}", model.id);
-            // Exactly one weight carries the denoiser, under whichever slot the
-            // family uses. A spec with neither cannot launch.
-            let denoisers = model
-                .components
-                .iter()
-                .filter(|component| {
-                    matches!(
-                        component.slot,
-                        ComponentSlot::Checkpoint | ComponentSlot::DiffusionModel
-                    )
-                })
-                .count();
-            assert_eq!(denoisers, 1, "{}", model.id);
-            assert!(model.total_bytes() > 0, "{}", model.id);
-            assert!(model.defaults.steps > 0, "{}", model.id);
-            if model.tasks.iter().any(|task| task.is_video()) {
-                assert_eq!(
-                    normalize_video_frames(
-                        model.defaults.frame_grid,
-                        model.defaults.video_frames
-                    ),
-                    model.defaults.video_frames,
-                    "{} default frame count is off its own grid",
-                    model.id
-                );
-            }
+    /// A model exactly as a user would have added it: files they chose, slots
+    /// they assigned. There is no built-in catalogue to borrow from.
+    fn model(id: &str, tasks: Vec<GenerationTask>, grid: FrameGrid) -> GenerationModelSpec {
+        GenerationModelSpec {
+            id: id.to_string(),
+            name: format!("{id} by hand"),
+            family: "Wan".to_string(),
+            tasks,
+            components: vec![ModelComponent::huggingface(
+                ComponentSlot::DiffusionModel,
+                "someone/some-repo",
+                "split_files/diffusion_models/model.safetensors",
+                10,
+            )],
+            defaults: GenerationDefaults {
+                width: 704,
+                height: 1280,
+                steps: 20,
+                cfg_scale: 6.0,
+                sample_method: "euler".to_string(),
+                flow_shift: Some(3.0),
+                fps: 24,
+                video_frames: 33,
+                frame_grid: grid,
+            },
+            min_ram_bytes: 16 * 1024 * 1024 * 1024,
+            license: LicenseGate::default(),
+            extra_launch_args: vec!["--diffusion-fa".to_string()],
         }
     }
 
-    /// Components land in one flat per-model directory, so two files in the
-    /// same spec sharing a basename would silently overwrite each other.
-    #[test]
-    fn curated_models_have_unique_component_files() {
-        for model in curated_models() {
-            let mut names: Vec<_> = model
-                .components
-                .iter()
-                .map(|component| component.file_name().to_string())
-                .collect();
-            names.sort();
-            let count = names.len();
-            names.dedup();
-            assert_eq!(names.len(), count, "{}", model.id);
-        }
-    }
-
-    /// A territory-restricted model must gate on acceptance; a permissive one
-    /// must not nag. Getting this backwards is a licensing problem, not a UI one.
-    #[test]
-    fn restricted_models_require_license_acceptance() {
-        for model in curated_models() {
-            assert_eq!(
-                model.license.acceptance_required,
-                !model.license.excluded_territories.is_empty(),
-                "{}",
-                model.id
-            );
-        }
-        let h3 = find_model("minimax-h3-fl2va").expect("h3");
-        assert!(h3.license.acceptance_required);
-        assert!(h3
-            .license
-            .excluded_territories
-            .contains(&"United States of America".to_string()));
-    }
-
-    #[test]
-    fn launch_args_map_every_slot_to_its_flag() {
-        let h3 = find_model("minimax-h3-fl2va").expect("h3");
-        let args = launch_args(&h3, Path::new("/models"), 8092);
-        for (flag, file) in [
-            ("--diffusion-model", "minimax_h3_fl2va_pruned-Q4_K_M.gguf"),
-            ("--llm", "qwen3vl_32b_minimax_h3-Q2_K_M.gguf"),
-            ("--vae", "minimax_h3_video_vae_fp16.safetensors"),
-            ("--audio-vae", "minimax_h3_audio_vae_fp32.safetensors"),
-        ] {
-            let at = args.iter().position(|arg| arg == flag).expect(flag);
-            assert_eq!(
-                args[at + 1],
-                format!("/models/minimax-h3-fl2va/{file}"),
-                "{flag}"
-            );
-        }
-        assert!(args.windows(2).any(|pair| pair == ["--listen-port", "8092"]));
-        assert!(args.contains(&"--offload-to-cpu".to_string()));
-
-        // A single-checkpoint family reaches the same builder with one slot.
-        let sdxl = find_model("sdxl-base-1.0").expect("sdxl");
-        let sdxl_args = launch_args(&sdxl, Path::new("/models"), 8092);
-        assert!(sdxl_args.contains(&"--model".to_string()));
-        assert!(!sdxl_args.contains(&"--diffusion-model".to_string()));
-    }
-
-    /// Wan rounds down onto 4n+1; MiniMax H3 rounds *up* onto 17k+5. Using one
-    /// rule for both would misreport the duration of every H3 clip.
-    #[test]
-    fn frame_counts_snap_onto_each_familys_own_grid() {
-        use FrameGrid::{DownTo4nPlus1, UpTo17kPlus5};
-        assert_eq!(normalize_video_frames(DownTo4nPlus1, 33), 33);
-        assert_eq!(normalize_video_frames(DownTo4nPlus1, 34), 33);
-        assert_eq!(normalize_video_frames(DownTo4nPlus1, 32), 29);
-        assert_eq!(normalize_video_frames(DownTo4nPlus1, 5), 5);
-        assert_eq!(normalize_video_frames(DownTo4nPlus1, 4), 1);
-        assert_eq!(normalize_video_frames(DownTo4nPlus1, 0), 1);
-        assert_eq!(normalize_video_frames(DownTo4nPlus1, u32::MAX), MAX_VIDEO_FRAMES);
-
-        assert_eq!(normalize_video_frames(UpTo17kPlus5, 56), 56);
-        assert_eq!(normalize_video_frames(UpTo17kPlus5, 45), 56);
-        assert_eq!(normalize_video_frames(UpTo17kPlus5, 39), 39);
-        assert_eq!(normalize_video_frames(UpTo17kPlus5, 1), 5);
-        assert_eq!(normalize_video_frames(UpTo17kPlus5, 0), 5);
-        // Rounding up must not push past the cap.
-        let ceiling = normalize_video_frames(UpTo17kPlus5, u32::MAX);
-        assert!(ceiling <= MAX_VIDEO_FRAMES);
-        assert_eq!((ceiling - 5) % 17, 0);
-    }
-
-    #[test]
-    fn dimensions_round_up_to_the_sampler_grid() {
-        assert_eq!(normalize_dimension(1344), 1344);
-        assert_eq!(normalize_dimension(1000), 1024);
-        assert_eq!(normalize_dimension(0), 32);
-        assert_eq!(normalize_dimension(u32::MAX), MAX_DIMENSION);
+    fn video_model() -> GenerationModelSpec {
+        model(
+            "wan-mine",
+            vec![GenerationTask::TextToVideo, GenerationTask::ImageToVideo],
+            FrameGrid::DownTo4nPlus1,
+        )
     }
 
     fn video_request(task: GenerationTask) -> GenerationRequest {
         GenerationRequest {
-            model_id: "wan2.2-ti2v-5b".to_string(),
+            model_id: "wan-mine".to_string(),
             task,
             prompt: "a lovely cat".to_string(),
             negative_prompt: String::new(),
@@ -1230,25 +1013,160 @@ mod tests {
         }
     }
 
+    /// The registry is the user's, so validation is the only thing standing
+    /// between what they typed and arguments handed to an engine.
+    #[test]
+    fn spec_validation_rejects_what_would_fail_inside_the_engine() {
+        assert!(validate_model_spec(&video_model()).is_ok());
+
+        let mut no_denoiser = video_model();
+        no_denoiser.components[0].slot = ComponentSlot::Vae;
+        assert!(validate_model_spec(&no_denoiser).is_err());
+
+        let mut two_denoisers = video_model();
+        two_denoisers.components.push(ModelComponent::huggingface(
+            ComponentSlot::Checkpoint,
+            "someone/some-repo",
+            "other.safetensors",
+            1,
+        ));
+        assert!(validate_model_spec(&two_denoisers).is_err());
+
+        // Two files in one slot is a mistake the engine cannot report usefully.
+        let mut duplicate_slot = video_model();
+        duplicate_slot.components.push(ModelComponent::huggingface(
+            ComponentSlot::DiffusionModel,
+            "someone/some-repo",
+            "second.safetensors",
+            1,
+        ));
+        assert!(validate_model_spec(&duplicate_slot).is_err());
+
+        // Components share one flat directory, so a basename collision would
+        // silently overwrite.
+        let mut collide = video_model();
+        collide.components.push(ModelComponent::huggingface(
+            ComponentSlot::Vae,
+            "another/repo",
+            "vae/model.safetensors",
+            1,
+        ));
+        assert!(validate_model_spec(&collide).is_err());
+
+        // The id becomes a directory name and must not climb out of the root.
+        for bad in ["../escape", ".hidden", "has space", ""] {
+            let mut spec = video_model();
+            spec.id = bad.to_string();
+            assert!(validate_model_spec(&spec).is_err(), "{bad}");
+        }
+
+        let mut relative = video_model();
+        relative.components[0].source = ComponentSource::LocalFile {
+            path: "models/mine.safetensors".to_string(),
+        };
+        assert!(validate_model_spec(&relative).is_err());
+
+        let mut no_tasks = video_model();
+        no_tasks.tasks.clear();
+        assert!(validate_model_spec(&no_tasks).is_err());
+    }
+
+    /// A user's own file is referenced where it lies, never copied into the
+    /// app's model directory and never counted as something to download.
+    #[test]
+    fn local_components_resolve_in_place_and_are_never_fetched() {
+        let mut spec = video_model();
+        spec.components = vec![ModelComponent {
+            slot: ComponentSlot::Checkpoint,
+            source: ComponentSource::LocalFile {
+                path: "/Users/somebody/models/my-own.safetensors".to_string(),
+            },
+            size_bytes: 1,
+        }];
+        assert_eq!(
+            launch_args(&spec, Path::new("/app/models"), 8092)
+                .windows(2)
+                .find(|pair| pair[0] == "--model")
+                .map(|pair| pair[1].clone()),
+            Some("/Users/somebody/models/my-own.safetensors".to_string())
+        );
+        // Missing from disk, but still not downloadable — the app has no repo
+        // to fetch it from and must not report a download size for it.
+        assert!(spec.missing_components(Path::new("/app/models")).is_empty());
+        assert!(!spec.components[0].is_downloadable());
+    }
+
+    #[test]
+    fn launch_args_map_every_slot_to_its_flag() {
+        let mut spec = video_model();
+        spec.components = vec![
+            ModelComponent::huggingface(ComponentSlot::DiffusionModel, "r", "unet.gguf", 1),
+            ModelComponent::huggingface(ComponentSlot::Llm, "r", "encoder.gguf", 1),
+            ModelComponent::huggingface(ComponentSlot::Vae, "r", "vae/video.safetensors", 1),
+            ModelComponent::huggingface(ComponentSlot::AudioVae, "r", "vae/audio.safetensors", 1),
+        ];
+        let args = launch_args(&spec, Path::new("/models"), 8092);
+        for (flag, file) in [
+            ("--diffusion-model", "unet.gguf"),
+            ("--llm", "encoder.gguf"),
+            ("--vae", "video.safetensors"),
+            ("--audio-vae", "audio.safetensors"),
+        ] {
+            let at = args.iter().position(|arg| arg == flag).expect(flag);
+            assert_eq!(args[at + 1], format!("/models/wan-mine/{file}"), "{flag}");
+        }
+        assert!(args.windows(2).any(|pair| pair == ["--listen-port", "8092"]));
+        assert!(args.contains(&"--diffusion-fa".to_string()));
+    }
+
+    /// Wan rounds down onto 4n+1; MiniMax H3 rounds *up* onto 17k+5. Using one
+    /// rule for both would misreport the duration of every H3 clip.
+    #[test]
+    fn frame_counts_snap_onto_each_familys_own_grid() {
+        use FrameGrid::{DownTo4nPlus1, UpTo17kPlus5};
+        assert_eq!(normalize_video_frames(DownTo4nPlus1, 33), 33);
+        assert_eq!(normalize_video_frames(DownTo4nPlus1, 34), 33);
+        assert_eq!(normalize_video_frames(DownTo4nPlus1, 32), 29);
+        assert_eq!(normalize_video_frames(DownTo4nPlus1, 4), 1);
+        assert_eq!(normalize_video_frames(DownTo4nPlus1, u32::MAX), MAX_VIDEO_FRAMES);
+
+        assert_eq!(normalize_video_frames(UpTo17kPlus5, 56), 56);
+        assert_eq!(normalize_video_frames(UpTo17kPlus5, 45), 56);
+        assert_eq!(normalize_video_frames(UpTo17kPlus5, 39), 39);
+        assert_eq!(normalize_video_frames(UpTo17kPlus5, 0), 5);
+        let ceiling = normalize_video_frames(UpTo17kPlus5, u32::MAX);
+        assert!(ceiling <= MAX_VIDEO_FRAMES);
+        assert_eq!((ceiling - 5) % 17, 0);
+    }
+
+    #[test]
+    fn dimensions_round_up_to_the_sampler_grid() {
+        assert_eq!(normalize_dimension(1344), 1344);
+        assert_eq!(normalize_dimension(1000), 1024);
+        assert_eq!(normalize_dimension(0), 32);
+        assert_eq!(normalize_dimension(u32::MAX), MAX_DIMENSION);
+    }
+
     #[test]
     fn validation_normalizes_and_rejects_out_of_bounds_requests() {
-        let wan = find_model("wan2.2-ti2v-5b").expect("wan");
+        let wan = video_model();
         let normalized =
             validate_request(&wan, &video_request(GenerationTask::TextToVideo)).unwrap();
         assert_eq!(normalized.video_frames, 33);
-        // The same 34 becomes 39 on H3's upward 17k+5 grid, not 33.
-        let h3 = find_model("minimax-h3-fl2va").expect("h3");
+        assert_eq!(normalized.fps, 24);
+
+        // The same 34 becomes 39 on an upward 17k+5 grid, not 33.
+        let h3 = model("h3-mine", vec![GenerationTask::TextToVideo], FrameGrid::UpTo17kPlus5);
         let mut on_h3 = video_request(GenerationTask::TextToVideo);
         on_h3.model_id = h3.id.clone();
         assert_eq!(validate_request(&h3, &on_h3).unwrap().video_frames, 39);
-        assert_eq!(normalized.fps, 24);
 
         // Image-driven tasks cannot silently fall back to text-only.
         assert!(validate_request(&wan, &video_request(GenerationTask::ImageToVideo)).is_err());
 
-        // A model that does not do video must refuse a video task outright.
-        let sdxl = find_model("sdxl-base-1.0").expect("sdxl");
-        assert!(validate_request(&sdxl, &video_request(GenerationTask::TextToVideo)).is_err());
+        // A model that does not declare video must refuse a video task.
+        let stills = model("sd-mine", vec![GenerationTask::TextToImage], FrameGrid::DownTo4nPlus1);
+        assert!(validate_request(&stills, &video_request(GenerationTask::TextToVideo)).is_err());
 
         let mut blank = video_request(GenerationTask::TextToVideo);
         blank.prompt = "   ".to_string();
@@ -1265,7 +1183,7 @@ mod tests {
 
     #[test]
     fn request_bodies_carry_video_fields_only_for_video_tasks() {
-        let wan = find_model("wan2.2-ti2v-5b").expect("wan");
+        let wan = video_model();
         let body = request_body(&wan, &video_request(GenerationTask::TextToVideo));
         assert_eq!(body["video_frames"], json!(34));
         assert_eq!(body["output_format"], json!("webm"));
@@ -1273,15 +1191,89 @@ mod tests {
         assert_eq!(body["sample_params"]["guidance"]["txt_cfg"], json!(6.0));
         assert!(body.get("init_image").is_none());
 
-        let sdxl = find_model("sdxl-base-1.0").expect("sdxl");
+        let mut stills = model("sd-mine", vec![GenerationTask::TextToImage], FrameGrid::DownTo4nPlus1);
+        stills.defaults.flow_shift = None;
         let mut image = video_request(GenerationTask::TextToImage);
-        image.model_id = sdxl.id.clone();
-        let body = request_body(&sdxl, &image);
+        image.model_id = stills.id.clone();
+        let body = request_body(&stills, &image);
         assert_eq!(body["output_format"], json!("png"));
         assert!(body.get("video_frames").is_none());
-        // SDXL declares no flow shift, so the field must be absent rather than
-        // pinned to a value the backend would otherwise choose itself.
+        // A model that declares no flow shift must leave the field absent
+        // rather than pinning a value the backend would otherwise choose.
         assert!(body["sample_params"].get("flow_shift").is_none());
+    }
+
+    /// The engine ignores prompt-embedded `<lora:...>` tags on purpose, so the
+    /// structured array is the only way a LoRA reaches it — and any model can
+    /// take any number of them.
+    #[test]
+    fn lora_stacks_reach_the_request_body_and_are_bounded() {
+        let wan = video_model();
+        let mut request = video_request(GenerationTask::TextToVideo);
+        request.loras = vec![
+            LoraSelection {
+                path: "/loras/style.safetensors".to_string(),
+                multiplier: 0.8,
+                is_high_noise: false,
+            },
+            LoraSelection {
+                path: "/loras/motion.safetensors".to_string(),
+                multiplier: -0.4,
+                is_high_noise: true,
+            },
+        ];
+        let normalized = validate_request(&wan, &request).unwrap();
+        let body = request_body(&wan, &normalized);
+        let loras = body["lora"].as_array().expect("lora array");
+        assert_eq!(loras.len(), 2);
+        assert_eq!(loras[0]["path"], json!("/loras/style.safetensors"));
+        // Negative strengths are meaningful — they subtract a style.
+        assert_eq!(loras[1]["multiplier"], json!(-0.4));
+        assert_eq!(loras[1]["is_high_noise"], json!(true));
+
+        // No LoRAs means no key at all, not an empty array.
+        let plain = request_body(&wan, &video_request(GenerationTask::TextToVideo));
+        assert!(plain.get("lora").is_none());
+
+        let mut relative = request.clone();
+        relative.loras[0].path = "style.safetensors".to_string();
+        assert!(validate_request(&wan, &relative).is_err());
+
+        let mut wild = request.clone();
+        wild.loras[0].multiplier = f64::INFINITY;
+        assert!(validate_request(&wan, &wild).is_err());
+
+        let mut too_many = request.clone();
+        too_many.loras = std::iter::repeat_n(request.loras[0].clone(), MAX_LORAS + 1).collect();
+        assert!(validate_request(&wan, &too_many).is_err());
+    }
+
+    /// A user-added model is stored as JSON and read back on the next launch,
+    /// so the whole spec has to survive a round trip.
+    #[test]
+    fn a_user_added_model_survives_a_round_trip_through_disk() {
+        let mut spec = video_model();
+        spec.components.push(ModelComponent {
+            slot: ComponentSlot::Vae,
+            source: ComponentSource::LocalFile {
+                path: "/Users/somebody/vae.safetensors".to_string(),
+            },
+            size_bytes: 5,
+        });
+        let encoded = serde_json::to_vec(&spec).unwrap();
+        let decoded: GenerationModelSpec = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.id, spec.id);
+        assert_eq!(decoded.defaults.sample_method, "euler");
+        assert_eq!(decoded.defaults.frame_grid, FrameGrid::DownTo4nPlus1);
+        assert_eq!(decoded.components.len(), 2);
+        assert!(matches!(
+            decoded.components[1].source,
+            ComponentSource::LocalFile { .. }
+        ));
+        assert_eq!(
+            launch_args(&decoded, Path::new("/m"), 1),
+            launch_args(&spec, Path::new("/m"), 1)
+        );
     }
 
     #[test]
@@ -1347,88 +1339,16 @@ mod tests {
         assert!(decode_job_status(&json!({"status": "invented"})).is_err());
     }
 
-    /// A user's own file is referenced where it lies, never copied into the
-    /// app's model directory and never counted as something to download.
-    #[test]
-    fn local_components_resolve_in_place_and_are_never_fetched() {
-        let mut spec = find_model("sdxl-base-1.0").expect("sdxl");
-        spec.components = vec![ModelComponent {
-            slot: ComponentSlot::Checkpoint,
-            source: ComponentSource::LocalFile {
-                path: "/Users/somebody/models/my-own.safetensors".to_string(),
-            },
-            size_bytes: 1,
-        }];
-        assert_eq!(
-            launch_args(&spec, Path::new("/app/models"), 8092)
-                .windows(2)
-                .find(|pair| pair[0] == "--model")
-                .map(|pair| pair[1].clone()),
-            Some("/Users/somebody/models/my-own.safetensors".to_string())
-        );
-        // Missing from disk, but still not downloadable — the app has no repo
-        // to fetch it from and must not report a download size for it.
-        assert!(spec.missing_components(Path::new("/app/models")).is_empty());
-        assert!(!spec.components[0].is_downloadable());
-    }
-
-    /// The engine ignores prompt-embedded `<lora:...>` tags on purpose, so the
-    /// structured array is the only way a LoRA reaches it — and any model can
-    /// take any number of them.
-    #[test]
-    fn lora_stacks_reach_the_request_body_and_are_bounded() {
-        let wan = find_model("wan2.2-ti2v-5b").expect("wan");
-        let mut request = video_request(GenerationTask::TextToVideo);
-        request.loras = vec![
-            LoraSelection {
-                path: "/loras/style.safetensors".to_string(),
-                multiplier: 0.8,
-                is_high_noise: false,
-            },
-            LoraSelection {
-                path: "/loras/motion.safetensors".to_string(),
-                multiplier: -0.4,
-                is_high_noise: true,
-            },
-        ];
-        let normalized = validate_request(&wan, &request).unwrap();
-        let body = request_body(&wan, &normalized);
-        let loras = body["lora"].as_array().expect("lora array");
-        assert_eq!(loras.len(), 2);
-        assert_eq!(loras[0]["path"], json!("/loras/style.safetensors"));
-        // Negative strengths are meaningful — they subtract a style.
-        assert_eq!(loras[1]["multiplier"], json!(-0.4));
-        assert_eq!(loras[1]["is_high_noise"], json!(true));
-
-        // No LoRAs means no key at all, not an empty array.
-        let plain = request_body(&wan, &video_request(GenerationTask::TextToVideo));
-        assert!(plain.get("lora").is_none());
-
-        let mut relative = request.clone();
-        relative.loras[0].path = "style.safetensors".to_string();
-        assert!(validate_request(&wan, &relative).is_err());
-
-        let mut wild = request.clone();
-        wild.loras[0].multiplier = f64::INFINITY;
-        assert!(validate_request(&wan, &wild).is_err());
-
-        let mut too_many = request.clone();
-        too_many.loras = std::iter::repeat_n(request.loras[0].clone(), MAX_LORAS + 1).collect();
-        assert!(validate_request(&wan, &too_many).is_err());
-    }
-
     #[test]
     fn video_and_image_tasks_reach_different_endpoints() {
-        assert_eq!(
-            GenerationTask::TextToVideo.endpoint(),
-            "/sdcpp/v1/vid_gen"
-        );
-        assert_eq!(
-            GenerationTask::ImageToVideo.endpoint(),
-            "/sdcpp/v1/vid_gen"
-        );
+        assert_eq!(GenerationTask::TextToVideo.endpoint(), "/sdcpp/v1/vid_gen");
+        assert_eq!(GenerationTask::ImageToVideo.endpoint(), "/sdcpp/v1/vid_gen");
         assert_eq!(GenerationTask::TextToImage.endpoint(), "/sdcpp/v1/img_gen");
         assert!(GenerationTask::ImageToVideo.needs_init_image());
         assert!(!GenerationTask::TextToVideo.needs_init_image());
+        // Speech runs on a different engine and must be routed before anything
+        // sd-server-shaped is reached for.
+        assert!(GenerationTask::TextToSpeech.is_speech());
+        assert!(!GenerationTask::TextToVideo.is_speech());
     }
 }
