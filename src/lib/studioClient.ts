@@ -22,11 +22,33 @@ export type ComponentSlot =
   | "audio_vae"
   | "taesd";
 
+/** Where a component's bytes come from. A file the user already has is a
+ *  first-class source, referenced where it lies and never fetched. */
+export type ComponentSource =
+  | { kind: "hugging_face"; repo: string; file: string }
+  | { kind: "local_file"; path: string };
+
 export interface ModelComponent {
   slot: ComponentSlot;
-  repo: string;
-  file: string;
+  source: ComponentSource;
   sizeBytes: number;
+}
+
+/** The flat file name a component takes on disk. */
+export function componentFileName(component: ModelComponent): string {
+  const raw =
+    component.source.kind === "hugging_face"
+      ? component.source.file
+      : component.source.path;
+  const parts = raw.split(/[/\\]/);
+  return parts[parts.length - 1] ?? raw;
+}
+
+/** One LoRA applied to a generation. Any model takes any number of them. */
+export interface LoraSelection {
+  path: string;
+  multiplier: number;
+  isHighNoise: boolean;
 }
 
 export interface GenerationDefaults {
@@ -107,6 +129,7 @@ export interface GenerationRequest {
   videoFrames: number;
   fps: number;
   initImageBase64: string | null;
+  loras: LoraSelection[];
 }
 
 export interface GenerationProgressPayload {

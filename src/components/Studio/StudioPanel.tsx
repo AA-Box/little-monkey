@@ -4,6 +4,7 @@ import { Download, Loader2, Sparkles, Square, Trash2, Upload } from "lucide-reac
 import { Button, IconButton, StatusPill } from "../ui";
 import { useT } from "../../lib/i18n";
 import {
+  componentFileName,
   formatBytes,
   isVideoTask,
   needsInitImage,
@@ -22,19 +23,23 @@ function errorText(reason: unknown): string {
 
 /** A model's own file basenames, for the "what will this download" list. */
 function componentNames(model: GenerationModel): string[] {
-  return model.components.map((component) => {
-    const parts = component.file.split("/");
-    return parts[parts.length - 1] ?? component.file;
-  });
+  return model.components.map(componentFileName);
 }
 
-export function StudioPanel() {
+export type StudioMode = "image" | "video";
+
+const MODE_TASKS: Record<StudioMode, GenerationTask[]> = {
+  image: ["text_to_image", "image_to_image"],
+  video: ["text_to_video", "image_to_video"],
+};
+
+export function StudioPanel({ mode }: { mode: StudioMode }) {
   const { t } = useT();
   const [status, setStatus] = useState<GenerationEngineStatus | null>(null);
   const [models, setModels] = useState<GenerationModel[]>([]);
   const [gallery, setGallery] = useState<GenerationEntry[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [task, setTask] = useState<GenerationTask>("text_to_video");
+  const [task, setTask] = useState<GenerationTask>(MODE_TASKS[mode][0]);
   const [prompt, setPrompt] = useState("");
   const [negativePrompt, setNegativePrompt] = useState("");
   const [seconds, setSeconds] = useState(3);
@@ -47,9 +52,15 @@ export function StudioPanel() {
   const [previews, setPreviews] = useState<Record<string, string>>({});
   const fileInput = useRef<HTMLInputElement>(null);
 
+  // A segment shows only the models that can do something in it, so the
+  // picker never offers a video model under Image.
+  const visible = useMemo(
+    () => models.filter((model) => model.tasks.some((entry) => MODE_TASKS[mode].includes(entry))),
+    [models, mode],
+  );
   const selected = useMemo(
-    () => models.find((model) => model.id === selectedId) ?? null,
-    [models, selectedId],
+    () => visible.find((model) => model.id === selectedId) ?? null,
+    [visible, selectedId],
   );
 
   const refresh = useCallback(async () => {
@@ -62,16 +73,19 @@ export function StudioPanel() {
       setStatus(engine);
       setModels(list);
       setGallery([...entries].reverse());
+      const usable = list.filter((model) =>
+        model.tasks.some((entry) => MODE_TASKS[mode].includes(entry)),
+      );
       setSelectedId((current) => {
-        if (current && list.some((model) => model.id === current)) return current;
+        if (current && usable.some((model) => model.id === current)) return current;
         // Prefer something already downloaded so the panel opens on a model
         // the user can actually run.
-        return (list.find((model) => model.installed) ?? list[0])?.id ?? null;
+        return (usable.find((model) => model.installed) ?? usable[0])?.id ?? null;
       });
     } catch (reason) {
       setError(errorText(reason));
     }
-  }, []);
+  }, [mode]);
 
   useEffect(() => {
     void refresh();
@@ -93,10 +107,11 @@ export function StudioPanel() {
   // Keep the task valid for whichever model is selected: switching from a
   // video model to an image-only one must not leave a video task armed.
   useEffect(() => {
-    if (selected && !selected.tasks.includes(task)) {
-      setTask(selected.tasks[0] ?? "text_to_image");
-    }
-  }, [selected, task]);
+    const allowed = selected
+      ? selected.tasks.filter((entry) => MODE_TASKS[mode].includes(entry))
+      : MODE_TASKS[mode];
+    if (!allowed.includes(task)) setTask(allowed[0] ?? MODE_TASKS[mode][0]);
+  }, [selected, task, mode]);
 
   const loadPreview = useCallback(
     async (entry: GenerationEntry) => {
@@ -172,6 +187,7 @@ export function StudioPanel() {
           : 1,
         fps: isVideoTask(task) ? selected.defaults.fps : 1,
         initImageBase64: needsInitImage(task) ? initImage : null,
+        loras: [],
       });
       setGallery((current) => [entry, ...current]);
       void loadPreview(entry);
@@ -207,8 +223,8 @@ export function StudioPanel() {
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">
       <header className="mb-4">
-        <h1 className="text-sm font-medium">{t("Studio.title")}</h1>
-        <p className="mt-1 text-xs text-muted">{t("Studio.subtitle")}</p>
+        <h1 className="text-sm font-medium">{t(`Studio.${mode}.title`)}</h1>
+        <p className="mt-1 text-xs text-muted">{t(`Studio.${mode}.subtitle`)}</p>
       </header>
 
       {error && (
@@ -220,7 +236,7 @@ export function StudioPanel() {
       <section className="mb-4">
         <h2 className="mb-2 text-xs font-medium text-muted">{t("Studio.models")}</h2>
         <div className="grid gap-2">
-          {models.map((model) => {
+          {visible.map((model) => {
             const blockedByLicense =
               model.license.acceptanceRequired && !model.licenseAccepted;
             return (
@@ -321,7 +337,9 @@ export function StudioPanel() {
       {selected && (
         <section className="mb-4 grid gap-3">
           <div className="flex flex-wrap gap-1.5">
-            {selected.tasks.map((entry) => (
+            {selected.tasks
+              .filter((entry) => MODE_TASKS[mode].includes(entry))
+              .map((entry) => (
               <Button
                 key={entry}
                 size="sm"
@@ -436,7 +454,9 @@ export function StudioPanel() {
           <p className="text-xs text-faint">{t("Studio.galleryEmpty")}</p>
         ) : (
           <div className="grid gap-3 sm:grid-cols-2">
-            {gallery.map((entry) => {
+            {gallery
+              .filter((entry) => MODE_TASKS[mode].includes(entry.task))
+              .map((entry) => {
               const preview = previews[entry.artifactId];
               return (
                 <figure key={entry.entryId} className="rounded border border-border p-2">

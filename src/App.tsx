@@ -272,7 +272,7 @@ function App() {
   /** Which top-level section the window is in. Chat is everything that was
    *  here before — sessions, code, the feature panels; Studio is image and
    *  video generation, which shares none of that state. */
-  const [section, setSection] = useState<"chat" | "studio">("chat");
+  const [section, setSection] = useState<"chat" | "image" | "video">("chat");
   const [workspacePanelOpen, setWorkspacePanelOpen] = useState(true);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
@@ -965,7 +965,8 @@ function App() {
             onChange={setSection}
             items={[
               { id: "chat", label: t("App.section.chat") },
-              { id: "studio", label: t("App.section.studio") },
+              { id: "image", label: t("App.section.image") },
+              { id: "video", label: t("App.section.video") },
             ]}
           />
         </div>
@@ -1054,8 +1055,8 @@ function App() {
           }
         >
           <Suspense fallback={<LazyPanelFallback />}>
-            {section === "studio" ? (
-              <StudioPanel />
+            {section !== "chat" ? (
+              <StudioPanel mode={section} />
             ) : globalSearchOpen ? (
               <GlobalSearch
                 onClose={() => closeFeaturePanel("global-search")}

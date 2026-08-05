@@ -7,10 +7,14 @@
 export const studioLocale: Record<string, string> = {
   "App.section.switcher": "Section",
   "App.section.chat": "Chat",
-  "App.section.studio": "Studio",
+  "App.section.image": "Image",
+  "App.section.video": "Video",
+  "App.section.audio": "Audio",
 
-  "Studio.title": "Studio",
-  "Studio.subtitle": "Generate images and video on this machine. No account, no upload.",
+  "Studio.image.title": "Image",
+  "Studio.image.subtitle": "Generate images on this machine. No account, no upload.",
+  "Studio.video.title": "Video",
+  "Studio.video.subtitle": "Generate video on this machine. No account, no upload.",
   "Studio.models": "Models",
   "Studio.installed": "Installed",
   "Studio.download": "Download {{size}}",
