@@ -744,7 +744,16 @@ impl UrlSourcePolicy {
             // service, a Tailscale peer or a documentation range. The classifier
             // now hands back which one, and the address rides along as detail.
             if let Some(rule) = non_public_address_rule(*address) {
-                if !self.allow_private_networks {
+                // The grant is per rule, not per classifier verdict. It used to be
+                // `!self.allow_private_networks` alone, which made one boolean named
+                // for private networks stand for all fourteen classes this
+                // classifier can return — so a user switching it on to reach a NAS
+                // also permitted multicast, `255.255.255.255`, the documentation
+                // ranges, `240/4`, and the deprecated IPv4-compatible form that is a
+                // *spelling* of an address rather than a class of one.
+                let granted =
+                    self.allow_private_networks && rule.covered_by_private_network_grant();
+                if !granted {
                     let is_loopback_http =
                         address.is_loopback() && url.scheme() == "http" && self.allow_http_loopback;
                     if !is_loopback_http {
@@ -5169,6 +5178,54 @@ mod tests {
             "an `[::1]` literal is refused as loopback — same rule as the v4 \
              literal and the name that resolves there"
         );
+    }
+
+    /// `allow_private_networks` used to be one boolean over every class this
+    /// classifier can return, so switching it on to reach a NAS at `192.168.1.10`
+    /// also permitted multicast, `255.255.255.255`, the documentation ranges,
+    /// `240/4` and the deprecated IPv4-compatible form.
+    ///
+    /// Both halves are asserted together because each alone describes a different
+    /// bug: without the first this is "refuse everything", which is not what a
+    /// user asking for their LAN wants; without the second it is the blanket that
+    /// was already there.
+    ///
+    /// The refusals name their rule rather than merely being refusals — a grant
+    /// that leaked would most likely show up as the *wrong* rule surviving, and
+    /// `Err(UrlRejected(_))` cannot tell those apart.
+    #[test]
+    fn a_private_network_grant_reaches_a_lan_host_and_nothing_that_routes_nowhere() {
+        let limits = test_limits();
+        let policy = UrlSourcePolicy::new(["https://example.com"], false, true).expect("policy");
+
+        for text in ["192.168.1.10", "10.0.0.1", "172.16.0.1", "100.64.0.1"] {
+            let address = text.parse::<IpAddr>().expect("private address parses");
+            assert!(
+                policy
+                    .validate("https://example.com/docs", &[address], &limits)
+                    .is_ok(),
+                "{text} is what the setting is for and must be reachable with it on"
+            );
+        }
+
+        for (text, rule) in [
+            ("224.0.0.1", EgressRule::Multicast),
+            ("255.255.255.255", EgressRule::Broadcast),
+            ("0.1.2.3", EgressRule::ThisNetwork),
+            ("192.0.0.8", EgressRule::ProtocolAssignments),
+            ("192.0.2.1", EgressRule::TestNet),
+            ("198.18.0.1", EgressRule::Benchmarking),
+            ("240.0.0.1", EgressRule::ReservedRange),
+            ("::127.0.0.1", EgressRule::Ipv4Compatible),
+        ] {
+            let address = text.parse::<IpAddr>().expect("address parses");
+            assert_eq!(
+                refused_rule(policy.validate("https://example.com/docs", &[address], &limits)),
+                rule,
+                "{text} must stay refused as {} even with private networks allowed",
+                rule.code()
+            );
+        }
     }
 
     #[test]

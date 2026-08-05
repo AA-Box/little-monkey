@@ -235,6 +235,77 @@ impl EgressRule {
     pub fn redacts_target(self) -> bool {
         matches!(self, EgressRule::EmbeddedCredentials)
     }
+
+    /// Whether a user's opt-in to private networks is meant to cover this rule.
+    ///
+    /// A setting named for private networks was one boolean over every rule an
+    /// address classifier can return, so switching it on to reach a NAS at
+    /// `192.168.1.10` also permitted multicast, `255.255.255.255`, the
+    /// documentation ranges, `240/4` and the deprecated IPv4-compatible form. None
+    /// of those is a thing anybody enables that setting to reach, and the last is
+    /// not a destination class at all — it is an alternative *spelling* of one, so
+    /// blanketing it turned a private-network grant into a way to launder any
+    /// address past the guard.
+    ///
+    /// The split is "could a host the user actually runs answer here?":
+    ///
+    /// - **Covered.** Loopback, RFC 1918, link-local, unique-local IPv6, and CGNAT
+    ///   — that last because `100.64/10` is Tailscale's default range and live on
+    ///   some consumer ISPs, so it is where a real peer lives rather than a
+    ///   curiosity. [`Unspecified`](Self::Unspecified) joins them because an
+    ///   outbound connection to `0.0.0.0` is routed to `127.0.0.1`: it reaches the
+    ///   *same* service the loopback grant already covers, so refusing it while
+    ///   permitting loopback would be inconsistent about one destination rather
+    ///   than protective of anything.
+    /// - **Not covered.** Multicast and broadcast, which HTTP does not use;
+    ///   `0/8` past `0.0.0.0`, `192.0.0/24`, the documentation and benchmarking
+    ///   ranges and `240/4`, which route nowhere; and the IPv4-compatible form,
+    ///   which is a spelling and not a place.
+    ///
+    /// Written as an exhaustive `match` rather than a `matches!` over the covered
+    /// set, so that adding a rule to [`EgressRule`] is a compile error here until
+    /// somebody decides which side of this line it falls on. Every rule that is not
+    /// an address class answers `false`, which is both correct and moot: this is
+    /// only ever consulted with a classifier's verdict.
+    #[must_use]
+    pub fn covered_by_private_network_grant(self) -> bool {
+        match self {
+            EgressRule::Loopback
+            | EgressRule::Unspecified
+            | EgressRule::PrivateV4
+            | EgressRule::LinkLocal
+            | EgressRule::UniqueLocalV6
+            | EgressRule::Cgnat => true,
+            EgressRule::Multicast
+            | EgressRule::Broadcast
+            | EgressRule::ThisNetwork
+            | EgressRule::ProtocolAssignments
+            | EgressRule::TestNet
+            | EgressRule::Benchmarking
+            | EgressRule::ReservedRange
+            | EgressRule::Ipv4Compatible => false,
+            // Not address classes, so no address grant reaches them.
+            EgressRule::UrlMalformed
+            | EgressRule::UrlTooLong
+            | EgressRule::UrlControlCharacters
+            | EgressRule::SchemeNotAllowed
+            | EgressRule::EmbeddedCredentials
+            | EgressRule::FragmentNotAllowed
+            | EgressRule::HostMissing
+            | EgressRule::PortMissing
+            | EgressRule::OriginNotAllowlisted
+            | EgressRule::RedirectLeftGrant
+            | EgressRule::SubresourceLeftGrant
+            | EgressRule::CleartextNotAllowed
+            | EgressRule::DnsResolutionFailed
+            | EgressRule::DnsAnswersRequired
+            | EgressRule::DnsNoAddresses
+            | EgressRule::RedirectHopLimit
+            | EgressRule::RedirectCrossOrigin
+            | EgressRule::RedirectOriginUnknown
+            | EgressRule::RunNetworkDenied => false,
+        }
+    }
 }
 
 /// A refusal: the rule that fired, plus optional request-specific detail.
@@ -793,6 +864,62 @@ mod tests {
                 .map(|rule| rule.code())
                 .collect();
             assert_eq!(redacting, vec!["egress.embedded-credentials"]);
+        }
+
+        /// The set a private-network opt-in covers, written out, for the same reason
+        /// the test above is an inventory: the risk is not that this returns the
+        /// wrong answer for a rule somebody thought about, it is that a rule added
+        /// later lands on the permissive side without anyone deciding it should.
+        ///
+        /// Pinned by code rather than by variant, because the code is the identity
+        /// that outlives the spelling — and pinned as an ordered list over `ALL`, so
+        /// the assertion also fails if a rule is *removed* from the enum entirely.
+        #[test]
+        fn a_private_network_grant_covers_exactly_these_rules() {
+            let covered: Vec<&str> = EgressRule::ALL
+                .iter()
+                .filter(|rule| rule.covered_by_private_network_grant())
+                .map(|rule| rule.code())
+                .collect();
+            assert_eq!(
+                covered,
+                vec![
+                    "egress.loopback",
+                    "egress.unspecified",
+                    "egress.private-v4",
+                    "egress.link-local",
+                    "egress.unique-local-v6",
+                    "egress.cgnat",
+                ]
+            );
+        }
+
+        /// The other half, and the one that is a security claim rather than a
+        /// convenience: these classes stay refused however the setting is set.
+        ///
+        /// `egress.ipv4-compatible` is the one worth naming out loud. It is not a
+        /// class of destination but an alternative *spelling* of one, so covering it
+        /// with a private-network grant would not have widened the reachable network
+        /// — it would have provided a second way to write any address at all past
+        /// the classifier that refuses it.
+        #[test]
+        fn a_private_network_grant_never_covers_a_range_nothing_routes_to() {
+            for rule in [
+                EgressRule::Multicast,
+                EgressRule::Broadcast,
+                EgressRule::ThisNetwork,
+                EgressRule::ProtocolAssignments,
+                EgressRule::TestNet,
+                EgressRule::Benchmarking,
+                EgressRule::ReservedRange,
+                EgressRule::Ipv4Compatible,
+            ] {
+                assert!(
+                    !rule.covered_by_private_network_grant(),
+                    "{} must stay refused whatever the private-network setting says",
+                    rule.code()
+                );
+            }
         }
 
         /// A denial handed to `io::Error` must arrive as itself, not as a
