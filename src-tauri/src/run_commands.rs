@@ -158,6 +158,26 @@ pub(crate) fn with_profile_ledger<R: tauri::Runtime, T>(
 /// already-submitted run. A webview cannot combine one provider's key with
 /// an arbitrary endpoint, and later provider-setting changes cannot retarget
 /// an in-flight request.
+///
+/// # This is also where the run's own network permission becomes binding
+///
+/// `permission_policy.allow_network` has been part of every frozen `RunSpec`
+/// since the protocol was written, and until now **nothing read it on any
+/// outbound path**. Its only enforcement anywhere was a same-named field on
+/// `sandbox.rs`'s Seatbelt request, which governs sandboxed shell children and is
+/// not this flag; `recipes.rs` compares it against a tool profile but enforces
+/// nothing. So a run submitted with `allow_network: false` — which is the default
+/// when a submitter omits it — reached every cloud provider unimpeded.
+///
+/// The check lives here rather than in a new gate because this function already
+/// does the hard half: it loads the frozen spec by run id, refuses to trust the
+/// caller's claimed target, and is fail-closed on an unknown run. The destination
+/// it returns is the thing the permission is about, so a separate consult would be
+/// a second lookup of the same row with a chance of disagreeing with this one.
+///
+/// Loopback is exempt, and that is not a loophole — see
+/// [`crate::egress::is_loopback_target`]. A local-inference run legitimately
+/// carries `allow_network: false`.
 pub(crate) fn provider_endpoint_for_run(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -184,6 +204,11 @@ pub(crate) fn provider_endpoint_for_run(
             && frozen_model == model
             && credential_ref_id == crate::providers::credential_ref_id(provider_id) =>
         {
+            enforce_run_network_permission(
+                &endpoint,
+                run_id,
+                run.spec.permission_policy.allow_network,
+            )?;
             Ok(endpoint)
         }
         ModelTargetSnapshot::Provider { .. } => {
@@ -191,6 +216,56 @@ pub(crate) fn provider_endpoint_for_run(
         }
         _ => Err("Run target is not a provider model".to_string()),
     }
+}
+
+/// Names this gate in a denial record.
+const RUN_TARGET_GUARD: &str = "run.provider-target";
+
+/// Refuses a destination that leaves this machine when the run said it would not.
+///
+/// Deny-by-default in the only sense a run can express today: the permission is
+/// frozen at submission, so neither the model, a skill, a package nor a routing
+/// decision can widen it afterwards — the spec row is written once and there is no
+/// update path to it. That is the acceptance clause's "cannot be widened at
+/// runtime", for this one destination.
+///
+/// An endpoint that will not parse is refused rather than allowed. It reached here
+/// out of a frozen spec, so a malformed one means the row is not what this build
+/// expects, and guessing in the permissive direction is the wrong way to be wrong.
+fn enforce_run_network_permission(
+    endpoint: &str,
+    run_id: &str,
+    allow_network: bool,
+) -> Result<(), String> {
+    if allow_network {
+        return Ok(());
+    }
+
+    let parsed = url::Url::parse(endpoint).map_err(|error| {
+        let denial = crate::egress::EgressDenial::about(
+            crate::egress::EgressRule::UrlMalformed,
+            format!("the run's frozen provider endpoint does not parse: {error}"),
+        );
+        crate::denial_sink::record(RUN_TARGET_GUARD, &denial, Some(run_id));
+        denial.to_string()
+    })?;
+
+    if crate::egress::is_loopback_target(&parsed) {
+        return Ok(());
+    }
+
+    let denial = crate::egress::EgressDenial::about(
+        crate::egress::EgressRule::RunNetworkDenied,
+        // The origin, never the endpoint as given: these strings surface in the UI
+        // and a custom provider's endpoint can carry a token in its query.
+        format!(
+            "this run's frozen permission_policy.allow_network is false, so it may \
+             not reach {}",
+            crate::egress::origin_label(&parsed)
+        ),
+    );
+    crate::denial_sink::record(RUN_TARGET_GUARD, &denial, Some(run_id));
+    Err(denial.to_string())
 }
 
 fn emit_changed<R: tauri::Runtime>(app: &tauri::AppHandle<R>, outcome: &AppendEventOutcome) {
@@ -549,5 +624,63 @@ mod tests {
     fn host_event_ids_are_protocol_safe() {
         let id = format!("event-{}", uuid::Uuid::new_v4().simple());
         crate::run_protocol::validate_protocol_id("event_id", &id).unwrap();
+    }
+
+    /// The flag becomes binding. Before this, `permission_policy.allow_network`
+    /// was read by nothing on any outbound path — only by `recipes.rs`, which
+    /// compares it to a tool profile and enforces nothing, and by `sandbox.rs`'s
+    /// same-named field, which is a different field on a different request and
+    /// governs shell children.
+    #[test]
+    fn a_run_without_network_permission_cannot_reach_a_remote_provider() {
+        let denial = enforce_run_network_permission(
+            "https://api.openai.com/v1",
+            "run-under-declared",
+            false,
+        )
+        .expect_err("a run that declared no network must not reach a cloud provider");
+
+        assert!(
+            denial.contains(crate::egress::EgressRule::RunNetworkDenied.code()),
+            "the refusal must name the rule: {denial}"
+        );
+        // The origin, not the endpoint as given — a custom provider endpoint can
+        // carry a token in its query and this string reaches the UI.
+        assert!(denial.contains("https://api.openai.com:443"));
+    }
+
+    /// The counter-test that stops this from being a blanket kill switch, and the
+    /// reason the loopback exemption exists at all: a local-inference run is
+    /// submitted with `allow_network: false` quite correctly, because it uses no
+    /// network in the sense the flag means. Reading the flag as "no sockets" would
+    /// refuse every local run — not a stricter policy, a broken one.
+    #[test]
+    fn a_run_without_network_permission_still_reaches_this_machine() {
+        for endpoint in [
+            "http://127.0.0.1:8090/v1",
+            "http://localhost:11434/v1",
+            "http://[::1]:8090/v1",
+        ] {
+            enforce_run_network_permission(endpoint, "run-local", false)
+                .unwrap_or_else(|error| panic!("{endpoint} must stay reachable: {error}"));
+        }
+    }
+
+    /// And the permission still permits what it says it permits, so "deny
+    /// everything" cannot pass the test above.
+    #[test]
+    fn a_run_with_network_permission_is_unaffected() {
+        enforce_run_network_permission("https://api.anthropic.com/v1", "run-declared", true)
+            .expect("a run that declared network may use it");
+    }
+
+    /// A frozen endpoint that will not parse is refused rather than allowed. It
+    /// came out of a spec row, so a malformed one means the row is not what this
+    /// build expects, and guessing permissively is the wrong way to be wrong.
+    #[test]
+    fn an_unparseable_frozen_endpoint_is_refused_not_waved_through() {
+        let denial = enforce_run_network_permission("not a url", "run-corrupt", false)
+            .expect_err("a malformed frozen endpoint must not be treated as local");
+        assert!(denial.contains(crate::egress::EgressRule::UrlMalformed.code()));
     }
 }
