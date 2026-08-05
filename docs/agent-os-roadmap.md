@@ -1523,8 +1523,26 @@ rename:
 - **`knowledge_pipeline.rs` blocks all of `198.51/16`** where TEST-NET-2 is only
   `198.51.100/24` — over-blocking, not a hole, but it is a real range a user could
   legitimately need.
-- **`PipelineLimits::validate` never validates `max_redirects`,** so `max_redirects:
-  0` is accepted and silently forbids every redirect.
+- ~~**`PipelineLimits::validate` never validates `max_redirects`,** so `max_redirects:
+  0` is accepted and silently forbids every redirect.~~ **Fixed — and this entry had
+  the danger the wrong way round.** `0` is a coherent setting: refusing every redirect
+  is a choice, and the refusal it produces names the limit, so it is not silent
+  either. Clamping it away would have been the opposite mistake. The real gap was the
+  absence of an *upper* bound — `max_redirects` was the one field of the thirteen
+  `validate` never read, so a value large enough that the downstream
+  `redirect_chain.len() > limits.max_redirects` check can never fire counted as
+  "consistent", which is a bound that has stopped being one. Now a ceiling of
+  `MAX_REDIRECT_CHAIN` = 10, matching `web.rs`, `egress.rs` and reqwest's own
+  `Policy::limited(10)` so no guard in this tree follows a longer chain than any
+  other; the pipeline's own default stays 3. Tested at zero, at the ceiling, and one
+  past it, because a test of only the middle value passes for a gate that rejects
+  everything or nothing.
+
+  Found while fixing it: `knowledge_service.rs`'s OCR-sidecar path builds a
+  `PipelineLimits`, raises `max_file_bytes` and `max_total_bytes` to 256 MiB, and
+  never calls `validate()` at all. The two values it sets are consistent, so nothing
+  is wrong today — but it is a production caller outside the gate, which is worth
+  knowing before that gate is relied on for anything.
 - **`model_sources.rs` caps redirects at 8 while `egress.rs` caps at 10,** and it
   hand-builds its client rather than starting from `egress::hardened()`. *The missing
   read timeout is fixed — see the shipped note below. The cap mismatch stands, and so
@@ -1715,9 +1733,17 @@ named, and a `.timeout(` on a *`RequestBuilder`* correctly does not trip it.
   Also fixed in passing: the three clients read their bodies with `.text()`, which
   reads to end-of-stream and so let the backend size the allocation. They now share
   `fetch_impl`'s streaming read under a `MAX_SEARCH_BODY_BYTES` cap.
-- **`knowledge_pipeline.rs` compares `max_url_chars` against bytes**
-  (`value.len()`), so a URL of multibyte characters is cut earlier than the setting's
-  name promises. The new denial detail says "bytes" rather than papering over it.
+- ~~**`knowledge_pipeline.rs` compares `max_url_chars` against bytes**
+  (`value.len()`).~~ **Fixed, by moving the name to the measurement rather than the
+  measurement to the name.** The field is `max_url_bytes` now. Changing the
+  comparison to `chars().count()` was the other option and it is the wrong one: it
+  would have *widened* this guard, since 2,048 characters of three-byte glyphs is
+  6 KiB, and bytes are what actually fill a buffer and a log line. `serde` keeps
+  `max_url_chars` as an alias, because the struct derives `Deserialize` for a config
+  surface it does not have yet and a rename should not become a breaking change the
+  day it gets one. The test pins a two-byte-per-character path that is under the
+  limit in characters and over it in bytes, so the comparison cannot be quietly
+  "tidied" back later.
 - **`allow_private_networks` is one switch over fourteen distinct rules,** so a
   setting named for private networks also permits multicast, `255.255.255.255`,
   `240/4` and the deprecated `::/96` form. Now that the rules have names, this could
