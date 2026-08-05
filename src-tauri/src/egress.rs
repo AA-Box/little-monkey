@@ -438,9 +438,11 @@ const MAX_REDIRECT_HOPS: usize = 10;
 ///    peer that completes a TCP handshake and then goes silent holds the
 ///    caller's task open indefinitely.
 ///
-/// Prose here says `Client::builder` rather than the bare constructor on
-/// purpose: the ratchet test at the bottom of this file counts that exact
-/// string across the tree, and a doc comment naming it would count as a site.
+/// Prose here used to have to say `Client::builder` rather than the bare
+/// constructor, because the ratchet at the bottom of this file counted that exact
+/// string across the tree and a doc comment naming it registered as a site. Both
+/// ratchets now strip comment-only lines before scanning (see `code_only`), so
+/// that tax is gone and prose may name whatever it is describing.
 ///
 /// # Two things this deliberately does not do
 ///
@@ -1456,6 +1458,188 @@ mod tests {
                 .map_or(source, |(before, _)| before)
         }
 
+        /// Drops comment-only lines, so prose about a spelling is not counted as a
+        /// use of it.
+        ///
+        /// Learnt twice, both times the hard way. `egress.rs`'s own doc comments
+        /// talk around the bare constructor because naming it registered as a site,
+        /// and the `ollama.rs` conversion broke this module's other ratchet for
+        /// exactly that reason. Then the total-deadline scan below counted
+        /// `web.rs`'s `search_client` doc comment — which mentions the builder only
+        /// to say it deliberately does *not* use it — as a builder chain, and
+        /// picked up a `.timeout(` thirty-odd lines further down as if it belonged
+        /// to it.
+        ///
+        /// A ratchet that greps source text greps the prose explaining it, and the
+        /// remedy is here rather than in every future doc comment. Only whole-line
+        /// comments are dropped: a trailing `// note` after real code cannot
+        /// introduce a false match, since the code on that line is kept either way.
+        /// Block comments are not handled — this tree does not use them for API
+        /// docs, and a `/* */` naming a constructor would still register.
+        fn code_only(source: &str) -> String {
+            source
+                .lines()
+                .map(|line| {
+                    if line.trim_start().starts_with("//") {
+                        ""
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        /// A `ClientBuilder` chain's own total-request deadline.
+        ///
+        /// Matched as the builder spelling only. `.timeout(..)` on a
+        /// *`RequestBuilder`* is a different thing and usually correct — a
+        /// per-request deadline on one small buffered call, which `llama.rs` and
+        /// `stacks.rs` use exactly right — and there is no way to tell the two
+        /// apart from the substring alone. So the scan finds `Client::builder()`
+        /// first and only looks inside the chain that follows it.
+        const BUILDER_TOTAL_TIMEOUT: &str = ".timeout(";
+
+        /// How far past a `Client::builder()` to keep looking for its own
+        /// `.timeout(`. Every builder chain in this tree is far shorter than this;
+        /// the window exists so the scan cannot run off into an unrelated
+        /// function and count its per-request deadline.
+        const CHAIN_WINDOW_LINES: usize = 14;
+
+        /// Production `Client::builder()` chains that set a total deadline, and
+        /// why each is allowed to.
+        ///
+        /// Paths are relative to `src/`. A total deadline covers the body, so it is
+        /// only proportionate when the response is small and buffered. Auditing
+        /// every site here turned up **three** distinct ways it goes wrong, not
+        /// one, and the notes below say which applies:
+        ///
+        /// - **(A) A large download.** The truncation this rule is named for. Both
+        ///   sites found were converted rather than listed — `remote/client.rs`'s
+        ///   artifact fetch and `m7_companion`'s ComfyUI image download.
+        /// - **(B) A large upload.** `ClientBuilder::timeout` covers *writing* the
+        ///   request body too, which is easy to miss when only the response is
+        ///   scored. Two sites carry a `MAX_MEDIA_BYTES` (256 MiB) multipart body
+        ///   inside their deadline.
+        /// - **(C) Work that is not network at all.** A `"stream": false` request
+        ///   to a local model sends nothing until generation finishes, so the
+        ///   deadline is a ceiling on *inference* and a slow model looks like a
+        ///   transport failure.
+        ///
+        /// B and C are recorded rather than fixed: both need a product decision
+        /// about what the ceiling should be, not a mechanical conversion, and a
+        /// `read_timeout` alone would let a wedged local model hang forever.
+        /// `docs/agent-os-roadmap.md` carries the detail.
+        const TOTAL_TIMEOUT_ALLOWED: &[(&str, usize)] = &[
+            // 8s for two favicon candidates. `MAX_FAVICON_BYTES` (256 KiB) is
+            // checked *after* `bytes()` has already buffered the body, so the
+            // deadline is doing the byte cap's job — a separate defect from this
+            // rule, recorded in the roadmap rather than fixed here.
+            ("browser_pane.rs", 1),
+            // 15s against `MAX_VERIFY_BYTES` (64 KiB), enforced both by a
+            // `Content-Length` pre-check and a running total. 4.4 KB/s — the one
+            // site where the cap and the deadline are plainly proportionate.
+            ("connectors.rs", 1),
+            // 1.5s on a loopback `/health` probe whose body is never read at all,
+            // only `status()`. Nothing to truncate.
+            ("diagnostics.rs", 1),
+            // 30s for OAuth token/revocation JSON under a 1 MiB cap (35 KB/s), and
+            // 120s on the workflow client — the second is (C): `run_model` posts
+            // `"stream": false`, so that budget is a cap on how long a local model
+            // may think.
+            ("m4_runtime.rs", 2),
+            // 900s for one loopback Ollama review, `"stream": false` under a 4 MiB
+            // cap. (C) again, and the most generous ceiling in the tree — but a
+            // ceiling on inference, not on transfer.
+            ("m5_delivery/reviewer.rs", 1),
+            // (B), both of them: 1800s on the image-edit multipart and 3600s on the
+            // transcription upload, each carrying a body bounded only by
+            // `MAX_MEDIA_BYTES` (256 MiB) — 149 KB/s and 74 KB/s respectively,
+            // *plus* the provider's own render or transcription time.
+            ("m7_companion.rs", 2),
+            // 1.5s for `/api/version` (a tens-of-bytes object) and 10s for
+            // `/api/ps`, both fully buffered. The third is 60s on `/api/embed`,
+            // which is (C): `EMBED_BATCH_SIZE` caps the vector *count* at 32, not
+            // the bytes and not the work, and a spec may declare up to 65,536 dims.
+            ("ollama.rs", 3),
+            // 20s per page against `MAX_RESPONSE_BYTES` (2 MiB) and `PER_PAGE` 30
+            // pull requests: 105 KB/s, and at most `MAX_PAGES` = 3 requests each
+            // with its own deadline.
+            ("runtime_pr_watcher.rs", 1),
+            // `fetch_impl`'s 30s under `MAX_BODY_BYTES` (5 MiB). Kept as a total
+            // deliberately: it is a product ceiling as much as a safety net, since
+            // a `web_fetch` the model is waiting on is useless once it is slower
+            // than this — which is why the fetch path keeps one and the download
+            // paths do not. Two caveats in the roadmap: the chain sets no
+            // `connect_timeout`, so those 30s also cover DNS, TLS and up to
+            // `MAX_REDIRECT_HOPS` hops; and `search_client`'s own 15s total is
+            // **not** counted here, because it starts from
+            // `hardened_with_read_budget` rather than the builder this scan looks
+            // for. That is the documented hole, and it is the one that will let a
+            // future total deadline through.
+            ("web.rs", 1),
+        ];
+
+        #[test]
+        fn no_new_total_request_deadline_can_be_added_unnoticed() {
+            let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+            let mut found: Vec<(String, usize)> = Vec::new();
+
+            for entry in walkdir::WalkDir::new(&src)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                if entry.path().extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(entry.path()).expect("source file reads");
+                let scannable = code_only(production_half(&source));
+                let lines: Vec<&str> = scannable.lines().collect();
+                let count = lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, line)| {
+                        line.contains("Client::builder()")
+                            && lines
+                                .iter()
+                                .skip(index + 1)
+                                .take(CHAIN_WINDOW_LINES)
+                                .take_while(|following| !following.contains("Client::builder()"))
+                                .any(|following| following.contains(BUILDER_TOTAL_TIMEOUT))
+                    })
+                    .count();
+                if count > 0 {
+                    let relative = entry
+                        .path()
+                        .strip_prefix(&src)
+                        .expect("walked path is under src/")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    found.push((relative, count));
+                }
+            }
+            found.sort();
+
+            let expected: Vec<(String, usize)> = TOTAL_TIMEOUT_ALLOWED
+                .iter()
+                .map(|(file, count)| ((*file).to_string(), *count))
+                .collect();
+
+            assert_eq!(
+                found, expected,
+                "the set of `Client::builder()` chains setting their own total \
+                 request deadline changed.\n\
+                 `ClientBuilder::timeout` covers the response body, so on any path \
+                 that streams (`bytes_stream()`, a `chunk()` loop) it truncates a \
+                 legitimate transfer instead of protecting against a stalled one — \
+                 bound silence with `read_timeout` and size with a byte cap \
+                 instead, which is what `egress::hardened()` supplies. If the \
+                 response really is small and fully buffered, add the site to \
+                 `TOTAL_TIMEOUT_ALLOWED` with a comment naming the cap that makes \
+                 the deadline proportionate. If a site disappeared, drop its entry."
+            );
+        }
+
         #[test]
         fn no_new_bare_reqwest_client_can_be_added_unnoticed() {
             let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1469,7 +1653,9 @@ mod tests {
                     continue;
                 }
                 let source = std::fs::read_to_string(entry.path()).expect("source file reads");
-                let count = production_half(&source).matches(BARE_CLIENT).count();
+                let count = code_only(production_half(&source))
+                    .matches(BARE_CLIENT)
+                    .count();
                 if count > 0 {
                     let relative = entry
                         .path()
