@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Generation's own `sd-server` instance, next to `llama.rs`'s chat (8090) and
@@ -584,6 +584,24 @@ pub enum JobProgress {
     Cancelled,
 }
 
+/// Media type for a container format the engine names but does not classify.
+/// `img_gen` states its `output_format` once for the batch and leaves the media
+/// type to the caller; without this the artifact would be stored as an opaque
+/// blob and the gallery could not tell an image from a clip.
+fn media_type_for_format(format: &str) -> String {
+    match format.trim().to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "webm" => "video/webm",
+        "avi" => "video/x-msvideo",
+        "mp4" => "video/mp4",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
 /// Reads one `GET /sdcpp/v1/jobs/{id}` body.
 pub fn decode_job_status(value: &Value) -> Result<JobProgress, String> {
     let status = value
@@ -610,8 +628,14 @@ pub fn decode_job_status(value: &Value) -> Result<JobProgress, String> {
             let result = value
                 .get("result")
                 .ok_or("Completed generation job carried no result")?;
+            // The two modes return different shapes. `img_gen` yields a list of
+            // encoded images with no media type, since the format is stated once
+            // for the batch; `vid_gen` yields one encoded container inline with
+            // its own `mime_type`. Read whichever is present rather than
+            // assuming a mode from the caller.
             let encoded = result
-                .get("b64_json")
+                .pointer("/images/0/b64_json")
+                .or_else(|| result.get("b64_json"))
                 .and_then(Value::as_str)
                 .ok_or("Generation result carried no payload")?;
             // Reject before decoding: base64 is 4/3 the size of its payload, so
@@ -629,8 +653,14 @@ pub fn decode_job_status(value: &Value) -> Result<JobProgress, String> {
                 media_type: result
                     .get("mime_type")
                     .and_then(Value::as_str)
-                    .unwrap_or("application/octet-stream")
-                    .to_string(),
+                    .map(str::to_string)
+                    .or_else(|| {
+                        result
+                            .get("output_format")
+                            .and_then(Value::as_str)
+                            .map(media_type_for_format)
+                    })
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
                 frame_count: result
                     .get("frame_count")
                     .and_then(Value::as_u64)
@@ -643,6 +673,14 @@ pub fn decode_job_status(value: &Value) -> Result<JobProgress, String> {
     }
 }
 
+/// Bytes of engine stderr kept for the failure message.
+///
+/// The engine's diagnostics are the only place a real cause appears — a weight
+/// file quantized for a different loader reports "wrong shape in model
+/// metadata" here and nothing but a non-zero exit code anywhere else. Small
+/// because this is a message a person reads, not a model's context.
+const MAX_STDERR_TAIL: usize = 4_000;
+
 /// The one running `sd-server`, plus which model it was launched against.
 #[derive(Default)]
 pub struct GenerationEngineState {
@@ -653,6 +691,9 @@ pub struct GenerationEngineState {
 struct EngineProcess {
     child: Option<Child>,
     model_id: Option<String>,
+    /// Tail of the engine's stderr, drained by a reader thread so the pipe can
+    /// never fill and block the child.
+    stderr_tail: Option<Arc<Mutex<String>>>,
 }
 
 impl GenerationEngineState {
@@ -670,21 +711,37 @@ impl GenerationEngineState {
             let _ = child.wait();
         }
         state.model_id = None;
+        // Keep the tail: `ensure_ready` stops a failed launch before reporting,
+        // and dropping it here would throw away the only useful diagnosis.
         Ok(())
     }
 
     /// True when the child has already exited; used to fail a readiness wait
     /// fast instead of polling a dead process for five minutes.
+    ///
+    /// The message carries the engine's own stderr tail. Without it every
+    /// launch failure — a weight file quantized for a different loader, a VAE
+    /// that does not match the diffusion model, too little memory — reads as
+    /// the same bare exit code, and none of them are actionable.
     fn child_exited(&self) -> Result<Option<String>, String> {
         let mut state = self.inner.lock().map_err(|error| error.to_string())?;
         let Some(child) = state.child.as_mut() else {
             return Ok(Some("Generation engine is not running".to_string()));
         };
-        match child.try_wait() {
-            Ok(Some(status)) => Ok(Some(format!("Generation engine exited early ({status})"))),
-            Ok(None) => Ok(None),
-            Err(error) => Ok(Some(format!("Generation engine is unreachable: {error}"))),
-        }
+        let outcome = match child.try_wait() {
+            Ok(Some(status)) => format!("Generation engine exited early ({status})"),
+            Ok(None) => return Ok(None),
+            Err(error) => format!("Generation engine is unreachable: {error}"),
+        };
+        let detail = state
+            .stderr_tail
+            .as_ref()
+            .and_then(|tail| tail.lock().ok().map(|value| value.trim().to_string()))
+            .filter(|value| !value.is_empty());
+        Ok(Some(match detail {
+            Some(detail) => format!("{outcome}:\n{detail}"),
+            None => outcome,
+        }))
     }
 
     /// Ensures a healthy `sd-server` is serving `spec`, relaunching if a
@@ -714,17 +771,38 @@ impl GenerationEngineState {
             }
         }
 
-        let child = Command::new(binary)
+        let mut child = Command::new(binary)
             .args(launch_args(spec, model_root, port))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("Failed to spawn the generation engine: {error}"))?;
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        if let Some(stream) = child.stderr.take() {
+            let sink = Arc::clone(&stderr_tail);
+            // A piped stream nobody reads fills its buffer and blocks the
+            // child, so this thread drains it for the process's whole life and
+            // keeps only the tail — a failing loader prints its diagnosis last.
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader};
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    let Ok(mut buffer) = sink.lock() else { return };
+                    buffer.push_str(&line);
+                    buffer.push('\n');
+                    if buffer.len() > MAX_STDERR_TAIL {
+                        let (capped, _) =
+                            crate::output_cap::cap_tail(std::mem::take(&mut buffer), MAX_STDERR_TAIL);
+                        *buffer = capped;
+                    }
+                }
+            });
+        }
         {
             let mut state = self.inner.lock().map_err(|error| error.to_string())?;
             state.child = Some(child);
             state.model_id = Some(spec.id.clone());
+            state.stderr_tail = Some(stderr_tail);
         }
 
         let client = reqwest::Client::new();
@@ -1050,10 +1128,12 @@ mod tests {
             JobProgress::Failed("out of memory".to_string())
         );
 
+        // vid_gen: one container inline, carrying its own media type.
         let completed = decode_job_status(&json!({
             "status": "completed",
             "result": {
                 "mime_type": "video/webm",
+                "output_format": "webm",
                 "fps": 24,
                 "frame_count": 33,
                 "b64_json": STANDARD.encode(b"webm-bytes"),
@@ -1067,8 +1147,31 @@ mod tests {
         assert_eq!(media.media_type, "video/webm");
         assert_eq!(media.frame_count, 33);
 
+        // img_gen: a list of encoded images and no media type at all — the
+        // format is stated once for the batch. Verified against a real
+        // sd-server response, which is how this shape was found.
+        let completed = decode_job_status(&json!({
+            "status": "completed",
+            "result": {
+                "output_format": "png",
+                "images": [{"index": 0, "b64_json": STANDARD.encode(b"png-bytes")}],
+            }
+        }))
+        .unwrap();
+        let JobProgress::Completed(media) = completed else {
+            panic!("expected a completed job");
+        };
+        assert_eq!(media.bytes, b"png-bytes");
+        assert_eq!(media.media_type, "image/png");
+        assert_eq!(media.frame_count, 1);
+
         // A completed job with no payload is a protocol error, not empty media.
         assert!(decode_job_status(&json!({"status": "completed", "result": {}})).is_err());
+        assert!(decode_job_status(&json!({
+            "status": "completed",
+            "result": {"output_format": "png", "images": []}
+        }))
+        .is_err());
         assert!(decode_job_status(&json!({"status": "invented"})).is_err());
     }
 
