@@ -49,6 +49,13 @@ export function componentFileName(component: ModelComponent): string {
   return parts[parts.length - 1] ?? raw;
 }
 
+/** A LoRA in the user's library — added once with a file picker, then chosen
+ *  by name for each run rather than typed as a path every time. */
+export interface LoraAsset {
+  name: string;
+  path: string;
+}
+
 /** One LoRA applied to a generation. Any model takes any number of them. */
 export interface LoraSelection {
   path: string;
@@ -200,6 +207,9 @@ export const studioClient = {
     invoke<void>("generation_download_model", { modelId }),
   cancelDownload: (modelId: string) =>
     invoke<boolean>("generation_cancel_download", { modelId }),
+  loras: () => invoke<LoraAsset[]>("generation_loras"),
+  addLora: (asset: LoraAsset) => invoke<LoraAsset[]>("generation_add_lora", { asset }),
+  removeLora: (path: string) => invoke<LoraAsset[]>("generation_remove_lora", { path }),
   run: (request: GenerationRequest) =>
     invoke<GenerationEntry>("generation_run", { request }),
   cancel: (jobId: string) => invoke<boolean>("generation_cancel", { jobId }),
@@ -216,6 +226,21 @@ export const studioClient = {
       listener(event.payload),
     ),
 };
+
+/** The stored half of a library model, without the fields the backend
+ *  measured. Sending a view straight back to `addModel` would persist those as
+ *  if the user had typed them. */
+export function toSpec(model: GenerationModel): GenerationModelSpec {
+  const {
+    installed: _installed,
+    totalBytes: _totalBytes,
+    missingBytes: _missingBytes,
+    licenseAccepted: _licenseAccepted,
+    fitsInMemory: _fitsInMemory,
+    ...spec
+  } = model;
+  return spec;
+}
 
 /** Each family snaps clip length differently — Wan rounds down onto `4n + 1`,
  *  MiniMax H3 rounds up onto `17k + 5`. The slider has to snap the same way the

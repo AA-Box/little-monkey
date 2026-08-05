@@ -183,6 +183,35 @@ impl ModelComponent {
     }
 }
 
+/// A LoRA in the user's library.
+///
+/// Added once, then picked by name for each run. The engine still takes an
+/// absolute path per generation — this is only so the user names the file with
+/// a file picker instead of typing its path into the generation page every
+/// time. Like a model's own weights, the file is referenced where it lies and
+/// never copied, moved or deleted by the app.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoraAsset {
+    pub name: String,
+    pub path: String,
+}
+
+/// Validates a library LoRA before it is stored.
+///
+/// Existence is deliberately not checked here: this is the Tauri-free core and
+/// the caller that has a real filesystem does that, so a missing file is caught
+/// with a real message at the boundary rather than in a pure function.
+pub fn validate_lora_asset(asset: &LoraAsset) -> Result<(), String> {
+    if asset.name.trim().is_empty() || asset.name.len() > 200 {
+        return Err("A LoRA needs a name".to_string());
+    }
+    if !Path::new(&asset.path).is_absolute() {
+        return Err("A LoRA needs an absolute path".to_string());
+    }
+    Ok(())
+}
+
 /// One LoRA applied to a generation. The engine accepts an unbounded list, so
 /// this is a per-request stack rather than a single slot.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -468,6 +497,17 @@ pub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> 
     }
     args.extend(spec.extra_launch_args.iter().cloned());
     args
+}
+
+/// What a running engine was launched with, port aside.
+///
+/// A warm engine is reused on this rather than on the model id. Editing a
+/// model's files — adding the VAE it was missing, swapping a text encoder —
+/// leaves the id alone, so an id-keyed reuse would keep serving the old file
+/// set until the app restarted, and the fix the user just made would appear to
+/// do nothing.
+fn launch_signature(spec: &GenerationModelSpec, model_root: &Path) -> Vec<String> {
+    launch_args(spec, model_root, 0)
 }
 
 /// The weight file that identifies a loaded model to `sd-server`, which
@@ -1134,6 +1174,9 @@ struct EngineProcess {
     model_id: Option<String>,
     /// The port this instance was launched on. Chosen per launch, never fixed.
     port: Option<u16>,
+    /// The command line it was launched with, port aside. Reuse is keyed on
+    /// this, so an edited model gets a fresh engine.
+    signature: Option<Vec<String>>,
     /// Tail of the engine's stderr, drained by a reader thread so the pipe can
     /// never fill and block the child.
     stderr_tail: Option<Arc<Mutex<String>>>,
@@ -1186,6 +1229,7 @@ impl GenerationEngineState {
             let _ = child.wait();
         }
         state.model_id = None;
+        state.signature = None;
         state.port = None;
         // Keep the tail: `ensure_ready` stops a failed launch before reporting,
         // and dropping it here would throw away the only useful diagnosis.
@@ -1228,9 +1272,15 @@ impl GenerationEngineState {
         spec: &GenerationModelSpec,
         model_root: &Path,
     ) -> Result<String, String> {
-        if self.loaded_model().as_deref() == Some(spec.id.as_str())
-            && self.child_exited()?.is_none()
-        {
+        let signature = launch_signature(spec, model_root);
+        let warm = self
+            .inner
+            .lock()
+            .map_err(|error| error.to_string())?
+            .signature
+            .as_deref()
+            == Some(signature.as_slice());
+        if warm && self.child_exited()?.is_none() {
             if let Some(base_url) = self.base_url() {
                 return Ok(base_url);
             }
@@ -1272,6 +1322,7 @@ impl GenerationEngineState {
             let mut state = self.inner.lock().map_err(|error| error.to_string())?;
             state.child = Some(child);
             state.model_id = Some(spec.id.clone());
+            state.signature = Some(signature);
             state.port = Some(port);
             state.stderr_tail = Some(stderr_tail);
             state.sampling = Some(sampling);
@@ -1618,6 +1669,51 @@ mod tests {
         }
         assert!(args.windows(2).any(|pair| pair == ["--listen-port", "8092"]));
         assert!(args.contains(&"--diffusion-fa".to_string()));
+    }
+
+    /// A warm engine is reused on what it was launched with, not on the model
+    /// id. Adding the VAE a model was missing keeps the same id, and reusing
+    /// the engine across that edit would serve the old file set forever — the
+    /// user's fix would look like it did nothing.
+    #[test]
+    fn adding_a_file_to_a_model_makes_the_running_engine_stale() {
+        let root = Path::new("/models");
+        let mut spec = video_model();
+        spec.components = vec![ModelComponent::huggingface(
+            ComponentSlot::DiffusionModel,
+            "r",
+            "unet.gguf",
+            1,
+        )];
+        let before = launch_signature(&spec, root);
+        spec.components
+            .push(ModelComponent::huggingface(ComponentSlot::Vae, "r", "vae.safetensors", 1));
+        assert_ne!(before, launch_signature(&spec, root));
+        // The port is the one thing that legitimately differs between two
+        // launches of the same file set, so it must not be in the key.
+        assert_eq!(
+            launch_signature(&spec, root),
+            launch_args(&spec, root, 0),
+        );
+    }
+
+    #[test]
+    fn a_library_lora_is_named_and_absolute() {
+        let good = LoraAsset {
+            name: "Detail slider".to_string(),
+            path: "/Users/somebody/loras/detail.safetensors".to_string(),
+        };
+        assert!(validate_lora_asset(&good).is_ok());
+
+        let mut nameless = good.clone();
+        nameless.name = "  ".to_string();
+        assert!(validate_lora_asset(&nameless).is_err());
+
+        // The engine resolves nothing: a relative path is read against whatever
+        // directory it happens to be running in.
+        let mut relative = good.clone();
+        relative.path = "loras/detail.safetensors".to_string();
+        assert!(validate_lora_asset(&relative).is_err());
     }
 
     /// Wan rounds down onto 4n+1; MiniMax H3 rounds *up* onto 17k+5. Using one

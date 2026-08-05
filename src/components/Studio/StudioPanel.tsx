@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { confirm, open } from "@tauri-apps/plugin-dialog";
 import {
   ChevronDown,
   Download,
   Loader2,
+  Plus,
   RectangleHorizontal,
   RectangleVertical,
   Shuffle,
@@ -17,7 +18,9 @@ import {
 import { Button, IconButton, Listbox, StatusPill, Tabs } from "../ui";
 import { AddModelForm } from "./AddModelForm";
 import { LoraStack } from "./LoraStack";
+import { ModelFiles } from "./ModelFiles";
 import { useT } from "../../lib/i18n";
+import { describeWeightFile } from "../../lib/weightFileHints";
 import {
   componentFileName,
   editTaskFor,
@@ -27,6 +30,7 @@ import {
   needsInitImage,
   normalizeDimension,
   normalizeVideoFrames,
+  toSpec,
   ASPECT_PRESETS,
   SAMPLERS,
   SCHEDULERS,
@@ -37,7 +41,9 @@ import {
   type GenerationModel,
   type GenerationTask,
   type HiresSettings,
+  type LoraAsset,
   type LoraSelection,
+  type ModelComponent,
 } from "../../lib/studioClient";
 
 /** The canvas and sampling controls for one run. Seeded from the model but
@@ -206,6 +212,10 @@ export function StudioPanel() {
   const [speakerFile, setSpeakerFile] = useState("");
   const [language, setLanguage] = useState("");
   const [loras, setLoras] = useState<LoraSelection[]>([]);
+  const [loraLibrary, setLoraLibrary] = useState<LoraAsset[]>([]);
+  /** The selected model's files, edited here and saved back to the library.
+   *  Null while it matches what is stored, which is what hides Save. */
+  const [fileDraft, setFileDraft] = useState<ModelComponent[] | null>(null);
   const [settings, setSettings] = useState<RunSettings | null>(null);
   const [adding, setAdding] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -255,14 +265,16 @@ export function StudioPanel() {
 
   const refresh = useCallback(async () => {
     try {
-      const [engine, list, entries] = await Promise.all([
+      const [engine, list, entries, assets] = await Promise.all([
         studioClient.engineStatus(),
         studioClient.models(),
         studioClient.gallery(),
+        studioClient.loras(),
       ]);
       setStatus(engine);
       setModels(list);
       setGallery([...entries].reverse());
+      setLoraLibrary(assets);
       const usable = list.filter((model) =>
         mode === "models" || model.tasks.some((entry) => tasksFor(mode).includes(entry)),
       );
@@ -307,6 +319,7 @@ export function StudioPanel() {
   // offers that model's own starting point rather than the last one's.
   useEffect(() => {
     if (!selected) return;
+    setFileDraft(null);
     setSettings({
       width: selected.defaults.width,
       height: selected.defaults.height,
@@ -363,6 +376,46 @@ export function StudioPanel() {
       setError(errorText(reason));
     } finally {
       setDownloadingId(null);
+    }
+  };
+
+  /** Adds a LoRA to the library from a file picker, named after the file. The
+   *  name is only a label, so a wrong guess costs nothing. */
+  const addLora = async () => {
+    setError(null);
+    const picked = await open({ multiple: false, directory: false });
+    if (typeof picked !== "string") return;
+    try {
+      const basename = picked.split(/[/\\]/).pop() ?? picked;
+      setLoraLibrary(
+        await studioClient.addLora({
+          name: describeWeightFile(picked).name || basename,
+          path: picked,
+        }),
+      );
+    } catch (reason) {
+      setError(errorText(reason));
+    }
+  };
+
+  /**
+   * Saves an edit to the selected model's file list.
+   *
+   * The same entry the library holds — a model whose VAE was missing is the
+   * same model once it is not. Any engine still holding the old file set is
+   * dropped: it was launched from the list that just changed, and the backend
+   * keys a warm engine on exactly that.
+   */
+  const saveFiles = async (components: ModelComponent[]) => {
+    if (!selected) return;
+    setError(null);
+    try {
+      await studioClient.addModel({ ...toSpec(selected), components });
+      if (status?.loadedModelId === selected.id) await studioClient.unloadEngine();
+      setFileDraft(null);
+      await refresh();
+    } catch (reason) {
+      setError(errorText(reason));
     }
   };
 
@@ -683,6 +736,47 @@ export function StudioPanel() {
               </div>
             );
           })}
+        </div>
+
+        {/* LoRAs are a library of their own: they fill no slot, launch no
+            engine, and are picked per run rather than loaded with a model. */}
+        <div className="mt-6">
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="text-xs font-medium text-muted">{t("Studio.lora.library")}</h2>
+            <Button size="sm" variant="secondary" onClick={() => void addLora()}>
+              <Plus size={13} />
+              {t("Studio.lora.addToLibrary")}
+            </Button>
+          </div>
+          {loraLibrary.length === 0 ? (
+            <p className="text-xs text-faint">{t("Studio.lora.libraryEmpty")}</p>
+          ) : (
+            <div className="grid gap-1.5">
+              {loraLibrary.map((asset) => (
+                <div
+                  key={asset.path}
+                  className="flex items-center gap-2 rounded border border-border p-2"
+                >
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-xs">{asset.name}</span>
+                    <span className="block truncate text-[11px] text-faint">{asset.path}</span>
+                  </span>
+                  <IconButton
+                    size="sm"
+                    aria-label={t("Studio.lora.forget")}
+                    onClick={() =>
+                      void studioClient
+                        .removeLora(asset.path)
+                        .then(setLoraLibrary)
+                        .catch((reason) => setError(errorText(reason)))
+                    }
+                  >
+                    <Trash2 size={12} />
+                  </IconButton>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </section>
       ) : (
@@ -1081,6 +1175,7 @@ export function StudioPanel() {
               <div className="mt-3">
                 <LoraStack
                   loras={loras}
+                  library={loraLibrary}
                   onChange={setLoras}
                   showHighNoise={selected.components.some(
                     (component) => component.slot === "high_noise_diffusion_model",
@@ -1089,6 +1184,34 @@ export function StudioPanel() {
               </div>
             </details>
           )}
+
+          {/* The files the engine loads. Here as well as in the models tab
+              because "this one is missing its VAE" is something you find out
+              while generating, and being sent to another tab to fix it is the
+              whole of the complaint. */}
+          <details className="rounded border border-border p-3">
+            <summary className="cursor-pointer text-xs font-medium">
+              {t("Studio.files")}
+            </summary>
+            <div className="mt-3 grid gap-2">
+              <p className="text-[11px] text-faint">{t("Studio.filesHint")}</p>
+              <ModelFiles
+                allowDownload={false}
+                components={fileDraft ?? selected.components}
+                onChange={setFileDraft}
+              />
+              {fileDraft && (
+                <div className="flex items-center gap-1.5">
+                  <Button size="sm" variant="primary" onClick={() => void saveFiles(fileDraft)}>
+                    {t("Studio.filesSave")}
+                  </Button>
+                  <Button size="sm" variant="secondary" onClick={() => setFileDraft(null)}>
+                    {t("Studio.add.cancel")}
+                  </Button>
+                </div>
+              )}
+            </div>
+          </details>
 
         </aside>
         )}

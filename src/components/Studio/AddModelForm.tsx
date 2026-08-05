@@ -1,16 +1,13 @@
 import { useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
-import { FolderOpen, Plus, Trash2 } from "lucide-react";
 
-import { Button, IconButton } from "../ui";
+import { Button } from "../ui";
+import { ModelFiles } from "./ModelFiles";
 import { useT } from "../../lib/i18n";
 import { describeWeightFile } from "../../lib/weightFileHints";
 import {
   ALL_TASKS,
-  COMPONENT_SLOTS,
   emptyModelSpec,
   studioClient,
-  type ComponentSlot,
   type GenerationModelSpec,
   type GenerationTask,
   type ModelComponent,
@@ -25,22 +22,22 @@ function slugify(value: string): string {
     .slice(0, 128);
 }
 
-function blankComponent(): ModelComponent {
-  return {
-    slot: "checkpoint",
-    source: { kind: "local_file", path: "" },
-    sizeBytes: 0,
-  };
+/** The path a component reads from, whichever source it uses. */
+function componentPath(component: ModelComponent | undefined): string {
+  const source = component?.source;
+  if (source?.kind === "local_file") return source.path;
+  if (source?.kind === "hugging_face") return source.file;
+  return "";
 }
 
 /**
  * Adds a model to the user's library.
  *
- * Every slot is prefilled from the file's own name and every one stays an open
- * select. The distinction matters: a wrong slot does not fail here, it fails
- * deep inside the engine as a tensor-shape error that reads like a corrupt
- * download — so the form suggests only where the name names a component, and
- * leaves the row alone otherwise rather than inventing an answer.
+ * The first file named says most of what the entry needs: its name, its
+ * architecture family, and — through that family — what it can make and how it
+ * counts frames. All of it lands in a visible control the user can overwrite,
+ * because these guesses are cheap to correct on screen and expensive to
+ * discover wrong several minutes into a load.
  */
 export function AddModelForm({ onSaved }: { onSaved: () => void }) {
   const { t } = useT();
@@ -51,45 +48,27 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
   const patch = (next: Partial<GenerationModelSpec>) =>
     setSpec((current) => ({ ...current, ...next }));
 
-  const patchComponent = (index: number, next: Partial<ModelComponent>) =>
+  /** Fills every blank the first file can speak for. Only blanks: once the
+   *  user has typed a name or picked a task, that is the answer. */
+  const patchComponents = (components: ModelComponent[]) =>
     setSpec((current) => {
-      const components = current.components.map((component, at) =>
-        at === index ? { ...component, ...next } : component,
-      );
-      // The first file named is what the model gets called. Both fields stay
-      // editable — this fills a blank, it never overwrites a choice.
-      const source = components[index]?.source;
-      const path =
-        source?.kind === "local_file"
-          ? source.path
-          : source?.kind === "hugging_face"
-            ? source.file
-            : "";
+      const path = componentPath(components[0]);
       if (!path.trim()) return { ...current, components };
       const hint = describeWeightFile(path);
-      // A named component wins over whatever the row defaulted to; a file that
-      // names nothing leaves the row alone.
-      if (hint.slot && next.slot === undefined) {
-        components[index] = { ...components[index], slot: hint.slot };
-      }
-      // Naming only ever fills a blank, and only from the first file.
-      if (index !== 0 || (current.name && current.family)) {
-        return { ...current, components };
-      }
+      // Frame rate and frame grid ride along with the tasks rather than being
+      // reapplied on every edit, so a user who tuned them keeps them.
+      const profile = current.tasks.length === 0 ? hint.profile : null;
       return {
         ...current,
         components,
         name: current.name || hint.name,
         family: current.family || hint.family,
+        tasks: profile?.tasks ?? current.tasks,
+        defaults: profile
+          ? { ...current.defaults, fps: profile.fps, frameGrid: profile.frameGrid }
+          : current.defaults,
       };
     });
-
-  /** The native picker, so a path is chosen rather than typed. */
-  const browse = async (index: number) => {
-    const picked = await open({ multiple: false, directory: false });
-    if (typeof picked !== "string") return;
-    patchComponent(index, { source: { kind: "local_file", path: picked } });
-  };
 
   const toggleTask = (task: GenerationTask) =>
     setSpec((current) => ({
@@ -168,114 +147,7 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
 
       <div className="grid gap-2">
         <span className="text-[11px] text-muted">{t("Studio.add.files")}</span>
-        {spec.components.map((component, index) => (
-          <div key={index} className="grid gap-1.5 rounded bg-background/60 p-2">
-            <div className="flex items-center gap-1.5">
-              <select
-                className="rounded border border-border bg-background px-1.5 py-1 font-mono text-[11px] text-foreground"
-                value={component.slot}
-                onChange={(event) =>
-                  patchComponent(index, { slot: event.target.value as ComponentSlot })
-                }
-              >
-                {COMPONENT_SLOTS.map((entry) => (
-                  <option key={entry.slot} value={entry.slot}>
-                    {entry.flag}
-                  </option>
-                ))}
-              </select>
-              <select
-                className="rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground"
-                value={component.source.kind}
-                onChange={(event) =>
-                  patchComponent(index, {
-                    source:
-                      event.target.value === "local_file"
-                        ? { kind: "local_file", path: "" }
-                        : { kind: "hugging_face", repo: "", file: "" },
-                  })
-                }
-              >
-                <option value="local_file">{t("Studio.add.onDisk")}</option>
-                <option value="hugging_face">{t("Studio.add.download")}</option>
-              </select>
-              <IconButton
-                size="sm"
-                aria-label={t("Studio.add.removeFile")}
-                onClick={() =>
-                  patch({
-                    components: spec.components.filter((_, at) => at !== index),
-                  })
-                }
-              >
-                <Trash2 size={12} />
-              </IconButton>
-            </div>
-
-            {component.source.kind === "local_file" ? (
-              <div className="flex items-center gap-1.5">
-                <input
-                  className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
-                  value={component.source.path}
-                  placeholder="/Users/you/models/wan2.2_ti2v_5B_fp16.safetensors"
-                  onChange={(event) =>
-                    patchComponent(index, {
-                      source: { kind: "local_file", path: event.target.value },
-                    })
-                  }
-                />
-                <IconButton
-                  size="sm"
-                  variant="secondary"
-                  aria-label={t("Studio.add.browse")}
-                  title={t("Studio.add.browse")}
-                  onClick={() => void browse(index)}
-                >
-                  <FolderOpen size={12} />
-                </IconButton>
-              </div>
-            ) : (
-              <div className="grid gap-1.5 sm:grid-cols-2">
-                <input
-                  className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
-                  value={component.source.repo}
-                  placeholder="Comfy-Org/Wan_2.2_ComfyUI_Repackaged"
-                  onChange={(event) =>
-                    patchComponent(index, {
-                      source: {
-                        kind: "hugging_face",
-                        repo: event.target.value,
-                        file: component.source.kind === "hugging_face" ? component.source.file : "",
-                      },
-                    })
-                  }
-                />
-                <input
-                  className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
-                  value={component.source.file}
-                  placeholder="split_files/vae/wan2.2_vae.safetensors"
-                  onChange={(event) =>
-                    patchComponent(index, {
-                      source: {
-                        kind: "hugging_face",
-                        repo: component.source.kind === "hugging_face" ? component.source.repo : "",
-                        file: event.target.value,
-                      },
-                    })
-                  }
-                />
-              </div>
-            )}
-          </div>
-        ))}
-        <Button
-          size="sm"
-          variant="secondary"
-          onClick={() => patch({ components: [...spec.components, blankComponent()] })}
-        >
-          <Plus size={13} />
-          {t("Studio.add.addFile")}
-        </Button>
+        <ModelFiles components={spec.components} onChange={patchComponents} />
       </div>
 
       {/* Canvas size, steps, guidance and sampler are per-generation and live

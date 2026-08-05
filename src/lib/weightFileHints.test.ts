@@ -56,6 +56,38 @@ describe("describeWeightFile", () => {
       name: "something custom",
       family: "",
       slot: null,
+      profile: null,
     });
+  });
+
+  /** Tasks are the opposite trade to slots: they are on screen as buttons the
+   *  user can toggle before saving, so guessing is free and *not* guessing
+   *  means asking someone to tell the app that Wan makes video. */
+  it("reads what a file is for, so the tasks are filled in", () => {
+    const wan = describeWeightFile("split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors");
+    expect(wan.profile?.tasks).toEqual(["text_to_video", "image_to_video"]);
+    expect(wan.profile?.frameGrid).toBe("down_to4n_plus1");
+
+    // H3 is the family that rounds clip length the other way, and getting that
+    // wrong misreports the duration of every clip it makes.
+    expect(describeWeightFile("minimax_h3_ref2va-Q4_K_M.gguf").profile?.frameGrid).toBe(
+      "up_to17k_plus5",
+    );
+
+    expect(describeWeightFile("sd-turbo.safetensors").profile?.tasks).toEqual([
+      "text_to_image",
+      "image_to_image",
+    ]);
+
+    // Speech is a purpose, not an architecture: this file's family is honestly
+    // Qwen, and Qwen otherwise makes images.
+    const speech = describeWeightFile("Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf");
+    expect(speech.family).toBe("Qwen");
+    expect(speech.profile?.tasks).toEqual(["text_to_speech"]);
+    expect(describeWeightFile("mmproj-Qwen3-TTS-1.7B-Q8_0.gguf").profile?.tasks).toEqual([
+      "text_to_speech",
+    ]);
+
+    expect(describeWeightFile("/models/something_custom.safetensors").profile).toBeNull();
   });
 });

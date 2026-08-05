@@ -1,4 +1,4 @@
-import type { ComponentSlot } from "./studioClient";
+import type { ComponentSlot, FrameGrid, GenerationTask } from "./studioClient";
 
 /** What a weight file's own name suggests about it. Every field is a starting
  *  point the add form prefills and the user can overwrite. */
@@ -6,6 +6,8 @@ export interface WeightFileHint {
   name: string;
   family: string;
   slot: ComponentSlot | null;
+  /** What this family is for. Null when the name named nothing known. */
+  profile: FamilyProfile | null;
 }
 
 /** Architecture families, matched against a weight file's own name. */
@@ -47,6 +49,49 @@ const SLOT_HINTS: [RegExp, ComponentSlot][] = [
   [/unet|diffusion[._\-/]?model|transformer/i, "diffusion_model"],
 ];
 
+/** What a family is for, so the add form does not ask the user to tell it that
+ *  Wan makes video. */
+export interface FamilyProfile {
+  tasks: GenerationTask[];
+  frameGrid: FrameGrid;
+  fps: number;
+}
+
+const IMAGE: GenerationTask[] = ["text_to_image", "image_to_image"];
+const VIDEO: GenerationTask[] = ["text_to_video", "image_to_video"];
+
+/**
+ * Per-family starting points, keyed by the family [`describeWeightFile`]
+ * already reads out of the file name.
+ *
+ * Unlike a slot, a wrong guess here costs nothing: the tasks are on screen as
+ * buttons the user can toggle before saving. So this fills them in, where the
+ * slot logic deliberately stays quiet.
+ */
+const FAMILY_PROFILES: Record<string, FamilyProfile> = {
+  Wan: { tasks: VIDEO, frameGrid: "down_to4n_plus1", fps: 24 },
+  // H3 is the one family that rounds clip length the other way.
+  MiniMax: { tasks: VIDEO, frameGrid: "up_to17k_plus5", fps: 25 },
+  Hunyuan: { tasks: VIDEO, frameGrid: "down_to4n_plus1", fps: 24 },
+  LTX: { tasks: VIDEO, frameGrid: "down_to4n_plus1", fps: 24 },
+  FLUX: { tasks: IMAGE, frameGrid: "down_to4n_plus1", fps: 24 },
+  Qwen: { tasks: IMAGE, frameGrid: "down_to4n_plus1", fps: 24 },
+  SDXL: { tasks: IMAGE, frameGrid: "down_to4n_plus1", fps: 24 },
+  SD: { tasks: IMAGE, frameGrid: "down_to4n_plus1", fps: 24 },
+  TTS: { tasks: ["text_to_speech"], frameGrid: "down_to4n_plus1", fps: 24 },
+};
+
+/** Speech is a purpose, not an architecture, so it is read off the file name
+ *  rather than the family: a Qwen3-TTS backbone is honestly family `Qwen`, and
+ *  Qwen otherwise makes images. */
+const SPEECH_HINT = /outetts|wavtokenizer|[._-]tts|vocoder|mmproj/i;
+
+/** What a file is for, or null when its name says nothing we recognize. */
+function profileFor(path: string, family: string): FamilyProfile | null {
+  if (SPEECH_HINT.test(path)) return FAMILY_PROFILES.TTS;
+  return FAMILY_PROFILES[family] ?? null;
+}
+
 /**
  * Reads a name, a family and a slot out of a weight file's own file name.
  *
@@ -64,9 +109,11 @@ export function describeWeightFile(raw: string): WeightFileHint {
   // these out as `split_files/diffusion_models/…`, `text_encoders/…`, `vae/…`,
   // so the directory names the component even when the file does not.
   const path = raw.replace(/\\/g, "/");
+  const family = FAMILY_HINTS.find(([pattern]) => pattern.test(base))?.[1] ?? "";
   return {
     name: base.replace(/[._-]+/g, " ").replace(/\s+/g, " ").trim(),
-    family: FAMILY_HINTS.find(([pattern]) => pattern.test(base))?.[1] ?? "",
+    family,
     slot: SLOT_HINTS.find(([pattern]) => pattern.test(path))?.[1] ?? null,
+    profile: profileFor(path, family),
   };
 }

@@ -39,6 +39,8 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.title": "Add a model",
   "Studio.add.slotHint":
     "Slots are filled in from each file's name where it says one — check them. A wrong slot fails inside the engine as a tensor-shape error, not here.",
+  "Studio.add.slot": "What this file is",
+  "Studio.add.source": "Where it comes from",
   "Studio.add.name": "Name",
   "Studio.add.family": "Family",
   "Studio.add.tasks": "What it can do",
@@ -59,6 +61,17 @@ export const studioLocale: Record<string, string> = {
   "Studio.lora.remove": "Remove this LoRA",
   "Studio.lora.strength": "Strength",
   "Studio.lora.highNoise": "high noise",
+  "Studio.lora.library": "LoRA library",
+  "Studio.lora.addToLibrary": "Add a LoRA",
+  "Studio.lora.libraryEmpty":
+    "No LoRAs yet. Add the files you have and they become pickable in every generation.",
+  "Studio.lora.empty": "No LoRAs in your library. Add one in the Models tab.",
+  "Studio.lora.pick": "Which LoRA",
+  "Studio.lora.forget": "Remove from library",
+  "Studio.files": "Files",
+  "Studio.filesHint":
+    "What the engine loads for this model: the checkpoint or diffusion model, plus any CLIP, text encoder or VAE it needs beside it.",
+  "Studio.filesSave": "Save files",
   "Studio.installed": "Installed",
   "Studio.download": "Download {{size}}",
   "Studio.cancelDownload": "Cancel download",

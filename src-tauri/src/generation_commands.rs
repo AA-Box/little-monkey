@@ -30,6 +30,9 @@ const GALLERY_FILE: &str = "studio-gallery.json";
 /// the whole registry, and it starts empty.
 const MODELS_FILE: &str = "studio-models.json";
 const ACCEPTED_LICENSES_FILE: &str = "studio-accepted-licenses.json";
+/// The user's LoRA library. Separate from the model registry because a LoRA is
+/// not a model: it fills no slot, launches no engine, and is chosen per run.
+const LORAS_FILE: &str = "studio-loras.json";
 /// Keeps a corrupt or hand-edited gallery from being read without bound.
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 /// A long clip on a constrained machine can legitimately sample for a long
@@ -393,6 +396,48 @@ pub async fn generation_download_model(
         .map_err(|e| e.to_string())?
         .remove(&spec.id);
     result
+}
+
+/// The user's LoRA library.
+#[tauri::command]
+pub fn generation_loras(app: AppHandle) -> Result<Vec<generation::LoraAsset>, String> {
+    read_state(&app, LORAS_FILE)
+}
+
+/// Adds a LoRA to the library, keyed on its path so re-adding the same file
+/// renames it rather than listing it twice.
+#[tauri::command]
+pub fn generation_add_lora(
+    app: AppHandle,
+    asset: generation::LoraAsset,
+) -> Result<Vec<generation::LoraAsset>, String> {
+    generation::validate_lora_asset(&asset)?;
+    // Caught here rather than in the validator, which has no filesystem. A
+    // LoRA that is not there fails several minutes into a load otherwise, with
+    // an engine message that does not name it.
+    if !PathBuf::from(&asset.path).is_file() {
+        return Err(format!("{} is not a file on this machine", asset.path));
+    }
+    let mut loras: Vec<generation::LoraAsset> = read_state(&app, LORAS_FILE)?;
+    match loras.iter_mut().find(|entry| entry.path == asset.path) {
+        Some(existing) => *existing = asset,
+        None => loras.push(asset),
+    }
+    loras.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    write_state(&app, LORAS_FILE, &loras)?;
+    Ok(loras)
+}
+
+/// Forgets a LoRA. The file itself is the user's and stays where it is.
+#[tauri::command]
+pub fn generation_remove_lora(
+    app: AppHandle,
+    path: String,
+) -> Result<Vec<generation::LoraAsset>, String> {
+    let mut loras: Vec<generation::LoraAsset> = read_state(&app, LORAS_FILE)?;
+    loras.retain(|entry| entry.path != path);
+    write_state(&app, LORAS_FILE, &loras)?;
+    Ok(loras)
 }
 
 #[tauri::command]
