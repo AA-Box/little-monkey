@@ -41,6 +41,7 @@ pub mod runtime_adapter;
 // Model-agnostic image and video generation over the managed
 // stable-diffusion.cpp runtime. Tauri-free so the CLI can share it.
 pub mod generation;
+mod generation_commands;
 pub mod managed_runtime;
 // Knowledge Stacks 2.0 contracts and generation-based hybrid index. Kept
 // Tauri-free so desktop, daemon, CLI workflows, and connector packages share
@@ -333,6 +334,10 @@ use tauri::Manager;
 /// `LlamaState::default()` for both) can't express. See the manual `impl
 /// Default for AppState` below.
 pub struct AppState {
+    /// The one `sd-server` behind Studio's image and video generation. Its
+    /// weight set is bound at launch, so switching models restarts it; see
+    /// `generation::GenerationEngineState`.
+    pub generation_engine: generation::GenerationEngineState,
     pub llama: std::sync::Mutex<llama::LlamaState>,
     /// The second, embeddings-only managed `llama-server` instance (port
     /// 8091, started with `--embeddings --pooling mean`) used by
@@ -626,6 +631,7 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         AppState {
+            generation_engine: Default::default(),
             llama: Default::default(),
             embed_llama: std::sync::Mutex::new(llama::LlamaState::for_embeddings()),
             ollama: Default::default(),
@@ -1402,6 +1408,16 @@ pub fn run() {
             m7_companion::m7_transcribe_audio,
             m7_companion::m7_tts_speak,
             m7_companion::m7_job_cancel,
+            generation_commands::generation_engine_status,
+            generation_commands::generation_models,
+            generation_commands::generation_accept_license,
+            generation_commands::generation_download_model,
+            generation_commands::generation_cancel_download,
+            generation_commands::generation_run,
+            generation_commands::generation_cancel,
+            generation_commands::generation_gallery,
+            generation_commands::generation_media_data_url,
+            generation_commands::generation_unload_engine,
             m7_companion::m7_image_generate,
             m7_companion::m7_image_gallery,
             m7_companion::m7_image_data_url,
