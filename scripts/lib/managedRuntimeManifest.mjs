@@ -1,15 +1,22 @@
-// Pinned, official llama.cpp CPU runtime archives used by Little Monkey's
-// release builds. Every archive digest comes from the matching GitHub release
-// asset and is verified before extraction by stage-managed-runtime.mjs.
+// Pinned, official native runtime archives used by Little Monkey's release
+// builds. Every archive digest comes from the matching GitHub release asset and
+// is verified before extraction by stage-managed-runtime.mjs.
 //
-// Keep this map target-triple keyed: release.yml and the local staging script
-// already speak Rust triples, so there is one unambiguous source of truth for
-// both packaging and tests.
+// Two runtimes ship on these rails:
+//   llama — llama.cpp `llama-server`, chat and embedding inference
+//   sd    — stable-diffusion.cpp `sd-server`, image and video generation
+//
+// Keep every asset map target-triple keyed: release.yml, the staging script and
+// the Rust side already speak Rust triples, so there is one unambiguous source
+// of truth for packaging and tests. The `id` and `version` of each runtime must
+// stay in step with `ManagedRuntimeSpec` in src-tauri/src/managed_runtime.rs and
+// with the staged directory names in src-tauri/build.rs.
 
 export const MANAGED_LLAMA_VERSION = "b9637";
+export const MANAGED_SD_VERSION = "master-812-ea7f0c8";
 
-const releaseBase =
-  `https://github.com/ggml-org/llama.cpp/releases/download/${MANAGED_LLAMA_VERSION}`;
+const llamaBase = `https://github.com/ggml-org/llama.cpp/releases/download/${MANAGED_LLAMA_VERSION}`;
+const sdBase = `https://github.com/leejet/stable-diffusion.cpp/releases/download/${MANAGED_SD_VERSION}`;
 
 export const MANAGED_LLAMA_ASSETS = Object.freeze({
   "aarch64-apple-darwin": {
@@ -38,6 +45,69 @@ export const MANAGED_LLAMA_ASSETS = Object.freeze({
   },
 });
 
+// Upstream publishes GPU-accelerated builds only for these three hosts: Metal
+// on Apple silicon, Vulkan on x86_64 Linux and Windows. Vulkan is deliberate —
+// it covers NVIDIA, AMD and Intel from one archive, where CUDA would need a
+// separate 362 MB build plus a CUDA runtime. Other hosts get no managed sd
+// runtime and Studio stays unavailable there.
+export const MANAGED_SD_ASSETS = Object.freeze({
+  "aarch64-apple-darwin": {
+    archive: "sd-master-ea7f0c8-bin-Darwin-macOS-26.5.2-arm64.zip",
+    sha256: "a9ba3ccd1e9e984691d10b143f4c0c801b96351e486272a2a60e930de49cca85",
+  },
+  "x86_64-unknown-linux-gnu": {
+    archive: "sd-master-ea7f0c8-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip",
+    sha256: "a98d446ead81b956a97fa5e04d5aea8acdba0a36e5547c1de88a0a1c0fa7cfd8",
+  },
+  "x86_64-pc-windows-msvc": {
+    archive: "sd-master-ea7f0c8-bin-win-vulkan-x64.zip",
+    sha256: "ac785dc435faf616fd9ff1eb864beb6927dcc8f9a7f1875bbfdeab0a3a86b089",
+  },
+});
+
 for (const asset of Object.values(MANAGED_LLAMA_ASSETS)) {
-  asset.url = `${releaseBase}/${asset.archive}`;
+  asset.url = `${llamaBase}/${asset.archive}`;
+}
+for (const asset of Object.values(MANAGED_SD_ASSETS)) {
+  asset.url = `${sdBase}/${asset.archive}`;
+}
+
+export const MANAGED_RUNTIMES = Object.freeze({
+  llama: Object.freeze({
+    id: "llama",
+    manifestRuntime: "llama.cpp",
+    version: MANAGED_LLAMA_VERSION,
+    serverBaseName: "llama-server",
+    assets: MANAGED_LLAMA_ASSETS,
+  }),
+  sd: Object.freeze({
+    id: "sd",
+    manifestRuntime: "stable-diffusion.cpp",
+    version: MANAGED_SD_VERSION,
+    serverBaseName: "sd-server",
+    assets: MANAGED_SD_ASSETS,
+  }),
+});
+
+/** Resolves a runtime by id, failing loudly on an unknown one. */
+export function managedRuntime(id) {
+  const runtime = MANAGED_RUNTIMES[id];
+  if (!runtime) {
+    throw new Error(
+      `Unknown managed runtime "${id}". Known runtimes: ${Object.keys(MANAGED_RUNTIMES).join(", ")}`,
+    );
+  }
+  return runtime;
+}
+
+/** The staged Tauri resource directory name for a runtime. */
+export function stagedRuntimeDirectory(runtime) {
+  return `${runtime.id}-${runtime.version}`;
+}
+
+/** The launchable binary's file name inside a runtime tree, per target. */
+export function serverFileName(runtime, target) {
+  return target.includes("windows")
+    ? `${runtime.serverBaseName}.exe`
+    : runtime.serverBaseName;
 }
