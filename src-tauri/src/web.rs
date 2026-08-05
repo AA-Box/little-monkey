@@ -449,6 +449,44 @@ pub fn validate_fetch_url(url: &Url, allow_local_network: bool) -> Result<(), Eg
 /// same address class stay distinguishable in the sink.
 const GUARD: &str = "web.fetch";
 
+/// Whether a hostname's resolved answers leave anything this app may connect to.
+///
+/// Its own function purely so the quantifier is testable without the system resolver.
+/// The case the change to it is *about* — one public answer and one private one — cannot
+/// be produced hermetically through `to_socket_addrs`, and a rule that only the
+/// deployment environment can exercise is a rule with no test.
+fn classify_resolved_answers(
+    domain: &str,
+    answers: impl Iterator<Item = IpAddr>,
+) -> Result<(), EgressDenial> {
+    let mut refused = None;
+    let mut survivors = 0usize;
+    for ip in answers {
+        match blocked_reason_ip(&ip) {
+            // The address is named in the detail, not just the class: a hostname with
+            // several answers used to be refused by a message that said nothing about
+            // which answer tripped it.
+            Some(rule) => {
+                refused = Some(EgressDenial::about(
+                    rule,
+                    format!("{domain} resolves to {ip}"),
+                ));
+            }
+            None => survivors += 1,
+        }
+    }
+    if survivors == 0 {
+        // `DnsNoAddresses` when the lookup came back empty, which no rule refused;
+        // otherwise the rule that accounted for the last answer. The same two-case split
+        // the resolver makes, for the same reason: "nothing answered" and "everything
+        // that answered is refused" are different facts.
+        return Err(refused.unwrap_or_else(|| {
+            EgressDenial::about(EgressRule::DnsNoAddresses, domain.to_string())
+        }));
+    }
+    Ok(())
+}
+
 /// [`validate_fetch_url`]'s decision, without the recording.
 ///
 /// Split so the guard's logic stays a pure function of its arguments: the tests
@@ -494,22 +532,35 @@ fn classify_fetch_url(url: &Url, allow_local_network: bool) -> Result<(), Egress
             }
         }
         url::Host::Domain(domain) => {
-            // Resolve and check every address the hostname maps to. The port
-            // passed to `ToSocketAddrs` is irrelevant to the lookup itself.
+            // Resolve and check the addresses the hostname maps to. The port passed to
+            // `ToSocketAddrs` is irrelevant to the lookup itself.
+            //
+            // # Why this refuses only when *no* answer survives
+            //
+            // This used to refuse if **any** answer was blocked, which disagreed with
+            // [`SsrfGuardedResolver`] — the thing that actually enforces — and the
+            // disagreement was this gate over-blocking rather than the resolver
+            // under-blocking. The resolver prunes blocked answers and hands `reqwest`
+            // only the survivors, and since those are exactly what `reqwest` connects
+            // to, a pruned private answer is never dialled. So a legitimate host that
+            // answers with one public and one private address — ordinary split-horizon
+            // or dual-stack DNS — connects safely through the public one, and was being
+            // refused outright here for it.
+            //
+            // Matching the resolver's quantifier keeps this layer without keeping the
+            // false refusals. It stays a layer rather than being deleted because it is
+            // the only guard for a URL that never reaches a resolver at all: the
+            // literal-IP arms above, and any future caller that validates without
+            // installing the resolver. Deleting it would make that mistake silent.
+            //
+            // Note this pre-check's lookup is a *different* lookup from the resolver's,
+            // which is why it cannot be the enforcement point — see
+            // [`SsrfGuardedResolver`] for the rebinding argument. It is a fast, and now
+            // consistent, pre-filter.
             let addrs = (domain, 0u16)
                 .to_socket_addrs()
                 .map_err(|e| EgressDenial::about(EgressRule::DnsResolutionFailed, e.to_string()))?;
-            for addr in addrs {
-                // The address is named in the detail, not just the class: a
-                // hostname with several answers used to be refused by a message
-                // that said nothing about which answer tripped it.
-                if let Some(rule) = blocked_reason_ip(&addr.ip()) {
-                    return Err(EgressDenial::about(
-                        rule,
-                        format!("{domain} resolves to {}", addr.ip()),
-                    ));
-                }
-            }
+            classify_resolved_answers(domain, addrs.map(|addr| addr.ip()))?;
         }
     }
 
@@ -1595,6 +1646,64 @@ mod tests {
     ///
     /// The public row is the load-bearing counter-test: refusing the whole prefix would
     /// satisfy every other row and break a v6-only network reaching a v4-only host.
+    /// The two DNS rules in this file used to disagree on the quantifier, and the
+    /// disagreement was this pre-check over-blocking rather than the resolver
+    /// under-blocking.
+    ///
+    /// `SsrfGuardedResolver` prunes blocked answers and hands `reqwest` only the
+    /// survivors — which are exactly what it connects to, so a pruned private answer is
+    /// never dialled. This gate refused the whole request if *any* answer was blocked,
+    /// so an ordinary split-horizon or dual-stack host answering with one public and one
+    /// private address was refused here while the resolver would have connected safely.
+    ///
+    /// Tested through the extracted quantifier rather than the system resolver: the
+    /// mixed case is the entire point and no hermetic hostname produces it.
+    #[test]
+    fn a_hostname_is_refused_only_when_no_answer_survives() {
+        use std::str::FromStr;
+        let ip = |text: &str| IpAddr::from_str(text).expect("parses");
+
+        // The case that was wrongly refused. Order both ways, because a loop that
+        // returns early on the first blocked answer passes one order and fails the
+        // other — which is precisely the bug.
+        for answers in [
+            vec![ip("93.184.216.34"), ip("10.0.0.1")],
+            vec![ip("10.0.0.1"), ip("93.184.216.34")],
+        ] {
+            assert!(
+                classify_resolved_answers("dual.example", answers.into_iter()).is_ok(),
+                "a host with one reachable answer must not be refused for the others"
+            );
+        }
+
+        // The counter-test, without which "allow everything" passes: every answer
+        // blocked is still refused, and the refusal names a rule rather than a blank.
+        let denial = classify_resolved_answers(
+            "private.example",
+            vec![ip("10.0.0.1"), ip("127.0.0.1")].into_iter(),
+        )
+        .expect_err("a host whose every answer is refused must be refused");
+        assert!(
+            matches!(denial.rule(), EgressRule::PrivateV4 | EgressRule::Loopback),
+            "the refusal must name one of the rules that fired: {denial}"
+        );
+        assert!(
+            denial
+                .detail()
+                .is_some_and(|detail| detail.contains("private.example resolves to")),
+            "the refusal must name the answer it refused: {denial}"
+        );
+
+        // An empty answer list is a different fact from "everything was refused", and
+        // the resolver draws the same distinction.
+        assert_eq!(
+            classify_resolved_answers("empty.example", std::iter::empty())
+                .expect_err("no answers is not a pass")
+                .rule(),
+            EgressRule::DnsNoAddresses
+        );
+    }
+
     #[test]
     fn nat64_reaches_this_guards_own_ipv4_rule() {
         use std::str::FromStr;
