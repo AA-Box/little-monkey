@@ -212,6 +212,12 @@ egress_rules! {
     /// compare against. Refused rather than assumed, because "follow it anyway"
     /// is the wrong direction to fail in for a client holding an API key.
     RedirectOriginUnknown => "egress.redirect-origin-unknown", "the redirect has no recorded origin to compare against";
+    /// The run's own frozen `permission_policy.allow_network` is `false` and the
+    /// target is not on this machine. The first rule in this list keyed to a run
+    /// rather than to an address: it refuses a destination that every other rule
+    /// here would happily allow, because *this run* said it would not use the
+    /// network.
+    RunNetworkDenied => "egress.run-network-denied", "this run was submitted without network permission";
 }
 
 impl EgressRule {
@@ -568,13 +574,41 @@ fn may_follow(previous: &Url, next: &Url) -> bool {
     previous.scheme() == "http" && next.scheme() == "https" && previous.port() == next.port()
 }
 
+/// Whether `url` names a peer on this machine.
+///
+/// # Why a run with no network permission may still reach loopback
+///
+/// `permission_policy.allow_network` defaults to `false`, and a run targeting the
+/// bundled `llama-server` or a local Ollama is submitted with it `false` — quite
+/// correctly, because such a run uses no network in the sense the flag means.
+/// Reading the flag as "no sockets at all" would therefore refuse every local
+/// inference run, which is not a stricter policy, it is a broken one. The flag
+/// gates *leaving this machine*.
+///
+/// Deliberately narrow: literal loopback addresses and the `localhost` names that
+/// resolve to them. It does not consult DNS, so a hostname that happens to resolve
+/// to `127.0.0.1` is not treated as local here — that is the conservative
+/// direction for this predicate, since a name is exactly what a rebind can move.
+#[must_use]
+pub fn is_loopback_target(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(domain)) => {
+            let lowered = domain.to_ascii_lowercase();
+            lowered == "localhost" || lowered.ends_with(".localhost")
+        }
+        None => false,
+    }
+}
+
 /// `scheme://host:port` for a diagnostic — deliberately **not** the whole URL.
 ///
 /// These messages surface in provider errors the UI shows and the CLI prints,
 /// and some of these paths put tokens in a query string (`hosted_oauth`'s relay
 /// among them). Naming only the origin says everything a reader needs about a
 /// refused hop without copying a credential into a log.
-fn origin_label(url: &Url) -> String {
+pub(crate) fn origin_label(url: &Url) -> String {
     match (url.host_str(), url.port_or_known_default()) {
         (Some(host), Some(port)) => format!("{}://{host}:{port}", url.scheme()),
         (Some(host), None) => format!("{}://{host}", url.scheme()),
@@ -637,6 +671,7 @@ mod tests {
             "egress.redirect-hop-limit",
             "egress.redirect-cross-origin",
             "egress.redirect-origin-unknown",
+            "egress.run-network-denied",
         ];
 
         #[test]
