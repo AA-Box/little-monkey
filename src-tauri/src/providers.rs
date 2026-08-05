@@ -25,6 +25,7 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Notify;
 
+use crate::run_scope::{RunScope, Unattributed};
 use crate::AppState;
 
 const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
@@ -652,16 +653,28 @@ pub async fn providers_stream_chat(
         .lock()
         .unwrap()
         .insert(request_id.clone(), cancel.clone());
-    let result = run_stream_chat(
-        &app,
-        &request_id,
-        &provider_id,
-        &model,
-        messages,
-        tools,
-        effort,
-        cancel,
-        frozen_endpoint,
+    // The scope covers the whole stream, so every refusal raised anywhere inside it
+    // is attributable without `run_stream_chat` — or the SSRF predicates several
+    // frames below it — taking a run id they have no other use for. Both arms are
+    // real here: a ledgered run carries its id, and an ordinary chat is not a run
+    // and says so, rather than arriving at the sink as an unexplained blank.
+    let scope = match run_id.as_deref() {
+        Some(run_id) => RunScope::run(run_id),
+        None => RunScope::Unattributed(Unattributed::UserAction),
+    };
+    let result = crate::run_scope::scoped(
+        scope,
+        run_stream_chat(
+            &app,
+            &request_id,
+            &provider_id,
+            &model,
+            messages,
+            tools,
+            effort,
+            cancel,
+            frozen_endpoint,
+        ),
     )
     .await;
 

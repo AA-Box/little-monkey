@@ -104,6 +104,36 @@ const SINK_V1_SQL: &str = "CREATE TABLE IF NOT EXISTS egress_denials (
      CREATE INDEX IF NOT EXISTS egress_denials_by_rule
         ON egress_denials (rule_code);";
 
+const SINK_V2: i64 = 2;
+
+/// Latest version this build understands. The forward-only guard compares against
+/// this rather than against a specific version, so adding V3 needs no edit there.
+const SINK_LATEST: i64 = SINK_V2;
+
+const SINK_V2_CHECKSUM: &str = "egress-denials-v2";
+
+/// `run_id` alone could not tell "background work" from "we lost the identity" —
+/// both were `NULL`. `run_scope::Unattributed` gives the first case a name, and this
+/// is where the name is kept.
+///
+/// Added by `ALTER` rather than by rebuilding the table, which costs the ability to
+/// express "exactly one of these two is set" as a SQL `CHECK` (SQLite cannot add a
+/// constraint to an existing table). No loss worth rebuilding for: the pair is
+/// derived from a `RunScope`, and that type is an enum, so the invariant holds by
+/// construction one layer up rather than being re-checked here.
+const SINK_V2_SQL: &str = "ALTER TABLE egress_denials ADD COLUMN unattributed_reason TEXT;";
+
+/// Every migration in order, so applying them is a loop rather than a stanza per
+/// version.
+///
+/// Each entry keeps its own checksum, and the check is per version: editing V1's SQL
+/// in place still fails, which is the property the single-version form had and the
+/// reason it is preserved here rather than replaced by "compare the latest".
+const SINK_MIGRATIONS: &[(i64, &str, &str)] = &[
+    (SINK_V1, SINK_V1_CHECKSUM, SINK_V1_SQL),
+    (SINK_V2, SINK_V2_CHECKSUM, SINK_V2_SQL),
+];
+
 /// One recorded refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenialRecord {
@@ -112,6 +142,12 @@ pub struct DenialRecord {
     pub guard: String,
     pub detail: Option<String>,
     pub run_id: Option<String>,
+    /// `run_scope::Unattributed::code` when the work deliberately had no run.
+    ///
+    /// Mutually exclusive with `run_id` because both are derived from one
+    /// [`crate::run_scope::RunScope`], whose two arms cannot both hold. Both `None`
+    /// is the third, honest state: a site nothing has scoped yet.
+    pub unattributed_reason: Option<String>,
 }
 
 /// The append-only store.
@@ -162,32 +198,38 @@ impl DenialSink {
                     row.get::<_, Option<i64>>(0)
                 })?
         {
-            if version > SINK_V1 {
+            if version > SINK_LATEST {
                 return Err(rusqlite::Error::InvalidQuery);
             }
         }
 
-        if let Some(checksum) = self
-            .connection
-            .query_row(
-                "SELECT checksum FROM sink_migrations WHERE version = ?1",
-                [SINK_V1],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            if checksum != SINK_V1_CHECKSUM {
-                return Err(rusqlite::Error::InvalidQuery);
+        for &(version, checksum, sql) in SINK_MIGRATIONS {
+            if let Some(recorded) = self
+                .connection
+                .query_row(
+                    "SELECT checksum FROM sink_migrations WHERE version = ?1",
+                    [version],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                // Already applied. Still checked rather than skipped: a schema
+                // edited in place instead of added as a new version is the mistake
+                // worth failing on, and only comparing the recorded checksum can
+                // see it.
+                if recorded != checksum {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                continue;
             }
-            return Ok(());
-        }
 
-        self.connection.execute_batch(SINK_V1_SQL)?;
-        self.connection.execute(
-            "INSERT INTO sink_migrations (version, checksum, applied_at_ms)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![SINK_V1, SINK_V1_CHECKSUM, 1_i64],
-        )?;
+            self.connection.execute_batch(sql)?;
+            self.connection.execute(
+                "INSERT INTO sink_migrations (version, checksum, applied_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![version, checksum, 1_i64],
+            )?;
+        }
         Ok(())
     }
 
@@ -199,14 +241,15 @@ impl DenialSink {
     pub fn record(&self, record: &DenialRecord) -> rusqlite::Result<()> {
         self.connection.execute(
             "INSERT INTO egress_denials
-                (recorded_at_ms, rule_code, guard, detail, run_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+                (recorded_at_ms, rule_code, guard, detail, run_id, unattributed_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
                 record.recorded_at_ms,
                 record.rule_code,
                 record.guard,
                 record.detail,
                 record.run_id,
+                record.unattributed_reason,
             ],
         )?;
         self.connection.execute(
@@ -222,7 +265,7 @@ impl DenialSink {
     /// Most recent denials first.
     pub fn recent(&self, limit: usize) -> rusqlite::Result<Vec<DenialRecord>> {
         let mut statement = self.connection.prepare(
-            "SELECT recorded_at_ms, rule_code, guard, detail, run_id
+            "SELECT recorded_at_ms, rule_code, guard, detail, run_id, unattributed_reason
              FROM egress_denials
              ORDER BY id DESC
              LIMIT ?1",
@@ -234,6 +277,7 @@ impl DenialSink {
                 guard: row.get(2)?,
                 detail: row.get(3)?,
                 run_id: row.get(4)?,
+                unattributed_reason: row.get(5)?,
             })
         })?;
         rows.collect()
@@ -307,6 +351,25 @@ pub fn is_installed() -> bool {
 /// observability write must not become a request failure. `guard` is the module
 /// that refused, so two guards that disagree about the same address class stay
 /// distinguishable.
+///
+/// # Where the identity comes from
+///
+/// `run_id` is the explicit answer, and it wins whenever it is `Some`: a caller
+/// holding the id knows better than an ambient value, and keeping that precedence
+/// makes this change a no-op at the sites that already pass one.
+///
+/// When it is `None`, [`crate::run_scope::current`] is consulted. That is the whole
+/// point of the task-local — this module's own doc used to say "there are zero
+/// `task_local!` declarations in this crate to carry one implicitly", and the
+/// refusals it describes are raised by pure functions of a `Url` or an `IpAddr` that
+/// will never hold a run id. Now they do not have to: the scope set at a command
+/// boundary reaches them without a single intervening signature changing.
+///
+/// Three outcomes, and they are deliberately three rather than two:
+///
+/// - a run id, explicit or ambient;
+/// - no run id and a *reason*, when the scope says the work is unattributed;
+/// - neither, at a site nothing has scoped yet.
 pub fn record(guard: &'static str, denial: &EgressDenial, run_id: Option<&str>) {
     let recorded_at_ms = match std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -318,12 +381,22 @@ pub fn record(guard: &'static str, denial: &EgressDenial, run_id: Option<&str>) 
         _ => return,
     };
 
+    let (run_id, unattributed_reason) = match (run_id, crate::run_scope::current()) {
+        (Some(explicit), _) => (Some(explicit.to_string()), None),
+        (None, Some(crate::run_scope::RunScope::Run(id))) => (Some(id), None),
+        (None, Some(crate::run_scope::RunScope::Unattributed(reason))) => {
+            (None, Some(reason.code().to_string()))
+        }
+        (None, None) => (None, None),
+    };
+
     let record = DenialRecord {
         recorded_at_ms,
         rule_code: denial.rule().code().to_string(),
         guard: guard.to_string(),
         detail: denial.detail().map(str::to_string),
-        run_id: run_id.map(str::to_string),
+        run_id,
+        unattributed_reason,
     };
 
     if let Ok(slot) = slot().lock() {
@@ -337,6 +410,7 @@ pub fn record(guard: &'static str, denial: &EgressDenial, run_id: Option<&str>) 
 mod tests {
     use super::*;
     use crate::egress::EgressRule;
+    use crate::run_scope::{self, RunScope, Unattributed};
 
     fn record_of(rule: EgressRule, detail: &str) -> DenialRecord {
         DenialRecord {
@@ -345,6 +419,7 @@ mod tests {
             guard: "test".to_string(),
             detail: Some(detail.to_string()),
             run_id: None,
+            unattributed_reason: None,
         }
     }
 
@@ -461,6 +536,197 @@ mod tests {
         assert_eq!(reopened.count().expect("counts"), 1);
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A database left at V1 by an older build must upgrade **and keep its rows**.
+    ///
+    /// The interesting failure is not "the column is missing" — that shows up
+    /// immediately — it is a migration that recreates the table and silently drops
+    /// what was already recorded. So a row is written before the upgrade and read
+    /// back after it.
+    #[test]
+    fn a_v1_database_upgrades_in_place_without_losing_rows() {
+        let directory = std::env::temp_dir().join(format!("lm-sink-v1-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("creates");
+        let path = directory.join(SINK_FILE);
+
+        // Stand up exactly what a V1-era build would have left behind: the V1
+        // schema, its migration row, and one denial.
+        {
+            let connection = Connection::open(&path).expect("opens");
+            connection
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS sink_migrations (
+                        version INTEGER PRIMARY KEY,
+                        checksum TEXT NOT NULL,
+                        applied_at_ms INTEGER NOT NULL
+                     ) STRICT;",
+                )
+                .expect("migration table");
+            connection.execute_batch(SINK_V1_SQL).expect("v1 schema");
+            connection
+                .execute(
+                    "INSERT INTO sink_migrations (version, checksum, applied_at_ms)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![SINK_V1, SINK_V1_CHECKSUM, 1_i64],
+                )
+                .expect("v1 migration row");
+            connection
+                .execute(
+                    "INSERT INTO egress_denials
+                        (recorded_at_ms, rule_code, guard, detail, run_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        1_700_000_000_000_i64,
+                        "egress.loopback",
+                        "old",
+                        "::1",
+                        "run-old"
+                    ],
+                )
+                .expect("pre-existing row");
+        }
+
+        let upgraded = DenialSink::open(&path).expect("a V1 database must upgrade");
+        let rows = upgraded.recent(10).expect("reads");
+        assert_eq!(rows.len(), 1, "the pre-existing row must survive");
+        assert_eq!(rows[0].run_id.as_deref(), Some("run-old"));
+        assert_eq!(
+            rows[0].unattributed_reason, None,
+            "a row written before the column existed reads as neither attributed \
+             nor deliberately unattributed, which is exactly what it was"
+        );
+
+        // And the new column is usable afterwards.
+        let mut scheduled = record_of(EgressRule::Loopback, "127.0.0.1");
+        scheduled.unattributed_reason = Some(Unattributed::Scheduled.code().to_string());
+        upgraded.record(&scheduled).expect("records post-upgrade");
+        let rows = upgraded.recent(10).expect("reads");
+        assert_eq!(
+            rows[0].unattributed_reason.as_deref(),
+            Some("unattributed.scheduled")
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The D3 acceptance clause at the integration level: a scope set at a command
+    /// boundary reaches a refusal several frames down, with **no** run id passed to
+    /// `record` and no signature in between carrying one.
+    ///
+    /// Both arms are asserted, because the point of the mechanism is that they are
+    /// different answers rather than one blank. The third state — nothing scoped —
+    /// is asserted too, since a fallback that quietly invented an identity would
+    /// pass the first two.
+    #[test]
+    fn a_scope_at_the_boundary_reaches_a_refusal_that_was_never_handed_one() {
+        let _guard = test_lock();
+        let sink = DenialSink::open_in_memory().expect("sink opens");
+        install(sink);
+
+        // Stands in for the frames between a command and an SSRF predicate: it
+        // takes no run id, exactly like `validate_fetch_url` and `classify_ip`.
+        fn refuse_somewhere_deep(marker: &str) {
+            record(
+                "d3.test",
+                &EgressDenial::about(EgressRule::Loopback, marker.to_string()),
+                None,
+            );
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime builds");
+        runtime.block_on(async {
+            run_scope::scoped(RunScope::run("run:d3"), async {
+                refuse_somewhere_deep("attributed");
+            })
+            .await;
+
+            run_scope::scoped(RunScope::Unattributed(Unattributed::Scheduled), async {
+                refuse_somewhere_deep("background");
+            })
+            .await;
+        });
+        // Outside every scope, and outside the runtime entirely.
+        refuse_somewhere_deep("uninstrumented");
+
+        let rows = if let Ok(slot) = slot().lock() {
+            slot.as_ref()
+                .expect("sink installed")
+                .recent(10)
+                .expect("reads")
+        } else {
+            panic!("sink lock poisoned");
+        };
+        let find = |marker: &str| {
+            rows.iter()
+                .find(|row| row.detail.as_deref() == Some(marker))
+                .unwrap_or_else(|| panic!("no row for {marker}"))
+        };
+
+        let attributed = find("attributed");
+        assert_eq!(
+            attributed.run_id.as_deref(),
+            Some("run:d3"),
+            "the run id must arrive without being threaded"
+        );
+        assert_eq!(attributed.unattributed_reason, None);
+
+        let background = find("background");
+        assert_eq!(background.run_id, None);
+        assert_eq!(
+            background.unattributed_reason.as_deref(),
+            Some("unattributed.scheduled"),
+            "deliberately runless work must record why, not a blank"
+        );
+
+        let uninstrumented = find("uninstrumented");
+        assert_eq!(uninstrumented.run_id, None);
+        assert_eq!(
+            uninstrumented.unattributed_reason, None,
+            "an unscoped site must stay distinguishable from a deliberate one"
+        );
+    }
+
+    /// An explicitly passed run id wins over the ambient scope.
+    ///
+    /// Pinned because it is what makes this change a no-op at the sites that already
+    /// pass one, and because the opposite precedence would let an outer scope
+    /// silently relabel a refusal whose owner the caller already knew.
+    #[test]
+    fn an_explicit_run_id_beats_the_ambient_scope() {
+        let _guard = test_lock();
+        let sink = DenialSink::open_in_memory().expect("sink opens");
+        install(sink);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime builds");
+        runtime.block_on(async {
+            run_scope::scoped(RunScope::run("run:ambient"), async {
+                record(
+                    "d3.test",
+                    &EgressDenial::about(EgressRule::Loopback, "explicit-wins".to_string()),
+                    Some("run:explicit"),
+                );
+            })
+            .await;
+        });
+
+        let rows = if let Ok(slot) = slot().lock() {
+            slot.as_ref()
+                .expect("sink installed")
+                .recent(10)
+                .expect("reads")
+        } else {
+            panic!("sink lock poisoned");
+        };
+        let row = rows
+            .iter()
+            .find(|row| row.detail.as_deref() == Some("explicit-wins"))
+            .expect("row recorded");
+        assert_eq!(row.run_id.as_deref(), Some("run:explicit"));
     }
 
     /// Recording with nothing installed must be a no-op and not a panic: every
