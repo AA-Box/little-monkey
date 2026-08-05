@@ -1006,7 +1006,9 @@ export function StudioPanel() {
         </aside>
         )}
 
-        <section className="flex min-h-0 flex-1 flex-col gap-2">
+        {/* The split wrapper clips, so the focus ring on the first field needs
+            a pixel of room or it is drawn straight through the top edge. */}
+        <section className="flex min-h-0 flex-1 flex-col gap-2 px-0.5 pt-0.5">
           {/* Each button sits with the field it belongs to and stretches to
               its height, so the row reads as one control rather than two. */}
           <div className="flex shrink-0 items-stretch gap-2">
@@ -1065,38 +1067,54 @@ export function StudioPanel() {
           )}
 
           {/* The canvas: whatever was made last, as large as the pane allows.
-              It is the thing being worked on, so it gets the space. */}
-          <div className="grid min-h-0 flex-1 place-items-center overflow-hidden rounded border border-border bg-background/40 p-2">
-            {shown && previews[shown.artifactId] ? (
-              shown.mediaType.startsWith("audio/") ? (
-                <audio controls src={previews[shown.artifactId]} className="w-full max-w-md" />
-              ) : (
-                <button
-                  type="button"
-                  className="grid min-h-0 place-items-center"
-                  title={t("Studio.result.expand")}
-                  onClick={() => setLightbox(shown)}
-                >
-                  {shown.mediaType.startsWith("video/") ? (
-                    <video
-                      controls
-                      loop
-                      src={previews[shown.artifactId]}
-                      className="max-h-full rounded bg-black object-contain"
-                    />
-                  ) : (
-                    <img
-                      src={previews[shown.artifactId]}
-                      alt={shown.prompt}
-                      className="max-h-full rounded object-contain"
-                    />
-                  )}
-                </button>
-              )
-            ) : (
-              <p className="text-xs text-faint">
+              It is the thing being worked on, so it gets the space.
+
+              `absolute inset-0` is load-bearing. A percentage max-height only
+              resolves against a definite height, and a centred grid or flex
+              item is sized by its content — so `max-h-full` on the image was
+              silently doing nothing and a tall result rendered at full size
+              behind `overflow-hidden`, which looks exactly like a blank pane. */}
+          <div className="relative min-h-0 flex-1 overflow-hidden rounded border border-border bg-background/40">
+            {!shown ? (
+              <p className="absolute inset-0 grid place-items-center text-xs text-faint">
                 {busy ? t("Studio.phase.running") : t("Studio.galleryEmpty")}
               </p>
+            ) : !previews[shown.artifactId] ? (
+              // Something was made but its bytes are not here yet. Saying
+              // "nothing generated yet" in this state is a lie, and it is the
+              // lie that reads as "it finished and showed me nothing".
+              <div className="absolute inset-0 grid place-items-center">
+                <Button size="sm" variant="secondary" onClick={() => void loadPreview(shown)}>
+                  <Loader2 size={13} className="animate-spin" />
+                  {t("Studio.loadPreview")}
+                </Button>
+              </div>
+            ) : shown.mediaType.startsWith("audio/") ? (
+              <div className="absolute inset-0 grid place-items-center p-2">
+                <audio controls src={previews[shown.artifactId]} className="w-full max-w-md" />
+              </div>
+            ) : (
+              <button
+                type="button"
+                className="absolute inset-0 flex cursor-zoom-in items-center justify-center p-2"
+                title={t("Studio.result.expand")}
+                onClick={() => setLightbox(shown)}
+              >
+                {shown.mediaType.startsWith("video/") ? (
+                  <video
+                    controls
+                    loop
+                    src={previews[shown.artifactId]}
+                    className="max-h-full max-w-full rounded bg-black object-contain"
+                  />
+                ) : (
+                  <img
+                    src={previews[shown.artifactId]}
+                    alt={shown.prompt}
+                    className="max-h-full max-w-full rounded object-contain"
+                  />
+                )}
+              </button>
             )}
           </div>
 
