@@ -207,3 +207,6 @@ export const ApprovalChainModal = lazy(() =>
 export const ReviewPanel = lazy(() =>
   import("../components/Workspace/ReviewPanel").then(({ ReviewPanel }) => ({ default: ReviewPanel })),
 );
+export const StudioPanel = lazy(() =>
+  import("../components/Studio/StudioPanel").then(({ StudioPanel }) => ({ default: StudioPanel })),
+);
