@@ -802,6 +802,29 @@ impl reqwest::dns::Resolve for SsrfGuardedResolver {
     }
 }
 
+/// Reads `response`'s body into memory, stopping at `max` bytes.
+///
+/// Streams rather than calling `.text()`/`.bytes()` for one reason: those read
+/// to end-of-stream, so the size of the allocation is the peer's choice. Here
+/// the cap is ours, and it holds whether or not `Content-Length` was sent and
+/// whether or not it was honest.
+///
+/// Over-long bodies are truncated rather than refused, which is the same
+/// bargain [`fetch_impl`] already made: the callers parse a best-effort
+/// document out of what arrived, and a body past these caps is pathological
+/// either way.
+async fn read_body_capped(mut response: reqwest::Response, max: usize) -> reqwest::Result<Vec<u8>> {
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() >= max {
+            bytes.truncate(max);
+            break;
+        }
+    }
+    Ok(bytes)
+}
+
 /// Core `web_fetch` logic: AppHandle-free and directly testable (against a
 /// local fixture server) — see the module doc for why. Not itself
 /// cancellable; [`tool_web_fetch`] wraps the call in a `tokio::select!` against
@@ -836,7 +859,7 @@ pub async fn fetch_impl(
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    let mut response = client
+    let response = client
         .get(parsed.clone())
         .send()
         .await
@@ -850,20 +873,9 @@ pub async fn fetch_impl(
         .unwrap_or("")
         .to_string();
 
-    // Streamed read capped at MAX_BODY_BYTES regardless of what (if
-    // anything) Content-Length claims.
-    let mut bytes: Vec<u8> = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
+    let bytes = read_body_capped(response, MAX_BODY_BYTES)
         .await
-        .map_err(|e| format!("Failed to read response body from '{}': {}", url, e))?
-    {
-        bytes.extend_from_slice(&chunk);
-        if bytes.len() >= MAX_BODY_BYTES {
-            bytes.truncate(MAX_BODY_BYTES);
-            break;
-        }
-    }
+        .map_err(|e| format!("Failed to read response body from '{}': {}", url, e))?;
 
     let body = String::from_utf8_lossy(&bytes).into_owned();
     let (title, full_content) = dispatch_content(&content_type, &body, &final_url)?;
@@ -971,6 +983,58 @@ const DEFAULT_SEARCH_COUNT: usize = 10;
 /// arbitrary page.
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Cap on a search backend's response body, the same protection
+/// [`MAX_BODY_BYTES`] gives the fetch path. Smaller than that one because a
+/// search response is a results page or a JSON array, not an arbitrary
+/// document: DuckDuckGo's HTML runs a few hundred KB and both JSON payloads are
+/// far under it, so this only ever bites a body no honest backend sends.
+const MAX_SEARCH_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// The client all three search backends share.
+///
+/// Starts from [`crate::egress::hardened_with_read_budget`] rather than a bare
+/// `Client::builder()` for one property the three hand-rolled builders it
+/// replaces did not have: a redirect that has to stay on the origin the request
+/// was aimed at.
+///
+/// The distinction the previous code missed is between the *request* and the
+/// *response*. Each backend's request target is trustworthy — a vendor constant,
+/// or a base URL the user typed into Settings themselves — and the old doc
+/// comments were right that the untrusted query text never builds a URL. But a
+/// `302` is chosen by the response, and reqwest's default `Policy::limited(10)`
+/// follows one to any host. Two concrete consequences, both closed here:
+///
+/// - **Brave's API key could walk to a host the redirect picked.**
+///   `X-Subscription-Token` is not one of the four headers reqwest strips when a
+///   redirect crosses origins (it strips `Authorization`, `Cookie`,
+///   `Proxy-Authorization`, `WWW-Authenticate`) — the same hazard
+///   [`crate::egress::hardened`] documents for `x-api-key`.
+/// - **A hop could reach unauthenticated loopback services.** This machine's own
+///   `llama-server` and `ollama:11434` have no authentication at all.
+///   `allow_local_network` was no defence: it is consulted only on the fetch
+///   path, so every search client followed a loopback hop with the setting off.
+///
+/// A SearXNG instance is the sharpest edge of it — that base URL is the one
+/// search target a user can point anywhere, and `normalize_base_url` accepts
+/// plain `http://` on purpose, because a self-hosted instance on the LAN or on
+/// loopback is a supported setup. The rule here is deliberately *relative*
+/// (does this hop stay where it was already going?) rather than absolute (is
+/// this a public HTTPS host?), for exactly that reason: an absolute rule would
+/// refuse the self-hosted instance outright, while the relative one leaves it
+/// working and still refuses the `302` off it.
+///
+/// The total [`SEARCH_TIMEOUT`] deadline stays layered on top of the inherited
+/// connect and read budgets. That is safe here, unlike on a download path: these
+/// bodies are small and buffered, so a whole-request ceiling bounds a slow
+/// backend rather than truncating a legitimate transfer.
+fn search_client() -> Result<reqwest::Client, String> {
+    crate::egress::hardened_with_read_budget(SEARCH_TIMEOUT)
+        .timeout(SEARCH_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))
+}
+
 /// DuckDuckGo's keyless HTML results endpoint (no API key, no official API —
 /// see the module doc's "best-effort/brittle" framing). `POST` with the query
 /// in a `q` form field is what the (JS-less) `html.duckduckgo.com/html/`
@@ -1061,16 +1125,13 @@ fn parse_ddg_results(html: &str, count: usize) -> Vec<SearchResult> {
 /// arm of three). AppHandle-free and directly testable, same split as
 /// [`fetch_impl`].
 ///
-/// Unlike `fetch_impl`, there is no SSRF guard here to run: the request
-/// target is DuckDuckGo's own fixed endpoint, never a user/model-supplied
-/// URL — only the query text (sent as a POST form field, not part of the
-/// URL) is untrusted.
+/// Unlike `fetch_impl`, there is no SSRF guard here to run on the request: the
+/// target is DuckDuckGo's own fixed endpoint, never a user/model-supplied URL —
+/// only the query text (sent as a POST form field, not part of the URL) is
+/// untrusted. The *response* is a different matter, and [`search_client`]
+/// handles it: a `302` off that endpoint is followed only if it stays on it.
 async fn ddg_search(query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(SEARCH_TIMEOUT)
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let client = search_client()?;
 
     let response = client
         .post(DUCKDUCKGO_HTML_ENDPOINT)
@@ -1080,9 +1141,9 @@ async fn ddg_search(query: &str, count: usize) -> Result<Vec<SearchResult>, Stri
         .map_err(|e| format!("Failed to search DuckDuckGo for '{}': {}", query, e))?;
 
     let status = response.status();
-    let body = response
-        .text()
+    let body = read_body_capped(response, MAX_SEARCH_BODY_BYTES)
         .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .map_err(|e| format!("Failed to read DuckDuckGo response for '{}': {}", query, e))?;
 
     if !status.is_success() {
@@ -1150,17 +1211,17 @@ fn parse_brave_response(body: &str, count: usize) -> Result<Vec<SearchResult>, S
 /// can point it at a local fixture server instead of the real Brave API —
 /// [`brave_search`] is the real-endpoint entry point both `search_impl` and
 /// [`web_set_brave_key`]'s validate-before-store call use.
+///
+/// This is the credentialed search path — [`search_client`]'s origin-pinned
+/// redirect policy is what keeps the `X-Subscription-Token` below from riding a
+/// `302` to a host of the response's choosing.
 async fn brave_search_at(
     endpoint: &str,
     api_key: &str,
     query: &str,
     count: usize,
 ) -> Result<Vec<SearchResult>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(SEARCH_TIMEOUT)
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let client = search_client()?;
 
     let response = client
         .get(endpoint)
@@ -1172,9 +1233,9 @@ async fn brave_search_at(
         .map_err(|e| format!("Failed to search Brave for '{}': {}", query, e))?;
 
     let status = response.status();
-    let body = response
-        .text()
+    let body = read_body_capped(response, MAX_SEARCH_BODY_BYTES)
         .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .map_err(|e| format!("Failed to read Brave response for '{}': {}", query, e))?;
 
     if !status.is_success() {
@@ -1245,16 +1306,17 @@ fn parse_searxng_response(body: &str, count: usize) -> Result<Vec<SearchResult>,
 /// than a bare "HTTP 403" the user would have to go guess the cause of (the
 /// design doc's own risk note: "needs the explicit error hint or users will
 /// blame the app").
+///
+/// `base_url` is the one search target a user can point anywhere, so this is the
+/// branch [`search_client`]'s origin-pinned redirect matters most on: the
+/// configured host stays reachable, including a self-hosted instance on plain
+/// `http://` or on loopback, but a `302` off it does not.
 async fn searxng_search(
     base_url: &str,
     query: &str,
     count: usize,
 ) -> Result<Vec<SearchResult>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(SEARCH_TIMEOUT)
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let client = search_client()?;
 
     let url = format!("{}/search", base_url.trim_end_matches('/'));
     let response = client
@@ -1272,9 +1334,9 @@ async fn searxng_search(
         ));
     }
 
-    let body = response
-        .text()
+    let body = read_body_capped(response, MAX_SEARCH_BODY_BYTES)
         .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .map_err(|e| format!("Failed to read SearXNG response from '{}': {}", base_url, e))?;
 
     if !status.is_success() {
@@ -1298,12 +1360,18 @@ async fn searxng_search(
 /// and pass the result through, keeping `search_impl` trivially testable
 /// without touching the real OS keychain.
 ///
-/// Unlike `fetch_impl`, there is no SSRF guard to run for any of the three
-/// branches: Brave/SearXNG/DuckDuckGo targets are either a fixed vendor
-/// endpoint or a user-configured SearXNG base URL the user themselves typed
-/// into Settings (not a model-supplied URL) — only the query text is
+/// Unlike `fetch_impl`, there is no SSRF guard to run on the *request* for any
+/// of the three branches: Brave/SearXNG/DuckDuckGo targets are either a fixed
+/// vendor endpoint or a user-configured SearXNG base URL the user themselves
+/// typed into Settings (not a model-supplied URL) — only the query text is
 /// untrusted, and it's sent as a query/form parameter, never used to build a
 /// request to an arbitrary host.
+///
+/// The *response* is guarded, though, and by the client rather than by this
+/// function: all three branches build from [`search_client`], whose redirect
+/// policy refuses a hop that leaves the origin the request was aimed at. See its
+/// doc comment for why a trustworthy request target does not make a `302` off it
+/// trustworthy too.
 pub async fn search_impl(
     settings: &WebSettings,
     brave_key: Option<String>,
@@ -2518,6 +2586,199 @@ mod tests {
             err.contains("formats") && err.contains("settings.yml"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Spawns a local server that answers its first request with a `302 Found`
+    /// pointing at `location`, and any later request with `200 OK` carrying
+    /// `body`.
+    ///
+    /// Serves two requests rather than one because the same-origin counter-test
+    /// needs the redirect actually followed to something that answers; the
+    /// cross-origin tests only ever reach the first.
+    fn spawn_redirecting_server(location: String, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            for hop in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let response = if hop == 0 {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        format!("http://{}", addr)
+    }
+
+    /// Spawns a local server that records the raw text of the first request it
+    /// receives, then answers an empty `200 OK`.
+    ///
+    /// The recording is the assertion: anything that reached this origin shows up
+    /// as `Some(request)`, headers included.
+    fn spawn_recording_server() -> (String, std::sync::Arc<std::sync::Mutex<Option<String>>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorder = std::sync::Arc::clone(&seen);
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                *recorder.lock().unwrap() =
+                    Some(String::from_utf8_lossy(&buf[..read]).into_owned());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+
+        (format!("http://{}", addr), seen)
+    }
+
+    /// The property [`search_client`] exists for, driven through the one search
+    /// backend that carries a secret: a `302` off Brave's endpoint must not walk
+    /// `X-Subscription-Token` to whatever host the redirect names.
+    ///
+    /// Asserted on the *victim* server rather than on the error message, because
+    /// the question is not what the user was told — it is whether the key left
+    /// for an address the response picked. reqwest strips `Authorization` across
+    /// an origin change but not this header, so before `search_client` the
+    /// recording below captured the key verbatim.
+    #[tokio::test]
+    async fn a_302_does_not_carry_the_brave_key_to_another_origin() {
+        let (victim, seen) = spawn_recording_server();
+        let attacker = spawn_redirecting_server(format!("{victim}/steal"), "");
+
+        let err = brave_search_at(&attacker, "super-secret-key", "rust", 1)
+            .await
+            .expect_err("a cross-origin redirect must fail the whole request");
+
+        let captured = seen.lock().unwrap().clone();
+        assert!(
+            captured.is_none(),
+            "the redirect target was contacted at all: {captured:?}"
+        );
+        assert!(
+            !err.contains("super-secret-key"),
+            "the key must not reach the error text either: {err}"
+        );
+    }
+
+    /// The refusal is attributable by rule, not an anonymous transport failure —
+    /// which is what puts it in the denial sink under `egress.redirect-cross-origin`
+    /// rather than as a nameless "failed to search".
+    ///
+    /// Driven against the client instead of a backend because the backends return
+    /// `Result<_, String>`, and the `format!` at that boundary is where the error
+    /// chain carrying the rule ends.
+    #[tokio::test]
+    async fn the_search_client_names_the_rule_that_refused_a_cross_origin_hop() {
+        let (victim, _seen) = spawn_recording_server();
+        let attacker = spawn_redirecting_server(format!("{victim}/steal"), "");
+
+        let error = search_client()
+            .expect("build the search client")
+            .get(format!("{attacker}/search"))
+            .send()
+            .await
+            .expect_err("expected the cross-origin redirect to be refused");
+
+        assert_eq!(
+            denied_rule(&error),
+            Some(EgressRule::RedirectCrossOrigin),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    /// The counter-test that keeps the two above honest: a policy of "refuse
+    /// every redirect" passes both, and would also break the SearXNG instances
+    /// that redirect `/search` internally. A hop that stays on the configured
+    /// origin has to still be followed all the way to its results.
+    #[tokio::test]
+    async fn a_302_that_stays_on_the_searxng_origin_is_still_followed() {
+        let base = spawn_redirecting_server(
+            "/search?q=rust&format=json".to_string(),
+            SEARXNG_FIXTURE_JSON,
+        );
+
+        let results = searxng_search(&base, "rust", 10)
+            .await
+            .expect("a same-origin redirect must be followed");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Rust Programming Language");
+    }
+
+    /// `read_body_capped` stops at its cap against a peer that keeps writing —
+    /// the property `.text()` cannot offer, since it reads to end-of-stream and
+    /// so lets the peer size the allocation.
+    ///
+    /// The declared `Content-Length` is deliberately a lie about a body this
+    /// server has no intention of finishing, because an honest length is the case
+    /// that never needed a cap.
+    #[tokio::test]
+    async fn read_body_capped_stops_at_its_cap() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                if stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 104857600\r\nConnection: close\r\n\r\n",
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+                let chunk = vec![b'x'; 64 * 1024];
+                // Bounded so a reader that never stops reading cannot leave this
+                // thread spinning; 1600 × 64 KiB is the declared length.
+                for _ in 0..1600 {
+                    if stream.write_all(&chunk).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        let response = search_client()
+            .expect("build the search client")
+            .get(format!("http://{}/", addr))
+            .send()
+            .await
+            .expect("the fixture server answers");
+
+        let bytes = read_body_capped(response, 4096)
+            .await
+            .expect("read the capped body");
+
+        assert_eq!(bytes.len(), 4096);
     }
 
     #[tokio::test]
