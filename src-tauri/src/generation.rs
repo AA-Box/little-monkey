@@ -36,6 +36,9 @@ const MAX_STEPS: u32 = 200;
 const MAX_VIDEO_FRAMES: u32 = 361;
 const MAX_FPS: u32 = 60;
 const MAX_INIT_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+/// LoRAs per generation. The engine accepts an unbounded list; this exists so
+/// one request cannot make the engine open an arbitrary number of files.
+const MAX_LORAS: usize = 32;
 /// A 15 s 2K clip with audio stays far under this; it exists so a runaway
 /// server response can never be buffered without bound.
 const MAX_MEDIA_BYTES: usize = 256 * 1024 * 1024;
@@ -90,20 +93,85 @@ impl ComponentSlot {
 #[serde(rename_all = "camelCase")]
 pub struct ModelComponent {
     pub slot: ComponentSlot,
-    /// Hugging Face repo id, resolved through the existing model downloader.
-    pub repo: String,
-    /// Path within the repo. The basename is what lands on disk.
-    pub file: String,
+    pub source: ComponentSource,
     pub size_bytes: u64,
 }
 
+/// Where a component's bytes come from.
+///
+/// The engine takes an absolute path per slot and does not care how the file
+/// got there, so a model the user already has on disk is a first-class source
+/// rather than a special case bolted onto the curated list.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ComponentSource {
+    /// Fetched from Hugging Face into the app's own model directory.
+    HuggingFace {
+        repo: String,
+        /// Path within the repo. The basename is what lands on disk.
+        file: String,
+    },
+    /// A file the user already has. Referenced where it lies and never copied,
+    /// moved, or deleted by the app — these weights are not ours to manage.
+    LocalFile { path: String },
+}
+
 impl ModelComponent {
-    /// The flat on-disk name. Components from different repos can collide only
-    /// if they share a basename, which [`curated_models_have_unique_component_files`]
-    /// rejects at test time.
-    pub fn file_name(&self) -> &str {
-        self.file.rsplit('/').next().unwrap_or(&self.file)
+    pub fn huggingface(slot: ComponentSlot, repo: &str, file: &str, size_bytes: u64) -> Self {
+        Self {
+            slot,
+            source: ComponentSource::HuggingFace {
+                repo: repo.to_string(),
+                file: file.to_string(),
+            },
+            size_bytes,
+        }
     }
+
+    /// The flat on-disk name a downloaded component takes. Two components of
+    /// one model sharing a basename would overwrite each other, which
+    /// [`curated_models_have_unique_component_files`] rejects at test time.
+    pub fn file_name(&self) -> &str {
+        match &self.source {
+            ComponentSource::HuggingFace { file, .. } => {
+                file.rsplit('/').next().unwrap_or(file.as_str())
+            }
+            ComponentSource::LocalFile { path } => path
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(path.as_str()),
+        }
+    }
+
+    /// Where this component actually lives once available.
+    pub fn resolved_path(&self, model_root: &Path, model_id: &str) -> PathBuf {
+        match &self.source {
+            ComponentSource::HuggingFace { .. } => {
+                model_root.join(model_id).join(self.file_name())
+            }
+            ComponentSource::LocalFile { path } => PathBuf::from(path),
+        }
+    }
+
+    /// Only downloadable components can be fetched; a user's own file is
+    /// present or it is not.
+    pub fn is_downloadable(&self) -> bool {
+        matches!(self.source, ComponentSource::HuggingFace { .. })
+    }
+}
+
+/// One LoRA applied to a generation. The engine accepts an unbounded list, so
+/// this is a per-request stack rather than a single slot.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoraSelection {
+    /// Absolute path to the LoRA file.
+    pub path: String,
+    /// Strength. Negative values are meaningful — they subtract a style.
+    pub multiplier: f64,
+    /// Applies only to a mixture model's high-noise stage (Wan 2.2 A14B).
+    #[serde(default)]
+    pub is_high_noise: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,7 +279,7 @@ impl GenerationModelSpec {
     pub fn component_paths(&self, model_root: &Path) -> Vec<PathBuf> {
         self.components
             .iter()
-            .map(|component| model_root.join(&self.id).join(component.file_name()))
+            .map(|component| component.resolved_path(model_root, &self.id))
             .collect()
     }
 
@@ -221,10 +289,8 @@ impl GenerationModelSpec {
         self.components
             .iter()
             .filter(|component| {
-                !model_root
-                    .join(&self.id)
-                    .join(component.file_name())
-                    .is_file()
+                component.is_downloadable()
+                    && !component.resolved_path(model_root, &self.id).is_file()
             })
             .collect()
     }
@@ -250,12 +316,12 @@ pub fn curated_models() -> Vec<GenerationModelSpec> {
             name: "Stable Diffusion XL 1.0".to_string(),
             family: "SDXL".to_string(),
             tasks: vec![GenerationTask::TextToImage, GenerationTask::ImageToImage],
-            components: vec![ModelComponent {
-                slot: ComponentSlot::Checkpoint,
-                repo: "stabilityai/stable-diffusion-xl-base-1.0".to_string(),
-                file: "sd_xl_base_1.0.safetensors".to_string(),
-                size_bytes: 6_938_040_682,
-            }],
+            components: vec![ModelComponent::huggingface(
+                    ComponentSlot::Checkpoint,
+                    "stabilityai/stable-diffusion-xl-base-1.0",
+                    "sd_xl_base_1.0.safetensors",
+                    6_938_040_682,
+                )],
             defaults: GenerationDefaults {
                 width: 1024,
                 height: 1024,
@@ -281,25 +347,24 @@ pub fn curated_models() -> Vec<GenerationModelSpec> {
             family: "Wan".to_string(),
             tasks: vec![GenerationTask::TextToVideo, GenerationTask::ImageToVideo],
             components: vec![
-                ModelComponent {
-                    slot: ComponentSlot::DiffusionModel,
-                    repo: "Comfy-Org/Wan_2.2_ComfyUI_Repackaged".to_string(),
-                    file: "split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors"
-                        .to_string(),
-                    size_bytes: 10_003_000_000,
-                },
-                ModelComponent {
-                    slot: ComponentSlot::Vae,
-                    repo: "Comfy-Org/Wan_2.2_ComfyUI_Repackaged".to_string(),
-                    file: "split_files/vae/wan2.2_vae.safetensors".to_string(),
-                    size_bytes: 1_411_000_000,
-                },
-                ModelComponent {
-                    slot: ComponentSlot::T5xxl,
-                    repo: "city96/umt5-xxl-encoder-gguf".to_string(),
-                    file: "umt5-xxl-encoder-Q8_0.gguf".to_string(),
-                    size_bytes: 6_043_000_000,
-                },
+                ModelComponent::huggingface(
+                    ComponentSlot::DiffusionModel,
+                    "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+                    "split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+                    10_003_000_000,
+                ),
+                ModelComponent::huggingface(
+                    ComponentSlot::Vae,
+                    "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+                    "split_files/vae/wan2.2_vae.safetensors",
+                    1_411_000_000,
+                ),
+                ModelComponent::huggingface(
+                    ComponentSlot::T5xxl,
+                    "city96/umt5-xxl-encoder-gguf",
+                    "umt5-xxl-encoder-Q8_0.gguf",
+                    6_043_000_000,
+                ),
             ],
             defaults: GenerationDefaults {
                 width: 704,
@@ -331,30 +396,30 @@ pub fn curated_models() -> Vec<GenerationModelSpec> {
             // video like any other H3 weight.
             tasks: vec![GenerationTask::TextToVideo, GenerationTask::ImageToVideo],
             components: vec![
-                ModelComponent {
-                    slot: ComponentSlot::DiffusionModel,
-                    repo: "leejet/MiniMax-H3-GGUF".to_string(),
-                    file: "minimax_h3_ref2va_pruned-Q4_K_M.gguf".to_string(),
-                    size_bytes: 11_420_663_904,
-                },
-                ModelComponent {
-                    slot: ComponentSlot::Llm,
-                    repo: "leejet/MiniMax-H3-GGUF".to_string(),
-                    file: "qwen3vl_32b_minimax_h3-Q2_K_M.gguf".to_string(),
-                    size_bytes: 13_102_161_024,
-                },
-                ModelComponent {
-                    slot: ComponentSlot::Vae,
-                    repo: "Comfy-Org/MiniMax-H3".to_string(),
-                    file: "vae/minimax_h3_video_vae_fp16.safetensors".to_string(),
-                    size_bytes: 5_207_808_496,
-                },
-                ModelComponent {
-                    slot: ComponentSlot::AudioVae,
-                    repo: "Comfy-Org/MiniMax-H3".to_string(),
-                    file: "vae/minimax_h3_audio_vae_fp32.safetensors".to_string(),
-                    size_bytes: 605_254_808,
-                },
+                ModelComponent::huggingface(
+                    ComponentSlot::DiffusionModel,
+                    "leejet/MiniMax-H3-GGUF",
+                    "minimax_h3_ref2va_pruned-Q4_K_M.gguf",
+                    11_420_663_904,
+                ),
+                ModelComponent::huggingface(
+                    ComponentSlot::Llm,
+                    "leejet/MiniMax-H3-GGUF",
+                    "qwen3vl_32b_minimax_h3-Q2_K_M.gguf",
+                    13_102_161_024,
+                ),
+                ModelComponent::huggingface(
+                    ComponentSlot::Vae,
+                    "Comfy-Org/MiniMax-H3",
+                    "vae/minimax_h3_video_vae_fp16.safetensors",
+                    5_207_808_496,
+                ),
+                ModelComponent::huggingface(
+                    ComponentSlot::AudioVae,
+                    "Comfy-Org/MiniMax-H3",
+                    "vae/minimax_h3_audio_vae_fp32.safetensors",
+                    605_254_808,
+                ),
             ],
             defaults: GenerationDefaults {
                 width: 864,
@@ -394,30 +459,30 @@ pub fn curated_models() -> Vec<GenerationModelSpec> {
             family: "MiniMax H3".to_string(),
             tasks: vec![GenerationTask::TextToVideo, GenerationTask::ImageToVideo],
             components: vec![
-                ModelComponent {
-                    slot: ComponentSlot::DiffusionModel,
-                    repo: "leejet/MiniMax-H3-GGUF".to_string(),
-                    file: "minimax_h3_fl2va_pruned-Q4_K_M.gguf".to_string(),
-                    size_bytes: 11_420_000_000,
-                },
-                ModelComponent {
-                    slot: ComponentSlot::Llm,
-                    repo: "leejet/MiniMax-H3-GGUF".to_string(),
-                    file: "qwen3vl_32b_minimax_h3-Q2_K_M.gguf".to_string(),
-                    size_bytes: 13_100_000_000,
-                },
-                ModelComponent {
-                    slot: ComponentSlot::Vae,
-                    repo: "Comfy-Org/MiniMax-H3".to_string(),
-                    file: "vae/minimax_h3_video_vae_fp16.safetensors".to_string(),
-                    size_bytes: 5_210_000_000,
-                },
-                ModelComponent {
-                    slot: ComponentSlot::AudioVae,
-                    repo: "Comfy-Org/MiniMax-H3".to_string(),
-                    file: "vae/minimax_h3_audio_vae_fp32.safetensors".to_string(),
-                    size_bytes: 605_000_000,
-                },
+                ModelComponent::huggingface(
+                    ComponentSlot::DiffusionModel,
+                    "leejet/MiniMax-H3-GGUF",
+                    "minimax_h3_fl2va_pruned-Q4_K_M.gguf",
+                    11_420_000_000,
+                ),
+                ModelComponent::huggingface(
+                    ComponentSlot::Llm,
+                    "leejet/MiniMax-H3-GGUF",
+                    "qwen3vl_32b_minimax_h3-Q2_K_M.gguf",
+                    13_100_000_000,
+                ),
+                ModelComponent::huggingface(
+                    ComponentSlot::Vae,
+                    "Comfy-Org/MiniMax-H3",
+                    "vae/minimax_h3_video_vae_fp16.safetensors",
+                    5_210_000_000,
+                ),
+                ModelComponent::huggingface(
+                    ComponentSlot::AudioVae,
+                    "Comfy-Org/MiniMax-H3",
+                    "vae/minimax_h3_audio_vae_fp32.safetensors",
+                    605_000_000,
+                ),
             ],
             defaults: GenerationDefaults {
                 width: 1344,
@@ -467,9 +532,8 @@ pub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> 
     for component in &spec.components {
         args.push(component.slot.flag().to_string());
         args.push(
-            model_root
-                .join(&spec.id)
-                .join(component.file_name())
+            component
+                .resolved_path(model_root, &spec.id)
                 .to_string_lossy()
                 .to_string(),
         );
@@ -538,6 +602,9 @@ pub struct GenerationRequest {
     /// Base64 PNG/JPEG starting frame, required by the image-driven tasks.
     #[serde(default)]
     pub init_image_base64: Option<String>,
+    /// LoRAs to apply, in order. Any model can take any number.
+    #[serde(default)]
+    pub loras: Vec<LoraSelection>,
 }
 
 /// Rejects a request that is out of bounds, and returns it with dimensions and
@@ -570,6 +637,18 @@ pub fn validate_request(
             return Err("Source image exceeds its size limit".to_string())
         }
         _ => {}
+    }
+
+    if request.loras.len() > MAX_LORAS {
+        return Err(format!("At most {MAX_LORAS} LoRAs can be applied at once"));
+    }
+    for lora in &request.loras {
+        if lora.path.trim().is_empty() || !Path::new(&lora.path).is_absolute() {
+            return Err("Each LoRA needs an absolute path".to_string());
+        }
+        if !lora.multiplier.is_finite() || !(-10.0..=10.0).contains(&lora.multiplier) {
+            return Err("LoRA strength is out of range".to_string());
+        }
     }
 
     let mut normalized = request.clone();
@@ -620,6 +699,21 @@ pub fn request_body(spec: &GenerationModelSpec, request: &GenerationRequest) -> 
         "seed": request.seed,
         "sample_params": sample_params,
     });
+    if !request.loras.is_empty() {
+        body["lora"] = Value::Array(
+            request
+                .loras
+                .iter()
+                .map(|lora| {
+                    json!({
+                        "path": lora.path,
+                        "multiplier": lora.multiplier,
+                        "is_high_noise": lora.is_high_noise,
+                    })
+                })
+                .collect(),
+        );
+    }
     if let Some(image) = &request.init_image_base64 {
         body["init_image"] = json!(image);
     }
@@ -1123,6 +1217,7 @@ mod tests {
             video_frames: 34,
             fps: 24,
             init_image_base64: None,
+            loras: Vec::new(),
         }
     }
 
@@ -1241,6 +1336,76 @@ mod tests {
         }))
         .is_err());
         assert!(decode_job_status(&json!({"status": "invented"})).is_err());
+    }
+
+    /// A user's own file is referenced where it lies, never copied into the
+    /// app's model directory and never counted as something to download.
+    #[test]
+    fn local_components_resolve_in_place_and_are_never_fetched() {
+        let mut spec = find_model("sdxl-base-1.0").expect("sdxl");
+        spec.components = vec![ModelComponent {
+            slot: ComponentSlot::Checkpoint,
+            source: ComponentSource::LocalFile {
+                path: "/Users/somebody/models/my-own.safetensors".to_string(),
+            },
+            size_bytes: 1,
+        }];
+        assert_eq!(
+            launch_args(&spec, Path::new("/app/models"), 8092)
+                .windows(2)
+                .find(|pair| pair[0] == "--model")
+                .map(|pair| pair[1].clone()),
+            Some("/Users/somebody/models/my-own.safetensors".to_string())
+        );
+        // Missing from disk, but still not downloadable — the app has no repo
+        // to fetch it from and must not report a download size for it.
+        assert!(spec.missing_components(Path::new("/app/models")).is_empty());
+        assert!(!spec.components[0].is_downloadable());
+    }
+
+    /// The engine ignores prompt-embedded `<lora:...>` tags on purpose, so the
+    /// structured array is the only way a LoRA reaches it — and any model can
+    /// take any number of them.
+    #[test]
+    fn lora_stacks_reach_the_request_body_and_are_bounded() {
+        let wan = find_model("wan2.2-ti2v-5b").expect("wan");
+        let mut request = video_request(GenerationTask::TextToVideo);
+        request.loras = vec![
+            LoraSelection {
+                path: "/loras/style.safetensors".to_string(),
+                multiplier: 0.8,
+                is_high_noise: false,
+            },
+            LoraSelection {
+                path: "/loras/motion.safetensors".to_string(),
+                multiplier: -0.4,
+                is_high_noise: true,
+            },
+        ];
+        let normalized = validate_request(&wan, &request).unwrap();
+        let body = request_body(&wan, &normalized);
+        let loras = body["lora"].as_array().expect("lora array");
+        assert_eq!(loras.len(), 2);
+        assert_eq!(loras[0]["path"], json!("/loras/style.safetensors"));
+        // Negative strengths are meaningful — they subtract a style.
+        assert_eq!(loras[1]["multiplier"], json!(-0.4));
+        assert_eq!(loras[1]["is_high_noise"], json!(true));
+
+        // No LoRAs means no key at all, not an empty array.
+        let plain = request_body(&wan, &video_request(GenerationTask::TextToVideo));
+        assert!(plain.get("lora").is_none());
+
+        let mut relative = request.clone();
+        relative.loras[0].path = "style.safetensors".to_string();
+        assert!(validate_request(&wan, &relative).is_err());
+
+        let mut wild = request.clone();
+        wild.loras[0].multiplier = f64::INFINITY;
+        assert!(validate_request(&wan, &wild).is_err());
+
+        let mut too_many = request.clone();
+        too_many.loras = std::iter::repeat_n(request.loras[0].clone(), MAX_LORAS + 1).collect();
+        assert!(validate_request(&wan, &too_many).is_err());
     }
 
     #[test]

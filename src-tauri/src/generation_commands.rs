@@ -273,6 +273,12 @@ pub async fn generation_download_model(
 
     let result = async {
         for component in &spec.components {
+            // A component the user supplied from their own disk is present or
+            // it is not; there is nothing to fetch and nothing to own.
+            let crate::generation::ComponentSource::HuggingFace { repo, file } = &component.source
+            else {
+                continue;
+            };
             let destination = root.join(component.file_name());
             if destination.is_file() {
                 continue;
@@ -280,14 +286,8 @@ pub async fn generation_download_model(
             // Download beside the destination and rename, so an interrupted
             // transfer never leaves a half file that looks installed.
             let temporary = root.join(format!(".{}.{}.part", component.file_name(), Uuid::new_v4()));
-            let outcome = crate::models::download_to_file(
-                &app,
-                &component.repo,
-                &component.file,
-                &temporary,
-                &cancel,
-            )
-            .await;
+            let outcome =
+                crate::models::download_to_file(&app, repo, file, &temporary, &cancel).await;
             if let Err(error) = outcome {
                 let _ = std::fs::remove_file(&temporary);
                 return Err(error);
