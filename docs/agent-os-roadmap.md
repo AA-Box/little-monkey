@@ -1310,6 +1310,119 @@ target by the fourth.
 - Each guard has its own test plus a counter-test that a real public address is
   still reachable; sabotaging the shared predicate fails all four independently.
 
+**Shipped — a refusal is now a value, not only a sentence.** `egress::EgressRule`
+names every rule the four guards enforce, and `EgressDenial` carries the rule plus
+per-request detail. This is the enabling half of "every blocked attempt is a ledger
+event with the rule that blocked it": nothing is recorded yet, but there is now
+something recordable, which is why it had to land before the sink rather than with
+it.
+
+- **The defect, stated concretely.** `knowledge_pipeline.rs` mapped a `Url::parse`
+  failure and a loopback block onto the same `UrlRejected(String)`, and one of its
+  tests asserted five different refusals — loopback, embedded credentials, a
+  `file://` scheme, an over-length URL, an `[::1]` literal — with the identical
+  `Err(UrlRejected(_))` pattern. `web.rs`'s one string
+  `"target host is a local/private address"` was the verdict of ten address
+  predicates, substring-matched by seven tests. `browser_worker.rs`'s message named
+  four classes while the predicate behind it blocked eleven, so the prose was not
+  merely vague, it was **wrong**.
+- **Codes, not variant names, are the identity.** `egress.loopback` and its 31
+  siblings are what a sink will store, so a test pins the whole list against a
+  written-out copy: renaming one orphans every denial already recorded under the old
+  name, and that has to be a deliberate two-place edit rather than a one-character
+  one.
+- **The enum, its code table and its `ALL` list are declared once**, by a small
+  macro, because hand-written they can drift: a variant missing from `ALL` compiles
+  fine, and `ALL` is exactly what the tests iterate — so the one mistake that
+  matters most would be the one the tests could not see.
+- **Denials travel through reqwest as themselves.** Both places a guard must hand
+  its verdict to somebody else's signature — `reqwest::dns::Resolve` and
+  `redirect::Attempt::error` — accept any `std::error::Error`, so the denial is
+  passed rather than `to_string()`ed and is recovered on the far side with
+  `downcast_ref`. Two tests now walk a real `reqwest::Error`'s source chain and
+  assert the rule. Previously the only machine-readable signal on that path was an
+  `io::ErrorKind::PermissionDenied` that the caller's own `format!` destroyed.
+- **One rule may not name its target**, and it is the rule whose target is the
+  secret: `EgressRule::redacts_target` is true only for embedded credentials.
+  `web.rs` already had this right by hand — its credentials refusal was the only one
+  of seven that omitted the URL — so this makes an accident of one guard's care into
+  a property the next guard inherits.
+- **The tests got stronger, not merely different.** The load-bearing one was
+  `fetch_impl_honors_settings_allow_local_network`, which asserted the *absence* of
+  the substring `"local/private"` to prove the guard let a target through. Any
+  reworded policy block would have passed it. It now asserts the absence of any rule
+  code at all, which is a claim about the whole class.
+- **Blocklists are unchanged.** Every predicate keeps its exact ranges; this
+  splits verdicts apart, it does not move a boundary. Where a guard checks a class
+  its siblings do not, that asymmetry is now visible in an inventory test rather
+  than hidden inside four differently-worded sentences.
+
+**Found while typing the guards, and left alone deliberately** — each is a real
+defect that naming rules made visible, and each is a behaviour change rather than a
+rename:
+
+- **`web.rs`'s two DNS rules disagree on the quantifier.** Its pre-check refuses a
+  hostname if **any** resolved answer is blocked; its resolver *prunes* blocked
+  answers and refuses only if **all** of them are. A dual-stack host answering with
+  one public and one private address is refused by the first and would have been
+  allowed by the second.
+- **`browser_worker.rs` does not block `240/4`,** nor `0.0.0.0/8` other than
+  `0.0.0.0` itself, so those classify as public navigation targets there while the
+  broadest guard refuses them.
+- **`knowledge_pipeline.rs` blocks all of `198.51/16`** where TEST-NET-2 is only
+  `198.51.100/24` — over-blocking, not a hole, but it is a real range a user could
+  legitimately need.
+- **`PipelineLimits::validate` never validates `max_redirects`,** so `max_redirects:
+  0` is accepted and silently forbids every redirect.
+- **`model_sources.rs` caps redirects at 8 while `egress.rs` caps at 10,** and it
+  hand-builds its client rather than starting from `egress::hardened()` — worse than
+  the cap mismatch suggests: it sets a connect timeout and **no read timeout at all**,
+  so a model-source peer that completes the handshake and then goes silent holds a
+  download open indefinitely. It spells the constructor `Client::builder()`, which is
+  not the spelling the bare-client ratchet counts, so the site is invisible to it.
+  This is the strongest candidate for the next egress commit.
+- **`hugging_face_license` discards a refusal twice, silently** — once for a
+  `Url::parse` failure and once for the policy verdict — falling through to a
+  fallback URL with no diagnostic. A `license_link` pointing at
+  `https://127.0.0.1/license` now produces a typed denial that is still thrown away.
+- **`validate_ollama_auth_url` constrains only the host,** so
+  `https://auth.ollama.ai:8443/anything` passes: the port and path of a
+  bearer-token endpoint are unpinned.
+- **Nothing pins a model download to the origin that resolved it.** The redirect
+  policy admits a hop to any public HTTPS host; reqwest strips `Authorization`
+  cross-host so the bearer does not travel, and the SHA-256 check is what actually
+  makes this safe — but that reliance was undocumented.
+- **`web.rs` builds four clients and installs the SSRF guard on one.** The other
+  three reach fixed provider endpoints except the SearXNG one, whose base URL is
+  user-configured — pointing it at loopback is a supported setup, which is why it is
+  a question about the policy and not a straightforward fix.
+- **`knowledge_pipeline.rs` compares `max_url_chars` against bytes**
+  (`value.len()`), so a URL of multibyte characters is cut earlier than the setting's
+  name promises. The new denial detail says "bytes" rather than papering over it.
+- **`allow_private_networks` is one switch over fourteen distinct rules,** so a
+  setting named for private networks also permits multicast, `255.255.255.255`,
+  `240/4` and the deprecated `::/96` form. Now that the rules have names, this could
+  become a per-class allowance; today it is all or nothing.
+
+**Two things the denial sink will have to handle, learnt from doing this first.**
+Neither is a defect in the sink's absence, which is precisely why finding them now
+was worth the ordering:
+
+- **Rule identity dies at every command boundary.** `knowledge_service.rs` and
+  `connectors.rs` both `.map_err(|error| error.to_string())` the moment a refusal
+  leaves the pipeline, and `web.rs`'s commands hand the UI a `String`. The code
+  survives *inside* the prose, so a human can grep it, but nothing can branch on the
+  rule. A sink fed from these call sites would be parsing its own output back out of
+  a sentence; the denial has to be recorded where it is raised, not where it is
+  displayed.
+- **Not every refusal is a request.** Some fire while *building* a policy from
+  configured origins, before anything is requested. Recording those as `egress.*`
+  denials would put phantom blocked requests in an operator's log for what is a typo
+  in settings. Most are kept off the rule path deliberately, but `origin_for_url` is
+  shared between the request and configuration paths, so a configuration error can
+  still surface `egress.host-missing` — the sink needs to know the difference rather
+  than trusting that every rule code means a request happened.
+
 **Acceptance:** each process record carries a deny-by-default egress policy —
 allowed hosts, ports, and protocols — that is narrower than or equal to its
 workspace policy and cannot be widened at runtime by the model, a skill, a
@@ -1363,11 +1476,12 @@ needs its own non-run-scoped table, and that table must not land before somethin
 writes to it — the caution being `ProcessLimits`' own doc, three of whose four fields
 are declaration-only to this day.
 
-**Nothing in the tree names a rule.** Every refusal today is hardcoded prose
-(`web.rs`, `knowledge_pipeline.rs`'s `UrlRejected(String)`), so a test asserting
-`is_err()` cannot tell a policy block from a typo in a URL, and neither can an
-operator reading a log. Typed rule identity has to land before any denial sink, or
-the sink records unparseable strings.
+**Nothing in the tree named a rule** — *addressed; see the shipped note above.*
+Every refusal was hardcoded prose (`web.rs`, `knowledge_pipeline.rs`'s
+`UrlRejected(String)`), so a test asserting `is_err()` could not tell a policy block
+from a typo in a URL, and neither could an operator reading a log. `EgressRule` now
+names all four guards' rules, which is why it landed before the sink rather than
+with it: a sink built first would have recorded unparseable strings.
 
 **Also missing from the "Today" above:** the inbound OpenAI-compatible
 `POST /v1/chat/completions` route forwards an external caller's body verbatim to a
