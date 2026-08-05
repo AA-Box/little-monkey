@@ -297,12 +297,44 @@ already finished. Work continuing in a spawned task re-enters the scope itself. 
 by a test so the next reader meets it as a documented property rather than as a blank
 column they assume is a bug.
 
-**Still to do before the items this unblocks can land:** the three shapes below are
-untouched — `browser_worker.rs`'s per-subresource decisions, `mcp.rs`'s process-wide
-cached transport, and `m4_runtime.rs`'s two unforwarded model branches — and the other
-64 client sites still record `None`. The mechanism exists and is proven; adopting it
-site by site is the remaining work, and each site is now a two-line change rather than
-a signature cascade.
+**First adoption — `m4_runtime.rs`, and the diagnosis below was wrong.** This item
+called it "two unforwarded model branches … the one case where the gap is a single
+unpassed parameter rather than a missing mechanism". Reading the file settles it the
+other way. `run_async_worker` is the single place M4 crosses from sync into async, and
+it does so by spawning a **fresh OS thread with a fresh current-thread runtime**. A
+task-local follows a task, and the task being blocked on is created *there* — so no
+ambient scope can survive that bridge no matter what the caller was running under.
+`run_scope::current()` inside any of it answered `None` unconditionally, which means the
+gap was never two branches: it was all eight async egress paths in the file, MCP tool
+calls and delivery pushes and PR review included. Two of those already received
+`request.run_id` and still lost it, which is precisely why "a single unpassed
+parameter" read as the whole story.
+
+So the fix goes at the bridge rather than at the branches: `run_async_worker` takes a
+`RunScope` and wraps the future in `run_scope::scoped`. Required, not optional — all
+eight sites are forced to answer "whose work is this?", and the two possible answers are
+the enum's two arms. Five sites now carry the run (model, model discovery, MCP,
+delivery, PR review; plus the legacy-recipe model path, which reaches
+`providers::read_key` and so is the credentialed one). The three OAuth sites answer
+`unattributed.user-action` through a named constant whose doc states the ceiling: the
+`OAuthTransport` trait fixes those signatures, so a token refresh driven from *inside* a
+run would still record as a user action. Widening that means changing the trait and both
+test doubles, so it waits for a caller that needs it.
+
+Three tests pin the bridge, and the second exists because the first is not enough: a
+`thread_local!` would also pass "the scope survives the thread hop", since the worker
+builds a *current-thread* runtime. The one that awaits four times inside the worker is
+the one it would fail. The third runs eight bridges on eight threads and checks none
+reads another's run — the failure being not a missing label but one run's egress
+attributed to another, which under a per-run allowlist is the wrong policy against the
+wrong host. Verified by sabotage: dropping the `scoped` wrapper turns all three red and
+leaves the file's other nine tests green.
+
+**Still to do:** `browser_worker.rs`'s per-subresource decisions and `mcp.rs`'s
+process-wide cached transport are untouched, and the remaining client sites still record
+`None`. `mcp.rs` is the genuinely hard one — one client per server connection, cached
+process-wide, so per-run policy means giving up the connection reuse and OAuth refresh
+the design depends on — and it wants its own decision rather than a mechanical adoption.
 
 ---
 
@@ -337,7 +369,9 @@ rather than asserted:
   losing the connection reuse and OAuth refresh the design depends on.
 - `m4_runtime.rs` forwards the run id to its MCP, browser and shell branches but not
   to its two model branches — the one case where the gap is a single unpassed
-  parameter rather than a missing mechanism.
+  parameter rather than a missing mechanism. *(Wrong, and corrected above: the branches
+  that did receive the id lost it again at `run_async_worker`, so the gap was the
+  sync-to-async bridge and covered all eight of the file's async egress paths.)*
 
 **And the part that any design has to answer first: some work legitimately has no
 run.** Timer-driven knowledge refresh, connector verification in Settings, model
