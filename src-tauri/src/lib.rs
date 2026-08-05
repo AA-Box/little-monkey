@@ -217,6 +217,11 @@ pub mod output_cap;
 // riskier change.
 pub mod denial_sink;
 pub mod egress;
+// The run a piece of work belongs to, carried as a `tokio::task_local!` rather
+// than threaded through signatures that have no other reason to hold it. See
+// `run_scope.rs` for why a thread-local would be a correctness bug here and not
+// merely a lossy shortcut.
+pub mod run_scope;
 // `pub` (unlike `sessions`/`tools`/`system`/`models`/`git`/`llama` above) so
 // `monkey-cli` (Plan/Act + risk-adaptive permissions design doc, phase 4) can
 // call `permissions::path_risk_floor` directly for its own floor-only
