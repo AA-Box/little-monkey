@@ -29,22 +29,34 @@ function componentNames(model: GenerationModel): string[] {
   return model.components.map(componentFileName);
 }
 
-export type StudioMode = "image" | "video" | "audio";
+export type StudioMode = "models" | "image" | "video" | "audio";
 
-const MODE_TASKS: Record<StudioMode, GenerationTask[]> = {
+/** Which tasks each making-tab covers. The models tab makes nothing, so it
+ *  has no entry and its model list is never filtered. */
+const MODE_TASKS: Record<Exclude<StudioMode, "models">, GenerationTask[]> = {
   image: ["text_to_image", "image_to_image"],
   video: ["text_to_video", "image_to_video"],
   audio: ["text_to_speech"],
 };
 
+const tasksFor = (mode: StudioMode): GenerationTask[] =>
+  mode === "models" ? [] : MODE_TASKS[mode];
+
+/** Studio talks to the engine over Tauri commands, which only exist inside the
+ *  desktop window. In a plain browser tab every call throws a bare TypeError
+ *  about `invoke`, which says nothing useful — detect it and say the real
+ *  thing instead. */
+const IN_DESKTOP_APP =
+  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
 export function StudioPanel() {
   const { t } = useT();
-  const [mode, setMode] = useState<StudioMode>("image");
+  const [mode, setMode] = useState<StudioMode>("models");
   const [status, setStatus] = useState<GenerationEngineStatus | null>(null);
   const [models, setModels] = useState<GenerationModel[]>([]);
   const [gallery, setGallery] = useState<GenerationEntry[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [task, setTask] = useState<GenerationTask>(MODE_TASKS[mode][0]);
+  const [task, setTask] = useState<GenerationTask>("text_to_image");
   const [prompt, setPrompt] = useState("");
   const [negativePrompt, setNegativePrompt] = useState("");
   const [seconds, setSeconds] = useState(3);
@@ -62,7 +74,10 @@ export function StudioPanel() {
   // A segment shows only the models that can do something in it, so the
   // picker never offers a video model under Image.
   const visible = useMemo(
-    () => models.filter((model) => model.tasks.some((entry) => MODE_TASKS[mode].includes(entry))),
+    () =>
+      mode === "models"
+        ? models
+        : models.filter((model) => model.tasks.some((entry) => tasksFor(mode).includes(entry))),
     [models, mode],
   );
   const selected = useMemo(
@@ -81,7 +96,7 @@ export function StudioPanel() {
       setModels(list);
       setGallery([...entries].reverse());
       const usable = list.filter((model) =>
-        model.tasks.some((entry) => MODE_TASKS[mode].includes(entry)),
+        mode === "models" || model.tasks.some((entry) => tasksFor(mode).includes(entry)),
       );
       setSelectedId((current) => {
         if (current && usable.some((model) => model.id === current)) return current;
@@ -115,9 +130,11 @@ export function StudioPanel() {
   // video model to an image-only one must not leave a video task armed.
   useEffect(() => {
     const allowed = selected
-      ? selected.tasks.filter((entry) => MODE_TASKS[mode].includes(entry))
-      : MODE_TASKS[mode];
-    if (!allowed.includes(task)) setTask(allowed[0] ?? MODE_TASKS[mode][0]);
+      ? selected.tasks.filter((entry) => tasksFor(mode).includes(entry))
+      : tasksFor(mode);
+    if (mode !== "models" && !allowed.includes(task)) {
+      setTask(allowed[0] ?? tasksFor(mode)[0]);
+    }
   }, [selected, task, mode]);
 
   const loadPreview = useCallback(
@@ -207,6 +224,17 @@ export function StudioPanel() {
     }
   };
 
+  if (!IN_DESKTOP_APP) {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center p-8 text-center">
+        <div className="max-w-md">
+          <h2 className="text-sm font-medium">{t("Studio.browserOnly.title")}</h2>
+          <p className="mt-2 text-xs text-muted">{t("Studio.browserOnly.body")}</p>
+        </div>
+      </div>
+    );
+  }
+
   if (status && !status.supported) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center p-8 text-center">
@@ -234,6 +262,7 @@ export function StudioPanel() {
         active={mode}
         onChange={(next) => setMode(next as StudioMode)}
         tabs={[
+          { id: "models", label: t("Studio.tab.models") },
           { id: "image", label: t("Studio.tab.image") },
           { id: "video", label: t("Studio.tab.video") },
           { id: "audio", label: t("Studio.tab.audio") },
@@ -250,6 +279,7 @@ export function StudioPanel() {
         </p>
       )}
 
+      {mode === "models" ? (
       <section className="mb-4">
         <div className="mb-2 flex items-center justify-between">
           <h2 className="text-xs font-medium text-muted">{t("Studio.models")}</h2>
@@ -380,12 +410,32 @@ export function StudioPanel() {
           })}
         </div>
       </section>
+      ) : (
+        <section className="mb-3">
+          <label className="grid gap-1 text-[11px] text-muted">
+            {t("Studio.models")}
+            <select
+              className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+              value={selectedId ?? ""}
+              onChange={(event) => setSelectedId(event.target.value || null)}
+            >
+              {visible.length === 0 && <option value="">{t("Studio.noneForTab")}</option>}
+              {visible.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.name}
+                  {model.installed ? "" : ` — ${t("Studio.notDownloaded")}`}
+                </option>
+              ))}
+            </select>
+          </label>
+        </section>
+      )}
 
-      {selected && (
+      {mode !== "models" && selected && (
         <section className="mb-4 grid gap-3">
           <div className="flex flex-wrap gap-1.5">
             {selected.tasks
-              .filter((entry) => MODE_TASKS[mode].includes(entry))
+              .filter((entry) => tasksFor(mode).includes(entry))
               .map((entry) => (
               <Button
                 key={entry}
@@ -503,6 +553,7 @@ export function StudioPanel() {
         </section>
       )}
 
+      {mode !== "models" && (
       <section>
         <h2 className="mb-2 text-xs font-medium text-muted">{t("Studio.gallery")}</h2>
         {gallery.length === 0 ? (
@@ -510,7 +561,7 @@ export function StudioPanel() {
         ) : (
           <div className="grid gap-3 sm:grid-cols-2">
             {gallery
-              .filter((entry) => MODE_TASKS[mode].includes(entry.task))
+              .filter((entry) => tasksFor(mode).includes(entry.task))
               .map((entry) => {
               const preview = previews[entry.artifactId];
               return (
@@ -543,6 +594,7 @@ export function StudioPanel() {
           </div>
         )}
       </section>
+      )}
     </div>
   );
 }

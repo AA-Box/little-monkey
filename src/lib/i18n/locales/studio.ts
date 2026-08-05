@@ -9,6 +9,7 @@ export const studioLocale: Record<string, string> = {
   "App.section.chat": "Chat",
   "App.section.studio": "Studio",
 
+  "Studio.tab.models": "Models",
   "Studio.tab.image": "Image",
   "Studio.tab.video": "Video",
   "Studio.tab.audio": "Audio",
@@ -20,6 +21,11 @@ export const studioLocale: Record<string, string> = {
   "Studio.video.title": "Video",
   "Studio.video.subtitle": "Generate video on this machine. No account, no upload.",
   "Studio.models": "Models",
+  "Studio.noneForTab": "No model in your library can do this yet",
+  "Studio.notDownloaded": "not downloaded",
+  "Studio.browserOnly.title": "Studio runs in the desktop app",
+  "Studio.browserOnly.body":
+    "This page is open in a browser, where Studio cannot reach the generation engine. Open Little Monkey itself to add models and generate.",
   "Studio.emptyLibrary": "Your library is empty. Add a model to get started — nothing is preinstalled.",
   "Studio.forget": "Forget this model",
   "Studio.add.open": "Add model",
