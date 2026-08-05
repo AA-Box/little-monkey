@@ -394,6 +394,14 @@ fn blocked_reason_ipv6(ip: &Ipv6Addr) -> Option<EgressRule> {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return blocked_reason_ipv4(&v4);
     }
+    // The third spelling of a v4 address, and the one this guard was missing:
+    // `64:ff9b::7f00:1` *is* `127.0.0.1` wherever a NAT64/CLAT path exists. Delegated
+    // to this file's own v4 rule rather than refused outright, because the prefix is
+    // live and legitimate — `64:ff9b::` plus a public address is how a v6-only network
+    // reaches a v4-only server. See `egress::nat64_embedded_ipv4`.
+    if let Some(v4) = crate::egress::nat64_embedded_ipv4(ip) {
+        return blocked_reason_ipv4(&v4);
+    }
     if ip.is_loopback() {
         return Some(EgressRule::Loopback);
     }
@@ -1579,6 +1587,37 @@ mod tests {
         assert_eq!(mine, 0, "nothing was refused, so nothing may be recorded");
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Proves this guard *delegates* NAT64 to its own v4 rule. `64:ff9b::7f00:1` is
+    /// `127.0.0.1` wherever a NAT64/CLAT path exists, and this guard — the one the
+    /// agent's own fetch tool goes through — read it as an ordinary public address.
+    ///
+    /// The public row is the load-bearing counter-test: refusing the whole prefix would
+    /// satisfy every other row and break a v6-only network reaching a v4-only host.
+    #[test]
+    fn nat64_reaches_this_guards_own_ipv4_rule() {
+        use std::str::FromStr;
+        for (text, expected) in [
+            ("64:ff9b::7f00:1", Some(EgressRule::Loopback)),
+            ("64:ff9b::a00:1", Some(EgressRule::PrivateV4)),
+            ("64:ff9b::c0a8:101", Some(EgressRule::PrivateV4)),
+            ("64:ff9b::a9fe:a9fe", Some(EgressRule::LinkLocal)),
+            ("64:ff9b::", Some(EgressRule::Unspecified)),
+            // The divergence proof, and the reason this delegates rather than
+            // importing a shared blocklist: `100.64.0.1` is CGNAT, which only the
+            // broadest guard refuses. This one must still allow it, in either
+            // spelling — a shared blocklist would refuse it here and newly break
+            // Tailscale users.
+            ("64:ff9b::6440:1", None),
+            ("64:ff9b::5db8:d822", None),
+        ] {
+            assert_eq!(
+                blocked_reason_ipv6(&Ipv6Addr::from_str(text).expect("parses")),
+                expected,
+                "{text} must report whichever v4 rule its embedded address trips"
+            );
+        }
     }
 
     #[test]
