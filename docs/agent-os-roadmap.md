@@ -1546,6 +1546,47 @@ hazard `egress::hardened`'s doc warns about, already shipped. Two are load-beari
 `portability_commands.rs`'s 45-second budget against an archive capped at
 `2 × max_archive_bytes`, and `knowledge_service.rs`'s two 45-second budgets against
 `max_file_bytes`. That, not "no timeout", is the rule worth ratcheting.
+
+**Those three are now fixed, and the numbers were worse than "load-bearing" conveys.**
+`webdav_client()`'s 45-second total against a 1 GiB cap needs **23 MB/s sustained for
+the whole request**, so WebDAV backup could not complete a snapshot past a couple of
+hundred megabytes on an ordinary connection — the upload half had the same ceiling, and
+the failure surfaced as a transport error rather than as "too slow". `knowledge_service`'s
+two clients needed **745 KB/s** against a 32 MiB `max_file_bytes`, so a large PDF from a
+slow or rate-limited host truncated. All three now take a *silence* budget of the same
+45 seconds via `egress::hardened_with_read_budget`, overriding its redirect policy back
+to `Policy::none()` (WebDAV pins every path to the configured origin in `remote_url`;
+`knowledge_service` pins the dialled address with `.resolve()`, and the pipeline follows
+redirects itself so each hop gets its own guarded lookup). The two duplicate
+`knowledge_service` builders collapsed into one `pinned_http_client` helper.
+
+One thing the new shape does not cover, accepted deliberately and written into
+`webdav_client`'s doc: reqwest has no *write* timeout, so a server that accepts a
+connection and then stops reading during an upload is no longer bounded. That needs a
+pathological peer, whereas the truncation it replaces broke every large backup against a
+healthy one.
+
+The proof is one test in `egress.rs` rather than three per call site, because the property
+belongs to the two options and not to any one caller:
+`a_total_deadline_aborts_a_trickling_body_where_a_read_budget_does_not` trickles a body
+one byte at a time and asserts both halves — the read budget lets all 12 bytes through,
+and the *identical* trickle fails once that same 400ms becomes a deadline for the whole
+request. Either half alone would be misleading. Sabotage-verified by widening the total
+to 30 seconds, which fails the second assertion, confirming the `Err` comes from the
+deadline and not from the fixture.
+
+**The ratchet is real and deferred one PR, because writing it found 18 sites, not 8.**
+Scanning `Client::builder()` chains for their own `.timeout(` reports:
+`bin/monkey-cli/daemon/remote/client.rs` 1, `browser_pane.rs` 1, `connectors.rs` 1,
+`diagnostics.rs` 1, `m4_runtime.rs` 2, `m5_delivery/reviewer.rs` 1, `m7_companion.rs` 3,
+`ollama.rs` 3, `runtime_pr_watcher.rs` 1, `web.rs` 4. Most are legitimate — a total
+deadline is correct when the response is small and fully buffered, as with
+`connectors.rs`'s 64 KiB cap under 15 seconds — but an allow-list is only worth having if
+every entry names the cap that makes its deadline proportionate, and verifying 18 of those
+is its own change rather than a rider on a bug fix. Two known gaps in the scan to settle
+there: a chain starting from `hardened()` instead of `Client::builder()` escapes it, and
+`.timeout(` on a *`RequestBuilder`* is a different, usually-correct thing that the
+substring cannot distinguish.
 - **`hugging_face_license` discards a refusal twice, silently** — once for a
   `Url::parse` failure and once for the policy verdict — falling through to a
   fallback URL with no diagnostic. A `license_link` pointing at
