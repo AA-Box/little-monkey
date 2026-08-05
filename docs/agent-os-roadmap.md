@@ -1633,11 +1633,37 @@ code rather than re-read:
 defect that naming rules made visible, and each is a behaviour change rather than a
 rename:
 
-- **`web.rs`'s two DNS rules disagree on the quantifier.** Its pre-check refuses a
+- ~~**`web.rs`'s two DNS rules disagree on the quantifier.** Its pre-check refuses a
   hostname if **any** resolved answer is blocked; its resolver *prunes* blocked
   answers and refuses only if **all** of them are. A dual-stack host answering with
   one public and one private address is refused by the first and would have been
-  allowed by the second.
+  allowed by the second.~~ **Fixed, and the entry left out which side was wrong.**
+
+  It reads as a hole in the permissive half. It is the opposite: the pre-check was
+  over-blocking. `SsrfGuardedResolver` prunes blocked answers and hands `reqwest` only
+  the survivors, and — as its own doc says — those are *exactly* what `reqwest`
+  connects to, so a pruned private answer is never dialled. Pruning is therefore safe,
+  and refusing the whole request because one of several answers was private turned an
+  ordinary split-horizon or dual-stack host into a fetch that could not be made, with a
+  denial naming a rule the connection would never have tripped.
+
+  The pre-check now matches the resolver's quantifier. Kept as a layer rather than
+  deleted, even though the resolver is the only enforcement: it is the sole guard for a
+  URL that never reaches a resolver — the literal-IP arms, and any future caller that
+  validates without installing one — and deleting it would make that mistake silent.
+  Verified that no such caller exists today before loosening it: the only production
+  caller is `fetch_impl` and the redirect policy it builds, both on a client carrying
+  the guarded resolver.
+
+  The quantifier is extracted into `classify_resolved_answers` purely so it has a test.
+  The case the change is *about* — one public answer and one private — cannot be
+  produced hermetically through `to_socket_addrs`, and a rule only the deployment
+  environment can exercise is a rule with no test. Asserted in both orders, because a
+  loop that returns early on the first blocked answer passes one order and fails the
+  other, which is exactly the old bug. Counter-tests keep "allow everything" out: every
+  answer blocked is still refused and still names a rule, and an empty answer list
+  stays `egress.dns-no-addresses` — a different fact from "everything was refused", the
+  same split the resolver already made.
 - ~~**`browser_worker.rs` does not block `240/4`,** nor `0.0.0.0/8` other than
   `0.0.0.0` itself.~~ **Fixed.** Two arms in `classify_v4`, spelled the same way as
   the broad guard's own tests (`0.1.2.3`, `240.0.0.1`) so the two files agree by
@@ -1728,9 +1754,23 @@ rename:
   red, and loosening the prefix check from /96 to its first two segments is caught by
   the counter-test with `64:ff9b:0:0:1::7f00:1` — a network-specific-prefix shape whose
   low bytes would otherwise be judged as an address.
-- **`knowledge_pipeline.rs` blocks all of `198.51/16`** where TEST-NET-2 is only
+- ~~**`knowledge_pipeline.rs` blocks all of `198.51/16`** where TEST-NET-2 is only
   `198.51.100/24` — over-blocking, not a hole, but it is a real range a user could
-  legitimately need.
+  legitimately need.~~ **Fixed.** Narrowed to the `198.51.100/24` RFC 5737 actually
+  reserves. The 65,280 addresses it over-blocked are ordinary public space, so this was
+  a guard refusing traffic no rule entitled it to refuse, and the failure mode was a
+  knowledge source that simply could not be fetched behind a denial naming a
+  documentation range the address is not in. Its two sibling arms (`192.0.2/24`,
+  `203.0.113/24`) were already spelled to the RFC; this one was the outlier.
+
+  Worth noting how this landed: the earlier renaming change deliberately preserved the
+  /16 because narrowing it newly *allows* fetches and that is not a decision to smuggle
+  into a rename — and it left a test pinning `198.51.0.1` as refused precisely so the
+  narrowing would have to be a visible, deliberate edit. That worked. The pin is now
+  four counter-test rows instead: both neighbours of the real /24 and both ends of the
+  /16, because narrowing a range is where an off-by-one shows up, and getting it wrong
+  either leaks the documentation range or under-narrows. Sabotage-verified — restoring
+  the /16 fails with `198.51.0.1 is ordinary public space and must not be refused`.
 - ~~**`PipelineLimits::validate` never validates `max_redirects`,** so `max_redirects:
   0` is accepted and silently forbids every redirect.~~ **Fixed — and this entry had
   the danger the wrong way round.** `0` is a coherent setting: refusing every redirect

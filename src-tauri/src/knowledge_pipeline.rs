@@ -914,13 +914,20 @@ fn non_public_ipv4_rule(address: Ipv4Addr) -> Option<EgressRule> {
     if matches!(address.octets(), [198, 18 | 19, _, _]) {
         return Some(EgressRule::Benchmarking);
     }
-    // Deliberately left as `198.51/16`, which is wider than the RFC 5737
-    // TEST-NET-2 block `198.51.100/24` — it blocks 65,280 addresses that are
-    // ordinary public space. Preserved rather than narrowed because this change
-    // is behaviour-preserving by contract; narrowing it would newly *allow*
-    // fetches, which is not a decision to smuggle into a renaming.
-    if matches!(address.octets(), [198, 51, _, _]) {
-        return Some(EgressRule::TestNet);
+    // `198.51.100/24` and no wider, which is what RFC 5737 actually reserves for
+    // TEST-NET-2. This arm was `[198, 51, _, _]` — a /16 — and the earlier renaming
+    // change preserved that on purpose, because narrowing it newly *allows* fetches and
+    // that is not a decision to smuggle into a rename. It left a test pinning
+    // `198.51.0.1` as refused so the narrowing would have to be a visible, deliberate
+    // edit. This is that edit.
+    //
+    // The 65,280 addresses it over-blocked are ordinary public space, so this was a
+    // guard refusing traffic no rule entitles it to refuse — the failure mode being a
+    // knowledge source that simply cannot be fetched, with a denial naming a
+    // documentation range the address is not in. The two sibling arms are already spelled
+    // to the RFC (`192.0.2/24`, `203.0.113/24`); this one was the outlier.
+    if matches!(address.octets(), [198, 51, 100, _]) {
+        return Some(EgressRule::TestNet); // TEST-NET-2
     }
     if matches!(address.octets(), [203, 0, 113, _]) {
         return Some(EgressRule::TestNet); // TEST-NET-3
@@ -4997,10 +5004,7 @@ mod tests {
             ("198.18.0.1", EgressRule::Benchmarking),
             ("198.19.255.255", EgressRule::Benchmarking),
             ("198.51.100.1", EgressRule::TestNet),
-            // Inside this guard's wider-than-RFC `198.51/16` arm, and outside the
-            // documented `198.51.100/24`. Pinned so that narrowing the range to
-            // the RFC becomes a visible, deliberate edit rather than a silent one.
-            ("198.51.0.1", EgressRule::TestNet),
+            ("198.51.100.255", EgressRule::TestNet),
             ("203.0.113.1", EgressRule::TestNet),
             ("240.0.0.1", EgressRule::ReservedRange),
             ("::1", EgressRule::Loopback),
@@ -5049,6 +5053,15 @@ mod tests {
             "198.20.0.1",
             "198.52.0.1",
             "203.0.114.1",
+            // The 65,280 addresses this guard used to over-block. TEST-NET-2 is
+            // `198.51.100/24` and nothing wider, so every other `198.51.x` is ordinary
+            // public space. Both neighbours of the real /24 plus both ends of the /16,
+            // because narrowing a range is where an off-by-one shows up: get it wrong and
+            // either the documentation range leaks through or the fix under-narrows.
+            "198.51.0.1",
+            "198.51.99.255",
+            "198.51.101.0",
+            "198.51.255.254",
             "223.255.255.254",
             "2606:2800:220:1:248:1893:25c8:1946",
             // A mapped *public* address: the unwrap must not refuse it either.
