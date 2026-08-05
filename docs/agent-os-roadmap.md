@@ -1606,6 +1606,53 @@ is its own change rather than a rider on a bug fix. Two known gaps in the scan t
 there: a chain starting from `hardened()` instead of `Client::builder()` escapes it, and
 `.timeout(` on a *`RequestBuilder`* is a different, usually-correct thing that the
 substring cannot distinguish.
+
+**Shipped — and the premise "a total deadline is fine when the body is small and
+buffered" turned out to be too simple.** Auditing all 15 sites (10 verifiers, each
+verdict then adversarially challenged by a second reader instructed to refute it) turned
+up **three** distinct failure modes, not one:
+
+- **(A) A large download.** The truncation the rule is named for. Two sites, both
+  converted rather than allow-listed. `bin/monkey-cli/daemon/remote/client.rs`'s
+  `fetch_artifact` reads a whole artifact out of one JSON body — the runner inlines it as
+  `content_base64` — so a `max_artifact_bytes` at its 32 MiB ceiling arrives as ~43 MiB
+  through a single `bytes()` call under a 30-second total: **1.4 MB/s sustained**.
+  `m7_companion`'s ComfyUI `{base}/view` download is bounded only by the caller's 256 MiB
+  `MAX_MEDIA_BYTES`, checked after the fact, so 30 seconds meant **8.9 MB/s**. Localhost
+  never noticed; `endpoint.base_url` is user-configured.
+- **(B) A large *upload*.** `ClientBuilder::timeout` covers writing the request body, and
+  it is easy to score only the response and miss this — the first reader did on both
+  sites, and the challenger caught it. `m7_companion`'s image-edit multipart (1800s) and
+  its transcription upload (3600s) each carry a body bounded only by `MAX_MEDIA_BYTES`:
+  149 KB/s and 74 KB/s respectively, *plus* the provider's own render or transcription
+  time inside the same budget.
+- **(C) Work that is not network at all.** A `"stream": false` request to a local model
+  sends nothing until generation finishes, so the deadline is a ceiling on *inference* and
+  a slow model surfaces as a transport failure. `m4_runtime`'s 120s workflow client,
+  `m5_delivery/reviewer`'s 900s, and `ollama.rs`'s 60s `/api/embed` — where
+  `EMBED_BATCH_SIZE` caps the vector *count* at 32, not the bytes and not the work, while
+  a spec may declare up to 65,536 dimensions.
+
+B and C are recorded rather than converted: each needs a decision about what the ceiling
+*should* be, and a `read_timeout` alone would let a wedged local model hang forever. The
+allow-list entries say which category they are, so the debt is visible at the site.
+
+Two things about the ratchet itself worth writing down, both found by trying to break it:
+
+- **The scan counted a doc comment as a use.** `web.rs`'s `search_client` doc mentions
+  `Client::builder()` only to say it deliberately does *not* use it, and the scan picked up
+  a `.timeout(` thirty-odd lines below as if it belonged to that chain. This is the third
+  time prose has tripped a ratchet in this file, so the fix went into the scan — both
+  ratchets now strip comment-only lines — rather than into another instruction to talk
+  around a spelling. The window is verified irrelevant at 25, 40 and 80 lines, which is
+  the property that says the parse is no longer accidental.
+- **Three of the nine counts I wrote by hand were wrong,** which is the argument for the
+  ratchet in one line: nobody holds this inventory in their head. `web.rs` is 1 rather
+  than 2 precisely *because* `search_client` starts from `hardened_with_read_budget` — the
+  documented hole, and the one that will let a future total deadline through.
+
+Sabotage-verified both directions: a new `Client::builder().timeout(..)` is caught and
+named, and a `.timeout(` on a *`RequestBuilder`* correctly does not trip it.
 - **`hugging_face_license` discards a refusal twice, silently** — once for a
   `Url::parse` failure and once for the policy verdict — falling through to a
   fallback URL with no diagnostic. A `license_link` pointing at

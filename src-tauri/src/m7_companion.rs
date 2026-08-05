@@ -1397,7 +1397,16 @@ async fn generate_comfy_image(
     replace_workflow_placeholders(&mut workflow, request);
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(30))
+        // A silence budget rather than a deadline for the whole request. The
+        // `{base}/view` download below reads the finished image with one
+        // `bytes()` call and the only size bound on it is the caller's 256 MiB
+        // `MAX_MEDIA_BYTES`, checked after the fact — so 30 seconds for the whole
+        // request meant 8.9 MB/s sustained at that bound. Localhost never noticed;
+        // `endpoint.base_url` is user-configured and a ComfyUI on the LAN or
+        // further away truncated a large render mid-body. The queue-poll requests
+        // sharing this client are small JSON and are bounded by silence just as
+        // well.
+        .read_timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| error.to_string())?;
     let base = endpoint.base_url.trim_end_matches('/');
