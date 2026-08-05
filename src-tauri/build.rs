@@ -42,6 +42,10 @@ fn main() {
 fn emit_managed_runtime_trust() {
     emit_runtime_digest("llama-b9637", "LITTLE_MONKEY_TRUSTED_RUNTIME_MANIFEST_SHA256");
     emit_runtime_digest(
+        "llama-tts-b10278",
+        "LITTLE_MONKEY_TRUSTED_TTS_MANIFEST_SHA256",
+    );
+    emit_runtime_digest(
         "sd-master-812-ea7f0c8",
         "LITTLE_MONKEY_TRUSTED_SD_MANIFEST_SHA256",
     );

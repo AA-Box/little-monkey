@@ -14,7 +14,10 @@ export const studioLocale: Record<string, string> = {
   "Studio.tab.video": "Video",
   "Studio.tab.audio": "Audio",
   "Studio.audio.title": "Audio",
-  "Studio.audio.subtitle": "Speak text in a chosen voice, or clone one from a recording. Nothing leaves this machine.",
+  "Studio.audio.subtitle":
+    "Speak text in a chosen voice, or clone one from a recording. Nothing leaves this machine.",
+  "Studio.add.speechHint":
+    "A speech model is its backbone on --model plus its projector on --mmproj.",
   "Studio.task.text_to_speech": "Text to speech",
   "Studio.image.title": "Image",
   "Studio.image.subtitle": "Generate images on this machine. No account, no upload.",
@@ -94,9 +97,11 @@ export const studioLocale: Record<string, string> = {
   "Studio.hiresSteps": "Hires steps",
   "Studio.seedPlaceholder": "Empty for random",
   "Studio.seedShuffle": "Pick a random seed",
-  "Studio.speakerFile": "Voice profile",
+  "Studio.speakerFile": "Reference voice",
   "Studio.speakerHint":
-    "Optional path to an OuteTTS speaker profile (.json). Leave empty for the model's own voice.",
+    "Optional path to an audio clip. The voice in it is the voice you get. Leave empty for the model's own.",
+  "Studio.language": "Language",
+  "Studio.languageHint": "ISO 639-1, e.g. en",
   "Studio.result.edit": "Edit this",
   "Studio.result.save": "Save",
   "Studio.result.noEditTask":

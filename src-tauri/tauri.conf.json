@@ -4,9 +4,9 @@
   "version": "1.1.0",
   "identifier": "com.littlemonkey.app",
   "build": {
-    "beforeDevCommand": "pnpm stage:runtime && pnpm stage:runtime:sd && pnpm stage:cli && pnpm dev",
+    "beforeDevCommand": "pnpm stage:runtime && pnpm stage:runtime:tts && pnpm stage:runtime:sd && pnpm stage:cli && pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm stage:runtime && pnpm codesign:runtime && pnpm stage:runtime:sd && pnpm codesign:runtime:sd && pnpm stage:cli && pnpm build",
+    "beforeBuildCommand": "pnpm stage:runtime && pnpm codesign:runtime && pnpm stage:runtime:tts && pnpm codesign:runtime:tts && pnpm stage:runtime:sd && pnpm codesign:runtime:sd && pnpm stage:cli && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {

@@ -163,6 +163,7 @@ export function StudioPanel() {
   const [seed, setSeed] = useState("");
   const [initImage, setInitImage] = useState<string | null>(null);
   const [speakerFile, setSpeakerFile] = useState("");
+  const [language, setLanguage] = useState("");
   const [loras, setLoras] = useState<LoraSelection[]>([]);
   const [settings, setSettings] = useState<RunSettings | null>(null);
   const [adding, setAdding] = useState(false);
@@ -348,6 +349,7 @@ export function StudioPanel() {
           : 1,
         fps: isVideoTask(task) ? selected.defaults.fps : 1,
         speakerFile: isSpeechTask(task) ? speakerFile.trim() || null : null,
+        language: isSpeechTask(task) ? language.trim() || null : null,
         initImageBase64: needsInitImage(task) ? initImage : null,
         // Blank rows are a half-typed path, not a LoRA the user meant.
         loras: loras.filter((lora) => lora.path.trim().length > 0),
@@ -624,16 +626,31 @@ export function StudioPanel() {
           )}
 
           {isSpeechTask(task) && (
-            <label className="grid gap-1 text-[11px] text-muted">
-              {t("Studio.speakerFile")}
-              <input
-                className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
-                placeholder="/Users/you/voices/narrator.json"
-                value={speakerFile}
-                onChange={(event) => setSpeakerFile(event.target.value)}
-              />
-              <span className="text-faint">{t("Studio.speakerHint")}</span>
-            </label>
+            <div className="grid gap-3 sm:grid-cols-[2fr_1fr]">
+              <label className="grid gap-1 text-[11px] text-muted">
+                {t("Studio.speakerFile")}
+                <input
+                  className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
+                  placeholder="/Users/you/voices/narrator.wav"
+                  value={speakerFile}
+                  onChange={(event) => setSpeakerFile(event.target.value)}
+                />
+                <span className="text-faint">{t("Studio.speakerHint")}</span>
+              </label>
+              <label className="grid gap-1 text-[11px] text-muted">
+                {t("Studio.language")}
+                <input
+                  className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
+                  placeholder="en"
+                  maxLength={2}
+                  value={language}
+                  onChange={(event) =>
+                    setLanguage(event.target.value.replace(/[^a-zA-Z]/g, ""))
+                  }
+                />
+                <span className="text-faint">{t("Studio.languageHint")}</span>
+              </label>
+            </div>
           )}
 
           {needsInitImage(task) && (

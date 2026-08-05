@@ -74,8 +74,13 @@ pub enum ComponentSlot {
     /// Models that generate synchronized audio decode it through its own VAE.
     AudioVae,
     Taesd,
-    /// Speech only: the codec that turns `llama-tts`'s audio tokens into a
-    /// waveform. Belongs to a different engine than every slot above it.
+    /// Speech only: the multimodal projector beside a TTS backbone. Belongs to
+    /// a different engine than every slot above it.
+    Mmproj,
+    /// Speech, older shape: a standalone vocoder. The pinned speech runtime
+    /// takes an [`Self::Mmproj`] instead, but the slot stays so a library
+    /// entry written against another build still loads and still says what it
+    /// meant, rather than failing the whole registry to parse.
     Vocoder,
 }
 
@@ -93,8 +98,16 @@ impl ComponentSlot {
             Self::Vae => "--vae",
             Self::AudioVae => "--audio-vae",
             Self::Taesd => "--taesd",
+            Self::Mmproj => "--mmproj",
             Self::Vocoder => "--model-vocoder",
         }
+    }
+
+    /// Whether this slot belongs to `llama-tts` rather than `sd-server`. The
+    /// two engines share no flags, so each builder consults this rather than
+    /// listing the other's slots and drifting out of step.
+    pub fn is_speech_only(self) -> bool {
+        matches!(self, Self::Mmproj | Self::Vocoder)
     }
 }
 
@@ -422,9 +435,9 @@ pub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> 
         port.to_string(),
     ];
     for component in &spec.components {
-        // The vocoder belongs to `llama-tts`; handing its flag to `sd-server`
-        // is an unknown argument, not an unused one.
-        if component.slot == ComponentSlot::Vocoder {
+        // Speech slots belong to `llama-tts`; handing one of their flags to
+        // `sd-server` is an unknown argument, not an unused one.
+        if component.slot.is_speech_only() {
             continue;
         }
         args.push(component.slot.flag().to_string());
@@ -455,8 +468,12 @@ fn identifying_component(spec: &GenerationModelSpec) -> Option<&ModelComponent> 
 /// Speech is not served by `sd-server` and is not a server at all: `llama-tts`
 /// loads its weights, writes one wav and exits, so there is nothing to keep
 /// warm and no job to poll. The model is still an ordinary library entry — the
-/// speech model fills [`ComponentSlot::Checkpoint`] and its codec fills
-/// [`ComponentSlot::Vocoder`], both of which map to flags `llama-tts` accepts.
+/// backbone fills [`ComponentSlot::Checkpoint`] and its projector fills
+/// [`ComponentSlot::Mmproj`], both of which map to flags `llama-tts` accepts.
+///
+/// Which slots a given build wants is the build's business, not this
+/// function's: every speech slot the user assigned is passed through, and an
+/// engine that does not know one says so itself.
 pub fn speech_args(
     spec: &GenerationModelSpec,
     model_root: &Path,
@@ -465,10 +482,7 @@ pub fn speech_args(
 ) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     for component in &spec.components {
-        if !matches!(
-            component.slot,
-            ComponentSlot::Checkpoint | ComponentSlot::Vocoder
-        ) {
+        if !component.slot.is_speech_only() && component.slot != ComponentSlot::Checkpoint {
             continue;
         }
         args.push(component.slot.flag().to_string());
@@ -479,16 +493,12 @@ pub fn speech_args(
                 .to_string(),
         );
     }
-    if !args.iter().any(|arg| arg == "--model-vocoder") {
-        return Err(format!(
-            "{} needs a vocoder file — assign one to --model-vocoder",
-            spec.name
-        ));
-    }
     args.push("--prompt".to_string());
     args.push(request.prompt.clone());
     args.push("--output".to_string());
     args.push(output.to_string_lossy().to_string());
+    // A reference clip is a plain wav: the engine listens to it and speaks the
+    // prompt in that voice. This is the whole of voice cloning here.
     if let Some(path) = request
         .speaker_file
         .as_deref()
@@ -497,6 +507,15 @@ pub fn speech_args(
     {
         args.push("--tts-speaker-file".to_string());
         args.push(path.to_string());
+    }
+    if let Some(language) = request
+        .language
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.push("--tts-lang".to_string());
+        args.push(language.to_ascii_lowercase());
     }
     args.extend(spec.extra_launch_args.iter().cloned());
     Ok(args)
@@ -599,9 +618,12 @@ pub struct GenerationRequest {
     pub video_frames: u32,
     #[serde(default)]
     pub fps: u32,
-    /// Speech only: an OuteTTS speaker profile (JSON) to voice the utterance.
+    /// Speech only: a reference clip whose voice the utterance is spoken in.
     #[serde(default)]
     pub speaker_file: Option<String>,
+    /// Speech only: ISO 639-1 code. `None` leaves the model's own default.
+    #[serde(default)]
+    pub language: Option<String>,
     /// Base64 PNG/JPEG starting frame, required by the image-driven tasks.
     #[serde(default)]
     pub init_image_base64: Option<String>,
@@ -637,7 +659,17 @@ pub fn validate_request(
     if request.task.is_speech() {
         if let Some(path) = &request.speaker_file {
             if !path.trim().is_empty() && !Path::new(path).is_absolute() {
-                return Err("A speaker profile needs an absolute path".to_string());
+                return Err("A reference clip needs an absolute path".to_string());
+            }
+        }
+        if let Some(code) = request
+            .language
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if code.len() != 2 || !code.chars().all(|c| c.is_ascii_alphabetic()) {
+                return Err("Language must be a two-letter ISO 639-1 code".to_string());
             }
         }
         let mut normalized = request.clone();
@@ -1383,6 +1415,7 @@ mod tests {
             video_frames: 34,
             fps: 24,
             speaker_file: None,
+            language: None,
             init_image_base64: None,
             loras: Vec::new(),
         }
@@ -1836,43 +1869,116 @@ mod tests {
     fn speech_builds_its_own_command_line_and_skips_the_diffusion_bounds() {
         let mut spec = model("voice", vec![GenerationTask::TextToSpeech], FrameGrid::default());
         spec.components = vec![
-            ModelComponent::huggingface(ComponentSlot::Checkpoint, "r", "outetts.gguf", 1),
-            ModelComponent::huggingface(ComponentSlot::Vocoder, "r", "wavtokenizer.gguf", 1),
+            ModelComponent::huggingface(ComponentSlot::Checkpoint, "r", "backbone.gguf", 1),
+            ModelComponent::huggingface(ComponentSlot::Mmproj, "r", "mmproj.gguf", 1),
         ];
         spec.extra_launch_args = vec!["--tts-use-guide-tokens".to_string()];
         assert!(validate_model_spec(&spec).is_ok());
 
         let mut request = video_request(GenerationTask::TextToSpeech);
         request.model_id = spec.id.clone();
-        request.speaker_file = Some("/Users/somebody/voice.json".to_string());
+        request.speaker_file = Some("/Users/somebody/reference.wav".to_string());
+        request.language = Some("EN".to_string());
         let normalized = validate_request(&spec, &request).unwrap();
         assert_eq!(normalized.width, 0);
 
         let args = speech_args(&spec, Path::new("/m"), &normalized, Path::new("/out.wav")).unwrap();
         for (flag, value) in [
-            ("--model", "/m/voice/outetts.gguf"),
-            ("--model-vocoder", "/m/voice/wavtokenizer.gguf"),
+            ("--model", "/m/voice/backbone.gguf"),
+            ("--mmproj", "/m/voice/mmproj.gguf"),
             ("--prompt", "a lovely cat"),
             ("--output", "/out.wav"),
-            ("--tts-speaker-file", "/Users/somebody/voice.json"),
+            ("--tts-speaker-file", "/Users/somebody/reference.wav"),
+            ("--tts-lang", "en"),
         ] {
             let at = args.iter().position(|arg| arg == flag).expect(flag);
             assert_eq!(args[at + 1], value, "{flag}");
         }
         assert!(args.contains(&"--tts-use-guide-tokens".to_string()));
 
-        // The vocoder is llama-tts's flag; sd-server would reject it outright.
-        assert!(!launch_args(&spec, Path::new("/m"), 1).contains(&"--model-vocoder".to_string()));
+        // The projector is llama-tts's flag; sd-server would reject it outright.
+        assert!(!launch_args(&spec, Path::new("/m"), 1).contains(&"--mmproj".to_string()));
 
-        // A relative speaker profile must not reach the command line.
+        // A relative reference clip must not reach the command line.
         let mut relative = request.clone();
-        relative.speaker_file = Some("voice.json".to_string());
+        relative.speaker_file = Some("reference.wav".to_string());
         assert!(validate_request(&spec, &relative).is_err());
 
-        // Without a codec there is nothing to turn tokens into a waveform.
-        let mut no_vocoder = spec.clone();
-        no_vocoder.components.pop();
-        assert!(speech_args(&no_vocoder, Path::new("/m"), &normalized, Path::new("/o.wav")).is_err());
+        let mut wrong_language = request.clone();
+        wrong_language.language = Some("english".to_string());
+        assert!(validate_request(&spec, &wrong_language).is_err());
+    }
+
+    /// Speaks one utterance with the real pinned `llama-tts`, twice: once in
+    /// the model's own voice and once cloned from the first take. Ignored by
+    /// default because it needs weights on disk, but it is what proves the
+    /// second pin was worth taking — the chat pin's `llama-tts` rejects these
+    /// weights outright with `unknown model architecture: 'qwen3tts'`.
+    ///
+    /// ```text
+    /// TTS_BINARY=…/llama-tts TTS_MODEL=…/backbone.gguf TTS_MMPROJ=…/mmproj.gguf \
+    ///   cargo test --lib generation -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs the staged llama-tts and a speech model"]
+    fn the_pinned_speech_engine_speaks_and_clones_a_voice() {
+        let (Ok(binary), Ok(model), Ok(mmproj)) = (
+            std::env::var("TTS_BINARY"),
+            std::env::var("TTS_MODEL"),
+            std::env::var("TTS_MMPROJ"),
+        ) else {
+            panic!("set TTS_BINARY, TTS_MODEL and TTS_MMPROJ");
+        };
+        let mut spec = model_spec_for_speech(&model, &mmproj);
+        spec.extra_launch_args.clear();
+
+        let directory = std::env::temp_dir().join(format!("lm-tts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let speak = |output: &Path, reference: Option<&Path>| {
+            let mut request = video_request(GenerationTask::TextToSpeech);
+            request.model_id = spec.id.clone();
+            request.prompt = "Little Monkey now speaks.".to_string();
+            request.speaker_file =
+                reference.map(|path| path.to_string_lossy().to_string());
+            let request = validate_request(&spec, &request).unwrap();
+            let args = speech_args(&spec, Path::new("/unused"), &request, output).unwrap();
+            let status = Command::new(&binary).args(&args).output().unwrap();
+            assert!(
+                status.status.success(),
+                "{}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            let bytes = std::fs::read(output).unwrap();
+            // RIFF/WAVE, and long enough to be speech rather than a header.
+            assert_eq!(&bytes[..4], b"RIFF");
+            assert_eq!(&bytes[8..12], b"WAVE");
+            assert!(bytes.len() > 8_000, "{} bytes", bytes.len());
+            bytes
+        };
+
+        let first = directory.join("spoken.wav");
+        speak(&first, None);
+        // The clone reads the take above as its reference, which is the whole
+        // of voice cloning here: a plain clip in, that voice out.
+        speak(&directory.join("cloned.wav"), Some(&first));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    fn model_spec_for_speech(backbone: &str, mmproj: &str) -> GenerationModelSpec {
+        let mut spec = model("voice", vec![GenerationTask::TextToSpeech], FrameGrid::default());
+        spec.components = vec![
+            ModelComponent {
+                slot: ComponentSlot::Checkpoint,
+                source: ComponentSource::LocalFile { path: backbone.to_string() },
+                size_bytes: 0,
+            },
+            ModelComponent {
+                slot: ComponentSlot::Mmproj,
+                source: ComponentSource::LocalFile { path: mmproj.to_string() },
+                size_bytes: 0,
+            },
+        ];
+        spec
     }
 
     /// Drives a real `sd-server` end to end. Ignored by default because it

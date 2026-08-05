@@ -423,19 +423,30 @@ async fn run_speech(
         .path()
         .app_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
-    // Staging the llama tree is what puts `llama-tts` on disk beside
-    // `llama-server`; it shares that tree's pinned version and checksums.
-    let _ = managed_runtime::materialize_bundled_runtime_for(
-        &managed_runtime::LLAMA,
+    // Speech has its own verified tree, pinned ahead of the chat engine's.
+    if let Ok(Some(path)) = managed_runtime::materialize_bundled_runtime_for(
+        &managed_runtime::LLAMA_TTS,
         app.path().resource_dir().ok().as_deref(),
         &app_data,
-    );
+    ) {
+        return run_speech_with(app, &path, spec, request).await;
+    }
     let binary = managed_runtime::find_managed_llama_tts(Some(&app_data))
-        .ok_or("The speech engine is not installed in this build")?;
+        .ok_or("The speech engine is not installed in this build; run `pnpm stage:runtime:tts` and rebuild")?;
+    run_speech_with(app, &binary, spec, request).await
+}
+
+/// The body of [`run_speech`], once the verified binary is known.
+async fn run_speech_with(
+    app: &AppHandle,
+    binary: &std::path::Path,
+    spec: &GenerationModelSpec,
+    request: &GenerationRequest,
+) -> Result<generation::GeneratedMedia, String> {
 
     let output_path = studio_dir(app)?.join(format!("speech-{}.wav", Uuid::new_v4()));
     let args = generation::speech_args(spec, &model_root(app)?, request, &output_path)?;
-    let run = tokio::process::Command::new(&binary)
+    let run = tokio::process::Command::new(binary)
         .args(&args)
         .stdin(std::process::Stdio::null())
         .output();

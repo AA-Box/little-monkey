@@ -85,6 +85,9 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
     <div className="grid gap-3 rounded border border-border p-3">
       <p className="text-xs font-medium">{t("Studio.add.title")}</p>
       <p className="text-[11px] text-faint">{t("Studio.add.slotHint")}</p>
+      {spec.tasks.includes("text_to_speech") && (
+        <p className="text-[11px] text-faint">{t("Studio.add.speechHint")}</p>
+      )}
 
       {error && (
         <p className="rounded border border-danger/40 bg-danger/10 px-2 py-1 text-[11px] text-danger">

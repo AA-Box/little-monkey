@@ -26,6 +26,13 @@ use uuid::Uuid;
 use std::os::unix::fs::PermissionsExt;
 
 pub const MANAGED_LLAMA_VERSION: &str = "b9637";
+/// Pinned llama.cpp release for speech, deliberately ahead of the chat pin.
+/// `llama-tts` was rewritten onto libmtmd between the two: the newer binary
+/// takes a backbone plus an `--mmproj` and clones a voice from a plain audio
+/// clip, where [`MANAGED_LLAMA_VERSION`]'s rejects those weights outright with
+/// `unknown model architecture: 'qwen3tts'`. Two pins keep speech from
+/// re-qualifying every chat and embedding path.
+pub const MANAGED_TTS_VERSION: &str = "b10278";
 /// Pinned stable-diffusion.cpp release. Upstream tags releases as
 /// `master-<build>-<commit>`; the whole tag is the version so the staged
 /// directory name is unambiguous across rebuilds of the same commit.
@@ -35,6 +42,8 @@ const MAX_RUNTIME_FILES: usize = 256;
 const MAX_RUNTIME_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const TRUSTED_RUNTIME_MANIFEST_SHA256: Option<&str> =
     option_env!("LITTLE_MONKEY_TRUSTED_RUNTIME_MANIFEST_SHA256");
+const TRUSTED_TTS_MANIFEST_SHA256: Option<&str> =
+    option_env!("LITTLE_MONKEY_TRUSTED_TTS_MANIFEST_SHA256");
 const TRUSTED_SD_MANIFEST_SHA256: Option<&str> =
     option_env!("LITTLE_MONKEY_TRUSTED_SD_MANIFEST_SHA256");
 
@@ -102,6 +111,29 @@ pub const LLAMA: ManagedRuntimeSpec = ManagedRuntimeSpec {
     trusted_manifest_sha256: TRUSTED_RUNTIME_MANIFEST_SHA256,
 };
 
+/// llama.cpp again, pinned separately for speech. Same six targets and the
+/// same plain CPU archives as [`LLAMA`], but its own directory, its own trusted
+/// manifest digest and its own install lock, so the two versions coexist and
+/// either can move without the other.
+pub const LLAMA_TTS: ManagedRuntimeSpec = ManagedRuntimeSpec {
+    id: "llama-tts",
+    manifest_runtime: "llama.cpp",
+    version: MANAGED_TTS_VERSION,
+    source_url_prefix: "https://github.com/ggml-org/llama.cpp/releases/",
+    override_env: "LITTLE_MONKEY_TTS_RUNTIME",
+    supported_targets: &[
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-pc-windows-msvc",
+        "x86_64-pc-windows-msvc",
+    ],
+    executable_unix: "llama-tts",
+    executable_windows: "llama-tts.exe",
+    trusted_manifest_sha256: TRUSTED_TTS_MANIFEST_SHA256,
+};
+
 /// stable-diffusion.cpp — image and video generation. Upstream publishes
 /// prebuilt binaries for three hosts only (Metal on Apple silicon, Vulkan on
 /// x86_64 Windows and Linux), so the other targets get no managed runtime and
@@ -151,22 +183,15 @@ pub fn sd_server_filename() -> &'static str {
     STABLE_DIFFUSION.executable()
 }
 
-/// `llama-tts` — speech generation and voice cloning. It lives in the same
-/// verified tree as `llama-server`, so it inherits that tree's pinned version
-/// and per-file checksums rather than needing a runtime of its own.
+/// `llama-tts` — speech generation and voice cloning, from its own pinned
+/// tree rather than the chat one. See [`LLAMA_TTS`] for why the pins differ.
 pub fn llama_tts_filename() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "llama-tts.exe"
-    } else {
-        "llama-tts"
-    }
+    LLAMA_TTS.executable()
 }
 
-/// The verified `llama-tts` beside an already-materialized `llama-server`.
+/// The verified `llama-tts` in the speech runtime's own directory.
 pub fn find_managed_llama_tts(app_data_dir: Option<&Path>) -> Option<PathBuf> {
-    let server = find_managed_llama_server(app_data_dir)?;
-    let tts = server.with_file_name(llama_tts_filename());
-    tts.is_file().then_some(tts)
+    find_managed_server(&LLAMA_TTS, app_data_dir)
 }
 
 pub fn managed_runtime_dir_for(spec: &ManagedRuntimeSpec, app_data_dir: &Path) -> PathBuf {

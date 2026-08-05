@@ -24,6 +24,7 @@ export type ComponentSlot =
   | "audio_vae"
   | "taesd"
   /** Speech only, and served by llama-tts rather than sd-server. */
+  | "mmproj"
   | "vocoder";
 
 /** Where a component's bytes come from. A file the user already has is a
@@ -165,8 +166,10 @@ export interface GenerationRequest {
   seed: number;
   videoFrames: number;
   fps: number;
-  /** Speech only: an OuteTTS speaker profile to voice the utterance. */
+  /** Speech only: a reference clip whose voice the utterance is spoken in. */
   speakerFile: string | null;
+  /** Speech only: ISO 639-1 code. Null leaves the model's own default. */
+  language: string | null;
   initImageBase64: string | null;
   loras: LoraSelection[];
 }
@@ -278,6 +281,7 @@ export const COMPONENT_SLOTS: { slot: ComponentSlot; flag: string }[] = [
   { slot: "vae", flag: "--vae" },
   { slot: "audio_vae", flag: "--audio-vae" },
   { slot: "taesd", flag: "--taesd" },
+  { slot: "mmproj", flag: "--mmproj" },
   { slot: "vocoder", flag: "--model-vocoder" },
 ];
 
