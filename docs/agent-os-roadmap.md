@@ -245,6 +245,57 @@ produce context by different rules.
 
 *Maps to: ROADMAP #9.*
 
+## D3. A run identity that reaches the work it pays for *(not started)*
+
+**Why this is its own item.** It was discovered as the reason K5's per-run egress
+allowlist could not be built, and then turned out to be the same wall K6's
+per-process resource ledger will hit. Two items depending on one missing mechanism
+makes it a prerequisite, not a footnote inside either.
+
+**Today:** there is no ambient notion of "the run this work belongs to". Measured
+rather than asserted:
+
+- **Zero `task_local!` and zero `thread_local!` declarations** across the crate's 96
+  source files, so nothing can be carried implicitly down a call chain.
+- **`AppState` has no run field.** Every per-work-unit map is keyed by `turn_id`,
+  `request_id`, `job_id`, or a destination filename. `turn_id` is the closest thing
+  that exists, and `permissions.rs` already validates its `turn` parameter against
+  the run ledger — so at the tool-command boundary a run identity *is* present under
+  another name. It stops there.
+- **30 files construct an outbound HTTP client, at 65 sites.** A run id can only
+  reach any of them as an explicit parameter, and most signatures between the command
+  layer and the request have no reason to carry one.
+
+**Three concrete shapes the gap takes**, each already blocking something:
+
+- `browser_worker.rs` decides per subresource and per redirect inside
+  `CdpConnection::handle_event`, on a struct with no run id and no path to one. This
+  is the highest-volume egress decision in the tree.
+- `mcp.rs` builds one client per *server connection* and caches it process-wide, so
+  one transport serves every run. Per-run policy means rebuilding it per call and
+  losing the connection reuse and OAuth refresh the design depends on.
+- `m4_runtime.rs` forwards the run id to its MCP, browser and shell branches but not
+  to its two model branches — the one case where the gap is a single unpassed
+  parameter rather than a missing mechanism.
+
+**And the part that any design has to answer first: some work legitimately has no
+run.** Timer-driven knowledge refresh, connector verification in Settings, model
+downloads, update checks, and every inbound HTTP request to `server.rs` are not runs
+and never will be. A mechanism that assumes a run is always present will either
+refuse that work or quietly invent an identity for it, and both are worse than the
+current honesty. So the acceptance below deliberately asks for "attributable or
+explicitly unattributed", not "always attributed".
+
+**Acceptance:** any code that egresses, spawns, or consumes a measurable resource can
+name the run it belongs to, or state that it has none — without threading a parameter
+through every intervening signature. Work with no run is a first-class case with a
+name, not a `None` that means "we lost it". A test proves an identity set at a command
+boundary is visible at an egress site several frames down, and that concurrent runs
+never observe each other's.
+
+**Blocks:** K5's per-run host/port/protocol allowlist (four of whose five acceptance
+clauses are already corrected for this reason) and K6's per-process resource ledger.
+
 ---
 
 # Phase 1 — Process and isolation kernel
@@ -1462,12 +1513,39 @@ rename:
 - **`PipelineLimits::validate` never validates `max_redirects`,** so `max_redirects:
   0` is accepted and silently forbids every redirect.
 - **`model_sources.rs` caps redirects at 8 while `egress.rs` caps at 10,** and it
-  hand-builds its client rather than starting from `egress::hardened()` — worse than
-  the cap mismatch suggests: it sets a connect timeout and **no read timeout at all**,
-  so a model-source peer that completes the handshake and then goes silent holds a
-  download open indefinitely. It spells the constructor `Client::builder()`, which is
-  not the spelling the bare-client ratchet counts, so the site is invisible to it.
-  This is the strongest candidate for the next egress commit.
+  hand-builds its client rather than starting from `egress::hardened()`. *The missing
+  read timeout is fixed — see the shipped note below. The cap mismatch stands, and so
+  does the fact that it spells the constructor `Client::builder()`, which the
+  bare-client ratchet cannot see.*
+
+**Shipped — the two unbounded download clients no longer hang on a silent peer.**
+Both set a silence budget now. `model_sources.rs`'s was the worst outbound site in
+the tree and the reason is not the missing timeout on its own:
+
+- Its download loop is `while let Some(chunk) = stream.next().await` with no
+  `select!` and no timeout; `models_install_reference` has **no cancellation token**,
+  unlike its `models_download` sibling; and `INSTALL_MUTEX` is held across the whole
+  install. So a peer that completed its handshake and then stopped writing froze the
+  progress bar with no error and no Cancel — *and* every later managed-model install
+  in the session blocked on the mutex at zero progress with nothing shown. Only an
+  app restart cleared it.
+- `models.rs`'s `download_to_file` had **no timeout of any kind**. Same hang, less
+  severe only because `cancel` is wired, so a user could escape it by hand.
+- `read_timeout`, never `ClientBuilder::timeout`: any total deadline large enough for
+  a 40 GB download is far too large to notice a dead peer. Both reuse
+  `egress::READ_TIMEOUT` so there is one number, not three.
+- Sabotage-verified against a real listener that accepts and never answers: without
+  the budget the request waits `30.011s`, until the *peer* gives up.
+
+**The audit that found it also found the shape of the remaining problem, which is the
+inverse.** A ratchet on "builder with no timeout" would catch 7 sites, of which only
+3 are real (the other 4 are bounded at the application layer by `run_bounded` or an
+outer `tokio::time::timeout`). Meanwhile **8 sites pair a *total* `ClientBuilder::timeout`
+with `bytes_stream()`**, which is a truncation bug rather than a safety net — the exact
+hazard `egress::hardened`'s doc warns about, already shipped. Two are load-bearing:
+`portability_commands.rs`'s 45-second budget against an archive capped at
+`2 × max_archive_bytes`, and `knowledge_service.rs`'s two 45-second budgets against
+`max_file_bytes`. That, not "no timeout", is the rule worth ratcheting.
 - **`hugging_face_license` discards a refusal twice, silently** — once for a
   `Url::parse` failure and once for the policy verdict — falling through to a
   fallback URL with no diagnostic. A `license_link` pointing at
@@ -1609,9 +1687,9 @@ against the code, most cannot, and several *never* will:
 So the clause's shape is wrong for this architecture, not merely unimplemented. What
 is deliverable — and what the entry above delivers — is enforcement at the paths where
 a run *is* nameable, plus the honest statement that a per-run host/port/protocol
-allowlist would need a context-propagation layer this app does not have. Building that
-layer is a larger change than K5 and should be its own item rather than hidden inside
-this one.
+allowlist would need a context-propagation layer this app does not have. That layer is
+now **D3**, its own item, because K6's per-process resource ledger turns out to need
+the same thing — two dependents make it a prerequisite rather than a footnote here.
 
 **Shipped — every blocked attempt is written down with the rule that blocked it.**
 `denial_sink.rs` is an append-only store in its **own database file**

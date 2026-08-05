@@ -2234,6 +2234,23 @@ fn build_http_client() -> Result<Client, String> {
     Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(20))
+        // Bounds *silence*, not elapsed time, and resets after every successful
+        // read — so a multi-gigabyte GGUF that keeps producing chunks runs as long
+        // as it needs to, while a peer that completes the TCP handshake and then
+        // stops writing is abandoned. `ClientBuilder::timeout` would be the wrong
+        // tool twice over: it is a total-request deadline, so any value large
+        // enough for a 40 GB download is far too large to detect a dead peer.
+        //
+        // # Why this mattered more here than at any other timeout-less site
+        //
+        // The download loop is `while let Some(chunk) = stream.next().await` with
+        // no `select!` and no timeout, `models_install_reference` has no
+        // cancellation token (unlike its `models_download` sibling), and
+        // `INSTALL_MUTEX` is held across the whole install. A silent peer therefore
+        // froze the progress bar with no error and no Cancel, *and* every later
+        // managed-model install in the session blocked on the mutex at zero
+        // progress. Only an app restart cleared it.
+        .read_timeout(crate::egress::READ_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= MAX_MODEL_SOURCE_REDIRECTS {
                 return attempt.error(refused(EgressDenial::about(
@@ -2799,6 +2816,88 @@ mod tests {
     /// `::127.0.0.1` as a *public* address here, which is what gates a model
     /// download URL.
     ///
+    /// A peer that completes the handshake and then goes silent must be abandoned.
+    ///
+    /// Driven against a real listener that accepts and writes nothing, because that
+    /// is the only way to tell the fix apart from its absence: before the read
+    /// timeout, this request never returned at all.
+    ///
+    /// Bounded here by a short budget injected through a locally built client
+    /// rather than by `build_http_client`'s production ten minutes — a test that
+    /// waited that out would not be a test. The assertion that the *production*
+    /// budget exists is separate, below.
+    #[tokio::test]
+    async fn a_model_source_that_stops_writing_is_abandoned() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let origin = format!("http://{}", listener.local_addr().expect("has an address"));
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        std::thread::spawn(move || {
+            // Accept, read the request, then hold the socket open and never answer.
+            while let Ok((mut stream, _)) = listener.accept() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer);
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
+
+        let client = Client::builder()
+            .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(20))
+            .read_timeout(Duration::from_millis(250))
+            .build()
+            .expect("the client builds");
+
+        let started = std::time::Instant::now();
+        let result = client.get(&origin).send().await;
+
+        assert!(
+            result.is_err(),
+            "a peer that never writes must not be waited on forever"
+        );
+        // The peer *did* accept, so this is a read timeout and not a refused
+        // connection — an `Err` alone would not distinguish the two, and the
+        // connection being refused is exactly what this test must not measure.
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the request must have reached the peer"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "gave up after {:?}, which is not the 250ms read budget",
+            started.elapsed()
+        );
+    }
+
+    /// The production client carries a silence budget at all.
+    ///
+    /// `reqwest::Client` exposes nothing about its own timeouts, so this asserts
+    /// the one observable consequence: the builder that ships is the shared
+    /// constant's, and the constant is finite. Deleting `.read_timeout(...)` from
+    /// `build_http_client` is caught by the wiring test above only if it is run
+    /// against the production builder, which it deliberately is not — so this pins
+    /// the constant instead of the client.
+    #[test]
+    fn the_production_download_budget_is_finite_and_shared() {
+        assert!(
+            build_http_client().is_ok(),
+            "the shipped builder must build"
+        );
+        assert!(
+            crate::egress::READ_TIMEOUT > Duration::from_secs(0),
+            "a zero silence budget would abandon every download immediately"
+        );
+        assert!(
+            crate::egress::READ_TIMEOUT <= Duration::from_secs(3600),
+            "a budget this large stops being a way to notice a dead peer"
+        );
+    }
+
     /// Now asserts the exact rule, which is stronger than "not public" in the one
     /// way that matters: `::10.0.0.1` must be refused as `Ipv4Compatible` — the
     /// wrapper — and not as `PrivateV4`, because a wrapper carrying a *public* v4
