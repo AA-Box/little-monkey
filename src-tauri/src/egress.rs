@@ -1302,8 +1302,7 @@ mod tests {
         ///
         /// Paths are relative to `src/`. Every one of these is a **loopback-only**
         /// peer — this machine's own `llama-server`, `ollama`, or an LM-Studio-
-        /// style runtime — except `server.rs`, which is owned by a different
-        /// change. They are not egress targets: there is no credential to
+        /// style runtime. They are not egress targets: there is no credential to
         /// forward and no third party to forward it to, and the counts are
         /// pinned here rather than converted so that a *new* site has to be
         /// justified.
@@ -1314,7 +1313,11 @@ mod tests {
             ("llama.rs", 2),
             // The local Ollama daemon on `11434`.
             ("ollama.rs", 2),
-            // Out of scope for this change by ownership, not by argument.
+            // The two API-server instances' `local_client`. Each was one client
+            // serving both loopback inference and cloud providers; the cloud half
+            // now starts from `hardened()` and these two are loopback-only by
+            // construction, which is what earns them a place in this list rather
+            // than the "owned by a different change" note they used to carry.
             ("server.rs", 2),
             // Local stack runtimes.
             ("stacks.rs", 1),

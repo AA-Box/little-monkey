@@ -1284,9 +1284,10 @@ deny-by-default and nothing here is keyed to a run.
   egress targets, and custom providers at `http://127.0.0.1:1234/v1` (LM Studio,
   vLLM, LiteLLM) are a supported configuration — any public-only or cleartext-refusing
   rule would break local inference.
-- `server.rs`'s two forwarding clients are pinned in the ratchet rather than
-  converted: that client serves **both** loopback inference and cloud providers, so
-  no single policy fits it and splitting it is its own change.
+- `server.rs`'s forwarding clients were pinned in the ratchet rather than
+  converted: one client served **both** loopback inference and cloud providers, so
+  no single policy fitted it and splitting it was its own change — *now done, see
+  below*.
 
 **Shipped — the deprecated IPv4-compatible form no longer walks past any of the four
 guards.** All four unwrapped v4-in-v6 with `to_ipv4_mapped()`, which by design
@@ -1382,6 +1383,56 @@ are different ranges reached by different branches.
   neither platform's resolver behaviour as the expected answer.
 - The only range this section moves. Everything else in the conversion is
   behaviour-preserving.
+
+**Shipped — the API server's outbound client is split by target class.** One client
+per server instance used to serve all three upstreams: the bundled `llama-server` on
+`127.0.0.1:{llama_port}`, the local Ollama daemon on the hardcoded
+`OLLAMA_BASE_URL`, and a configured cloud provider carrying the user's API key. There
+is now a `local_client` and a `cloud_client`, the latter from `egress::hardened()`,
+chosen by the route.
+
+- **Why one client could not be hardened in place**, which is the whole argument for
+  a split rather than an adoption: a silence budget on the loopback half would be
+  actively wrong, because prompt processing on a large context legitimately produces
+  no bytes for minutes and that is exactly where it happens. Leaving it bare left an
+  `x-api-key` exposed to a `302`. Neither policy is defective; they just do not
+  belong to the same client.
+- **The choice is a pure function of the route, `client_for`**, not a `match` inlined
+  at each send site. `reqwest::Client` exposes nothing about its own timeouts or
+  redirect policy — there is no `client.redirect_policy()` to read — so an inlined
+  match would be correct and completely unassertable. As a function, the decision is
+  testable by pointer identity.
+- **Streaming survives, and the reason is the same one that made `hardened()` usable
+  at all:** the SSE path is a byte-level `bytes_stream()` passthrough, and
+  `read_timeout` bounds *silence* and resets after each read, so a provider that
+  keeps producing chunks runs as long as it likes. A `ClientBuilder::timeout` here
+  would have truncated every streamed completion.
+- **A failure to build the hardened client is fatal, not a fallback.** Falling back
+  to the bare client would mean serving cloud requests with no redirect policy —
+  precisely the hole being closed.
+- Two behavioural tests, in opposite directions: the cloud client must refuse a
+  cross-origin hop *and never contact the target*, and the local client must still
+  follow the same redirect. The second is what makes it a test of the split rather
+  than a second test of `egress::hardened`.
+
+**Correction to this item's own description of that route.** Verified against the
+code rather than re-read:
+
+- **"Forwards an external caller's body verbatim" is exactly right.**
+  `handle_chat_completions` clones the parsed body and rewrites only `model`, from
+  `"{provider_id}/{model_id}"` to the bare `model_id`. It deliberately does *not*
+  use `providers::build_chat_request`, which would reconstruct a narrow body and
+  force `stream: true`.
+- **"A second Rust bypass of the Privacy Firewall" is also right.** `server.rs` and
+  `providers.rs` contain no reference to `privacy_firewall` at all; its only Rust
+  callers are `lib.rs`, `knowledge_pipeline.rs` and `runtime_pr_watcher.rs`.
+- **"Reachable by any bearer-token holder" overstates it, and the gates are worth
+  naming** because they are what makes this a smaller hole than the sentence implied.
+  Three conditions, all required: `expose_providers` must be on, and it defaults to
+  **`false`** in `ApiServerConfig::default`; the token must carry `Scope::Chat`; and
+  it must list `Backend::Providers`. Tokens are individually scoped, so this is "a
+  token holder scoped for chat *and* the providers backend, on a server whose
+  operator turned the toggle on" — not any bearer-token holder.
 
 **Found while typing the guards, and left alone deliberately** — each is a real
 defect that naming rules made visible, and each is a behaviour change rather than a
@@ -1521,10 +1572,11 @@ with it: a sink built first would have recorded unparseable strings.
 
 **Also missing from the "Today" above:** the inbound OpenAI-compatible
 `POST /v1/chat/completions` route forwards an external caller's body verbatim to a
-cloud provider through a bare client. That is a second Rust bypass of the Privacy
-Firewall, and a worse one than the `providers.rs` bypass already documented, because
-it is reachable by any bearer-token holder rather than only by this app's own
-frontend.
+cloud provider — *through a bare client, until the split above; see the correction
+there for which parts of this claim held and which overstated the reach.* It remains a
+second Rust bypass of the Privacy Firewall, which no longer follows from the client
+being bare: hardened defaults decide *where* a request may go, and say nothing about
+what is in its body.
 
 **Blocks:** K17 — placing a run on a remote node is only safe if the run's
 egress travels with it.
