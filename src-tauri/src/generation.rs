@@ -36,6 +36,11 @@ const MAX_STEPS: u32 = 200;
 /// 15 s at 24 fps, the longest clip any currently supported model produces.
 const MAX_VIDEO_FRAMES: u32 = 361;
 const MAX_FPS: u32 = 60;
+/// Text-encoder layers a request may skip. Beyond a handful the conditioning
+/// is gone rather than stylized.
+const MAX_CLIP_SKIP: i32 = 12;
+/// Ceiling on the high-resolution pass's multiplier.
+const MAX_HIRES_SCALE: f64 = 4.0;
 const MAX_INIT_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 /// LoRAs per generation. The engine accepts an unbounded list; this exists so
 /// one request cannot make the engine open an arbitrary number of files.
@@ -535,6 +540,25 @@ pub fn normalize_video_frames(grid: FrameGrid, value: u32) -> u32 {
     }
 }
 
+/// The engine's high-resolution fix: sample at the requested canvas, upscale,
+/// then denoise the larger image. Present means enabled — a disabled pass has
+/// no settings worth carrying.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HiresSettings {
+    /// Multiplier on the canvas, so 2.0 turns 512×768 into 1024×1536.
+    pub scale: f64,
+    /// Steps for the second pass. Zero reuses the first pass's count.
+    #[serde(default)]
+    pub steps: u32,
+    /// How far the upscaled image is re-sampled. 0 keeps it, 1 redraws it.
+    pub denoising_strength: f64,
+    /// Named upscaler. The built-in set is fixed, but a model dropped in the
+    /// directory given to `--hires-upscalers-dir` joins it under its own name,
+    /// which is why this is a free string rather than an enum.
+    pub upscaler: String,
+}
+
 /// One generation job's user-controlled inputs.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -553,6 +577,22 @@ pub struct GenerationRequest {
     /// library entry, so every one of them can be changed per run.
     #[serde(default)]
     pub sample_method: String,
+    /// Sigma schedule. Empty leaves the backend's own choice in place.
+    #[serde(default)]
+    pub scheduler: String,
+    /// How many text-encoder layers to skip. `-1` is the model's own setting.
+    #[serde(default = "default_clip_skip")]
+    pub clip_skip: i32,
+    /// Sampler noise multiplier. `None` leaves the backend's default.
+    #[serde(default)]
+    pub eta: Option<f64>,
+    /// How far an init image is redrawn: 0 keeps it, 1 ignores it. Only
+    /// meaningful for the image-driven tasks.
+    #[serde(default)]
+    pub strength: Option<f64>,
+    /// The second, higher-resolution pass. `None` disables it.
+    #[serde(default)]
+    pub hires: Option<HiresSettings>,
     /// Negative asks the backend for a random seed.
     pub seed: i64,
     #[serde(default)]
@@ -568,6 +608,12 @@ pub struct GenerationRequest {
     /// LoRAs to apply, in order. Any model can take any number.
     #[serde(default)]
     pub loras: Vec<LoraSelection>,
+}
+
+/// `-1` means "whatever the model was trained with", which is the only sane
+/// default for a setting most models do not want changed.
+fn default_clip_skip() -> i32 {
+    -1
 }
 
 /// Rejects a request that is out of bounds, and returns it with dimensions and
@@ -601,8 +647,47 @@ pub fn validate_request(
         normalized.fps = 1;
         return Ok(normalized);
     }
-    if request.sample_method.len() > 64 {
+    if request.sample_method.len() > 64 || request.scheduler.len() > 64 {
         return Err("Sampler name is too long".to_string());
+    }
+    if !(-1..=MAX_CLIP_SKIP).contains(&request.clip_skip) {
+        return Err(format!("Clip skip must be between -1 and {MAX_CLIP_SKIP}"));
+    }
+    if let Some(eta) = request.eta {
+        if !eta.is_finite() || !(0.0..=1.0).contains(&eta) {
+            return Err("Eta must be between 0 and 1".to_string());
+        }
+    }
+    if let Some(strength) = request.strength {
+        if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+            return Err("Denoising strength must be between 0 and 1".to_string());
+        }
+    }
+    if let Some(hires) = &request.hires {
+        if !hires.scale.is_finite() || !(1.0..=MAX_HIRES_SCALE).contains(&hires.scale) {
+            return Err(format!("Upscale must be between 1x and {MAX_HIRES_SCALE}x"));
+        }
+        if hires.steps > MAX_STEPS {
+            return Err(format!("Upscale steps may not exceed {MAX_STEPS}"));
+        }
+        if !hires.denoising_strength.is_finite()
+            || !(0.0..=1.0).contains(&hires.denoising_strength)
+        {
+            return Err("Upscale denoising strength must be between 0 and 1".to_string());
+        }
+        if hires.upscaler.trim().is_empty() || hires.upscaler.len() > 64 {
+            return Err("Pick an upscaler".to_string());
+        }
+        // The canvas the second pass renders is bounded by the same ceiling as
+        // the first, so an upscale that would blow past it is rejected here
+        // rather than deep inside the engine.
+        let scaled = (f64::from(request.width.max(request.height)) * hires.scale).round();
+        if scaled > f64::from(MAX_DIMENSION) {
+            return Err(format!(
+                "{}× would exceed the {MAX_DIMENSION} px limit",
+                hires.scale
+            ));
+        }
     }
     if request.steps == 0 || request.steps > MAX_STEPS {
         return Err(format!("Steps must be between 1 and {MAX_STEPS}"));
@@ -677,6 +762,12 @@ pub fn request_body(spec: &GenerationModelSpec, request: &GenerationRequest) -> 
     if let Some(flow_shift) = spec.defaults.flow_shift {
         sample_params["flow_shift"] = json!(flow_shift);
     }
+    if !request.scheduler.trim().is_empty() {
+        sample_params["scheduler"] = json!(request.scheduler.trim());
+    }
+    if let Some(eta) = request.eta {
+        sample_params["eta"] = json!(eta);
+    }
 
     let mut body = json!({
         "prompt": request.prompt,
@@ -684,8 +775,22 @@ pub fn request_body(spec: &GenerationModelSpec, request: &GenerationRequest) -> 
         "width": request.width,
         "height": request.height,
         "seed": request.seed,
+        "clip_skip": request.clip_skip,
         "sample_params": sample_params,
     });
+    // Only the image-driven tasks have something to denoise away from.
+    if let (true, Some(strength)) = (request.task.needs_init_image(), request.strength) {
+        body["strength"] = json!(strength);
+    }
+    if let Some(hires) = &request.hires {
+        body["hires"] = json!({
+            "enabled": true,
+            "scale": hires.scale,
+            "steps": hires.steps,
+            "denoising_strength": hires.denoising_strength,
+            "upscaler": hires.upscaler.trim(),
+        });
+    }
     if !request.loras.is_empty() {
         body["lora"] = Value::Array(
             request
@@ -1269,6 +1374,11 @@ mod tests {
             steps: 20,
             cfg_scale: 6.0,
             sample_method: String::new(),
+            scheduler: String::new(),
+            clip_skip: -1,
+            eta: None,
+            strength: None,
+            hires: None,
             seed: -1,
             video_frames: 34,
             fps: 24,
@@ -1623,6 +1733,64 @@ mod tests {
         assert!(validate_request(&wan, &absurd).is_err());
     }
 
+    /// Every control on the Image and Video tabs has to survive the trip to
+    /// the engine, and every one of them has a bound — a canvas that grows
+    /// past the ceiling on the second pass fails several minutes in, long
+    /// after the first pass has already been paid for.
+    #[test]
+    fn the_full_control_set_reaches_the_body_and_is_bounded() {
+        let wan = video_model();
+        let mut request = video_request(GenerationTask::ImageToVideo);
+        request.init_image_base64 = Some("aGk=".to_string());
+        request.scheduler = " karras ".to_string();
+        request.clip_skip = 2;
+        request.eta = Some(0.3);
+        request.strength = Some(0.55);
+        request.hires = Some(HiresSettings {
+            scale: 1.5,
+            steps: 8,
+            denoising_strength: 0.5,
+            upscaler: "Lanczos".to_string(),
+        });
+        let body = request_body(&wan, &validate_request(&wan, &request).unwrap());
+        assert_eq!(body["sample_params"]["scheduler"], json!("karras"));
+        assert_eq!(body["sample_params"]["eta"], json!(0.3));
+        assert_eq!(body["clip_skip"], json!(2));
+        assert_eq!(body["strength"], json!(0.55));
+        assert_eq!(body["hires"]["enabled"], json!(true));
+        assert_eq!(body["hires"]["upscaler"], json!("Lanczos"));
+
+        // Nothing optional is guessed: an untouched request leaves the
+        // backend's own choices alone.
+        let plain = request_body(&wan, &video_request(GenerationTask::TextToVideo));
+        assert!(plain["sample_params"].get("scheduler").is_none());
+        assert!(plain["sample_params"].get("eta").is_none());
+        assert!(plain.get("hires").is_none());
+        // Denoising strength is meaningless without something to denoise from.
+        let mut text_only = request.clone();
+        text_only.task = GenerationTask::TextToVideo;
+        text_only.init_image_base64 = None;
+        assert!(request_body(&wan, &validate_request(&wan, &text_only).unwrap())
+            .get("strength")
+            .is_none());
+
+        for spoil in [
+            (|r: &mut GenerationRequest| r.clip_skip = MAX_CLIP_SKIP + 1) as fn(&mut _),
+            |r| r.clip_skip = -2,
+            |r| r.eta = Some(1.5),
+            |r| r.strength = Some(-0.1),
+            |r| r.hires.as_mut().unwrap().scale = MAX_HIRES_SCALE + 1.0,
+            |r| r.hires.as_mut().unwrap().denoising_strength = f64::NAN,
+            |r| r.hires.as_mut().unwrap().upscaler = String::new(),
+            // 1280 × 4 overshoots the 4096 px ceiling on the second pass.
+            |r| r.hires.as_mut().unwrap().scale = 4.0,
+        ] {
+            let mut bad = request.clone();
+            spoil(&mut bad);
+            assert!(validate_request(&wan, &bad).is_err());
+        }
+    }
+
     /// The job API reports no step count, so the engine's redrawn progress bar
     /// is the only source of a percentage. Tensor loading draws the identical
     /// bar with a byte rate, which must not be mistaken for sampling.
@@ -1738,9 +1906,17 @@ mod tests {
 
         let mut request = video_request(GenerationTask::TextToImage);
         request.model_id = spec.id.clone();
-        request.width = 768;
-        request.height = 768;
+        request.width = 256;
+        request.height = 256;
         request.steps = 25;
+        request.scheduler = "karras".to_string();
+        request.clip_skip = 2;
+        request.hires = Some(HiresSettings {
+            scale: 2.0,
+            steps: 4,
+            denoising_strength: 0.5,
+            upscaler: "Lanczos".to_string(),
+        });
         let request = validate_request(&spec, &request).unwrap();
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1771,6 +1947,10 @@ mod tests {
             assert!(step >= 1 && step <= total);
             assert_eq!(media.media_type, "image/png");
             assert!(media.bytes.starts_with(b"\x89PNG"));
+            // IHDR carries the real canvas: a 2× hires pass on 256 px has to
+            // come back at 512, or the second pass never ran.
+            let dimension = |at: usize| u32::from_be_bytes(media.bytes[at..at + 4].try_into().unwrap());
+            assert_eq!((dimension(16), dimension(20)), (512, 512));
             engine.stop().unwrap();
         });
     }

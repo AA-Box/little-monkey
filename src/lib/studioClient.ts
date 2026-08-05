@@ -133,6 +133,15 @@ export interface GenerationEngineStatus {
   totalRamBytes: number;
 }
 
+/** The engine's high-resolution fix: sample, upscale, denoise again. */
+export interface HiresSettings {
+  scale: number;
+  /** 0 reuses the first pass's step count. */
+  steps: number;
+  denoisingStrength: number;
+  upscaler: string;
+}
+
 export interface GenerationRequest {
   modelId: string;
   task: GenerationTask;
@@ -144,6 +153,15 @@ export interface GenerationRequest {
   cfgScale: number;
   /** Empty falls back to the model's own default. */
   sampleMethod: string;
+  /** Empty leaves the engine's own sigma schedule. */
+  scheduler: string;
+  /** -1 is whatever the model was trained with. */
+  clipSkip: number;
+  eta: number | null;
+  /** How far an init image is redrawn. Only used by the image-driven tasks. */
+  strength: number | null;
+  /** The second, higher-resolution pass. Null disables it. */
+  hires: HiresSettings | null;
   seed: number;
   videoFrames: number;
   fps: number;
@@ -294,6 +312,50 @@ export const SAMPLERS = [
   "dpm++2m_sde",
   "dpm++2m_sde_bt",
   "lms",
+];
+
+/** Sigma schedules the engine accepts, in the order it reports them. */
+export const SCHEDULERS = [
+  "discrete",
+  "normal",
+  "karras",
+  "exponential",
+  "ays",
+  "gits",
+  "sgm_uniform",
+  "simple",
+  "smoothstep",
+  "kl_optimal",
+  "lcm",
+  "bong_tangent",
+  "ltx2",
+  "logit_normal",
+  "flux2",
+  "flux",
+  "beta",
+];
+
+/** The engine's built-in upscalers. Offered as suggestions rather than a
+ *  closed list: a model dropped in the directory passed to
+ *  `--hires-upscalers-dir` joins them under its own name, which is how an
+ *  R-ESRGAN becomes selectable. */
+export const UPSCALERS = [
+  "Latent",
+  "Latent (nearest)",
+  "Latent (nearest-exact)",
+  "Latent (antialiased)",
+  "Latent (bicubic)",
+  "Latent (bicubic antialiased)",
+  "Lanczos",
+  "Nearest",
+  "None",
+];
+
+/** Canvas presets, matching the sizes these families are trained at. */
+export const ASPECT_PRESETS: { id: string; width: number; height: number }[] = [
+  { id: "portrait", width: 768, height: 1152 },
+  { id: "landscape", width: 1152, height: 768 },
+  { id: "square", width: 1024, height: 1024 },
 ];
 
 /** A blank model, ready for the user to fill in. */

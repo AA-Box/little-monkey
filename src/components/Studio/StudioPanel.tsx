@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Download, Loader2, Sparkles, Square, Trash2, Upload, Wand2 } from "lucide-react";
+import {
+  Download,
+  Loader2,
+  Shuffle,
+  Sparkles,
+  Square,
+  Trash2,
+  Upload,
+  Wand2,
+} from "lucide-react";
 
 import { Button, IconButton, StatusPill, Tabs } from "../ui";
 import { AddModelForm } from "./AddModelForm";
@@ -14,12 +23,16 @@ import {
   needsInitImage,
   normalizeDimension,
   normalizeVideoFrames,
+  ASPECT_PRESETS,
   SAMPLERS,
+  SCHEDULERS,
   studioClient,
+  UPSCALERS,
   type GenerationEngineStatus,
   type GenerationEntry,
   type GenerationModel,
   type GenerationTask,
+  type HiresSettings,
   type LoraSelection,
 } from "../../lib/studioClient";
 
@@ -32,6 +45,13 @@ interface RunSettings {
   steps: number;
   cfgScale: number;
   sampler: string;
+  scheduler: string;
+  clipSkip: number;
+  eta: number | null;
+  /** How far an init image is redrawn. Ignored by the text-only tasks. */
+  strength: number;
+  /** Null means the second pass is off. */
+  hires: HiresSettings | null;
 }
 
 /** The file extension a saved asset should carry, from its media type. */
@@ -39,6 +59,64 @@ function extensionFor(mediaType: string): string {
   const subtype = mediaType.split("/")[1] ?? "bin";
   return subtype === "jpeg" ? "jpg" : subtype.replace(/[^a-z0-9]/gi, "");
 }
+
+/** A slider paired with the number it sets, because a slider alone cannot be
+ *  typed into and a number alone cannot be swept. */
+function SliderField({
+  label,
+  value,
+  min,
+  max,
+  step,
+  hint,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  hint?: string;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label className="grid gap-1 text-[11px] text-muted">
+      <span className="flex items-center justify-between gap-2">
+        {label}
+        {hint && <span className="font-mono text-faint">{hint}</span>}
+      </span>
+      <span className="flex items-center gap-2">
+        <input
+          type="range"
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          onChange={(event) => onChange(Number(event.target.value))}
+          className="min-w-0 flex-1"
+        />
+        <input
+          type="number"
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          onChange={(event) => onChange(Number(event.target.value))}
+          className="w-20 shrink-0 rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+        />
+      </span>
+    </label>
+  );
+}
+
+/** The hires pass at its usual starting point, so the toggle has something
+ *  sensible to switch on. */
+const DEFAULT_HIRES: HiresSettings = {
+  scale: 2,
+  steps: 20,
+  denoisingStrength: 0.5,
+  upscaler: "Latent",
+};
 
 function errorText(reason: unknown): string {
   return reason instanceof Error ? reason.message : String(reason);
@@ -80,7 +158,9 @@ export function StudioPanel() {
   const [prompt, setPrompt] = useState("");
   const [negativePrompt, setNegativePrompt] = useState("");
   const [seconds, setSeconds] = useState(3);
-  const [seed, setSeed] = useState(-1);
+  // A string rather than a number so "empty means random" is expressible, the
+  // way every other generation tool spells it.
+  const [seed, setSeed] = useState("");
   const [initImage, setInitImage] = useState<string | null>(null);
   const [speakerFile, setSpeakerFile] = useState("");
   const [loras, setLoras] = useState<LoraSelection[]>([]);
@@ -167,6 +247,11 @@ export function StudioPanel() {
       steps: selected.defaults.steps,
       cfgScale: selected.defaults.cfgScale,
       sampler: selected.defaults.sampleMethod,
+      scheduler: "",
+      clipSkip: -1,
+      eta: null,
+      strength: 0.75,
+      hires: null,
     });
   }, [selected?.id]);
 
@@ -251,7 +336,13 @@ export function StudioPanel() {
         steps: settings.steps,
         cfgScale: settings.cfgScale,
         sampleMethod: settings.sampler,
-        seed,
+        scheduler: settings.scheduler,
+        clipSkip: settings.clipSkip,
+        eta: settings.eta,
+        strength: needsInitImage(task) ? settings.strength : null,
+        hires: settings.hires,
+        // Blank asks the engine for a fresh seed rather than pinning one.
+        seed: seed.trim() === "" ? -1 : Number(seed),
         videoFrames: isVideoTask(task)
           ? normalizeVideoFrames(selected.defaults.frameGrid, seconds * selected.defaults.fps)
           : 1,
@@ -602,46 +693,58 @@ export function StudioPanel() {
           {/* Every one of these is a per-run choice, not a property of the
               model — the library entry only supplies the starting values. */}
           {settings && !isSpeechTask(task) && (
-            <>
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                {(
-                  [
-                    ["width", t("Studio.width"), 32],
-                    ["height", t("Studio.height"), 32],
-                    ["steps", t("Studio.steps"), 1],
-                  ] as const
-                ).map(([key, label, step]) => (
-                  <label key={key} className="grid gap-1 text-[11px] text-muted">
-                    {label}
-                    <input
-                      type="number"
-                      step={step}
-                      min={step}
-                      className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
-                      value={settings[key]}
-                      onChange={(event) =>
-                        setSettings({ ...settings, [key]: Number(event.target.value) })
+            <div className="grid gap-3 rounded border border-border p-3">
+              <span className="text-xs font-medium">{t("Studio.settings")}</span>
+
+              <div className="grid gap-1 text-[11px] text-muted">
+                {t("Studio.aspect")}
+                <div className="flex flex-wrap gap-1.5">
+                  {ASPECT_PRESETS.map((preset) => (
+                    <Button
+                      key={preset.id}
+                      size="sm"
+                      variant={
+                        settings.width === preset.width && settings.height === preset.height
+                          ? "primary"
+                          : "secondary"
                       }
-                    />
-                  </label>
-                ))}
-                <label className="grid gap-1 text-[11px] text-muted">
-                  {t("Studio.guidance")}
-                  <input
-                    type="number"
-                    step={0.1}
-                    min={0}
-                    max={100}
-                    className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
-                    value={settings.cfgScale}
-                    onChange={(event) =>
-                      setSettings({ ...settings, cfgScale: Number(event.target.value) })
-                    }
-                  />
-                </label>
+                      onClick={() =>
+                        setSettings({ ...settings, width: preset.width, height: preset.height })
+                      }
+                    >
+                      {t(`Studio.aspect.${preset.id}`)}
+                      <span className="font-mono text-[10px] opacity-70">
+                        {preset.width}×{preset.height}
+                      </span>
+                    </Button>
+                  ))}
+                </div>
               </div>
-              <label className="flex items-center gap-3 text-xs">
-                <span className="w-24 shrink-0 text-muted">{t("Studio.sampler")}</span>
+
+              <div className="grid gap-3 sm:grid-cols-2">
+                <SliderField
+                  label={t("Studio.width")}
+                  value={settings.width}
+                  min={64}
+                  max={2048}
+                  step={32}
+                  onChange={(width) => setSettings({ ...settings, width })}
+                />
+                <SliderField
+                  label={t("Studio.height")}
+                  value={settings.height}
+                  min={64}
+                  max={2048}
+                  step={32}
+                  // The engine aligns edges up to a multiple of 32, so show the
+                  // canvas that will really be rendered.
+                  hint={`${normalizeDimension(settings.width)}×${normalizeDimension(settings.height)}`}
+                  onChange={(height) => setSettings({ ...settings, height })}
+                />
+              </div>
+
+              <label className="grid gap-1 text-[11px] text-muted">
+                {t("Studio.sampler")}
                 <select
                   className="rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
                   value={settings.sampler}
@@ -658,13 +761,184 @@ export function StudioPanel() {
                     </option>
                   ))}
                 </select>
-                {/* The engine aligns edges up to a multiple of 32, so show the
-                    canvas that will really be rendered. */}
-                <span className="font-mono text-[11px] text-faint">
-                  {normalizeDimension(settings.width)}×{normalizeDimension(settings.height)}
+              </label>
+
+              <div className="grid gap-3 sm:grid-cols-2">
+                <SliderField
+                  label={t("Studio.steps")}
+                  value={settings.steps}
+                  min={1}
+                  max={150}
+                  step={1}
+                  onChange={(steps) => setSettings({ ...settings, steps })}
+                />
+                <SliderField
+                  label={t("Studio.guidance")}
+                  value={settings.cfgScale}
+                  min={0}
+                  max={30}
+                  step={0.1}
+                  onChange={(cfgScale) => setSettings({ ...settings, cfgScale })}
+                />
+              </div>
+
+              {needsInitImage(task) && (
+                <SliderField
+                  label={t("Studio.denoise")}
+                  value={settings.strength}
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  onChange={(strength) => setSettings({ ...settings, strength })}
+                />
+              )}
+
+              <label className="grid gap-1 text-[11px] text-muted">
+                {t("Studio.seed")}
+                <span className="flex items-center gap-2">
+                  <input
+                    className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
+                    placeholder={t("Studio.seedPlaceholder")}
+                    value={seed}
+                    inputMode="numeric"
+                    onChange={(event) => setSeed(event.target.value.replace(/[^\d-]/g, ""))}
+                  />
+                  <IconButton
+                    size="sm"
+                    aria-label={t("Studio.seedShuffle")}
+                    onClick={() => setSeed(String(Math.floor(Math.random() * 2_147_483_647)))}
+                  >
+                    <Shuffle size={12} />
+                  </IconButton>
                 </span>
               </label>
-            </>
+
+              <details className="grid gap-2">
+                <summary className="cursor-pointer text-[11px] text-muted">
+                  {t("Studio.advanced")}
+                </summary>
+                <div className="mt-2 grid gap-3 sm:grid-cols-2">
+                  <label className="grid gap-1 text-[11px] text-muted">
+                    {t("Studio.scheduler")}
+                    <select
+                      className="rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
+                      value={settings.scheduler}
+                      onChange={(event) =>
+                        setSettings({ ...settings, scheduler: event.target.value })
+                      }
+                    >
+                      <option value="">{t("Studio.engineDefault")}</option>
+                      {SCHEDULERS.map((entry) => (
+                        <option key={entry} value={entry}>
+                          {entry}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <SliderField
+                    label={t("Studio.clipSkip")}
+                    value={settings.clipSkip}
+                    min={-1}
+                    max={12}
+                    step={1}
+                    hint={settings.clipSkip < 0 ? t("Studio.engineDefault") : undefined}
+                    onChange={(clipSkip) => setSettings({ ...settings, clipSkip })}
+                  />
+                </div>
+              </details>
+
+              <div className="grid gap-2 rounded bg-background/60 p-2">
+                <label className="flex items-center gap-2 text-[11px] font-medium">
+                  <input
+                    type="checkbox"
+                    checked={settings.hires !== null}
+                    onChange={(event) =>
+                      setSettings({
+                        ...settings,
+                        hires: event.target.checked ? DEFAULT_HIRES : null,
+                      })
+                    }
+                  />
+                  {t("Studio.upscale")}
+                  {settings.hires && (
+                    <span className="font-mono text-[10px] font-normal text-faint">
+                      {t("Studio.upscaleTo", {
+                        target: `${normalizeDimension(Math.round(settings.width * settings.hires.scale))}×${normalizeDimension(Math.round(settings.height * settings.hires.scale))}`,
+                      })}
+                    </span>
+                  )}
+                </label>
+                {settings.hires && (
+                  <>
+                    <div className="flex flex-wrap gap-1.5">
+                      {[1.5, 2, 3, 4].map((scale) => (
+                        <Button
+                          key={scale}
+                          size="sm"
+                          variant={settings.hires?.scale === scale ? "primary" : "secondary"}
+                          onClick={() =>
+                            setSettings({ ...settings, hires: { ...DEFAULT_HIRES, ...settings.hires, scale } })
+                          }
+                        >
+                          {scale}x
+                        </Button>
+                      ))}
+                    </div>
+                    <label className="grid gap-1 text-[11px] text-muted">
+                      {t("Studio.upscaler")}
+                      {/* A free field with suggestions, not a closed list: an
+                          ESRGAN model in --hires-upscalers-dir is selectable
+                          under its own name, which no fixed list can know. */}
+                      <input
+                        list="studio-upscalers"
+                        className="rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
+                        value={settings.hires.upscaler}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            hires: { ...DEFAULT_HIRES, ...settings.hires, upscaler: event.target.value },
+                          })
+                        }
+                      />
+                      <datalist id="studio-upscalers">
+                        {UPSCALERS.map((entry) => (
+                          <option key={entry} value={entry} />
+                        ))}
+                      </datalist>
+                      <span className="text-faint">{t("Studio.upscalerHint")}</span>
+                    </label>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <SliderField
+                        label={t("Studio.hiresSteps")}
+                        value={settings.hires.steps}
+                        min={0}
+                        max={150}
+                        step={1}
+                        onChange={(steps) =>
+                          setSettings({
+                            ...settings,
+                            hires: { ...DEFAULT_HIRES, ...settings.hires, steps },
+                          })
+                        }
+                      />
+                      <SliderField
+                        label={t("Studio.denoise")}
+                        value={settings.hires.denoisingStrength}
+                        min={0}
+                        max={1}
+                        step={0.01}
+                        onChange={(denoisingStrength) =>
+                          setSettings({
+                            ...settings,
+                            hires: { ...DEFAULT_HIRES, ...settings.hires, denoisingStrength },
+                          })
+                        }
+                      />
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
           )}
 
           {!isSpeechTask(task) && (
@@ -675,19 +949,6 @@ export function StudioPanel() {
                 (component) => component.slot === "high_noise_diffusion_model",
               )}
             />
-          )}
-
-          {!isSpeechTask(task) && (
-            <label className="flex items-center gap-3 text-xs">
-              <span className="w-24 shrink-0 text-muted">{t("Studio.seed")}</span>
-              <input
-                type="number"
-                value={seed}
-                onChange={(event) => setSeed(Number(event.target.value))}
-                className="w-32 rounded border border-border bg-background px-2 py-1 text-xs"
-              />
-              <span className="text-[11px] text-faint">{t("Studio.seedHint")}</span>
-            </label>
           )}
 
           <div className="flex items-center gap-2">
