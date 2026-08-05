@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use url::Url;
 
 use crate::artifact_store::{ArtifactBlob, ArtifactStore};
+use crate::egress::{EgressDenial, EgressRule};
 
 const PROFILE_MARKER: &str = ".little-monkey-browser-profile";
 const MAX_CDP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -729,12 +730,14 @@ impl OwnedBrowser {
         validate_identifier("runId", &request.run_id)?;
         validate_limits(&request.limits)?;
         let grant = ValidatedGrant::new(request.grant)?;
-        grant.validate_navigation(&request.url)?;
+        grant
+            .validate_navigation(&request.url)
+            .map_err(denial_text)?;
         // Chromium resolves a request only after Fetch.requestPaused is
         // continued. Pin each granted hostname to an address that was already
         // classified here so a second DNS answer cannot pivot the browser to
         // a private/link-local address between our check and the socket open.
-        let resolver_rules = grant.chromium_resolver_rules()?;
+        let resolver_rules = grant.chromium_resolver_rules().map_err(denial_text)?;
         let session_id = format!("browser-{}", uuid::Uuid::new_v4());
         let profile = profile_root.join(&session_id);
         ensure_new_owned_profile(&profile_root, &profile, &session_id)?;
@@ -984,8 +987,8 @@ impl OwnedBrowser {
             .map_err(|_| "Browser CDP lock is poisoned".to_string())?;
         let result = operation(&mut cdp);
         self.collect_events(&mut cdp);
-        if let Some(error) = cdp.security_error.take() {
-            return Err(error);
+        if let Some(denial) = cdp.security_error.take() {
+            return Err(denial_text(denial));
         }
         result
     }
@@ -1014,7 +1017,7 @@ impl OwnedBrowser {
     fn navigate(&self, url: &str) -> Result<BrowserActionResult, String> {
         let url = url.to_string();
         self.with_cdp(|cdp| {
-            cdp.grant.validate_navigation(&url)?;
+            cdp.grant.validate_navigation(&url).map_err(denial_text)?;
             cdp.command("Page.navigate", json!({"url":url}))?;
             cdp.wait_for_load(Duration::from_millis(self.limits.timeout_ms))
         })?;
@@ -1382,6 +1385,25 @@ struct ValidatedGrant {
 }
 
 impl ValidatedGrant {
+    /// Builds the per-run grant from what the caller asked for.
+    ///
+    /// # Why these three refusals stay prose while the request guards are typed
+    ///
+    /// Everything below is a *configuration* defect: an empty or oversized origin
+    /// list, an entry that is not a URL at all, an entry that carries a path or
+    /// credentials. None of them is a decision about where the browser may go —
+    /// they all fire before any destination exists, and they are answered by
+    /// fixing the grant, not by granting more. An [`EgressRule`] is scoped to a
+    /// request: its code is what a denial sink stores per refused destination, and
+    /// its detail names the address or origin that tripped it. Recording
+    /// `egress.url-malformed` for a typo in a *grant entry* would put a
+    /// configuration mistake into the same counter as a page trying to reach
+    /// `169.254.169.254`, and an operator reading that counter could no longer
+    /// tell an attack from a bad config file.
+    ///
+    /// [`normalized_origin`] is the exception, because it is shared with the
+    /// request path: it returns a typed denial, and this is the one place where
+    /// that denial is rendered straight to prose rather than propagated.
     fn new(grant: BrowserGrant) -> Result<Self, String> {
         if grant.allowed_origins.is_empty() || grant.allowed_origins.len() > MAX_ALLOWED_ORIGINS {
             return Err("Browser grant requires 1..=32 exact origins".to_string());
@@ -1401,7 +1423,7 @@ impl ValidatedGrant {
                         .to_string(),
                 );
             }
-            let origin = normalized_origin(&url)?;
+            let origin = normalized_origin(&url).map_err(denial_text)?;
             if !allowed_origins.contains(&origin) {
                 allowed_origins.push(origin);
             }
@@ -1412,66 +1434,102 @@ impl ValidatedGrant {
         })
     }
 
-    fn validate_navigation(&self, value: &str) -> Result<(), String> {
+    fn validate_navigation(&self, value: &str) -> Result<(), EgressDenial> {
         let url = validate_http_url(value)?;
         let origin = normalized_origin(&url)?;
         if !self.allowed_origins.contains(&origin) {
-            return Err(format!(
-                "Navigation origin '{origin}' is outside this run's grant"
+            return Err(EgressDenial::about(
+                EgressRule::OriginNotAllowlisted,
+                format!("navigation origin '{origin}' is outside this run's grant"),
             ));
         }
         self.validate_resolved(&url, true)
     }
 
-    fn validate_request(&self, value: &str, document: bool) -> Result<(), String> {
+    fn validate_request(&self, value: &str, document: bool) -> Result<(), EgressDenial> {
         let url = validate_http_url(value)?;
-        if !self.allowed_origins.contains(&normalized_origin(&url)?) {
-            return Err(if document {
-                "Redirect/document navigation left the granted origin set".to_string()
+        let origin = normalized_origin(&url)?;
+        if !self.allowed_origins.contains(&origin) {
+            // Two rules rather than one rule with a flag, because the two are not
+            // the same event: a document hop is the page navigating itself
+            // somewhere the run was never granted, while a subresource is the page
+            // pulling in a third party. They were already two distinct sentences
+            // here on purpose, and the test that pins the distinction is the only
+            // egress refusal in this file whose text anybody asserted on.
+            let rule = if document {
+                EgressRule::RedirectLeftGrant
             } else {
-                "Page subresource left the granted origin set".to_string()
-            });
+                EgressRule::SubresourceLeftGrant
+            };
+            return Err(EgressDenial::about(
+                rule,
+                format!("'{origin}' is outside this run's grant"),
+            ));
         }
         self.validate_resolved(&url, document)
     }
 
-    fn validate_resolved(&self, url: &Url, _document: bool) -> Result<(), String> {
+    fn validate_resolved(&self, url: &Url, _document: bool) -> Result<(), EgressDenial> {
         self.resolved_addresses(url).map(|_| ())
     }
 
-    fn resolved_addresses(&self, url: &Url) -> Result<Vec<IpAddr>, String> {
+    fn resolved_addresses(&self, url: &Url) -> Result<Vec<IpAddr>, EgressDenial> {
         let host = url
             .host_str()
-            .ok_or_else(|| "Browser URL has no host".to_string())?;
+            .ok_or_else(|| EgressDenial::new(EgressRule::HostMissing))?;
         let port = url
             .port_or_known_default()
-            .ok_or_else(|| "Browser URL has no port".to_string())?;
+            .ok_or_else(|| EgressDenial::new(EgressRule::PortMissing))?;
         let addresses: Vec<IpAddr> = (host, port)
             .to_socket_addrs()
-            .map_err(|error| format!("Browser DNS resolution failed: {error}"))?
+            .map_err(|error| {
+                EgressDenial::about(
+                    EgressRule::DnsResolutionFailed,
+                    // The host, never the URL: a path or query on a browser target
+                    // is page-supplied and may carry a session token, and the host
+                    // is the whole of what failed to resolve.
+                    format!("browser DNS resolution failed for {host}: {error}"),
+                )
+            })?
             .map(|address| address.ip())
             .collect();
         if addresses.is_empty() {
-            return Err("Browser DNS resolution returned no addresses".to_string());
+            return Err(EgressDenial::about(EgressRule::DnsNoAddresses, host));
         }
         for address in &addresses {
+            // Every refusal names the address that tripped it. A name can resolve
+            // to several answers and any one of them is enough to refuse the whole
+            // set, so a message that named no address at all — which is what this
+            // used to be — left no way to tell which answer was the problem.
             match classify_ip(*address) {
-                IpClass::Public => {}
-                IpClass::Loopback if self.allow_loopback => {}
-                IpClass::Loopback => return Err("Loopback browser access requires an explicit per-run grant".to_string()),
-                IpClass::Private => return Err("Private, link-local, multicast, and unspecified browser destinations are blocked".to_string()),
+                None => {}
+                Some(EgressRule::Loopback) if self.allow_loopback => {}
+                Some(EgressRule::Loopback) => {
+                    return Err(EgressDenial::about(
+                        EgressRule::Loopback,
+                        format!("{address} requires an explicit per-run loopback grant"),
+                    ))
+                }
+                Some(rule) => return Err(EgressDenial::about(rule, address.to_string())),
             }
         }
         Ok(addresses)
     }
 
-    fn chromium_resolver_rules(&self) -> Result<String, String> {
+    fn chromium_resolver_rules(&self) -> Result<String, EgressDenial> {
         let mut pinned = BTreeMap::<String, IpAddr>::new();
         for origin in &self.allowed_origins {
-            let url = Url::parse(origin).map_err(|error| error.to_string())?;
+            // Re-parsing this file's own normalized output, so a failure here is a
+            // broken invariant rather than caller input. Typed all the same: the
+            // alternative is one `String` in a function whose every other refusal
+            // is a rule, and `UrlMalformed` exists precisely so "did not parse"
+            // stays distinguishable from "a rule refused it".
+            let url = Url::parse(origin).map_err(|error| {
+                EgressDenial::about(EgressRule::UrlMalformed, error.to_string())
+            })?;
             let host = url
                 .host_str()
-                .ok_or_else(|| "Browser origin has no host".to_string())?;
+                .ok_or_else(|| EgressDenial::new(EgressRule::HostMissing))?;
             // Literal IP hosts cannot be DNS-rebound and need no resolver rule.
             if host.parse::<IpAddr>().is_ok() {
                 continue;
@@ -1480,7 +1538,7 @@ impl ValidatedGrant {
                 .resolved_addresses(&url)?
                 .into_iter()
                 .next()
-                .ok_or_else(|| "Browser DNS resolution returned no addresses".to_string())?;
+                .ok_or_else(|| EgressDenial::about(EgressRule::DnsNoAddresses, host))?;
             pinned.insert(host.to_string(), address);
         }
         Ok(pinned
@@ -1497,48 +1555,118 @@ impl ValidatedGrant {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IpClass {
-    Public,
-    Loopback,
-    Private,
-}
-
-fn classify_ip(ip: IpAddr) -> IpClass {
+/// The rule that names `ip`'s address class, or `None` when no rule in this file
+/// accounts for it and the browser may be pointed at it.
+///
+/// # Why this replaced a three-variant `IpClass`
+///
+/// `IpClass::Private` was the single verdict of eleven distinct predicates, and
+/// the one sentence built from it named four of them ("Private, link-local,
+/// multicast, and unspecified") — so a refused navigation could not say whether it
+/// had hit RFC 1918, CGNAT, the benchmarking range or the broadcast address, and
+/// neither could a test. Decomposing the verdict rather than the message is what
+/// makes the difference visible to both.
+///
+/// # `Some(Loopback)` is not by itself a refusal
+///
+/// This file treats loopback specially and no other class that way: it is reachable
+/// with an explicit per-run grant, everything else never is. So the rule is
+/// *reported* here and the allow decision stays with the caller, which is the only
+/// place the grant is known. Every other `Some` is refused unconditionally.
+///
+/// # Deliberately not `web.rs`'s classifier
+///
+/// `web.rs::blocked_reason_ip` has the same shape and shares this vocabulary, but
+/// it is a different function on purpose: it refuses four classes where this
+/// refuses eleven, and unifying them would newly refuse fetches that work today
+/// (CGNAT is Tailscale's default range). See `egress`'s module doc.
+fn classify_ip(ip: IpAddr) -> Option<EgressRule> {
     if ip.is_loopback() {
-        return IpClass::Loopback;
+        return Some(EgressRule::Loopback);
     }
     match ip {
-        IpAddr::V4(ip) if is_private_v4(ip) => IpClass::Private,
-        IpAddr::V6(ip) if is_private_v6(ip) => IpClass::Private,
-        _ => IpClass::Public,
+        IpAddr::V4(ip) => classify_v4(ip),
+        IpAddr::V6(ip) => classify_v6(ip),
     }
 }
 
-fn is_private_v4(ip: Ipv4Addr) -> bool {
-    ip.is_private()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_documentation()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || matches!(
-            ip.octets(),
-            [100, 64..=127, _, _] | [198, 18..=19, _, _] | [192, 0, 0, _]
-        )
+/// One rule per class, in the order the predicate disjunction that preceded this
+/// listed them. The classes are unchanged: this names the verdict, it does not
+/// widen or narrow the set of refused addresses.
+///
+/// # Two things a reader will look for and not find
+///
+/// `240.0.0.0/4` and all of `0.0.0.0/8` except `0.0.0.0` itself are **not**
+/// refused, and no branch below returns [`EgressRule::ReservedRange`] or
+/// [`EgressRule::ThisNetwork`]. That is the behaviour this file already had;
+/// adding either rule here would refuse addresses it accepts today, which is a
+/// separate decision from naming the rules it already enforces.
+///
+/// # The loopback branch below is not redundant
+///
+/// [`classify_ip`] does answer `127.0.0.0/8` before either family helper is
+/// reached, so for a v4 address this arm never fires. It exists for the address
+/// that arrives here the other way: the IPv4-**mapped** form `::ffff:127.0.0.1` is
+/// not `Ipv6Addr::is_loopback`, so `classify_ip` passes it through to
+/// [`classify_v6`], which unwraps it to a bare `127.0.0.1` and delegates here.
+/// Without this branch that address matched nothing and was classified as an
+/// ordinary public navigation target — a loopback destination reachable without the
+/// explicit per-run loopback grant that gates `127.0.0.1` itself.
+fn classify_v4(ip: Ipv4Addr) -> Option<EgressRule> {
+    if ip.is_loopback() {
+        return Some(EgressRule::Loopback); // 127/8, reached via `::ffff:127.0.0.1`
+    }
+    if ip.is_private() {
+        return Some(EgressRule::PrivateV4); // 10/8, 172.16/12, 192.168/16
+    }
+    if ip.is_link_local() {
+        return Some(EgressRule::LinkLocal); // 169.254/16
+    }
+    if ip.is_broadcast() {
+        return Some(EgressRule::Broadcast); // 255.255.255.255
+    }
+    if ip.is_documentation() {
+        return Some(EgressRule::TestNet); // 192.0.2/24, 198.51.100/24, 203.0.113/24
+    }
+    if ip.is_unspecified() {
+        return Some(EgressRule::Unspecified); // 0.0.0.0
+    }
+    if ip.is_multicast() {
+        return Some(EgressRule::Multicast); // 224/4
+    }
+    match ip.octets() {
+        [100, 64..=127, _, _] => Some(EgressRule::Cgnat),
+        [198, 18..=19, _, _] => Some(EgressRule::Benchmarking),
+        [192, 0, 0, _] => Some(EgressRule::ProtocolAssignments),
+        _ => None,
+    }
 }
 
-fn is_private_v6(ip: Ipv6Addr) -> bool {
-    // `classify_ip` checks `is_loopback` before reaching here, so `::1` is already
-    // handled — but `::127.0.0.1` is not loopback by that predicate and is not what
-    // `to_ipv4_mapped` matches, so it classified as Public. See
-    // `egress::is_ipv4_compatible`.
-    crate::egress::is_ipv4_compatible(&ip)
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || (ip.segments()[0] & 0xfe00) == 0xfc00
-        || (ip.segments()[0] & 0xffc0) == 0xfe80
-        || ip.to_ipv4_mapped().is_some_and(is_private_v4)
+/// The IPv6 half of [`classify_v4`], in the order the disjunction it replaced had.
+fn classify_v6(ip: Ipv6Addr) -> Option<EgressRule> {
+    // First, because `classify_ip` checks `is_loopback` before reaching here so
+    // `::1` is already handled — but `::127.0.0.1` is not loopback by that
+    // predicate and is not what `to_ipv4_mapped` matches, so it classified as
+    // public. See `egress::is_ipv4_compatible`.
+    if crate::egress::is_ipv4_compatible(&ip) {
+        return Some(EgressRule::Ipv4Compatible); // ::/96, minus `::` and `::1`
+    }
+    if ip.is_unspecified() {
+        return Some(EgressRule::Unspecified); // ::
+    }
+    if ip.is_multicast() {
+        return Some(EgressRule::Multicast); // ff00::/8
+    }
+    if (ip.segments()[0] & 0xfe00) == 0xfc00 {
+        return Some(EgressRule::UniqueLocalV6); // fc00::/7
+    }
+    if (ip.segments()[0] & 0xffc0) == 0xfe80 {
+        return Some(EgressRule::LinkLocal); // fe80::/10
+    }
+    // Last, and reporting whichever v4 rule the wrapped address trips rather than a
+    // rule of its own: `::ffff:10.0.0.1` is a private address, and calling it
+    // anything else would hide that from whoever reads the denial.
+    ip.to_ipv4_mapped().and_then(classify_v4)
 }
 
 struct CdpConnection {
@@ -1547,7 +1675,17 @@ struct CdpConnection {
     next_id: u64,
     events: VecDeque<Value>,
     grant: ValidatedGrant,
-    security_error: Option<String>,
+    /// The refusal that failed an intercepted request, held until the action that
+    /// provoked it can return it.
+    ///
+    /// Holds the denial rather than a rendered sentence. Chromium is told
+    /// `BlockedByClient` immediately and the caller only learns why on the next
+    /// `take()`, so this field is the whole of the refusal's memory on this path —
+    /// and rendering it here would mean every re-raise site below had lost the rule
+    /// before it was reached. Kept as a value, the rule survives the round trip and
+    /// only becomes prose at the `String` boundary, exactly like the returned
+    /// refusals. See [`denial_text`].
+    security_error: Option<EgressDenial>,
 }
 
 impl CdpConnection {
@@ -1557,6 +1695,13 @@ impl CdpConnection {
         if url.scheme() != "ws" || !matches!(url.host_str(), Some("127.0.0.1" | "localhost")) {
             return Err("DevTools websocket must be loopback ws:".to_string());
         }
+        // Prose, not a rule, and deliberately: this is the local DevTools control
+        // channel, so a handshake failure here is not an egress denial. Recording it
+        // under an `egress.*` code would put a local wiring fault in the same counter
+        // as a page reaching for `169.254.169.254`, which is exactly the conflation
+        // the rule codes exist to end. The loopback-`ws:` check above stays prose for
+        // the same reason — this channel *must* be loopback, so `egress.loopback`
+        // would name the rule that refuses what is required here.
         let port = url
             .port()
             .ok_or_else(|| "DevTools websocket has no port".to_string())?;
@@ -1611,8 +1756,8 @@ impl CdpConnection {
                 if let Some(error) = message.get("error") {
                     return Err(format!("CDP {method} failed: {error}"));
                 }
-                if let Some(error) = self.security_error.take() {
-                    return Err(error);
+                if let Some(denial) = self.security_error.take() {
+                    return Err(denial_text(denial));
                 }
                 return Ok(message.get("result").cloned().unwrap_or_else(|| json!({})));
             }
@@ -1782,8 +1927,8 @@ impl CdpConnection {
             self.next_id = self.next_id.saturating_add(1);
             match decision {
                 Ok(()) => self.send_json(&json!({"id":id,"method":"Fetch.continueRequest","params":{"requestId":request_id}}))?,
-                Err(error) => {
-                    self.security_error = Some(error);
+                Err(denial) => {
+                    self.security_error = Some(denial);
                     self.send_json(&json!({"id":id,"method":"Fetch.failRequest","params":{"requestId":request_id,"errorReason":"BlockedByClient"}}))?;
                 }
             }
@@ -1795,8 +1940,8 @@ impl CdpConnection {
     fn wait_for_load(&mut self, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if let Some(error) = self.security_error.take() {
-                return Err(error);
+            if let Some(denial) = self.security_error.take() {
+                return Err(denial_text(denial));
             }
             match self.read_json(Some(Duration::from_millis(100)))? {
                 Some(event)
@@ -1821,39 +1966,79 @@ impl CdpConnection {
                 None => break,
             }
         }
-        if let Some(error) = self.security_error.take() {
-            Err(error)
+        if let Some(denial) = self.security_error.take() {
+            Err(denial_text(denial))
         } else {
             Ok(())
         }
     }
 }
 
-fn validate_http_url(value: &str) -> Result<Url, String> {
+/// Renders a typed denial for one of the `String`-shaped boundaries.
+///
+/// The twelve `#[tauri::command]`s and [`BrowserWorkflowAdapter::execute`] are
+/// `Result<_, String>` by their own contract — Tauri serializes the error to the
+/// webview and the workflow engine puts it in a node result — so a denial has to
+/// become prose somewhere. It becomes prose *here*, as late as it can, and through
+/// [`EgressDenial`]'s own `Display`, which is the only rendering that carries the
+/// rule code. Every hand-built refusal string this replaced dropped the code at
+/// the refusal site instead, which is why nothing downstream could tell two
+/// refusals apart. Greppable on purpose: each `map_err(denial_text)` is a place a
+/// rule stops being a value.
+fn denial_text(denial: EgressDenial) -> String {
+    denial.to_string()
+}
+
+fn validate_http_url(value: &str) -> Result<Url, EgressDenial> {
     if value.len() > 16 * 1024 {
-        return Err("Browser URL exceeds 16 KiB".to_string());
+        // The length, not the URL: quoting 16 KiB of caller-supplied text into an
+        // error that surfaces in the UI is its own problem.
+        return Err(EgressDenial::about(
+            EgressRule::UrlTooLong,
+            format!(
+                "browser URL is {} bytes, over the 16 KiB limit",
+                value.len()
+            ),
+        ));
     }
-    let url = Url::parse(value).map_err(|error| format!("Invalid browser URL: {error}"))?;
+    let url = Url::parse(value)
+        .map_err(|error| EgressDenial::about(EgressRule::UrlMalformed, error.to_string()))?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err("Only http: and https: browser URLs are allowed".to_string());
+        return Err(EgressDenial::about(
+            EgressRule::SchemeNotAllowed,
+            format!(
+                "only http: and https: browser URLs are allowed, not '{}:'",
+                url.scheme()
+            ),
+        ));
     }
+    // No detail at all, and the one refusal in this file for which that is the
+    // correct choice: `EgressRule::redacts_target` is true for exactly this rule
+    // because the URL is what carries the secret. Naming the host would already be
+    // most of the way to naming the credential's owner, and the summary says
+    // everything the caller needs to fix it.
     if !url.username().is_empty() || url.password().is_some() {
-        return Err("Browser URLs cannot contain credentials".to_string());
+        return Err(EgressDenial::new(EgressRule::EmbeddedCredentials));
     }
     if url.host_str().is_none() {
-        return Err("Browser URL has no host".to_string());
+        return Err(EgressDenial::new(EgressRule::HostMissing));
     }
     Ok(url)
 }
 
-fn normalized_origin(url: &Url) -> Result<String, String> {
+fn normalized_origin(url: &Url) -> Result<String, EgressDenial> {
     let host = url
         .host_str()
-        .ok_or_else(|| "URL has no host".to_string())?;
+        .ok_or_else(|| EgressDenial::new(EgressRule::HostMissing))?;
     let default = match url.scheme() {
         "http" => 80,
         "https" => 443,
-        _ => return Err("Only HTTP origins are supported".to_string()),
+        _ => {
+            return Err(EgressDenial::about(
+                EgressRule::SchemeNotAllowed,
+                format!("only HTTP origins are supported, not '{}:'", url.scheme()),
+            ))
+        }
     };
     Ok(match url.port() {
         Some(port) if port != default => format!("{}://{}:{port}", url.scheme(), host),
@@ -2512,15 +2697,20 @@ mod tests {
     /// what was already being set correctly.
     /// `classify_ip` catches `::1` up front, but `::127.0.0.1` is not loopback by
     /// that predicate and is not what `to_ipv4_mapped()` matches — so an
-    /// agent-driven navigation to it classified as `Public` and needed no grant.
+    /// agent-driven navigation to it classified as allowed and needed no grant.
+    ///
+    /// Asserted as `Ipv4Compatible` rather than merely "not allowed": the rule is
+    /// the claim. `::127.0.0.1` is refused because the deprecated wrapper is refused
+    /// whole, *not* because anything unwrapped it and recognised loopback, and only
+    /// naming the rule says which of those two happened.
     #[test]
     fn the_deprecated_ipv4_compatible_form_is_not_a_public_navigation_target() {
         use std::str::FromStr;
         for text in ["::127.0.0.1", "::10.0.0.1"] {
             let address = IpAddr::V6(Ipv6Addr::from_str(text).unwrap());
-            assert_ne!(
+            assert_eq!(
                 classify_ip(address),
-                IpClass::Public,
+                Some(EgressRule::Ipv4Compatible),
                 "{text} must not classify as public"
             );
         }
@@ -2528,7 +2718,7 @@ mod tests {
             classify_ip(IpAddr::V6(
                 Ipv6Addr::from_str("2606:2800:220:1:248:1893:25c8:1946").unwrap()
             )),
-            IpClass::Public
+            None
         );
     }
 
@@ -2918,17 +3108,117 @@ mod tests {
         );
     }
 
+    /// The same four claims as before, each now asserted by rule.
+    ///
+    /// `is_err()` was all this could say while these returned strings, and an
+    /// `Err` is the one thing every wrong implementation also produces: a guard
+    /// that refused `file:` for having no host, or refused a private address as a
+    /// malformed URL, passed it unchanged. The rule is what distinguishes "refused"
+    /// from "refused for the reason claimed".
     #[test]
     fn schemes_credentials_and_private_networks_are_blocked() {
-        assert!(validate_http_url("file:///etc/passwd").is_err());
-        assert!(validate_http_url("http://user:pass@example.com/").is_err());
-        assert_eq!(classify_ip("127.0.0.1".parse().unwrap()), IpClass::Loopback);
+        assert_eq!(
+            validate_http_url("file:///etc/passwd").unwrap_err().rule(),
+            EgressRule::SchemeNotAllowed
+        );
+
+        let credentials = validate_http_url("http://user:pass@example.com/").unwrap_err();
+        assert_eq!(credentials.rule(), EgressRule::EmbeddedCredentials);
+        // The one rule whose diagnostic may not quote what it refused, so the
+        // rendered sentence is asserted too and not just the rule.
+        assert!(credentials.rule().redacts_target());
+        assert_eq!(credentials.detail(), None);
+        let rendered = credentials.to_string();
+        assert!(!rendered.contains("user:pass"), "leaked: {rendered}");
+        assert!(!rendered.contains("example.com"), "leaked: {rendered}");
+
+        assert_eq!(
+            classify_ip("127.0.0.1".parse().unwrap()),
+            Some(EgressRule::Loopback)
+        );
         assert_eq!(
             classify_ip("169.254.1.1".parse().unwrap()),
-            IpClass::Private
+            Some(EgressRule::LinkLocal)
         );
-        assert_eq!(classify_ip("10.1.2.3".parse().unwrap()), IpClass::Private);
-        assert_eq!(classify_ip("8.8.8.8".parse().unwrap()), IpClass::Public);
+        assert_eq!(
+            classify_ip("10.1.2.3".parse().unwrap()),
+            Some(EgressRule::PrivateV4)
+        );
+        assert_eq!(classify_ip("8.8.8.8".parse().unwrap()), None);
+    }
+
+    /// One representative address per class this file refuses, asserted by rule.
+    ///
+    /// The list is the readable inventory of what a browser session cannot be
+    /// pointed at, which the chain of predicates is not. It also pins the
+    /// *precedence* between overlapping-looking branches: `192.0.0.1` is a protocol
+    /// assignment and not documentation, `255.255.255.255` is the broadcast address
+    /// and not multicast, and a v4-mapped v6 address reports its inner v4 rule
+    /// rather than a wrapper rule of its own.
+    #[test]
+    fn every_refused_address_class_reports_its_own_rule() {
+        for (text, expected) in [
+            // v4, in the order `classify_v4` tests them.
+            ("10.1.2.3", EgressRule::PrivateV4),
+            ("172.16.0.1", EgressRule::PrivateV4),
+            ("192.168.1.1", EgressRule::PrivateV4),
+            ("169.254.169.254", EgressRule::LinkLocal),
+            ("255.255.255.255", EgressRule::Broadcast),
+            ("192.0.2.1", EgressRule::TestNet),
+            ("198.51.100.1", EgressRule::TestNet),
+            ("203.0.113.1", EgressRule::TestNet),
+            ("0.0.0.0", EgressRule::Unspecified),
+            ("224.0.0.1", EgressRule::Multicast),
+            ("239.255.255.250", EgressRule::Multicast),
+            ("100.64.0.1", EgressRule::Cgnat),
+            ("100.127.255.255", EgressRule::Cgnat),
+            ("198.18.0.1", EgressRule::Benchmarking),
+            ("198.19.255.255", EgressRule::Benchmarking),
+            ("192.0.0.1", EgressRule::ProtocolAssignments),
+            ("127.0.0.1", EgressRule::Loopback),
+            ("127.1.2.3", EgressRule::Loopback),
+            // v6, in the order `classify_v6` tests them.
+            ("::127.0.0.1", EgressRule::Ipv4Compatible),
+            ("::93.184.216.34", EgressRule::Ipv4Compatible),
+            ("::", EgressRule::Unspecified),
+            ("ff02::1", EgressRule::Multicast),
+            ("fc00::1", EgressRule::UniqueLocalV6),
+            ("fd12:3456::1", EgressRule::UniqueLocalV6),
+            ("fe80::1", EgressRule::LinkLocal),
+            ("::1", EgressRule::Loopback),
+            // The mapped form keeps whichever rule its inner address trips.
+            ("::ffff:10.0.0.1", EgressRule::PrivateV4),
+            ("::ffff:169.254.169.254", EgressRule::LinkLocal),
+        ] {
+            let address: IpAddr = text.parse().expect("test address parses");
+            assert_eq!(
+                classify_ip(address),
+                Some(expected),
+                "{text} must be refused as {}",
+                expected.code()
+            );
+        }
+    }
+
+    /// The counter-test, without which "refuse everything" would pass every
+    /// assertion above: real public addresses in both families still classify as
+    /// allowed.
+    #[test]
+    fn public_addresses_in_both_families_are_still_allowed() {
+        for text in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:2800:220:1:248:1893:25c8:1946",
+            "2001:4860:4860::8888",
+        ] {
+            let address: IpAddr = text.parse().expect("test address parses");
+            assert_eq!(
+                classify_ip(address),
+                None,
+                "{text} is a public address and must stay reachable"
+            );
+        }
     }
 
     #[test]
@@ -2957,6 +3247,11 @@ mod tests {
         .is_err());
     }
 
+    /// Two independent requirements, and asserting only `is_err()` could not tell
+    /// them apart: a missing loopback grant and an origin outside the grant were the
+    /// same `Err`, so a guard that refused every loopback URL regardless of the
+    /// grant — or one that refused every URL regardless of its origin — passed this
+    /// test. The rule says which requirement each case is about.
     #[test]
     fn exact_origin_and_loopback_grant_are_required() {
         let denied = ValidatedGrant::new(BrowserGrant {
@@ -2964,9 +3259,21 @@ mod tests {
             allow_loopback: false,
         })
         .unwrap();
-        assert!(denied
+        let refusal = denied
             .validate_navigation("http://127.0.0.1:3000/")
-            .is_err());
+            .unwrap_err();
+        assert_eq!(
+            refusal.rule(),
+            EgressRule::Loopback,
+            "the origin is granted; the loopback class is what is not"
+        );
+        // The address that tripped it, because a name can resolve to several and
+        // only one of them may be the loopback answer.
+        assert_eq!(
+            refusal.detail(),
+            Some("127.0.0.1 requires an explicit per-run loopback grant")
+        );
+
         let allowed = ValidatedGrant::new(BrowserGrant {
             allowed_origins: vec!["http://127.0.0.1:3000".into()],
             allow_loopback: true,
@@ -2975,11 +3282,25 @@ mod tests {
         assert!(allowed
             .validate_navigation("http://127.0.0.1:3000/a")
             .is_ok());
-        assert!(allowed
-            .validate_navigation("http://127.0.0.1:3001/a")
-            .is_err());
+        assert_eq!(
+            allowed
+                .validate_navigation("http://127.0.0.1:3001/a")
+                .unwrap_err()
+                .rule(),
+            EgressRule::OriginNotAllowlisted,
+            "the loopback grant is held; the port is what leaves the grant"
+        );
     }
 
+    /// Four refusals that were four identical `Err`s, now four named rules.
+    ///
+    /// Writing them down exposed something the old assertions hid: with a grant of
+    /// `https://example.com`, the two IP-literal cases never reach the address
+    /// classifier at all — their *origin* is already outside the grant, so the
+    /// origin rule answers first and the private-address rules are not what is being
+    /// tested here. That layer is tested by
+    /// [`an_allowlisted_origin_that_resolves_into_a_refused_class_is_still_blocked`],
+    /// which grants the origin so the classifier is the only thing left to refuse it.
     #[test]
     fn page_requests_cannot_expand_the_run_grant() {
         let grant = ValidatedGrant::new(BrowserGrant {
@@ -2987,20 +3308,175 @@ mod tests {
             allow_loopback: false,
         })
         .unwrap();
-        assert!(grant.validate_request("file:///etc/passwd", false).is_err());
-        assert!(grant
-            .validate_request("http://10.10.10.10/secret", false)
-            .is_err());
-        assert!(grant
-            .validate_request("http://169.254.169.254/latest", false)
-            .is_err());
-        assert!(grant
-            .validate_request("https://other.example/path", true)
-            .is_err());
-        assert!(grant
+        let rule_for = |result: Result<(), EgressDenial>| result.unwrap_err().rule();
+
+        assert_eq!(
+            rule_for(grant.validate_request("file:///etc/passwd", false)),
+            EgressRule::SchemeNotAllowed
+        );
+        assert_eq!(
+            rule_for(grant.validate_request("http://10.10.10.10/secret", false)),
+            EgressRule::SubresourceLeftGrant,
+            "the origin rule fires before the address is ever classified"
+        );
+        assert_eq!(
+            rule_for(grant.validate_request("http://169.254.169.254/latest", false)),
+            EgressRule::SubresourceLeftGrant,
+            "the origin rule fires before the address is ever classified"
+        );
+        // The distinction this pair exists to hold: a document hop and a subresource
+        // leaving the same grant are two rules, not one sentence with two spellings.
+        assert_eq!(
+            rule_for(grant.validate_request("https://other.example/path", true)),
+            EgressRule::RedirectLeftGrant
+        );
+        let subresource = grant
             .validate_request("https://cdn.example/path.js", false)
-            .unwrap_err()
-            .contains("subresource"));
+            .unwrap_err();
+        assert_eq!(subresource.rule(), EgressRule::SubresourceLeftGrant);
+        assert_ne!(
+            subresource.rule(),
+            EgressRule::RedirectLeftGrant,
+            "these two must stay distinguishable by type, not by prose"
+        );
+        assert_eq!(
+            subresource.detail(),
+            Some("'https://cdn.example' is outside this run's grant")
+        );
+    }
+
+    /// The second layer, which the test above cannot reach: an origin the run *was*
+    /// granted, whose host resolves into a class this file refuses.
+    ///
+    /// A grant naming a private IP literal is a plausible mistake for a caller to
+    /// make, and the address classifier is the only thing standing behind it. Every
+    /// address here is a literal, so nothing in this test resolves a name off-box.
+    #[test]
+    fn an_allowlisted_origin_that_resolves_into_a_refused_class_is_still_blocked() {
+        for (origin, target, expected) in [
+            (
+                "http://10.10.10.10",
+                "http://10.10.10.10/secret",
+                EgressRule::PrivateV4,
+            ),
+            (
+                "http://169.254.169.254",
+                "http://169.254.169.254/latest/meta-data/",
+                EgressRule::LinkLocal,
+            ),
+            (
+                "http://192.0.0.1",
+                "http://192.0.0.1/",
+                EgressRule::ProtocolAssignments,
+            ),
+        ] {
+            let grant = ValidatedGrant::new(BrowserGrant {
+                allowed_origins: vec![origin.to_string()],
+                allow_loopback: false,
+            })
+            .unwrap();
+            let denial = grant.validate_request(target, false).unwrap_err();
+            assert_eq!(
+                denial.rule(),
+                expected,
+                "{origin} is granted, so {} is what must refuse it",
+                expected.code()
+            );
+            // The offending address, so a multi-answer refusal says which answer.
+            assert!(
+                denial
+                    .detail()
+                    .is_some_and(|detail| detail.contains(origin.trim_start_matches("http://"))),
+                "the refusal must name the address it refused: {denial}"
+            );
+            // A document hop reaches the same classifier by the same route.
+            assert_eq!(
+                grant.validate_request(target, true).unwrap_err().rule(),
+                expected
+            );
+        }
+    }
+
+    /// The IPv4-**mapped** loopback form was classified as an ordinary public
+    /// navigation target: it is not `Ipv6Addr::is_loopback`, so it slipped past
+    /// [`classify_ip`]'s loopback check, and the v4 helper it then unwrapped into had
+    /// no loopback branch — because until that unwrap existed, nothing had ever
+    /// reached it with a loopback address.
+    ///
+    /// Sibling of the `::127.0.0.1` bug the shared `egress::is_ipv4_compatible`
+    /// predicate closed, and it survived that fix because the compatible form and the
+    /// mapped form are different ranges reached by different branches.
+    ///
+    /// # Whether it was reachable end to end depends on the platform
+    ///
+    /// `Url::host_str` serializes an IPv6 literal *with* its brackets, and
+    /// `("[::ffff:127.0.0.1]", port).to_socket_addrs()` is where the platforms part
+    /// company: macOS and Linux refuse to parse it, so the target is refused as a
+    /// resolution failure before the classifier is consulted, while **Windows
+    /// resolves it** — so on Windows this was a live bypass, and a granted
+    /// `http://[::ffff:127.0.0.1]` origin reached this machine's own loopback
+    /// services without the explicit per-run loopback grant that a plain
+    /// `127.0.0.1` requires. Elsewhere the same fix is defensive: a classifier must
+    /// not call a loopback address public whatever route reaches it, and a hostname
+    /// whose resolver answers with a mapped address is such a route.
+    ///
+    /// The classifier assertions below are the load-bearing half on every platform.
+    /// The `validate_navigation` half asserts the one invariant that holds on all of
+    /// them, and deliberately does not pin either platform's resolver behaviour as
+    /// the expected answer — an earlier version pinned the macOS verdict and failed
+    /// on Windows for a reason that was not a defect.
+    #[test]
+    fn the_ipv4_mapped_loopback_form_is_classified_as_loopback() {
+        for text in ["::ffff:127.0.0.1", "::ffff:127.1.2.3"] {
+            let address: Ipv6Addr = text.parse().expect("parses");
+            assert!(
+                !address.is_loopback(),
+                "{text} is deliberately NOT `is_loopback`, which is the whole trap"
+            );
+            assert_eq!(
+                classify_ip(IpAddr::V6(address)),
+                Some(EgressRule::Loopback),
+                "{text} must be reported as loopback, not as a public target"
+            );
+        }
+
+        // Counter-test: a public address in the same wrapper is still reachable, so
+        // the new branch did not refuse the whole mapped range.
+        assert_eq!(
+            classify_ip(IpAddr::V6(
+                "::ffff:93.184.216.34".parse::<Ipv6Addr>().unwrap()
+            )),
+            None
+        );
+
+        // End to end, through the gate that actually decides a navigation. The origin
+        // is granted, so the only thing left to refuse it is the address — and on
+        // Windows, where the bracketed literal does resolve, this is the assertion
+        // that fails without the fix.
+        let grant = ValidatedGrant::new(BrowserGrant {
+            allowed_origins: vec!["http://[::ffff:127.0.0.1]:11434".into()],
+            allow_loopback: false,
+        })
+        .unwrap();
+        let denial = grant
+            .validate_navigation("http://[::ffff:127.0.0.1]:11434/api/tags")
+            .expect_err("loopback without a grant must never be allowed");
+        match denial.rule() {
+            // macOS and Linux: `to_socket_addrs` cannot parse the bracketed host, so
+            // the target is refused before the classifier is reached. Accepted rather
+            // than asserted, because it is this platform's resolver talking and not
+            // this guard's policy — and because it is a bug of its own, recorded in
+            // the roadmap: `web.rs` avoids it by matching on `Url::host()`, the parsed
+            // enum, and its own comment names this "bracket-handling class of bug".
+            EgressRule::DnsResolutionFailed => {}
+            // Windows: the host resolves, so the classifier decides — and it must say
+            // loopback. Any other rule, and above all `Ok`, is the bypass.
+            rule => assert_eq!(
+                rule,
+                EgressRule::Loopback,
+                "a resolvable mapped-loopback target must be refused as loopback"
+            ),
+        }
     }
 
     #[test]

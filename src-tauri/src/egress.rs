@@ -15,11 +15,294 @@
 //! `reqwest::Client` — the spelling ~25 call sites in this tree reached for — has
 //! no timeout of any kind and a redirect policy that will follow ten hops to
 //! anywhere. See its doc comment for the three concrete holes that closes.
+//!
+//! [`EgressRule`] is the third piece, and the one the other two were missing: a
+//! *name* for the rule that refused a request, so a refusal is a value and not
+//! only a sentence. See its doc comment for what could not be done without it.
 
+use std::fmt;
 use std::net::Ipv6Addr;
 use std::time::Duration;
 
 use reqwest::Url;
+
+/// Declares [`EgressRule`] together with its code and summary tables.
+///
+/// A macro rather than three hand-written lists because those three must not be
+/// able to drift apart. Written out by hand, a new variant compiles fine while
+/// missing from `ALL`, and `ALL` is what the tests below iterate to prove codes
+/// are unique and stable — so the one mistake that matters most (a rule nobody
+/// is checking) would be the one mistake the tests could not see. Declared this
+/// way, a variant without a code is a compile error and membership in `ALL` is
+/// not a thing anyone can forget.
+macro_rules! egress_rules {
+    ($(
+        $(#[doc = $doc:literal])*
+        $variant:ident => $code:literal, $summary:literal;
+    )+) => {
+        /// The rule that refused an outbound request.
+        ///
+        /// # Why a type, when a sentence was already there
+        ///
+        /// Every refusal in the four SSRF guards used to be prose built at the
+        /// refusal site — `web.rs` returned `Result<(), String>`,
+        /// `knowledge_pipeline.rs` wrapped a `String` in `UrlRejected`,
+        /// `browser_worker.rs` and `model_sources.rs` returned `Err(String)`.
+        /// Three consequences, each observed in this tree rather than imagined:
+        ///
+        /// 1. **A test could not tell a policy block from a typo.**
+        ///    `knowledge_pipeline.rs` maps `Url::parse` failures and its loopback
+        ///    block onto the same `UrlRejected` variant, and one of its tests
+        ///    asserts five semantically different refusals — loopback, embedded
+        ///    credentials, a `file://` scheme, an over-length URL and an `[::1]`
+        ///    literal — with the identical `Err(UrlRejected(_))` pattern.
+        /// 2. **Neither could an operator.** At the command boundary `web.rs`
+        ///    hands the UI a flat `String` in which a policy denial, a DNS
+        ///    outage and a TCP reset are the same shape, discriminated only by
+        ///    substring-matching prose like `"local/private"`.
+        /// 3. **One sentence stood for many rules.** That `"local/private"`
+        ///    string is the verdict of ten distinct address predicates.
+        ///    `browser_worker.rs` is worse than imprecise: its message names
+        ///    four classes ("Private, link-local, multicast, and unspecified")
+        ///    while the predicate behind it blocks eleven.
+        ///
+        /// # What this is not
+        ///
+        /// Not a unification of the four blocklists. They still disagree, on
+        /// purpose and for the reason this module's own doc gives. This is shared
+        /// *vocabulary*: where two guards refuse for the same reason they now say
+        /// so with the same name, and where only one guard checks a class, that
+        /// asymmetry becomes visible instead of hiding inside four different
+        /// sentences.
+        ///
+        /// # Codes are permanent
+        ///
+        /// [`code`](Self::code) is the machine identity a denial sink will store,
+        /// so it outlives the prose and outlives this enum's spelling. A test
+        /// below pins every code against a written-out list; changing one has to
+        /// be a deliberate edit in two places, because renaming a code orphans
+        /// every denial already recorded under the old one.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub enum EgressRule {
+            $($(#[doc = $doc])* $variant,)+
+        }
+
+        impl EgressRule {
+            /// Every rule, in declaration order.
+            ///
+            /// Complete by construction — see [`egress_rules`]'s own doc for why
+            /// that guarantee is worth a macro.
+            pub const ALL: &'static [EgressRule] = &[$(EgressRule::$variant,)+];
+
+            /// The stable machine identity, e.g. `egress.loopback`.
+            ///
+            /// Never localized, never reworded, and safe to persist, match on, or
+            /// grep a log for.
+            #[must_use]
+            pub fn code(self) -> &'static str {
+                match self { $(EgressRule::$variant => $code,)+ }
+            }
+
+            /// One short human sentence, with no interpolation.
+            ///
+            /// Anything request-specific — an address, an origin, a hop count —
+            /// belongs in [`EgressDenial`]'s detail, so that the two can be
+            /// stored and compared separately.
+            #[must_use]
+            pub fn summary(self) -> &'static str {
+                match self { $(EgressRule::$variant => $summary,)+ }
+            }
+        }
+    };
+}
+
+egress_rules! {
+    /// The URL did not parse. Not a policy decision — it is here so that a
+    /// malformed URL is *distinguishable* from one a rule refused, which is
+    /// exactly what `knowledge_pipeline.rs` could not express when both were
+    /// `UrlRejected(String)`.
+    UrlMalformed => "egress.url-malformed", "the URL could not be parsed";
+    /// Longer than the caller's configured maximum.
+    UrlTooLong => "egress.url-too-long", "the URL is over its length limit";
+    /// Contains control characters. Split from [`UrlTooLong`](EgressRule::UrlTooLong)
+    /// even though `knowledge_pipeline.rs` tested both in one branch: a 40 KB URL
+    /// and a URL carrying a `\r` are different problems and one of the two is an
+    /// injection attempt.
+    UrlControlCharacters => "egress.url-control-characters", "the URL contains control characters";
+    /// The scheme is not one this caller will send to.
+    SchemeNotAllowed => "egress.scheme-not-allowed", "the URL scheme is not allowed here";
+    /// `user:password@host`. The only rule whose diagnostics must not name the
+    /// target — see [`EgressRule::redacts_target`].
+    EmbeddedCredentials => "egress.embedded-credentials", "the URL carries embedded credentials";
+    /// A fragment was present where the URL is an identity, not a location.
+    FragmentNotAllowed => "egress.fragment-not-allowed", "the URL carries a fragment";
+    /// No host at all — `data:`, `file:`, or a relative URL that reached a guard.
+    HostMissing => "egress.host-missing", "the URL has no host";
+    /// No port, and the scheme has no default to fall back on.
+    PortMissing => "egress.port-missing", "the URL has no port";
+    /// The origin is outside the set this run or this source was granted.
+    OriginNotAllowlisted => "egress.origin-not-allowlisted", "the origin is not on the allowlist";
+    /// A redirect or document navigation left the granted origin set. Kept
+    /// separate from [`SubresourceLeftGrant`](EgressRule::SubresourceLeftGrant)
+    /// because `browser_worker.rs` deliberately distinguishes them and a test
+    /// there exists only to hold that line.
+    RedirectLeftGrant => "egress.redirect-left-grant", "a redirect left the granted origins";
+    /// A page subresource pointed outside the granted origin set.
+    SubresourceLeftGrant => "egress.subresource-left-grant", "a subresource left the granted origins";
+    /// Plain `http` where TLS is required.
+    CleartextNotAllowed => "egress.cleartext-not-allowed", "cleartext HTTP is not allowed here";
+    /// `127.0.0.0/8`, `::1`, or a name that resolves there. This machine's own
+    /// unauthenticated services live here, which is what makes it the class that
+    /// matters most.
+    Loopback => "egress.loopback", "the target is a loopback address";
+    /// `0.0.0.0` / `::`. Blocked as loopback would be, because the OS routes an
+    /// outbound connection to `0.0.0.0` to `127.0.0.1` — verified empirically on
+    /// macOS — so it is a live path to a loopback-bound service and not a dead
+    /// address.
+    Unspecified => "egress.unspecified", "the target is the unspecified address";
+    /// RFC 1918: `10/8`, `172.16/12`, `192.168/16`.
+    PrivateV4 => "egress.private-v4", "the target is a private IPv4 address";
+    /// `169.254/16` or `fe80::/10`. One rule for both families: same policy,
+    /// same reason, and no guard distinguishes them.
+    LinkLocal => "egress.link-local", "the target is a link-local address";
+    /// `fc00::/7`. Its own rule rather than folded into
+    /// [`PrivateV4`](EgressRule::PrivateV4) because there is no v4 analogue and a
+    /// reader should not have to know that "private-v4" secretly meant v6 too.
+    UniqueLocalV6 => "egress.unique-local-v6", "the target is a unique-local IPv6 address";
+    /// `224/4` or `ff00::/8`.
+    Multicast => "egress.multicast", "the target is a multicast address";
+    /// `255.255.255.255`.
+    Broadcast => "egress.broadcast", "the target is the broadcast address";
+    /// Carrier-grade NAT, `100.64/10`. Only the broadest guard blocks this, and
+    /// deliberately so: it is Tailscale's default range and live on some consumer
+    /// ISPs, so blocking it everywhere would refuse fetches that work today.
+    Cgnat => "egress.cgnat", "the target is a carrier-grade NAT address";
+    /// `0.0.0.0/8` — "this network" — other than the unspecified address itself.
+    ThisNetwork => "egress.this-network", "the target is in the this-network range";
+    /// `192.0.0.0/24`, IETF protocol assignments.
+    ProtocolAssignments => "egress.protocol-assignments", "the target is an IETF protocol assignment";
+    /// Documentation ranges: `192.0.2/24`, `203.0.113/24`, and (in one guard, wider
+    /// than the RFC's `198.51.100/24`) all of `198.51/16`.
+    TestNet => "egress.test-net", "the target is in a documentation range";
+    /// `198.18/15`, reserved for inter-network benchmarking.
+    Benchmarking => "egress.benchmarking", "the target is in the benchmarking range";
+    /// `240/4` and above, reserved.
+    ReservedRange => "egress.reserved-range", "the target is in a reserved range";
+    /// The deprecated IPv4-compatible form `::a.b.c.d`, which walked past all four
+    /// guards until [`is_ipv4_compatible`] existed. Rejected as a range rather
+    /// than unwrapped — that function's doc says why the unwrap is worse than the
+    /// bug.
+    Ipv4Compatible => "egress.ipv4-compatible", "the target uses the deprecated IPv4-compatible form";
+    /// The name could not be resolved at all. Not a policy decision, and named so
+    /// that "the guard blocked it" and "DNS is down" stop being one string.
+    DnsResolutionFailed => "egress.dns-resolution-failed", "the host could not be resolved";
+    /// The caller must supply the resolved addresses and did not. An interface
+    /// contract, not a resolution outcome: `knowledge_pipeline.rs` refuses to
+    /// accept bytes for a name whose answers it was never shown.
+    DnsAnswersRequired => "egress.dns-answers-required", "the caller supplied no resolved addresses";
+    /// Resolution succeeded and returned nothing usable.
+    DnsNoAddresses => "egress.dns-no-addresses", "the host resolved to no addresses";
+    /// More hops than the caller's cap.
+    RedirectHopLimit => "egress.redirect-hop-limit", "the redirect chain is over its hop limit";
+    /// A hop changed origin while the request carried a credential. `x-api-key`
+    /// is the specific reason: reqwest strips `Authorization` across hosts but
+    /// not that one.
+    RedirectCrossOrigin => "egress.redirect-cross-origin", "the redirect leaves the origin the request was aimed at";
+    /// A hop arrived with no recorded previous URL, so there was no origin to
+    /// compare against. Refused rather than assumed, because "follow it anyway"
+    /// is the wrong direction to fail in for a client holding an API key.
+    RedirectOriginUnknown => "egress.redirect-origin-unknown", "the redirect has no recorded origin to compare against";
+}
+
+impl EgressRule {
+    /// Whether a diagnostic for this rule must **not** name the target URL.
+    ///
+    /// True for exactly one rule, and the asymmetry is the point:
+    /// [`EmbeddedCredentials`](Self::EmbeddedCredentials) fires *because* the URL
+    /// contains a secret, so the message that reports it is the one message that
+    /// cannot quote it. `web.rs` already had this right by hand — its
+    /// credentials refusal is the only one of its seven that omits the URL — and
+    /// putting it on the rule is what stops the next guard from getting it wrong.
+    /// The same instinct as [`origin_label`], one step further: there, the URL is
+    /// reduced to an origin; here, it is dropped.
+    #[must_use]
+    pub fn redacts_target(self) -> bool {
+        matches!(self, EgressRule::EmbeddedCredentials)
+    }
+}
+
+/// A refusal: the rule that fired, plus optional request-specific detail.
+///
+/// Implements [`std::error::Error`], which is not decoration. Two of the places
+/// a guard has to hand its verdict to somebody else's signature —
+/// `reqwest::dns::Resolve` (`Box<dyn Error + Send + Sync>`) and
+/// `redirect::Attempt::error` (via `io::Error::new`) — accept any such error, so
+/// a denial can travel through reqwest as itself rather than as a flattened
+/// string, and be recovered later with `downcast_ref`. Before this, the only
+/// machine-readable signal on that path was an `io::ErrorKind::PermissionDenied`
+/// that the caller's `format!` promptly destroyed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressDenial {
+    rule: EgressRule,
+    detail: Option<String>,
+}
+
+impl EgressDenial {
+    /// A denial with no detail beyond the rule.
+    #[must_use]
+    pub fn new(rule: EgressRule) -> Self {
+        Self { rule, detail: None }
+    }
+
+    /// A denial carrying the specifics — the address that tripped it, the origin
+    /// that was not allowlisted, the hop count.
+    ///
+    /// Detail is prose for a human. It must never be the only place the *reason*
+    /// lives: anything a test or a sink needs to branch on belongs in the rule.
+    #[must_use]
+    pub fn about(rule: EgressRule, detail: impl Into<String>) -> Self {
+        Self {
+            rule,
+            detail: Some(detail.into()),
+        }
+    }
+
+    #[must_use]
+    pub const fn rule(&self) -> EgressRule {
+        self.rule
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+}
+
+impl From<EgressRule> for EgressDenial {
+    fn from(rule: EgressRule) -> Self {
+        Self::new(rule)
+    }
+}
+
+/// The one canonical rendering, so no surface can drop the code.
+///
+/// `EgressRule` itself deliberately has no `Display`: with two of them, half the
+/// call sites would print prose with no code and there would be no way to notice.
+impl fmt::Display for EgressDenial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.detail {
+            Some(detail) => write!(
+                formatter,
+                "{}: {detail} [{}]",
+                self.rule.summary(),
+                self.rule.code()
+            ),
+            None => write!(formatter, "{} [{}]", self.rule.summary(), self.rule.code()),
+        }
+    }
+}
+
+impl std::error::Error for EgressDenial {}
 
 /// Whether `address` is an IPv4-**compatible** address (`::/96`), the deprecated
 /// form `::a.b.c.d` — as distinct from the IPv4-**mapped** form `::ffff:a.b.c.d`.
@@ -200,8 +483,9 @@ fn hardened_with_timeouts(connect: Duration, read: Duration) -> reqwest::ClientB
 fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= MAX_REDIRECT_HOPS {
-            return attempt.error(std::io::Error::other(format!(
-                "Refusing to follow more than {MAX_REDIRECT_HOPS} redirects"
+            return attempt.error(refused(EgressDenial::about(
+                EgressRule::RedirectHopLimit,
+                format!("refusing to follow more than {MAX_REDIRECT_HOPS} redirects"),
             )));
         }
         // `previous()` cannot actually be empty here — reqwest pushes the
@@ -210,10 +494,9 @@ fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
         // would be no origin to compare against, and "follow it anyway" is the
         // wrong direction to fail in for a client carrying an API key.
         let Some(previous) = attempt.previous().last() else {
-            return attempt.error(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "Refusing a redirect with no recorded origin to compare against",
-            ));
+            return attempt.error(refused(EgressDenial::new(
+                EgressRule::RedirectOriginUnknown,
+            )));
         };
         // The verdict is taken first, and the follow returns immediately, because
         // `Attempt::follow`/`Attempt::error` consume `attempt` while `previous`
@@ -224,16 +507,26 @@ fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
         if may_follow(previous, attempt.url()) {
             return attempt.follow();
         }
-        let refusal = format!(
-            "Refusing to carry credentials across a redirect from {} to {}",
-            origin_label(previous),
-            origin_label(attempt.url())
+        let refusal = EgressDenial::about(
+            EgressRule::RedirectCrossOrigin,
+            format!(
+                "refusing to carry credentials from {} to {}",
+                origin_label(previous),
+                origin_label(attempt.url())
+            ),
         );
-        attempt.error(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            refusal,
-        ))
+        attempt.error(refused(refusal))
     })
+}
+
+/// Wraps a denial for a signature that wants an error rather than a verdict.
+///
+/// `PermissionDenied` is kept from the hand-written version it replaces, and the
+/// denial is passed as itself rather than as `to_string()` so the rule survives
+/// the trip: `io::Error::into_inner`/`downcast_ref` can still recover an
+/// [`EgressDenial`] on the far side of reqwest.
+fn refused(denial: EgressDenial) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, denial)
 }
 
 /// Whether a redirect from `previous` to `next` stays on the same origin.
@@ -294,6 +587,202 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use std::str::FromStr;
+
+    mod rule {
+        use super::*;
+        use std::collections::BTreeSet;
+
+        /// Every code, written out.
+        ///
+        /// # Why duplicate what the macro already declares
+        ///
+        /// Because a code is a persisted identifier, not an implementation
+        /// detail. A denial sink will store these strings; renaming one orphans
+        /// every row already written under the old name, and a rename is a
+        /// one-character edit that reviews as a typo fix. Repeating the list here
+        /// means such an edit fails `cargo test` with the before and after side
+        /// by side, and updating it is an explicit statement that the orphaning
+        /// is intended. The list is also the readable inventory of what this app
+        /// will refuse, in one place, which the macro invocation is not.
+        const EXPECTED_CODES: &[&str] = &[
+            "egress.url-malformed",
+            "egress.url-too-long",
+            "egress.url-control-characters",
+            "egress.scheme-not-allowed",
+            "egress.embedded-credentials",
+            "egress.fragment-not-allowed",
+            "egress.host-missing",
+            "egress.port-missing",
+            "egress.origin-not-allowlisted",
+            "egress.redirect-left-grant",
+            "egress.subresource-left-grant",
+            "egress.cleartext-not-allowed",
+            "egress.loopback",
+            "egress.unspecified",
+            "egress.private-v4",
+            "egress.link-local",
+            "egress.unique-local-v6",
+            "egress.multicast",
+            "egress.broadcast",
+            "egress.cgnat",
+            "egress.this-network",
+            "egress.protocol-assignments",
+            "egress.test-net",
+            "egress.benchmarking",
+            "egress.reserved-range",
+            "egress.ipv4-compatible",
+            "egress.dns-resolution-failed",
+            "egress.dns-answers-required",
+            "egress.dns-no-addresses",
+            "egress.redirect-hop-limit",
+            "egress.redirect-cross-origin",
+            "egress.redirect-origin-unknown",
+        ];
+
+        #[test]
+        fn every_code_is_exactly_what_was_published() {
+            let actual: Vec<&str> = EgressRule::ALL.iter().map(|rule| rule.code()).collect();
+            assert_eq!(
+                actual, EXPECTED_CODES,
+                "a rule code changed, was added, or was removed. Codes are the \
+                 identity a denial sink persists: renaming one orphans every \
+                 denial already recorded under the old code. If that is intended, \
+                 update this list in the same commit."
+            );
+        }
+
+        /// Two rules sharing a code would silently merge in any log or sink that
+        /// groups by it — and with 32 hand-written strings, a copy-paste is the
+        /// likeliest way it happens.
+        #[test]
+        fn no_two_rules_share_a_code() {
+            let unique: BTreeSet<&str> = EgressRule::ALL.iter().map(|rule| rule.code()).collect();
+            assert_eq!(
+                unique.len(),
+                EgressRule::ALL.len(),
+                "duplicate rule code among {:?}",
+                EgressRule::ALL
+            );
+        }
+
+        /// Codes end up in logs, config and (eventually) a database column, so
+        /// the shape has to be boring: one namespace, lowercase, dash-separated,
+        /// nothing that needs quoting.
+        #[test]
+        fn codes_keep_a_shape_that_survives_a_log_and_a_column() {
+            for rule in EgressRule::ALL {
+                let code = rule.code();
+                let suffix = code
+                    .strip_prefix("egress.")
+                    .unwrap_or_else(|| panic!("{code} must be namespaced `egress.`"));
+                assert!(!suffix.is_empty(), "{code} has an empty suffix");
+                assert!(
+                    suffix
+                        .chars()
+                        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'),
+                    "{code} must be lowercase ASCII words joined by dashes"
+                );
+                assert!(
+                    !suffix.starts_with('-') && !suffix.ends_with('-'),
+                    "{code} has a dangling dash"
+                );
+            }
+        }
+
+        /// A summary that interpolated a request detail would defeat the split
+        /// this type exists to make: the rule is the stable part, the detail is
+        /// the per-request part, and a sink stores them in different columns.
+        #[test]
+        fn summaries_are_static_prose_with_nothing_interpolated() {
+            for rule in EgressRule::ALL {
+                let summary = rule.summary();
+                assert!(!summary.is_empty(), "{} has no summary", rule.code());
+                assert!(
+                    !summary.contains('{') && !summary.contains('}'),
+                    "{}'s summary looks like a format string: {summary}",
+                    rule.code()
+                );
+                assert!(
+                    !summary.ends_with('.'),
+                    "{}'s summary is a clause, not a sentence: {summary}",
+                    rule.code()
+                );
+            }
+        }
+
+        /// The rendering is the only thing an operator sees, so the code has to
+        /// be in it — that is the whole difference between this and the prose it
+        /// replaced.
+        #[test]
+        fn a_denial_always_renders_its_code() {
+            let bare = EgressDenial::new(EgressRule::Loopback);
+            assert_eq!(
+                bare.to_string(),
+                "the target is a loopback address [egress.loopback]"
+            );
+
+            let detailed = EgressDenial::about(EgressRule::Loopback, "127.0.0.1");
+            assert_eq!(
+                detailed.to_string(),
+                "the target is a loopback address: 127.0.0.1 [egress.loopback]"
+            );
+
+            for rule in EgressRule::ALL {
+                assert!(
+                    EgressDenial::new(*rule).to_string().contains(rule.code()),
+                    "{} rendered without its code",
+                    rule.code()
+                );
+            }
+        }
+
+        #[test]
+        fn the_rule_and_the_detail_stay_separable() {
+            let denial = EgressDenial::about(EgressRule::OriginNotAllowlisted, "https://evil.test");
+            assert_eq!(denial.rule(), EgressRule::OriginNotAllowlisted);
+            assert_eq!(denial.detail(), Some("https://evil.test"));
+            assert_eq!(EgressDenial::new(EgressRule::Loopback).detail(), None);
+        }
+
+        /// Exactly one rule may not name its target, and it is the one whose
+        /// target is a secret. Written as an inventory over `ALL` rather than as
+        /// a single assertion so that a new rule cannot quietly join the
+        /// exemption.
+        #[test]
+        fn only_the_credentials_rule_hides_the_target_it_refused() {
+            let redacting: Vec<&str> = EgressRule::ALL
+                .iter()
+                .filter(|rule| rule.redacts_target())
+                .map(|rule| rule.code())
+                .collect();
+            assert_eq!(redacting, vec!["egress.embedded-credentials"]);
+        }
+
+        /// A denial handed to `io::Error` must arrive as itself, not as a
+        /// sentence. This is what lets a caller on the far side of reqwest ask
+        /// *which rule* fired instead of substring-matching prose — the defect
+        /// this whole type exists to remove.
+        #[test]
+        fn a_denial_survives_being_boxed_into_an_io_error() {
+            let error = refused(EgressDenial::about(
+                EgressRule::RedirectCrossOrigin,
+                "https://a.test:443 to https://b.test:443",
+            ));
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+            let inner = error
+                .into_inner()
+                .expect("the denial was passed as an error, not as a string");
+            let denial = inner
+                .downcast_ref::<EgressDenial>()
+                .expect("an `EgressDenial` must be recoverable from the far side");
+            assert_eq!(denial.rule(), EgressRule::RedirectCrossOrigin);
+            assert_eq!(
+                denial.detail(),
+                Some("https://a.test:443 to https://b.test:443")
+            );
+        }
+    }
 
     #[test]
     fn an_ipv4_compatible_address_is_recognised_whatever_it_wraps() {

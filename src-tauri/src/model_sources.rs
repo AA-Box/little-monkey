@@ -8,6 +8,7 @@
 //! original reference and requires the caller's previously observed SHA-256
 //! to still match before any bytes are written.
 
+use crate::egress::{EgressDenial, EgressRule};
 use crate::process_lock::{acquire_cross_process_lock, CrossProcessFileLock};
 use futures_util::StreamExt;
 use reqwest::header::{
@@ -43,6 +44,15 @@ const MAX_PROVENANCE_BYTES: u64 = 64 * 1024;
 const PROVENANCE_SCHEMA_VERSION: u32 = 2;
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+/// Hop cap for the redirect policy in [`build_http_client`].
+///
+/// Named rather than inlined only so the refusal can say what it refused. The
+/// number is unchanged: eight hops, which is what this file has always allowed
+/// and deliberately **not** the ten that `egress::MAX_REDIRECT_HOPS` gives the
+/// shared hardened client. Reconciling the two would change which chains this
+/// app accepts, so it belongs with the wider adoption of `egress::hardened()`
+/// here — which this file still does not do — rather than with naming the rules.
+const MAX_MODEL_SOURCE_REDIRECTS: usize = 8;
 
 static INSTALL_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -1155,7 +1165,8 @@ async fn fetch_registry_token(
     client: &Client,
     challenge: &RegistryAuthChallenge,
 ) -> Result<String, String> {
-    validate_ollama_auth_url(&challenge.realm)?;
+    validate_ollama_auth_url(&challenge.realm)
+        .map_err(|denial| format!("Ollama registry token URL refused: {denial}"))?;
     let mut url = challenge.realm.clone();
     {
         let mut query = url.query_pairs_mut();
@@ -1222,7 +1233,11 @@ fn parse_registry_auth_challenge(value: &str) -> Result<RegistryAuthChallenge, S
         service,
         scope,
     };
-    validate_ollama_auth_url(&challenge.realm)?;
+    // The only egress rule in this parser. Every other refusal above is about the
+    // *shape* of the challenge; this one is about where the token request may go,
+    // so it is the one that names a rule.
+    validate_ollama_auth_url(&challenge.realm)
+        .map_err(|denial| format!("Ollama registry auth realm refused: {denial}"))?;
     Ok(challenge)
 }
 
@@ -1231,7 +1246,8 @@ async fn probe_remote_gguf(
     url: Url,
     bearer_token: Option<&str>,
 ) -> Result<(), String> {
-    validate_public_https_url(&url)?;
+    validate_public_https_url(&url)
+        .map_err(|denial| format!("GGUF probe URL refused: {denial}"))?;
     let response = send_get(client, url, bearer_token, Some("bytes=0-3")).await?;
     if !matches!(
         response.status(),
@@ -1242,7 +1258,11 @@ async fn probe_remote_gguf(
             response.status()
         ));
     }
-    validate_public_https_url(response.url())?;
+    // Distinct from the pre-flight message above on purpose: both used to render
+    // the identical string, so a refusal could not be placed before or after the
+    // redirect chain.
+    validate_public_https_url(response.url())
+        .map_err(|denial| format!("GGUF probe final URL refused: {denial}"))?;
     let mut stream = response.bytes_stream();
     let mut magic = Vec::with_capacity(GGUF_MAGIC.len());
     while magic.len() < GGUF_MAGIC.len() {
@@ -1266,7 +1286,8 @@ async fn send_get(
     bearer_token: Option<&str>,
     range: Option<&str>,
 ) -> Result<Response, String> {
-    validate_public_https_url(&url)?;
+    validate_public_https_url(&url)
+        .map_err(|denial| format!("Model download URL refused: {denial}"))?;
     let mut request = client.get(url).header(ACCEPT_ENCODING, "identity");
     if let Some(token) = bearer_token {
         request = request.header(
@@ -1282,7 +1303,10 @@ async fn send_get(
         .send()
         .await
         .map_err(|error| format!("Model download request failed: {error}"))?;
-    validate_public_https_url(response.url())?;
+    // As in `probe_remote_gguf`, this says "final" so that a post-redirect
+    // refusal is not word-for-word identical to the pre-flight one above.
+    validate_public_https_url(response.url())
+        .map_err(|denial| format!("Model download final URL refused: {denial}"))?;
     Ok(response)
 }
 
@@ -1311,7 +1335,8 @@ where
     }
     let download_url = Url::parse(&resolution.public.download_url)
         .map_err(|error| format!("Resolved model URL is invalid: {error}"))?;
-    validate_public_https_url(&download_url)?;
+    validate_public_https_url(&download_url)
+        .map_err(|denial| format!("Resolved model download URL refused: {denial}"))?;
     let range_header = (offset > 0).then(|| format!("bytes={offset}-"));
     let response = send_get(
         client,
@@ -1824,11 +1849,13 @@ fn validate_provenance(
     validate_model_size(provenance.size_bytes)?;
     let download_url = Url::parse(&provenance.download_url)
         .map_err(|error| format!("Invalid provenance download URL: {error}"))?;
-    validate_public_https_url(&download_url)?;
+    validate_public_https_url(&download_url)
+        .map_err(|denial| format!("Provenance download URL refused: {denial}"))?;
     if let Some(url) = &provenance.license_url {
         let url =
             Url::parse(url).map_err(|error| format!("Invalid provenance license URL: {error}"))?;
-        validate_public_https_url(&url)?;
+        validate_public_https_url(&url)
+            .map_err(|denial| format!("Provenance license URL refused: {denial}"))?;
     }
     if let Some(name) = &provenance.license_name {
         validate_human_text(name, "licenseName", 4096)?;
@@ -1970,7 +1997,8 @@ fn hugging_face_metadata_url(reference: &HuggingFaceReference) -> Result<Url, St
         }
     }
     url.query_pairs_mut().append_pair("blobs", "true");
-    validate_public_https_url(&url)?;
+    validate_public_https_url(&url)
+        .map_err(|denial| format!("Hugging Face metadata URL refused: {denial}"))?;
     Ok(url)
 }
 
@@ -2003,7 +2031,8 @@ fn hugging_face_file_url(
     if operation == "resolve" {
         url.query_pairs_mut().append_pair("download", "true");
     }
-    validate_public_https_url(&url)?;
+    validate_public_https_url(&url)
+        .map_err(|denial| format!("Hugging Face file URL refused: {denial}"))?;
     Ok(url)
 }
 
@@ -2030,7 +2059,8 @@ fn ollama_registry_url(
             .map_err(|_| "Ollama registry URL cannot accept path segments")?;
         segments.extend(["v2", namespace, model, operation, value]);
     }
-    validate_public_https_url(&url)?;
+    validate_public_https_url(&url)
+        .map_err(|denial| format!("Ollama registry URL refused: {denial}"))?;
     Ok(url)
 }
 
@@ -2205,55 +2235,152 @@ fn build_http_client() -> Result<Client, String> {
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 8 {
-                return attempt.error("too many model-source redirects");
+            if attempt.previous().len() >= MAX_MODEL_SOURCE_REDIRECTS {
+                return attempt.error(refused(EgressDenial::about(
+                    EgressRule::RedirectHopLimit,
+                    format!(
+                        "refusing to follow more than {MAX_MODEL_SOURCE_REDIRECTS} model-source redirects"
+                    ),
+                )));
             }
-            if validate_public_https_url(attempt.url()).is_ok() {
-                attempt.follow()
-            } else {
-                attempt.error("unsafe model-source redirect")
+            // The hop is judged by exactly the same rules as the original URL,
+            // and a refusal now travels as *the rule that fired*. It used to be
+            // discarded: every possible verdict from `validate_public_https_url`
+            // collapsed into one "unsafe model-source redirect" sentence, so a
+            // `302` to plain `http`, to `127.0.0.1`, and to `169.254.169.254`
+            // were indistinguishable in a log and in a test.
+            match validate_public_https_url(attempt.url()) {
+                Ok(()) => attempt.follow(),
+                Err(denial) => attempt.error(refused(denial)),
             }
         }))
         .build()
         .map_err(|error| format!("Failed to build model-source HTTP client: {error}"))
 }
 
-fn validate_public_https_url(url: &Url) -> Result<(), String> {
-    if url.scheme() != "https"
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-        || url.host().is_none()
-    {
-        return Err("Model-source URL must be credential-free HTTPS with a host".to_string());
+/// Wraps a denial for `redirect::Attempt::error`, whose signature wants an error
+/// rather than a verdict.
+///
+/// `PermissionDenied` plus the denial passed **as itself** rather than as
+/// `to_string()`, so that `io::Error::into_inner`/`downcast_ref` can still
+/// recover an [`EgressDenial`] on the far side of reqwest instead of a flattened
+/// string. This mirrors `egress.rs`'s own `refused` helper, which is private to
+/// that module; the two lines are written out again here rather than exported,
+/// because widening that module's surface is not this change's to make.
+fn refused(denial: EgressDenial) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, denial)
+}
+
+/// The one network-destination gate for every model-source request: public
+/// HTTPS, no credential in the URL, no fragment, and not an address that points
+/// back at this machine or its network.
+///
+/// # Why the verdict is a rule and not a sentence
+///
+/// This function used to return four `String`s, and the first of them stood for
+/// five different reasons at once: a plain-`http` URL, a `user@` URL, a
+/// `user:password@` URL, a `#fragment` and a hostless URL all produced
+/// "Model-source URL must be credential-free HTTPS with a host". Nothing
+/// downstream could tell them apart — least of all the redirect policy in
+/// [`build_http_client`], which threw the sentence away entirely and substituted
+/// one of its own. Each reason now names its own [`EgressRule`], so a refusal is
+/// a value that survives the trip to a caller, a log, or a test.
+///
+/// The composite `if` is therefore split into one `if` per reason. That is not a
+/// behaviour change: the checks are in the original short-circuit order, so the
+/// set of refused URLs is identical and a URL that trips several reasons still
+/// reports the first reason it always would have.
+///
+/// # Why the diagnostics name no URL
+///
+/// Callers render the denial behind a short label saying which of the thirteen
+/// call sites refused, and none of them quote the URL. That is deliberate:
+/// [`EgressRule::redacts_target`] is true for exactly
+/// [`EgressRule::EmbeddedCredentials`], the one rule that fires *because* the URL
+/// contains a secret, and the cheapest way never to leak it is for no site to
+/// interpolate a model-source URL at all. The per-request specifics that are safe
+/// to print — the offending host, the offending address — ride in the denial's
+/// own detail instead.
+fn validate_public_https_url(url: &Url) -> Result<(), EgressDenial> {
+    if url.scheme() != "https" {
+        return Err(EgressDenial::about(
+            EgressRule::SchemeNotAllowed,
+            url.scheme().to_string(),
+        ));
     }
+    // Username and password are one rule rather than two: both are `userinfo`,
+    // and what the rule says is that the URL carries a credential at all.
+    if !url.username().is_empty() || url.password().is_some() {
+        // Deliberately detail-free. This is the rule `redacts_target` singles
+        // out, and the detail field is the one place the secret could reappear.
+        return Err(EgressDenial::new(EgressRule::EmbeddedCredentials));
+    }
+    if url.fragment().is_some() {
+        return Err(EgressDenial::new(EgressRule::FragmentNotAllowed));
+    }
+    if url.host().is_none() {
+        // Unreachable in practice, and kept anyway: `https` is a special scheme,
+        // so `Url` guarantees a non-empty host for anything that got past the
+        // scheme check above (`https:///x` does not parse at all). Deleting the
+        // check would make that a property of the `url` crate instead of a
+        // property of this gate, which is not a trade a destination gate should
+        // make.
+        return Err(EgressDenial::new(EgressRule::HostMissing));
+    }
+    // Every `Host` variant is handled and there is no wildcard arm: if the `url`
+    // crate ever adds a host kind, that must be a compile error here rather than
+    // a new shape of host quietly treated as public.
     match url.host() {
         Some(Host::Domain(domain)) => {
-            let domain = domain.trim_end_matches('.');
-            if domain.is_empty()
-                || domain.eq_ignore_ascii_case("localhost")
-                || domain.to_ascii_lowercase().ends_with(".localhost")
+            let trimmed = domain.trim_end_matches('.');
+            if trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("localhost")
+                || trimmed.to_ascii_lowercase().ends_with(".localhost")
             {
-                return Err("Model-source URL cannot target localhost".to_string());
+                // One rule for all three spellings: a name that is nothing but
+                // dots, `localhost`, and `anything.localhost` are the same
+                // destination by policy — this machine — and RFC 6761 reserves
+                // the whole `.localhost` tree for loopback. The untrimmed name is
+                // the detail so that the `.`-only case still says something.
+                return Err(EgressDenial::about(EgressRule::Loopback, domain));
             }
         }
-        Some(Host::Ipv4(address)) if !public_ipv4(address) => {
-            return Err("Model-source URL cannot target a private IPv4 address".to_string())
+        Some(Host::Ipv4(address)) => {
+            if let Some(rule) = non_public_ipv4_rule(address) {
+                return Err(EgressDenial::about(rule, address.to_string()));
+            }
         }
-        Some(Host::Ipv6(address)) if !public_ipv6(address) => {
-            return Err("Model-source URL cannot target a private IPv6 address".to_string())
+        Some(Host::Ipv6(address)) => {
+            if let Some(rule) = non_public_ipv6_rule(address) {
+                return Err(EgressDenial::about(rule, address.to_string()));
+            }
         }
-        Some(_) => {}
-        None => return Err("Model-source URL has no host".to_string()),
+        // Unreachable for the same reason as the `host().is_none()` check above,
+        // which has already refused this case. Kept refusing rather than deleted
+        // or `unwrap`ped: a hostless URL reaching here would mean the invariant
+        // this gate depends on has changed, and "no host, so nothing to check" is
+        // the wrong direction for a guard to fail in.
+        None => return Err(EgressDenial::new(EgressRule::HostMissing)),
     }
     Ok(())
 }
 
-fn validate_ollama_auth_url(url: &Url) -> Result<(), String> {
+/// [`validate_public_https_url`] plus the one origin allowlist in this file.
+///
+/// An Ollama registry `WWW-Authenticate` challenge names the realm the bearer
+/// token is fetched from, which means a *response* gets to propose where this app
+/// sends a credential request. That makes the host restriction below an egress
+/// rule and not a parsing rule: it decides where a request may go.
+fn validate_ollama_auth_url(url: &Url) -> Result<(), EgressDenial> {
     validate_public_https_url(url)?;
     let host = url
         .host_str()
-        .ok_or("Ollama authentication URL has no host")?
+        // Unreachable for the same reason as the `None` arm in
+        // `validate_public_https_url`: the call above has already refused a
+        // hostless URL. Kept refusing rather than `unwrap`ped, because the wrong
+        // way to fail here is "there is no host, so there is nothing to check
+        // against the allowlist".
+        .ok_or_else(|| EgressDenial::new(EgressRule::HostMissing))?
         .to_ascii_lowercase();
     if host == "ollama.ai"
         || host.ends_with(".ollama.ai")
@@ -2262,37 +2389,94 @@ fn validate_ollama_auth_url(url: &Url) -> Result<(), String> {
     {
         Ok(())
     } else {
-        Err("Ollama authentication challenge points outside ollama.ai/ollama.com".to_string())
+        // The host is the detail because the host is the whole reason, and naming
+        // it is safe: it is a host, not a URL that could carry userinfo.
+        Err(EgressDenial::about(EgressRule::OriginNotAllowlisted, host))
     }
 }
 
-fn public_ipv4(address: Ipv4Addr) -> bool {
-    !(address.is_private()
-        || address.is_loopback()
-        || address.is_link_local()
-        || address.is_broadcast()
-        || address.is_documentation()
-        || address.is_unspecified()
-        || address.is_multicast())
+/// The rule that makes `address` non-public, or `None` if it is publicly
+/// routable.
+///
+/// The predicates and their order are exactly the `||` chain this replaces, so
+/// the set of refused addresses is unchanged — not one range is added, removed,
+/// widened or narrowed. What changes is that the verdict now says *which* class
+/// matched, where before seven distinct classes shared the single sentence
+/// "Model-source URL cannot target a private IPv4 address" — which was literally
+/// true of exactly one of them. None of these seven ranges overlap, so the order
+/// below cannot affect which rule is reported either; it is preserved because a
+/// future range that *does* overlap should inherit the chain's original
+/// precedence rather than a new one.
+fn non_public_ipv4_rule(address: Ipv4Addr) -> Option<EgressRule> {
+    if address.is_private() {
+        return Some(EgressRule::PrivateV4);
+    }
+    if address.is_loopback() {
+        return Some(EgressRule::Loopback);
+    }
+    if address.is_link_local() {
+        return Some(EgressRule::LinkLocal);
+    }
+    if address.is_broadcast() {
+        return Some(EgressRule::Broadcast);
+    }
+    if address.is_documentation() {
+        return Some(EgressRule::TestNet);
+    }
+    if address.is_unspecified() {
+        return Some(EgressRule::Unspecified);
+    }
+    if address.is_multicast() {
+        return Some(EgressRule::Multicast);
+    }
+    None
 }
 
-fn public_ipv6(address: Ipv6Addr) -> bool {
+/// The IPv6 counterpart of [`non_public_ipv4_rule`], with the same guarantee: the
+/// same addresses are refused as before, and only the naming is new.
+fn non_public_ipv6_rule(address: Ipv6Addr) -> Option<EgressRule> {
     // Checked before the mapped unwrap: `::a.b.c.d` is not `::ffff:a.b.c.d`, and
-    // without this it was reported as public. See `egress::is_ipv4_compatible`.
+    // without this it was reported as public. See `egress::is_ipv4_compatible`,
+    // whose doc also explains why the range is refused outright instead of being
+    // unwrapped and re-classified — doing that would turn `::1` into `0.0.0.1`,
+    // which every predicate above calls public.
     if crate::egress::is_ipv4_compatible(&address) {
-        return false;
+        return Some(EgressRule::Ipv4Compatible);
     }
     if let Some(address) = address.to_ipv4_mapped() {
-        return public_ipv4(address);
+        // A mapped address keeps whichever v4 rule its inner address reports, so
+        // `::ffff:127.0.0.1` is `Loopback` and `::ffff:10.0.0.1` is `PrivateV4`
+        // rather than both being some v6-flavoured approximation.
+        return non_public_ipv4_rule(address);
     }
     let segments = address.segments();
-    !(address.is_loopback()
-        || address.is_unspecified()
-        || address.is_multicast()
-        || address.is_unique_local()
-        || address.is_unicast_link_local()
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-        || (segments[0] & 0xffc0) == 0xfec0)
+    if address.is_loopback() {
+        return Some(EgressRule::Loopback);
+    }
+    if address.is_unspecified() {
+        return Some(EgressRule::Unspecified);
+    }
+    if address.is_multicast() {
+        return Some(EgressRule::Multicast);
+    }
+    if address.is_unique_local() {
+        return Some(EgressRule::UniqueLocalV6);
+    }
+    if address.is_unicast_link_local() {
+        return Some(EgressRule::LinkLocal);
+    }
+    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        return Some(EgressRule::TestNet);
+    }
+    // Site-local, `fec0::/10`. Reported as `UniqueLocalV6` rather than getting a
+    // rule of its own: RFC 3879 deprecated site-local *in favour of* unique-local
+    // `fc00::/7`, so the two are the same policy about the same kind of
+    // destination, and `EgressRule` has no site-local variant to invent one from.
+    // The range itself is untouched — this arm still refuses exactly `fec0::/10`.
+    if (segments[0] & 0xffc0) == 0xfec0 {
+        return Some(EgressRule::UniqueLocalV6);
+    }
+    None
 }
 
 fn require_success(
@@ -2599,21 +2783,218 @@ mod tests {
     /// The same deprecated form that fooled the other three guards reported
     /// `::127.0.0.1` as a *public* address here, which is what gates a model
     /// download URL.
+    ///
+    /// Now asserts the exact rule, which is stronger than "not public" in the one
+    /// way that matters: `::10.0.0.1` must be refused as `Ipv4Compatible` — the
+    /// wrapper — and not as `PrivateV4`, because a wrapper carrying a *public* v4
+    /// address has to be refused too and a v4 blocklist would let that through.
     #[test]
     fn the_deprecated_ipv4_compatible_form_is_not_public() {
         use std::str::FromStr;
-        for text in ["::127.0.0.1", "::10.0.0.1"] {
-            assert!(
-                !public_ipv6(Ipv6Addr::from_str(text).expect("parses")),
-                "{text} must not be treated as public"
+        for text in ["::127.0.0.1", "::10.0.0.1", "::93.184.216.34"] {
+            assert_eq!(
+                non_public_ipv6_rule(Ipv6Addr::from_str(text).expect("parses")),
+                Some(EgressRule::Ipv4Compatible),
+                "{text} must be refused as the deprecated wrapper it is"
             );
         }
-        assert!(public_ipv6(
-            Ipv6Addr::from_str("2606:2800:220:1:248:1893:25c8:1946").unwrap()
-        ));
-        assert!(!public_ipv6(
-            Ipv6Addr::from_str("::ffff:127.0.0.1").unwrap()
-        ));
+        assert_eq!(
+            non_public_ipv6_rule(Ipv6Addr::from_str("2606:2800:220:1:248:1893:25c8:1946").unwrap()),
+            None
+        );
+        // The *mapped* form keeps the rule of the address it wraps, which is how a
+        // reader tells this case apart from the compatible one above.
+        assert_eq!(
+            non_public_ipv6_rule(Ipv6Addr::from_str("::ffff:127.0.0.1").unwrap()),
+            Some(EgressRule::Loopback)
+        );
+    }
+
+    /// One representative address per class, asserting the exact rule.
+    ///
+    /// The decomposition replaced two boolean predicates with two classifiers, and
+    /// a classifier can be wrong in a way a boolean could not: it can refuse the
+    /// right address under the wrong name. Only an exact-rule assertion per class
+    /// can see that, and the pair of tests below is deliberately split so that
+    /// neither "refuse everything" nor "allow everything" passes both.
+    #[test]
+    fn every_blocked_address_class_reports_its_own_rule() {
+        use std::str::FromStr;
+
+        for (text, rule) in [
+            ("10.0.0.1", EgressRule::PrivateV4),
+            ("172.16.0.1", EgressRule::PrivateV4),
+            ("192.168.1.1", EgressRule::PrivateV4),
+            ("127.0.0.1", EgressRule::Loopback),
+            // The cloud instance-metadata address, which is the reason this class
+            // is worth naming separately from "private".
+            ("169.254.169.254", EgressRule::LinkLocal),
+            ("255.255.255.255", EgressRule::Broadcast),
+            ("192.0.2.1", EgressRule::TestNet),
+            ("0.0.0.0", EgressRule::Unspecified),
+            ("224.0.0.1", EgressRule::Multicast),
+        ] {
+            assert_eq!(
+                non_public_ipv4_rule(Ipv4Addr::from_str(text).expect("parses")),
+                Some(rule),
+                "{text} must report its own rule"
+            );
+        }
+
+        for (text, rule) in [
+            ("::127.0.0.1", EgressRule::Ipv4Compatible),
+            // Mapped, so the inner v4 rule is what surfaces.
+            ("::ffff:10.0.0.1", EgressRule::PrivateV4),
+            ("::ffff:169.254.169.254", EgressRule::LinkLocal),
+            ("::1", EgressRule::Loopback),
+            ("::", EgressRule::Unspecified),
+            ("ff02::1", EgressRule::Multicast),
+            ("fc00::1", EgressRule::UniqueLocalV6),
+            ("fd12:3456::1", EgressRule::UniqueLocalV6),
+            ("fe80::1", EgressRule::LinkLocal),
+            ("2001:db8::1", EgressRule::TestNet),
+            // Deprecated site-local. Reported as unique-local, its RFC 3879
+            // successor, because there is no site-local rule to report and the
+            // policy is identical — pinned here so that choice is visible rather
+            // than inferred from the classifier's source.
+            ("fec0::1", EgressRule::UniqueLocalV6),
+            ("feff::1", EgressRule::UniqueLocalV6),
+        ] {
+            assert_eq!(
+                non_public_ipv6_rule(Ipv6Addr::from_str(text).expect("parses")),
+                Some(rule),
+                "{text} must report its own rule"
+            );
+        }
+    }
+
+    /// The counter-test, so that "refuse everything" cannot pass the one above.
+    ///
+    /// A real public v4 and a real public v6 address must classify as `None` and
+    /// still be accepted as model-source URLs, including as bare IP literals,
+    /// which is what the classifiers actually gate.
+    #[test]
+    fn a_genuinely_public_address_is_refused_by_no_class() {
+        use std::str::FromStr;
+
+        assert_eq!(non_public_ipv4_rule(Ipv4Addr::new(93, 184, 216, 34)), None);
+        assert_eq!(
+            non_public_ipv6_rule(Ipv6Addr::from_str("2606:2800:220:1:248:1893:25c8:1946").unwrap()),
+            None
+        );
+        for text in [
+            "https://93.184.216.34/model.gguf",
+            "https://[2606:2800:220:1:248:1893:25c8:1946]/model.gguf",
+            "https://huggingface.co/model.gguf",
+            // A trailing dot is a fully qualified name, not an empty one.
+            "https://huggingface.co./model.gguf",
+        ] {
+            assert!(
+                validate_public_https_url(&Url::parse(text).unwrap()).is_ok(),
+                "{text} must still be accepted"
+            );
+        }
+    }
+
+    /// Each reason the composite `if` used to flatten into one sentence now names
+    /// its own rule.
+    ///
+    /// The refusals themselves are unchanged — every URL here was refused before
+    /// this split, by the same function, with the same effect. What the split buys
+    /// is that "you typed `http`" and "you embedded a password" stop being the
+    /// same string.
+    ///
+    /// Four of the composite's five reasons are covered. The fifth, `HostMissing`,
+    /// has no test case because it has no input: `https` is a special scheme, so a
+    /// hostless URL cannot get past the scheme check — see the comment on that
+    /// guard. The three `localhost` spellings ride along here because they were
+    /// the *second* flattened message and are refused by the same walk.
+    #[test]
+    fn each_reason_the_composite_flattened_now_names_its_own_rule() {
+        for (text, rule) in [
+            (
+                "http://huggingface.co/model.gguf",
+                EgressRule::SchemeNotAllowed,
+            ),
+            (
+                "ftp://huggingface.co/model.gguf",
+                EgressRule::SchemeNotAllowed,
+            ),
+            (
+                "https://user@huggingface.co/model.gguf",
+                EgressRule::EmbeddedCredentials,
+            ),
+            (
+                "https://user:secret@huggingface.co/model.gguf",
+                EgressRule::EmbeddedCredentials,
+            ),
+            (
+                "https://huggingface.co/model.gguf#fragment",
+                EgressRule::FragmentNotAllowed,
+            ),
+            ("https://localhost/model.gguf", EgressRule::Loopback),
+            (
+                "https://registry.localhost/model.gguf",
+                EgressRule::Loopback,
+            ),
+            ("https://localhost./model.gguf", EgressRule::Loopback),
+        ] {
+            let denial = validate_public_https_url(&Url::parse(text).unwrap())
+                .expect_err("this URL must be refused");
+            assert_eq!(denial.rule(), rule, "{text} named the wrong rule");
+        }
+
+        // Scheme and credentials were the same message before; now the scheme
+        // refusal says which scheme, and the credentials refusal deliberately says
+        // nothing at all. `redacts_target` is true for exactly that rule, and an
+        // empty detail is the only way a secret cannot reappear in a log.
+        let scheme =
+            validate_public_https_url(&Url::parse("http://huggingface.co/m.gguf").unwrap())
+                .expect_err("plain http must be refused");
+        assert_eq!(scheme.detail(), Some("http"));
+
+        let credentials = validate_public_https_url(
+            &Url::parse("https://user:secret@huggingface.co/m.gguf").unwrap(),
+        )
+        .expect_err("userinfo must be refused");
+        assert!(credentials.rule().redacts_target());
+        assert_eq!(
+            credentials.detail(),
+            None,
+            "the one rule that fires because the URL holds a secret must not quote it"
+        );
+        assert!(
+            !credentials.to_string().contains("secret"),
+            "rendering a credentials denial must not leak the credential"
+        );
+    }
+
+    /// A refused redirect hop must arrive at reqwest carrying the rule that
+    /// refused it.
+    ///
+    /// The policy in `build_http_client` used to answer every refused hop with the
+    /// flat string "unsafe model-source redirect", discarding whichever rule
+    /// `validate_public_https_url` had actually reported. This drives the same
+    /// wrapper the policy uses and proves the denial survives as a value —
+    /// `Attempt::error` takes it by the same `Into<Box<dyn Error>>` path.
+    #[test]
+    fn a_refused_redirect_hop_carries_the_rule_that_refused_it() {
+        let denial =
+            validate_public_https_url(&Url::parse("http://127.0.0.1:11434/api/tags").unwrap())
+                .expect_err("a cleartext loopback hop must be refused");
+        // Scheme first, matching the original short-circuit order: this hop is
+        // both cleartext and loopback, and it reports the reason it always did.
+        assert_eq!(denial.rule(), EgressRule::SchemeNotAllowed);
+
+        let error = refused(denial);
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let inner = error
+            .into_inner()
+            .expect("the denial must be passed as an error, not as a string");
+        let recovered = inner
+            .downcast_ref::<EgressDenial>()
+            .expect("an `EgressDenial` must be recoverable on the far side of reqwest");
+        assert_eq!(recovered.rule(), EgressRule::SchemeNotAllowed);
     }
 
     #[test]
@@ -2937,22 +3318,67 @@ mod tests {
             challenge.scope.as_deref(),
             Some("repository:library/qwen3:pull")
         );
-        assert!(parse_registry_auth_challenge(
-            r#"Bearer realm="https://evil.example/token",service="registry.ollama.ai""#
+        // `is_err()` alone could not tell this apart from a malformed challenge:
+        // this parser refuses eight other ways (no space, wrong scheme, a
+        // parameter without `=`, an unparseable realm URL, a missing realm...) and
+        // every one of them was also just `Err(String)`. The realm here parses
+        // perfectly — it is refused because of *where it points*, so the assertion
+        // is on the rule.
+        let error = parse_registry_auth_challenge(
+            r#"Bearer realm="https://evil.example/token",service="registry.ollama.ai""#,
         )
-        .is_err());
+        .expect_err("a realm outside ollama.ai/ollama.com must be refused");
+        assert!(
+            error.contains(EgressRule::OriginNotAllowlisted.code()),
+            "the refusal must name the allowlist rule, not just fail: {error}"
+        );
+        assert!(
+            error.contains("evil.example"),
+            "the refusal must name the realm host it refused: {error}"
+        );
+
+        // The same verdict in typed form, so the rule is pinned and not only its
+        // rendering, plus the counter-case: a realm that really is on the
+        // allowlist is still accepted.
+        assert_eq!(
+            validate_ollama_auth_url(&Url::parse("https://evil.example/token").unwrap())
+                .expect_err("an off-allowlist realm must be refused")
+                .rule(),
+            EgressRule::OriginNotAllowlisted
+        );
+        assert!(
+            validate_ollama_auth_url(&Url::parse("https://auth.ollama.ai/token").unwrap()).is_ok()
+        );
+        assert!(validate_ollama_auth_url(&Url::parse("https://ollama.com/token").unwrap()).is_ok());
+        // A near-miss host that merely *contains* the allowlisted name.
+        assert_eq!(
+            validate_ollama_auth_url(&Url::parse("https://ollama.ai.evil.example/token").unwrap())
+                .expect_err("a suffix attack must be refused")
+                .rule(),
+            EgressRule::OriginNotAllowlisted
+        );
     }
 
+    /// Before this asserted rules, the two blocks below were indistinguishable:
+    /// both were `is_err()`, so the test passed just as well if the v4-mapped
+    /// unwrap and the documentation range had been collapsed into one another —
+    /// or if the whole function had started refusing everything.
     #[test]
     fn url_validation_rejects_ipv4_mapped_loopback_and_documentation_ipv6() {
-        assert!(validate_public_https_url(
-            &Url::parse("https://[::ffff:127.0.0.1]/model.gguf").unwrap()
-        )
-        .is_err());
-        assert!(validate_public_https_url(
-            &Url::parse("https://[2001:db8::1]/model.gguf").unwrap()
-        )
-        .is_err());
+        assert_eq!(
+            validate_public_https_url(
+                &Url::parse("https://[::ffff:127.0.0.1]/model.gguf").unwrap()
+            )
+            .expect_err("a mapped loopback address must be refused")
+            .rule(),
+            EgressRule::Loopback
+        );
+        assert_eq!(
+            validate_public_https_url(&Url::parse("https://[2001:db8::1]/model.gguf").unwrap())
+                .expect_err("a documentation address must be refused")
+                .rule(),
+            EgressRule::TestNet
+        );
         assert!(validate_public_https_url(
             &Url::parse("https://huggingface.co/model.gguf").unwrap()
         )
