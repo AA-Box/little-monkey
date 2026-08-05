@@ -79,7 +79,6 @@ import {
   DebatePanel,
   DeepResearchWorkspacePanel,
   DesignToAppPanel,
-  DiffPanel,
   DiffViewer,
   EvalHarnessPanel,
   EvidenceBoardPanel,
@@ -1378,9 +1377,12 @@ function App() {
                 {rightTabs.map((kind) => (
                   <div key={kind} className={`absolute inset-0 ${kind === activeRightTab ? "flex flex-col" : "hidden"}`}>
                     {kind === "review" ? (
-                      <ReviewPanel onClose={() => closeRightTab("review")} />
+                      <ReviewPanel onClose={() => closeRightTab("review")} view="continuous" />
                     ) : kind === "diff" ? (
-                      <DiffPanel onClose={() => closeRightTab("diff")} />
+                      // Same component: the standalone Diff panel folded into
+                      // ReviewPanel, whose "working" base and "single" view are
+                      // exactly what it did. Both tabs and both shortcuts stay.
+                      <ReviewPanel onClose={() => closeRightTab("diff")} view="single" />
                     ) : kind === "sideTasks" ? (
                       // Side tasks are CONVERSATIONS, so this tab hosts the
                       // whole pane — its own task tab strip and its composer —
