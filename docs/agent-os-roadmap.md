@@ -1693,6 +1693,41 @@ rename:
   (`browser DNS resolution failed for [::1]`), while on Windows — where a bracketed
   literal does resolve — only the new classifier rows and the resolver-rule assertion
   are load-bearing. CI runs all three legs.
+- ~~**Three of the four guards read NAT64 as a public address.**~~ **Fixed.** Found by
+  auditing the other three against what `browser_worker.rs` gained above, and it is a
+  loopback bypass rather than a parity nit: `64:ff9b::7f00:1` **is** `127.0.0.1`
+  wherever a NAT64/CLAT path exists, which is every modern iOS device and a growing
+  share of mobile networks. `web.rs`, `knowledge_pipeline.rs` and `model_sources.rs` all
+  classified it as ordinary public. `browser_worker.rs` was the exception, and only
+  since its `2000::/3` allowlist tail landed.
+
+  The same class as the `::/96` and `::ffff:` forms, and fixed the same way: a shared
+  `egress::nat64_embedded_ipv4` beside `egress::is_ipv4_compatible`, which is exactly
+  the remit that module's doc claims — "the narrow subset where all four agreed *and
+  were all wrong the same way*". Nothing here decides whether `127.0.0.1` is refused,
+  only that `64:ff9b::7f00:1` is the same place.
+
+  **An unwrap, where `::/96` is a rejection**, and the difference matters. RFC 4291
+  deprecated the compatible form so refusing its whole range costs nothing. NAT64 is
+  live and standard — `64:ff9b::` plus a *public* v4 address is how a v6-only network
+  reaches a v4-only server — so refusing the prefix would break that. Each guard
+  therefore unwraps and re-checks against its **own** v4 blocklist, which is what keeps
+  the deliberate divergence intact rather than smuggling in the blocklist unification
+  `egress.rs` defers. Pinned by test: `64:ff9b::6440:1` embeds CGNAT `100.64.0.1`, so
+  `knowledge_pipeline.rs` refuses it as `egress.cgnat` while `web.rs` and
+  `model_sources.rs` allow it — the same asymmetry those guards already have in v4, now
+  reachable through the v6 spelling too. A shared blocklist would have refused it
+  everywhere and newly broken Tailscale users.
+
+  Only the well-known prefix is recognised, and that limit is deliberate: RFC 6052 also
+  allows network-specific prefixes, which cannot be detected from an address alone —
+  finding them needs RFC 7050's DNS lookup, and a guard that consulted the network to
+  decide policy would be taking instructions from the thing it guards against.
+
+  Sabotage-verified per guard: removing any one delegation turns that guard's own test
+  red, and loosening the prefix check from /96 to its first two segments is caught by
+  the counter-test with `64:ff9b:0:0:1::7f00:1` — a network-specific-prefix shape whose
+  low bytes would otherwise be judged as an address.
 - **`knowledge_pipeline.rs` blocks all of `198.51/16`** where TEST-NET-2 is only
   `198.51.100/24` — over-blocking, not a hole, but it is a real range a user could
   legitimately need.
