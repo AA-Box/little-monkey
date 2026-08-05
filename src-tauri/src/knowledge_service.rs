@@ -1942,16 +1942,7 @@ async fn refresh_inner_at(
         overlap_chars: stack.chunk_overlap.min(stack.chunk_chars.saturating_sub(1)),
         min_chars: 40.min(stack.chunk_chars.max(1)),
     };
-    let pipeline_fingerprint = sha256(
-        &serde_json::to_vec(&serde_json::json!({
-            "extractors": ["plain-text-v1", "office-openxml-v1", "html-pdf-v1"],
-            "chunking": chunking,
-            "embedding": embedding,
-            "privacy": "local-default",
-            "ocr": &ocr_config,
-        }))
-        .map_err(|error| error.to_string())?,
-    );
+    let pipeline_fingerprint = refresh_pipeline_fingerprint(&chunking, &embedding, &ocr_config)?;
     let generation_store =
         GenerationStore::new(root.join("indexes")).map_err(|error| error.to_string())?;
     let active = generation_store
@@ -2254,6 +2245,34 @@ async fn refresh_inner_at(
     })
 }
 
+/// The `pipeline_fingerprint` a real refresh stamps on every object snapshot it
+/// writes: a hash over everything that decides what a chunk *is* — which
+/// extractors ran, the chunking spec, the embedding spec, the privacy mode, and
+/// the OCR configuration. Change any of them and the fingerprint changes, so
+/// `refresh_inner_at` stops carrying that object's chunks forward and re-extracts.
+///
+/// Extracted from `refresh_inner_at` so the v1 import can be tested against the
+/// real recipe rather than a copy of it: the import's whole safety argument is
+/// that its sentinel fingerprint can never equal this function's output (see
+/// [`V1_IMPORT_FINGERPRINT_PREIMAGE`]), and a copied recipe would keep agreeing
+/// with itself after the real one moved.
+fn refresh_pipeline_fingerprint(
+    chunking: &ChunkingSpec,
+    embedding: &PipelineEmbeddingSpec,
+    ocr_config: &KnowledgeOcrConfig,
+) -> Result<String, String> {
+    Ok(sha256(
+        &serde_json::to_vec(&serde_json::json!({
+            "extractors": ["plain-text-v1", "office-openxml-v1", "html-pdf-v1"],
+            "chunking": chunking,
+            "embedding": embedding,
+            "privacy": "local-default",
+            "ocr": ocr_config,
+        }))
+        .map_err(|error| error.to_string())?,
+    ))
+}
+
 fn pipeline_embedding(stack: &KnowledgeStack) -> PipelineEmbeddingSpec {
     PipelineEmbeddingSpec {
         contract_version: EMBEDDING_CONTRACT_VERSION,
@@ -2267,6 +2286,617 @@ fn pipeline_embedding(stack: &KnowledgeStack) -> PipelineEmbeddingSpec {
         document_prefix: stack.embedding.doc_prefix.clone(),
         normalized: true,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Importing a v1 stack index as a v2 generation, without re-embedding
+//
+// A v1 stack already owns the expensive artifact: `vectors.bin` holds one
+// L2-normalized f32 row per `chunks.jsonl` line, at the stack's embedding
+// dimension (`stacks::embed_batch` normalizes every returned row and hard-fails
+// on a dimension it did not expect). So a stack can be moved onto the v2
+// generation store by re-describing rows it already has, rather than making the
+// user re-embed a whole corpus against a local model.
+//
+// What v1 does NOT have is v2's chunk boundaries: v1 chunked by paragraph
+// accumulation into `chunk_chars`, v2 chunks per extracted block with overlap
+// and real document locations. An imported chunk therefore carries a *synthetic*
+// location — one block per v1 row, character offsets spanning that row's own
+// text — which is true about the row and honest about knowing nothing more.
+// That is why the fingerprint sentinel below matters: the import is a bridge to
+// keep search working, and the first real refresh must replace every imported
+// chunk with a properly extracted one.
+// ---------------------------------------------------------------------------
+
+/// Preimage of the `pipeline_fingerprint` every imported generation carries.
+///
+/// The v1-import design called for a literal `"v1-import"` sentinel. That value
+/// cannot exist: both [`crate::knowledge_pipeline::GenerationDraft`] and
+/// [`ObjectSnapshot`] validate `pipeline_fingerprint` with `is_sha256` (exactly
+/// 64 hex digits), so a nine-character marker is refused before anything reaches
+/// disk. The sentinel is the SHA-256 of this fixed string instead — it satisfies
+/// both validators, and a real fingerprint is the SHA-256 of a JSON object
+/// describing extractors/chunking/embedding/privacy/OCR (see `refresh_inner_at`),
+/// so no real configuration can produce this digest short of a preimage break.
+///
+/// The inequality is the whole safety device. `refresh_inner_at` carries a prior
+/// object's chunks forward only when its snapshot's `pipeline_fingerprint`
+/// equals the fingerprint it just computed for the live configuration; against
+/// this sentinel that comparison can never hold, so the first real refresh
+/// re-extracts every imported object with true v2 chunk boundaries instead of
+/// trusting v1's chunking forever.
+const V1_IMPORT_FINGERPRINT_PREIMAGE: &[u8] = b"little-monkey/knowledge/v1-import/1";
+
+/// The sentinel `pipeline_fingerprint` — see [`V1_IMPORT_FINGERPRINT_PREIMAGE`].
+fn v1_import_pipeline_fingerprint() -> String {
+    sha256(V1_IMPORT_FINGERPRINT_PREIMAGE)
+}
+
+/// What an import did, for the caller to show and for tests to assert against.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeV1ImportReport {
+    pub stack_id: String,
+    pub generation_id: String,
+    pub object_count: usize,
+    pub chunk_count: usize,
+    /// v1 rows that could not be described as a valid v2 chunk and were left
+    /// behind (see [`import_v1_generation_impl`]). Zero for any index v1 itself
+    /// wrote; non-zero means the source `chunks.jsonl` was edited or damaged.
+    pub skipped_rows: usize,
+    pub dimension: usize,
+    pub warnings: Vec<String>,
+}
+
+/// True for a lowercase-or-uppercase 64-digit hex string, matching the
+/// `knowledge_pipeline::is_sha256` this module cannot reach (it is private
+/// there). Checked here so a damaged `content_hash` is reported against the
+/// offending v1 file instead of surfacing as a generic "snapshot hashes must be
+/// SHA-256" from deep inside staging.
+fn looks_like_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Reads a v1 `<stack_dir>/chunks.jsonl`.
+///
+/// A deliberate duplicate of `stacks::read_chunks_jsonl`, which is private to
+/// that module and cannot be widened here (`stacks.rs` is being refactored on
+/// another branch). Divergence is bounded: this reader parses the same public
+/// [`crate::stacks::ChunkMeta`], so a field change breaks both readers at
+/// compile time rather than silently importing something else.
+fn read_v1_chunk_meta(stack_dir: &Path) -> Result<Vec<crate::stacks::ChunkMeta>, String> {
+    let path = stack_dir.join("chunks.jsonl");
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .map_err(|error| format!("Corrupt v1 chunk entry in {}: {error}", path.display()))
+        })
+        .collect()
+}
+
+/// Reads a v1 `vectors.bin` into `(dim, count, row-major f32)`.
+///
+/// The second deliberate duplicate (see [`read_v1_chunk_meta`]); this one parses
+/// a byte layout rather than a serde type, so `v1_vectors_bin_layout_is_pinned`
+/// pins the header it accepts and the versions it refuses. It mirrors
+/// `stacks::read_vectors_bin` exactly, *including* tolerating trailing bytes
+/// past the promised row data: the point of an import is to carry over the rows
+/// v1 would itself have searched, so refusing a file v1 accepts would strand a
+/// working index.
+fn read_v1_vectors(path: &Path) -> Result<(u32, u32, Vec<f32>), String> {
+    const MAGIC: [u8; 4] = *b"LMVC";
+    const VERSION: u32 = 1;
+    const HEADER_LEN: usize = 16;
+
+    let bytes =
+        fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    if bytes.len() < HEADER_LEN {
+        return Err("vectors.bin is truncated (missing header)".to_string());
+    }
+    if bytes[0..4] != MAGIC {
+        return Err("vectors.bin has an invalid magic header — reindex required".to_string());
+    }
+    let word = |start: usize| -> u32 {
+        u32::from_le_bytes([
+            bytes[start],
+            bytes[start + 1],
+            bytes[start + 2],
+            bytes[start + 3],
+        ])
+    };
+    let version = word(4);
+    if version != VERSION {
+        return Err(format!(
+            "vectors.bin has unsupported version {version} — reindex required"
+        ));
+    }
+    let dim = word(8);
+    let count = word(12);
+    let values = (dim as usize)
+        .checked_mul(count as usize)
+        .ok_or_else(|| "vectors.bin header describes an impossible row set".to_string())?;
+    let expected_len = values
+        .checked_mul(4)
+        .and_then(|size| size.checked_add(HEADER_LEN))
+        .ok_or_else(|| "vectors.bin header describes an impossible row set".to_string())?;
+    if bytes.len() < expected_len {
+        return Err("vectors.bin is truncated (fewer bytes than its header promises)".to_string());
+    }
+    let mut flat = Vec::with_capacity(values);
+    for row in bytes[HEADER_LEN..expected_len].chunks_exact(4) {
+        flat.push(f32::from_le_bytes([row[0], row[1], row[2], row[3]]));
+    }
+    Ok((dim, count, flat))
+}
+
+/// The filesystem path a local connector points at, for the one comparison the
+/// v1 import needs: whether the catalog already holds a source for a path the
+/// imported stack lists. Every variant that walks a local path is included —
+/// matching only `LocalFolder` would let an import seed a second source for a
+/// path a `WatchedFolder` (or a `Project`) already covers, and the next refresh
+/// would then index that path twice under two source ids.
+fn local_source_path(connector: &ConnectorConfig) -> Option<&str> {
+    match connector {
+        ConnectorConfig::LocalFile { path }
+        | ConnectorConfig::LocalFolder { path }
+        | ConnectorConfig::Project { path }
+        | ConnectorConfig::WatchedFolder { path, .. } => Some(path),
+        _ => None,
+    }
+}
+
+/// One imported row's chunk or citation id: the SHA-256 of a JSON array, so no
+/// pair of field values can be concatenated into the same preimage. Keyed on the
+/// row's index as well as its `ordinal`, so two byte-identical v1 rows still get
+/// distinct ids — a duplicate chunk id fails generation validation and would
+/// take the whole import down with it.
+fn v1_import_row_id(
+    tag: &str,
+    stack_id: &str,
+    source_id: &str,
+    object_id: &str,
+    row: &crate::stacks::ChunkMeta,
+    row_index: usize,
+    text_sha256: &str,
+) -> Result<String, String> {
+    Ok(sha256(
+        &serde_json::to_vec(&serde_json::json!([
+            tag,
+            stack_id,
+            source_id,
+            object_id,
+            row.content_hash,
+            row.ordinal,
+            row_index,
+            text_sha256,
+        ]))
+        .map_err(|error| error.to_string())?,
+    ))
+}
+
+/// Synthesizes a v2 generation for `stack_id` from that stack's v1 index,
+/// reusing its already-computed embedding vectors instead of re-embedding.
+///
+/// Non-destructive by construction. Nothing under `<app_data>/stacks/<id>/` is
+/// opened for writing, so the v1 index stays intact and searchable whether this
+/// succeeds or fails; and the write side is `GenerationStore::stage` +
+/// `activate` unchanged, which builds the whole index under `staging/`, deletes
+/// that directory on any error, drops it again if the `StagedGeneration` is
+/// never published, and moves the active pointer last. There is no code path
+/// here that leaves a half-written generation behind — which is also why this
+/// does not pre-flight its own copy of the pipeline's validation: the staging
+/// transaction is allowed to be the thing that says no.
+///
+/// The states this refuses rather than guesses at:
+///
+/// * **A stack that already has an active v2 generation.** Importing would
+///   replace properly extracted chunks with v1-boundary ones — a regression, not
+///   a bridge. This makes the operation refuse-on-repeat rather than idempotent,
+///   which is the safe direction: nothing is lost by declining.
+/// * **A dimension disagreement** between `vectors.bin`'s header and the
+///   stack's own embedding spec. These vectors are then not the ones this model
+///   produces and no honest generation can be written from them.
+/// * **A row/vector count disagreement**, including a `vectors.bin` with no
+///   `chunks.jsonl` or the reverse — either way the row `i` ↔ vector `i`
+///   correspondence the whole import rests on is unproven.
+/// * **A zero or non-finite row.** v1's `l2_normalize` leaves a zero vector
+///   alone (it guards on `norm > 0.0`), so v1 can hold one; v2's
+///   `normalize_vector` refuses it. Reporting that here names the remedy.
+/// * **An empty stack**, which would otherwise publish an empty generation and
+///   mark the stack "indexed" on the strength of nothing.
+/// * **An object whose rows disagree about their source file's hash**, which
+///   would make the object snapshot's `content_sha256` a coin flip.
+/// * **A row no source of the stack covers** — a leftover from a source removed
+///   from the stack without a reindex (`stacks::remove_source_impl` does not
+///   rewrite the index). There is no catalog source such a row can honestly
+///   belong to, and inventing one is the very bug the seeding below fixes.
+/// * **A disabled catalog source for a path this stack lists.** Reusing its id
+///   would stamp the imported objects with a source `refresh_inner_at` filters
+///   out, so nothing would ever replace them — the same dead end as a synthetic
+///   id, one step further along.
+pub fn import_v1_generation_impl(
+    app_data: &Path,
+    stack_id: &str,
+) -> Result<KnowledgeV1ImportReport, String> {
+    validate_id("stack id", stack_id)?;
+    let stacks_root = app_data.join("stacks");
+    let stack = crate::stacks::list_impl(&stacks_root)?
+        .into_iter()
+        .find(|stack| stack.id == stack_id)
+        .ok_or_else(|| "Knowledge stack not found".to_string())?;
+    let root = data_root_at(app_data)?;
+    let store = GenerationStore::new(root.join("indexes")).map_err(|error| error.to_string())?;
+    if store
+        .active(stack_id)
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err(
+            "This stack already has an active Knowledge 2.0 generation; importing its v1 index \
+             would replace properly extracted chunks with v1 chunk boundaries. Refresh the stack \
+             instead."
+                .to_string(),
+        );
+    }
+
+    let stack_dir = stacks_root.join(stack_id);
+    let rows = read_v1_chunk_meta(&stack_dir)?;
+    let (dim, count, flat) = read_v1_vectors(&stack_dir.join("vectors.bin"))?;
+    if count as usize != rows.len() {
+        return Err(format!(
+            "The v1 index is inconsistent: {} chunk rows against {count} vectors — reindex required",
+            rows.len()
+        ));
+    }
+    if rows.is_empty() {
+        return Err("This stack's v1 index is empty; there is nothing to import".to_string());
+    }
+    let embedding = pipeline_embedding(&stack);
+    if dim as usize != embedding.dimension {
+        return Err(format!(
+            "The v1 index holds {dim}-dimensional vectors but this stack's embedding model \
+             produces {} — reindex required",
+            embedding.dimension
+        ));
+    }
+    let dim = dim as usize;
+
+    // The imported objects carry REAL catalog source ids, one seeded here per
+    // `stack.sources` entry. A v1 stack keeps its sources in `stacks/index.json`
+    // and v2 keeps them in the connector catalog, so an import that copies none
+    // of them is a one-way door: `store.active()` becomes `Some` and the agent
+    // is served these chunks, while `refresh_inner_at` refuses before its
+    // fingerprint comparison ("Add and enable at least one Knowledge 2.0
+    // source") and `remove_source_generation` — which prunes by `source_id` —
+    // can never match an id no catalog source owns. Object ids and URIs use the
+    // same derivation `read_validated_file` uses, so a refreshed object lands on
+    // the same `(source_id, object_id)` key as its imported predecessor and
+    // replaces it.
+    //
+    // The lock is held from here through publication: the catalog read below
+    // decides the ids stamped into every chunk, and a concurrent
+    // `knowledge_v2_add_source` between that read and the write would be lost.
+    let _catalog_guard = catalog_lock()
+        .lock()
+        .map_err(|_| "Knowledge catalog lock poisoned".to_string())?;
+    let previous_catalog = load_catalog(&root)?;
+    let mut catalog = previous_catalog.clone();
+    let mut source_ids = Vec::with_capacity(stack.sources.len());
+    for stack_source in &stack.sources {
+        // Exhaustive, with no wildcard arm on purpose: a future `SourceKind`
+        // with no connector equivalent must fail this build, rather than be
+        // dropped from an import that then reports itself complete.
+        let connector = match stack_source.kind {
+            crate::stacks::SourceKind::Folder => ConnectorConfig::LocalFolder {
+                path: stack_source.path.clone(),
+            },
+            crate::stacks::SourceKind::File => ConnectorConfig::LocalFile {
+                path: stack_source.path.clone(),
+            },
+        };
+        // Reuse over a second source: this stack may already have a v2 source
+        // for the same path (the user wired one up before importing, or the
+        // stack lists the path twice), and a duplicate would index it twice
+        // under two ids. A disabled match is refused instead — see this
+        // function's doc comment.
+        let existing = catalog
+            .sources
+            .iter()
+            .find(|source| {
+                source.stack_id == stack_id
+                    && local_source_path(&source.connector) == Some(stack_source.path.as_str())
+            })
+            .map(|source| (source.id.clone(), source.enabled));
+        let id = match existing {
+            Some((_, false)) => {
+                return Err(format!(
+                    "This stack already has a disabled Knowledge 2.0 source for {}; enable or \
+                     remove it before importing the v1 index",
+                    stack_source.path
+                ))
+            }
+            Some((id, true)) => id,
+            None => {
+                let source = KnowledgeSource {
+                    id: Uuid::new_v4().to_string(),
+                    stack_id: stack_id.to_string(),
+                    label: Path::new(&stack_source.path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().chars().take(120).collect::<String>())
+                        .unwrap_or_else(|| "Imported v1 source".to_string()),
+                    enabled: true,
+                    connector,
+                    cursor: None,
+                    checkpoint: None,
+                    last_refresh_at_ms: None,
+                    last_error: None,
+                    objects: Vec::new(),
+                    retries: Vec::new(),
+                };
+                let id = source.id.clone();
+                catalog.sources.push(source);
+                id
+            }
+        };
+        source_ids.push(id);
+    }
+
+    let fingerprint = v1_import_pipeline_fingerprint();
+    let mut chunks = Vec::with_capacity(rows.len());
+    let mut vectors = Vec::with_capacity(rows.len());
+    // `source_path` -> (object id, owning source id, content hash, chunk ids).
+    let mut objects: std::collections::BTreeMap<String, (String, String, String, Vec<String>)> =
+        std::collections::BTreeMap::new();
+    let mut skipped_rows = 0usize;
+
+    for (row_index, row) in rows.iter().enumerate() {
+        // v1's own chunker never emits a blank row (it checks
+        // `!current.trim().is_empty()` before pushing), and `validate_chunk`
+        // refuses one. Skipping the row and its vector together keeps the rest
+        // of a hand-edited file importable instead of failing the whole corpus
+        // over a line the user cannot see.
+        if row.text.trim().is_empty() {
+            skipped_rows += 1;
+            continue;
+        }
+        if !looks_like_sha256(&row.content_hash) {
+            return Err(format!(
+                "The v1 index row for {} carries a malformed content hash — reindex required",
+                row.source_path
+            ));
+        }
+        let vector = &flat[row_index * dim..(row_index + 1) * dim];
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "The v1 index holds a non-finite vector for {} — reindex required",
+                row.source_path
+            ));
+        }
+        if vector.iter().all(|value| *value == 0.0) {
+            return Err(format!(
+                "The v1 index holds an all-zero vector for {}, which cannot be normalized — \
+                 reindex required",
+                row.source_path
+            ));
+        }
+
+        // Which of the stack's sources this row came from, recomputed the way v1
+        // collected it: `stacks::collect_source_files` walks each source path, so
+        // every row's path either *is* a `File` source's path or sits under a
+        // `Folder` source's. Longest match wins, for a stack that lists both a
+        // folder and something inside it. A linear scan because a stack has a
+        // handful of sources, not thousands.
+        let owner = stack
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| Path::new(&row.source_path).starts_with(&candidate.path))
+            .max_by_key(|(_, candidate)| candidate.path.len())
+            .map(|(index, _)| index)
+            .ok_or_else(|| {
+                format!(
+                    "The v1 index holds rows for {}, which none of this stack's sources covers — \
+                     re-add that source to the stack, or reindex it",
+                    row.source_path
+                )
+            })?;
+        let source_id = &source_ids[owner];
+
+        let canonical_uri = Url::from_file_path(&row.source_path)
+            .map(|url| url.to_string())
+            .unwrap_or_else(|()| row.source_path.clone());
+        let object_id = format!("file-{}", &sha256(canonical_uri.as_bytes())[..32]);
+        let text_sha256 = sha256(row.text.as_bytes());
+        let char_end = row.text.chars().count() as u64;
+        let location = crate::knowledge_pipeline::DocumentLocation::Text {
+            line_start: 1,
+            line_end: row.text.lines().count().max(1) as u32,
+            char_start: 0,
+            char_end,
+        };
+        let chunk_id = v1_import_row_id(
+            "little-monkey/knowledge/v1-import/chunk",
+            stack_id,
+            source_id,
+            &object_id,
+            row,
+            row_index,
+            &text_sha256,
+        )?;
+        let citation_id = v1_import_row_id(
+            "little-monkey/knowledge/v1-import/citation",
+            stack_id,
+            source_id,
+            &object_id,
+            row,
+            row_index,
+            &text_sha256,
+        )?;
+
+        let (_, _, object_hash, object_chunk_ids) =
+            objects.entry(row.source_path.clone()).or_insert_with(|| {
+                (
+                    object_id.clone(),
+                    source_id.clone(),
+                    row.content_hash.clone(),
+                    Vec::<String>::new(),
+                )
+            });
+        if *object_hash != row.content_hash {
+            return Err(format!(
+                "The v1 index disagrees with itself about the content hash of {} — reindex required",
+                row.source_path
+            ));
+        }
+        object_chunk_ids.push(chunk_id.clone());
+
+        chunks.push(KnowledgeChunk {
+            chunk_id,
+            source_id: source_id.clone(),
+            object_id: object_id.clone(),
+            object_content_sha256: row.content_hash.clone(),
+            text_sha256,
+            // Stored byte-for-byte as v1 held it. Trimming here would leave the
+            // text no longer the text this row's vector was computed from.
+            text: row.text.clone(),
+            heading_path: row
+                .heading
+                .clone()
+                .filter(|heading| !heading.trim().is_empty())
+                .map(|heading| vec![heading])
+                .unwrap_or_default(),
+            location: location.clone(),
+            block_char_start: 0,
+            block_char_end: char_end,
+            citation: crate::knowledge_pipeline::Citation {
+                citation_id,
+                source_id: source_id.clone(),
+                object_id,
+                canonical_uri,
+                location,
+                block_char_start: 0,
+                block_char_end: char_end,
+            },
+            content_role: crate::knowledge_pipeline::ContentRole::RetrievedData,
+            // v1 recorded no block type and no OCR confidence. Leaving these at
+            // their defaults is what keeps `validate_chunk`'s OCR consistency
+            // rules satisfied, and `is_low_confidence_ocr` correctly reads a
+            // synthetic `Text` location as "not an OCR result".
+            content_type: String::new(),
+            confidence_micros: None,
+            low_confidence: false,
+        });
+        vectors.push(vector.to_vec());
+    }
+
+    if chunks.is_empty() {
+        return Err(
+            "Every row in this stack's v1 index is blank; there is nothing to import".to_string(),
+        );
+    }
+
+    let generation_id = Uuid::new_v4().to_string();
+    let snapshots = objects
+        .into_values()
+        .map(
+            |(object_id, source_id, content_sha256, chunk_ids)| ObjectSnapshot {
+                source_id,
+                object_id,
+                content_sha256,
+                pipeline_fingerprint: fingerprint.clone(),
+                chunk_ids,
+            },
+        )
+        .collect::<Vec<_>>();
+    let object_count = snapshots.len();
+    let chunk_count = chunks.len();
+    let build = GenerationBuild {
+        draft: GenerationDraft {
+            stack_id: stack_id.to_string(),
+            generation_id: generation_id.clone(),
+            // No parent: `activate` requires this to equal the currently active
+            // generation id, and the refusal above established there is none.
+            parent_generation_id: None,
+            created_unix_ms: now_ms(),
+            pipeline_fingerprint: fingerprint,
+            embedding_spec: embedding,
+            objects: snapshots,
+        },
+        chunks,
+        vectors,
+    };
+    let cancel = CancellationToken::new();
+    let staged = store
+        .stage(&build, &PipelineLimits::default(), &cancel)
+        .map_err(|error| error.to_string())?;
+    // Seeding and publication are one transaction, in the only order that keeps
+    // both halves recoverable with the existing machinery. Staging validates and
+    // materializes the whole index first and drops it again — deleting its
+    // directory — if it is never published, so every failure up to and including
+    // the catalog write below leaves neither the catalog nor a generation
+    // changed. The catalog write comes next, and the active pointer moves last,
+    // because that pointer is what starts serving these chunks: a generation
+    // whose sources are not in the catalog is exactly the state this fix exists
+    // to prevent. A failed `activate` puts the catalog back.
+    let seeded = catalog != previous_catalog;
+    if seeded {
+        save_catalog(&root, &catalog)?;
+    }
+    if let Err(error) = store.activate(staged, &cancel) {
+        if seeded {
+            if let Err(rollback) = save_catalog(&root, &previous_catalog) {
+                return Err(format!(
+                    "Failed to publish the imported generation ({error}), and the Knowledge 2.0 \
+                     sources seeded for it could not be rolled back ({rollback}) — remove them by \
+                     hand before retrying"
+                ));
+            }
+        }
+        return Err(error.to_string());
+    }
+
+    let mut warnings = Vec::new();
+    if skipped_rows > 0 {
+        warnings.push(format!(
+            "{skipped_rows} blank row(s) in the v1 index were not imported; reindex this stack to \
+             rebuild it cleanly."
+        ));
+    }
+    if let Err(error) =
+        crate::stacks::mark_v2_indexed_impl(&stacks_root, stack_id, now_ms(), chunk_count)
+    {
+        warnings.push(format!(
+            "The imported generation is active, but its legacy readiness badge could not be \
+             updated: {error}"
+        ));
+    }
+    Ok(KnowledgeV1ImportReport {
+        stack_id: stack_id.to_string(),
+        generation_id,
+        object_count,
+        chunk_count,
+        skipped_rows,
+        dimension: dim,
+        warnings,
+    })
+}
+
+/// Imports `stack_id`'s v1 index as its first v2 generation. See
+/// [`import_v1_generation_impl`], which this only resolves the app-data path for
+/// so `monkey-cli` can call the same code.
+#[tauri::command]
+pub fn knowledge_v2_import_from_v1(
+    app: AppHandle,
+    stack_id: String,
+) -> Result<KnowledgeV1ImportReport, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    import_v1_generation_impl(&app_data, &stack_id)
 }
 
 /// Collects `source`'s current object set. Returns `(objects, explicit_cursor)`:
@@ -5555,5 +6185,992 @@ mod tests {
             "the cap must still admit a real sidecar"
         );
         assert!(limits.validate().is_ok(), "the limit set must be coherent");
+    }
+
+    // -----------------------------------------------------------------------
+    // v1 -> v2 generation import
+    // -----------------------------------------------------------------------
+
+    /// v1's `vectors.bin` layout, written by the test rather than read from
+    /// `stacks.rs`, so `read_v1_vectors` is exercised against the documented
+    /// format instead of against its own assumptions.
+    fn v1_vectors_bin(dim: u32, rows: &[Vec<f32>], version: u32, magic: [u8; 4]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&magic);
+        bytes.extend_from_slice(&version.to_le_bytes());
+        bytes.extend_from_slice(&dim.to_le_bytes());
+        bytes.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        for row in rows {
+            for value in row {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    fn v1_row(source_path: &str, ordinal: usize, text: &str) -> crate::stacks::ChunkMeta {
+        crate::stacks::ChunkMeta {
+            source_path: source_path.to_string(),
+            ordinal,
+            text: text.to_string(),
+            content_hash: sha256(source_path.as_bytes()),
+            heading: Some(format!("Heading {ordinal}")),
+        }
+    }
+
+    /// Writes a complete v1 stack: registry entry plus `chunks.jsonl` and
+    /// `vectors.bin`. `registry_dim` is separate from `header_dim` so the
+    /// dimension-disagreement state can be built without hand-rolling the rest.
+    /// `source_root` is the stack's one v1 source, the folder every row's
+    /// `source_path` must sit under — the import attributes rows to sources by
+    /// path, so a fixture whose rows live outside it is a fixture of a damaged
+    /// v1 index.
+    fn write_v1_stack_rooted(
+        app_data: &Path,
+        stack_id: &str,
+        source_root: &str,
+        registry_dim: u32,
+        header_dim: u32,
+        rows: &[crate::stacks::ChunkMeta],
+        vectors: &[Vec<f32>],
+    ) {
+        let stacks_root = app_data.join("stacks");
+        let stack_dir = stacks_root.join(stack_id);
+        fs::create_dir_all(&stack_dir).unwrap();
+        let registry = json!([{
+            "id": stack_id,
+            "name": "Imported stack",
+            "sources": [{ "path": source_root, "kind": "folder" }],
+            "embedding": {
+                "backend": "ollama",
+                "model_id_or_tag": "nomic-embed-text",
+                "dim": registry_dim,
+                "query_prefix": "search_query: ",
+                "doc_prefix": "search_document: ",
+            },
+            "chunk_chars": 1600,
+            "chunk_overlap": 200,
+            "indexed_at": 1_700_000_000_000u64,
+            "chunk_count": rows.len(),
+        }]);
+        fs::write(
+            stacks_root.join("index.json"),
+            serde_json::to_vec_pretty(&registry).unwrap(),
+        )
+        .unwrap();
+        let mut jsonl = String::new();
+        for row in rows {
+            jsonl.push_str(&serde_json::to_string(row).unwrap());
+            jsonl.push('\n');
+        }
+        fs::write(stack_dir.join("chunks.jsonl"), jsonl).unwrap();
+        fs::write(
+            stack_dir.join("vectors.bin"),
+            v1_vectors_bin(header_dim, vectors, 1, *b"LMVC"),
+        )
+        .unwrap();
+    }
+
+    /// The common case: every fixture row lives under `/docs`, which is that
+    /// stack's single v1 source.
+    fn write_v1_stack(
+        app_data: &Path,
+        stack_id: &str,
+        registry_dim: u32,
+        header_dim: u32,
+        rows: &[crate::stacks::ChunkMeta],
+        vectors: &[Vec<f32>],
+    ) {
+        write_v1_stack_rooted(
+            app_data,
+            stack_id,
+            "/docs",
+            registry_dim,
+            header_dim,
+            rows,
+            vectors,
+        );
+    }
+
+    /// The common case: a 4-dimensional stack whose registry and `vectors.bin`
+    /// agree about that dimension.
+    fn write_v1_stack_4d(
+        app_data: &Path,
+        stack_id: &str,
+        rows: &[crate::stacks::ChunkMeta],
+        vectors: &[Vec<f32>],
+    ) {
+        write_v1_stack(app_data, stack_id, 4, 4, rows, vectors);
+    }
+
+    /// The single catalog source an import seeded for `stack_id`, or a failed
+    /// assertion naming what the catalog holds instead.
+    fn only_seeded_source(app_data: &Path, stack_id: &str) -> KnowledgeSource {
+        let catalog = load_catalog(&data_root_at(app_data).unwrap()).unwrap();
+        let mut sources = catalog
+            .sources
+            .into_iter()
+            .filter(|source| source.stack_id == stack_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sources.len(),
+            1,
+            "the import must seed exactly one catalog source for this stack's one v1 source"
+        );
+        sources.remove(0)
+    }
+
+    /// Every generation directory under the store, plus every staging
+    /// directory — what "a failed import left nothing behind" is measured on.
+    fn generation_store_residue(app_data: &Path) -> (usize, usize) {
+        let indexes = app_data.join("knowledge-v2").join("indexes");
+        let count = |child: &str| {
+            fs::read_dir(indexes.join(child))
+                .map(|entries| entries.filter_map(Result::ok).count())
+                .unwrap_or(0)
+        };
+        (count("generations"), count(".staging"))
+    }
+
+    fn assert_no_v2_generation(app_data: &Path, stack_id: &str) {
+        let store = GenerationStore::new(app_data.join("knowledge-v2").join("indexes")).unwrap();
+        assert!(
+            store.active(stack_id).unwrap().is_none(),
+            "a refused import must not leave an active generation"
+        );
+        assert_eq!(
+            generation_store_residue(app_data),
+            (0, 0),
+            "a refused import must leave no published or staged generation directory"
+        );
+    }
+
+    #[test]
+    fn importing_a_v1_index_publishes_a_generation_the_pipeline_accepts() {
+        let app_data = temporary_root("v1-import-roundtrip");
+        let stack_id = "stack-import-1";
+        let rows = vec![
+            v1_row("/docs/alpha.md", 0, "alpha chunk text"),
+            v1_row("/docs/alpha.md", 1, "second alpha chunk"),
+            v1_row("/docs/beta.md", 0, "beta chunk text"),
+        ];
+        // Unit norm in f32 exactly: 4 x 0.5^2 = 1.0, and 1.0^2 = 1.0. See
+        // `imported_vectors_keep_their_exact_bytes` for why that matters.
+        let vectors = vec![
+            vec![0.5, 0.5, 0.5, 0.5],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.5, -0.5, 0.5, -0.5],
+        ];
+        write_v1_stack(&app_data, stack_id, 4, 4, &rows, &vectors);
+
+        // `GenerationStore::stage` runs `validate_generation_contents` (and
+        // `validate_chunk` for every chunk, twice — once there and once inside
+        // `HybridIndex::create`) before it writes anything, so a successful
+        // import IS the round-trip proof: no synthesized chunk can reach disk
+        // without satisfying both validators exactly.
+        let report = import_v1_generation_impl(&app_data, stack_id).unwrap();
+        assert_eq!(report.chunk_count, 3);
+        assert_eq!(report.object_count, 2, "two distinct v1 source paths");
+        assert_eq!(report.skipped_rows, 0);
+        assert_eq!(report.dimension, 4);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        let store = GenerationStore::new(app_data.join("knowledge-v2").join("indexes")).unwrap();
+        let active = store.active(stack_id).unwrap().expect("generation active");
+        assert_eq!(active.manifest.generation_id, report.generation_id);
+        assert_eq!(active.manifest.chunk_count, 3);
+        assert_eq!(active.manifest.parent_generation_id, None);
+        // `active()` already re-validated the manifest and re-derived the index
+        // digest; opening the index re-reads and re-validates every stored chunk.
+        let entries = store
+            .open_active_index(stack_id)
+            .unwrap()
+            .expect("index openable")
+            .entries()
+            .unwrap();
+        assert_eq!(entries.len(), 3);
+        let texts = entries
+            .iter()
+            .map(|(chunk, _)| chunk.text.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            texts,
+            rows.iter()
+                .map(|row| row.text.clone())
+                .collect::<BTreeSet<_>>(),
+            "every v1 row's text must survive verbatim — it is what its vector encodes"
+        );
+        for (chunk, _) in &entries {
+            assert_eq!(chunk.heading_path.len(), 1, "v1 heading must carry over");
+            // Named rather than asserted as a `file://` URI because
+            // `Url::from_file_path` rejects a POSIX-shaped fixture path on
+            // Windows and falls back to the raw path; either way the citation
+            // must still name the file the chunk came from.
+            assert!(
+                chunk.citation.canonical_uri.ends_with(".md"),
+                "citations must point at the real file: {}",
+                chunk.citation.canonical_uri
+            );
+            assert!(
+                !chunk.is_low_confidence_ocr(),
+                "a synthetic text location must not read as an OCR result"
+            );
+        }
+
+        // The v1 index is untouched and still readable.
+        let stack_dir = app_data.join("stacks").join(stack_id);
+        assert_eq!(read_v1_chunk_meta(&stack_dir).unwrap(), rows);
+        let (dim, count, flat) = read_v1_vectors(&stack_dir.join("vectors.bin")).unwrap();
+        assert_eq!((dim, count), (4, 3));
+        assert_eq!(flat.len(), 12);
+
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn imported_vectors_keep_their_exact_bytes() {
+        let app_data = temporary_root("v1-import-bytes");
+        let stack_id = "stack-import-bytes";
+        let rows = vec![
+            v1_row("/docs/alpha.md", 0, "alpha"),
+            v1_row("/docs/beta.md", 0, "beta"),
+        ];
+        // Rows whose f32 L2 norm is exactly 1.0. `HybridIndex::create` re-runs
+        // `normalize_vector` because the imported spec honestly declares
+        // `normalized: true`, and for these rows that pass is an exact no-op
+        // (norm_squared is exactly 1.0, so the scale factor is exactly 1.0f32).
+        // That is what makes a bit-for-bit assertion meaningful here: any code
+        // that re-embedded, rescaled, or truncated instead of carrying the rows
+        // over would change these bytes.
+        let vectors = vec![vec![0.5, 0.5, -0.5, 0.5], vec![0.0, 0.0, 1.0, 0.0]];
+        write_v1_stack(&app_data, stack_id, 4, 4, &rows, &vectors);
+        import_v1_generation_impl(&app_data, stack_id).unwrap();
+
+        let store = GenerationStore::new(app_data.join("knowledge-v2").join("indexes")).unwrap();
+        let stored = store
+            .open_active_index(stack_id)
+            .unwrap()
+            .unwrap()
+            .entries()
+            .unwrap()
+            .into_iter()
+            .map(|(chunk, vector)| (chunk.text, vector))
+            .collect::<HashMap<_, _>>();
+        for (row, expected) in rows.iter().zip(&vectors) {
+            let actual = stored.get(&row.text).expect("row imported");
+            let actual_bits = actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            let expected_bits = expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                actual_bits, expected_bits,
+                "the imported vector for {} must be the v1 bytes, not a re-embedding",
+                row.source_path
+            );
+        }
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn the_import_sentinel_forces_the_first_real_refresh_to_re_extract() {
+        let app_data = temporary_root("v1-import-fingerprint");
+        let stack_id = "stack-import-fp";
+        let rows = vec![v1_row("/docs/alpha.md", 0, "alpha chunk text")];
+        write_v1_stack_4d(&app_data, stack_id, &rows, &[vec![0.5, 0.5, 0.5, 0.5]]);
+        import_v1_generation_impl(&app_data, stack_id).unwrap();
+
+        let store = GenerationStore::new(app_data.join("knowledge-v2").join("indexes")).unwrap();
+        let manifest = store.active(stack_id).unwrap().unwrap().manifest;
+        let sentinel = v1_import_pipeline_fingerprint();
+        assert_eq!(manifest.pipeline_fingerprint, sentinel);
+        for object in &manifest.objects {
+            assert_eq!(
+                object.pipeline_fingerprint, sentinel,
+                "the per-object snapshots are what refresh_inner_at compares"
+            );
+        }
+
+        // The correction to the design: a literal "v1-import" cannot be the
+        // sentinel, because both validators demand a SHA-256.
+        assert!(
+            looks_like_sha256(&sentinel),
+            "the sentinel must be a SHA-256 or no generation carrying it can be written"
+        );
+        assert_ne!(sentinel, "v1-import");
+
+        // The load-bearing inequality: `refresh_inner_at` reuses an object's
+        // chunks only when its snapshot fingerprint equals the one it just
+        // computed for the live configuration. Computed here through the same
+        // function refresh uses, so a change to that recipe cannot quietly
+        // start agreeing with the sentinel.
+        let stack = crate::stacks::list_impl(&app_data.join("stacks"))
+            .unwrap()
+            .into_iter()
+            .find(|stack| stack.id == stack_id)
+            .unwrap();
+        let chunking = ChunkingSpec {
+            strategy_version: crate::knowledge_pipeline::CHUNKER_CONTRACT_VERSION,
+            target_chars: stack.chunk_chars.max(64),
+            overlap_chars: stack.chunk_overlap.min(stack.chunk_chars.saturating_sub(1)),
+            min_chars: 40.min(stack.chunk_chars.max(1)),
+        };
+        let real = refresh_pipeline_fingerprint(
+            &chunking,
+            &pipeline_embedding(&stack),
+            &KnowledgeOcrConfig::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            sentinel, real,
+            "an imported object must never look unchanged to a real refresh"
+        );
+
+        // The counter-test: the recipe does return the same value for the same
+        // configuration, so the assertion above is about the sentinel and not
+        // about `refresh_pipeline_fingerprint` being unstable.
+        assert_eq!(
+            real,
+            refresh_pipeline_fingerprint(
+                &chunking,
+                &pipeline_embedding(&stack),
+                &KnowledgeOcrConfig::default()
+            )
+            .unwrap()
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn a_dimension_disagreement_is_refused_instead_of_written() {
+        let app_data = temporary_root("v1-import-dim");
+        let stack_id = "stack-import-dim";
+        let rows = vec![v1_row("/docs/alpha.md", 0, "alpha chunk text")];
+        // The registry says this stack's model emits 768 dims; the index on disk
+        // holds 4. These vectors are not this model's output.
+        write_v1_stack(&app_data, stack_id, 768, 4, &rows, &[vec![0.5; 4]]);
+        let error = import_v1_generation_impl(&app_data, stack_id).unwrap_err();
+        assert!(error.contains("4-dimensional"), "{error}");
+        assert!(error.contains("768"), "{error}");
+        assert_no_v2_generation(&app_data, stack_id);
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn a_row_vector_count_disagreement_is_refused() {
+        let app_data = temporary_root("v1-import-count");
+        let stack_id = "stack-import-count";
+        let rows = vec![
+            v1_row("/docs/alpha.md", 0, "alpha chunk text"),
+            v1_row("/docs/beta.md", 0, "beta chunk text"),
+        ];
+        // Two metadata rows, one vector — the row `i` <-> vector `i` pairing the
+        // whole import rests on is unproven, so nothing may be written.
+        write_v1_stack_4d(&app_data, stack_id, &rows, &[vec![0.5, 0.5, 0.5, 0.5]]);
+        let error = import_v1_generation_impl(&app_data, stack_id).unwrap_err();
+        assert!(error.contains("inconsistent"), "{error}");
+        assert_no_v2_generation(&app_data, stack_id);
+
+        // Vectors with no metadata at all is the same state seen from the other
+        // side, and must also be refused rather than importing zero rows.
+        fs::remove_file(app_data.join("stacks").join(stack_id).join("chunks.jsonl")).unwrap();
+        assert!(import_v1_generation_impl(&app_data, stack_id).is_err());
+        assert_no_v2_generation(&app_data, stack_id);
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn an_unusable_vector_row_leaves_no_partial_generation_behind() {
+        let app_data = temporary_root("v1-import-partial");
+        let stack_id = "stack-import-partial";
+        let rows = vec![
+            v1_row("/docs/alpha.md", 0, "alpha chunk text"),
+            v1_row("/docs/beta.md", 0, "beta chunk text"),
+        ];
+        // v1's `l2_normalize` guards on `norm > 0.0`, so it leaves an all-zero
+        // row alone and one can genuinely be sitting in a `vectors.bin`. v2's
+        // `normalize_vector` refuses it. The second row is fine, so this is a
+        // *partial* failure: the first row would already have been described as
+        // a valid chunk before the bad one was reached.
+        write_v1_stack(
+            &app_data,
+            stack_id,
+            4,
+            4,
+            &rows,
+            &[vec![0.5, 0.5, 0.5, 0.5], vec![0.0, 0.0, 0.0, 0.0]],
+        );
+        let error = import_v1_generation_impl(&app_data, stack_id).unwrap_err();
+        assert!(error.contains("all-zero"), "{error}");
+        assert_no_v2_generation(&app_data, stack_id);
+
+        // And the v1 index it read is still intact.
+        let stack_dir = app_data.join("stacks").join(stack_id);
+        assert_eq!(read_v1_chunk_meta(&stack_dir).unwrap(), rows);
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn a_failure_inside_staging_removes_the_directory_it_had_already_created() {
+        // The import's non-destructiveness claim rests on `GenerationStore::stage`
+        // being a transaction, and every other refusal here happens *before*
+        // staging is entered — so nothing above proves the transaction itself
+        // cleans up. This does: it drives a build past
+        // `validate_generation_contents` (which never looks at vectors) and into
+        // `HybridIndex::create`, where `validate_embeddings` rejects the zero row
+        // — by which point the staging directory has already been created on disk.
+        let app_data = temporary_root("v1-import-staging");
+        let stack_id = "stack-import-staging";
+        let rows = vec![v1_row("/docs/alpha.md", 0, "alpha chunk text")];
+        write_v1_stack_4d(&app_data, stack_id, &rows, &[vec![0.5, 0.5, 0.5, 0.5]]);
+        import_v1_generation_impl(&app_data, stack_id).unwrap();
+
+        let store = GenerationStore::new(app_data.join("knowledge-v2").join("indexes")).unwrap();
+        let active = store.active(stack_id).unwrap().unwrap();
+        let chunks = store
+            .open_active_index(stack_id)
+            .unwrap()
+            .unwrap()
+            .entries()
+            .unwrap()
+            .into_iter()
+            .map(|(chunk, _)| chunk)
+            .collect::<Vec<_>>();
+        let doomed = GenerationBuild {
+            draft: GenerationDraft {
+                stack_id: "stack-import-staging-b".to_string(),
+                generation_id: Uuid::new_v4().to_string(),
+                parent_generation_id: None,
+                created_unix_ms: now_ms(),
+                pipeline_fingerprint: active.manifest.pipeline_fingerprint.clone(),
+                embedding_spec: active.manifest.embedding_spec.clone(),
+                objects: active.manifest.objects.clone(),
+            },
+            chunks,
+            vectors: vec![vec![0.0, 0.0, 0.0, 0.0]],
+        };
+        let error = store
+            .stage(
+                &doomed,
+                &PipelineLimits::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("normalized"), "{error}");
+        assert_eq!(
+            generation_store_residue(&app_data),
+            (1, 0),
+            "staging must clean up after itself, leaving only the published generation"
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn re_importing_a_stack_that_already_has_a_generation_is_refused() {
+        let app_data = temporary_root("v1-import-repeat");
+        let stack_id = "stack-import-repeat";
+        let rows = vec![v1_row("/docs/alpha.md", 0, "alpha chunk text")];
+        write_v1_stack_4d(&app_data, stack_id, &rows, &[vec![0.5, 0.5, 0.5, 0.5]]);
+        let first = import_v1_generation_impl(&app_data, stack_id).unwrap();
+
+        let error = import_v1_generation_impl(&app_data, stack_id).unwrap_err();
+        assert!(error.contains("already has an active"), "{error}");
+        // Refused, not idempotent — and critically, the refusal did not disturb
+        // the generation that was already active.
+        let store = GenerationStore::new(app_data.join("knowledge-v2").join("indexes")).unwrap();
+        let active = store.active(stack_id).unwrap().unwrap();
+        assert_eq!(active.manifest.generation_id, first.generation_id);
+        assert_eq!(
+            generation_store_residue(&app_data),
+            (1, 0),
+            "the refused second import must not stage anything"
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn an_empty_or_blank_only_v1_index_is_refused() {
+        let app_data = temporary_root("v1-import-empty");
+        let stack_id = "stack-import-empty";
+        write_v1_stack(&app_data, stack_id, 4, 4, &[], &[]);
+        let error = import_v1_generation_impl(&app_data, stack_id).unwrap_err();
+        assert!(error.contains("nothing to import"), "{error}");
+        assert_no_v2_generation(&app_data, stack_id);
+
+        // A file of rows that are all whitespace is the same non-event: every
+        // row is unusable, so there is no generation worth publishing and the
+        // stack must not be badged as v2-indexed.
+        let blank = vec![v1_row("/docs/alpha.md", 0, "   \n  ")];
+        write_v1_stack_4d(&app_data, stack_id, &blank, &[vec![0.5, 0.5, 0.5, 0.5]]);
+        let error = import_v1_generation_impl(&app_data, stack_id).unwrap_err();
+        assert!(error.contains("blank"), "{error}");
+        assert_no_v2_generation(&app_data, stack_id);
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn a_blank_row_is_skipped_without_losing_its_neighbours_vectors() {
+        let app_data = temporary_root("v1-import-blank-row");
+        let stack_id = "stack-import-blank";
+        let rows = vec![
+            v1_row("/docs/alpha.md", 0, "alpha chunk text"),
+            v1_row("/docs/alpha.md", 1, "\t\n "),
+            v1_row("/docs/beta.md", 0, "beta chunk text"),
+        ];
+        // Row 1 is blank. Its vector must be dropped WITH it: if the skip lost
+        // track of the row index, row 2's text would end up paired with row 1's
+        // vector, which is exactly the silent corruption this import exists to
+        // avoid. The distinct vectors below are what catch that.
+        let vectors = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ];
+        write_v1_stack_4d(&app_data, stack_id, &rows, &vectors);
+        let report = import_v1_generation_impl(&app_data, stack_id).unwrap();
+        assert_eq!(report.chunk_count, 2);
+        assert_eq!(report.skipped_rows, 1);
+        assert_eq!(report.object_count, 2);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("blank")),
+            "a dropped row must be reported, not silent: {:?}",
+            report.warnings
+        );
+
+        let store = GenerationStore::new(app_data.join("knowledge-v2").join("indexes")).unwrap();
+        let stored = store
+            .open_active_index(stack_id)
+            .unwrap()
+            .unwrap()
+            .entries()
+            .unwrap()
+            .into_iter()
+            .map(|(chunk, vector)| (chunk.text, vector))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored.get("alpha chunk text"), Some(&vectors[0]));
+        assert_eq!(
+            stored.get("beta chunk text"),
+            Some(&vectors[2]),
+            "the surviving rows must keep their OWN vectors"
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn rows_disagreeing_about_a_files_content_hash_are_refused() {
+        let app_data = temporary_root("v1-import-hash");
+        let stack_id = "stack-import-hash";
+        let mut rows = vec![
+            v1_row("/docs/alpha.md", 0, "alpha chunk text"),
+            v1_row("/docs/alpha.md", 1, "second alpha chunk"),
+        ];
+        // Same file, two different content hashes: the object snapshot's
+        // `content_sha256` would be a coin flip, and `validate_generation_contents`
+        // requires every chunk of an object to match it.
+        rows[1].content_hash = sha256(b"a different revision of alpha.md");
+        write_v1_stack(
+            &app_data,
+            stack_id,
+            4,
+            4,
+            &rows,
+            &[vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]],
+        );
+        let error = import_v1_generation_impl(&app_data, stack_id).unwrap_err();
+        assert!(error.contains("disagrees with itself"), "{error}");
+        assert_no_v2_generation(&app_data, stack_id);
+
+        // The counter-test: two rows of the SAME file agreeing on its hash is
+        // the normal case and must still import.
+        rows[1].content_hash = rows[0].content_hash.clone();
+        write_v1_stack(
+            &app_data,
+            stack_id,
+            4,
+            4,
+            &rows,
+            &[vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]],
+        );
+        let report = import_v1_generation_impl(&app_data, stack_id).unwrap();
+        assert_eq!((report.object_count, report.chunk_count), (1, 2));
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    /// The assertion the whole seeding change exists for: the ids on the
+    /// imported objects are ids the catalog actually owns, so the one operation
+    /// that prunes by `source_id` can reach them.
+    ///
+    /// Sabotage check: put back a synthetic `format!("v1-import:{}", ...)` id and
+    /// this fails twice over — the equality below, and then
+    /// `remove_source_generation` silently keeping every object.
+    #[test]
+    fn an_imported_object_carries_a_real_catalog_source_id_and_can_be_pruned() {
+        let app_data = temporary_root("v1-import-source-id");
+        let stack_id = "stack-import-source-id";
+        let rows = vec![
+            v1_row("/docs/alpha.md", 0, "alpha chunk text"),
+            v1_row("/docs/beta.md", 0, "beta chunk text"),
+        ];
+        write_v1_stack_4d(
+            &app_data,
+            stack_id,
+            &rows,
+            &[vec![0.5, 0.5, 0.5, 0.5], vec![1.0, 0.0, 0.0, 0.0]],
+        );
+        import_v1_generation_impl(&app_data, stack_id).unwrap();
+
+        let seeded = only_seeded_source(&app_data, stack_id);
+        assert!(
+            seeded.enabled,
+            "a disabled source is a source refresh skips"
+        );
+        assert_eq!(
+            seeded.connector,
+            ConnectorConfig::LocalFolder {
+                path: "/docs".to_string()
+            },
+            "the v1 folder source must map onto its connector equivalent"
+        );
+
+        let root = data_root_at(&app_data).unwrap();
+        let store = GenerationStore::new(root.join("indexes")).unwrap();
+        let manifest = store.active(stack_id).unwrap().unwrap().manifest;
+        assert_eq!(manifest.objects.len(), 2);
+        for object in &manifest.objects {
+            assert_eq!(
+                object.source_id, seeded.id,
+                "an imported object must carry the seeded catalog source's id"
+            );
+        }
+        for (chunk, _) in store
+            .open_active_index(stack_id)
+            .unwrap()
+            .unwrap()
+            .entries()
+            .unwrap()
+        {
+            assert_eq!(chunk.source_id, seeded.id);
+            assert_eq!(chunk.citation.source_id, seeded.id);
+        }
+
+        // The id the previous design used. It matches nothing, which is exactly
+        // why removal could never reach these objects — the control for the
+        // pruning assertion that follows.
+        let synthetic = format!("v1-import:{}", sha256(stack_id.as_bytes()));
+        remove_source_generation(&app_data, &root, stack_id, &synthetic).unwrap();
+        assert_eq!(
+            store
+                .active(stack_id)
+                .unwrap()
+                .unwrap()
+                .manifest
+                .objects
+                .len(),
+            2,
+            "an id no object carries must prune nothing"
+        );
+
+        remove_source_generation(&app_data, &root, stack_id, &seeded.id).unwrap();
+        let pruned = store.active(stack_id).unwrap().unwrap().manifest;
+        assert!(
+            pruned.objects.is_empty(),
+            "removing the seeded source must prune every object it owns"
+        );
+        assert_eq!(pruned.chunk_count, 0);
+        assert_eq!(
+            store
+                .open_active_index(stack_id)
+                .unwrap()
+                .unwrap()
+                .entries()
+                .unwrap()
+                .len(),
+            0,
+            "the pruned generation's index must hold no chunks either"
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    /// After an import, a refresh gets past "Add and enable at least one
+    /// Knowledge 2.0 source" and all the way to the per-object fingerprint
+    /// comparison — the comparison the sentinel exists to lose.
+    ///
+    /// Hermetic, and deliberately so: `alpha.md` is empty, so the re-extraction
+    /// the sentinel forces produces no blocks and no chunk needs embedding. That
+    /// is what lets a real refresh run in a unit test with no model behind it.
+    /// Its content hash is what the v1 row claims, so `reusable`'s first leg
+    /// (content) and third (chunks present) both hold and only the fingerprint
+    /// can decide.
+    ///
+    /// Sabotage check: restore the synthetic source id and this fails at the
+    /// `unwrap` with "Add and enable at least one Knowledge 2.0 source"; keep the
+    /// seeding but drop the ids from the objects and `deleted_objects` becomes 1.
+    #[tokio::test]
+    async fn a_refresh_after_an_import_reaches_the_fingerprint_comparison() {
+        let app_data = temporary_root("v1-import-refresh");
+        let stack_id = "stack-import-refresh";
+        let docs = app_data.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        let file = docs.join("alpha.md");
+        fs::write(&file, b"").unwrap();
+        // Canonical, because that is what v1 recorded (`add_source_impl`
+        // canonicalizes, and the walker's paths inherit it) and what the v2
+        // collector derives its object id from. On macOS these differ from the
+        // paths above by `/private`.
+        let docs = fs::canonicalize(&docs).unwrap();
+        let file = fs::canonicalize(&file).unwrap();
+        let mut row = v1_row(file.to_str().unwrap(), 0, "alpha chunk text");
+        row.content_hash = sha256(b"");
+        write_v1_stack_rooted(
+            &app_data,
+            stack_id,
+            docs.to_str().unwrap(),
+            4,
+            4,
+            &[row],
+            &[vec![0.5, 0.5, 0.5, 0.5]],
+        );
+        let imported = import_v1_generation_impl(&app_data, stack_id).unwrap();
+
+        let report = knowledge_v2_refresh_headless(&app_data, stack_id)
+            .await
+            .expect("the seeded source is what lets this refresh run at all");
+        assert_eq!(report.source_count, 1);
+        assert_eq!(report.object_count, 1);
+        assert_eq!(
+            report.parent_generation_id.as_deref(),
+            Some(imported.generation_id.as_str())
+        );
+        assert_eq!(
+            report.deleted_objects, 0,
+            "the refreshed object must land on the imported object's own \
+             (source_id, object_id) key, not orphan it"
+        );
+        assert_eq!(
+            report.unchanged_objects, 0,
+            "the sentinel fingerprint must lose the reuse comparison"
+        );
+        assert_eq!(
+            report.changed_objects, 1,
+            "losing that comparison is what re-extracts the imported object"
+        );
+        assert_eq!(
+            report.embedded_chunks, 0,
+            "an empty file re-extracts to nothing, which is why this test needs no model"
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    /// Reuse-or-refuse, both halves, against a catalog that already holds a
+    /// source for the path this stack lists. Enabled: reused, so the path is not
+    /// indexed twice under two ids. Disabled: refused, because reusing its id
+    /// would stamp the imported objects with a source `refresh_inner_at` filters
+    /// out — the same dead end as a synthetic id.
+    #[test]
+    fn a_disabled_catalog_source_for_the_same_path_refuses_the_import() {
+        let app_data = temporary_root("v1-import-disabled-source");
+        let stack_id = "stack-import-disabled";
+        let root = data_root_at(&app_data).unwrap();
+        let existing = KnowledgeCatalog {
+            version: CATALOG_VERSION,
+            sources: vec![KnowledgeSource {
+                id: "source-already-here".to_string(),
+                stack_id: stack_id.to_string(),
+                label: "Docs".to_string(),
+                enabled: false,
+                connector: ConnectorConfig::LocalFolder {
+                    path: "/docs".to_string(),
+                },
+                cursor: None,
+                checkpoint: None,
+                last_refresh_at_ms: None,
+                last_error: None,
+                objects: Vec::new(),
+                retries: Vec::new(),
+            }],
+        };
+        save_catalog(&root, &existing).unwrap();
+        let rows = vec![v1_row("/docs/alpha.md", 0, "alpha chunk text")];
+        write_v1_stack_4d(&app_data, stack_id, &rows, &[vec![0.5, 0.5, 0.5, 0.5]]);
+
+        let error = import_v1_generation_impl(&app_data, stack_id).unwrap_err();
+        assert!(error.contains("disabled"), "{error}");
+        assert_eq!(
+            load_catalog(&root).unwrap(),
+            existing,
+            "a refused import must not touch the catalog it read"
+        );
+        assert_no_v2_generation(&app_data, stack_id);
+
+        // The reuse half: the same source, enabled. The import must adopt it
+        // rather than seed a second source for the same folder.
+        let mut enabled = existing.clone();
+        enabled.sources[0].enabled = true;
+        save_catalog(&root, &enabled).unwrap();
+        import_v1_generation_impl(&app_data, stack_id).unwrap();
+        let reused = only_seeded_source(&app_data, stack_id);
+        assert_eq!(
+            reused.id, "source-already-here",
+            "an enabled source for the same path must be reused, not duplicated"
+        );
+        let store = GenerationStore::new(root.join("indexes")).unwrap();
+        for object in &store.active(stack_id).unwrap().unwrap().manifest.objects {
+            assert_eq!(
+                object.source_id, "source-already-here",
+                "the imported objects must carry the reused source's id"
+            );
+        }
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    /// The all-or-nothing half that ordering decides: a build that dies inside
+    /// staging must leave the catalog unseeded. Staging is entered after the
+    /// source ids have been chosen and stamped into every chunk, so this is the
+    /// window where a catalog written too early would survive a failed import.
+    ///
+    /// Sabotage check: move `save_catalog` above `store.stage` and the
+    /// catalog-file assertion fails while the error assertion still passes.
+    #[test]
+    fn a_staging_failure_leaves_the_catalog_unseeded() {
+        let app_data = temporary_root("v1-import-seed-rollback");
+        let stack_id = "stack-import-rollback";
+        let rows = vec![v1_row("/docs/alpha.md", 0, "alpha chunk text")];
+        // Finite and not all-zero, so the import's own guards pass it through —
+        // and far too small to normalize (`norm_squared <= f64::EPSILON`), so
+        // `HybridIndex::create` refuses it from inside `stage`.
+        write_v1_stack_4d(&app_data, stack_id, &rows, &[vec![1e-30, 0.0, 0.0, 0.0]]);
+
+        let error = import_v1_generation_impl(&app_data, stack_id).unwrap_err();
+        assert!(error.contains("normalized"), "{error}");
+        let root = data_root_at(&app_data).unwrap();
+        assert!(
+            !catalog_path(&root).exists(),
+            "the catalog must not be written until the generation is staged"
+        );
+        assert!(load_catalog(&root).unwrap().sources.is_empty());
+        assert_no_v2_generation(&app_data, stack_id);
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    /// A row from a source the stack no longer lists (`remove_source_impl` drops
+    /// a source without rewriting the index) has no catalog source it can
+    /// honestly belong to. Refused, rather than attributed to whichever source
+    /// happens to be first.
+    #[test]
+    fn a_row_no_stack_source_covers_is_refused() {
+        let app_data = temporary_root("v1-import-orphan-row");
+        let stack_id = "stack-import-orphan";
+        let rows = vec![
+            v1_row("/docs/alpha.md", 0, "alpha chunk text"),
+            v1_row("/elsewhere/gamma.md", 0, "gamma chunk text"),
+        ];
+        write_v1_stack_4d(
+            &app_data,
+            stack_id,
+            &rows,
+            &[vec![0.5, 0.5, 0.5, 0.5], vec![1.0, 0.0, 0.0, 0.0]],
+        );
+        let error = import_v1_generation_impl(&app_data, stack_id).unwrap_err();
+        assert!(error.contains("/elsewhere/gamma.md"), "{error}");
+        assert!(
+            error.contains("none of this stack's sources covers"),
+            "{error}"
+        );
+        assert!(load_catalog(&data_root_at(&app_data).unwrap())
+            .unwrap()
+            .sources
+            .is_empty());
+        assert_no_v2_generation(&app_data, stack_id);
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    /// The non-finite guard has to fail *as itself*. Staging would refuse a NaN
+    /// row too ("provider returned a malformed vector"), which is why asserting
+    /// only `is_err()` here would pass with the guard deleted.
+    #[test]
+    fn a_non_finite_vector_is_refused_by_the_imports_own_guard() {
+        let app_data = temporary_root("v1-import-non-finite");
+        let stack_id = "stack-import-non-finite";
+        let rows = vec![v1_row("/docs/alpha.md", 0, "alpha chunk text")];
+        write_v1_stack_4d(&app_data, stack_id, &rows, &[vec![f32::NAN, 0.5, 0.5, 0.5]]);
+        let error = import_v1_generation_impl(&app_data, stack_id).unwrap_err();
+        assert!(
+            error.contains("non-finite") && error.contains("/docs/alpha.md"),
+            "the import's own guard must name the offending v1 file: {error}"
+        );
+        assert_no_v2_generation(&app_data, stack_id);
+
+        // Infinity is the same defect from the other end, and v1's
+        // `l2_normalize` propagates rather than rejects it.
+        write_v1_stack_4d(
+            &app_data,
+            stack_id,
+            &rows,
+            &[vec![f32::INFINITY, 0.5, 0.5, 0.5]],
+        );
+        let error = import_v1_generation_impl(&app_data, stack_id).unwrap_err();
+        assert!(error.contains("non-finite"), "{error}");
+        assert_no_v2_generation(&app_data, stack_id);
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    /// Same shape: `validate_chunk` would also refuse a malformed
+    /// `content_hash`, but as "malformed chunk <id>" — a message that names a
+    /// synthesized id instead of the v1 file the user has to fix.
+    #[test]
+    fn a_malformed_content_hash_is_refused_by_the_imports_own_guard() {
+        let app_data = temporary_root("v1-import-bad-hash");
+        let stack_id = "stack-import-bad-hash";
+        let mut rows = vec![v1_row("/docs/alpha.md", 0, "alpha chunk text")];
+        rows[0].content_hash = "nope".into();
+        write_v1_stack_4d(&app_data, stack_id, &rows, &[vec![0.5, 0.5, 0.5, 0.5]]);
+        let error = import_v1_generation_impl(&app_data, stack_id).unwrap_err();
+        assert!(
+            error.contains("malformed content hash") && error.contains("/docs/alpha.md"),
+            "the import's own guard must name the offending v1 file: {error}"
+        );
+        assert_no_v2_generation(&app_data, stack_id);
+
+        // A 64-character non-hex string is the near miss the length check alone
+        // would let through.
+        rows[0].content_hash = "z".repeat(64);
+        write_v1_stack_4d(&app_data, stack_id, &rows, &[vec![0.5, 0.5, 0.5, 0.5]]);
+        let error = import_v1_generation_impl(&app_data, stack_id).unwrap_err();
+        assert!(error.contains("malformed content hash"), "{error}");
+        assert_no_v2_generation(&app_data, stack_id);
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn v1_vectors_bin_layout_is_pinned() {
+        let dir = temporary_root("v1-vectors-bin");
+        let path = dir.join("vectors.bin");
+        let rows = vec![vec![0.25_f32, -0.5, 1.5, 0.0], vec![2.0, 3.0, 4.0, 5.0]];
+
+        fs::write(&path, v1_vectors_bin(4, &rows, 1, *b"LMVC")).unwrap();
+        let (dim, count, flat) = read_v1_vectors(&path).unwrap();
+        assert_eq!((dim, count), (4, 2));
+        assert_eq!(flat, rows.concat());
+
+        // Trailing bytes past the promised rows are tolerated, exactly as
+        // `stacks::read_vectors_bin` tolerates them — an import must carry over
+        // every row v1 would itself have searched.
+        let mut padded = v1_vectors_bin(4, &rows, 1, *b"LMVC");
+        padded.extend_from_slice(b"trailing");
+        fs::write(&path, padded).unwrap();
+        assert_eq!(read_v1_vectors(&path).unwrap().2, rows.concat());
+
+        // A different producer, a future format, and a short file must each be
+        // refused rather than reinterpreted as f32s.
+        fs::write(&path, v1_vectors_bin(4, &rows, 1, *b"XXXX")).unwrap();
+        assert!(read_v1_vectors(&path).unwrap_err().contains("magic"));
+        fs::write(&path, v1_vectors_bin(4, &rows, 2, *b"LMVC")).unwrap();
+        assert!(read_v1_vectors(&path).unwrap_err().contains("version 2"));
+        let mut truncated = v1_vectors_bin(4, &rows, 1, *b"LMVC");
+        truncated.truncate(truncated.len() - 4);
+        fs::write(&path, truncated).unwrap();
+        assert!(read_v1_vectors(&path).unwrap_err().contains("truncated"));
+        fs::write(&path, b"LMVC").unwrap();
+        assert!(read_v1_vectors(&path).unwrap_err().contains("truncated"));
+        fs::remove_dir_all(dir).unwrap();
     }
 }
