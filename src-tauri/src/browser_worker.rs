@@ -1435,6 +1435,14 @@ impl ValidatedGrant {
     }
 
     fn validate_navigation(&self, value: &str) -> Result<(), EgressDenial> {
+        let verdict = self.classify_navigation(value);
+        if let Err(denial) = &verdict {
+            crate::denial_sink::record(BROWSER_GUARD, denial, None);
+        }
+        verdict
+    }
+
+    fn classify_navigation(&self, value: &str) -> Result<(), EgressDenial> {
         let url = validate_http_url(value)?;
         let origin = normalized_origin(&url)?;
         if !self.allowed_origins.contains(&origin) {
@@ -1447,6 +1455,14 @@ impl ValidatedGrant {
     }
 
     fn validate_request(&self, value: &str, document: bool) -> Result<(), EgressDenial> {
+        let verdict = self.classify_request(value, document);
+        if let Err(denial) = &verdict {
+            crate::denial_sink::record(BROWSER_GUARD, denial, None);
+        }
+        verdict
+    }
+
+    fn classify_request(&self, value: &str, document: bool) -> Result<(), EgressDenial> {
         let url = validate_http_url(value)?;
         let origin = normalized_origin(&url)?;
         if !self.allowed_origins.contains(&origin) {
@@ -1988,6 +2004,9 @@ impl CdpConnection {
 fn denial_text(denial: EgressDenial) -> String {
     denial.to_string()
 }
+
+/// Names this guard in a denial record.
+const BROWSER_GUARD: &str = "browser.navigation";
 
 fn validate_http_url(value: &str) -> Result<Url, EgressDenial> {
     if value.len() > 16 * 1024 {
@@ -3425,6 +3444,72 @@ mod tests {
     /// them, and deliberately does not pin either platform's resolver behaviour as
     /// the expected answer — an earlier version pinned the macOS verdict and failed
     /// on Windows for a reason that was not a defect.
+    /// Two different guards refusing, and the `guard` column keeping them apart.
+    ///
+    /// This is the column's whole justification. The four guards disagree about
+    /// which address classes they block — deliberately, since the broadest blocks
+    /// CGNAT and unifying them would refuse fetches that work today — so a sink that
+    /// recorded only the rule would average those disagreements into one number and
+    /// an operator could not tell which guard was involved.
+    ///
+    /// Drives the real guards rather than synthesising records, so it also proves
+    /// both call sites are actually wired.
+    #[test]
+    fn two_guards_refusing_are_distinguishable_in_the_record() {
+        let directory =
+            std::env::temp_dir().join(format!("lm-two-guards-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("creates the directory");
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+
+        // The web fetch guard, on a link-local literal.
+        let refused = crate::web::validate_fetch_url(
+            &reqwest::Url::parse("http://169.254.1.1/probe").expect("parses"),
+            false,
+        );
+        assert!(refused.is_err());
+
+        // The browser guard, on an origin outside the run's grant.
+        let grant = ValidatedGrant::new(BrowserGrant {
+            allowed_origins: vec!["https://granted.example".to_string()],
+            allow_loopback: false,
+        })
+        .expect("the grant is valid");
+        assert!(grant
+            .validate_navigation("https://ungranted.example/page")
+            .is_err());
+
+        let reader = crate::denial_sink::DenialSink::open(&path).expect("reopens for reading");
+        let rows = reader.recent(64).expect("reads");
+
+        let web = rows
+            .iter()
+            .find(|row| row.detail.as_deref() == Some("169.254.1.1"))
+            .expect("the web guard's refusal was recorded");
+        assert_eq!(web.rule_code, EgressRule::LinkLocal.code());
+        assert_eq!(web.guard, "web.fetch");
+
+        let browser = rows
+            .iter()
+            .find(|row| {
+                row.detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("ungranted.example"))
+            })
+            .expect("the browser guard's refusal was recorded");
+        assert_eq!(browser.rule_code, EgressRule::OriginNotAllowlisted.code());
+        assert_eq!(browser.guard, "browser.navigation");
+
+        assert_ne!(
+            web.guard, browser.guard,
+            "the column exists precisely to keep these apart"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[test]
     fn the_ipv4_mapped_loopback_form_is_classified_as_loopback() {
         for text in ["::ffff:127.0.0.1", "::ffff:127.1.2.3"] {
