@@ -1602,13 +1602,20 @@ fn classify_ip(ip: IpAddr) -> Option<EgressRule> {
 /// adding either rule here would refuse addresses it accepts today, which is a
 /// separate decision from naming the rules it already enforces.
 ///
-/// There is also no loopback branch, because [`classify_ip`] answers `127.0.0.0/8`
-/// before either family helper is reached. The consequence is worth stating
-/// plainly: the IPv4-*mapped* form `::ffff:127.0.0.1` is not `Ipv6Addr::is_loopback`
-/// and arrives here as a bare `127.0.0.1`, which no branch below matches — so it
-/// classifies as allowed. A gap in the blocklist, left exactly as it was for the
-/// same reason as the two ranges above.
+/// # The loopback branch below is not redundant
+///
+/// [`classify_ip`] does answer `127.0.0.0/8` before either family helper is
+/// reached, so for a v4 address this arm never fires. It exists for the address
+/// that arrives here the other way: the IPv4-**mapped** form `::ffff:127.0.0.1` is
+/// not `Ipv6Addr::is_loopback`, so `classify_ip` passes it through to
+/// [`classify_v6`], which unwraps it to a bare `127.0.0.1` and delegates here.
+/// Without this branch that address matched nothing and was classified as an
+/// ordinary public navigation target — a loopback destination reachable without the
+/// explicit per-run loopback grant that gates `127.0.0.1` itself.
 fn classify_v4(ip: Ipv4Addr) -> Option<EgressRule> {
+    if ip.is_loopback() {
+        return Some(EgressRule::Loopback); // 127/8, reached via `::ffff:127.0.0.1`
+    }
     if ip.is_private() {
         return Some(EgressRule::PrivateV4); // 10/8, 172.16/12, 192.168/16
     }
@@ -3388,6 +3395,74 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// The IPv4-**mapped** loopback form was classified as an ordinary public
+    /// navigation target: it is not `Ipv6Addr::is_loopback`, so it slipped past
+    /// [`classify_ip`]'s loopback check, and the v4 helper it then unwrapped into had
+    /// no loopback branch — because until that unwrap existed, nothing had ever
+    /// reached it with a loopback address.
+    ///
+    /// Sibling of the `::127.0.0.1` bug the shared `egress::is_ipv4_compatible`
+    /// predicate closed, and it survived that fix because the compatible form and the
+    /// mapped form are different ranges reached by different branches.
+    ///
+    /// # Scope of the claim, since the classifier is not the only gate
+    ///
+    /// This was a hole in the classifier, not a demonstrated end-to-end bypass. A
+    /// bracketed IPv6 literal never reaches the classifier through
+    /// `validate_navigation` today — see the second half of this test — so the fix is
+    /// defensive: the classifier must not report a loopback address as public
+    /// whatever route reaches it, and one of those routes is a hostname whose
+    /// resolver answers with a mapped address.
+    #[test]
+    fn the_ipv4_mapped_loopback_form_is_classified_as_loopback() {
+        for text in ["::ffff:127.0.0.1", "::ffff:127.1.2.3"] {
+            let address: Ipv6Addr = text.parse().expect("parses");
+            assert!(
+                !address.is_loopback(),
+                "{text} is deliberately NOT `is_loopback`, which is the whole trap"
+            );
+            assert_eq!(
+                classify_ip(IpAddr::V6(address)),
+                Some(EgressRule::Loopback),
+                "{text} must be reported as loopback, not as a public target"
+            );
+        }
+
+        // Counter-test: a public address in the same wrapper is still reachable, so
+        // the new branch did not refuse the whole mapped range.
+        assert_eq!(
+            classify_ip(IpAddr::V6(
+                "::ffff:93.184.216.34".parse::<Ipv6Addr>().unwrap()
+            )),
+            None
+        );
+
+        // And the second gate, pinned because it is the reason the hole above was
+        // not reachable end to end — and because it is a bug of its own.
+        // `Url::host_str` serializes an IPv6 literal *with its brackets*, so
+        // `("[::ffff:127.0.0.1]", port).to_socket_addrs()` cannot parse it and every
+        // IPv6-literal browser target is refused as a resolution failure rather than
+        // classified. `web.rs` avoids this by matching on `Url::host()` — the parsed
+        // enum — and its own comment names this exact "bracket-handling class of
+        // bug". Fail-closed, so not a hole; but it means this guard's IPv6 literal
+        // handling is unreachable. Whoever fixes it will trip this assertion, which
+        // is the point: the loopback grant has to be re-checked at the same time.
+        let grant = ValidatedGrant::new(BrowserGrant {
+            allowed_origins: vec!["http://[::ffff:127.0.0.1]:11434".into()],
+            allow_loopback: false,
+        })
+        .unwrap();
+        assert_eq!(
+            grant
+                .validate_navigation("http://[::ffff:127.0.0.1]:11434/api/tags")
+                .unwrap_err()
+                .rule(),
+            EgressRule::DnsResolutionFailed,
+            "if this now reports a rule about the address, the bracket bug is fixed \
+             and the loopback grant needs re-checking here"
+        );
     }
 
     #[test]

@@ -1357,6 +1357,23 @@ it.
   its siblings do not, that asymmetry is now visible in an inventory test rather
   than hidden inside four differently-worded sentences.
 
+**Shipped — `::ffff:127.0.0.1` is no longer a public navigation target.** Found by
+writing `browser_worker.rs`'s address classes down: the IPv4-**mapped** loopback form
+is not `Ipv6Addr::is_loopback`, so it passed the loopback check, and the v4 helper it
+then unwrapped into had no loopback branch — until that unwrap existed, nothing had
+ever reached it with a loopback address. Sibling of the `::127.0.0.1` bug the shared
+predicate closed, and it survived that fix because the compatible and mapped forms
+are different ranges reached by different branches.
+
+- **A classifier hole, not a demonstrated end-to-end bypass**, and the difference is
+  worth stating rather than claiming the stronger version: a bracketed IPv6 literal
+  never reaches the classifier today, because of the bracket bug listed below. The
+  fix is defensive — a classifier must not call a loopback address public whatever
+  route reaches it, and a hostname whose resolver answers with a mapped address is
+  such a route.
+- The only range this section moves. Everything else in the conversion is
+  behaviour-preserving.
+
 **Found while typing the guards, and left alone deliberately** — each is a real
 defect that naming rules made visible, and each is a behaviour change rather than a
 rename:
@@ -1369,6 +1386,16 @@ rename:
 - **`browser_worker.rs` does not block `240/4`,** nor `0.0.0.0/8` other than
   `0.0.0.0` itself, so those classify as public navigation targets there while the
   broadest guard refuses them.
+- **`browser_worker.rs` cannot handle an IPv6 literal host at all.**
+  `Url::host_str()` serializes one *with its brackets*, so
+  `("[::1]", port).to_socket_addrs()` fails to parse and every IPv6-literal browser
+  target is refused as a resolution failure rather than classified. Fail-closed, so
+  not a hole — but this guard's whole IPv6-literal path is unreachable, including the
+  loopback grant. `web.rs` avoids it by matching on `Url::host()`, the parsed enum,
+  and its own comment names this exact "bracket-handling class of bug". Fixing it
+  widens what is reachable (a public v6 literal would become allowed), so it is a
+  behaviour change and its own review; a test now pins the current verdict so whoever
+  fixes it has to re-check the loopback interaction in the same commit.
 - **`knowledge_pipeline.rs` blocks all of `198.51/16`** where TEST-NET-2 is only
   `198.51.100/24` — over-blocking, not a hole, but it is a real range a user could
   legitimately need.
