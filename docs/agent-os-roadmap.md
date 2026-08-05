@@ -1658,11 +1658,37 @@ code rather than re-read:
 defect that naming rules made visible, and each is a behaviour change rather than a
 rename:
 
-- **`web.rs`'s two DNS rules disagree on the quantifier.** Its pre-check refuses a
+- ~~**`web.rs`'s two DNS rules disagree on the quantifier.** Its pre-check refuses a
   hostname if **any** resolved answer is blocked; its resolver *prunes* blocked
   answers and refuses only if **all** of them are. A dual-stack host answering with
   one public and one private address is refused by the first and would have been
-  allowed by the second.
+  allowed by the second.~~ **Fixed, and the entry left out which side was wrong.**
+
+  It reads as a hole in the permissive half. It is the opposite: the pre-check was
+  over-blocking. `SsrfGuardedResolver` prunes blocked answers and hands `reqwest` only
+  the survivors, and — as its own doc says — those are *exactly* what `reqwest`
+  connects to, so a pruned private answer is never dialled. Pruning is therefore safe,
+  and refusing the whole request because one of several answers was private turned an
+  ordinary split-horizon or dual-stack host into a fetch that could not be made, with a
+  denial naming a rule the connection would never have tripped.
+
+  The pre-check now matches the resolver's quantifier. Kept as a layer rather than
+  deleted, even though the resolver is the only enforcement: it is the sole guard for a
+  URL that never reaches a resolver — the literal-IP arms, and any future caller that
+  validates without installing one — and deleting it would make that mistake silent.
+  Verified that no such caller exists today before loosening it: the only production
+  caller is `fetch_impl` and the redirect policy it builds, both on a client carrying
+  the guarded resolver.
+
+  The quantifier is extracted into `classify_resolved_answers` purely so it has a test.
+  The case the change is *about* — one public answer and one private — cannot be
+  produced hermetically through `to_socket_addrs`, and a rule only the deployment
+  environment can exercise is a rule with no test. Asserted in both orders, because a
+  loop that returns early on the first blocked answer passes one order and fails the
+  other, which is exactly the old bug. Counter-tests keep "allow everything" out: every
+  answer blocked is still refused and still names a rule, and an empty answer list
+  stays `egress.dns-no-addresses` — a different fact from "everything was refused", the
+  same split the resolver already made.
 - ~~**`browser_worker.rs` does not block `240/4`,** nor `0.0.0.0/8` other than
   `0.0.0.0` itself.~~ **Fixed.** Two arms in `classify_v4`, spelled the same way as
   the broad guard's own tests (`0.1.2.3`, `240.0.0.1`) so the two files agree by
@@ -1753,9 +1779,23 @@ rename:
   red, and loosening the prefix check from /96 to its first two segments is caught by
   the counter-test with `64:ff9b:0:0:1::7f00:1` — a network-specific-prefix shape whose
   low bytes would otherwise be judged as an address.
-- **`knowledge_pipeline.rs` blocks all of `198.51/16`** where TEST-NET-2 is only
+- ~~**`knowledge_pipeline.rs` blocks all of `198.51/16`** where TEST-NET-2 is only
   `198.51.100/24` — over-blocking, not a hole, but it is a real range a user could
-  legitimately need.
+  legitimately need.~~ **Fixed.** Narrowed to the `198.51.100/24` RFC 5737 actually
+  reserves. The 65,280 addresses it over-blocked are ordinary public space, so this was
+  a guard refusing traffic no rule entitled it to refuse, and the failure mode was a
+  knowledge source that simply could not be fetched behind a denial naming a
+  documentation range the address is not in. Its two sibling arms (`192.0.2/24`,
+  `203.0.113/24`) were already spelled to the RFC; this one was the outlier.
+
+  Worth noting how this landed: the earlier renaming change deliberately preserved the
+  /16 because narrowing it newly *allows* fetches and that is not a decision to smuggle
+  into a rename — and it left a test pinning `198.51.0.1` as refused precisely so the
+  narrowing would have to be a visible, deliberate edit. That worked. The pin is now
+  four counter-test rows instead: both neighbours of the real /24 and both ends of the
+  /16, because narrowing a range is where an off-by-one shows up, and getting it wrong
+  either leaks the documentation range or under-narrows. Sabotage-verified — restoring
+  the /16 fails with `198.51.0.1 is ordinary public space and must not be refused`.
 - ~~**`PipelineLimits::validate` never validates `max_redirects`,** so `max_redirects:
   0` is accepted and silently forbids every redirect.~~ **Fixed — and this entry had
   the danger the wrong way round.** `0` is a coherent setting: refusing every redirect
@@ -1798,11 +1838,45 @@ rename:
   The lesson worth keeping: this entry described a *missing check* when the defect was
   a *disagreement between two numbers*. Fixing what an entry says rather than what the
   code does is how a cosmetic change ships with a confident comment on it.
-- **`model_sources.rs` caps redirects at 8 while `egress.rs` caps at 10,** and it
-  hand-builds its client rather than starting from `egress::hardened()`. *The missing
-  read timeout is fixed — see the shipped note below. The cap mismatch stands, and so
-  does the fact that it spells the constructor `Client::builder()`, which the
-  bare-client ratchet cannot see.*
+- ~~**`model_sources.rs` caps redirects at 8 while `egress.rs` caps at 10,** and it
+  hand-builds its client rather than starting from `egress::hardened()`.~~ **Closed as
+  "will not do", and the entry was asking for something that breaks model downloads.**
+  The read timeout half is fixed (see the shipped note below). What follows is why the
+  other two halves are being retired rather than done.
+
+  **`egress::hardened()` cannot be adopted here.** It installs
+  `same_origin_redirect_policy`, whose `may_follow` requires the next hop to keep the
+  **same host** — a scheme upgrade on the same host is the only exception. Model
+  downloads are cross-host by construction: Hugging Face redirects
+  `huggingface.co/…/resolve/…` to a CDN host, and the Ollama registry redirects blob
+  requests likewise. Adopting `hardened()` would refuse every one of them with
+  `egress.redirect-cross-origin`.
+
+  That is not a guess. This file has **three** separate post-redirect re-checks —
+  `probe_remote_gguf`, the model download, and the registry token — each phrased "final
+  URL refused" specifically so a refusal can be placed *after* the chain. Those exist
+  because the final URL routinely differs from the requested one. And this file's own
+  per-hop policy validates "any public HTTPS host" rather than one origin, which is the
+  same fact stated as policy.
+
+  So the two designs answer different questions. `hardened()` protects a client that
+  **carries a credential** and must not hand it to another origin — its refusal message
+  is literally "refusing to carry credentials from … to …". This file's client fetches
+  content whose integrity is guaranteed by a **SHA-256 check**, over a chain where
+  changing host is the norm; reqwest strips `Authorization` cross-host anyway, so the
+  credential concern that motivates the origin pin does not apply. Neither is the
+  general case, and forcing one on the other loses either the feature or the guarantee.
+
+  **The 8-vs-10 cap is not worth reconciling either.** Both are finite, both refuse a
+  loop, and the number only decides the fate of pathological chains no real registry
+  produces. Changing it changes which chains this app accepts in exchange for nothing —
+  the definition of churn. Recorded as deliberate divergence, like the four blocklists.
+
+  **The one real residue is the ratchet blind spot**, and it is a property of the
+  scanner rather than of this file: `Client::builder()` is not the string the
+  bare-client scan looks for. That is worth fixing in the *scan* if it is worth fixing
+  at all — a file that sets `connect_timeout`, `read_timeout`, a hop cap and a per-hop
+  SSRF check is not the risk the ratchet was built to catch.
 
 **Shipped — the two unbounded download clients no longer hang on a silent peer.**
 Both set a silence budget now. `model_sources.rs`'s was the worst outbound site in
