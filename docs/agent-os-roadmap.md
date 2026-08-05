@@ -1553,6 +1553,49 @@ web-tools setting, and expanding to an all-or-nothing Seatbelt clause for sandbo
 shell children on macOS only. This clause is greenfield, and the roadmap should say
 so rather than implying a hierarchy exists to slot into.
 
+**Shipped — every blocked attempt is written down with the rule that blocked it.**
+`denial_sink.rs` is an append-only store in its **own database file**
+(`egress-denials-v1.sqlite3`), written at the raise site by all four guards.
+
+- **The migration hazard was designed out, not decided.** The open question was
+  whether the ledger should tolerate a database newer than the binary. Both answers
+  were bad: relaxing `apply_migrations`' `version > MIGRATION_V7` guard would let an
+  older build write into a schema it does not understand, and keeping it while
+  bumping to V8 would mean a rolled-back build — which the in-app updater makes an
+  ordinary event — could not open its run history **at all**. Not a degraded
+  feature: no runs, no events, no approvals. A separate file removes the question
+  entirely. The ledger stays at V7 and an older binary opens it exactly as before.
+- **The sink keeps the same forward-only discipline, but the blast radius is
+  contained**, and that containment is the point of the separate file rather than a
+  side effect of it: a rolled-back build meeting a newer sink declines to record and
+  everything else keeps working, because nothing but that module reads the file.
+- **Recording is fail-soft and cannot fail open.** The write happens *after* the
+  refusal, and no guard consults the sink to decide anything, so a sink failure
+  costs a log line and can never unblock a request. It is also the only entry in
+  `lib.rs`'s startup list that is deliberately not an `expect`.
+- **The rows are bounded, because the volume is attacker-influenced.** A page under
+  the browser guard can request as many refused subresources as it likes. An
+  unbounded audit table whose row count a remote page controls is a disk-exhaustion
+  primitive, not an audit trail; the oldest rows beyond ten thousand are dropped in
+  the same statement batch as the insert, not by a background task.
+- **`run_id` is a plain nullable column, deliberately not a foreign key** — making it
+  one is exactly what `run_events` does and exactly why `run_events` cannot host
+  these rows.
+- **Recorded at the raise site, not the command boundary**, which is what the
+  previous slice's own finding demanded: by the time a refusal reaches a command it
+  is a `String`, and a sink fed from there would be parsing its rule code back out of
+  a sentence. Since `validate_fetch_url` and `classify_ip` are pure functions of a
+  `Url` and an `IpAddr` with no state handle — and this crate has zero `task_local!`
+  declarations to carry one implicitly — the recorder is a process-wide install and
+  the refusal calls it, rather than the other way round. Acceptable precisely because
+  the sink is append-only and no decision reads it, so a global cannot change what
+  any guard allows.
+- Each guard names itself in the record, so the four guards' deliberate
+  disagreements about which address classes they block stay visible instead of
+  averaging into one number. A test drives two guards and asserts both names.
+- Sabotage-verified: removing the row bound overshoots to 10,250, and silencing one
+  guard's recording fails that guard's test.
+
 **"Every blocked attempt is a ledger event" cannot use `run_events` as built.**
 `run_events.run_id` is `NOT NULL REFERENCES runs(run_id)` behind a trigger that
 demands a gapless `sequence = last_sequence + 1`, refuses any event after a terminal
@@ -1561,7 +1604,9 @@ and one arriving after a run ended would be rejected outright. None of `RunEvent
 variants is a policy denial, and `PermissionDecided` carries no rule identity. This
 needs its own non-run-scoped table, and that table must not land before something
 writes to it — the caution being `ProcessLimits`' own doc, three of whose four fields
-are declaration-only to this day.
+are declaration-only to this day. *Addressed: it became its own **database** rather
+than one more table, for the migration reason in the shipped note above, and all four
+guards write to it in the same change.*
 
 **Nothing in the tree named a rule** — *addressed; see the shipped note above.*
 Every refusal was hardcoded prose (`web.rs`, `knowledge_pipeline.rs`'s
