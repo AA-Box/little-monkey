@@ -1670,6 +1670,10 @@ mod tests {
         const ALLOWED: &[(&str, usize)] = &[
             // The CLI's local embedding endpoint.
             ("bin/monkey-cli/embed_cli.rs", 1),
+            // Local stack runtimes. Lived in `stacks.rs` until the v1 registry and
+            // embedding core were extracted for the D2 collapse; the client itself is
+            // unchanged and still talks only to the loopback embedding runtime.
+            ("knowledge_core.rs", 1),
             // Bundled `llama-server` health/completion probes.
             ("llama.rs", 2),
             // `ollama.rs` used to sit here with 2. Both were converted rather
@@ -1684,8 +1688,6 @@ mod tests {
             // construction, which is what earns them a place in this list rather
             // than the "owned by a different change" note they used to carry.
             ("server.rs", 2),
-            // Local stack runtimes.
-            ("stacks.rs", 1),
         ];
 
         /// Everything after the first `#[cfg(test)]` is test code, and a test is
