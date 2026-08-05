@@ -1,0 +1,334 @@
+import { useState } from "react";
+import { Plus, Trash2 } from "lucide-react";
+
+import { Button, IconButton } from "../ui";
+import { useT } from "../../lib/i18n";
+import {
+  ALL_TASKS,
+  COMPONENT_SLOTS,
+  emptyModelSpec,
+  studioClient,
+  type ComponentSlot,
+  type GenerationModelSpec,
+  type GenerationTask,
+  type ModelComponent,
+} from "../../lib/studioClient";
+
+/** A slug the backend will accept as a directory name. */
+function slugify(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[.-]+/, "")
+    .slice(0, 128);
+}
+
+function blankComponent(): ModelComponent {
+  return {
+    slot: "diffusion_model",
+    source: { kind: "local_file", path: "" },
+    sizeBytes: 0,
+  };
+}
+
+/**
+ * Adds a model to the user's library.
+ *
+ * Slot assignment is explicit for every file. The app deliberately does not
+ * infer it from the file name: a wrong guess does not fail here, it fails deep
+ * inside the engine as a tensor-shape error that reads like a corrupt
+ * download.
+ */
+export function AddModelForm({ onSaved }: { onSaved: () => void }) {
+  const { t } = useT();
+  const [spec, setSpec] = useState<GenerationModelSpec>(emptyModelSpec);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const patch = (next: Partial<GenerationModelSpec>) =>
+    setSpec((current) => ({ ...current, ...next }));
+
+  const patchComponent = (index: number, next: Partial<ModelComponent>) =>
+    setSpec((current) => ({
+      ...current,
+      components: current.components.map((component, at) =>
+        at === index ? { ...component, ...next } : component,
+      ),
+    }));
+
+  const toggleTask = (task: GenerationTask) =>
+    setSpec((current) => ({
+      ...current,
+      tasks: current.tasks.includes(task)
+        ? current.tasks.filter((entry) => entry !== task)
+        : [...current.tasks, task],
+    }));
+
+  const save = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      await studioClient.addModel({
+        ...spec,
+        id: spec.id.trim() || slugify(spec.name),
+      });
+      setSpec(emptyModelSpec());
+      onSaved();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="grid gap-3 rounded border border-border p-3">
+      <p className="text-xs font-medium">{t("Studio.add.title")}</p>
+      <p className="text-[11px] text-faint">{t("Studio.add.slotHint")}</p>
+
+      {error && (
+        <p className="rounded border border-danger/40 bg-danger/10 px-2 py-1 text-[11px] text-danger">
+          {error}
+        </p>
+      )}
+
+      <label className="grid gap-1 text-[11px] text-muted">
+        {t("Studio.add.name")}
+        <input
+          className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+          value={spec.name}
+          placeholder="Wan 2.2 TI2V 5B"
+          onChange={(event) => patch({ name: event.target.value })}
+        />
+      </label>
+
+      <label className="grid gap-1 text-[11px] text-muted">
+        {t("Studio.add.family")}
+        <input
+          className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+          value={spec.family}
+          placeholder="Wan"
+          onChange={(event) => patch({ family: event.target.value })}
+        />
+      </label>
+
+      <fieldset className="grid gap-1 text-[11px] text-muted">
+        <legend>{t("Studio.add.tasks")}</legend>
+        <div className="flex flex-wrap gap-1.5">
+          {ALL_TASKS.map((task) => (
+            <Button
+              key={task}
+              size="sm"
+              variant={spec.tasks.includes(task) ? "primary" : "secondary"}
+              onClick={() => toggleTask(task)}
+            >
+              {t(`Studio.task.${task}`)}
+            </Button>
+          ))}
+        </div>
+      </fieldset>
+
+      <div className="grid gap-2">
+        <span className="text-[11px] text-muted">{t("Studio.add.files")}</span>
+        {spec.components.map((component, index) => (
+          <div key={index} className="grid gap-1.5 rounded bg-background/60 p-2">
+            <div className="flex items-center gap-1.5">
+              <select
+                className="rounded border border-border bg-background px-1.5 py-1 font-mono text-[11px] text-foreground"
+                value={component.slot}
+                onChange={(event) =>
+                  patchComponent(index, { slot: event.target.value as ComponentSlot })
+                }
+              >
+                {COMPONENT_SLOTS.map((entry) => (
+                  <option key={entry.slot} value={entry.slot}>
+                    {entry.flag}
+                  </option>
+                ))}
+              </select>
+              <select
+                className="rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground"
+                value={component.source.kind}
+                onChange={(event) =>
+                  patchComponent(index, {
+                    source:
+                      event.target.value === "local_file"
+                        ? { kind: "local_file", path: "" }
+                        : { kind: "hugging_face", repo: "", file: "" },
+                  })
+                }
+              >
+                <option value="local_file">{t("Studio.add.onDisk")}</option>
+                <option value="hugging_face">{t("Studio.add.download")}</option>
+              </select>
+              <IconButton
+                size="sm"
+                aria-label={t("Studio.add.removeFile")}
+                onClick={() =>
+                  patch({
+                    components: spec.components.filter((_, at) => at !== index),
+                  })
+                }
+              >
+                <Trash2 size={12} />
+              </IconButton>
+            </div>
+
+            {component.source.kind === "local_file" ? (
+              <input
+                className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
+                value={component.source.path}
+                placeholder="/Users/you/models/wan2.2_ti2v_5B_fp16.safetensors"
+                onChange={(event) =>
+                  patchComponent(index, {
+                    source: { kind: "local_file", path: event.target.value },
+                  })
+                }
+              />
+            ) : (
+              <div className="grid gap-1.5 sm:grid-cols-2">
+                <input
+                  className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
+                  value={component.source.repo}
+                  placeholder="Comfy-Org/Wan_2.2_ComfyUI_Repackaged"
+                  onChange={(event) =>
+                    patchComponent(index, {
+                      source: {
+                        kind: "hugging_face",
+                        repo: event.target.value,
+                        file: component.source.kind === "hugging_face" ? component.source.file : "",
+                      },
+                    })
+                  }
+                />
+                <input
+                  className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
+                  value={component.source.file}
+                  placeholder="split_files/vae/wan2.2_vae.safetensors"
+                  onChange={(event) =>
+                    patchComponent(index, {
+                      source: {
+                        kind: "hugging_face",
+                        repo: component.source.kind === "hugging_face" ? component.source.repo : "",
+                        file: event.target.value,
+                      },
+                    })
+                  }
+                />
+              </div>
+            )}
+          </div>
+        ))}
+        <Button
+          size="sm"
+          variant="secondary"
+          onClick={() => patch({ components: [...spec.components, blankComponent()] })}
+        >
+          <Plus size={13} />
+          {t("Studio.add.addFile")}
+        </Button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <label className="grid gap-1 text-[11px] text-muted">
+          {t("Studio.add.width")}
+          <input
+            type="number"
+            className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+            value={spec.defaults.width}
+            onChange={(event) =>
+              patch({ defaults: { ...spec.defaults, width: Number(event.target.value) } })
+            }
+          />
+        </label>
+        <label className="grid gap-1 text-[11px] text-muted">
+          {t("Studio.add.height")}
+          <input
+            type="number"
+            className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+            value={spec.defaults.height}
+            onChange={(event) =>
+              patch({ defaults: { ...spec.defaults, height: Number(event.target.value) } })
+            }
+          />
+        </label>
+        <label className="grid gap-1 text-[11px] text-muted">
+          {t("Studio.add.steps")}
+          <input
+            type="number"
+            className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+            value={spec.defaults.steps}
+            onChange={(event) =>
+              patch({ defaults: { ...spec.defaults, steps: Number(event.target.value) } })
+            }
+          />
+        </label>
+        <label className="grid gap-1 text-[11px] text-muted">
+          {t("Studio.add.cfg")}
+          <input
+            type="number"
+            step="0.1"
+            className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+            value={spec.defaults.cfgScale}
+            onChange={(event) =>
+              patch({ defaults: { ...spec.defaults, cfgScale: Number(event.target.value) } })
+            }
+          />
+        </label>
+      </div>
+
+      <div className="grid gap-2 sm:grid-cols-2">
+        <label className="grid gap-1 text-[11px] text-muted">
+          {t("Studio.add.sampler")}
+          <input
+            className="rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
+            value={spec.defaults.sampleMethod}
+            onChange={(event) =>
+              patch({ defaults: { ...spec.defaults, sampleMethod: event.target.value } })
+            }
+          />
+        </label>
+        <label className="grid gap-1 text-[11px] text-muted">
+          {t("Studio.add.frameGrid")}
+          <select
+            className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+            value={spec.defaults.frameGrid}
+            onChange={(event) =>
+              patch({
+                defaults: {
+                  ...spec.defaults,
+                  frameGrid: event.target.value as typeof spec.defaults.frameGrid,
+                },
+              })
+            }
+          >
+            <option value="down_to4n_plus1">{t("Studio.add.grid4n1")}</option>
+            <option value="up_to17k_plus5">{t("Studio.add.grid17k5")}</option>
+          </select>
+        </label>
+      </div>
+
+      <label className="grid gap-1 text-[11px] text-muted">
+        {t("Studio.add.engineArgs")}
+        <input
+          className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
+          value={spec.extraLaunchArgs.join(" ")}
+          placeholder="--diffusion-fa --offload-to-cpu"
+          onChange={(event) =>
+            patch({
+              extraLaunchArgs: event.target.value.split(/\s+/).filter(Boolean),
+            })
+          }
+        />
+      </label>
+
+      <Button
+        variant="primary"
+        disabled={busy || !spec.name.trim() || spec.components.length === 0}
+        onClick={() => void save()}
+      >
+        {t("Studio.add.save")}
+      </Button>
+    </div>
+  );
+}

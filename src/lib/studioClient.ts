@@ -75,6 +75,19 @@ export interface LicenseGate {
   acceptanceRequired: boolean;
 }
 
+/** A model exactly as stored in the user's library. */
+export interface GenerationModelSpec {
+  id: string;
+  name: string;
+  family: string;
+  tasks: GenerationTask[];
+  components: ModelComponent[];
+  defaults: GenerationDefaults;
+  minRamBytes: number;
+  license: LicenseGate;
+  extraLaunchArgs: string[];
+}
+
 export interface GenerationModel {
   id: string;
   name: string;
@@ -143,6 +156,10 @@ export interface GenerationProgressPayload {
 export const studioClient = {
   engineStatus: () => invoke<GenerationEngineStatus>("generation_engine_status"),
   models: () => invoke<GenerationModel[]>("generation_models"),
+  addModel: (spec: GenerationModelSpec) =>
+    invoke<GenerationModelSpec[]>("generation_add_model", { spec }),
+  removeModel: (modelId: string) =>
+    invoke<void>("generation_remove_model", { modelId }),
   acceptLicense: (licenseId: string) =>
     invoke<void>("generation_accept_license", { licenseId }),
   downloadModel: (modelId: string) =>
@@ -199,4 +216,59 @@ export function isVideoTask(task: GenerationTask): boolean {
 
 export function needsInitImage(task: GenerationTask): boolean {
   return task === "image_to_image" || task === "image_to_video";
+}
+
+/** Every slot the engine exposes, with the flag it maps to. Shown verbatim in
+ *  the picker because the flag is the least ambiguous label there is — the app
+ *  never guesses which slot a file fills. */
+export const COMPONENT_SLOTS: { slot: ComponentSlot; flag: string }[] = [
+  { slot: "checkpoint", flag: "--model" },
+  { slot: "diffusion_model", flag: "--diffusion-model" },
+  { slot: "high_noise_diffusion_model", flag: "--high-noise-diffusion-model" },
+  { slot: "clip_l", flag: "--clip_l" },
+  { slot: "clip_g", flag: "--clip_g" },
+  { slot: "clip_vision", flag: "--clip_vision" },
+  { slot: "t5xxl", flag: "--t5xxl" },
+  { slot: "llm", flag: "--llm" },
+  { slot: "vae", flag: "--vae" },
+  { slot: "audio_vae", flag: "--audio-vae" },
+  { slot: "taesd", flag: "--taesd" },
+];
+
+export const ALL_TASKS: GenerationTask[] = [
+  "text_to_image",
+  "image_to_image",
+  "text_to_video",
+  "image_to_video",
+];
+
+/** A blank model, ready for the user to fill in. */
+export function emptyModelSpec(): GenerationModelSpec {
+  return {
+    id: "",
+    name: "",
+    family: "",
+    tasks: [],
+    components: [],
+    defaults: {
+      width: 1024,
+      height: 1024,
+      steps: 20,
+      cfgScale: 7,
+      sampleMethod: "euler",
+      flowShift: null,
+      fps: 24,
+      videoFrames: 33,
+      frameGrid: "down_to4n_plus1",
+    },
+    minRamBytes: 0,
+    license: {
+      id: "",
+      name: "",
+      url: "",
+      excludedTerritories: [],
+      acceptanceRequired: false,
+    },
+    extraLaunchArgs: [],
+  };
 }

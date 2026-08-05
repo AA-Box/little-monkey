@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Download, Loader2, Sparkles, Square, Trash2, Upload } from "lucide-react";
 
 import { Button, IconButton, StatusPill, Tabs } from "../ui";
+import { AddModelForm } from "./AddModelForm";
+import { LoraStack } from "./LoraStack";
 import { useT } from "../../lib/i18n";
 import {
   componentFileName,
@@ -15,6 +17,7 @@ import {
   type GenerationEntry,
   type GenerationModel,
   type GenerationTask,
+  type LoraSelection,
 } from "../../lib/studioClient";
 
 function errorText(reason: unknown): string {
@@ -47,6 +50,8 @@ export function StudioPanel() {
   const [seconds, setSeconds] = useState(3);
   const [seed, setSeed] = useState(-1);
   const [initImage, setInitImage] = useState<string | null>(null);
+  const [loras, setLoras] = useState<LoraSelection[]>([]);
+  const [adding, setAdding] = useState(false);
   const [busy, setBusy] = useState(false);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [phase, setPhase] = useState<string | null>(null);
@@ -189,7 +194,8 @@ export function StudioPanel() {
           : 1,
         fps: isVideoTask(task) ? selected.defaults.fps : 1,
         initImageBase64: needsInitImage(task) ? initImage : null,
-        loras: [],
+        // Blank rows are a half-typed path, not a LoRA the user meant.
+        loras: loras.filter((lora) => lora.path.trim().length > 0),
       });
       setGallery((current) => [entry, ...current]);
       void loadPreview(entry);
@@ -245,7 +251,25 @@ export function StudioPanel() {
       )}
 
       <section className="mb-4">
-        <h2 className="mb-2 text-xs font-medium text-muted">{t("Studio.models")}</h2>
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-xs font-medium text-muted">{t("Studio.models")}</h2>
+          <Button size="sm" variant="secondary" onClick={() => setAdding((open) => !open)}>
+            {adding ? t("Studio.add.cancel") : t("Studio.add.open")}
+          </Button>
+        </div>
+        {adding && (
+          <div className="mb-2">
+            <AddModelForm
+              onSaved={() => {
+                setAdding(false);
+                void refresh();
+              }}
+            />
+          </div>
+        )}
+        {visible.length === 0 && !adding && (
+          <p className="mb-2 text-xs text-faint">{t("Studio.emptyLibrary")}</p>
+        )}
         <div className="grid gap-2">
           {visible.map((model) => {
             const blockedByLicense =
@@ -271,6 +295,18 @@ export function StudioPanel() {
                     </span>
                   </span>
                   <span className="flex shrink-0 items-center gap-2">
+                    <IconButton
+                      size="sm"
+                      aria-label={t("Studio.forget")}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void studioClient.removeModel(model.id).then(refresh).catch((reason) =>
+                          setError(errorText(reason)),
+                        );
+                      }}
+                    >
+                      <Trash2 size={12} />
+                    </IconButton>
                     {model.installed ? (
                       <StatusPill tone="success">{t("Studio.installed")}</StatusPill>
                     ) : (
@@ -428,6 +464,14 @@ export function StudioPanel() {
               </span>
             </label>
           )}
+
+          <LoraStack
+            loras={loras}
+            onChange={setLoras}
+            showHighNoise={selected.components.some(
+              (component) => component.slot === "high_noise_diffusion_model",
+            )}
+          />
 
           <label className="flex items-center gap-3 text-xs">
             <span className="w-24 shrink-0 text-muted">{t("Studio.seed")}</span>
