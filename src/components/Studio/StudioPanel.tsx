@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Download, Loader2, Sparkles, Square, Trash2, Upload } from "lucide-react";
+import { Download, Loader2, Sparkles, Square, Trash2, Upload, Wand2 } from "lucide-react";
 
 import { Button, IconButton, StatusPill, Tabs } from "../ui";
 import { AddModelForm } from "./AddModelForm";
@@ -7,11 +7,14 @@ import { LoraStack } from "./LoraStack";
 import { useT } from "../../lib/i18n";
 import {
   componentFileName,
+  editTaskFor,
   formatBytes,
+  isSpeechTask,
   isVideoTask,
   needsInitImage,
   normalizeDimension,
   normalizeVideoFrames,
+  SAMPLERS,
   studioClient,
   type GenerationEngineStatus,
   type GenerationEntry,
@@ -19,6 +22,23 @@ import {
   type GenerationTask,
   type LoraSelection,
 } from "../../lib/studioClient";
+
+/** The canvas and sampling controls for one run. Seeded from the model but
+ *  owned by the tab, because they are choices about this generation rather
+ *  than facts about the model. */
+interface RunSettings {
+  width: number;
+  height: number;
+  steps: number;
+  cfgScale: number;
+  sampler: string;
+}
+
+/** The file extension a saved asset should carry, from its media type. */
+function extensionFor(mediaType: string): string {
+  const subtype = mediaType.split("/")[1] ?? "bin";
+  return subtype === "jpeg" ? "jpg" : subtype.replace(/[^a-z0-9]/gi, "");
+}
 
 function errorText(reason: unknown): string {
   return reason instanceof Error ? reason.message : String(reason);
@@ -62,11 +82,14 @@ export function StudioPanel() {
   const [seconds, setSeconds] = useState(3);
   const [seed, setSeed] = useState(-1);
   const [initImage, setInitImage] = useState<string | null>(null);
+  const [speakerFile, setSpeakerFile] = useState("");
   const [loras, setLoras] = useState<LoraSelection[]>([]);
+  const [settings, setSettings] = useState<RunSettings | null>(null);
   const [adding, setAdding] = useState(false);
   const [busy, setBusy] = useState(false);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [phase, setPhase] = useState<string | null>(null);
+  const [percent, setPercent] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [previews, setPreviews] = useState<Record<string, string>>({});
   const fileInput = useRef<HTMLInputElement>(null);
@@ -118,13 +141,34 @@ export function StudioPanel() {
       setPhase(
         payload.phase === "running" && payload.queuePosition > 0
           ? t("Studio.phase.queued", { position: String(payload.queuePosition) })
-          : t(`Studio.phase.${payload.phase}`),
+          : payload.step !== null && payload.totalSteps !== null
+            ? t("Studio.phase.step", {
+                step: String(payload.step),
+                total: String(payload.totalSteps),
+              })
+            : t(`Studio.phase.${payload.phase}`),
       );
+      // Weight loading reports no step count, so the bar stays indeterminate
+      // until the first sampling step rather than sitting at a false zero.
+      setPercent(payload.percent);
     });
     return () => {
       void unlisten.then((stop) => stop());
     };
   }, [t]);
+
+  // The controls follow whichever model is selected, so switching models
+  // offers that model's own starting point rather than the last one's.
+  useEffect(() => {
+    if (!selected) return;
+    setSettings({
+      width: selected.defaults.width,
+      height: selected.defaults.height,
+      steps: selected.defaults.steps,
+      cfgScale: selected.defaults.cfgScale,
+      sampler: selected.defaults.sampleMethod,
+    });
+  }, [selected?.id]);
 
   // Keep the task valid for whichever model is selected: switching from a
   // video model to an image-only one must not leave a video task armed.
@@ -191,9 +235,10 @@ export function StudioPanel() {
   };
 
   const generate = async () => {
-    if (!selected) return;
+    if (!selected || !settings) return;
     setError(null);
     setBusy(true);
+    setPercent(null);
     setPhase(t("Studio.phase.submitted"));
     try {
       const entry = await studioClient.run({
@@ -201,15 +246,17 @@ export function StudioPanel() {
         task,
         prompt,
         negativePrompt,
-        width: normalizeDimension(selected.defaults.width),
-        height: normalizeDimension(selected.defaults.height),
-        steps: selected.defaults.steps,
-        cfgScale: selected.defaults.cfgScale,
+        width: normalizeDimension(settings.width),
+        height: normalizeDimension(settings.height),
+        steps: settings.steps,
+        cfgScale: settings.cfgScale,
+        sampleMethod: settings.sampler,
         seed,
         videoFrames: isVideoTask(task)
           ? normalizeVideoFrames(selected.defaults.frameGrid, seconds * selected.defaults.fps)
           : 1,
         fps: isVideoTask(task) ? selected.defaults.fps : 1,
+        speakerFile: isSpeechTask(task) ? speakerFile.trim() || null : null,
         initImageBase64: needsInitImage(task) ? initImage : null,
         // Blank rows are a half-typed path, not a LoRA the user meant.
         loras: loras.filter((lora) => lora.path.trim().length > 0),
@@ -221,6 +268,27 @@ export function StudioPanel() {
     } finally {
       setBusy(false);
       setPhase(null);
+      setPercent(null);
+    }
+  };
+
+  /** Sends a finished asset back in as the next run's starting frame, which is
+   *  how a generation model edits: regenerate from what you already have. */
+  const editEntry = async (entry: GenerationEntry) => {
+    if (!selected) return;
+    const next = editTaskFor(selected);
+    if (!next) {
+      setError(t("Studio.result.noEditTask", { name: selected.name }));
+      return;
+    }
+    try {
+      const dataUrl = previews[entry.artifactId] ?? (await studioClient.mediaDataUrl(entry.artifactId));
+      setPreviews((current) => ({ ...current, [entry.artifactId]: dataUrl }));
+      setInitImage(dataUrl.slice(dataUrl.indexOf(",") + 1));
+      setTask(next);
+      setPrompt(entry.prompt);
+    } catch (reason) {
+      setError(errorText(reason));
     }
   };
 
@@ -251,6 +319,7 @@ export function StudioPanel() {
     : 0;
   const canGenerate =
     !!selected &&
+    !!settings &&
     selected.installed &&
     prompt.trim().length > 0 &&
     !busy &&
@@ -454,12 +523,27 @@ export function StudioPanel() {
             value={prompt}
             onChange={(event) => setPrompt(event.target.value)}
           />
-          <input
-            className="w-full rounded border border-border bg-background p-2 text-xs"
-            placeholder={t("Studio.negativePlaceholder")}
-            value={negativePrompt}
-            onChange={(event) => setNegativePrompt(event.target.value)}
-          />
+          {!isSpeechTask(task) && (
+            <input
+              className="w-full rounded border border-border bg-background p-2 text-xs"
+              placeholder={t("Studio.negativePlaceholder")}
+              value={negativePrompt}
+              onChange={(event) => setNegativePrompt(event.target.value)}
+            />
+          )}
+
+          {isSpeechTask(task) && (
+            <label className="grid gap-1 text-[11px] text-muted">
+              {t("Studio.speakerFile")}
+              <input
+                className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
+                placeholder="/Users/you/voices/narrator.json"
+                value={speakerFile}
+                onChange={(event) => setSpeakerFile(event.target.value)}
+              />
+              <span className="text-faint">{t("Studio.speakerHint")}</span>
+            </label>
+          )}
 
           {needsInitImage(task) && (
             <div className="flex items-center gap-2">
@@ -515,24 +599,96 @@ export function StudioPanel() {
             </label>
           )}
 
-          <LoraStack
-            loras={loras}
-            onChange={setLoras}
-            showHighNoise={selected.components.some(
-              (component) => component.slot === "high_noise_diffusion_model",
-            )}
-          />
+          {/* Every one of these is a per-run choice, not a property of the
+              model — the library entry only supplies the starting values. */}
+          {settings && !isSpeechTask(task) && (
+            <>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                {(
+                  [
+                    ["width", t("Studio.width"), 32],
+                    ["height", t("Studio.height"), 32],
+                    ["steps", t("Studio.steps"), 1],
+                  ] as const
+                ).map(([key, label, step]) => (
+                  <label key={key} className="grid gap-1 text-[11px] text-muted">
+                    {label}
+                    <input
+                      type="number"
+                      step={step}
+                      min={step}
+                      className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+                      value={settings[key]}
+                      onChange={(event) =>
+                        setSettings({ ...settings, [key]: Number(event.target.value) })
+                      }
+                    />
+                  </label>
+                ))}
+                <label className="grid gap-1 text-[11px] text-muted">
+                  {t("Studio.guidance")}
+                  <input
+                    type="number"
+                    step={0.1}
+                    min={0}
+                    max={100}
+                    className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+                    value={settings.cfgScale}
+                    onChange={(event) =>
+                      setSettings({ ...settings, cfgScale: Number(event.target.value) })
+                    }
+                  />
+                </label>
+              </div>
+              <label className="flex items-center gap-3 text-xs">
+                <span className="w-24 shrink-0 text-muted">{t("Studio.sampler")}</span>
+                <select
+                  className="rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
+                  value={settings.sampler}
+                  onChange={(event) => setSettings({ ...settings, sampler: event.target.value })}
+                >
+                  {/* A model may name a sampler this build does not list; keep
+                      it selectable rather than silently switching it. */}
+                  {(SAMPLERS.includes(settings.sampler)
+                    ? SAMPLERS
+                    : [settings.sampler, ...SAMPLERS]
+                  ).map((entry) => (
+                    <option key={entry} value={entry}>
+                      {entry}
+                    </option>
+                  ))}
+                </select>
+                {/* The engine aligns edges up to a multiple of 32, so show the
+                    canvas that will really be rendered. */}
+                <span className="font-mono text-[11px] text-faint">
+                  {normalizeDimension(settings.width)}×{normalizeDimension(settings.height)}
+                </span>
+              </label>
+            </>
+          )}
 
-          <label className="flex items-center gap-3 text-xs">
-            <span className="w-24 shrink-0 text-muted">{t("Studio.seed")}</span>
-            <input
-              type="number"
-              value={seed}
-              onChange={(event) => setSeed(Number(event.target.value))}
-              className="w-32 rounded border border-border bg-background px-2 py-1 text-xs"
+          {!isSpeechTask(task) && (
+            <LoraStack
+              loras={loras}
+              onChange={setLoras}
+              showHighNoise={selected.components.some(
+                (component) => component.slot === "high_noise_diffusion_model",
+              )}
             />
-            <span className="text-[11px] text-faint">{t("Studio.seedHint")}</span>
-          </label>
+          )}
+
+          {!isSpeechTask(task) && (
+            <label className="flex items-center gap-3 text-xs">
+              <span className="w-24 shrink-0 text-muted">{t("Studio.seed")}</span>
+              <input
+                type="number"
+                value={seed}
+                onChange={(event) => setSeed(Number(event.target.value))}
+                className="w-32 rounded border border-border bg-background px-2 py-1 text-xs"
+              />
+              <span className="text-[11px] text-faint">{t("Studio.seedHint")}</span>
+            </label>
+          )}
 
           <div className="flex items-center gap-2">
             <Button variant="primary" disabled={!canGenerate} onClick={() => void generate()}>
@@ -540,6 +696,21 @@ export function StudioPanel() {
               {t("Studio.generate")}
             </Button>
             {phase && <span className="text-[11px] text-muted">{phase}</span>}
+            {busy && (
+              <span className="flex min-w-0 flex-1 items-center gap-2">
+                <span className="h-1 min-w-16 flex-1 overflow-hidden rounded-full bg-surface-2">
+                  <span
+                    className={`block h-full bg-accent ${
+                      percent === null ? "w-1/3 animate-pulse" : "transition-[width]"
+                    }`}
+                    style={percent === null ? undefined : { width: `${percent}%` }}
+                  />
+                </span>
+                {percent !== null && (
+                  <span className="shrink-0 font-mono text-[11px] text-muted">{percent}%</span>
+                )}
+              </span>
+            )}
             {status?.loadedModelId && (
               <Button
                 size="sm"
@@ -562,10 +733,15 @@ export function StudioPanel() {
           <div className="grid gap-3 sm:grid-cols-2">
             {gallery
               .filter((entry) => tasksFor(mode).includes(entry.task))
-              .map((entry) => {
+              .map((entry, index) => {
               const preview = previews[entry.artifactId];
               return (
-                <figure key={entry.entryId} className="rounded border border-border p-2">
+                <figure
+                  key={entry.entryId}
+                  // The newest result is the one the user is waiting on, so it
+                  // gets the full width rather than sharing a row.
+                  className={`rounded border border-border p-2 ${index === 0 ? "sm:col-span-2" : ""}`}
+                >
                   {preview ? (
                     entry.mediaType.startsWith("video/") ? (
                       <video
@@ -574,6 +750,8 @@ export function StudioPanel() {
                         src={preview}
                         className="w-full rounded bg-black"
                       />
+                    ) : entry.mediaType.startsWith("audio/") ? (
+                      <audio controls src={preview} className="w-full" />
                     ) : (
                       <img src={preview} alt={entry.prompt} className="w-full rounded" />
                     )
@@ -584,10 +762,31 @@ export function StudioPanel() {
                   )}
                   <figcaption className="mt-2 text-[11px] text-faint">
                     <span className="line-clamp-2 block text-muted">{entry.prompt}</span>
-                    {entry.modelId} · {entry.width}×{entry.height}
+                    {entry.modelId}
+                    {entry.width > 0 && ` · ${entry.width}×${entry.height}`}
                     {entry.frameCount > 1 &&
                       ` · ${(entry.durationMs / 1000).toFixed(1)}s`}
                   </figcaption>
+                  {preview && (
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                      {/* Editing a generated asset means generating from it —
+                          the result becomes the next run's starting frame. */}
+                      {!entry.mediaType.startsWith("audio/") && selected && editTaskFor(selected) && (
+                        <Button size="sm" variant="secondary" onClick={() => void editEntry(entry)}>
+                          <Wand2 size={12} />
+                          {t("Studio.result.edit")}
+                        </Button>
+                      )}
+                      <a
+                        className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-[11px] text-muted hover:text-foreground"
+                        href={preview}
+                        download={`${entry.entryId}.${extensionFor(entry.mediaType)}`}
+                      >
+                        <Download size={12} />
+                        {t("Studio.result.save")}
+                      </a>
+                    </div>
+                  )}
                 </figure>
               );
             })}

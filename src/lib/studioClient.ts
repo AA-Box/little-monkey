@@ -22,7 +22,9 @@ export type ComponentSlot =
   | "llm"
   | "vae"
   | "audio_vae"
-  | "taesd";
+  | "taesd"
+  /** Speech only, and served by llama-tts rather than sd-server. */
+  | "vocoder";
 
 /** Where a component's bytes come from. A file the user already has is a
  *  first-class source, referenced where it lies and never fetched. */
@@ -140,9 +142,13 @@ export interface GenerationRequest {
   height: number;
   steps: number;
   cfgScale: number;
+  /** Empty falls back to the model's own default. */
+  sampleMethod: string;
   seed: number;
   videoFrames: number;
   fps: number;
+  /** Speech only: an OuteTTS speaker profile to voice the utterance. */
+  speakerFile: string | null;
   initImageBase64: string | null;
   loras: LoraSelection[];
 }
@@ -151,6 +157,11 @@ export interface GenerationProgressPayload {
   jobId: string;
   phase: string;
   queuePosition: number;
+  /** Absent while the engine is still loading weights, which it does not
+   *  count towards the sampling pass. */
+  percent: number | null;
+  step: number | null;
+  totalSteps: number | null;
 }
 
 export const studioClient = {
@@ -218,6 +229,22 @@ export function needsInitImage(task: GenerationTask): boolean {
   return task === "image_to_image" || task === "image_to_video";
 }
 
+/** Speech runs on llama-tts, which has no canvas and no sampler — the whole
+ *  diffusion control set is meaningless for it. */
+export function isSpeechTask(task: GenerationTask): boolean {
+  return task === "text_to_speech";
+}
+
+/** The task that takes an existing asset back as its starting point, so a
+ *  generated image can be edited by generating from it. */
+export function editTaskFor(model: GenerationModel): GenerationTask | null {
+  return (
+    (["image_to_image", "image_to_video"] as GenerationTask[]).find((task) =>
+      model.tasks.includes(task),
+    ) ?? null
+  );
+}
+
 /** Every slot the engine exposes, with the flag it maps to. Shown verbatim in
  *  the picker because the flag is the least ambiguous label there is — the app
  *  never guesses which slot a file fills. */
@@ -233,6 +260,7 @@ export const COMPONENT_SLOTS: { slot: ComponentSlot; flag: string }[] = [
   { slot: "vae", flag: "--vae" },
   { slot: "audio_vae", flag: "--audio-vae" },
   { slot: "taesd", flag: "--taesd" },
+  { slot: "vocoder", flag: "--model-vocoder" },
 ];
 
 export const ALL_TASKS: GenerationTask[] = [
@@ -240,6 +268,32 @@ export const ALL_TASKS: GenerationTask[] = [
   "image_to_image",
   "text_to_video",
   "image_to_video",
+  "text_to_speech",
+];
+
+/** Samplers the engine accepts, in the order it reports them. */
+export const SAMPLERS = [
+  "euler",
+  "euler_a",
+  "heun",
+  "dpm2",
+  "dpm++2s_a",
+  "dpm++2m",
+  "dpm++2mv2",
+  "ipndm",
+  "ipndm_v",
+  "lcm",
+  "ddim_trailing",
+  "tcd",
+  "res_multistep",
+  "res_2s",
+  "er_sde",
+  "euler_cfg_pp",
+  "euler_a_cfg_pp",
+  "euler_ge",
+  "dpm++2m_sde",
+  "dpm++2m_sde_bt",
+  "lms",
 ];
 
 /** A blank model, ready for the user to fill in. */

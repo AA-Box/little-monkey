@@ -8,11 +8,15 @@
 //! `llama-server` instances in `llama.rs`, and the spawn/health-poll/kill body
 //! below deliberately mirrors that module.
 //!
-//! Nothing in this file is specific to one model. Adding Flux, LTX or
-//! HunyuanVideo is a [`curated_models`] entry — a list of component slots and a
-//! table of defaults — not new code. The two video entries prove the shape:
-//! Wan 2.2 wants `--t5xxl` and a plain VAE, MiniMax H3 wants `--llm` plus a
-//! second `--audio-vae`, and both reach the same argv builder.
+//! Nothing in this file is specific to one model, and nothing is built in:
+//! every model is one the user added, so Flux, LTX or HunyuanVideo is a set of
+//! component slots and a table of defaults rather than new code. Wan 2.2 wants
+//! `--t5xxl` and a plain VAE, MiniMax H3 wants `--llm` plus a second
+//! `--audio-vae`, and both reach the same argv builder.
+//!
+//! Speech is the one task that leaves this shape. It is served by `llama-tts`,
+//! a one-shot process with no server and no job queue, so it has its own
+//! command-line builder ([`speech_args`]) and never touches `sd-server`.
 //!
 //! This module is Tauri-free so the desktop commands and the CLI can share it.
 
@@ -25,10 +29,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-/// Generation's own `sd-server` instance, next to `llama.rs`'s chat (8090) and
-/// embeddings (8091) instances.
-pub const GENERATION_PORT: u16 = 8092;
 
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_DIMENSION: u32 = 4096;
@@ -69,6 +69,9 @@ pub enum ComponentSlot {
     /// Models that generate synchronized audio decode it through its own VAE.
     AudioVae,
     Taesd,
+    /// Speech only: the codec that turns `llama-tts`'s audio tokens into a
+    /// waveform. Belongs to a different engine than every slot above it.
+    Vocoder,
 }
 
 impl ComponentSlot {
@@ -85,6 +88,7 @@ impl ComponentSlot {
             Self::Vae => "--vae",
             Self::AudioVae => "--audio-vae",
             Self::Taesd => "--taesd",
+            Self::Vocoder => "--model-vocoder",
         }
     }
 }
@@ -131,7 +135,7 @@ impl ModelComponent {
 
     /// The flat on-disk name a downloaded component takes. Two components of
     /// one model sharing a basename would overwrite each other, which
-    /// [`curated_models_have_unique_component_files`] rejects at test time.
+    /// [`validate_model_spec`] rejects before the model is stored.
     pub fn file_name(&self) -> &str {
         match &self.source {
             ComponentSource::HuggingFace { file, .. } => {
@@ -413,6 +417,11 @@ pub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> 
         port.to_string(),
     ];
     for component in &spec.components {
+        // The vocoder belongs to `llama-tts`; handing its flag to `sd-server`
+        // is an unknown argument, not an unused one.
+        if component.slot == ComponentSlot::Vocoder {
+            continue;
+        }
         args.push(component.slot.flag().to_string());
         args.push(
             component
@@ -423,6 +432,69 @@ pub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> 
     }
     args.extend(spec.extra_launch_args.iter().cloned());
     args
+}
+
+/// The weight file that identifies a loaded model to `sd-server`, which
+/// reports it back as `model.path` in its capabilities.
+fn identifying_component(spec: &GenerationModelSpec) -> Option<&ModelComponent> {
+    spec.components.iter().find(|component| {
+        matches!(
+            component.slot,
+            ComponentSlot::Checkpoint | ComponentSlot::DiffusionModel
+        )
+    })
+}
+
+/// Builds the `llama-tts` command line for one utterance.
+///
+/// Speech is not served by `sd-server` and is not a server at all: `llama-tts`
+/// loads its weights, writes one wav and exits, so there is nothing to keep
+/// warm and no job to poll. The model is still an ordinary library entry — the
+/// speech model fills [`ComponentSlot::Checkpoint`] and its codec fills
+/// [`ComponentSlot::Vocoder`], both of which map to flags `llama-tts` accepts.
+pub fn speech_args(
+    spec: &GenerationModelSpec,
+    model_root: &Path,
+    request: &GenerationRequest,
+    output: &Path,
+) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    for component in &spec.components {
+        if !matches!(
+            component.slot,
+            ComponentSlot::Checkpoint | ComponentSlot::Vocoder
+        ) {
+            continue;
+        }
+        args.push(component.slot.flag().to_string());
+        args.push(
+            component
+                .resolved_path(model_root, &spec.id)
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
+    if !args.iter().any(|arg| arg == "--model-vocoder") {
+        return Err(format!(
+            "{} needs a vocoder file — assign one to --model-vocoder",
+            spec.name
+        ));
+    }
+    args.push("--prompt".to_string());
+    args.push(request.prompt.clone());
+    args.push("--output".to_string());
+    args.push(output.to_string_lossy().to_string());
+    if let Some(path) = request
+        .speaker_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.push("--tts-speaker-file".to_string());
+        args.push(path.to_string());
+    }
+    args.extend(spec.extra_launch_args.iter().cloned());
+    Ok(args)
 }
 
 /// Snaps a canvas edge to the multiple of 32 the samplers require. The backend
@@ -476,12 +548,20 @@ pub struct GenerationRequest {
     pub height: u32,
     pub steps: u32,
     pub cfg_scale: f64,
+    /// Sampler for this run. Empty falls back to the model's own default —
+    /// the canvas and sampling controls belong to the generation, not to the
+    /// library entry, so every one of them can be changed per run.
+    #[serde(default)]
+    pub sample_method: String,
     /// Negative asks the backend for a random seed.
     pub seed: i64,
     #[serde(default)]
     pub video_frames: u32,
     #[serde(default)]
     pub fps: u32,
+    /// Speech only: an OuteTTS speaker profile (JSON) to voice the utterance.
+    #[serde(default)]
+    pub speaker_file: Option<String>,
     /// Base64 PNG/JPEG starting frame, required by the image-driven tasks.
     #[serde(default)]
     pub init_image_base64: Option<String>,
@@ -504,6 +584,25 @@ pub fn validate_request(
     }
     if request.prompt.len() > MAX_PROMPT_BYTES || request.negative_prompt.len() > MAX_PROMPT_BYTES {
         return Err("Prompt exceeds its size limit".to_string());
+    }
+    // Speech runs on `llama-tts`, which has no canvas, no sampler and no
+    // guidance — validating it against the diffusion bounds below would reject
+    // a request over fields that do not reach the engine at all.
+    if request.task.is_speech() {
+        if let Some(path) = &request.speaker_file {
+            if !path.trim().is_empty() && !Path::new(path).is_absolute() {
+                return Err("A speaker profile needs an absolute path".to_string());
+            }
+        }
+        let mut normalized = request.clone();
+        normalized.width = 0;
+        normalized.height = 0;
+        normalized.video_frames = 1;
+        normalized.fps = 1;
+        return Ok(normalized);
+    }
+    if request.sample_method.len() > 64 {
+        return Err("Sampler name is too long".to_string());
     }
     if request.steps == 0 || request.steps > MAX_STEPS {
         return Err(format!("Steps must be between 1 and {MAX_STEPS}"));
@@ -565,8 +664,13 @@ pub fn validate_request(
 /// Builds the `/sdcpp/v1/{img,vid}_gen` request body. Optional sampling fields
 /// are omitted rather than guessed, so the backend's own defaults apply.
 pub fn request_body(spec: &GenerationModelSpec, request: &GenerationRequest) -> Value {
+    let sampler = if request.sample_method.trim().is_empty() {
+        spec.defaults.sample_method.as_str()
+    } else {
+        request.sample_method.trim()
+    };
     let mut sample_params = json!({
-        "sample_method": spec.defaults.sample_method,
+        "sample_method": sampler,
         "sample_steps": request.steps,
         "guidance": { "txt_cfg": request.cfg_scale },
     });
@@ -663,11 +767,7 @@ pub fn decode_job_status(value: &Value) -> Result<JobProgress, String> {
         }),
         "cancelled" => Ok(JobProgress::Cancelled),
         "failed" => Ok(JobProgress::Failed(
-            value
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("Generation failed")
-                .to_string(),
+            engine_error_text(value).unwrap_or("Generation failed").to_string(),
         )),
         "completed" => {
             let result = value
@@ -726,6 +826,103 @@ pub fn decode_job_status(value: &Value) -> Result<JobProgress, String> {
 /// because this is a message a person reads, not a model's context.
 const MAX_STDERR_TAIL: usize = 4_000;
 
+/// Sampling progress read off one line of engine output.
+///
+/// The job API reports `queued`/`generating`/`completed` and nothing in
+/// between — no step counter, no percentage — so the only place a real
+/// completion figure exists is the progress bar the engine writes to stderr:
+///
+/// ```text
+///   |========>                                         | 4/25 - 2.42s/it
+/// ```
+///
+/// The same bar shape is used for tensor loading (`| 212/686 - 1.06GB/s`),
+/// which is why the rate suffix, not the bar, decides whether a line counts.
+fn parse_sampling_progress(line: &str) -> Option<(u32, u32)> {
+    if !line.contains('|') {
+        return None;
+    }
+    let tail = line.rsplit('|').next()?;
+    if !(tail.contains("s/it") || tail.contains("it/s")) {
+        return None;
+    }
+    let (done, total) = tail.split('-').next()?.trim().split_once('/')?;
+    let done = done.trim().parse().ok()?;
+    let total = total.trim().parse().ok()?;
+    if total == 0 {
+        return None;
+    }
+    Some((done, total))
+}
+
+/// Latest `(step, total)` scraped from the engine's progress bar, shared
+/// between the reader threads and whoever is reporting progress.
+type SamplingProgress = Arc<Mutex<Option<(u32, u32)>>>;
+
+/// Consumes one of the engine's output streams on its own thread, keeping the
+/// tail for failure messages and the latest step count for the progress bar.
+///
+/// Splits on carriage returns as well as newlines: the engine redraws its
+/// progress bar with `\r`, so a newline-only reader would hold an entire run in
+/// one unterminated line and report no progress until the job was already over.
+fn drain_engine_output(
+    stream: impl std::io::Read + Send + 'static,
+    tail: Arc<Mutex<String>>,
+    sampling: SamplingProgress,
+) {
+    std::thread::spawn(move || {
+        use std::io::{BufReader, Read as _};
+        let mut line: Vec<u8> = Vec::new();
+        let flush = |line: &mut Vec<u8>| {
+            if line.is_empty() {
+                return true;
+            }
+            let text = String::from_utf8_lossy(line).to_string();
+            line.clear();
+            if let Some(progress) = parse_sampling_progress(&text) {
+                let Ok(mut cell) = sampling.lock() else { return false };
+                *cell = Some(progress);
+                // A redrawn bar is noise in a failure message; the tail is for
+                // the lines a person reads.
+                return true;
+            }
+            let Ok(mut buffer) = tail.lock() else { return false };
+            buffer.push_str(text.trim_end());
+            buffer.push('\n');
+            if buffer.len() > MAX_STDERR_TAIL {
+                let (capped, _) =
+                    crate::output_cap::cap_tail(std::mem::take(&mut buffer), MAX_STDERR_TAIL);
+                *buffer = capped;
+            }
+            true
+        };
+        for byte in BufReader::new(stream).bytes().map_while(Result::ok) {
+            if byte == b'\n' || byte == b'\r' {
+                if !flush(&mut line) {
+                    return;
+                }
+            } else {
+                line.push(byte);
+            }
+        }
+        flush(&mut line);
+    });
+}
+
+/// Reserves a free loopback port by binding and immediately releasing it.
+///
+/// The engine takes a port on its command line, and a fixed one is a trap: an
+/// orphaned `sd-server` from a previous app run keeps listening and answers the
+/// readiness probe with whatever model *it* holds, so the new job is submitted
+/// to the wrong engine and comes back as a bare 400. Handing every launch its
+/// own port removes that collision entirely.
+fn free_port() -> Result<u16, String> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .map(|address| address.port())
+        .map_err(|error| format!("Failed to reserve a port for the generation engine: {error}"))
+}
+
 /// The one running `sd-server`, plus which model it was launched against.
 #[derive(Default)]
 pub struct GenerationEngineState {
@@ -736,14 +933,48 @@ pub struct GenerationEngineState {
 struct EngineProcess {
     child: Option<Child>,
     model_id: Option<String>,
+    /// The port this instance was launched on. Chosen per launch, never fixed.
+    port: Option<u16>,
     /// Tail of the engine's stderr, drained by a reader thread so the pipe can
     /// never fill and block the child.
     stderr_tail: Option<Arc<Mutex<String>>>,
+    /// Latest `(step, total)` scraped from that same stream.
+    sampling: Option<SamplingProgress>,
 }
 
 impl GenerationEngineState {
     pub fn loaded_model(&self) -> Option<String> {
         self.inner.lock().ok().and_then(|state| state.model_id.clone())
+    }
+
+    /// Where the running instance is listening, if one is.
+    pub fn base_url(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|state| state.port)
+            .map(|port| format!("http://127.0.0.1:{port}"))
+    }
+
+    /// Sampling progress for the job in flight, as `(step, total)`.
+    pub fn progress(&self) -> Option<(u32, u32)> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|state| state.sampling.clone())
+            .and_then(|cell| cell.lock().ok().and_then(|value| *value))
+    }
+
+    /// Drops the previous job's step count so a new job never briefly reports
+    /// the last one's progress.
+    pub fn clear_progress(&self) {
+        if let Ok(state) = self.inner.lock() {
+            if let Some(cell) = state.sampling.as_ref() {
+                if let Ok(mut value) = cell.lock() {
+                    *value = None;
+                }
+            }
+        }
     }
 
     /// Kills the running server, if any. Called on model switch and on
@@ -756,6 +987,7 @@ impl GenerationEngineState {
             let _ = child.wait();
         }
         state.model_id = None;
+        state.port = None;
         // Keep the tail: `ensure_ready` stops a failed launch before reporting,
         // and dropping it here would throw away the only useful diagnosis.
         Ok(())
@@ -796,15 +1028,17 @@ impl GenerationEngineState {
         binary: &Path,
         spec: &GenerationModelSpec,
         model_root: &Path,
-        port: u16,
     ) -> Result<String, String> {
-        let base_url = format!("http://127.0.0.1:{port}");
         if self.loaded_model().as_deref() == Some(spec.id.as_str())
             && self.child_exited()?.is_none()
         {
-            return Ok(base_url);
+            if let Some(base_url) = self.base_url() {
+                return Ok(base_url);
+            }
         }
         self.stop()?;
+        let port = free_port()?;
+        let base_url = format!("http://127.0.0.1:{port}");
 
         for path in spec.component_paths(model_root) {
             if !path.is_file() {
@@ -819,39 +1053,41 @@ impl GenerationEngineState {
         let mut child = Command::new(binary)
             .args(launch_args(spec, model_root, port))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("Failed to spawn the generation engine: {error}"))?;
         let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let sampling: SamplingProgress = Arc::new(Mutex::new(None));
+        // Both streams are drained. The engine splits its output in a way that
+        // is not worth predicting — the loader's diagnosis goes to stderr, the
+        // progress bar goes to stdout — and either way a piped stream nobody
+        // reads fills its buffer and blocks the child.
+        if let Some(stream) = child.stdout.take() {
+            drain_engine_output(stream, Arc::clone(&stderr_tail), Arc::clone(&sampling));
+        }
         if let Some(stream) = child.stderr.take() {
-            let sink = Arc::clone(&stderr_tail);
-            // A piped stream nobody reads fills its buffer and blocks the
-            // child, so this thread drains it for the process's whole life and
-            // keeps only the tail — a failing loader prints its diagnosis last.
-            std::thread::spawn(move || {
-                use std::io::{BufRead, BufReader};
-                for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                    let Ok(mut buffer) = sink.lock() else { return };
-                    buffer.push_str(&line);
-                    buffer.push('\n');
-                    if buffer.len() > MAX_STDERR_TAIL {
-                        let (capped, _) =
-                            crate::output_cap::cap_tail(std::mem::take(&mut buffer), MAX_STDERR_TAIL);
-                        *buffer = capped;
-                    }
-                }
-            });
+            drain_engine_output(stream, Arc::clone(&stderr_tail), Arc::clone(&sampling));
         }
         {
             let mut state = self.inner.lock().map_err(|error| error.to_string())?;
             state.child = Some(child);
             state.model_id = Some(spec.id.clone());
+            state.port = Some(port);
             state.stderr_tail = Some(stderr_tail);
+            state.sampling = Some(sampling);
         }
 
         let client = reqwest::Client::new();
         let capabilities = format!("{base_url}/sdcpp/v1/capabilities");
+        let expected_model_path = identifying_component(spec)
+            .map(|component| {
+                component
+                    .resolved_path(model_root, &spec.id)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .unwrap_or_default();
         let deadline = Instant::now() + READY_TIMEOUT;
         while Instant::now() < deadline {
             if let Some(failure) = self.child_exited()? {
@@ -866,8 +1102,22 @@ impl GenerationEngineState {
             {
                 // A foreign service could answer on this port while our child
                 // is losing the bind. Prove the child is still alive after the
-                // response, exactly as `llama.rs` does.
-                if response.status().is_success() {
+                // response, exactly as `llama.rs` does — and prove the answer
+                // came from the model we asked for, because an engine holding
+                // different weights accepts the connection and then rejects
+                // every job with a bare 400.
+                if response.status().is_success()
+                    && response
+                        .json::<Value>()
+                        .await
+                        .ok()
+                        .and_then(|body| {
+                            body.pointer("/model/path")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .is_some_and(|loaded| loaded == expected_model_path)
+                {
                     if let Some(failure) = self.child_exited()? {
                         self.stop()?;
                         return Err(failure);
@@ -886,6 +1136,21 @@ impl Drop for GenerationEngineState {
     fn drop(&mut self) {
         let _ = self.stop();
     }
+}
+
+/// The engine's own words for a failure.
+///
+/// A rejected submission answers `{"error": "loaded model does not support
+/// img_gen"}` — a bare string, not the `{"error": {"message": ...}}` object the
+/// job endpoint uses. Reading only the object form turned every rejection into
+/// "400 Bad Request: no detail" and hid the one sentence that explains it.
+fn engine_error_text(body: &Value) -> Option<&str> {
+    body.pointer("/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| body.get("error").and_then(Value::as_str))
+        .or_else(|| body.get("message").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// Submits a job and returns its id.
@@ -909,9 +1174,7 @@ pub async fn submit_job(
     if !status.is_success() {
         return Err(format!(
             "Generation engine returned {status}: {}",
-            body.pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("no detail")
+            engine_error_text(&body).unwrap_or("no detail")
         ));
     }
     body.get("id")
@@ -1005,9 +1268,11 @@ mod tests {
             height: 1280,
             steps: 20,
             cfg_scale: 6.0,
+            sample_method: String::new(),
             seed: -1,
             video_frames: 34,
             fps: 24,
+            speaker_file: None,
             init_image_base64: None,
             loras: Vec::new(),
         }
@@ -1337,6 +1602,177 @@ mod tests {
         }))
         .is_err());
         assert!(decode_job_status(&json!({"status": "invented"})).is_err());
+    }
+
+    /// The canvas and sampling controls belong to the run, not the library
+    /// entry, so a per-request sampler has to win over the model's default —
+    /// while an empty one still falls back rather than sending "".
+    #[test]
+    fn per_request_sampling_overrides_the_models_default() {
+        let wan = video_model();
+        let mut request = video_request(GenerationTask::TextToVideo);
+        request.sample_method = "  dpm++2m  ".to_string();
+        let body = request_body(&wan, &validate_request(&wan, &request).unwrap());
+        assert_eq!(body["sample_params"]["sample_method"], json!("dpm++2m"));
+
+        let fallback = request_body(&wan, &video_request(GenerationTask::TextToVideo));
+        assert_eq!(fallback["sample_params"]["sample_method"], json!("euler"));
+
+        let mut absurd = request.clone();
+        absurd.sample_method = "x".repeat(65);
+        assert!(validate_request(&wan, &absurd).is_err());
+    }
+
+    /// The job API reports no step count, so the engine's redrawn progress bar
+    /// is the only source of a percentage. Tensor loading draws the identical
+    /// bar with a byte rate, which must not be mistaken for sampling.
+    #[test]
+    fn sampling_progress_is_read_only_from_the_sampling_bar() {
+        assert_eq!(
+            parse_sampling_progress("  |========>              | 4/25 - 2.42s/it\u{1b}[K"),
+            Some((4, 25))
+        );
+        assert_eq!(
+            parse_sampling_progress("  |======| 30/30 - 1.9it/s"),
+            Some((30, 30))
+        );
+        // Model loading, not sampling.
+        assert_eq!(
+            parse_sampling_progress("  |####      | 212/686 - 647.34MB/s"),
+            None
+        );
+        assert_eq!(parse_sampling_progress("[INFO ] main.cpp:148 - listening"), None);
+        assert_eq!(parse_sampling_progress("  |==| 4/0 - 1.0s/it"), None);
+    }
+
+    /// A rejected submission answers with a bare string, and reading only the
+    /// object form is what turned every 400 into "no detail".
+    #[test]
+    fn engine_errors_are_read_in_both_shapes_the_engine_uses() {
+        assert_eq!(
+            engine_error_text(&json!({"error": "loaded model does not support img_gen"})),
+            Some("loaded model does not support img_gen")
+        );
+        assert_eq!(
+            engine_error_text(&json!({"error": {"message": "out of memory"}})),
+            Some("out of memory")
+        );
+        assert_eq!(engine_error_text(&json!({"error": null})), None);
+        assert_eq!(engine_error_text(&json!({"error": "  "})), None);
+    }
+
+    /// Speech is a different engine with a different command line: no canvas,
+    /// no sampler, a vocoder the diffusion server would reject as an unknown
+    /// flag, and one wav written straight to disk.
+    #[test]
+    fn speech_builds_its_own_command_line_and_skips_the_diffusion_bounds() {
+        let mut spec = model("voice", vec![GenerationTask::TextToSpeech], FrameGrid::default());
+        spec.components = vec![
+            ModelComponent::huggingface(ComponentSlot::Checkpoint, "r", "outetts.gguf", 1),
+            ModelComponent::huggingface(ComponentSlot::Vocoder, "r", "wavtokenizer.gguf", 1),
+        ];
+        spec.extra_launch_args = vec!["--tts-use-guide-tokens".to_string()];
+        assert!(validate_model_spec(&spec).is_ok());
+
+        let mut request = video_request(GenerationTask::TextToSpeech);
+        request.model_id = spec.id.clone();
+        request.speaker_file = Some("/Users/somebody/voice.json".to_string());
+        let normalized = validate_request(&spec, &request).unwrap();
+        assert_eq!(normalized.width, 0);
+
+        let args = speech_args(&spec, Path::new("/m"), &normalized, Path::new("/out.wav")).unwrap();
+        for (flag, value) in [
+            ("--model", "/m/voice/outetts.gguf"),
+            ("--model-vocoder", "/m/voice/wavtokenizer.gguf"),
+            ("--prompt", "a lovely cat"),
+            ("--output", "/out.wav"),
+            ("--tts-speaker-file", "/Users/somebody/voice.json"),
+        ] {
+            let at = args.iter().position(|arg| arg == flag).expect(flag);
+            assert_eq!(args[at + 1], value, "{flag}");
+        }
+        assert!(args.contains(&"--tts-use-guide-tokens".to_string()));
+
+        // The vocoder is llama-tts's flag; sd-server would reject it outright.
+        assert!(!launch_args(&spec, Path::new("/m"), 1).contains(&"--model-vocoder".to_string()));
+
+        // A relative speaker profile must not reach the command line.
+        let mut relative = request.clone();
+        relative.speaker_file = Some("voice.json".to_string());
+        assert!(validate_request(&spec, &relative).is_err());
+
+        // Without a codec there is nothing to turn tokens into a waveform.
+        let mut no_vocoder = spec.clone();
+        no_vocoder.components.pop();
+        assert!(speech_args(&no_vocoder, Path::new("/m"), &normalized, Path::new("/o.wav")).is_err());
+    }
+
+    /// Drives a real `sd-server` end to end. Ignored by default because it
+    /// needs a checkpoint on disk and minutes of sampling, but it is the only
+    /// thing that proves the parts unit tests cannot reach: that the engine
+    /// comes up on its own port even while an orphan holds the old fixed one,
+    /// that its capabilities identify the model we asked for, and that a step
+    /// count actually appears on stderr mid-job.
+    ///
+    /// ```text
+    /// SD_SERVER=…/sd-server SD_CHECKPOINT=…/sd-turbo.safetensors \
+    ///   cargo test --lib generation -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a local sd-server binary and checkpoint"]
+    fn a_real_engine_reports_its_model_and_its_step_count() {
+        let (Ok(binary), Ok(checkpoint)) = (
+            std::env::var("SD_SERVER"),
+            std::env::var("SD_CHECKPOINT"),
+        ) else {
+            panic!("set SD_SERVER and SD_CHECKPOINT");
+        };
+        let mut spec = model("live", vec![GenerationTask::TextToImage], FrameGrid::default());
+        spec.components = vec![ModelComponent {
+            slot: ComponentSlot::Checkpoint,
+            source: ComponentSource::LocalFile { path: checkpoint },
+            size_bytes: 0,
+        }];
+        spec.defaults.flow_shift = None;
+        spec.extra_launch_args.clear();
+
+        let mut request = video_request(GenerationTask::TextToImage);
+        request.model_id = spec.id.clone();
+        request.width = 768;
+        request.height = 768;
+        request.steps = 25;
+        let request = validate_request(&spec, &request).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let engine = GenerationEngineState::default();
+            let base_url = engine
+                .ensure_ready(Path::new(&binary), &spec, Path::new("/unused"))
+                .await
+                .expect("engine ready");
+            let client = reqwest::Client::new();
+            let job = submit_job(&client, &base_url, &spec, &request)
+                .await
+                .expect("submit");
+
+            let mut saw_progress = None;
+            let media = loop {
+                match poll_job(&client, &base_url, &job).await.unwrap() {
+                    JobProgress::Running { .. } => {
+                        saw_progress = saw_progress.or_else(|| engine.progress());
+                    }
+                    JobProgress::Completed(media) => break media,
+                    other => panic!("{other:?}"),
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            };
+            let (step, total) = saw_progress.expect("a step count reached the app mid-job");
+            assert_eq!(total, 25, "total steps came from the request");
+            assert!(step >= 1 && step <= total);
+            assert_eq!(media.media_type, "image/png");
+            assert!(media.bytes.starts_with(b"\x89PNG"));
+            engine.stop().unwrap();
+        });
     }
 
     #[test]

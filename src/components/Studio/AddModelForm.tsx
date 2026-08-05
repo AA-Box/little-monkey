@@ -229,62 +229,21 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
         </Button>
       </div>
 
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <label className="grid gap-1 text-[11px] text-muted">
-          {t("Studio.add.width")}
-          <input
-            type="number"
-            className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
-            value={spec.defaults.width}
-            onChange={(event) =>
-              patch({ defaults: { ...spec.defaults, width: Number(event.target.value) } })
-            }
-          />
-        </label>
-        <label className="grid gap-1 text-[11px] text-muted">
-          {t("Studio.add.height")}
-          <input
-            type="number"
-            className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
-            value={spec.defaults.height}
-            onChange={(event) =>
-              patch({ defaults: { ...spec.defaults, height: Number(event.target.value) } })
-            }
-          />
-        </label>
-        <label className="grid gap-1 text-[11px] text-muted">
-          {t("Studio.add.steps")}
-          <input
-            type="number"
-            className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
-            value={spec.defaults.steps}
-            onChange={(event) =>
-              patch({ defaults: { ...spec.defaults, steps: Number(event.target.value) } })
-            }
-          />
-        </label>
-        <label className="grid gap-1 text-[11px] text-muted">
-          {t("Studio.add.cfg")}
-          <input
-            type="number"
-            step="0.1"
-            className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
-            value={spec.defaults.cfgScale}
-            onChange={(event) =>
-              patch({ defaults: { ...spec.defaults, cfgScale: Number(event.target.value) } })
-            }
-          />
-        </label>
-      </div>
-
+      {/* Canvas size, steps, guidance and sampler are per-generation and live
+          on the Image and Video tabs. What stays here is what the architecture
+          fixes rather than the run: how the family rounds a clip's length, and
+          how fast it plays. */}
       <div className="grid gap-2 sm:grid-cols-2">
         <label className="grid gap-1 text-[11px] text-muted">
-          {t("Studio.add.sampler")}
+          {t("Studio.add.fps")}
           <input
-            className="rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
-            value={spec.defaults.sampleMethod}
+            type="number"
+            min={1}
+            max={60}
+            className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+            value={spec.defaults.fps}
             onChange={(event) =>
-              patch({ defaults: { ...spec.defaults, sampleMethod: event.target.value } })
+              patch({ defaults: { ...spec.defaults, fps: Number(event.target.value) } })
             }
           />
         </label>

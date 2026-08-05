@@ -21,9 +21,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::artifact_store::ArtifactStore;
-use crate::generation::{
-    self, GenerationModelSpec, GenerationRequest, JobProgress, GENERATION_PORT,
-};
+use crate::generation::{self, GenerationModelSpec, GenerationRequest, JobProgress};
 use crate::managed_runtime::{self, STABLE_DIFFUSION};
 use crate::AppState;
 
@@ -93,6 +91,35 @@ struct GenerationProgressEvent {
     job_id: String,
     phase: String,
     queue_position: u32,
+    /// Completion of the sampling pass, 0–100. `None` while the engine is
+    /// still loading weights, which is the only stretch it does not count.
+    percent: Option<u32>,
+    /// `(step, total)` behind `percent`, so the UI can say "7 / 25" rather
+    /// than only a bar.
+    step: Option<u32>,
+    total_steps: Option<u32>,
+}
+
+impl GenerationProgressEvent {
+    fn new(job_id: &str, phase: &str) -> Self {
+        Self {
+            job_id: job_id.to_string(),
+            phase: phase.to_string(),
+            queue_position: 0,
+            percent: None,
+            step: None,
+            total_steps: None,
+        }
+    }
+
+    fn with_progress(mut self, progress: Option<(u32, u32)>) -> Self {
+        if let Some((step, total)) = progress {
+            self.percent = Some((step * 100 / total).min(100));
+            self.step = Some(step);
+            self.total_steps = Some(total);
+        }
+        self
+    }
 }
 
 fn now_ms() -> u64 {
@@ -375,6 +402,84 @@ pub fn generation_cancel_download(
     })
 }
 
+/// Bounds a synthesized utterance, which is a wav on disk rather than a
+/// response body and so is not covered by the HTTP client's own limits.
+const MAX_SPEECH_BYTES: u64 = 64 * 1024 * 1024;
+/// A long utterance on a cold CPU still finishes well inside this.
+const SPEECH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Synthesizes one utterance with the managed `llama-tts`.
+///
+/// Speech does not go through `sd-server` at all: `llama-tts` is a one-shot
+/// process that loads its weights, writes a single wav and exits. There is no
+/// server to keep warm, no job id and no queue, so this whole path is one
+/// await rather than the submit-and-poll loop the diffusion engine needs.
+async fn run_speech(
+    app: &AppHandle,
+    spec: &GenerationModelSpec,
+    request: &GenerationRequest,
+) -> Result<generation::GeneratedMedia, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
+    // Staging the llama tree is what puts `llama-tts` on disk beside
+    // `llama-server`; it shares that tree's pinned version and checksums.
+    let _ = managed_runtime::materialize_bundled_runtime_for(
+        &managed_runtime::LLAMA,
+        app.path().resource_dir().ok().as_deref(),
+        &app_data,
+    );
+    let binary = managed_runtime::find_managed_llama_tts(Some(&app_data))
+        .ok_or("The speech engine is not installed in this build")?;
+
+    let output_path = studio_dir(app)?.join(format!("speech-{}.wav", Uuid::new_v4()));
+    let args = generation::speech_args(spec, &model_root(app)?, request, &output_path)?;
+    let run = tokio::process::Command::new(&binary)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .output();
+    let finished = tokio::time::timeout(SPEECH_TIMEOUT, run)
+        .await
+        .map_err(|_| "Speech generation exceeded its time limit".to_string())?
+        .map_err(|error| format!("Failed to start the speech engine: {error}"))?;
+
+    let read = (|| {
+        if !finished.status.success() {
+            // The engine's own diagnosis is the only actionable part of a
+            // failure here — a missing vocoder and a wrong quantization both
+            // exit non-zero and say so only on stderr.
+            let (detail, _) = crate::output_cap::cap_tail(
+                String::from_utf8_lossy(&finished.stderr).trim().to_string(),
+                2_000,
+            );
+            return Err(if detail.is_empty() {
+                format!("Speech engine exited ({})", finished.status)
+            } else {
+                format!("Speech engine exited ({}):\n{detail}", finished.status)
+            });
+        }
+        let size = std::fs::metadata(&output_path)
+            .map_err(|_| "The speech engine wrote no audio".to_string())?
+            .len();
+        if size == 0 {
+            return Err("The speech engine wrote an empty file".to_string());
+        }
+        if size > MAX_SPEECH_BYTES {
+            return Err("Generated audio exceeds its size limit".to_string());
+        }
+        std::fs::read(&output_path).map_err(|error| error.to_string())
+    })();
+    let _ = std::fs::remove_file(&output_path);
+
+    Ok(generation::GeneratedMedia {
+        bytes: read?,
+        media_type: "audio/wav".to_string(),
+        frame_count: 1,
+        fps: 1,
+    })
+}
+
 /// Runs one generation end to end: ensure the engine is serving the requested
 /// model, submit, poll to a terminal state, then publish the media as an
 /// artifact and record it in the gallery.
@@ -386,50 +491,15 @@ pub async fn generation_run(
 ) -> Result<GenerationEntry, String> {
     let spec = find_registered(&app, &request.model_id)?;
     let request = generation::validate_request(&spec, &request)?;
-    let root = model_root(&app)?;
-    let binary = engine_binary(&app)?;
 
-    let base_url = state
-        .generation_engine
-        .ensure_ready(&binary, &spec, &root, GENERATION_PORT)
-        .await?;
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|error| error.to_string())?;
-    let job_id = generation::submit_job(&client, &base_url, &spec, &request).await?;
-    let _ = app.emit(
-        "studio://progress",
-        GenerationProgressEvent {
-            job_id: job_id.clone(),
-            phase: "submitted".to_string(),
-            queue_position: 0,
-        },
-    );
-
-    let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
-    let media = loop {
-        if tokio::time::Instant::now() >= deadline {
-            generation::cancel_job(&client, &base_url, &job_id).await;
-            return Err("Generation exceeded its time limit".to_string());
-        }
-        match generation::poll_job(&client, &base_url, &job_id).await? {
-            JobProgress::Running { queue_position } => {
-                let _ = app.emit(
-                    "studio://progress",
-                    GenerationProgressEvent {
-                        job_id: job_id.clone(),
-                        phase: "running".to_string(),
-                        queue_position,
-                    },
-                );
-            }
-            JobProgress::Completed(media) => break *media,
-            JobProgress::Failed(error) => return Err(error),
-            JobProgress::Cancelled => return Err("Generation cancelled".to_string()),
-        }
-        tokio::time::sleep(Duration::from_millis(750)).await;
+    let media = if request.task.is_speech() {
+        let _ = app.emit(
+            "studio://progress",
+            GenerationProgressEvent::new("speech", "running"),
+        );
+        run_speech(&app, &spec, &request).await?
+    } else {
+        run_diffusion(&app, &state, &spec, &request).await?
     };
 
     let blob = artifacts(&app)?
@@ -466,30 +536,83 @@ pub async fn generation_run(
 
     let _ = app.emit(
         "studio://progress",
-        GenerationProgressEvent {
-            job_id,
-            phase: "completed".to_string(),
-            queue_position: 0,
-        },
+        GenerationProgressEvent::new(&entry.entry_id, "completed"),
     );
     Ok(entry)
 }
 
+/// The `sd-server` half of [`generation_run`]: ensure the engine is serving
+/// this model, submit, and poll to a terminal state.
+///
+/// The job API has no step counter, so the percentage in each progress event
+/// is scraped from the engine's own output by
+/// [`generation::GenerationEngineState`] rather than read from the poll body.
+async fn run_diffusion(
+    app: &AppHandle,
+    state: &tauri::State<'_, AppState>,
+    spec: &GenerationModelSpec,
+    request: &GenerationRequest,
+) -> Result<generation::GeneratedMedia, String> {
+    let root = model_root(app)?;
+    let binary = engine_binary(app)?;
+    let engine = &state.generation_engine;
+
+    let _ = app.emit(
+        "studio://progress",
+        GenerationProgressEvent::new("", "loading"),
+    );
+    let base_url = engine.ensure_ready(&binary, spec, &root).await?;
+    engine.clear_progress();
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let job_id = generation::submit_job(&client, &base_url, spec, request).await?;
+    let _ = app.emit(
+        "studio://progress",
+        GenerationProgressEvent::new(&job_id, "submitted"),
+    );
+
+    let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            generation::cancel_job(&client, &base_url, &job_id).await;
+            return Err("Generation exceeded its time limit".to_string());
+        }
+        match generation::poll_job(&client, &base_url, &job_id).await? {
+            JobProgress::Running { queue_position } => {
+                let mut event = GenerationProgressEvent::new(&job_id, "running")
+                    .with_progress(engine.progress());
+                event.queue_position = queue_position;
+                let _ = app.emit("studio://progress", event);
+            }
+            JobProgress::Completed(media) => return Ok(*media),
+            JobProgress::Failed(error) => return Err(error),
+            JobProgress::Cancelled => return Err("Generation cancelled".to_string()),
+        }
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+}
+
 #[tauri::command]
-pub async fn generation_cancel(job_id: String) -> Result<bool, String> {
+pub async fn generation_cancel(
+    state: tauri::State<'_, AppState>,
+    job_id: String,
+) -> Result<bool, String> {
     if job_id.is_empty() || job_id.len() > 128 {
         return Err("Invalid job id".to_string());
     }
+    // The engine is launched on a fresh port each time, so its address comes
+    // from the running instance rather than a constant.
+    let Some(base_url) = state.generation_engine.base_url() else {
+        return Ok(false);
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|error| error.to_string())?;
-    Ok(generation::cancel_job(
-        &client,
-        &format!("http://127.0.0.1:{GENERATION_PORT}"),
-        &job_id,
-    )
-    .await)
+    Ok(generation::cancel_job(&client, &base_url, &job_id).await)
 }
 
 #[tauri::command]
