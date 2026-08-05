@@ -1557,10 +1557,36 @@ hazard `egress::hardened`'s doc warns about, already shipped. Two are load-beari
   policy admits a hop to any public HTTPS host; reqwest strips `Authorization`
   cross-host so the bearer does not travel, and the SHA-256 check is what actually
   makes this safe — but that reliance was undocumented.
-- **`web.rs` builds four clients and installs the SSRF guard on one.** The other
-  three reach fixed provider endpoints except the SearXNG one, whose base URL is
-  user-configured — pointing it at loopback is a supported setup, which is why it is
-  a question about the policy and not a straightforward fix.
+- ~~**`web.rs` builds four clients and installs the SSRF guard on one.**~~ **Fixed**
+  — and the fix found that the hole was worse than this entry described. The three
+  search clients did not need the SSRF guard (their *request* targets are trustworthy,
+  as their doc comments correctly argued); they needed a redirect policy, because a
+  `302` is chosen by the response. All three now build from one `search_client()`
+  helper on top of `egress::hardened_with_read_budget`, whose origin-pinned policy
+  answers the loopback question this entry was stuck on: the rule is *relative* (does
+  this hop stay where it was already going?), so a self-hosted SearXNG on plain
+  `http://` or on loopback keeps working while a `302` off it does not.
+
+  **The Brave leak was demonstrated, not theorised.** Sabotaging `search_client()`
+  back to the old builder makes the second origin record, verbatim:
+
+  ```
+  GET /steal HTTP/1.1
+  x-subscription-token: super-secret-key
+  referer: http://127.0.0.1:58198/?q=rust&count=1
+  ```
+
+  reqwest strips `Authorization` across an origin change but not
+  `X-Subscription-Token`, so the user's Brave API key travelled to whatever host the
+  redirect named — with `referer` carrying the search query alongside it. This is the
+  same hazard `egress::hardened`'s doc records for `x-api-key`; the search path simply
+  was not built from it. `allow_local_network` was never a defence here: it is read
+  only on the fetch path, so all three search clients followed a loopback hop with the
+  setting off.
+
+  Also fixed in passing: the three clients read their bodies with `.text()`, which
+  reads to end-of-stream and so let the backend size the allocation. They now share
+  `fetch_impl`'s streaming read under a `MAX_SEARCH_BODY_BYTES` cap.
 - **`knowledge_pipeline.rs` compares `max_url_chars` against bytes**
   (`value.len()`), so a URL of multibyte characters is cut earlier than the setting's
   name promises. The new denial detail says "bytes" rather than papering over it.
