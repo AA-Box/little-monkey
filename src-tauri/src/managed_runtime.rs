@@ -508,6 +508,30 @@ pub fn find_managed_server(
     verify_runtime_directory(spec, &bundled).ok()
 }
 
+/// Whether a runtime's binary is simply *there*, without verifying the tree.
+///
+/// [`find_managed_server`] hashes every file the manifest lists — 113 MB for
+/// stable-diffusion.cpp — which is the right price before launching a process
+/// and far too much for a status probe the UI runs on every panel refresh.
+///
+/// Nothing is ever launched on the strength of this answer. It exists only to
+/// tell a panel whether to offer a feature; every path that actually starts a
+/// process still goes through [`find_managed_server`] and pays for the full
+/// verification there.
+pub fn managed_server_present(spec: &ManagedRuntimeSpec, app_data_dir: Option<&Path>) -> bool {
+    if explicit_runtime_override(spec).is_some_and(|path| path.is_file()) {
+        return true;
+    }
+    let installed = app_data_dir.is_some_and(|root| {
+        managed_runtime_dir_for(spec, root)
+            .join(spec.executable())
+            .is_file()
+    });
+    installed
+        || bundled_runtime_near_current_exe(spec)
+            .is_some_and(|directory| directory.join(spec.executable()).is_file())
+}
+
 pub fn find_managed_llama_server(app_data_dir: Option<&Path>) -> Option<PathBuf> {
     find_managed_server(&LLAMA, app_data_dir)
 }
@@ -670,6 +694,32 @@ fn materialize_runtime_from_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The status probe must not pay for verification. Hashing the whole tree
+    /// on every Studio refresh made switching tabs take seconds, because the
+    /// stable-diffusion.cpp tree is 113 MB and the check ran per call.
+    ///
+    /// The two answers are deliberately different: presence says only that a
+    /// binary is where it should be, and nothing is ever launched on that
+    /// answer alone.
+    #[test]
+    fn presence_is_cheap_and_is_not_verification() {
+        let root = std::env::temp_dir().join(format!("lm-present-{}", Uuid::new_v4().simple()));
+        let installed = managed_runtime_dir_for(&STABLE_DIFFUSION, &root);
+        fs::create_dir_all(&installed).unwrap();
+
+        fs::write(installed.join(STABLE_DIFFUSION.executable()), b"not really a binary").unwrap();
+        assert!(managed_server_present(&STABLE_DIFFUSION, Some(&root)));
+        // Same directory, and verification refuses it: there is no manifest
+        // and the bytes are not a runtime. That gap is the whole point —
+        // presence answers the picker, verification answers the spawn.
+        assert!(verify_runtime_directory(&STABLE_DIFFUSION, &installed).is_err());
+
+        // The absent case is deliberately not asserted through the top-level
+        // lookups: a developer checkout has a real staged tree beside the test
+        // binary, which both functions are entitled to find.
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     fn runtime_fixture(spec: &ManagedRuntimeSpec, label: &str) -> (PathBuf, String) {
         let directory = std::env::temp_dir().join(format!(

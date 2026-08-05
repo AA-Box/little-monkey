@@ -38,7 +38,7 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.cancel": "Cancel",
   "Studio.add.title": "Add a model",
   "Studio.add.slotHint":
-    "Assign every file to a slot yourself. A wrong slot fails inside the engine as a tensor-shape error, so this is never guessed for you.",
+    "Slots are filled in from each file's name where it says one — check them. A wrong slot fails inside the engine as a tensor-shape error, not here.",
   "Studio.add.name": "Name",
   "Studio.add.family": "Family",
   "Studio.add.tasks": "What it can do",

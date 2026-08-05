@@ -4,6 +4,7 @@ import { FolderOpen, Plus, Trash2 } from "lucide-react";
 
 import { Button, IconButton } from "../ui";
 import { useT } from "../../lib/i18n";
+import { describeWeightFile } from "../../lib/weightFileHints";
 import {
   ALL_TASKS,
   COMPONENT_SLOTS,
@@ -24,42 +25,9 @@ function slugify(value: string): string {
     .slice(0, 128);
 }
 
-/** Architecture families, matched against a weight file's own name. The list is
- *  only ever a starting point the user can overwrite — unlike a slot, a wrong
- *  family costs nothing but a retype. */
-const FAMILY_HINTS: [RegExp, string][] = [
-  [/wan[._-]?\d/i, "Wan"],
-  [/minimax|(^|[^a-z])h3([^a-z]|$)/i, "MiniMax"],
-  [/hunyuan/i, "Hunyuan"],
-  [/ltx/i, "LTX"],
-  [/flux/i, "FLUX"],
-  [/qwen/i, "Qwen"],
-  [/sdxl|xl[._-]?base|xl[._-]?refiner/i, "SDXL"],
-  [/(^|[^a-z])sd[._-]?[0-9x]|stable[._-]?diffusion|turbo/i, "SD"],
-  [/outetts|wavtokenizer|[._-]tts/i, "TTS"],
-];
-
-/** A readable name from a weight file's own name: drop the directory, the
- *  extension and the quantization tag, then space out the separators. */
-export function describeWeightFile(raw: string): { name: string; family: string } {
-  const base = (raw.split(/[/\\]/).pop() ?? raw)
-    .replace(/\.(safetensors|gguf|ckpt|pt|bin|pth)$/i, "")
-    // Repeated as one group: `_pruned-Q4_K_M` is two tags, and an anchored
-    // single match would only ever strip the last one.
-    .replace(/([._-](q\d[_a-z0-9]*|fp\d+|bf\d+|int\d+|pruned))+$/i, "");
-  const name = base
-    .replace(/[._-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return {
-    name,
-    family: FAMILY_HINTS.find(([pattern]) => pattern.test(base))?.[1] ?? "",
-  };
-}
-
 function blankComponent(): ModelComponent {
   return {
-    slot: "diffusion_model",
+    slot: "checkpoint",
     source: { kind: "local_file", path: "" },
     sizeBytes: 0,
   };
@@ -68,10 +36,11 @@ function blankComponent(): ModelComponent {
 /**
  * Adds a model to the user's library.
  *
- * Slot assignment is explicit for every file. The app deliberately does not
- * infer it from the file name: a wrong guess does not fail here, it fails deep
- * inside the engine as a tensor-shape error that reads like a corrupt
- * download.
+ * Every slot is prefilled from the file's own name and every one stays an open
+ * select. The distinction matters: a wrong slot does not fail here, it fails
+ * deep inside the engine as a tensor-shape error that reads like a corrupt
+ * download — so the form suggests only where the name names a component, and
+ * leaves the row alone otherwise rather than inventing an answer.
  */
 export function AddModelForm({ onSaved }: { onSaved: () => void }) {
   const { t } = useT();
@@ -96,15 +65,22 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
           : source?.kind === "hugging_face"
             ? source.file
             : "";
-      if (index !== 0 || !path.trim() || (current.name && current.family)) {
+      if (!path.trim()) return { ...current, components };
+      const hint = describeWeightFile(path);
+      // A named component wins over whatever the row defaulted to; a file that
+      // names nothing leaves the row alone.
+      if (hint.slot && next.slot === undefined) {
+        components[index] = { ...components[index], slot: hint.slot };
+      }
+      // Naming only ever fills a blank, and only from the first file.
+      if (index !== 0 || (current.name && current.family)) {
         return { ...current, components };
       }
-      const guess = describeWeightFile(path);
       return {
         ...current,
         components,
-        name: current.name || guess.name,
-        family: current.family || guess.family,
+        name: current.name || hint.name,
+        family: current.family || hint.family,
       };
     });
 

@@ -222,8 +222,11 @@ pub fn generation_engine_status(app: AppHandle) -> Result<GenerationEngineStatus
     let app_data = app.path().app_data_dir().ok();
     Ok(GenerationEngineStatus {
         supported,
+        // Presence, not verification: this runs on every Studio refresh, and
+        // hashing the whole runtime tree here made switching tabs take
+        // seconds. The launch path still verifies before spawning anything.
         engine_installed: supported
-            && managed_runtime::find_managed_sd_server(app_data.as_deref()).is_some(),
+            && managed_runtime::managed_server_present(&STABLE_DIFFUSION, app_data.as_deref()),
         loaded_model_id: app.state::<AppState>().generation_engine.loaded_model(),
         total_ram_bytes: total_ram_bytes(),
     })
