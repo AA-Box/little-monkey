@@ -7,7 +7,9 @@ export type GenerationTask =
   | "text_to_image"
   | "image_to_image"
   | "text_to_video"
-  | "image_to_video";
+  | "image_to_video"
+  /** Served by llama-tts, not sd-server. */
+  | "text_to_speech";
 
 export type ComponentSlot =
   | "checkpoint"

@@ -7,10 +7,14 @@
 export const studioLocale: Record<string, string> = {
   "App.section.switcher": "Section",
   "App.section.chat": "Chat",
-  "App.section.image": "Image",
-  "App.section.video": "Video",
-  "App.section.audio": "Audio",
+  "App.section.studio": "Studio",
 
+  "Studio.tab.image": "Image",
+  "Studio.tab.video": "Video",
+  "Studio.tab.audio": "Audio",
+  "Studio.audio.title": "Audio",
+  "Studio.audio.subtitle": "Speak text in a chosen voice, or clone one from a recording. Nothing leaves this machine.",
+  "Studio.task.text_to_speech": "Text to speech",
   "Studio.image.title": "Image",
   "Studio.image.subtitle": "Generate images on this machine. No account, no upload.",
   "Studio.video.title": "Video",

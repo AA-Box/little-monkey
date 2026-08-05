@@ -181,6 +181,9 @@ pub enum GenerationTask {
     ImageToImage,
     TextToVideo,
     ImageToVideo,
+    /// Speech, optionally in a voice cloned from a reference clip. Served by
+    /// `llama-tts` rather than `sd-server` — see [`speech_args`].
+    TextToSpeech,
 }
 
 impl GenerationTask {
@@ -190,6 +193,12 @@ impl GenerationTask {
 
     pub fn needs_init_image(self) -> bool {
         matches!(self, Self::ImageToImage | Self::ImageToVideo)
+    }
+
+    /// Speech runs on a different engine entirely, so callers must route it
+    /// before reaching for anything `sd-server`-shaped.
+    pub fn is_speech(self) -> bool {
+        matches!(self, Self::TextToSpeech)
     }
 
     /// The native async endpoint this task submits to.

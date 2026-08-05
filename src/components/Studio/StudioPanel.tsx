@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Download, Loader2, Sparkles, Square, Trash2, Upload } from "lucide-react";
 
-import { Button, IconButton, StatusPill } from "../ui";
+import { Button, IconButton, StatusPill, Tabs } from "../ui";
 import { useT } from "../../lib/i18n";
 import {
   componentFileName,
@@ -26,15 +26,17 @@ function componentNames(model: GenerationModel): string[] {
   return model.components.map(componentFileName);
 }
 
-export type StudioMode = "image" | "video";
+export type StudioMode = "image" | "video" | "audio";
 
 const MODE_TASKS: Record<StudioMode, GenerationTask[]> = {
   image: ["text_to_image", "image_to_image"],
   video: ["text_to_video", "image_to_video"],
+  audio: ["text_to_speech"],
 };
 
-export function StudioPanel({ mode }: { mode: StudioMode }) {
+export function StudioPanel() {
   const { t } = useT();
+  const [mode, setMode] = useState<StudioMode>("image");
   const [status, setStatus] = useState<GenerationEngineStatus | null>(null);
   const [models, setModels] = useState<GenerationModel[]>([]);
   const [gallery, setGallery] = useState<GenerationEntry[]>([]);
@@ -222,7 +224,16 @@ export function StudioPanel({ mode }: { mode: StudioMode }) {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">
-      <header className="mb-4">
+      <Tabs
+        active={mode}
+        onChange={(next) => setMode(next as StudioMode)}
+        tabs={[
+          { id: "image", label: t("Studio.tab.image") },
+          { id: "video", label: t("Studio.tab.video") },
+          { id: "audio", label: t("Studio.tab.audio") },
+        ]}
+      />
+      <header className="mb-4 mt-3">
         <h1 className="text-sm font-medium">{t(`Studio.${mode}.title`)}</h1>
         <p className="mt-1 text-xs text-muted">{t(`Studio.${mode}.subtitle`)}</p>
       </header>
