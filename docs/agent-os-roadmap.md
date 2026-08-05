@@ -63,7 +63,14 @@ made once and silently not take effect.
 **Today:** `server.rs` (~4.6k lines, legacy proxy) and `m3_http_server.rs`
 (~2.1k) both still serve live requests.
 
-**Shipped:** `http_policy.rs`, the shared module both listeners now draw from.
+**Shipped:** `http_policy.rs`, the shared module both listeners now draw from — and
+`tests/legacy_route_compatibility.rs`, the byte-level harness this item's own "Remaining"
+section calls "the one thing that would make the rest of the merge safe to attempt". Eight
+tests pin what `server.rs` does today: wildcard CORS on every response including failures,
+`/health` byte-for-byte, the OpenAI error envelope's exact nesting and each failure's own
+message bytes, `owned_by` values, raw SSE passthrough, and `OPTIONS /v1/*` → 204 scoped to
+`/v1/*`. Scaffolding for the merge rather than the merge: both servers are still live
+(`server.rs` 5.5k lines, `m3_http_server.rs` 2.1k).
 
 - **Admission control covers every serving path, and now actually bounds it.**
   `AdmissionGuard` / `RequestAdmission` own the concurrency permit and the
@@ -161,11 +168,44 @@ merge are blocked on decisions or on a release cycle, not on effort:
   both (pairing store first, legacy digest list as fallback, rate limiter on
   both), deprecate the legacy mint flow in the UI, then delete the legacy branch
   *a release later*. That last step is a calendar dependency.
-- **Model-id resolution is mutually exclusive.** `server.rs` treats any unknown
-  non-empty model id as an Ollama tag; m3 404s unless the model is installed or
-  an explicit runtime header is present. Both cannot hold for the same
-  `/v1/models` + `/v1/chat/completions` path. Someone has to pick and document
-  the break.
+- **Model-id resolution is mutually exclusive** — *decided, implementation reverted.*
+  `server.rs` treats any unknown non-empty model id as an Ollama tag; m3 404s unless the
+  model is installed or an explicit runtime header is present.
+
+  **The entry asked to "pick and document the break". Picking either breaks something
+  real**, which is why neither was picked:
+
+  - m3's `list_installed_models` reads *m3's own hub state*, so a tag pulled with
+    `ollama pull` is not in it. m3's rule 404s requests that work today.
+  - Worse, m3's `/api/tags` **reshapes m3's own inventory into Ollama's response shape**
+    rather than proxying Ollama. Legacy's `/v1/models` live-fetches
+    `ollama::list_tag_names` and labels each `owned_by: "ollama"` — it tells the truth;
+    m3 does not.
+
+  So the decision is **resolve and list against the union** — m3-managed models, live
+  Ollama tags when `expose_ollama` is on, provider-prefixed ids — with
+  `x-little-monkey-runtime-id` kept as the explicit override, and a 404 only when nothing
+  has it, naming where it looked.
+
+  **The implementation was written and reverted, and the reason is worth keeping.**
+  Resolution ran *before* `authorize_operation`, and `request_auth` promotes any
+  well-formed `Authorization: Bearer <anything>` to `HttpAuth::External` without
+  validating it — validity, revocation, expiry, scopes and rate limits are all enforced
+  later. So an unauthenticated caller got one outbound `/api/tags` probe per servable
+  runtime per request (unmetered: the limiter lives inside `authorize`, and
+  `MAX_ACTIVE_REQUESTS` is a concurrency cap), every runtime id echoed in the error body,
+  and a per-model-id existence oracle by 404-vs-401. That is the invariant
+  `server.rs`'s own comment states: a token not scoped for the `ollama` backend must never
+  see, or cause a request against, it. m3 honoured it *by accident* before, because
+  resolution was pure hub state.
+
+  Three further traps found while fixing it, recorded so the next attempt does not
+  rediscover them: `plan_model_resolution`'s **header and managed arms also return before
+  any authorize**, so fixing only the probe loop leaves the oracle open; `Unauthorized`
+  must `break` rather than `continue`, or one bogus token becomes N fsync'd
+  security-state writes behind a global mutex; and the same oracle still exists at
+  `discover_models` and three lifecycle paths, so this is a shared-helper fix rather than
+  a per-call-site one.
 - **Byte-level compatibility is load-bearing.** `Access-Control-Allow-Origin: *`
   on every legacy response versus m3's deny-all default; `/health` returning
   exactly `{"status":"ok"}`; the OpenAI error envelope real SDKs branch on;
@@ -225,27 +265,45 @@ Knowledge 2.0 (16 `knowledge_v*` commands in `knowledge_service.rs`).
 **Remaining.** The collapse itself, whose load-bearing step is a **data
 migration over users' existing embedded vectors**:
 
-- Extract the shared registry and embedding core out of `stacks.rs` (pure moves,
-  ~9 call sites).
+- ~~Extract the shared registry and embedding core out of `stacks.rs` (pure moves,
+  ~9 call sites).~~ **Done** — `knowledge_core.rs`. 29 items moved byte-identically, 62
+  tests split 44/18 with zero assertions changed. **The estimate was wrong: ~45 call
+  sites, not ~9** (16 `knowledge_service.rs`, 11 `portability_commands.rs`, 1
+  `diagnostics.rs`, ~17 `monkey-cli`). Harmless for the move itself, since they all
+  resolve through the re-export — but that is the size of the repointing below.
 - Port the two v1-only capabilities v2 lacks: source staleness, and the
   query-path hot cache that keeps the test-search box at keystroke latency.
-- **Synthesize a v2 generation from each v1 index without re-embedding.**
-  Feasible — `vectors.bin` rows are already L2-normalized f32 at the stack's
-  dimension, `ChunkMeta` supplies text/heading/path/hash, and `file_index.json`
-  supplies per-file SHA-256 — but it has to satisfy `validate_chunk` and
-  `validate_generation_contents` exactly, and set a `"v1-import"`
-  `pipeline_fingerprint` sentinel so the first real refresh cleanly re-extracts
-  with true v2 chunk boundaries. Imported chunks are a bridge, not a permanent
-  lie. Alternative is forcing every user to re-embed their whole corpus.
-- Then route every read through v2, delete the v1 index, and collapse the two
-  panels.
+- ~~**Synthesize a v2 generation from each v1 index without re-embedding.**~~ **Done**,
+  and the entry understated the hard part. Every factual claim in it held — the vectors
+  are reusable as-is, and all thirteen `validate_chunk`/`validate_generation_contents`
+  invariants are satisfiable. What it missed is that **a v1 stack's sources live in
+  `stacks/index.json`, not the v2 catalog**.
+
+  The first implementation gave every imported object one synthetic `v1-import:<sha256>`
+  source id, and that made the import a one-way door: `store.active()` became `Some` so
+  the agent was served v1-boundary chunks, `knowledge_v2_refresh` returned "Add and enable
+  at least one Knowledge 2.0 source" *before* reaching the fingerprint comparison so the
+  sentinel could never fire, and `remove_source_generation` filters against real catalog
+  ids (`Uuid::new_v4()`) so nothing ever matched and the objects could never be pruned.
+  Re-import was refused, so there was no undo either. "A bridge, not a permanent lie" was
+  false in the default case — caught by review, not by tests.
+
+  The shipped version seeds the catalog from `stack.sources` as part of the import, and
+  **the seeded ids are the ids the objects carry**. That one clause is the difference
+  between a real fix and a cosmetic one. All-or-nothing under the `catalog_lock`:
+  stage → `save_catalog` → activate, with a rollback to `previous_catalog` if activation
+  fails.
+- Port the remaining work: repoint the ~45 call sites off the re-export, route every
+  read through v2, delete the v1 index, and collapse the two panels. `stacks.rs` still
+  registers **12 Tauri commands**, so v1 is still live and this item is still
+  *partially built*.
 
 **Blocks:** K11 — context accounting cannot be honest while two systems
 produce context by different rules.
 
 *Maps to: ROADMAP #9.*
 
-## D3. A run identity that reaches the work it pays for *(mechanism built)*
+## D3. A run identity that reaches the work it pays for *(built)*
 
 **Shipped — `run_scope.rs`, and the choice of primitive is the whole decision.** A
 `tokio::task_local!`, not a `thread_local!`, and that is a correctness argument rather
@@ -356,7 +414,16 @@ reason. Passing `run_id: Some(..)` would have carried the first and silently fla
 the second into the blank the whole two-armed design exists to distinguish from it. Both
 arms are asserted.
 
-**Still to do:** the remaining client sites still record `None`.
+**Nothing left.** All twelve `denial_sink::record` sites across seven files either carry
+a run id or a coded reason. `run_commands.rs`'s two pass `Some(run_id)` explicitly, which
+needs no scope; every other site sits under one.
+
+The count in the original analysis was the wrong denominator and is worth correcting
+rather than quietly dropping: "65 client construction sites" counted *clients*, most of
+which never record anything. The number that mattered was **8** recording sites at the
+time of the audit, twelve now. A figure that large made the work look mechanical when the
+actual difficulty was per-site — whether a `tokio::spawn` or `spawn_blocking` sat between
+the scope and the record, which had to be traced one site at a time.
 
 ### `mcp.rs` — the question is answered, and the answer is "shared"
 
