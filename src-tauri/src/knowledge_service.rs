@@ -4599,41 +4599,57 @@ pub fn knowledge_ocr_configure_external(
 
 /// Largest OCR sidecar this host will accept, in bytes.
 ///
-/// One constant because the number has to be in two places that must agree: the
-/// `request.size_bytes` gate below, and the `max_file_bytes`/`max_total_bytes`
-/// [`fetch_http`] is given for the download itself. Two literals could drift, and
-/// the failure would be quiet in one direction — a fetch cap smaller than the
-/// declared-size gate turns "too big, refused up front" into "transport failure
-/// after downloading most of it".
-const OCR_SIDECAR_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// # This used to say 256 MiB, and it was never true
+///
+/// The declared gate and the enforced one disagreed by a factor of eight.
+/// `knowledge_ocr_install` admitted `request.size_bytes` up to 256 MiB and raised
+/// `PipelineLimits::max_file_bytes` to match, but [`fetch_http`] does not take that
+/// cap as given — it enforces `limits.max_file_bytes.min(MAX_HTTP_BYTES)`, and
+/// [`MAX_HTTP_BYTES`] is 32 MiB. So raising the limit accomplished nothing, and a
+/// sidecar between 32 and 256 MiB passed every up-front check and then died mid
+/// transfer with "Source response exceeds the byte limit" — the precise failure the
+/// old comment here claimed the constant ruled out.
+///
+/// # Why the smaller number wins
+///
+/// [`fetch_http`] buffers the whole body in memory before returning it, so
+/// `MAX_HTTP_BYTES` is not an arbitrary ceiling: it bounds a heap allocation an
+/// upstream server chooses the size of. Raising it to 256 MiB to make the other
+/// number true would trade a real bound for a cosmetic one. So the gate comes down
+/// to what is actually enforceable, and the refusal happens up front, naming the
+/// real limit, instead of after megabytes of transfer.
+///
+/// **If a real sidecar ever exceeds this**, the answer is a streaming download to
+/// disk rather than a bigger buffer — the asset is written to disk immediately
+/// afterwards anyway, so buffering it whole was never necessary. That is a change to
+/// [`fetch_http`] or a path of its own, and it is deliberately not smuggled in here.
+///
+/// Derived from [`MAX_HTTP_BYTES`] rather than spelled again, so the two cannot drift
+/// apart a second time. A test asserts the relationship, because a comment saying two
+/// numbers agree is exactly what was wrong before.
+const OCR_SIDECAR_MAX_BYTES: u64 = MAX_HTTP_BYTES as u64;
 
-/// The limit set [`knowledge_ocr_install`] hands [`fetch_http`], raised from the
-/// pipeline default's 32 MiB to `max_bytes` because a Tesseract sidecar is an
-/// order of magnitude larger than any document the pipeline ingests.
+/// The limit set [`knowledge_ocr_install`] hands [`fetch_http`].
 ///
-/// Exists as a function so the raise goes through [`PipelineLimits::validate`]
-/// rather than straight into a fetch. Be clear about what that buys today:
-/// nothing. `validate` checks only relational invariants — non-zero fields,
-/// `max_total_bytes >= max_file_bytes`, `max_redirects` within
-/// `MAX_REDIRECT_CHAIN` — and has no absolute ceiling on a byte cap, so the
-/// current 256 MiB passes and would pass at any size. The value is that the *next*
-/// edit here cannot silently produce an inconsistent set: raising one byte cap and
-/// not the other, or zeroing one, is now refused at the boundary instead of
-/// travelling into a fetch that would refuse every byte it read.
+/// `max_file_bytes` is the only field here that reaches anything: [`fetch_http`]
+/// enforces `max_file_bytes.min(MAX_HTTP_BYTES)` and never reads `max_total_bytes` --
+/// the sole reader of that field is `collect_selected_chats`, which this path does not
+/// touch. So the field is left at its default rather than assigned a number that would
+/// look like a bound and be inert. #200's predecessor set it to 256 MiB and justified
+/// the assignment with a claim about `fetch_http` reading it; it does not.
 ///
-/// `max_bytes` is a parameter rather than the constant read directly so the
-/// rejection path is reachable from a test — production has one caller and it
-/// passes [`OCR_SIDECAR_MAX_BYTES`].
-fn ocr_install_limits(max_bytes: u64) -> Result<PipelineLimits, String> {
-    let limits = PipelineLimits {
-        max_file_bytes: max_bytes,
-        max_total_bytes: max_bytes,
+/// Not a `Result`. `validate` can only fail on a relational invariant, every field
+/// here is either a compile-time constant or a default, and there is one caller -- so
+/// a fallible signature would be a `?` that never fires and an error path no test
+/// could reach without a parameter invented for it. The invariant that *is* real --
+/// that the declared cap does not exceed what `fetch_http` will enforce -- is asserted
+/// by a test against the constants themselves, which is where a claim about two
+/// numbers agreeing belongs.
+fn ocr_install_limits() -> PipelineLimits {
+    PipelineLimits {
+        max_file_bytes: OCR_SIDECAR_MAX_BYTES,
         ..PipelineLimits::default()
-    };
-    limits
-        .validate()
-        .map_err(|error| format!("Invalid OCR download limits: {error}"))?;
-    Ok(limits)
+    }
 }
 
 #[tauri::command]
@@ -4660,7 +4676,7 @@ pub async fn knowledge_ocr_install(
         return Err("OCR sidecars must be downloaded over HTTPS".to_string());
     }
     let origin = origin_of(&parsed)?;
-    let limits = ocr_install_limits(OCR_SIDECAR_MAX_BYTES)?;
+    let limits = ocr_install_limits();
     let fetched = fetch_http(
         &request.url,
         &origin,
@@ -5502,36 +5518,42 @@ mod tests {
         assert!(validate_jira_project_key("").is_err());
     }
 
+    /// The bug this replaces a cosmetic fix with: `knowledge_ocr_install` admitted a
+    /// declared size up to 256 MiB while [`fetch_http`] enforced
+    /// `max_file_bytes.min(MAX_HTTP_BYTES)` — 32 MiB. A sidecar in between passed every
+    /// up-front check and then died mid transfer.
+    ///
+    /// Asserted against the constants rather than against a download, because that is
+    /// the whole claim: the number the command *promises* cannot exceed the number the
+    /// fetch will *enforce*. The previous version of this code carried a comment
+    /// asserting exactly this and no test, and the comment was wrong by a factor of
+    /// eight — which is the argument for spending a test on two integers.
     #[test]
-    fn ocr_install_limits_accepts_the_cap_the_installer_actually_uses() {
-        let limits = ocr_install_limits(OCR_SIDECAR_MAX_BYTES)
-            .expect("the installer's own limit set must be a valid one");
-        // Both caps, not just the per-file one: `fetch_http` measures a single
-        // download against `max_file_bytes` and the running total against
-        // `max_total_bytes`, so leaving the latter at the pipeline default would cap
-        // the sidecar at 32 MiB by the other name.
-        assert_eq!(limits.max_file_bytes, OCR_SIDECAR_MAX_BYTES);
-        assert_eq!(limits.max_total_bytes, OCR_SIDECAR_MAX_BYTES);
-    }
-
-    #[test]
-    fn ocr_install_limits_refuses_a_cap_that_contradicts_the_rest_of_the_set() {
-        // Zero is the reachable inconsistency: a limit set that admits no bytes at
-        // all would let every OCR download start and then fail on the first read.
-        // `validate` is what turns that into a refusal before the fetch, and this
-        // case is the reason the raise goes through it rather than straight into
-        // `fetch_http`. Deleting that call makes this assertion fail.
-        let error = ocr_install_limits(0)
-            .expect_err("a zero byte cap is not a coherent limit set and must be refused");
-        assert!(
-            error.contains("Invalid OCR download limits"),
-            "rejection must name the limit set it refused, got: {error}"
+    fn the_declared_sidecar_cap_never_exceeds_the_one_the_fetch_enforces() {
+        let limits = ocr_install_limits();
+        let enforced = limits.max_file_bytes.min(MAX_HTTP_BYTES as u64);
+        assert_eq!(
+            OCR_SIDECAR_MAX_BYTES, enforced,
+            "a declared cap above the enforced one turns an up-front refusal into a \
+             transport failure after megabytes of transfer"
         );
-        // A cap below the pipeline's own `max_total_bytes` default is still fine —
-        // the invariant is `max_total_bytes >= max_file_bytes`, and this function
-        // moves both together, so lowering the cap must not be mistaken for
-        // inconsistency. Without this the test above would also pass a
-        // `validate` that refused everything.
-        assert!(ocr_install_limits(1024).is_ok());
+
+        // `max_total_bytes` is deliberately left at its default. `fetch_http` never
+        // reads it — `collect_selected_chats` is the only reader in this file — so
+        // assigning it here would look like a bound and be inert. Pinned so that
+        // "raise both to look symmetric" cannot come back without failing.
+        assert_eq!(
+            limits.max_total_bytes,
+            PipelineLimits::default().max_total_bytes,
+            "assigning an inert field is what made the old cap look enforced"
+        );
+
+        // The counter-test. Without it, `OCR_SIDECAR_MAX_BYTES = 0` would satisfy
+        // every assertion above while refusing every sidecar that exists.
+        assert!(
+            OCR_SIDECAR_MAX_BYTES >= 8 * 1024 * 1024,
+            "the cap must still admit a real sidecar"
+        );
+        assert!(limits.validate().is_ok(), "the limit set must be coherent");
     }
 }
