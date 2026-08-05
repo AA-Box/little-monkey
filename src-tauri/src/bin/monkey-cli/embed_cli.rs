@@ -2,7 +2,8 @@
 //! design doc slice 4, CLI parity for the `llama` embedding backend).
 //!
 //! Before this module existed, nothing in `monkey-cli` could ever start this
-//! process at all: `stacks::embed_via_llama` (`stacks.rs`) just POSTs to
+//! process at all: `embed_via_llama` (now `knowledge_core.rs`, re-exported by
+//! `stacks`) just POSTs to
 //! `http://127.0.0.1:{EMBED_PORT}/v1/embeddings` with no fallback, so any
 //! `llama`-backend stack (the curated/default backend — see
 //! `KnowledgePanel.tsx`) failed outright from a terminal unless the desktop
