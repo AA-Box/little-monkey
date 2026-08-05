@@ -1744,10 +1744,35 @@ named, and a `.timeout(` on a *`RequestBuilder`* correctly does not trip it.
   day it gets one. The test pins a two-byte-per-character path that is under the
   limit in characters and over it in bytes, so the comparison cannot be quietly
   "tidied" back later.
-- **`allow_private_networks` is one switch over fourteen distinct rules,** so a
-  setting named for private networks also permits multicast, `255.255.255.255`,
-  `240/4` and the deprecated `::/96` form. Now that the rules have names, this could
-  become a per-class allowance; today it is all or nothing.
+- ~~**`allow_private_networks` is one switch over fourteen distinct rules.**~~
+  **Fixed — it is a per-class allowance now**, which is the thing this entry said the
+  named rules made possible. `EgressRule::covered_by_private_network_grant` decides
+  it, and the switch covers exactly six classes: loopback, RFC 1918, link-local,
+  unique-local IPv6, CGNAT (`100.64/10` is Tailscale's default range and live on some
+  consumer ISPs, so a real peer lives there) and the unspecified address — that last
+  because an outbound connection to `0.0.0.0` is routed to `127.0.0.1`, so it reaches
+  the *same* service the loopback grant already covers and refusing it would be
+  inconsistent about one destination rather than protective of anything.
+
+  It no longer covers multicast, broadcast, `0/8` past `0.0.0.0`, `192.0.0/24`, the
+  documentation and benchmarking ranges, `240/4`, or the deprecated IPv4-compatible
+  form. That last is the one worth naming: it is not a class of destination but an
+  alternative *spelling* of one, so blanketing it did not widen the reachable network
+  — it offered a second way to write any address at all past the classifier that
+  refuses it.
+
+  **Scope, stated plainly: this changes no shipped behaviour.** All three production
+  callers of `UrlSourcePolicy::new` — two in `knowledge_service.rs` and one in
+  `connectors.rs` — pass `false` for this switch, and nothing in the frontend sets
+  it. So this is a latent-correctness fix that makes the setting mean its name before
+  anything turns it on, not a live hole being closed. Worth being exact about, rather
+  than filed under the security fixes above it.
+
+  Written as an exhaustive `match` rather than a `matches!` over the covered set, so
+  a rule added to `EgressRule` later is a compile error until somebody decides which
+  side of the line it belongs on — the failure mode being guarded is not a wrong
+  answer for a rule someone considered, it is a new rule landing on the permissive
+  side by default.
 
 **Two things the denial sink will have to handle, learnt from doing this first.**
 Neither is a defect in the sink's absence, which is precisely why finding them now
