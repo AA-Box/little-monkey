@@ -1687,7 +1687,14 @@ mod tests {
         .await;
         match result {
             Ok(_) => panic!("expected a loopback destination to be blocked by default"),
-            Err(message) => assert!(message.contains("blocked"), "unexpected error: {message}"),
+            // The rule code rather than the word "blocked": this refusal crosses a
+            // `.map_err(|error| error.to_string())` boundary, so the code is all the
+            // identity that survives — and it says *loopback*, where the prose this
+            // replaces would have matched any of fourteen address classes.
+            Err(message) => assert!(
+                message.contains(crate::egress::EgressRule::Loopback.code()),
+                "unexpected error: {message}"
+            ),
         }
     }
 
