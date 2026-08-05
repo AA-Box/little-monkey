@@ -1431,8 +1431,12 @@ mod tests {
             ("bin/monkey-cli/embed_cli.rs", 1),
             // Bundled `llama-server` health/completion probes.
             ("llama.rs", 2),
-            // The local Ollama daemon on `11434`.
-            ("ollama.rs", 2),
+            // `ollama.rs` used to sit here with 2. Both were converted rather
+            // than justified: loopback-only earns a site an exemption from the
+            // *redirect* and credential rules, but not from having any deadline
+            // at all, and these two were `#[tauri::command]`s that would hang
+            // the UI forever against a daemon that went quiet. Every Ollama
+            // call now goes through `ollama_client`.
             // The two API-server instances' `local_client`. Each was one client
             // serving both loopback inference and cloud providers; the cloud half
             // now starts from `hardened()` and these two are loopback-only by
