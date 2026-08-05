@@ -39,6 +39,13 @@ pub mod m5_delivery;
 pub mod runtime_adapter;
 // Verified app-owned llama.cpp runtime shared by desktop, CLI, and M3.
 pub mod managed_runtime;
+// The stack registry and the embedding path, shared by v1 Knowledge Stacks
+// (`stacks`) and Knowledge 2.0 (`knowledge_service`/`knowledge_pipeline`).
+// Extracted out of `stacks` so that nothing shared lives in the module the v1→v2
+// collapse is going to delete. v2's call sites still reach it *through* `stacks`'s
+// re-export, so the dependency is broken structurally and not yet in fact — see
+// this module's own doc for the repointing that step needs.
+pub mod knowledge_core;
 // Knowledge Stacks 2.0 contracts and generation-based hybrid index. Kept
 // Tauri-free so desktop, daemon, CLI workflows, and connector packages share
 // the same hostile-input and citation semantics.
