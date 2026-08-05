@@ -56,9 +56,9 @@ use std::future::Future;
 ///
 /// A closed set with stable codes rather than free text, for the reason
 /// [`crate::egress::EgressRule`] is: the code is what gets persisted and compared,
-/// so it has to outlive both the prose and this enum's spelling. Four variants
-/// covering the five cases the audit actually found — a model download and an
-/// update check are both `Startup`-class only if they happen at startup, so a
+/// so it has to outlive both the prose and this enum's spelling. The first four
+/// cover the five cases the audit actually found — a model download and an update
+/// check are both `Startup`-class only if they happen at startup, so a
 /// user-initiated download is [`UserAction`](Self::UserAction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Unattributed {
@@ -73,6 +73,29 @@ pub enum Unattributed {
     InboundRequest,
     /// Work done while the process comes up, before any run can exist.
     Startup,
+    /// A transport deliberately shared by every run that uses it, so its own
+    /// traffic belongs to the *connection* rather than to any one run.
+    ///
+    /// Unlike the four above, this one is a **decision** and not an observation,
+    /// so it is worth writing down why the decision went this way. The case is
+    /// `mcp.rs`: one connection per configured MCP server, reused by every run.
+    /// The alternative — one transport per run per server — was rejected on three
+    /// counts:
+    ///
+    /// - A stdio MCP server is a *child process*. Five parallel runs against four
+    ///   configured servers would mean twenty processes instead of four; that is a
+    ///   resource regression a user feels, in exchange for a label.
+    /// - Per-run connections multiply OAuth token refreshes by the concurrency,
+    ///   which is a good way to meet a provider's rate limit.
+    /// - What per-run connections would actually make attributable is the
+    ///   transport's *own* traffic — the SSE notification stream and its
+    ///   reconnects — and that traffic genuinely belongs to the connection. No run
+    ///   asked for it and it outlives any single run.
+    ///
+    /// So paying a felt resource cost to attach a run id to a stream that is not
+    /// one run's is backwards, and this variant is the honest label for what that
+    /// stream is instead.
+    SharedTransport,
 }
 
 impl Unattributed {
@@ -82,6 +105,7 @@ impl Unattributed {
         Unattributed::Scheduled,
         Unattributed::InboundRequest,
         Unattributed::Startup,
+        Unattributed::SharedTransport,
     ];
 
     /// The stable identity that gets persisted. Never reworded.
@@ -92,6 +116,7 @@ impl Unattributed {
             Unattributed::Scheduled => "unattributed.scheduled",
             Unattributed::InboundRequest => "unattributed.inbound-request",
             Unattributed::Startup => "unattributed.startup",
+            Unattributed::SharedTransport => "unattributed.shared-transport",
         }
     }
 }
@@ -363,6 +388,7 @@ mod tests {
                 "unattributed.scheduled",
                 "unattributed.inbound-request",
                 "unattributed.startup",
+                "unattributed.shared-transport",
             ]
         );
         assert_eq!(

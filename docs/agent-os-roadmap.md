@@ -263,6 +263,7 @@ part worth defending. `Run(id)` and `Unattributed(reason)` are the two things wo
 yet. Collapsing "deliberately background" and "we lost it" into one blank is exactly
 what makes an audit trail unreadable later, so `Unattributed` carries a named reason
 with a stable code (`unattributed.user-action`, `.scheduled`, `.inbound-request`,
+`.shared-transport`,
 `.startup`) pinned by a test, for the same reason `EgressRule`'s codes are.
 
 **The first consumer is the denial sink, and it retires that module's own confession.**
@@ -355,10 +356,9 @@ reason. Passing `run_id: Some(..)` would have carried the first and silently fla
 the second into the blank the whole two-armed design exists to distinguish from it. Both
 arms are asserted.
 
-**Still to do:** the remaining client sites still record `None`, and `mcp.rs` is
-deliberately deferred for the reason below.
+**Still to do:** the remaining client sites still record `None`.
 
-### `mcp.rs` is harder than "a cached client", and is deliberately not adopted yet
+### `mcp.rs` — the question is answered, and the answer is "shared"
 
 Measured rather than assumed, because the shared-client framing understates it. A tool
 call reaches the network like this:
@@ -401,10 +401,50 @@ where it is known, the third shape becomes optional. Picking now would be guessi
 requirement that does not exist yet, and the guess that costs a child process per run
 is not one to make speculatively.
 
-What K5 should decide first, in one sentence: **is an MCP server's transport allowed to
-be shared across runs?** Everything above follows from that answer, and until it is
-answered, `mcp.rs` recording `None` is the honest state rather than a gap — the
-mechanism is proven and this module's blank is a known, reasoned one.
+**Answered: yes, shared — and the egress that cannot be attributed says so instead of
+recording a blank.** Three reasons, in the order they mattered:
+
+- A stdio MCP server is a **child process**. One transport per run per server multiplies
+  process count by concurrency: five parallel runs against four servers is twenty
+  processes instead of four. That is a resource regression a user feels, traded for a
+  label.
+- Per-run connections multiply OAuth token refreshes, which is how a provider rate limit
+  gets hit by a feature nobody asked for.
+- What would become attributable is the transport's *own* traffic — the SSE notification
+  stream, its `Last-Event-ID` reconnects, the session delete. That traffic genuinely
+  belongs to the connection, which outlives every run that uses it. Attaching one run's
+  id to it would be a confident wrong label, and this file's history is that those are
+  worse than an honest blank.
+
+So `Unattributed::SharedTransport` is a fifth reason with its own stable code, and
+`connect_impl` enters it. What that covers is stated precisely rather than generously:
+the OAuth token fetch and the keychain read, which really do run in the caller's task —
+and **none** of the transport's requests, because `rmcp::serve_client` spawns the service
+loop (`rmcp-2.2.0/src/service.rs:945`) and `Transport::send` only pushes onto an mpsc
+channel, so even the `initialize` POST that `serve_client` awaits is issued by the worker
+task. Those record neither a run nor a reason, which is `run_scope`'s third state doing
+its job.
+
+The seam that could close the rest is a `StreamableHttpClient` wrapper entering the scope
+per request. It is not worth it yet: implementing that trait means naming `sse_stream::Sse`
+and `http::HeaderName`, neither of which rmcp re-exports nor this crate depends on
+directly — two dependencies and a stream wrapper to establish a scope that no policy reads
+today.
+
+**The ceiling, named here rather than left to be found:** the one credentialed in-task
+round-trip this covers is the OAuth refresh, and the reauth retry in
+`call_tool_with_cancel_impl` reaches it from *inside* a run's scope. So once a per-run
+allowlist reads `current()`, a run-triggered refresh is evaluated under the connection's
+policy, not that run's. That is the right default — the token belongs to the connection
+and is shared by every later run, so refreshing it on one run's narrower allowlist would
+let whichever run tripped the refresh decide whether every other run's connection
+survives — but it is a choice to re-read when K5's allowlist lands, not a detail to
+rediscover.
+
+Verified by sabotage: dropping the wrapper on `connect_impl` fails with
+`left: Some(Run("run:establishes-a-connection"))` where the connection reason belongs. The
+test drives the real call path rather than `run_scope::scoped` directly, which is what the
+two earlier adoptions set as the bar.
 
 ---
 
