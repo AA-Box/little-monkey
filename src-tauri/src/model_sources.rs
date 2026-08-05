@@ -220,7 +220,40 @@ struct HfCardData {
     license_link: Option<String>,
 }
 
+/// Resolves a public reference to immutable, digest-pinned metadata.
+///
+/// # The scope, and why `UserAction` is the honest arm
+///
+/// Everything below this point that refuses a destination —
+/// [`validate_public_https_url`] at thirteen call sites, `validate_ollama_auth_url`,
+/// and the unparseable-`license_link` record in [`hugging_face_license`] — writes into
+/// the denial sink, and every one of those rows was blank. This is where the label can
+/// be applied: the two callers are `models_resolve_reference` (a Tauri command behind
+/// the Settings model picker) and `monkey-cli model resolve`, and both are a person
+/// asking for a model. `run_scope`'s own doc names this case — "starting a model
+/// download" — as [`crate::run_scope::Unattributed::UserAction`].
+///
+/// The interesting rows here are the ones a *remote* server causes: a hostile
+/// `license_link`, a redirect off the allowlist, an auth realm naming another host.
+/// Those are precisely the ones an operator would want attributed, and they were the
+/// least readable rows in the table.
+///
+/// No `spawn` sits between this scope and any of those sites. The two
+/// `spawn_blocking` calls in this file — the cross-process install lock and the
+/// SHA-256 hash — record nothing, so nothing is lost to a task-local that does not
+/// cross them. If a durable run ever installs a model, this and
+/// [`install_reference`] must take a [`crate::run_scope::RunScope`] instead of
+/// hardcoding one, for the reason `m4_runtime::run_async_worker` states.
 pub async fn resolve_reference(reference: &str) -> Result<ResolvedModelReference, String> {
+    crate::run_scope::scoped(
+        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+        resolve_within_scope(reference),
+    )
+    .await
+}
+
+/// [`resolve_reference`]'s body, with the scope already established.
+async fn resolve_within_scope(reference: &str) -> Result<ResolvedModelReference, String> {
     let client = build_http_client()?;
     Ok(resolve_reference_with_client(&client, reference)
         .await?
@@ -248,7 +281,29 @@ fn validate_expected_digest(
 /// holding a cross-process destination lock. If a process is killed between
 /// those two renames, the next pull re-hashes the orphan and reconstructs its
 /// sidecar instead of downloading a duplicate multi-gigabyte file.
+///
+/// Enters the same scope [`resolve_reference`] does, for the same reasons — see that
+/// function's doc. Split into a wrapper plus `install_within_scope` rather than
+/// wrapping the body in an `async` block, so the scope is one readable frame and the
+/// body it covers is unchanged.
 pub async fn install_reference<F>(
+    models_dir: &Path,
+    reference: &str,
+    expected_sha256: &str,
+    on_progress: F,
+) -> Result<InstalledModelReference, String>
+where
+    F: FnMut(ModelDownloadProgress),
+{
+    crate::run_scope::scoped(
+        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+        install_within_scope(models_dir, reference, expected_sha256, on_progress),
+    )
+    .await
+}
+
+/// [`install_reference`]'s body, with the scope already established.
+async fn install_within_scope<F>(
     models_dir: &Path,
     reference: &str,
     expected_sha256: &str,
@@ -382,6 +437,28 @@ where
 ///
 /// A missing sidecar is `Ok(None)`. A corrupt or mismatched sidecar is an
 /// error so callers can fail closed instead of inventing capabilities.
+///
+/// # Why the scope is entered inside this function
+///
+/// [`validate_provenance`] runs the same destination gate the download path does, so a
+/// sidecar naming a non-public `downloadUrl` records a denial — and every one of them
+/// recorded a blank. The four callers are `models_list_installed`, `llama_start`,
+/// `embed_server_start` and `monkey-cli`, and all four are one answer: a person asked
+/// for a model list or clicked Start, so [`crate::run_scope::Unattributed::UserAction`].
+///
+/// Two of the four cannot deliver that answer from their own boundary.
+/// `llama_start`/`embed_server_start` reach here through
+/// `tokio::task::spawn_blocking`, and a spawned blocking task inherits no task-local —
+/// a `scoped` at either command would have produced exactly the failure this repo has
+/// already been bitten by: code that reads as instrumented and still writes `NULL`. So
+/// the nearest boundary that can carry the label is this function, and it uses
+/// [`crate::run_scope::scoped_sync`] because there is no future here to wrap.
+///
+/// If a durable run ever validates provenance, this must take a
+/// [`crate::run_scope::RunScope`] parameter instead — `m4_runtime::run_async_worker`
+/// made that exact move for the same reason. A `scoped_sync` shadows an outer scope,
+/// so leaving it hardcoded once a run reaches here would relabel that run's egress as
+/// a user action, which is a worse record than none.
 pub fn load_provenance(model_path: &Path) -> Result<Option<ManagedModelProvenance>, String> {
     let sidecar = provenance_path(model_path)?;
     let metadata = match fs::symlink_metadata(&sidecar) {
@@ -412,7 +489,13 @@ pub fn load_provenance(model_path: &Path) -> Result<Option<ManagedModelProvenanc
             sidecar.display()
         )
     })?;
-    validate_provenance(model_path, &provenance)?;
+    // Only the validation call is wrapped, not the whole body: the reads above cannot
+    // refuse an egress destination, and a scope around them would only widen what the
+    // label appears to cover.
+    crate::run_scope::scoped_sync(
+        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+        || validate_provenance(model_path, &provenance),
+    )?;
     Ok(Some(provenance))
 }
 
@@ -3642,6 +3725,202 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The provenance gate's refusals now say *why* they have no run, and the shape
+    /// this pins is the one the repo has already been bitten by.
+    ///
+    /// `llama_start` and `embed_server_start` reach [`load_provenance`] through
+    /// `tokio::task::spawn_blocking`, which inherits no task-local — so the scope has
+    /// to be entered below the spawn or it does not exist at the recording site at
+    /// all. This test drives it through a real `spawn_blocking`, which is the only
+    /// version of the assertion that can fail for the right reason: move the
+    /// `scoped_sync` up to a caller and this goes back to a blank column while a test
+    /// that called `load_provenance` directly would still pass.
+    ///
+    /// Hermetic and network-free: the download-URL check in `validate_provenance` runs
+    /// before the GGUF itself is ever opened, so a sidecar and a path are the whole
+    /// fixture. The address is unique to this test, so nothing another test records
+    /// into the same process-wide sink can satisfy the filter.
+    #[tokio::test]
+    async fn a_refused_provenance_url_survives_the_spawn_that_validates_it() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory = test_dir("provenance-scope");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+
+        // A private address rather than loopback: `10.66.4.21` appears nowhere else in
+        // this crate's tests, so the filter below cannot be satisfied by another one.
+        const REFUSED_HOST: &str = "10.66.4.21";
+        let model_path = directory.join("model.gguf");
+        let provenance = ManagedModelProvenance {
+            schema_version: PROVENANCE_SCHEMA_VERSION,
+            source: ModelReferenceSource::HuggingFace,
+            requested_reference: "hf:owner/repo".to_string(),
+            canonical_reference: "hf:owner/repo".to_string(),
+            display_name: "Provenance Scope Fixture".to_string(),
+            repo: "owner/repo".to_string(),
+            revision: "a".repeat(40),
+            source_file_name: "model.gguf".to_string(),
+            local_file_name: "model.gguf".to_string(),
+            download_url: format!("https://{REFUSED_HOST}/model.gguf"),
+            sha256: digest('c'),
+            size_bytes: 4_096,
+            tool_calling: false,
+            license_name: None,
+            license_url: None,
+            installed_at_ms: 1,
+        };
+        // Written directly rather than through `save_provenance`, which validates
+        // first and would therefore refuse to produce this fixture at all — the
+        // tampered-sidecar case is the only way this gate is reachable offline.
+        fs::write(
+            provenance_path(&model_path).unwrap(),
+            serde_json::to_vec(&provenance).unwrap(),
+        )
+        .unwrap();
+
+        let verification_path = model_path.clone();
+        let error = tokio::task::spawn_blocking(move || {
+            verify_managed_model_for_runtime(&verification_path)
+        })
+        .await
+        .expect("the blocking task joins")
+        .expect_err("a private download URL must be refused");
+        assert!(
+            error.contains(EgressRule::PrivateV4.code()),
+            "unexpected error: {error}"
+        );
+
+        let rows: Vec<_> = crate::denial_sink::DenialSink::open(&path)
+            .expect("reopens for reading")
+            .recent(256)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.detail.as_deref() == Some(REFUSED_HOST))
+            .collect();
+
+        assert_eq!(rows.len(), 1, "exactly one record for this test's address");
+        assert_eq!(rows[0].guard, MODEL_SOURCE_GUARD);
+        assert_eq!(rows[0].rule_code, EgressRule::PrivateV4.code());
+        assert_eq!(
+            rows[0].run_id, None,
+            "starting a local runtime is not a run, so there is no id to invent"
+        );
+        assert_eq!(
+            rows[0].unattributed_reason.as_deref(),
+            Some(crate::run_scope::Unattributed::UserAction.code()),
+            "the reason must survive `spawn_blocking`, which no task-local does"
+        );
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The counter-test to the one above: the provenance gate is not simply refusing
+    /// every sidecar it reads, which is what would satisfy that test without the gate
+    /// working at all.
+    ///
+    /// Asserted on the *absence of any rule code*, not on the sink, and deliberately:
+    /// the sink is process-wide and several tests in this file record into it without
+    /// taking `test_lock`, so "this file's sink is empty" is not a claim a parallel test
+    /// binary can make. The absence of `[egress.` covers the whole class of refusals at
+    /// once — the same idiom `web.rs`'s `fetch_impl_honors_settings_allow_local_network`
+    /// uses, and for the same reason a per-rule assertion would be weaker.
+    #[test]
+    fn an_accepted_provenance_url_is_not_refused_by_the_destination_gate() {
+        let directory = test_dir("provenance-scope-ok");
+        fs::create_dir_all(&directory).unwrap();
+
+        let model_path = directory.join("model.gguf");
+        let provenance = ManagedModelProvenance {
+            schema_version: PROVENANCE_SCHEMA_VERSION,
+            source: ModelReferenceSource::HuggingFace,
+            requested_reference: "hf:owner/repo".to_string(),
+            canonical_reference: "hf:owner/repo".to_string(),
+            display_name: "Provenance Scope Fixture".to_string(),
+            repo: "owner/repo".to_string(),
+            revision: "a".repeat(40),
+            source_file_name: "model.gguf".to_string(),
+            local_file_name: "model.gguf".to_string(),
+            download_url: "https://huggingface.co/owner/repo/resolve/main/model.gguf".to_string(),
+            sha256: digest('d'),
+            size_bytes: 4_096,
+            tool_calling: false,
+            license_name: None,
+            license_url: None,
+            installed_at_ms: 1,
+        };
+        fs::write(
+            provenance_path(&model_path).unwrap(),
+            serde_json::to_vec(&provenance).unwrap(),
+        )
+        .unwrap();
+
+        // It still fails — on the GGUF that is not there — and that is the point: it
+        // got past the destination gate, so the failure names no egress rule.
+        let error = load_provenance(&model_path).expect_err("the GGUF itself is missing");
+        assert!(
+            !error.contains("[egress."),
+            "no rule may have refused this: {error}"
+        );
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The two network entry points must each enter a run scope, so that the thirteen
+    /// `validate_public_https_url` call sites below them stop recording a blank.
+    ///
+    /// A source ratchet rather than a sink assertion, and the reason is the same one
+    /// that makes `the_registry_token_request_rechecks_where_the_redirect_chain_ended`
+    /// one: neither of these paths can be made to refuse anything offline. Every URL
+    /// they build comes from a hardcoded public origin, and the refusals that *are*
+    /// reachable — a hostile `license_link`, a redirect off the allowlist, an auth realm
+    /// naming another host — all sit behind a live HTTP response. The mechanism itself
+    /// is pinned against a real sink by the provenance test above; what is unprovable
+    /// here is only that these two callers still enter it.
+    ///
+    /// Comment lines are stripped first, because the prose explaining a scan is exactly
+    /// what a scan for that prose's subject matches — a mistake this repo has made
+    /// three times.
+    #[test]
+    fn both_model_source_network_entry_points_name_the_work_as_a_user_action() {
+        let source = include_str!("model_sources.rs");
+        let stripped = source
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for signature in [
+            "pub async fn resolve_reference(",
+            "pub async fn install_reference<F>(",
+        ] {
+            let body = stripped
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("{signature} is declared"))
+                .1
+                .split_once("\n}\n")
+                .expect("its body ends")
+                .0;
+            assert!(
+                body.contains("crate::run_scope::scoped("),
+                "{signature} must enter a run scope, or every destination refusal \
+                 beneath it records an unexplained blank"
+            );
+            assert!(
+                body.contains("Unattributed::UserAction"),
+                "{signature} must name the reason it has no run, not pick any arm"
+            );
+        }
     }
 
     #[test]
