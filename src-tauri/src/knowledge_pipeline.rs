@@ -613,6 +613,25 @@ impl UrlSourcePolicy {
         resolved_addresses: &[IpAddr],
         limits: &PipelineLimits,
     ) -> PipelineResult<ValidatedUrl> {
+        let verdict = self.classify(value, resolved_addresses, limits);
+        // Recorded here rather than in `knowledge_service.rs`, which is where this
+        // error becomes a `String` and the rule stops being a value. Only the
+        // request-time ladder is recorded: `normalize_origin`'s configuration-shape
+        // refusals fire while a policy is being *built*, and a denial sink that
+        // counted those would put a settings typo in the same column as a source
+        // reaching for `169.254.169.254`.
+        if let Err(PipelineError::UrlRejected(denial)) = &verdict {
+            crate::denial_sink::record(URL_SOURCE_GUARD, denial, None);
+        }
+        verdict
+    }
+
+    fn classify(
+        &self,
+        value: &str,
+        resolved_addresses: &[IpAddr],
+        limits: &PipelineLimits,
+    ) -> PipelineResult<ValidatedUrl> {
         // Two rules, not one condition. These were `if over_length || has_control`
         // with a single message naming both, which meant a 40 KB URL and a URL
         // carrying a `\r` were indistinguishable to anything downstream — and one
@@ -734,6 +753,9 @@ impl UrlSourcePolicy {
 /// [`EgressRule::UrlMalformed`] exists precisely to be *distinguishable* from a
 /// policy decision, so using it here loses nothing and keeps one spelling for
 /// "this text is not a URL" across both entry points.
+/// Names this guard in a denial record.
+const URL_SOURCE_GUARD: &str = "knowledge.url-source";
+
 fn normalize_origin(value: &str) -> PipelineResult<String> {
     let url = Url::parse(value)
         .map_err(|error| url_refused_about(EgressRule::UrlMalformed, error.to_string()))?;

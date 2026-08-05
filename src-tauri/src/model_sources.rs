@@ -2302,6 +2302,21 @@ fn refused(denial: EgressDenial) -> std::io::Error {
 /// to print — the offending host, the offending address — ride in the denial's
 /// own detail instead.
 fn validate_public_https_url(url: &Url) -> Result<(), EgressDenial> {
+    let verdict = classify_public_https_url(url);
+    if let Err(denial) = &verdict {
+        // The single choke point all thirteen call sites pass through, so one line
+        // covers every model-source destination check — pre-flight and post-redirect
+        // alike.
+        crate::denial_sink::record(MODEL_SOURCE_GUARD, denial, None);
+    }
+    verdict
+}
+
+/// Names this guard in a denial record.
+const MODEL_SOURCE_GUARD: &str = "model-sources.url";
+
+/// [`validate_public_https_url`]'s decision, without the recording.
+fn classify_public_https_url(url: &Url) -> Result<(), EgressDenial> {
     if url.scheme() != "https" {
         return Err(EgressDenial::about(
             EgressRule::SchemeNotAllowed,

@@ -215,6 +215,7 @@ pub mod output_cap;
 // guards already exist, and this holds only the narrow rules all four need to
 // agree on. See `egress.rs` for why unifying their blocklists is a separate,
 // riskier change.
+pub mod denial_sink;
 pub mod egress;
 // `pub` (unlike `sessions`/`tools`/`system`/`models`/`git`/`llama` above) so
 // `monkey-cli` (Plan/Act + risk-adaptive permissions design doc, phase 4) can
@@ -674,6 +675,18 @@ impl Default for AppState {
 pub fn run() {
     let app_data_dir = app_paths::data_dir()
         .expect("the operating system must provide an application data directory");
+    // Installed before anything that can refuse an outbound request, and the only
+    // initialization here that is deliberately NOT an `expect`. Every neighbour on
+    // this list is a capability the app needs to work; this one only writes refusals
+    // down. A machine that cannot open it should lose the audit trail, not the
+    // application — and it cannot fail *open*, because no guard consults the sink to
+    // decide anything. See `denial_sink`'s module doc.
+    match denial_sink::DenialSink::open(app_data_dir.join(denial_sink::SINK_FILE)) {
+        Ok(sink) => denial_sink::install(sink),
+        Err(error) => {
+            eprintln!("egress denials will not be recorded this session: {error}");
+        }
+    }
     let m3_state = m3_production::build_m3_command_state(&app_data_dir)
         .expect("failed to initialize the local runtime and API hub");
     let quantization_state = m3_production::build_quantization_command_state(&app_data_dir)

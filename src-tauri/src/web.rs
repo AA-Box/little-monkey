@@ -424,6 +424,30 @@ fn blocked_reason_ip(ip: &IpAddr) -> Option<EgressRule> {
 /// custom redirect policy in [`fetch_impl`], on every redirect hop — see the
 /// module doc for why re-checking every hop is the actual security boundary.
 pub fn validate_fetch_url(url: &Url, allow_local_network: bool) -> Result<(), EgressDenial> {
+    let verdict = classify_fetch_url(url, allow_local_network);
+    if let Err(denial) = &verdict {
+        // Recorded here, at the raise site, rather than at the command boundary —
+        // which is the whole reason the sink is reachable without a state handle.
+        // By the time this refusal reaches `tool_web_fetch` it is a `String`, and a
+        // sink fed from there would be parsing its own rule code back out of a
+        // sentence. Fail-soft and never consulted by any decision: see
+        // `denial_sink`'s module doc.
+        crate::denial_sink::record(GUARD, denial, None);
+    }
+    verdict
+}
+
+/// Names this guard in a denial record, so that two guards disagreeing about the
+/// same address class stay distinguishable in the sink.
+const GUARD: &str = "web.fetch";
+
+/// [`validate_fetch_url`]'s decision, without the recording.
+///
+/// Split so the guard's logic stays a pure function of its arguments: the tests
+/// below drive this one, and a test that recorded into a process-wide sink as a
+/// side effect of asserting a verdict would couple every one of them to every
+/// other test's expectations.
+fn classify_fetch_url(url: &Url, allow_local_network: bool) -> Result<(), EgressDenial> {
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err(EgressDenial::about(
             EgressRule::SchemeNotAllowed,
@@ -1416,10 +1440,75 @@ mod tests {
     /// so a test that meant "loopback was refused" could only prove "one of ten
     /// classes was refused", and a guard that misclassified loopback as private
     /// would have passed every one of them.
+    /// Drives [`classify_fetch_url`], the pure half, deliberately. Going through
+    /// [`validate_fetch_url`] would make every one of the assertions below write
+    /// into whatever process-wide sink another test happened to install.
     fn refusing_rule(target: &str) -> EgressRule {
-        validate_fetch_url(&url(target), false)
+        classify_fetch_url(&url(target), false)
             .expect_err("expected a refusal")
             .rule()
+    }
+
+    /// The recording half, and the claim K5's acceptance actually makes: a blocked
+    /// attempt becomes a durable record naming the rule that blocked it.
+    ///
+    /// Uses a file-backed sink and a second connection to read it, rather than a
+    /// test-only accessor on the installed one — which also exercises the path that
+    /// ships. The assertion filters by a host unique to this test, so it cannot be
+    /// satisfied (or broken) by a denial another test recorded into the same sink.
+    #[test]
+    fn a_refused_fetch_is_written_down_with_its_rule() {
+        let directory = std::env::temp_dir().join(format!("lm-web-sink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("creates the directory");
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+
+        // A literal, so no DNS is involved and the rule is unambiguous.
+        let denial = validate_fetch_url(&url("http://169.254.169.254/latest/meta-data/"), false)
+            .expect_err("link-local must be refused");
+        assert_eq!(denial.rule(), EgressRule::LinkLocal);
+
+        let reader = crate::denial_sink::DenialSink::open(&path).expect("reopens for reading");
+        let mine: Vec<_> = reader
+            .recent(64)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.detail.as_deref() == Some("169.254.169.254"))
+            .collect();
+
+        assert_eq!(mine.len(), 1, "exactly one record for this test's address");
+        assert_eq!(mine[0].rule_code, EgressRule::LinkLocal.code());
+        assert_eq!(mine[0].guard, GUARD);
+        assert_eq!(mine[0].run_id, None, "a tool-call fetch has no run to name");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The counter-test: an allowed fetch must leave no record. Without it, "record
+    /// everything unconditionally" would pass the test above.
+    #[test]
+    fn an_allowed_fetch_records_nothing() {
+        let directory = std::env::temp_dir().join(format!("lm-web-ok-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("creates the directory");
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+
+        validate_fetch_url(&url("http://93.184.216.34/"), false).expect("a public literal passes");
+
+        let reader = crate::denial_sink::DenialSink::open(&path).expect("reopens for reading");
+        let mine = reader
+            .recent(64)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.detail.as_deref() == Some("93.184.216.34"))
+            .count();
+        assert_eq!(mine, 0, "nothing was refused, so nothing may be recorded");
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
