@@ -1813,11 +1813,45 @@ rename:
   The lesson worth keeping: this entry described a *missing check* when the defect was
   a *disagreement between two numbers*. Fixing what an entry says rather than what the
   code does is how a cosmetic change ships with a confident comment on it.
-- **`model_sources.rs` caps redirects at 8 while `egress.rs` caps at 10,** and it
-  hand-builds its client rather than starting from `egress::hardened()`. *The missing
-  read timeout is fixed — see the shipped note below. The cap mismatch stands, and so
-  does the fact that it spells the constructor `Client::builder()`, which the
-  bare-client ratchet cannot see.*
+- ~~**`model_sources.rs` caps redirects at 8 while `egress.rs` caps at 10,** and it
+  hand-builds its client rather than starting from `egress::hardened()`.~~ **Closed as
+  "will not do", and the entry was asking for something that breaks model downloads.**
+  The read timeout half is fixed (see the shipped note below). What follows is why the
+  other two halves are being retired rather than done.
+
+  **`egress::hardened()` cannot be adopted here.** It installs
+  `same_origin_redirect_policy`, whose `may_follow` requires the next hop to keep the
+  **same host** — a scheme upgrade on the same host is the only exception. Model
+  downloads are cross-host by construction: Hugging Face redirects
+  `huggingface.co/…/resolve/…` to a CDN host, and the Ollama registry redirects blob
+  requests likewise. Adopting `hardened()` would refuse every one of them with
+  `egress.redirect-cross-origin`.
+
+  That is not a guess. This file has **three** separate post-redirect re-checks —
+  `probe_remote_gguf`, the model download, and the registry token — each phrased "final
+  URL refused" specifically so a refusal can be placed *after* the chain. Those exist
+  because the final URL routinely differs from the requested one. And this file's own
+  per-hop policy validates "any public HTTPS host" rather than one origin, which is the
+  same fact stated as policy.
+
+  So the two designs answer different questions. `hardened()` protects a client that
+  **carries a credential** and must not hand it to another origin — its refusal message
+  is literally "refusing to carry credentials from … to …". This file's client fetches
+  content whose integrity is guaranteed by a **SHA-256 check**, over a chain where
+  changing host is the norm; reqwest strips `Authorization` cross-host anyway, so the
+  credential concern that motivates the origin pin does not apply. Neither is the
+  general case, and forcing one on the other loses either the feature or the guarantee.
+
+  **The 8-vs-10 cap is not worth reconciling either.** Both are finite, both refuse a
+  loop, and the number only decides the fate of pathological chains no real registry
+  produces. Changing it changes which chains this app accepts in exchange for nothing —
+  the definition of churn. Recorded as deliberate divergence, like the four blocklists.
+
+  **The one real residue is the ratchet blind spot**, and it is a property of the
+  scanner rather than of this file: `Client::builder()` is not the string the
+  bare-client scan looks for. That is worth fixing in the *scan* if it is worth fixing
+  at all — a file that sets `connect_timeout`, `read_timeout`, a hop cap and a per-hop
+  SSRF check is not the risk the ratchet was built to catch.
 
 **Shipped — the two unbounded download clients no longer hang on a silent peer.**
 Both set a silence budget now. `model_sources.rs`'s was the worst outbound site in
