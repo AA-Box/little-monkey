@@ -1633,11 +1633,33 @@ rename:
   past it, because a test of only the middle value passes for a gate that rejects
   everything or nothing.
 
-  Found while fixing it: `knowledge_service.rs`'s OCR-sidecar path builds a
+  ~~Found while fixing it: `knowledge_service.rs`'s OCR-sidecar path builds a
   `PipelineLimits`, raises `max_file_bytes` and `max_total_bytes` to 256 MiB, and
   never calls `validate()` at all. The two values it sets are consistent, so nothing
   is wrong today — but it is a production caller outside the gate, which is worth
-  knowing before that gate is relied on for anything.
+  knowing before that gate is relied on for anything.~~ **Fixed, and the missing
+  `validate()` was the least of it.** A first attempt added the `validate()` call this
+  entry asked for and stopped there; adversarial review of that attempt found the
+  entry's "nothing is wrong today" to be false. `fetch_http` does not take
+  `max_file_bytes` as given — it enforces `max_file_bytes.min(MAX_HTTP_BYTES)`, and
+  `MAX_HTTP_BYTES` is 32 MiB. So the raise to 256 MiB never did anything, and a
+  sidecar between the two sizes passed every up-front check and then died mid transfer
+  with "Source response exceeds the byte limit". The declared gate and the enforced one
+  disagreed by a factor of eight, and a `validate()` call could not have found that,
+  because the limit set was internally *consistent* — just unenforced.
+
+  The cap is now derived from `MAX_HTTP_BYTES` so the two cannot drift again, and the
+  smaller number wins on purpose: `fetch_http` buffers the whole body in memory, so
+  that ceiling bounds a heap allocation an upstream server sizes. A sidecar larger than
+  it wants a streaming download to disk, not a bigger buffer. `max_total_bytes` is left
+  at its default because `fetch_http` never reads it — assigning it looked like a bound
+  and was inert — and `ocr_install_limits` is infallible, because with one caller and
+  no parameters `validate()` cannot fail, and the fallible version's only test pinned a
+  parameter that existed to make an unreachable error path reachable.
+
+  The lesson worth keeping: this entry described a *missing check* when the defect was
+  a *disagreement between two numbers*. Fixing what an entry says rather than what the
+  code does is how a cosmetic change ships with a confident comment on it.
 - **`model_sources.rs` caps redirects at 8 while `egress.rs` caps at 10,** and it
   hand-builds its client rather than starting from `egress::hardened()`. *The missing
   read timeout is fixed — see the shipped note below. The cap mismatch stands, and so
