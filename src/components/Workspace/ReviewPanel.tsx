@@ -678,8 +678,11 @@ export function ReviewPanel({ onClose, view: initialView = "continuous" }: {
           nothing to resolve against and nothing scrolls at all. In
           `continuous` view this column is the scroller.
         */}
+        {/* `min-w-0`: a flex item defaults to `min-width:auto`, so one long
+            unbreakable path or token would refuse to shrink and push the panel
+            past the sidebar's width instead of wrapping inside it. */}
         <div
-          className={`flex min-h-0 flex-1 flex-col ${
+          className={`flex min-h-0 min-w-0 flex-1 flex-col ${
             view === "single" ? "overflow-hidden" : "overflow-auto [overscroll-behavior:contain]"
           }`}
         >
