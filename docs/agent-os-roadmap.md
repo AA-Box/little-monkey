@@ -1494,9 +1494,22 @@ rename:
   answers and refuses only if **all** of them are. A dual-stack host answering with
   one public and one private address is refused by the first and would have been
   allowed by the second.
-- **`browser_worker.rs` does not block `240/4`,** nor `0.0.0.0/8` other than
-  `0.0.0.0` itself, so those classify as public navigation targets there while the
-  broadest guard refuses them.
+- ~~**`browser_worker.rs` does not block `240/4`,** nor `0.0.0.0/8` other than
+  `0.0.0.0` itself.~~ **Fixed.** Two arms in `classify_v4`, spelled the same way as
+  the broad guard's own tests (`0.1.2.3`, `240.0.0.1`) so the two files agree by
+  construction rather than by coincidence. This was the fail-*open* half of this
+  guard's gaps, which is what separates it from the bracket bug below: those ranges
+  read as public navigation targets while `knowledge_pipeline.rs` refused them.
+
+  Ordering is the whole subtlety, and the test pins it rather than merely asserting
+  "refused". Each new range contains one address that already had a more specific
+  rule — `0.0.0.0` is `Unspecified`, `255.255.255.255` is `Broadcast` — so the arms
+  sit after the `if` chain and only the *rest* of each range reaches them. Verified
+  by sabotage in both directions: dropping the arms fails with `0.1.2.3 must be
+  refused as egress.this-network`, and dropping the `is_unspecified` check ahead of
+  them fails with `0.0.0.0 must be refused as egress.unspecified`. `239.255.255.255`
+  pins the lower boundary as `Multicast`, and `1.1.1.1` is the counter-test that
+  "refuse everything" cannot pass.
 - **`browser_worker.rs` cannot handle an IPv6 literal host on macOS or Linux.**
   `Url::host_str()` serializes one *with its brackets*, so
   `("[::1]", port).to_socket_addrs()` fails to parse there and every IPv6-literal
@@ -1671,10 +1684,18 @@ Two things about the ratchet itself worth writing down, both found by trying to 
 
 Sabotage-verified both directions: a new `Client::builder().timeout(..)` is caught and
 named, and a `.timeout(` on a *`RequestBuilder`* correctly does not trip it.
-- **`hugging_face_license` discards a refusal twice, silently** — once for a
-  `Url::parse` failure and once for the policy verdict — falling through to a
-  fallback URL with no diagnostic. A `license_link` pointing at
-  `https://127.0.0.1/license` now produces a typed denial that is still thrown away.
+- **`hugging_face_license` discards a refusal *once*, silently — not twice.**
+  Correcting this entry against the code: the policy verdict at the
+  `validate_public_https_url(&parsed).is_ok()` call *is* recorded, because that
+  function is the single choke point all thirteen model-source call sites pass
+  through and it writes to the denial sink itself before returning. So a
+  `license_link` pointing at `https://127.0.0.1/license` does land in the sink under
+  `model-sources.url`; what is thrown away is the denial *value*, which nothing here
+  needs. The one genuinely invisible case is the `Url::parse` failure in the same
+  expression: a malformed `license_link` produces no `egress.url-malformed` record
+  anywhere, so it is indistinguishable from a card that carried no link at all. Both
+  paths fall back to the repo's own `LICENSE` file, which is the right behaviour and
+  is not what wants changing.
 - **`validate_ollama_auth_url` constrains only the host,** so
   `https://auth.ollama.ai:8443/anything` passes: the port and path of a
   bearer-token endpoint are unpinned.
