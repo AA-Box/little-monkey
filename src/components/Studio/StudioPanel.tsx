@@ -660,9 +660,11 @@ export function StudioPanel() {
           controls that scrolls on its own, and a canvas that keeps the prompt,
           the button and the result together where the work happens. */}
       {mode !== "models" && (
-      <div className="flex min-h-0 flex-1 gap-4 overflow-hidden">
+      <div className="flex min-h-0 flex-1 gap-4 overflow-hidden p-1">
+        {/* `overflow-y: auto` computes overflow-x to auto as well, so the rail
+            clips sideways too and its controls need room for a focus ring. */}
         {selected && (
-        <aside className="grid w-72 shrink-0 content-start gap-3 overflow-y-auto pb-4 pr-1">
+        <aside className="grid w-72 shrink-0 content-start gap-3 overflow-y-auto px-1 pb-4">
           <div className="flex flex-wrap gap-1.5">
             {selected.tasks
               .filter((entry) => tasksFor(mode).includes(entry))
@@ -1037,14 +1039,12 @@ export function StudioPanel() {
         </aside>
         )}
 
-        {/* The split wrapper clips, so the focus ring on the first field needs
-            a pixel of room or it is drawn straight through the top edge. */}
-        <section className="flex min-h-0 flex-1 flex-col gap-2 px-0.5 pt-0.5">
+        <section className="flex min-h-0 flex-1 flex-col gap-2">
           {/* Each button sits with the field it belongs to and stretches to
               its height, so the row reads as one control rather than two. */}
           <div className="flex shrink-0 items-stretch gap-2">
             <textarea
-              className="min-h-16 flex-1 rounded border border-border bg-background p-2 text-xs"
+              className="min-h-16 min-w-0 flex-1 resize-none rounded border border-border bg-background p-2 text-xs"
               placeholder={t("Studio.promptPlaceholder")}
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
