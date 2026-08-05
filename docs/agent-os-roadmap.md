@@ -330,11 +330,56 @@ attributed to another, which under a per-run allowlist is the wrong policy again
 wrong host. Verified by sabotage: dropping the `scoped` wrapper turns all three red and
 leaves the file's other nine tests green.
 
-**Still to do:** `browser_worker.rs`'s per-subresource decisions and `mcp.rs`'s
-process-wide cached transport are untouched, and the remaining client sites still record
-`None`. `mcp.rs` is the genuinely hard one — one client per server connection, cached
-process-wide, so per-run policy means giving up the connection reuse and OAuth refresh
-the design depends on — and it wants its own decision rather than a mechanical adoption.
+**Still to do:** `browser_worker.rs`'s per-subresource decisions are untouched, and the
+remaining client sites still record `None`.
+
+### `mcp.rs` is harder than "a cached client", and is deliberately not adopted yet
+
+Measured rather than assumed, because the shared-client framing understates it. A tool
+call reaches the network like this:
+
+```
+call_tool_once → peer.send_cancellable_request(…) → [rmcp service loop task] → HTTP
+```
+
+`send_cancellable_request` puts the request on a channel and returns a handle the
+caller awaits. The request is issued by the task `rmcp::serve_client` spawned at connect
+time — `rmcp-2.2.0/src/service.rs:945` is a bare `tokio::spawn(future)` for the service
+loop, and the send itself goes through `send_task_set.spawn(…)` at `:1131`, so it is two
+levels of spawn away from the caller. `tokio::spawn` does not inherit a task-local, a
+property `run_scope`'s own test pins deliberately, so **no scope set at any call
+boundary reaches the request**. This is not a case where a `scoped` wrapper in the right
+place would do it, and the shared client is the second problem rather than the first.
+
+Four shapes, and none is free:
+
+- **Scope the service loop with the run that connected.** Wrong answer, not just a
+  costly one: the connection is cached process-wide and serves every later run, so this
+  attributes every run's egress to whoever connected first — a confident wrong label,
+  which is worse than the honest blank.
+- **Rebuild the client per call.** Gives up connection reuse and the reconnect-driven
+  OAuth refresh that `call_tool_with_cancel_classified` depends on to survive an access
+  token expiring mid-session.
+- **Carry the run through rmcp's request channel.** The correct shape, and it needs
+  per-request context in rmcp's peer API, which does not exist today. That is an
+  upstream change or a fork.
+- **Key the connection cache by `(server_id, run)`.** Makes every run attributable and
+  keeps refresh working per connection. Costs one transport per run per server — and
+  for stdio servers, one **child process** per run, which is the expensive one.
+
+**So this stays unbuilt on purpose, and the reason is sequencing rather than
+difficulty.** The only consumer that needs it is K5's per-run egress allowlist, which
+is not built either, and the choice above turns on what that allowlist actually asks
+for: if it is per-run, the last shape is the only one that works and its process cost
+has to be accepted; if it settles for per-connection policy with the run recorded
+where it is known, the third shape becomes optional. Picking now would be guessing at a
+requirement that does not exist yet, and the guess that costs a child process per run
+is not one to make speculatively.
+
+What K5 should decide first, in one sentence: **is an MCP server's transport allowed to
+be shared across runs?** Everything above follows from that answer, and until it is
+answered, `mcp.rs` recording `None` is the honest state rather than a gap — the
+mechanism is proven and this module's blank is a known, reasoned one.
 
 ---
 
