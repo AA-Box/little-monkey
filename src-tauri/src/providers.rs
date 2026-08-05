@@ -360,7 +360,14 @@ pub async fn fetch_models(
     provider_id: &str,
     api_key: &str,
 ) -> Result<Vec<ProviderModelInfo>, String> {
-    let client = reqwest::Client::new();
+    // `egress::hardened()` rather than a default client because `base_url` is
+    // user-configurable and [`add_anthropic_headers`] attaches `x-api-key`,
+    // which reqwest does NOT strip across a cross-host redirect (it strips only
+    // `Authorization`, `Cookie`, `Proxy-Authorization`, `WWW-Authenticate`) —
+    // so a `302` from here could hand the key to a host the response chose.
+    let client = crate::egress::hardened()
+        .build()
+        .map_err(|e| format!("Failed to build the provider HTTP client: {e}"))?;
     let request = add_anthropic_headers(
         client
             .get(format!("{base_url}/models"))
@@ -769,7 +776,14 @@ async fn run_stream_chat(
     };
     let api_key = read_key(provider_id)?;
 
-    let client = reqwest::Client::new();
+    // Same `x-api-key`-across-a-redirect reasoning as [`fetch_models`]. Note
+    // that `egress::hardened()` sets a *read* timeout and never a total one:
+    // this request is `"stream": true` and its body is consumed chunk by chunk
+    // for as long as the model generates, so a total deadline would truncate a
+    // long answer rather than catch a dead peer.
+    let client = crate::egress::hardened()
+        .build()
+        .map_err(|e| format!("Failed to build the provider HTTP client: {e}"))?;
     let request = build_chat_request(
         &client,
         &base_url,

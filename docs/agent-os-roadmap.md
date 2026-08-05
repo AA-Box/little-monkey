@@ -1189,7 +1189,7 @@ process count and disk written need a mechanism this app does not have.
 **Blocks:** K7, K8 — admission control that cannot bound what it admits is a
 guess.
 
-## K5. Per-process egress policy
+## K5. Per-run egress policy *(renamed from per-process — see the acceptance correction)*
 
 **Today:** nothing gates outbound network by process. `privacy_firewall.rs` is a
 **content scanner plus a persisted per-workspace policy**, not a network gate: it
@@ -1239,6 +1239,55 @@ from the page URL plus a third-party icon service, with an 8-second timeout and
 default redirects. CORS and bind-interface restrictions remain **inbound only**;
 there is no outbound gate anywhere.
 
+**Shipped — hardened defaults on the credentialed remote paths.** `egress::hardened()`
+returns a `ClientBuilder` with a connect timeout, a read (silence) timeout, and a
+validating redirect policy, adopted at the seven sites that carry a credential to a
+configurable remote: both `providers.rs` clients, `triage.rs`, `mcp.rs`,
+`hosted_oauth.rs` (via one shared helper), and the single `monkey-cli` client that is
+threaded through about forty signatures, so one edit propagates across the CLI.
+
+This is a **precondition** for a per-run egress policy, not the delivery of one — it
+creates the one place a policy consult can later be added. Nothing here is
+deny-by-default and nothing here is keyed to a run.
+
+- **The hole that made this worth doing first:** reqwest strips `Authorization`,
+  `Cookie`, `Proxy-Authorization` and `WWW-Authenticate` across a cross-host
+  redirect, but **not** `x-api-key` — which `providers.rs` sets for Anthropic. Since
+  a custom provider's `base_url` is user-configurable, a 302 could walk that key to
+  a redirect-chosen host.
+- **`read_timeout`, never `ClientBuilder::timeout`.** The latter is a total-request
+  deadline covering body read, so it would truncate streaming chat and break the
+  30- and 60-minute companion budgets. `read_timeout` resets after each successful
+  read, so it bounds *silence* rather than elapsed time.
+- **`Policy::custom` does not inherit reqwest's loop cap**, which the sabotage run
+  measured concretely: with the explicit cap removed, a same-origin redirect loop
+  followed 1385 hops in ten seconds.
+- **One deliberate exception to "refuse every cross-origin hop":** `http` → `https`
+  on an otherwise identical authority is followed. `301` to the same host over TLS
+  is the most common redirect on the web, `validate_base_url` accepts `http://` by
+  design, and the destination is the host the request was always aimed at — so no
+  credential moves anywhere new. The inverse downgrade is refused, and both
+  directions are tested.
+- **The default silence budget is a floor, not a ceiling.** `mcp.rs` has a
+  per-server tool timeout users may set above it, so it passes
+  `max(default, configured)` — otherwise a server configured for fifteen minutes
+  that sends no progress notifications would have been cut at ten, turning a
+  supported configuration into a failure.
+- **Diagnostics name only `scheme://host:port`.** These paths put tokens in query
+  strings, so a refusal must not log the whole URL.
+- **A ratcheting source-scan test** pins the remaining bare `Client::new()` sites
+  per file, so a new one fails `cargo test` with a message naming
+  `egress::hardened()`. Bare production sites went from 13 to 8. Not clippy: this
+  repo has no `clippy.toml`, no `[lints]`, and CI never invokes clippy, so a lint
+  would have enforced nothing.
+- **The ~12 loopback-only clients were deliberately left alone.** They are not
+  egress targets, and custom providers at `http://127.0.0.1:1234/v1` (LM Studio,
+  vLLM, LiteLLM) are a supported configuration — any public-only or cleartext-refusing
+  rule would break local inference.
+- `server.rs`'s two forwarding clients are pinned in the ratchet rather than
+  converted: that client serves **both** loopback inference and cloud providers, so
+  no single policy fits it and splitting it is its own change.
+
 **Shipped — the deprecated IPv4-compatible form no longer walks past any of the four
 guards.** All four unwrapped v4-in-v6 with `to_ipv4_mapped()`, which by design
 matches only `::ffff:a.b.c.d`. So `::127.0.0.1` fell through every branch of every
@@ -1267,6 +1316,65 @@ workspace policy and cannot be widened at runtime by the model, a skill, a
 package, or a routing decision. DNS answers are pinned for the process's
 lifetime so a rebind cannot move an allowed name. Every blocked attempt is a
 ledger event with the rule that blocked it.
+
+**Correction to that acceptance — three of its four clauses name something that does
+not exist, and one names the wrong key.** Found by auditing the codebase against it
+rather than by reading it again.
+
+**The key is the run, not the process, and this item should be renamed
+accordingly.** No HTTP call site in this crate can learn which process it belongs
+to: there are zero `task_local!` and zero `thread_local!` declarations anywhere,
+`ProcessRecord`'s only budget field is `ProcessLimits` with no network member, and
+entry points like `ollama_list_models` are bare `#[tauri::command]`s with no process
+handle in scope. Two ways out, and the second is chosen:
+
+- *Thread process identity to the call sites* via a task-local egress scope entered
+  by each command that owns a process. Universal, but it needs a command-wrapper
+  layer this app does not have.
+- **Key off the immutable run spec instead.** `provider_endpoint_for_run` already
+  does exactly this for a neighbouring problem — it refuses to trust the caller's
+  claimed target and reads the frozen one back out of the run spec.
+
+The second is not merely easier, it is **safer**, and the reason is specific:
+`process_admit` copies limits verbatim out of the WebView's IPC payload with no
+clamp against the kind default or any ceiling, and admission is fail-soft. So keying
+a deny-by-default policy off the process row would mean choosing between "no record
+→ no network", which breaks every turn whenever the ledger blips, and "no record →
+allow", which reintroduces the hole the policy exists to close. A run spec is frozen
+at submission and is not writable by the party the policy constrains — which is what
+"cannot be widened at runtime by the model" actually requires.
+
+**"Narrower than or equal to its workspace policy" has nothing to be narrower
+than.** There is no per-workspace network policy: `privacy_firewall.rs`'s
+`PrivacyPolicy` carries no host, port, protocol or address field, and `workspace.rs`
+holds only roots. The only network policy in the tree is
+`PermissionPolicySnapshot::allow_network` — run-scoped, sourced from the global
+web-tools setting, and expanding to an all-or-nothing Seatbelt clause for sandboxed
+shell children on macOS only. This clause is greenfield, and the roadmap should say
+so rather than implying a hierarchy exists to slot into.
+
+**"Every blocked attempt is a ledger event" cannot use `run_events` as built.**
+`run_events.run_id` is `NOT NULL REFERENCES runs(run_id)` behind a trigger that
+demands a gapless `sequence = last_sequence + 1`, refuses any event after a terminal
+one, and caps the total. Meanwhile a denial can come from work with no run at all,
+and one arriving after a run ended would be rejected outright. None of `RunEvent`'s
+variants is a policy denial, and `PermissionDecided` carries no rule identity. This
+needs its own non-run-scoped table, and that table must not land before something
+writes to it — the caution being `ProcessLimits`' own doc, three of whose four fields
+are declaration-only to this day.
+
+**Nothing in the tree names a rule.** Every refusal today is hardcoded prose
+(`web.rs`, `knowledge_pipeline.rs`'s `UrlRejected(String)`), so a test asserting
+`is_err()` cannot tell a policy block from a typo in a URL, and neither can an
+operator reading a log. Typed rule identity has to land before any denial sink, or
+the sink records unparseable strings.
+
+**Also missing from the "Today" above:** the inbound OpenAI-compatible
+`POST /v1/chat/completions` route forwards an external caller's body verbatim to a
+cloud provider through a bare client. That is a second Rust bypass of the Privacy
+Firewall, and a worse one than the `providers.rs` bypass already documented, because
+it is reachable by any bearer-token holder rather than only by this app's own
+frontend.
 
 **Blocks:** K17 — placing a run on a remote node is only safe if the run's
 egress travels with it.
@@ -1346,7 +1454,7 @@ sequence.
 class, cost ceiling, latency target, data sensitivity, or tool requirement;
 per-turn inspection of which policy chose the target and why; reorder and
 disable without editing code. A policy can never widen a permission, bypass
-the Privacy Firewall, or widen a process's egress policy (K5).
+the Privacy Firewall, or widen a run's egress policy (K5).
 
 **Note:** in OS terms K8 decides *when* a process runs and K9 decides *which
 device* executes it. They are separable and K8 is the harder half. Shipping
@@ -1483,7 +1591,7 @@ the runner. Placement is a human decision — an operator starts work on a node.
 
 **Acceptance:** the scheduler (K8) can place a process on a paired node by
 capability, measured throughput (K6), and a data-residency rule, subject to
-the node's own admission control (K7); the process's egress policy (K5) and
+the node's own admission control (K7); the run's egress policy (K5) and
 resource limits (K4) travel with it and are enforced by the node, not
 assumed; and a node going away is a process-level failure with a defined
 restart policy (K2), not a lost run. No relay, consistent with the existing
