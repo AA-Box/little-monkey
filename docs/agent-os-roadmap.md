@@ -1365,12 +1365,21 @@ ever reached it with a loopback address. Sibling of the `::127.0.0.1` bug the sh
 predicate closed, and it survived that fix because the compatible and mapped forms
 are different ranges reached by different branches.
 
-- **A classifier hole, not a demonstrated end-to-end bypass**, and the difference is
-  worth stating rather than claiming the stronger version: a bracketed IPv6 literal
-  never reaches the classifier today, because of the bracket bug listed below. The
-  fix is defensive — a classifier must not call a loopback address public whatever
-  route reaches it, and a hostname whose resolver answers with a mapped address is
-  such a route.
+- **It was reachable end to end on Windows, and CI is what established that.** The
+  bracket bug below — `Url::host_str` keeps an IPv6 literal's brackets — is where the
+  platforms part company: macOS and Linux refuse to parse
+  `("[::ffff:127.0.0.1]", port)` and refuse the target as a resolution failure before
+  the classifier is consulted, while **Windows resolves it**, so there a granted
+  `http://[::ffff:127.0.0.1]` origin reached this machine's loopback services without
+  the per-run loopback grant that a plain `127.0.0.1` requires. A first draft of this
+  entry claimed the weaker "classifier hole, not a demonstrated bypass" on the
+  strength of a macOS observation; the Windows leg of CI disproved it.
+- **A guard's reachability can be platform-dependent, which nothing here accounted
+  for.** The lesson generalizes past this bug: an SSRF guard reached through
+  `to_socket_addrs` inherits the host resolver's parsing, so "unreachable" has to be
+  established per platform or not claimed. The test now asserts the one invariant
+  that holds everywhere — loopback without a grant is never allowed — and pins
+  neither platform's resolver behaviour as the expected answer.
 - The only range this section moves. Everything else in the conversion is
   behaviour-preserving.
 
@@ -1386,16 +1395,16 @@ rename:
 - **`browser_worker.rs` does not block `240/4`,** nor `0.0.0.0/8` other than
   `0.0.0.0` itself, so those classify as public navigation targets there while the
   broadest guard refuses them.
-- **`browser_worker.rs` cannot handle an IPv6 literal host at all.**
+- **`browser_worker.rs` cannot handle an IPv6 literal host on macOS or Linux.**
   `Url::host_str()` serializes one *with its brackets*, so
-  `("[::1]", port).to_socket_addrs()` fails to parse and every IPv6-literal browser
-  target is refused as a resolution failure rather than classified. Fail-closed, so
-  not a hole — but this guard's whole IPv6-literal path is unreachable, including the
-  loopback grant. `web.rs` avoids it by matching on `Url::host()`, the parsed enum,
-  and its own comment names this exact "bracket-handling class of bug". Fixing it
-  widens what is reachable (a public v6 literal would become allowed), so it is a
-  behaviour change and its own review; a test now pins the current verdict so whoever
-  fixes it has to re-check the loopback interaction in the same commit.
+  `("[::1]", port).to_socket_addrs()` fails to parse there and every IPv6-literal
+  browser target is refused as a resolution failure rather than classified.
+  Fail-closed, so not a hole — but this guard's IPv6-literal path is unreachable on
+  two of three platforms and reachable on the third, which is how the mapped-loopback
+  bug above stayed hidden. `web.rs` avoids it entirely by matching on `Url::host()`,
+  the parsed enum, and its own comment names this exact "bracket-handling class of
+  bug". Fixing it widens what is reachable on macOS and Linux (a public v6 literal
+  would become allowed), so it is a behaviour change and its own review.
 - **`knowledge_pipeline.rs` blocks all of `198.51/16`** where TEST-NET-2 is only
   `198.51.100/24` — over-blocking, not a hole, but it is a real range a user could
   legitimately need.

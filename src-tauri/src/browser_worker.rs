@@ -3407,14 +3407,24 @@ mod tests {
     /// predicate closed, and it survived that fix because the compatible form and the
     /// mapped form are different ranges reached by different branches.
     ///
-    /// # Scope of the claim, since the classifier is not the only gate
+    /// # Whether it was reachable end to end depends on the platform
     ///
-    /// This was a hole in the classifier, not a demonstrated end-to-end bypass. A
-    /// bracketed IPv6 literal never reaches the classifier through
-    /// `validate_navigation` today — see the second half of this test — so the fix is
-    /// defensive: the classifier must not report a loopback address as public
-    /// whatever route reaches it, and one of those routes is a hostname whose
-    /// resolver answers with a mapped address.
+    /// `Url::host_str` serializes an IPv6 literal *with* its brackets, and
+    /// `("[::ffff:127.0.0.1]", port).to_socket_addrs()` is where the platforms part
+    /// company: macOS and Linux refuse to parse it, so the target is refused as a
+    /// resolution failure before the classifier is consulted, while **Windows
+    /// resolves it** — so on Windows this was a live bypass, and a granted
+    /// `http://[::ffff:127.0.0.1]` origin reached this machine's own loopback
+    /// services without the explicit per-run loopback grant that a plain
+    /// `127.0.0.1` requires. Elsewhere the same fix is defensive: a classifier must
+    /// not call a loopback address public whatever route reaches it, and a hostname
+    /// whose resolver answers with a mapped address is such a route.
+    ///
+    /// The classifier assertions below are the load-bearing half on every platform.
+    /// The `validate_navigation` half asserts the one invariant that holds on all of
+    /// them, and deliberately does not pin either platform's resolver behaviour as
+    /// the expected answer — an earlier version pinned the macOS verdict and failed
+    /// on Windows for a reason that was not a defect.
     #[test]
     fn the_ipv4_mapped_loopback_form_is_classified_as_loopback() {
         for text in ["::ffff:127.0.0.1", "::ffff:127.1.2.3"] {
@@ -3439,30 +3449,34 @@ mod tests {
             None
         );
 
-        // And the second gate, pinned because it is the reason the hole above was
-        // not reachable end to end — and because it is a bug of its own.
-        // `Url::host_str` serializes an IPv6 literal *with its brackets*, so
-        // `("[::ffff:127.0.0.1]", port).to_socket_addrs()` cannot parse it and every
-        // IPv6-literal browser target is refused as a resolution failure rather than
-        // classified. `web.rs` avoids this by matching on `Url::host()` — the parsed
-        // enum — and its own comment names this exact "bracket-handling class of
-        // bug". Fail-closed, so not a hole; but it means this guard's IPv6 literal
-        // handling is unreachable. Whoever fixes it will trip this assertion, which
-        // is the point: the loopback grant has to be re-checked at the same time.
+        // End to end, through the gate that actually decides a navigation. The origin
+        // is granted, so the only thing left to refuse it is the address — and on
+        // Windows, where the bracketed literal does resolve, this is the assertion
+        // that fails without the fix.
         let grant = ValidatedGrant::new(BrowserGrant {
             allowed_origins: vec!["http://[::ffff:127.0.0.1]:11434".into()],
             allow_loopback: false,
         })
         .unwrap();
-        assert_eq!(
-            grant
-                .validate_navigation("http://[::ffff:127.0.0.1]:11434/api/tags")
-                .unwrap_err()
-                .rule(),
-            EgressRule::DnsResolutionFailed,
-            "if this now reports a rule about the address, the bracket bug is fixed \
-             and the loopback grant needs re-checking here"
-        );
+        let denial = grant
+            .validate_navigation("http://[::ffff:127.0.0.1]:11434/api/tags")
+            .expect_err("loopback without a grant must never be allowed");
+        match denial.rule() {
+            // macOS and Linux: `to_socket_addrs` cannot parse the bracketed host, so
+            // the target is refused before the classifier is reached. Accepted rather
+            // than asserted, because it is this platform's resolver talking and not
+            // this guard's policy — and because it is a bug of its own, recorded in
+            // the roadmap: `web.rs` avoids it by matching on `Url::host()`, the parsed
+            // enum, and its own comment names this "bracket-handling class of bug".
+            EgressRule::DnsResolutionFailed => {}
+            // Windows: the host resolves, so the classifier decides — and it must say
+            // loopback. Any other rule, and above all `Ok`, is the bypass.
+            rule => assert_eq!(
+                rule,
+                EgressRule::Loopback,
+                "a resolvable mapped-loopback target must be refused as loopback"
+            ),
+        }
     }
 
     #[test]
