@@ -1779,8 +1779,24 @@ Two things about the ratchet itself worth writing down, both found by trying to 
 
 Sabotage-verified both directions: a new `Client::builder().timeout(..)` is caught and
 named, and a `.timeout(` on a *`RequestBuilder`* correctly does not trip it.
-- **`hugging_face_license` discards a refusal *once*, silently — not twice.**
-  Correcting this entry against the code: the policy verdict at the
+- ~~**`hugging_face_license` discards a refusal *once*, silently — not twice.**~~
+  **Fixed — the `Url::parse` failure is recorded, and only when it is really a
+  refusal.** A malformed absolute link now writes `egress.url-malformed`. A *relative*
+  one does not, and that exclusion is the part worth stating: `license_link: "LICENSE"`
+  is the shape Hugging Face's own cards use and is this file's own fixture, the fallback
+  resolves a pinned repo URL for it, so nothing was denied — and recording it would add
+  a row per resolution to a table bounded at 10,000, evicting real denials and making
+  the rule code stop meaning "something was blocked".
+
+  Found while fixing it: the sink's `detail` column had no per-row bound at all, so
+  `MAX_ROWS` was only half a bound. A card can carry a 16 MB `license_link` that
+  *parses*, which reaches `validate_public_https_url` and records the whole thing. The
+  cap now lives in `denial_sink::record` next to `MAX_ROWS`, where all four guards route
+  through it — a first attempt put it at this call site, which guarded the one path that
+  change had just created while leaving the two that already existed open.
+
+  Original analysis, kept because its correction is the reasoning that mattered: the
+  policy verdict at the
   `validate_public_https_url(&parsed).is_ok()` call *is* recorded, because that
   function is the single choke point all thirteen model-source call sites pass
   through and it writes to the denial sink itself before returning. So a
@@ -1791,13 +1807,43 @@ named, and a `.timeout(` on a *`RequestBuilder`* correctly does not trip it.
   anywhere, so it is indistinguishable from a card that carried no link at all. Both
   paths fall back to the repo's own `LICENSE` file, which is the right behaviour and
   is not what wants changing.
-- **`validate_ollama_auth_url` constrains only the host,** so
+- ~~**`validate_ollama_auth_url` constrains only the host,** so
   `https://auth.ollama.ai:8443/anything` passes: the port and path of a
-  bearer-token endpoint are unpinned.
+  bearer-token endpoint are unpinned.~~ **Fixed, and the port was the small half.**
+  The port is pinned to 443 via `port_or_known_default`, so the explicit `:443`
+  spelling stays the same destination rather than becoming a surprise. Low severity as
+  this entry implied — that request carries no credential, it is the one that goes to
+  *fetch* one — and the path stays unpinned on purpose, because `/token` is the
+  registry's to change and a path does not decide which server answers.
+
+  What this entry missed is that **host and port only pin the request as sent.**
+  `build_http_client`'s redirect policy judges every hop with
+  `validate_public_https_url` alone — no ollama allowlist, no port — so a challenge
+  naming the real realm could 302 up to eight times to any public HTTPS host, and the
+  `token` in *that* host's body became the bearer attached to the follow-up registry
+  request. `validate_ollama_auth_url`'s own doc opens by naming exactly that shape ("a
+  *response* gets to propose where this app sends a credential request"), so pinning
+  only the pre-flight spelling left the response half of its own threat model open. Now
+  re-checked after `send()`, the same post-redirect pattern `probe_remote_gguf` uses.
+
+  The entry below is where that should have been caught, and its safety argument is why
+  it was not — see the correction there.
 - **Nothing pins a model download to the origin that resolved it.** The redirect
   policy admits a hop to any public HTTPS host; reqwest strips `Authorization`
   cross-host so the bearer does not travel, and the SHA-256 check is what actually
   makes this safe — but that reliance was undocumented.
+
+  **Correcting the safety argument, because it does not cover every request this
+  client makes.** Both of its two legs assume the app is *sending* something it must
+  protect: stripping `Authorization` matters when a credential travels outward, and a
+  SHA-256 check matters when the payload is a file whose content is pinned. The
+  registry *token fetch* has neither property — it sends no credential, so there is
+  nothing to strip, and it receives one, so there is no digest to compare. So "the
+  redirect policy admits a hop to any public HTTPS host" was not benign there, and the
+  entry above is now what closes it. The generalisation worth keeping: a per-client
+  redirect policy is only as strong as the weakest thing any of its callers does with
+  the response, so a policy justified by what *one* caller sends needs re-checking per
+  caller.
 - ~~**`web.rs` builds four clients and installs the SSRF guard on one.**~~ **Fixed**
   — and the fix found that the hole was worse than this entry described. The three
   search clients did not need the SSRF guard (their *request* targets are trustworthy,

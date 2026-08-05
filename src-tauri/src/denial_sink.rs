@@ -73,6 +73,21 @@ pub const SINK_FILE: &str = "egress-denials-v1.sqlite3";
 /// thousand is enough to see a pattern and small enough to be irrelevant on disk.
 const MAX_ROWS: i64 = 10_000;
 
+/// Characters kept of a denial's detail. Longer details are truncated on insert.
+///
+/// [`MAX_ROWS`] bounds how many rows a remote party can cause; on its own that is
+/// half a bound, because it says nothing about how large one row may be. Details are
+/// remote-derived by design — a refused host, a rejected scheme, an unparseable link
+/// — and the values behind them are only bounded by whatever the caller's own limit
+/// is, which for a Hugging Face model card is 16 MiB. Ten thousand rows of that is
+/// the same disk-exhaustion primitive `MAX_ROWS` exists to refuse.
+///
+/// Enforced **here** rather than at the call sites, because here is the one place all
+/// four guards route through: a rule applied per call site is a rule that the next
+/// guard forgets. 160 characters is what `model_sources::license_title` already keeps
+/// of remote text, and it is long enough to recognise the offending value.
+const MAX_DETAIL_CHARS: usize = 160;
+
 /// Schema version. Its own counter, unrelated to the run ledger's.
 const SINK_V1: i64 = 1;
 
@@ -394,7 +409,11 @@ pub fn record(guard: &'static str, denial: &EgressDenial, run_id: Option<&str>) 
         recorded_at_ms,
         rule_code: denial.rule().code().to_string(),
         guard: guard.to_string(),
-        detail: denial.detail().map(str::to_string),
+        // Truncated by `chars` and not by bytes, so a multi-byte detail cannot be cut
+        // mid-character into something that is no longer a `str`.
+        detail: denial
+            .detail()
+            .map(|detail| detail.chars().take(MAX_DETAIL_CHARS).collect()),
         run_id,
         unattributed_reason,
     };
@@ -608,6 +627,64 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// [`MAX_ROWS`] alone is half a bound: it says how many rows a remote party can
+    /// cause and nothing about how large one row may be. Details are remote-derived by
+    /// design — a refused host, a rejected scheme, an unparseable link — and bounded
+    /// only by the caller's own limit, which for a Hugging Face model card is 16 MiB.
+    ///
+    /// Asserted at [`record`] rather than at a call site on purpose, because that is
+    /// the claim: **every** guard is bounded, including the ones that predate this and
+    /// the ones not written yet. `classify_public_https_url` reaching the sink with a
+    /// megabyte-long scheme is the concrete case — no call site truncates that, and
+    /// none has to.
+    #[test]
+    fn a_remote_detail_cannot_decide_how_large_an_audit_row_is() {
+        let _guard = test_lock();
+        install(DenialSink::open_in_memory().expect("sink opens"));
+
+        let huge = "z".repeat(MAX_DETAIL_CHARS * 50);
+        record(
+            "bound.test",
+            &EgressDenial::about(EgressRule::SchemeNotAllowed, huge.clone()),
+            None,
+        );
+        let rows = slot()
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|sink| sink.recent(8).expect("reads")))
+            .expect("a sink is installed");
+        let stored = rows
+            .iter()
+            .find(|row| row.guard == "bound.test")
+            .and_then(|row| row.detail.as_deref())
+            .expect("the row was written");
+        assert_eq!(stored.chars().count(), MAX_DETAIL_CHARS);
+        assert!(
+            huge.starts_with(stored),
+            "truncation must keep the front of the detail, not rewrite it"
+        );
+
+        // Counter-test, so that truncating everything to nothing — or padding every
+        // detail to the cap — cannot pass the assertions above. A detail shorter than
+        // the cap has to arrive whole.
+        record(
+            "bound.test.short",
+            &EgressDenial::about(EgressRule::Loopback, "127.0.0.1"),
+            None,
+        );
+        let rows = slot()
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|sink| sink.recent(8).expect("reads")))
+            .expect("a sink is installed");
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.guard == "bound.test.short")
+                .and_then(|row| row.detail.as_deref()),
+            Some("127.0.0.1")
+        );
     }
 
     /// The D3 acceptance clause at the integration level: a scope set at a command
