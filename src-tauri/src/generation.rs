@@ -321,6 +321,74 @@ pub fn curated_models() -> Vec<GenerationModelSpec> {
             extra_launch_args: vec!["--diffusion-fa".to_string(), "--offload-to-cpu".to_string()],
         },
         GenerationModelSpec {
+            id: "minimax-h3-ref2va".to_string(),
+            name: "MiniMax H3 Ref2VA (video + audio)".to_string(),
+            family: "MiniMax H3".to_string(),
+            // The reference-conditioning this checkpoint is named for reaches
+            // the engine only through its CLI and C API: `sd-server`'s vid_gen
+            // route advertises `init_image` and `end_image` but no
+            // `ref_images`, so over HTTP it serves text- and image-driven
+            // video like any other H3 weight.
+            tasks: vec![GenerationTask::TextToVideo, GenerationTask::ImageToVideo],
+            components: vec![
+                ModelComponent {
+                    slot: ComponentSlot::DiffusionModel,
+                    repo: "leejet/MiniMax-H3-GGUF".to_string(),
+                    file: "minimax_h3_ref2va_pruned-Q4_K_M.gguf".to_string(),
+                    size_bytes: 11_420_663_904,
+                },
+                ModelComponent {
+                    slot: ComponentSlot::Llm,
+                    repo: "leejet/MiniMax-H3-GGUF".to_string(),
+                    file: "qwen3vl_32b_minimax_h3-Q2_K_M.gguf".to_string(),
+                    size_bytes: 13_102_161_024,
+                },
+                ModelComponent {
+                    slot: ComponentSlot::Vae,
+                    repo: "Comfy-Org/MiniMax-H3".to_string(),
+                    file: "vae/minimax_h3_video_vae_fp16.safetensors".to_string(),
+                    size_bytes: 5_207_808_496,
+                },
+                ModelComponent {
+                    slot: ComponentSlot::AudioVae,
+                    repo: "Comfy-Org/MiniMax-H3".to_string(),
+                    file: "vae/minimax_h3_audio_vae_fp32.safetensors".to_string(),
+                    size_bytes: 605_254_808,
+                },
+            ],
+            defaults: GenerationDefaults {
+                width: 864,
+                height: 480,
+                steps: 8,
+                cfg_scale: 1.0,
+                sample_method: "euler",
+                flow_shift: None,
+                fps: 24,
+                video_frames: 39,
+                frame_grid: FrameGrid::UpTo17kPlus5,
+            },
+            // Measured: 30.5 GB resident with --offload-to-cpu on a 52 GB M4 Pro.
+            min_ram_bytes: 36 * 1024 * 1024 * 1024,
+            license: LicenseGate {
+                id: "minimax-h3-community".to_string(),
+                name: "MiniMax H3 Community License".to_string(),
+                url: "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE".to_string(),
+                excluded_territories: vec![
+                    "European Union".to_string(),
+                    "United Kingdom".to_string(),
+                    "Republic of Korea".to_string(),
+                    "United States of America".to_string(),
+                ],
+                acceptance_required: true,
+            },
+            extra_launch_args: vec![
+                "--diffusion-fa".to_string(),
+                "--offload-to-cpu".to_string(),
+                "--rng".to_string(),
+                "cpu".to_string(),
+            ],
+        },
+        GenerationModelSpec {
             id: "minimax-h3-fl2va".to_string(),
             name: "MiniMax H3 (video + audio)".to_string(),
             family: "MiniMax H3".to_string(),
