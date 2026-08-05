@@ -173,7 +173,18 @@ export function StudioPanel() {
   const [percent, setPercent] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [previews, setPreviews] = useState<Record<string, string>>({});
+  const [lightbox, setLightbox] = useState<GenerationEntry | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const lightboxRef = useRef<HTMLDialogElement>(null);
+
+  // `showModal` is the only way into the top layer, so open and close are
+  // driven from state rather than the `open` attribute.
+  useEffect(() => {
+    const dialog = lightboxRef.current;
+    if (!dialog) return;
+    if (lightbox) dialog.showModal();
+    else dialog.close();
+  }, [lightbox]);
 
   // A segment shows only the models that can do something in it, so the
   // picker never offers a video model under Image.
@@ -593,8 +604,10 @@ export function StudioPanel() {
         </section>
       )}
 
-      {mode !== "models" && selected && (
-        <section className="mb-4 grid gap-3">
+      {mode !== "models" && (
+      <div className="grid items-start gap-4 lg:grid-cols-2">
+        {selected && (
+        <section className="grid gap-3">
           <div className="flex flex-wrap gap-1.5">
             {selected.tasks
               .filter((entry) => tasksFor(mode).includes(entry))
@@ -1000,78 +1013,134 @@ export function StudioPanel() {
             )}
           </div>
         </section>
-      )}
+        )}
 
-      {mode !== "models" && (
-      <section>
+        <section>
         <h2 className="mb-2 text-xs font-medium text-muted">{t("Studio.gallery")}</h2>
         {gallery.length === 0 ? (
           <p className="text-xs text-faint">{t("Studio.galleryEmpty")}</p>
         ) : (
-          <div className="grid gap-3 sm:grid-cols-2">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             {gallery
               .filter((entry) => tasksFor(mode).includes(entry.task))
-              .map((entry, index) => {
+              .map((entry) => {
               const preview = previews[entry.artifactId];
+              if (!preview) {
+                return (
+                  <Button
+                    key={entry.entryId}
+                    size="sm"
+                    variant="secondary"
+                    className="h-24"
+                    onClick={() => void loadPreview(entry)}
+                  >
+                    {t("Studio.loadPreview")}
+                  </Button>
+                );
+              }
+              // A player is already small and already interactive; enlarging it
+              // would only show the same controls bigger.
+              if (entry.mediaType.startsWith("audio/")) {
+                return (
+                  <figure
+                    key={entry.entryId}
+                    className="col-span-2 rounded border border-border p-2 sm:col-span-3"
+                  >
+                    <audio controls src={preview} className="w-full" />
+                    <figcaption className="mt-1 line-clamp-1 text-[11px] text-muted">
+                      {entry.prompt}
+                    </figcaption>
+                  </figure>
+                );
+              }
               return (
-                <figure
+                <button
                   key={entry.entryId}
-                  // The newest result is the one the user is waiting on, so it
-                  // gets the full width rather than sharing a row.
-                  className={`rounded border border-border p-2 ${index === 0 ? "sm:col-span-2" : ""}`}
+                  type="button"
+                  title={entry.prompt}
+                  className="overflow-hidden rounded border border-border transition hover:border-accent"
+                  onClick={() => setLightbox(entry)}
                 >
-                  {preview ? (
-                    entry.mediaType.startsWith("video/") ? (
-                      <video
-                        controls
-                        loop
-                        src={preview}
-                        className="w-full rounded bg-black"
-                      />
-                    ) : entry.mediaType.startsWith("audio/") ? (
-                      <audio controls src={preview} className="w-full" />
-                    ) : (
-                      <img src={preview} alt={entry.prompt} className="w-full rounded" />
-                    )
+                  {entry.mediaType.startsWith("video/") ? (
+                    <video src={preview} muted className="h-24 w-full bg-black object-cover" />
                   ) : (
-                    <Button size="sm" variant="secondary" onClick={() => void loadPreview(entry)}>
-                      {t("Studio.loadPreview")}
-                    </Button>
+                    <img src={preview} alt={entry.prompt} className="h-24 w-full object-cover" />
                   )}
-                  <figcaption className="mt-2 text-[11px] text-faint">
-                    <span className="line-clamp-2 block text-muted">{entry.prompt}</span>
-                    {entry.modelId}
-                    {entry.width > 0 && ` · ${entry.width}×${entry.height}`}
-                    {entry.frameCount > 1 &&
-                      ` · ${(entry.durationMs / 1000).toFixed(1)}s`}
-                  </figcaption>
-                  {preview && (
-                    <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                      {/* Editing a generated asset means generating from it —
-                          the result becomes the next run's starting frame. */}
-                      {!entry.mediaType.startsWith("audio/") && selected && editTaskFor(selected) && (
-                        <Button size="sm" variant="secondary" onClick={() => void editEntry(entry)}>
-                          <Wand2 size={12} />
-                          {t("Studio.result.edit")}
-                        </Button>
-                      )}
-                      <a
-                        className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-[11px] text-muted hover:text-foreground"
-                        href={preview}
-                        download={`${entry.entryId}.${extensionFor(entry.mediaType)}`}
-                      >
-                        <Download size={12} />
-                        {t("Studio.result.save")}
-                      </a>
-                    </div>
-                  )}
-                </figure>
+                </button>
               );
             })}
           </div>
         )}
-      </section>
+        </section>
+      </div>
       )}
+
+      {/* Full size on demand. `<dialog>` brings the top layer, the backdrop and
+          Esc-to-close with it, so none of that is reimplemented here. */}
+      <dialog
+        ref={lightboxRef}
+        onClose={() => setLightbox(null)}
+        // A native dialog does not close on a backdrop click. The backdrop is
+        // the dialog's own box outside its content, so this is that click.
+        onClick={(event) => {
+          if (event.target === lightboxRef.current) setLightbox(null);
+        }}
+        className="max-h-[92vh] max-w-[92vw] rounded-lg border border-border bg-surface p-3 text-foreground backdrop:bg-black/70"
+      >
+        {lightbox && previews[lightbox.artifactId] && (
+          <div className="grid gap-2">
+            {lightbox.mediaType.startsWith("video/") ? (
+              <video
+                controls
+                loop
+                autoPlay
+                src={previews[lightbox.artifactId]}
+                className="max-h-[74vh] rounded bg-black object-contain"
+              />
+            ) : (
+              <img
+                src={previews[lightbox.artifactId]}
+                alt={lightbox.prompt}
+                className="max-h-[74vh] rounded object-contain"
+              />
+            )}
+            <p className="max-w-prose text-[11px] text-muted">{lightbox.prompt}</p>
+            <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-faint">
+              <span className="mr-auto">
+                {lightbox.modelId}
+                {lightbox.width > 0 && ` · ${lightbox.width}×${lightbox.height}`}
+                {lightbox.frameCount > 1 && ` · ${(lightbox.durationMs / 1000).toFixed(1)}s`}
+              </span>
+              {/* Editing a generated asset means generating from it — the
+                  result becomes the next run's starting frame. */}
+              {selected && editTaskFor(selected) && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => {
+                    void editEntry(lightbox);
+                    setLightbox(null);
+                  }}
+                >
+                  <Wand2 size={12} />
+                  {t("Studio.result.edit")}
+                </Button>
+              )}
+              <a
+                className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-muted hover:text-foreground"
+                href={previews[lightbox.artifactId]}
+                download={`${lightbox.entryId}.${extensionFor(lightbox.mediaType)}`}
+              >
+                <Download size={12} />
+                {t("Studio.result.save")}
+              </a>
+              <Button size="sm" variant="secondary" onClick={() => setLightbox(null)}>
+                {t("Studio.result.close")}
+              </Button>
+            </div>
+          </div>
+        )}
+      </dialog>
     </div>
   );
 }

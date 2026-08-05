@@ -104,6 +104,7 @@ export const studioLocale: Record<string, string> = {
   "Studio.languageHint": "ISO 639-1, e.g. en",
   "Studio.result.edit": "Edit this",
   "Studio.result.save": "Save",
+  "Studio.result.close": "Close",
   "Studio.result.noEditTask":
     "{{name}} cannot start from an existing image. Pick a model that does image to image or image to video.",
   "Studio.seed": "Seed",
