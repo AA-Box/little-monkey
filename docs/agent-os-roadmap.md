@@ -1524,9 +1524,13 @@ are different ranges reached by different branches.
 - **A guard's reachability can be platform-dependent, which nothing here accounted
   for.** The lesson generalizes past this bug: an SSRF guard reached through
   `to_socket_addrs` inherits the host resolver's parsing, so "unreachable" has to be
-  established per platform or not claimed. The test now asserts the one invariant
-  that holds everywhere — loopback without a grant is never allowed — and pins
-  neither platform's resolver behaviour as the expected answer.
+  established per platform or not claimed. The test asserted the one invariant that
+  held everywhere — loopback without a grant is never allowed — and pinned neither
+  platform's resolver behaviour as the expected answer. *(Superseded: once the bracket
+  fix below took the resolver out of the literal path entirely, the platforms stopped
+  disagreeing and the test tightened to assert `Loopback` on all three. The lesson
+  stands; the workaround it justified is gone, which is the better outcome — a guard
+  whose verdict depends on the host resolver is the thing that was wrong.)*
 - The only range this section moves. Everything else in the conversion is
   behaviour-preserving.
 
@@ -1605,7 +1609,7 @@ rename:
   them fails with `0.0.0.0 must be refused as egress.unspecified`. `239.255.255.255`
   pins the lower boundary as `Multicast`, and `1.1.1.1` is the counter-test that
   "refuse everything" cannot pass.
-- **`browser_worker.rs` cannot handle an IPv6 literal host on macOS or Linux.**
+- ~~**`browser_worker.rs` cannot handle an IPv6 literal host on macOS or Linux.**
   `Url::host_str()` serializes one *with its brackets*, so
   `("[::1]", port).to_socket_addrs()` fails to parse there and every IPv6-literal
   browser target is refused as a resolution failure rather than classified.
@@ -1614,7 +1618,36 @@ rename:
   bug above stayed hidden. `web.rs` avoids it entirely by matching on `Url::host()`,
   the parsed enum, and its own comment names this exact "bracket-handling class of
   bug". Fixing it widens what is reachable on macOS and Linux (a public v6 literal
-  would become allowed), so it is a behaviour change and its own review.
+  would become allowed), so it is a behaviour change and its own review.~~
+  **Fixed, and the review it wanted found more than the bracket.** Matching on
+  `Url::host()` means a literal arrives as a real `IpAddr` and is not asked of the
+  resolver at all, which is how it should always have been — an address the caller
+  spelled out cannot be rebound, so a lookup could only substitute a different answer
+  for a known one. The same blindness was in the origin-to-resolver-rule loop, where
+  `host_str().parse::<IpAddr>()` never recognised a literal and so emitted a nonsense
+  `MAP [::1] …` rule for a host Chromium is never asked about.
+
+  The widening this entry predicted is real and is why the change is half classifier
+  work. With literals reaching `classify_ip`, five ranges were classifying as public:
+  `fec0::/10`, `2001:db8::/32` and `2001:2::/48` (v4 counterparts all refused),
+  `fe00::/9` (it fell in the gap between `fc00::/7` and `fe80::/10`), and
+  `64:ff9b::/96` — NAT64, where `64:ff9b::7f00:1` *is* `127.0.0.1`, the same "a
+  spelling is not a place" bypass as the mapped-loopback entry above. Enumerating them
+  one arm at a time is how the list fell behind to begin with, so the tail is now an
+  **allowlist**: global unicast is `2000::/3` and everything else is reserved. The
+  named arms stay, because a refusal should say which class refused it.
+
+  `fec0::/10` reports `ReservedRange` and deliberately **not** the `UniqueLocalV6` its
+  shape suggests: `covered_by_private_network_grant` answers true for `UniqueLocalV6`,
+  and RFC 3879 deprecated `fec0::/10` with nothing assigned in it, so "a host the user
+  actually runs could be here" is false. Getting that code wrong would have made a
+  dead range reachable under a grant the moment any guard consulted that predicate.
+
+  Sabotage is platform-conditional and worth stating as such: restoring the bracketed
+  host turns three tests red on macOS and Linux, quoting the original bug back
+  (`browser DNS resolution failed for [::1]`), while on Windows — where a bracketed
+  literal does resolve — only the new classifier rows and the resolver-rule assertion
+  are load-bearing. CI runs all three legs.
 - **`knowledge_pipeline.rs` blocks all of `198.51/16`** where TEST-NET-2 is only
   `198.51.100/24` — over-blocking, not a hole, but it is a real range a user could
   legitimately need.
