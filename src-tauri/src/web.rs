@@ -895,7 +895,50 @@ async fn read_body_capped(mut response: reqwest::Response, max: usize) -> reqwes
 /// phases 1-2 hardcoded both via module constants; this is the phase-3
 /// settings-driven version `tool_web_fetch` (and monkey-cli, phase 4) call with
 /// whatever `web_settings.json` currently holds.
+///
+/// # Why the run scope is entered here and not at the command
+///
+/// This tool has no run and will not acquire one. A `web_fetch` is a tool call
+/// inside a chat turn: the run id in this app is a `run_ledger` entity, the
+/// frontend agent loop only forwards one to `provider_chat`, and both of this
+/// function's callers — [`tool_web_fetch`] and `monkey-cli`'s agent — are a person
+/// asking for a turn. So the honest answer is a *reason*, and it is the same
+/// reason `providers.rs` gives an ordinary non-run chat stream:
+/// [`crate::run_scope::Unattributed::UserAction`], i.e. work the user asked for
+/// outside any run.
+///
+/// Entered here rather than in [`tool_web_fetch`] because this is the boundary both
+/// callers share — a scope at the command would leave `monkey-cli`'s fetches
+/// recording a blank — and because this is the one of the two that a test can drive,
+/// so the label is pinned rather than asserted in prose.
+///
+/// The consequence to know about: this is a `scoped` and therefore *shadows* an outer
+/// scope. If a durable run ever drives a fetch, this must become a
+/// [`crate::run_scope::RunScope`] parameter, exactly as `m4_runtime`'s
+/// `run_async_worker` did for the same reason — silently relabelling a run's egress
+/// as a user action would be worse than the blank this replaces.
 pub async fn fetch_impl(
+    settings: &WebSettings,
+    url: String,
+    max_chars: Option<usize>,
+    start_index: Option<usize>,
+) -> Result<FetchResult, String> {
+    crate::run_scope::scoped(
+        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+        fetch_within_scope(settings, url, max_chars, start_index),
+    )
+    .await
+}
+
+/// [`fetch_impl`]'s body, with the scope already established.
+///
+/// Split out rather than wrapping the body in an `async` block so that the
+/// `scoped` call is one readable frame and this function's own diff stays empty.
+/// Every refusal below is raised while this future is being polled, which is what
+/// puts it inside the scope: `validate_fetch_url` here, and the same function again
+/// from inside the redirect policy, which `reqwest` invokes while polling the
+/// request future this task owns.
+async fn fetch_within_scope(
     settings: &WebSettings,
     url: String,
     max_chars: Option<usize>,
@@ -1609,7 +1652,74 @@ mod tests {
         assert_eq!(mine.len(), 1, "exactly one record for this test's address");
         assert_eq!(mine[0].rule_code, EgressRule::LinkLocal.code());
         assert_eq!(mine[0].guard, GUARD);
-        assert_eq!(mine[0].run_id, None, "a tool-call fetch has no run to name");
+        // Both blank, and that is the point of asserting it: this drives the guard
+        // directly, outside every scope, so it records the third honest state —
+        // "nobody said". The reason column is filled in by `fetch_impl`'s scope and
+        // by nothing inside `record` itself, which is what the test below proves and
+        // what this row is the counter-example to.
+        assert_eq!(mine[0].run_id, None, "no scope was entered, so no run id");
+        assert_eq!(
+            mine[0].unattributed_reason, None,
+            "an uninstrumented site must stay distinguishable from a deliberate one"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The other half: driven through the production entry point, the same refusal
+    /// records *why* it has no run instead of a blank.
+    ///
+    /// A literal address, so no DNS and no listener are involved — the refusal
+    /// happens before a socket is opened, which is what makes this a hermetic test of
+    /// an egress path. The address is unique to this test so a denial another test
+    /// recorded into the same process-wide sink cannot satisfy the filter.
+    ///
+    /// Sabotage check: delete the `scoped` call in `fetch_impl` and the reason column
+    /// goes back to `NULL`, failing the last assertion while the two above it still
+    /// pass. That is the whole distinction D3 exists to make.
+    #[tokio::test]
+    async fn a_refused_tool_fetch_records_the_reason_it_has_no_run() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory = std::env::temp_dir().join(format!("lm-web-scope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("creates the directory");
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+
+        let error = fetch_impl(
+            &WebSettings::default(),
+            "http://10.83.7.11/private".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a private literal must be refused");
+        assert!(
+            error.contains(EgressRule::PrivateV4.code()),
+            "unexpected error: {error}"
+        );
+
+        let reader = crate::denial_sink::DenialSink::open(&path).expect("reopens for reading");
+        let mine: Vec<_> = reader
+            .recent(64)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.detail.as_deref() == Some("10.83.7.11"))
+            .collect();
+
+        assert_eq!(mine.len(), 1, "exactly one record for this test's address");
+        assert_eq!(mine[0].guard, GUARD);
+        assert_eq!(mine[0].rule_code, EgressRule::PrivateV4.code());
+        assert_eq!(
+            mine[0].run_id, None,
+            "a chat-turn fetch has no run id to invent"
+        );
+        assert_eq!(
+            mine[0].unattributed_reason.as_deref(),
+            Some(crate::run_scope::Unattributed::UserAction.code()),
+            "it must say why it has no run rather than leaving the column blank"
+        );
 
         let _ = std::fs::remove_dir_all(&directory);
     }
