@@ -245,7 +245,68 @@ produce context by different rules.
 
 *Maps to: ROADMAP #9.*
 
-## D3. A run identity that reaches the work it pays for *(not started)*
+## D3. A run identity that reaches the work it pays for *(mechanism built)*
+
+**Shipped — `run_scope.rs`, and the choice of primitive is the whole decision.** A
+`tokio::task_local!`, not a `thread_local!`, and that is a correctness argument rather
+than a preference: tokio moves a task between worker threads at every `.await`, so a
+thread-local set at a command boundary is not the value read after the first await —
+it is whatever the thread that last resumed the task happened to store. With
+concurrent runs that does not merely lose the identity, it hands one run *another
+run's*, which for the allowlist this unblocks would mean enforcing the wrong policy.
+The test that pins this awaits three times around the read across a four-thread
+runtime, because the version with no awaits passes under a thread-local too.
+
+**`RunScope` has two arms, and `current()` has three answers.** That asymmetry is the
+part worth defending. `Run(id)` and `Unattributed(reason)` are the two things work can
+*be*; `current() == None` is the third thing it can be — a site nothing has scoped
+yet. Collapsing "deliberately background" and "we lost it" into one blank is exactly
+what makes an audit trail unreadable later, so `Unattributed` carries a named reason
+with a stable code (`unattributed.user-action`, `.scheduled`, `.inbound-request`,
+`.startup`) pinned by a test, for the same reason `EgressRule`'s codes are.
+
+**The first consumer is the denial sink, and it retires that module's own confession.**
+`denial_sink.rs` used to say "there are zero `task_local!` declarations in this crate
+to carry one implicitly" as the reason its recorder had to be a process-wide global.
+`record` now consults `run_scope::current()` when no explicit id is passed, so a
+refusal raised by a pure function of a `Url` or an `IpAddr` — which will never hold a
+run id — is attributable without one signature between the command layer and the
+predicate changing. An explicit id still wins, which is what keeps this a no-op at the
+sites already passing one and stops an outer scope silently relabelling a refusal
+whose owner the caller already knew.
+
+Sink schema went to V2 for the reason column, which is cheap precisely because of the
+earlier decision to give the sink its own database file rather than a `MIGRATION_V8`
+on the run ledger. The migration list is now an ordered table so V3 needs no edit to
+the applier, each version keeps its own checksum so editing V1 in place still fails,
+and a test stands up a real V1 database with a row in it and proves the upgrade keeps
+that row. The "exactly one of run id / reason" invariant is **not** a SQL `CHECK` —
+SQLite cannot add one by `ALTER` — but it does not need to be: the pair is derived
+from a two-armed enum, so the type makes it unrepresentable a layer up.
+
+**Wired at one real boundary, deliberately.** `providers_stream_chat` is a
+`#[tauri::command]` that already holds `run_id: Option<String>` and whose egress
+happens several frames below it, so both arms are live from the first commit: a
+ledgered run carries its id, and an ordinary chat is not a run and says
+`unattributed.user-action` instead of arriving as a blank.
+
+**What this does not do, and why not.** `tokio::spawn` does not inherit a task-local,
+and that is left alone rather than worked around — a spawned task may outlive the run
+that spawned it, so copying the scope in would attribute work to a run that has
+already finished. Work continuing in a spawned task re-enters the scope itself. Pinned
+by a test so the next reader meets it as a documented property rather than as a blank
+column they assume is a bug.
+
+**Still to do before the items this unblocks can land:** the three shapes below are
+untouched — `browser_worker.rs`'s per-subresource decisions, `mcp.rs`'s process-wide
+cached transport, and `m4_runtime.rs`'s two unforwarded model branches — and the other
+64 client sites still record `None`. The mechanism exists and is proven; adopting it
+site by site is the remaining work, and each site is now a two-line change rather than
+a signature cascade.
+
+---
+
+### Original analysis, kept because the measurements are what justified the design
 
 **Why this is its own item.** It was discovered as the reason K5's per-run egress
 allowlist could not be built, and then turned out to be the same wall K6's
