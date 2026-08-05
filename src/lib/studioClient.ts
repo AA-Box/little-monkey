@@ -102,6 +102,8 @@ export interface GenerationModel {
   license: LicenseGate;
   extraLaunchArgs: string[];
   installed: boolean;
+  /** Measured on this machine, not declared in the entry. */
+  totalBytes: number;
   missingBytes: number;
   licenseAccepted: boolean;
   fitsInMemory: boolean;

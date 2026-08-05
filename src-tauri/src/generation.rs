@@ -316,6 +316,24 @@ impl GenerationModelSpec {
             .collect()
     }
 
+    /// What this model actually weighs, measured rather than declared.
+    ///
+    /// `size_bytes` is only ever a promise about a file that has not arrived
+    /// yet: a component the user pointed at on their own disk has no declared
+    /// size at all, and a downloaded one has a real length that beats whatever
+    /// the entry claimed. So every present file is stat'd and only the absent
+    /// ones fall back to the declared number.
+    pub fn size_on_disk(&self, model_root: &Path) -> u64 {
+        self.components
+            .iter()
+            .map(|component| {
+                std::fs::metadata(component.resolved_path(model_root, &self.id))
+                    .map(|entry| entry.len())
+                    .unwrap_or(component.size_bytes)
+            })
+            .sum()
+    }
+
     /// Components still missing from disk, so the UI can show what a download
     /// would actually fetch rather than re-fetching a partially present set.
     pub fn missing_components(&self, model_root: &Path) -> Vec<&ModelComponent> {
@@ -1521,6 +1539,37 @@ mod tests {
         let mut no_tasks = video_model();
         no_tasks.tasks.clear();
         assert!(validate_model_spec(&no_tasks).is_err());
+    }
+
+    /// A card built from declared sizes reads "0 GB" for a model that is
+    /// plainly installed, because a file the user pointed at on their own disk
+    /// never had a declared size to begin with. Measure what is there.
+    #[test]
+    fn a_models_weight_is_measured_on_disk_not_taken_from_the_entry() {
+        let root = std::env::temp_dir().join(format!("lm-size-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("wan-mine")).unwrap();
+        let elsewhere = root.join("my-own.safetensors");
+        std::fs::write(&elsewhere, vec![7u8; 2048]).unwrap();
+
+        let mut spec = video_model();
+        spec.components = vec![
+            // The user's own file: no declared size, but it is right there.
+            ModelComponent {
+                slot: ComponentSlot::Checkpoint,
+                source: ComponentSource::LocalFile {
+                    path: elsewhere.to_string_lossy().to_string(),
+                },
+                size_bytes: 0,
+            },
+            // Downloaded and present: the real length wins over the claim.
+            ModelComponent::huggingface(ComponentSlot::Vae, "r", "vae.safetensors", 999),
+            // Declared but not yet fetched: the claim is all there is.
+            ModelComponent::huggingface(ComponentSlot::T5xxl, "r", "t5.safetensors", 64),
+        ];
+        std::fs::write(root.join("wan-mine/vae.safetensors"), vec![1u8; 512]).unwrap();
+
+        assert_eq!(spec.size_on_disk(&root), 2048 + 512 + 64);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A user's own file is referenced where it lies, never copied into the

@@ -481,7 +481,7 @@ export function StudioPanel() {
                   <span className="min-w-0">
                     <span className="block text-xs font-medium">{model.name}</span>
                     <span className="mt-0.5 block text-[11px] text-faint">
-                      {model.family} · {formatBytes(model.components.reduce((sum, c) => sum + c.sizeBytes, 0))}
+                      {model.family} · {formatBytes(model.totalBytes)}
                       {" · "}
                       {model.tasks.map((entry) => t(`Studio.task.${entry}`)).join(", ")}
                     </span>

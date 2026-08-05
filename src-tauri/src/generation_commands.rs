@@ -43,6 +43,10 @@ pub struct GenerationModelView {
     #[serde(flatten)]
     pub spec: GenerationModelSpec,
     pub installed: bool,
+    /// What the model weighs on this machine, measured. A component the user
+    /// supplied from their own disk carries no declared size, so a card built
+    /// from the spec alone reports 0 GB for a model that is plainly there.
+    pub total_bytes: u64,
     /// Bytes still to fetch, so the UI can promise the real download size
     /// rather than the model's full weight.
     pub missing_bytes: u64,
@@ -285,6 +289,7 @@ pub fn generation_models(app: AppHandle) -> Result<Vec<GenerationModelView>, Str
             let missing_bytes = missing.iter().map(|entry| entry.size_bytes).sum();
             GenerationModelView {
                 installed: missing.is_empty(),
+                total_bytes: spec.size_on_disk(&root),
                 missing_bytes,
                 license_accepted: !spec.license.acceptance_required
                     || accepted.contains(&spec.license.id),
