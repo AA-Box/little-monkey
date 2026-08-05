@@ -41,16 +41,6 @@ const MAX_HF_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LICENSE_BYTES: u64 = 1024 * 1024;
 const MAX_MODEL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_PROVENANCE_BYTES: u64 = 64 * 1024;
-/// How much of a remote-supplied string may ride in a denial record's detail.
-///
-/// The sink's `detail` column is free text with no bound of its own, and the one
-/// value this file puts there straight from a remote document is a model card's
-/// `license_link`. A card is only bounded by [`MAX_HF_METADATA_BYTES`], so without
-/// this a 16 MB link would decide how large a row in a *bounded* audit table is —
-/// which is the same disk-exhaustion argument that caps the table's row count.
-/// 160 characters is what [`license_title`] already keeps of remote text, and it
-/// is long enough to recognise the offending value.
-const MAX_DENIAL_DETAIL_CHARS: usize = 160;
 const PROVENANCE_SCHEMA_VERSION: u32 = 2;
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
@@ -1082,25 +1072,23 @@ fn hugging_face_license(
                     return Ok((license_name, Some(parsed.to_string())));
                 }
             }
-            // A link that does not parse never reaches that gate, so this was the
-            // one refusal on this path that left no record at all — the card was
-            // simply ignored. `UrlMalformed` exists for exactly this distinction:
-            // "we could not read the link" is a different fact from "we read it and
-            // a rule refused where it pointed", and only the first one was invisible.
-            //
-            // A relative link such as `LICENSE` lands here too, and that is correct
-            // rather than noise: it is the same fact about the same card, and the
-            // fallback below still resolves a pinned repo LICENSE URL, so recording
-            // it fails nothing. The volume is user-paced — one card per resolution —
-            // not attacker-paced.
+            // A bare relative link — `LICENSE`, which is the shape Hugging Face's own
+            // cards use and this file's own fixture — is not a refusal and must not be
+            // recorded as one. The fallback below resolves a pinned repo LICENSE URL
+            // for exactly this case, so nothing was denied; writing a row per
+            // resolution would evict real denials from a table bounded at 10,000 and
+            // make `egress.url-malformed` stop meaning "something was blocked".
+            Err(url::ParseError::RelativeUrlWithoutBase) => {}
+            // A link that *tried* to be absolute and failed never reaches that gate,
+            // so this was the one refusal on this path that left no record at all —
+            // the card was simply ignored. `UrlMalformed` exists for exactly this
+            // distinction: "we could not read the link" is a different fact from "we
+            // read it and a rule refused where it pointed", and only the first was
+            // invisible. The detail is bounded by the sink itself, which is where a
+            // bound on remote text belongs — see `denial_sink::MAX_DETAIL_CHARS`.
             Err(_) => crate::denial_sink::record(
                 MODEL_SOURCE_GUARD,
-                &EgressDenial::about(
-                    EgressRule::UrlMalformed,
-                    link.chars()
-                        .take(MAX_DENIAL_DETAIL_CHARS)
-                        .collect::<String>(),
-                ),
+                &EgressDenial::about(EgressRule::UrlMalformed, link),
                 None,
             ),
         }
@@ -1219,6 +1207,19 @@ async fn fetch_registry_token(
         .send()
         .await
         .map_err(|error| format!("Failed to obtain Ollama registry token: {error}"))?;
+    // The pre-flight check above pins the realm the *challenge* named. It does not
+    // pin where the request ends up: `build_http_client`'s redirect policy judges
+    // every hop with `validate_public_https_url` only — no ollama allowlist, no port
+    // — so any of eight hops could leave the allowlist for another public HTTPS host,
+    // and the `token` in that host's body would become the bearer attached to the
+    // follow-up registry request. This function's own doc opens by naming that threat:
+    // a *response* gets to propose where a credential request goes. Pinning only the
+    // pre-flight spelling left the response half of it open.
+    //
+    // Same post-redirect shape `probe_remote_gguf` uses, and a distinct message so a
+    // refusal can be placed before or after the chain.
+    validate_ollama_auth_url(response.url())
+        .map_err(|denial| format!("Ollama registry token final URL refused: {denial}"))?;
     let response = require_success(response, "Ollama registry token", None)?;
     let bytes = response_bytes_bounded(response, 64 * 1024, "Ollama registry token").await?;
     let token: RegistryTokenResponse = serde_json::from_slice(&bytes)
@@ -2462,9 +2463,13 @@ fn validate_ollama_auth_url(url: &Url) -> Result<(), EgressDenial> {
 /// Pinned anyway because it costs production nothing — the real realm is
 /// `https://auth.ollama.ai/token`, the scheme's default port.
 ///
-/// The *path* is deliberately not pinned. `/token` is the registry's to change,
-/// and a path is not a destination: where the request can go is decided entirely
-/// by the host and this port.
+/// The *path* is deliberately not pinned. `/token` is the registry's to change, and
+/// pinning it buys nothing: a path does not decide which server answers.
+///
+/// Host and port do decide that, but only for the request as *sent*. Where it ends up
+/// is decided by the redirect chain, which this constant cannot reach — see the
+/// post-redirect re-check in [`fetch_registry_token`], which is the other half of the
+/// same rule and without which either half is bypassable by a response.
 const OLLAMA_AUTH_PORT: u16 = 443;
 
 /// [`validate_ollama_auth_url`]'s decision, without the recording.
@@ -3533,10 +3538,17 @@ mod tests {
                 .collect()
         };
 
-        const UNPARSEABLE: &str = "model-sources-test license link that is not a url";
+        // A link that *tried* to be absolute and failed. Deliberately not a bare
+        // relative word: `Url::parse("LICENSE")` is `RelativeUrlWithoutBase`, which is
+        // the normal Hugging Face card shape and is excluded from recording, so a
+        // fixture like that would assert nothing while looking like it did.
+        const UNPARSEABLE: &str = "https://[model-sources-test-not-an-address";
         assert!(
-            Url::parse(UNPARSEABLE).is_err(),
-            "the fixture must be a link that really does not parse"
+            matches!(
+                Url::parse(UNPARSEABLE),
+                Err(url::ParseError::InvalidIpv6Address)
+            ),
+            "the fixture must fail for a real reason, not for being relative"
         );
         let mut metadata = hf_metadata(vec![HfSibling {
             rfilename: "LICENSE".to_string(),
@@ -3559,23 +3571,23 @@ mod tests {
         assert_eq!(mine[0].rule_code, EgressRule::UrlMalformed.code());
         assert_eq!(mine[0].guard, MODEL_SOURCE_GUARD);
 
-        // The bound on what a remote card can put in an audit row. A card is only
-        // capped by `MAX_HF_METADATA_BYTES`, so an unbounded detail would let one
-        // link decide the size of a row in a bounded table.
-        let oversized = "x".repeat(MAX_DENIAL_DETAIL_CHARS * 4);
+        // A bare relative link is the shape Hugging Face's own cards use, and this
+        // file's other fixture uses it too. It is not a refusal — the fallback below
+        // resolves a pinned repo LICENSE URL — so it must leave no row. Recording it
+        // would write one per resolution into a table bounded at 10,000 and evict real
+        // denials.
         metadata.card_data = Some(HfCardData {
             license: None,
-            license_link: Some(oversized.clone()),
+            license_link: Some("LICENSE".to_string()),
         });
-        hugging_face_license(&metadata, "owner/repo", &"a".repeat(40)).unwrap();
-        assert_eq!(
-            read_details("x".repeat(MAX_DENIAL_DETAIL_CHARS)).len(),
-            1,
-            "an oversized link must be recorded truncated, not whole"
+        let (_, url) = hugging_face_license(&metadata, "owner/repo", &"a".repeat(40)).unwrap();
+        assert!(
+            url.as_deref().is_some_and(|url| url.ends_with("/LICENSE")),
+            "a relative link must still resolve through the fallback"
         );
         assert!(
-            read_details(oversized).is_empty(),
-            "the untruncated link must not appear in any row"
+            read_details("LICENSE".to_string()).is_empty(),
+            "a relative link is the normal card shape, not a refusal"
         );
 
         // The counter-test: a link that parses and points somewhere allowed is
@@ -3631,21 +3643,72 @@ mod tests {
         // rendering, plus the counter-case: a realm that really is on the
         // allowlist is still accepted.
         assert_eq!(
-            validate_ollama_auth_url(&Url::parse("https://evil.example/token").unwrap())
+            classify_ollama_auth_url(&Url::parse("https://evil.example/token").unwrap())
                 .expect_err("an off-allowlist realm must be refused")
                 .rule(),
             EgressRule::OriginNotAllowlisted
         );
         assert!(
-            validate_ollama_auth_url(&Url::parse("https://auth.ollama.ai/token").unwrap()).is_ok()
+            classify_ollama_auth_url(&Url::parse("https://auth.ollama.ai/token").unwrap()).is_ok()
         );
-        assert!(validate_ollama_auth_url(&Url::parse("https://ollama.com/token").unwrap()).is_ok());
+        assert!(classify_ollama_auth_url(&Url::parse("https://ollama.com/token").unwrap()).is_ok());
         // A near-miss host that merely *contains* the allowlisted name.
         assert_eq!(
-            validate_ollama_auth_url(&Url::parse("https://ollama.ai.evil.example/token").unwrap())
+            classify_ollama_auth_url(&Url::parse("https://ollama.ai.evil.example/token").unwrap())
                 .expect_err("a suffix attack must be refused")
                 .rule(),
             EgressRule::OriginNotAllowlisted
+        );
+    }
+
+    /// The allowlist is bypassable by a *response* unless the final URL is re-checked,
+    /// and that half cannot be reached from a unit test: the pre-flight check refuses
+    /// every host this process could stand a local listener on, so a real redirect out
+    /// of the allowlist is unreachable without overriding DNS.
+    ///
+    /// So this reads the source, in the style `egress.rs`'s two ratchets established
+    /// for the same reason. Comment lines are stripped first, because the prose
+    /// explaining a scan is exactly what a scan for that prose's own subject matches —
+    /// a mistake this repo has now made three times.
+    ///
+    /// What it pins: `fetch_registry_token` sends, and then judges `response.url()`
+    /// with the *ollama* validator. Not `validate_public_https_url`, which is what
+    /// `build_http_client`'s redirect policy already uses and which allows any public
+    /// HTTPS host — so a hop off the allowlist passes it. The credential shape is why
+    /// this matters: the `token` in the final host's body becomes the bearer attached
+    /// to the follow-up registry request.
+    #[test]
+    fn the_registry_token_request_rechecks_where_the_redirect_chain_ended() {
+        let source = include_str!("model_sources.rs");
+        let stripped = source
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = stripped
+            .split_once("async fn fetch_registry_token(")
+            .expect("fetch_registry_token is declared")
+            .1
+            .split_once("\n}\n")
+            .expect("its body ends")
+            .0;
+        assert!(
+            body.contains("validate_ollama_auth_url(response.url())"),
+            "fetch_registry_token must re-check the final URL against the ollama \
+             allowlist; the redirect policy's own check allows any public HTTPS host"
+        );
+        // The pre-flight check must survive too. Both halves, or the rule is
+        // bypassable from one side: without the pre-flight a challenge names any host
+        // directly, and without the re-check a response redirects to one.
+        assert!(
+            body.contains("validate_ollama_auth_url(&challenge.realm)"),
+            "the pre-flight realm check must not be dropped in favour of the re-check"
         );
     }
 
