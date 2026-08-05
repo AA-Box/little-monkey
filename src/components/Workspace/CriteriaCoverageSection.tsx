@@ -197,7 +197,10 @@ export function CriteriaCoverageSection({ review, mode, t, onRevealPath }: Crite
       </button>
 
       {expanded && (
-        <div className="border-t border-border px-3 py-2">
+        // Height-capped and self-scrolling: this band sits above the diff
+        // column as a `shrink-0` sibling, so an unbounded body (many criteria,
+        // a long claim list) would squeeze the diff to nothing.
+        <div className="max-h-[45vh] overflow-y-auto border-t border-border px-3 py-2 [overscroll-behavior:contain]">
           <label className="block text-[11px] text-muted" htmlFor="review-coverage-criteria">
             {t("ReviewPanel.coverageHint")}
           </label>

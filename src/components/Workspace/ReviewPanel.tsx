@@ -669,8 +669,20 @@ export function ReviewPanel({ onClose, view: initialView = "continuous" }: {
       <CriteriaCoverageSection review={coverageInput} mode={base} t={t} onRevealPath={revealFile} />
 
       <div className="flex min-h-0 flex-1">
-        {/* Main: every file's diff stacked, or just the selected one. */}
-        <div className="min-h-0 flex-1 overflow-auto [overscroll-behavior:contain]">
+        {/*
+          Main: every file's diff stacked, or just the selected one. Which
+          element scrolls differs by view and is not interchangeable:
+          `DiffViewer` scrolls its own body off a `h-full min-h-0` root, so in
+          `single` view this column must hand it a bounded height and NOT
+          scroll itself — a wrapper with auto height leaves that `h-full` with
+          nothing to resolve against and nothing scrolls at all. In
+          `continuous` view this column is the scroller.
+        */}
+        <div
+          className={`flex min-h-0 flex-1 flex-col ${
+            view === "single" ? "overflow-hidden" : "overflow-auto [overscroll-behavior:contain]"
+          }`}
+        >
           {review && !review.is_repo ? (
             <p className="p-4 text-sm text-faint">{t("ReviewPanel.notARepo")}</p>
           ) : filteredRows.length === 0 ? (
@@ -684,7 +696,7 @@ export function ReviewPanel({ onClose, view: initialView = "continuous" }: {
                 return unavailable !== null ? (
                   <p className="p-4 text-sm text-muted">{t(unavailable)}</p>
                 ) : (
-                  <div className="p-3">
+                  <div className="flex min-h-0 flex-1 flex-col p-3">
                     <DiffViewer
                       fileName={selectedRow.path}
                       oldValue={selectedRow.content?.old ?? ""}
@@ -698,7 +710,9 @@ export function ReviewPanel({ onClose, view: initialView = "continuous" }: {
             )
           ) : (
             filteredRows.map((row) => (
-              <div key={row.path} ref={(node) => { fileRefs.current[row.path] = node; }}>
+              // `shrink-0`: the column above is a flex container, so without it
+              // a long stack would be compressed to fit instead of scrolling.
+              <div key={row.path} className="shrink-0" ref={(node) => { fileRefs.current[row.path] = node; }}>
                 <FileDiff
                   row={row}
                   layout={layout}
