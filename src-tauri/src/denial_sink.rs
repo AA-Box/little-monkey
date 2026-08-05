@@ -267,6 +267,26 @@ fn slot() -> &'static Mutex<Option<DenialSink>> {
     SINK.get_or_init(|| Mutex::new(None))
 }
 
+/// Serializes the tests that install a sink, wherever in the crate they live.
+///
+/// Necessary because [`install`] replaces a **process-wide** slot: two tests
+/// running concurrently, each installing its own file-backed sink and then reading
+/// it back, will have one's records land in the other's sink. Filtering reads by a
+/// unique marker is not enough — that guards against mixing up *contents*, not
+/// against the slot being swapped between the write and the read. Found the honest
+/// way: the web recording test began failing `left: 0, right: 1` the moment a third
+/// installing test was added.
+///
+/// A poisoned lock is recovered rather than propagated, so one failing test does
+/// not cascade into every other test that touches the sink.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Installs the process's sink, replacing any previous one.
 pub fn install(sink: DenialSink) {
     if let Ok(mut slot) = slot().lock() {

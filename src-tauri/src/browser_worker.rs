@@ -3456,6 +3456,7 @@ mod tests {
     /// both call sites are actually wired.
     #[test]
     fn two_guards_refusing_are_distinguishable_in_the_record() {
+        let _serialized = crate::denial_sink::test_lock();
         let directory =
             std::env::temp_dir().join(format!("lm-two-guards-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).expect("creates the directory");

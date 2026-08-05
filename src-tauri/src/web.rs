@@ -1458,6 +1458,7 @@ mod tests {
     /// satisfied (or broken) by a denial another test recorded into the same sink.
     #[test]
     fn a_refused_fetch_is_written_down_with_its_rule() {
+        let _serialized = crate::denial_sink::test_lock();
         let directory = std::env::temp_dir().join(format!("lm-web-sink-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).expect("creates the directory");
         let path = directory.join(crate::denial_sink::SINK_FILE);
@@ -1490,6 +1491,7 @@ mod tests {
     /// everything unconditionally" would pass the test above.
     #[test]
     fn an_allowed_fetch_records_nothing() {
+        let _serialized = crate::denial_sink::test_lock();
         let directory = std::env::temp_dir().join(format!("lm-web-ok-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).expect("creates the directory");
         let path = directory.join(crate::denial_sink::SINK_FILE);
