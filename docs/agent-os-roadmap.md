@@ -1537,6 +1537,25 @@ the tree and the reason is not the missing timeout on its own:
 - Sabotage-verified against a real listener that accepts and never answers: without
   the budget the request waits `30.011s`, until the *peer* gives up.
 
+**Shipped — the same hang existed in two Tauri commands, and loopback was the reason
+it survived.** `ollama_list_models` and `ollama_remove_model` used reqwest's bare
+constructor, which sets no timeout at all, and neither has a cancellation token or
+anything racing it. A daemon that accepted the connection and then went quiet left the
+`invoke` unresolved forever — a UI spinner with no error and no way out but a restart.
+Both were sitting in the bare-client ratchet's allow-list under "loopback-only", which
+is a fair exemption from the *redirect* and credential rules and no exemption at all
+from having a deadline. That entry is now removed rather than annotated, and every
+Ollama call goes through one `ollama_client(total)`: 10 seconds for the read-only calls,
+60 for the delete, since Ollama unlinks a model's blobs before it answers. A total
+deadline is the right shape for these, unlike on a download path — the bodies are small
+and fully buffered.
+
+Worth recording as a lesson about the ratchet itself: writing the doc comment for the
+fix broke the ratchet, because it spelled the bare constructor out and the scan counts
+that literal string anywhere in the production half of a file. `egress.rs`'s own doc
+comments already talk around it for exactly this reason. A ratchet that greps source
+text also greps the prose explaining it.
+
 **The audit that found it also found the shape of the remaining problem, which is the
 inverse.** A ratchet on "builder with no timeout" would catch 7 sites, of which only
 3 are real (the other 4 are bounded at the application layer by `run_bounded` or an

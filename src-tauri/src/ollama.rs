@@ -304,7 +304,9 @@ async fn check_capabilities(client: &reqwest::Client, name: &str) -> (bool, bool
 /// hint fetched concurrently for all models.
 #[tauri::command]
 pub async fn ollama_list_models() -> Result<Vec<OllamaModelInfo>, String> {
-    let client = reqwest::Client::new();
+    // Bounds `/api/tags` and every concurrent `/api/show` hint below, since
+    // `check_capabilities` borrows this same client.
+    let client = ollama_client(Duration::from_secs(10))?;
 
     let resp = client
         .get(format!("{OLLAMA_BASE_URL}/api/tags"))
@@ -405,11 +407,34 @@ async fn fetch_running_models(
     Ok(normalize_running_models(parsed))
 }
 
-fn residency_client() -> Result<reqwest::Client, String> {
+/// A client for one of this file's calls to the local Ollama daemon, with
+/// `total` as the deadline for the whole request.
+///
+/// A *total* deadline is the right shape here, unlike on a download path: every
+/// caller reads a small, fully buffered JSON body from a loopback peer, so the
+/// deadline can be proportionate to the response instead of racing it.
+///
+/// Exists because two commands had no deadline of any kind. reqwest's bare
+/// constructor sets none, and a `#[tauri::command]` that never returns is worse
+/// than one that fails: `ollama_list_models` and `ollama_remove_model` are both
+/// `invoke`d from the UI with nothing racing them and no cancellation token, so a
+/// daemon that accepted the connection and then went quiet left the caller
+/// waiting forever with no error to show. The other calls in this file already
+/// passed a budget; these two were simply missed, which is what the bare-client
+/// ratchet in `egress.rs` now records as fixed rather than allowed.
+///
+/// Prose here avoids spelling that constructor out: the ratchet counts the exact
+/// string across the tree, so a doc comment naming it would count as a site — the
+/// same reason `egress.rs`'s own doc comments talk around it.
+fn ollama_client(total: Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(total)
         .build()
-        .map_err(|e| format!("Failed to create Ollama residency client: {e}"))
+        .map_err(|e| format!("Failed to create Ollama HTTP client: {e}"))
+}
+
+fn residency_client() -> Result<reqwest::Client, String> {
+    ollama_client(Duration::from_secs(10))
 }
 
 /// List the models currently loaded in Ollama memory. Callers can snapshot
@@ -891,7 +916,9 @@ pub async fn ollama_remove_model(tag: String) -> Result<(), String> {
     validate_tag(&tag)?;
     let tag = tag.trim().to_string();
 
-    let client = reqwest::Client::new();
+    // Longer than the read-only calls: Ollama unlinks the tag's blobs before it
+    // answers, and a large model's blobs are large files.
+    let client = ollama_client(Duration::from_secs(60))?;
     let resp = client
         .delete(format!("{OLLAMA_BASE_URL}/api/delete"))
         .json(&json!({ "model": tag }))
@@ -989,6 +1016,45 @@ pub async fn ollama_signin(_app: AppHandle) -> Result<String, String> {
 #[cfg(test)]
 mod residency_tests {
     use super::*;
+
+    /// A daemon that accepts and then goes quiet must not hold a command open.
+    ///
+    /// Driven against a silent loopback listener with an injected 200ms budget,
+    /// because the production budgets are 10 and 60 seconds and a test that waited
+    /// one out would not be a test. The listener is *held*, not dropped: dropping
+    /// sends `FIN`, which reqwest reports as a connection error, and this would
+    /// then pass with no deadline configured at all — the exact bug it exists to
+    /// catch.
+    #[tokio::test]
+    async fn a_daemon_that_accepts_and_goes_quiet_does_not_hold_a_command_open() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a silent peer");
+        let address = listener.local_addr().expect("peer address");
+
+        let held = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+
+        let started = std::time::Instant::now();
+        let result = ollama_client(Duration::from_millis(200))
+            .expect("client builds")
+            .get(format!("http://{address}/api/tags"))
+            .send()
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a daemon that never answers must not be waited on forever"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "gave up after {:?}, which is not the 200ms budget",
+            started.elapsed()
+        );
+        // Proves the peer accepted, so the error above is the deadline rather
+        // than a refused connection — `is_err()` alone cannot tell them apart.
+        assert!(
+            held.join().expect("accept thread joins").is_ok(),
+            "the request must have reached the peer"
+        );
+    }
 
     fn parse_running_models(json: &str) -> Vec<OllamaRunningModelInfo> {
         let raw: RawRunningModelsResponse =
