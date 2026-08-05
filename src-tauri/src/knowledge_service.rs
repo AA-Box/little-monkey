@@ -4597,6 +4597,45 @@ pub fn knowledge_ocr_configure_external(
     Ok(config)
 }
 
+/// Largest OCR sidecar this host will accept, in bytes.
+///
+/// One constant because the number has to be in two places that must agree: the
+/// `request.size_bytes` gate below, and the `max_file_bytes`/`max_total_bytes`
+/// [`fetch_http`] is given for the download itself. Two literals could drift, and
+/// the failure would be quiet in one direction — a fetch cap smaller than the
+/// declared-size gate turns "too big, refused up front" into "transport failure
+/// after downloading most of it".
+const OCR_SIDECAR_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The limit set [`knowledge_ocr_install`] hands [`fetch_http`], raised from the
+/// pipeline default's 32 MiB to `max_bytes` because a Tesseract sidecar is an
+/// order of magnitude larger than any document the pipeline ingests.
+///
+/// Exists as a function so the raise goes through [`PipelineLimits::validate`]
+/// rather than straight into a fetch. Be clear about what that buys today:
+/// nothing. `validate` checks only relational invariants — non-zero fields,
+/// `max_total_bytes >= max_file_bytes`, `max_redirects` within
+/// `MAX_REDIRECT_CHAIN` — and has no absolute ceiling on a byte cap, so the
+/// current 256 MiB passes and would pass at any size. The value is that the *next*
+/// edit here cannot silently produce an inconsistent set: raising one byte cap and
+/// not the other, or zeroing one, is now refused at the boundary instead of
+/// travelling into a fetch that would refuse every byte it read.
+///
+/// `max_bytes` is a parameter rather than the constant read directly so the
+/// rejection path is reachable from a test — production has one caller and it
+/// passes [`OCR_SIDECAR_MAX_BYTES`].
+fn ocr_install_limits(max_bytes: u64) -> Result<PipelineLimits, String> {
+    let limits = PipelineLimits {
+        max_file_bytes: max_bytes,
+        max_total_bytes: max_bytes,
+        ..PipelineLimits::default()
+    };
+    limits
+        .validate()
+        .map_err(|error| format!("Invalid OCR download limits: {error}"))?;
+    Ok(limits)
+}
+
 #[tauri::command]
 pub async fn knowledge_ocr_install(
     app: AppHandle,
@@ -4608,7 +4647,7 @@ pub async fn knowledge_ocr_install(
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
         || request.size_bytes == 0
-        || request.size_bytes > 256 * 1024 * 1024
+        || request.size_bytes > OCR_SIDECAR_MAX_BYTES
         || request.version.is_empty()
         || request.version.len() > 80
         || request.license_name.trim().is_empty()
@@ -4621,9 +4660,7 @@ pub async fn knowledge_ocr_install(
         return Err("OCR sidecars must be downloaded over HTTPS".to_string());
     }
     let origin = origin_of(&parsed)?;
-    let mut limits = PipelineLimits::default();
-    limits.max_file_bytes = 256 * 1024 * 1024;
-    limits.max_total_bytes = 256 * 1024 * 1024;
+    let limits = ocr_install_limits(OCR_SIDECAR_MAX_BYTES)?;
     let fetched = fetch_http(
         &request.url,
         &origin,
@@ -5463,5 +5500,38 @@ mod tests {
         assert!(validate_slack_channel_id("").is_err());
         assert!(validate_jira_project_key("PROJ").is_ok());
         assert!(validate_jira_project_key("").is_err());
+    }
+
+    #[test]
+    fn ocr_install_limits_accepts_the_cap_the_installer_actually_uses() {
+        let limits = ocr_install_limits(OCR_SIDECAR_MAX_BYTES)
+            .expect("the installer's own limit set must be a valid one");
+        // Both caps, not just the per-file one: `fetch_http` measures a single
+        // download against `max_file_bytes` and the running total against
+        // `max_total_bytes`, so leaving the latter at the pipeline default would cap
+        // the sidecar at 32 MiB by the other name.
+        assert_eq!(limits.max_file_bytes, OCR_SIDECAR_MAX_BYTES);
+        assert_eq!(limits.max_total_bytes, OCR_SIDECAR_MAX_BYTES);
+    }
+
+    #[test]
+    fn ocr_install_limits_refuses_a_cap_that_contradicts_the_rest_of_the_set() {
+        // Zero is the reachable inconsistency: a limit set that admits no bytes at
+        // all would let every OCR download start and then fail on the first read.
+        // `validate` is what turns that into a refusal before the fetch, and this
+        // case is the reason the raise goes through it rather than straight into
+        // `fetch_http`. Deleting that call makes this assertion fail.
+        let error = ocr_install_limits(0)
+            .expect_err("a zero byte cap is not a coherent limit set and must be refused");
+        assert!(
+            error.contains("Invalid OCR download limits"),
+            "rejection must name the limit set it refused, got: {error}"
+        );
+        // A cap below the pipeline's own `max_total_bytes` default is still fine —
+        // the invariant is `max_total_bytes >= max_file_bytes`, and this function
+        // moves both together, so lowering the cap must not be mistaken for
+        // inconsistency. Without this the test above would also pass a
+        // `validate` that refused everything.
+        assert!(ocr_install_limits(1024).is_ok());
     }
 }
