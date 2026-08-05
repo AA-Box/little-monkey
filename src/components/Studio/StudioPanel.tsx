@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Download,
   Loader2,
+  RectangleHorizontal,
+  RectangleVertical,
   Shuffle,
   Sparkles,
   Square,
@@ -102,12 +104,19 @@ function SliderField({
           step={step}
           value={value}
           onChange={(event) => onChange(Number(event.target.value))}
-          className="w-20 shrink-0 rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+          className="w-16 shrink-0 rounded border border-border bg-background px-1.5 py-1 text-center text-xs text-foreground"
         />
       </span>
     </label>
   );
 }
+
+/** The shape each preset makes, which is the whole of what the button says. */
+const ASPECT_ICONS = {
+  portrait: RectangleVertical,
+  landscape: RectangleHorizontal,
+  square: Square,
+} as const;
 
 /** The hires pass at its usual starting point, so the toggle has something
  *  sensible to switch on. */
@@ -639,7 +648,7 @@ export function StudioPanel() {
           </div>
 
           {isSpeechTask(task) && (
-            <div className="grid gap-3 sm:grid-cols-[2fr_1fr]">
+            <div className="grid gap-3">
               <label className="grid gap-1 text-[11px] text-muted">
                 {t("Studio.speakerFile")}
                 <input
@@ -731,30 +740,32 @@ export function StudioPanel() {
 
               <div className="grid gap-1 text-[11px] text-muted">
                 {t("Studio.aspect")}
-                <div className="flex flex-wrap gap-1.5">
-                  {ASPECT_PRESETS.map((preset) => (
-                    <Button
-                      key={preset.id}
-                      size="sm"
-                      variant={
-                        settings.width === preset.width && settings.height === preset.height
-                          ? "primary"
-                          : "secondary"
-                      }
-                      onClick={() =>
-                        setSettings({ ...settings, width: preset.width, height: preset.height })
-                      }
-                    >
-                      {t(`Studio.aspect.${preset.id}`)}
-                      <span className="font-mono text-[10px] opacity-70">
-                        {preset.width}×{preset.height}
-                      </span>
-                    </Button>
-                  ))}
+                <div className="flex gap-1.5">
+                  {ASPECT_PRESETS.map((preset) => {
+                    const Icon = ASPECT_ICONS[preset.id as keyof typeof ASPECT_ICONS];
+                    return (
+                      <IconButton
+                        key={preset.id}
+                        size="sm"
+                        variant={
+                          settings.width === preset.width && settings.height === preset.height
+                            ? "active"
+                            : "secondary"
+                        }
+                        aria-label={t(`Studio.aspect.${preset.id}`)}
+                        title={`${t(`Studio.aspect.${preset.id}`)} · ${preset.width}×${preset.height}`}
+                        onClick={() =>
+                          setSettings({ ...settings, width: preset.width, height: preset.height })
+                        }
+                      >
+                        <Icon size={13} />
+                      </IconButton>
+                    );
+                  })}
                 </div>
               </div>
 
-              <div className="grid gap-3 sm:grid-cols-2">
+              <div className="grid gap-3">
                 <SliderField
                   label={t("Studio.width")}
                   value={settings.width}
@@ -796,7 +807,7 @@ export function StudioPanel() {
                 </select>
               </label>
 
-              <div className="grid gap-3 sm:grid-cols-2">
+              <div className="grid gap-3">
                 <SliderField
                   label={t("Studio.steps")}
                   value={settings.steps}
@@ -850,7 +861,7 @@ export function StudioPanel() {
                 <summary className="cursor-pointer text-[11px] text-muted">
                   {t("Studio.advanced")}
                 </summary>
-                <div className="mt-2 grid gap-3 sm:grid-cols-2">
+                <div className="mt-2 grid gap-3">
                   <label className="grid gap-1 text-[11px] text-muted">
                     {t("Studio.scheduler")}
                     <select
@@ -940,7 +951,7 @@ export function StudioPanel() {
                       </datalist>
                       <span className="text-faint">{t("Studio.upscalerHint")}</span>
                     </label>
-                    <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="grid gap-3">
                       <SliderField
                         label={t("Studio.hiresSteps")}
                         value={settings.hires.steps}
@@ -996,53 +1007,62 @@ export function StudioPanel() {
         )}
 
         <section className="flex min-h-0 flex-1 flex-col gap-2">
-          <textarea
-            className="min-h-16 w-full shrink-0 rounded border border-border bg-background p-2 text-xs"
-            placeholder={t("Studio.promptPlaceholder")}
-            value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
-          />
-          {!isSpeechTask(task) && (
-            <input
-              className="w-full shrink-0 rounded border border-border bg-background p-2 text-xs"
-              placeholder={t("Studio.negativePlaceholder")}
-              value={negativePrompt}
-              onChange={(event) => setNegativePrompt(event.target.value)}
+          {/* Each button sits with the field it belongs to and stretches to
+              its height, so the row reads as one control rather than two. */}
+          <div className="flex shrink-0 items-stretch gap-2">
+            <textarea
+              className="min-h-16 flex-1 rounded border border-border bg-background p-2 text-xs"
+              placeholder={t("Studio.promptPlaceholder")}
+              value={prompt}
+              onChange={(event) => setPrompt(event.target.value)}
             />
-          )}
-
-          <div className="flex shrink-0 items-center gap-2">
-            <Button variant="primary" disabled={!canGenerate} onClick={() => void generate()}>
+            <Button
+              variant="primary"
+              className="h-auto shrink-0 flex-col px-4"
+              disabled={!canGenerate}
+              onClick={() => void generate()}
+            >
               {busy ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
               {t("Studio.generate")}
             </Button>
-            {phase && <span className="shrink-0 text-[11px] text-muted">{phase}</span>}
-            {busy && (
-              <span className="flex min-w-0 flex-1 items-center gap-2">
-                <span className="h-1 min-w-16 flex-1 overflow-hidden rounded-full bg-surface-2">
-                  <span
-                    className={`block h-full bg-accent ${
-                      percent === null ? "w-1/3 animate-pulse" : "transition-[width]"
-                    }`}
-                    style={percent === null ? undefined : { width: `${percent}%` }}
-                  />
-                </span>
-                {percent !== null && (
-                  <span className="shrink-0 font-mono text-[11px] text-muted">{percent}%</span>
-                )}
-              </span>
-            )}
-            {status?.loadedModelId && (
-              <Button
-                size="sm"
-                variant="secondary"
-                className="ml-auto"
-                onClick={() => void studioClient.unloadEngine().then(refresh)}
-              >
-                {t("Studio.unload")}
-              </Button>
-            )}
           </div>
+
+          {!isSpeechTask(task) && (
+            <div className="flex shrink-0 items-stretch gap-2">
+              <input
+                className="min-w-0 flex-1 rounded border border-border bg-background p-2 text-xs"
+                placeholder={t("Studio.negativePlaceholder")}
+                value={negativePrompt}
+                onChange={(event) => setNegativePrompt(event.target.value)}
+              />
+              {status?.loadedModelId && (
+                <Button
+                  variant="secondary"
+                  className="h-auto shrink-0"
+                  onClick={() => void studioClient.unloadEngine().then(refresh)}
+                >
+                  {t("Studio.unload")}
+                </Button>
+              )}
+            </div>
+          )}
+
+          {busy && (
+            <div className="flex shrink-0 items-center gap-2">
+              {phase && <span className="shrink-0 text-[11px] text-muted">{phase}</span>}
+              <span className="h-1 min-w-16 flex-1 overflow-hidden rounded-full bg-surface-2">
+                <span
+                  className={`block h-full bg-accent ${
+                    percent === null ? "w-1/3 animate-pulse" : "transition-[width]"
+                  }`}
+                  style={percent === null ? undefined : { width: `${percent}%` }}
+                />
+              </span>
+              {percent !== null && (
+                <span className="shrink-0 font-mono text-[11px] text-muted">{percent}%</span>
+              )}
+            </div>
+          )}
 
           {/* The canvas: whatever was made last, as large as the pane allows.
               It is the thing being worked on, so it gets the space. */}
