@@ -1553,6 +1553,66 @@ web-tools setting, and expanding to an all-or-nothing Seatbelt clause for sandbo
 shell children on macOS only. This clause is greenfield, and the roadmap should say
 so rather than implying a hierarchy exists to slot into.
 
+**Shipped — the run's own network permission is binding, and it was enforced
+nowhere.** `PermissionPolicySnapshot::allow_network` has been in every frozen
+`RunSpec` since the protocol was written. Nothing on any outbound path read it.
+Its only readers were `recipes.rs`, which compares it against a tool profile and
+enforces nothing, and `sandbox.rs`'s **same-named but different** field, which
+governs sandboxed shell children. So a run submitted with `allow_network: false` —
+the default when a submitter omits it — reached every cloud provider unimpeded.
+
+- **Enforced in `provider_endpoint_for_run`**, which already loads the frozen spec
+  by run id, refuses to trust the caller's claimed target, and is fail-closed on an
+  unknown run. The endpoint it returns *is* the destination the permission is about,
+  so a separate consult would be a second read of the same row with a chance of
+  disagreeing with the first.
+- **This is deny-by-default in the only sense a run can express today**, and it does
+  satisfy "cannot be widened at runtime by the model, a skill, a package, or a
+  routing decision": the permission is frozen at submission, the spec row is written
+  once, and no update path to it exists.
+- **Loopback is exempt, and that is not a loophole.** A local-inference run carries
+  `allow_network: false` quite correctly — it uses no network in the sense the flag
+  means. Reading the flag as "no sockets at all" would refuse every local run, which
+  is not a stricter policy but a broken one.
+- **Three submitters were under-declaring and are now fixed** — `compareRunner.ts`
+  (both sites) and `paletteActions.ts` omitted `allowNetwork`, which freezes `false`,
+  and then used the network. Enforcement turns a dormant inaccuracy into a refused
+  run, so they had to be corrected in the same change.
+- Denials carry the run id, which is what finally populates the sink column that
+  every production call site had been passing `None` for.
+
+**Correction — the fourth acceptance clause cannot be delivered as written, and this
+is the reason.** "Each record carries a deny-by-default egress policy — allowed
+hosts, ports, and protocols" assumes every egress site can name its run. Audited
+against the code, most cannot, and several *never* will:
+
+- **There are zero `task_local!` and zero `thread_local!` declarations in the crate**,
+  and `AppState` has no notion of a current run — every per-work-unit map is keyed by
+  `turn_id`, `request_id` or `job_id`. A run id can only reach an egress site as an
+  explicit parameter.
+- **30 files construct an outbound client at 65 sites.** The single highest-volume
+  egress decision in the tree — `browser_worker.rs`'s per-subresource and per-redirect
+  check inside `CdpConnection::handle_event` — is made on a struct that has no run id
+  and no path to one.
+- **`mcp.rs` builds one client per *server connection*, cached process-wide**, so one
+  transport serves every run. Making it per-run means rebuilding the transport per
+  call and losing the connection reuse and OAuth refresh the design depends on.
+- **Some egress legitimately has no run, and cannot.** Scheduled knowledge refresh is
+  timer-driven; connector verification happens in Settings before any run exists;
+  model downloads and update checks are not runs. Deny-by-default keyed to a run would
+  silently disable all of them.
+- **`server.rs` is the clause's own counter-example in literal form.** An inbound HTTP
+  caller's request body picks which of two egress policies applies, via
+  `route_model` → `client_for`. There is no run to attach to, because an inbound
+  request is not one.
+
+So the clause's shape is wrong for this architecture, not merely unimplemented. What
+is deliverable — and what the entry above delivers — is enforcement at the paths where
+a run *is* nameable, plus the honest statement that a per-run host/port/protocol
+allowlist would need a context-propagation layer this app does not have. Building that
+layer is a larger change than K5 and should be its own item rather than hidden inside
+this one.
+
 **Shipped — every blocked attempt is written down with the rule that blocked it.**
 `denial_sink.rs` is an append-only store in its **own database file**
 (`egress-denials-v1.sqlite3`), written at the raise site by all four guards.

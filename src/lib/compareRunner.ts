@@ -233,6 +233,12 @@ async function runBranch(
       target,
       roots: [],
       permissionMode: "manual",
+      // Declared, not defaulted. `allowNetwork` omitted means `false` in the
+      // frozen spec, and a comparison branch against a cloud provider does use
+      // the network — so omitting it froze a permission the run then contradicted.
+      // Rust now enforces this flag on the provider path, so an under-declaration
+      // is a refused run rather than a dormant inaccuracy.
+      allowNetwork: target.kind === "provider" || (target.kind === "ollama" && target.isCloud === true),
       budgets: defaultRunBudgets(true),
     });
     if (recorder) {
@@ -706,6 +712,10 @@ async function runSynthesis(groupId: string, synthesis: ComparisonSynthesis): Pr
       target: synthesis.target,
       roots: [],
       permissionMode: "manual",
+      // See the branch submission above.
+      allowNetwork:
+        synthesis.target.kind === "provider" ||
+        (synthesis.target.kind === "ollama" && synthesis.target.isCloud === true),
       budgets: defaultRunBudgets(true),
     });
     if (recorder) {
