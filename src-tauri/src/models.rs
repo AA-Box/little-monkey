@@ -665,8 +665,16 @@ async fn download_to_file(
 ) -> Result<(), String> {
     let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
 
+    // Same silence budget as every other download path, for the same reason: this
+    // client had no timeout of any kind, so a Hugging Face connection that
+    // completed its handshake and then stopped writing left the progress bar
+    // stopped at N bytes indefinitely, with no error and no self-recovery. Less
+    // severe than the managed-model installer's version of this bug only because
+    // `cancel` is wired here, so a user could get out of it by hand.
     let client = reqwest::Client::builder()
         .user_agent("LittleMonkey-Desktop/0.1")
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(crate::egress::READ_TIMEOUT)
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
