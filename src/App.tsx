@@ -58,6 +58,7 @@ import {
 import { recoverDaemonDesktopTurns } from "./lib/agentLoop";
 import { paletteClient } from "./lib/paletteClient";
 import { featurePanelReducer, type FeaturePanelId } from "./lib/appShellPanels";
+import { studioClient } from "./lib/studioClient";
 import { SegmentedControl } from "./components/ui/SegmentedControl";
 import {
   AgentInbox,
@@ -280,6 +281,13 @@ function App() {
    *  here before — sessions, code, the feature panels; Studio is image and
    *  video generation, which shares none of that state. */
   const [section, setSection] = useState<"chat" | "studio">("chat");
+  /** Studio needs a native engine that not every host can run — no upstream
+   *  build for Linux arm64, and the Linux x86_64 build needs a newer glibc
+   *  than some supported distributions ship. Where it cannot run, the section
+   *  switcher is not offered at all and the window stays the chat app it was
+   *  before Studio existed. Optimistically true so the switcher does not
+   *  flicker in on the hosts where Studio does work. */
+  const [studioSupported, setStudioSupported] = useState(true);
   const [workspacePanelOpen, setWorkspacePanelOpen] = useState(true);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
@@ -325,6 +333,19 @@ function App() {
   useEffect(() => {
     if (settingsOpen) setSettingsMounted(true);
   }, [settingsOpen]);
+
+  // One probe at startup. A failed call leaves the switcher in place: the
+  // panel reports its own errors, and a broken status command is not evidence
+  // that the host cannot run the engine.
+  useEffect(() => {
+    void studioClient
+      .engineStatus()
+      .then((status) => {
+        setStudioSupported(status.supported);
+        if (!status.supported) setSection("chat");
+      })
+      .catch(() => {});
+  }, []);
 
   // Title-bar slot the primary ChatWindow portals its Compare/Crew pickers
   // into — callback-ref state (not a plain ref) so ChatWindow re-renders
@@ -966,18 +987,21 @@ function App() {
       <aside className="app-session-sidebar flex shrink-0 flex-col border-r border-border bg-surface">
         <div data-tauri-drag-region className="h-11 shrink-0" />
         {/* Section switcher. Below the drag strip rather than inside it, so
-            clicking a segment never starts a window drag. */}
-        <div className="px-2 pb-2">
-          <SegmentedControl
-            ariaLabel={t("App.section.switcher")}
-            active={section}
-            onChange={setSection}
-            items={[
-              { id: "chat", label: t("App.section.chat") },
-              { id: "studio", label: t("App.section.studio") },
-            ]}
-          />
-        </div>
+            clicking a segment never starts a window drag. Hidden entirely
+            where Studio cannot run: a lone "Chat" segment switches nothing. */}
+        {studioSupported ? (
+          <div className="px-2 pb-2">
+            <SegmentedControl
+              ariaLabel={t("App.section.switcher")}
+              active={section}
+              onChange={setSection}
+              items={[
+                { id: "chat", label: t("App.section.chat") },
+                { id: "studio", label: t("App.section.studio") },
+              ]}
+            />
+          </div>
+        ) : null}
         {/* `relative` so the update card can float over the bottom of the
             session list (Claude Desktop places it exactly there) instead of
             pushing the list up when an update lands mid-scroll. */}
