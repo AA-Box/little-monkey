@@ -80,10 +80,14 @@ export function ModelFiles({
   };
 
   return (
-    <div className="grid gap-2">
+    // A grid item's default minimum is its min-content, and a `<select>`'s
+    // min-content is its *widest option* — here a slot name long enough to
+    // widen every row that holds one. `min-w-0` is what stops that from
+    // becoming the width of the whole rail.
+    <div className="grid gap-2 [&>*]:min-w-0">
       {components.map((component, index) => (
-        <div key={index} className="grid gap-1.5 rounded bg-background/60 p-2">
-          <div className="flex items-center gap-1.5">
+        <div key={index} className="grid gap-1.5 rounded bg-background/60 p-2 [&>*]:min-w-0">
+          <div className="flex min-w-0 items-center gap-1.5">
             {/* What the part *is*, in words. The engine flag stays beside it
                 because it is the unambiguous version, but nobody should have
                 to know that `--clip_l` is a text encoder to fill this in. */}

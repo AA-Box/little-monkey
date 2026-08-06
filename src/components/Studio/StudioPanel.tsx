@@ -819,7 +819,10 @@ export function StudioPanel() {
         // which is why the size hint and every number stepper looked sliced
         // off. `scrollbar-gutter` covers the other setting, where the bar is
         // solid and takes width instead.
-        <aside className="grid w-80 shrink-0 content-start gap-3 overflow-y-auto pb-4 pl-1 pr-3 [scrollbar-gutter:stable]">
+        // `[&>*]:min-w-0` is the other half: a grid item's default minimum is
+        // its own min-content, so one wide control anywhere in the rail sizes
+        // the whole column to itself and every box overflows together.
+        <aside className="grid w-80 shrink-0 content-start gap-3 overflow-y-auto pb-4 pl-1 pr-3 [scrollbar-gutter:stable] [&>*]:min-w-0">
           <div className="flex flex-wrap gap-1.5">
             {selected.tasks
               .filter((entry) => tasksFor(mode).includes(entry))
@@ -924,7 +927,7 @@ export function StudioPanel() {
               <summary className="cursor-pointer text-xs font-medium">
                 {t("Studio.settings")}
               </summary>
-              <div className="mt-3 grid gap-3">
+              <div className="mt-3 grid gap-3 [&>*]:min-w-0">
 
               <div className="grid gap-1 text-[11px] text-muted">
                 {t("Studio.aspect")}
@@ -1177,7 +1180,7 @@ export function StudioPanel() {
               <summary className="cursor-pointer text-xs font-medium">
                 {t("Studio.lora.title")}
               </summary>
-              <div className="mt-3">
+              <div className="mt-3 grid [&>*]:min-w-0">
                 <LoraStack
                   loras={loras}
                   library={loraLibrary}
@@ -1204,7 +1207,7 @@ export function StudioPanel() {
                   .join(", ")}
               </span>
             </summary>
-            <div className="mt-3 grid gap-2">
+            <div className="mt-3 grid gap-2 [&>*]:min-w-0">
               <p className="text-[11px] text-faint">{t("Studio.partsHint")}</p>
               <ModelFiles
                 allowDownload={false}
