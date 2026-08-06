@@ -163,12 +163,36 @@ jobs:
             - **Windows** — `-setup.exe` or `_en-US.msi` (`arm64` or `x64`)
             - **Linux** — `.AppImage`, `.deb`, or `.rpm` (`aarch64`/`arm64` or `amd64`/`x86_64`)
           generateReleaseNotes: true
-          # Kept as a draft on purpose: a release is a manual publish decision.
-          # Note the consequence for updates — GitHub does not serve draft
-          # assets, so `/releases/latest/download/latest.json` keeps 404ing
-          # (and nobody gets the update) until the draft is published.
+          # Draft only while the matrix runs. Six jobs write to one release, so
+          # publishing here would expose a release carrying whichever platform
+          # finished first — and an incomplete `latest.json` with it. The
+          # `publish` job below flips it once every target has uploaded.
           releaseDraft: true
           prerelease: false
           # Attaches the signed `latest.json` the updater endpoint points at.
           # No-op when the signing secrets are missing (nothing to describe).
           includeUpdaterJson: true
+
+  # Publishing is what makes the release real: GitHub serves no draft assets,
+  # so until this runs `/releases/latest/download/latest.json` 404s and no
+  # installed app sees the update. It needs the whole matrix, so a target that
+  # failed leaves the release a draft rather than shipping a partial one.
+  publish:
+    needs: release
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="$(jq -r .version src-tauri/tauri.conf.json)"
+          # --latest is explicit rather than implied: the updater endpoint
+          # resolves through /releases/latest, and a draft published later
+          # than a newer tag would otherwise not claim it.
+          gh release edit "$VERSION" --draft=false --latest
+          gh release view "$VERSION" --json isDraft,tagName,assets \
+            --jq '"published \(.tagName) with \(.assets | length) assets"'

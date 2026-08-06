@@ -116,10 +116,14 @@ the requested split.
 
 ## 8. Updater and release hardening
 
-**Today:** no updater exists at all. Signing is macOS-only. Ten locales are
-each missing the same ~650 of 1,726 keys (they fall back to English at
-runtime). There is no dependency scanning, SBOM, accessibility CI, or
-penetration test.
+**Today:** the in-app updater ships on all three desktop platforms — background
+checks, a staged bundle, a relaunch card, and Windows deferring its installer to
+the click so an update cannot kill a turn mid-flight — and releases publish
+themselves once every matrix target has uploaded. What is missing: rollback, a
+manual check control, a visible failed check, Linux coverage beyond the AppImage,
+and a startup self-integrity check. Signing is macOS-only. Ten locales are each
+missing the same ~650 of 1,726 keys (they fall back to English at runtime). There
+is no dependency scanning, SBOM, accessibility CI, or penetration test.
 
 **Acceptance:** signed, verifiable in-app updates with rollback on every
 supported platform; signed/notarized installers per platform; clean-machine
