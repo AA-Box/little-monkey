@@ -13,8 +13,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
@@ -223,17 +224,52 @@ fn engine_binary(app: &AppHandle) -> Result<PathBuf, String> {
     })
 }
 
+/// Whether the engine binary can actually start on this host.
+///
+/// `runtime_supported_here` only answers whether upstream publishes an sd
+/// build for this target. It cannot answer whether that build runs here: the
+/// Linux archive is compiled on Ubuntu 24.04 and needs glibc 2.38 /
+/// GLIBCXX 3.4.32 plus a Vulkan loader, so on an older distribution the tree
+/// stages and verifies perfectly and then dies at exec. Asking the binary to
+/// print its version settles every one of those cases at once — loader
+/// failures included — for the price of one short process.
+///
+/// Cached for the process: the answer cannot change while the app runs, and
+/// this is on the path of every Studio status refresh.
+fn engine_starts(binary: &Path) -> bool {
+    static STARTS: OnceLock<bool> = OnceLock::new();
+    *STARTS.get_or_init(|| binary_starts(binary))
+}
+
+fn binary_starts(binary: &Path) -> bool {
+    Command::new(binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 #[tauri::command]
 pub fn generation_engine_status(app: AppHandle) -> Result<GenerationEngineStatus, String> {
-    let supported = managed_runtime::runtime_supported_here(&STABLE_DIFFUSION);
     let app_data = app.path().app_data_dir().ok();
+    // Presence, not verification: this runs on every Studio refresh, and
+    // hashing the whole runtime tree here made switching tabs take seconds.
+    // The launch path still verifies before spawning anything.
+    let target_supported = managed_runtime::runtime_supported_here(&STABLE_DIFFUSION);
+    let present = target_supported
+        .then(|| {
+            managed_runtime::managed_server_path_unverified(&STABLE_DIFFUSION, app_data.as_deref())
+        })
+        .flatten();
+    // An engine that is not there yet cannot be probed, and must not be
+    // called unsupported for it: a fresh install has nothing under app data
+    // until Studio first materializes the bundle.
+    let supported = target_supported && present.as_deref().is_none_or(engine_starts);
     Ok(GenerationEngineStatus {
         supported,
-        // Presence, not verification: this runs on every Studio refresh, and
-        // hashing the whole runtime tree here made switching tabs take
-        // seconds. The launch path still verifies before spawning anything.
-        engine_installed: supported
-            && managed_runtime::managed_server_present(&STABLE_DIFFUSION, app_data.as_deref()),
+        engine_installed: supported && present.is_some(),
         loaded_model_id: app.state::<AppState>().generation_engine.loaded_model(),
         total_ram_bytes: total_ram_bytes(),
     })
@@ -798,4 +834,23 @@ pub fn generation_media_data_url(
 #[tauri::command]
 pub fn generation_unload_engine(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.generation_engine.stop()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{binary_starts, Uuid};
+
+    /// The whole point of the probe: a file that is present but cannot be
+    /// executed here reads as "does not start", which is what an old-glibc
+    /// Linux host produces from a perfectly staged, perfectly verified tree.
+    #[test]
+    fn a_binary_that_cannot_be_executed_does_not_start() {
+        let directory =
+            std::env::temp_dir().join(format!("lm-sd-probe-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let fake = directory.join("sd-server");
+        std::fs::write(&fake, b"not really a binary").unwrap();
+        assert!(!binary_starts(&fake));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 }
