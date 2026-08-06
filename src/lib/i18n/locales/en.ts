@@ -38,6 +38,7 @@ import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 import { localAppsLocale } from "./localApps";
+import { studioLocale } from "./studio";
 import { compareLabLocale } from "./compareLab";
 import { productionDebuggingLocale } from "./productionDebugging";
 import { designToAppLocale } from "./designToApp";
@@ -84,6 +85,7 @@ export const en: Record<string, string> = {
   ...crossRepoChangePlannerLocale,
   ...visualEditModeLocale,
   ...localAppsLocale,
+  ...studioLocale,
   ...compareLabLocale,
   ...productionDebuggingLocale,
   ...designToAppLocale,

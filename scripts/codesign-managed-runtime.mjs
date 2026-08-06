@@ -28,9 +28,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { isMachOFile } from "./lib/machO.mjs";
-import { MANAGED_LLAMA_VERSION } from "./lib/managedRuntimeManifest.mjs";
+import {
+  managedRuntime,
+  stagedRuntimeDirectory,
+} from "./lib/managedRuntimeManifest.mjs";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const runtime = managedRuntime(process.argv[2] ?? "llama");
 const target =
   process.env.MANAGED_RUNTIME_TARGET || process.env.CLI_SIDECAR_TARGET || "";
 const identity = process.env.APPLE_SIGNING_IDENTITY;
@@ -52,12 +56,22 @@ const stageRoot = join(
   "src-tauri",
   "resources",
   "managed-runtime",
-  `llama-${MANAGED_LLAMA_VERSION}`,
+  stagedRuntimeDirectory(runtime),
 );
 
 if (!existsSync(stageRoot)) {
+  // An optional runtime is legitimately absent on hosts upstream does not
+  // publish for; staging already skipped it, so there is nothing to sign.
+  if (runtime.optional) {
+    console.log(
+      `[codesign-managed-runtime] no staged ${runtime.id} runtime for this target, skipping`,
+    );
+    process.exit(0);
+  }
   throw new Error(
-    `[codesign-managed-runtime] ${stageRoot} does not exist - run "pnpm stage:runtime" first`,
+    `[codesign-managed-runtime] ${stageRoot} does not exist - run "pnpm stage:runtime${
+      runtime.id === "llama" ? "" : `:${runtime.id}`
+    }" first`,
   );
 }
 

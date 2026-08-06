@@ -1670,6 +1670,12 @@ mod tests {
         const ALLOWED: &[(&str, usize)] = &[
             // The CLI's local embedding endpoint.
             ("bin/monkey-cli/embed_cli.rs", 1),
+            // The readiness probe against Studio's own `sd-server` child, on a
+            // loopback port this process reserved and handed it on its command
+            // line. Loopback by construction, and not deadline-free: the probe
+            // carries a 2s per-request timeout and the whole wait is bounded by
+            // `READY_TIMEOUT`.
+            ("generation.rs", 1),
             // Local stack runtimes. Lived in `stacks.rs` until the v1 registry and
             // embedding core were extracted for the D2 collapse; the client itself is
             // unchanged and still talks only to the loopback embedding runtime.
@@ -1786,6 +1792,15 @@ mod tests {
             // 1.5s on a loopback `/health` probe whose body is never read at all,
             // only `status()`. Nothing to truncate.
             ("diagnostics.rs", 1),
+            // 120s on Studio's job client and 10s on its cancel, both loopback to
+            // the `sd-server` child. The generation itself is not under either:
+            // the API is submit-and-poll, so a deadline here only ever covers one
+            // round trip, and the run is bounded by `JOB_TIMEOUT` (2h) in the
+            // polling loop. The largest body is the terminal poll, which carries
+            // the finished media base64 inside the JSON under `MAX_MEDIA_BYTES`
+            // (256 MiB) — 2.8 MB/s across a loopback socket, and fully buffered
+            // by `json()`, so there is no stream for the deadline to truncate.
+            ("generation_commands.rs", 2),
             // 30s for OAuth token/revocation JSON under a 1 MiB cap (35 KB/s), and
             // 120s on the workflow client — the second is (C): `run_model` posts
             // `"stream": false`, so that budget is a cap on how long a local model

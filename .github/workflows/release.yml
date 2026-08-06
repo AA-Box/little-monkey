@@ -95,6 +95,21 @@ jobs:
         env:
           MANAGED_RUNTIME_TARGET: ${{ matrix.target }}
 
+      # Speech rides a second, newer llama.cpp pin so that reaching the
+      # libmtmd llama-tts never moves the chat and embedding engine.
+      - name: Verify and stage managed llama.cpp speech runtime
+        run: pnpm stage:runtime:tts
+        env:
+          MANAGED_RUNTIME_TARGET: ${{ matrix.target }}
+
+      # stable-diffusion.cpp publishes binaries for three of these six
+      # targets. The script skips the rest by design, so Studio is simply
+      # absent from those builds rather than failing them.
+      - name: Verify and stage managed stable-diffusion.cpp runtime
+        run: pnpm stage:runtime:sd
+        env:
+          MANAGED_RUNTIME_TARGET: ${{ matrix.target }}
+
       # tauri-action only imports APPLE_CERTIFICATE into a keychain during its
       # own bundling step, but codesign-managed-runtime.mjs runs earlier (in
       # beforeBuildCommand) and needs the Developer ID identity already
