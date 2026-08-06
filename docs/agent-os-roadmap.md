@@ -2736,12 +2736,14 @@ other people implement against, not a single binary.
 
 ## K22. Verified boot and updater
 
-**Today:** no updater exists. Signing is macOS-only. Managed runtime
-components install with digest verification and macOS notarization codesigning
-(recent release fixes), and installed models carry content-addressed,
-digest-verified manifests that never trust a corrupt local copy for reuse.
-Ten locales are each missing ~650 of 1,726 keys. No dependency scanning,
-SBOM, accessibility CI, or penetration test.
+**Today:** the in-app updater ships on all three desktop platforms and releases
+publish themselves once every matrix target has uploaded; rollback, a manual
+check control, a visible failed check, and Linux coverage beyond the AppImage
+are still missing. Signing is macOS-only. Managed runtime components install
+with digest verification and macOS notarization codesigning, and installed
+models carry content-addressed, digest-verified manifests that never trust a
+corrupt local copy for reuse. Ten locales are each missing ~650 of 1,726 keys.
+No dependency scanning, SBOM, accessibility CI, or penetration test.
 
 **Acceptance:** ROADMAP #8 in full, plus a startup self-integrity check that
 verifies the app's own binary signature and the digests of every managed
