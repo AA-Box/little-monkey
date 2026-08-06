@@ -29,9 +29,9 @@ function blankComponent(): ModelComponent {
  * The weight files a model is made of: the checkpoint or diffusion model, plus
  * whatever CLIP, text encoder or VAE the architecture wants beside it.
  *
- * Shared by the add form and the generation page, because "this model is
- * missing its VAE" is discovered while generating, not while filling in a form,
- * and sending the user back to a different tab to fix it is the whole problem.
+ * Lives only in the Models tab — both when adding a model and when editing one
+ * already in the library. Adding a file is a library operation; the generation
+ * tabs pick between what this produced and never introduce a new file.
  *
  * Each slot is prefilled from the file's own name and every one stays an open
  * select. That distinction is the point: a wrong slot does not fail here, it
@@ -42,13 +42,9 @@ function blankComponent(): ModelComponent {
 export function ModelFiles({
   components,
   onChange,
-  /** Whether a row may be fetched from Hugging Face rather than picked off
-   *  disk. The generation page is for pointing at a file you already have. */
-  allowDownload = true,
 }: {
   components: ModelComponent[];
   onChange: (next: ModelComponent[]) => void;
-  allowDownload?: boolean;
 }) {
   const { t } = useT();
 
@@ -103,24 +99,22 @@ export function ModelFiles({
                 </option>
               ))}
             </select>
-            {allowDownload && (
-              <select
-                className="rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground"
-                value={component.source.kind}
-                aria-label={t("Studio.add.source")}
-                onChange={(event) =>
-                  patch(index, {
-                    source:
-                      event.target.value === "local_file"
-                        ? { kind: "local_file", path: "" }
-                        : { kind: "hugging_face", repo: "", file: "" },
-                  })
-                }
-              >
-                <option value="local_file">{t("Studio.add.onDisk")}</option>
-                <option value="hugging_face">{t("Studio.add.download")}</option>
-              </select>
-            )}
+            <select
+              className="rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground"
+              value={component.source.kind}
+              aria-label={t("Studio.add.source")}
+              onChange={(event) =>
+                patch(index, {
+                  source:
+                    event.target.value === "local_file"
+                      ? { kind: "local_file", path: "" }
+                      : { kind: "hugging_face", repo: "", file: "" },
+                })
+              }
+            >
+              <option value="local_file">{t("Studio.add.onDisk")}</option>
+              <option value="hugging_face">{t("Studio.add.download")}</option>
+            </select>
             <IconButton
               size="sm"
               aria-label={t("Studio.add.removeFile")}

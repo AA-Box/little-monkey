@@ -44,6 +44,8 @@ import {
   type LoraAsset,
   type LoraSelection,
   type ModelComponent,
+  partsForSlot,
+  type ComponentOverride,
 } from "../../lib/studioClient";
 
 /** The canvas and sampling controls for one run. Seeded from the model but
@@ -213,9 +215,12 @@ export function StudioPanel() {
   const [language, setLanguage] = useState("");
   const [loras, setLoras] = useState<LoraSelection[]>([]);
   const [loraLibrary, setLoraLibrary] = useState<LoraAsset[]>([]);
-  /** The selected model's files, edited here and saved back to the library.
-   *  Null while it matches what is stored, which is what hides Save. */
-  const [fileDraft, setFileDraft] = useState<ModelComponent[] | null>(null);
+  /** Which library model's file fills a slot for this run. Empty means the
+   *  selected model's own, which is almost always the answer. */
+  const [overrides, setOverrides] = useState<ComponentOverride[]>([]);
+  /** A model's parts, being edited in the Models tab. Keyed by model id so an
+   *  edit survives the list re-rendering around it. */
+  const [partsDraft, setPartsDraft] = useState<Record<string, ModelComponent[]>>({});
   const [settings, setSettings] = useState<RunSettings | null>(null);
   const [adding, setAdding] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -262,6 +267,22 @@ export function StudioPanel() {
   );
   const shown = shownGallery[0] ?? null;
   const shownHistory = shownGallery.slice(1);
+
+  // Slots this model loads that the library can fill more than one way. One
+  // option means there is nothing to choose, so it never reaches the rail.
+  const swappable = useMemo(() => {
+    if (!selected) return [];
+    return selected.components
+      .map((component) => {
+        const others = partsForSlot(models, component.slot).filter(
+          (entry) => entry.model.id !== selected.id,
+        );
+        // The model's own file leads the list whether or not it is installed,
+        // so the control always has the value it is showing.
+        return { slot: component.slot, options: [{ model: selected, component }, ...others] };
+      })
+      .filter((entry) => entry.options.length > 1);
+  }, [selected, models]);
 
   const refresh = useCallback(async () => {
     try {
@@ -319,7 +340,7 @@ export function StudioPanel() {
   // offers that model's own starting point rather than the last one's.
   useEffect(() => {
     if (!selected) return;
-    setFileDraft(null);
+    setOverrides([]);
     setSettings({
       width: selected.defaults.width,
       height: selected.defaults.height,
@@ -399,20 +420,23 @@ export function StudioPanel() {
   };
 
   /**
-   * Saves an edit to the selected model's file list.
+   * Saves an edit to a model's file list.
    *
    * The same entry the library holds — a model whose VAE was missing is the
    * same model once it is not. Any engine still holding the old file set is
    * dropped: it was launched from the list that just changed, and the backend
    * keys a warm engine on exactly that.
    */
-  const saveFiles = async (components: ModelComponent[]) => {
-    if (!selected) return;
+  const saveParts = async (model: GenerationModel, components: ModelComponent[]) => {
     setError(null);
     try {
-      await studioClient.addModel({ ...toSpec(selected), components });
-      if (status?.loadedModelId === selected.id) await studioClient.unloadEngine();
-      setFileDraft(null);
+      await studioClient.addModel({ ...toSpec(model), components });
+      if (status?.loadedModelId === model.id) await studioClient.unloadEngine();
+      setPartsDraft((current) => {
+        const next = { ...current };
+        delete next[model.id];
+        return next;
+      });
       await refresh();
     } catch (reason) {
       setError(errorText(reason));
@@ -472,6 +496,7 @@ export function StudioPanel() {
         initImageBase64: needsInitImage(task) ? initImage : null,
         // Blank rows are a half-typed path, not a LoRA the user meant.
         loras: loras.filter((lora) => lora.path.trim().length > 0),
+        componentOverrides: overrides,
       });
       setGallery((current) => [entry, ...current]);
       void loadPreview(entry);
@@ -674,6 +699,51 @@ export function StudioPanel() {
                     )}
                   </span>
                 </button>
+
+                {/* Adding and swapping files happens here and only here. The
+                    generation tabs pick from what this produces. */}
+                <details className="mt-2">
+                  <summary className="cursor-pointer text-[11px] text-muted">
+                    {t("Studio.parts")}
+                    <span className="ml-1.5 text-faint">
+                      {model.components
+                        .map((component) => t(`Studio.slot.${component.slot}`))
+                        .join(", ")}
+                    </span>
+                  </summary>
+                  <div className="mt-2 grid gap-2 [&>*]:min-w-0">
+                    <ModelFiles
+                      components={partsDraft[model.id] ?? model.components}
+                      onChange={(components) =>
+                        setPartsDraft((current) => ({ ...current, [model.id]: components }))
+                      }
+                    />
+                    {partsDraft[model.id] && (
+                      <div className="flex items-center gap-1.5">
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          onClick={() => void saveParts(model, partsDraft[model.id])}
+                        >
+                          {t("Studio.partsSave")}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onClick={() =>
+                            setPartsDraft((current) => {
+                              const next = { ...current };
+                              delete next[model.id];
+                              return next;
+                            })
+                          }
+                        >
+                          {t("Studio.add.cancel")}
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                </details>
 
                 {!model.fitsInMemory && (
                   <p className="mt-2 text-[11px] text-warning">
@@ -1193,39 +1263,45 @@ export function StudioPanel() {
             </details>
           )}
 
-          {/* The parts the engine loads. Here as well as in the models tab
-              because "this one is missing its VAE" is something you find out
-              while generating, and being sent to another tab to fix it is the
-              whole of the complaint. Closed, it still says what is loaded —
-              which is the answer most of the time. */}
-          <details className="rounded border border-border p-3">
-            <summary className="cursor-pointer text-xs font-medium">
-              {t("Studio.parts")}
-              <span className="ml-1.5 font-normal text-faint">
-                {(fileDraft ?? selected.components)
-                  .map((component) => t(`Studio.slot.${component.slot}`))
-                  .join(", ")}
-              </span>
-            </summary>
-            <div className="mt-3 grid gap-2 [&>*]:min-w-0">
-              <p className="text-[11px] text-faint">{t("Studio.partsHint")}</p>
-              <ModelFiles
-                allowDownload={false}
-                components={fileDraft ?? selected.components}
-                onChange={setFileDraft}
-              />
-              {fileDraft && (
-                <div className="flex items-center gap-1.5">
-                  <Button size="sm" variant="primary" onClick={() => void saveFiles(fileDraft)}>
-                    {t("Studio.partsSave")}
-                  </Button>
-                  <Button size="sm" variant="secondary" onClick={() => setFileDraft(null)}>
-                    {t("Studio.add.cancel")}
-                  </Button>
-                </div>
-              )}
-            </div>
-          </details>
+          {/* Choosing only. Files are added in the Models tab, and a slot the
+              model does not already load is a different model rather than a
+              setting — so this offers the alternatives the library holds and
+              nothing else. Hidden entirely when there are none, because a
+              column of fixed dropdowns is just noise. */}
+          {swappable.length > 0 && (
+            <details className="rounded border border-border p-3">
+              <summary className="cursor-pointer text-xs font-medium">
+                {t("Studio.parts")}
+              </summary>
+              <div className="mt-3 grid gap-2 [&>*]:min-w-0">
+                <p className="text-[11px] text-faint">{t("Studio.partsHint")}</p>
+                {swappable.map(({ slot, options }) => (
+                  <label key={slot} className="grid gap-1 text-[11px] text-muted">
+                    {t(`Studio.slot.${slot}`)}
+                    <select
+                      className="min-w-0 rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground"
+                      value={overrides.find((entry) => entry.slot === slot)?.modelId ?? selected.id}
+                      onChange={(event) =>
+                        setOverrides((current) => [
+                          ...current.filter((entry) => entry.slot !== slot),
+                          ...(event.target.value === selected.id
+                            ? []
+                            : [{ slot, modelId: event.target.value }]),
+                        ])
+                      }
+                    >
+                      {options.map(({ model, component }) => (
+                        <option key={model.id} value={model.id}>
+                          {componentFileName(component)}
+                          {model.id === selected.id ? ` (${t("Studio.parts.own")})` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ))}
+              </div>
+            </details>
+          )}
 
         </aside>
         )}

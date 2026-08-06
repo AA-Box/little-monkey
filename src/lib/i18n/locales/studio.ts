@@ -71,7 +71,8 @@ export const studioLocale: Record<string, string> = {
   "Studio.lora.forget": "Remove from library",
   "Studio.parts": "Model parts",
   "Studio.partsHint":
-    "The weights this model is assembled from. Most models are one checkpoint; the split ones need their text encoder and VAE named separately.",
+    "Use another model's file for one of these. Files are added in the Models tab — this only picks between the ones already there.",
+  "Studio.parts.own": "this model's",
   "Studio.partsSave": "Save",
   "Studio.slot.checkpoint": "Checkpoint",
   "Studio.slot.diffusion_model": "Diffusion model",

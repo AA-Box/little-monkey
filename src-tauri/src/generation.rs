@@ -688,6 +688,68 @@ pub struct GenerationRequest {
     /// LoRAs to apply, in order. Any model can take any number.
     #[serde(default)]
     pub loras: Vec<LoraSelection>,
+    /// Per-run swaps of which library file fills one of this model's slots.
+    #[serde(default)]
+    pub component_overrides: Vec<ComponentOverride>,
+}
+
+/// One per-run swap: fill `slot` with the file another library model uses for
+/// the same slot.
+///
+/// A model id rather than a path on purpose. The caller is the UI, and letting
+/// it name an arbitrary absolute path would make every generation request a
+/// way to hand the engine any file on the machine. Naming a library entry
+/// keeps the set of loadable files exactly the set the user added.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentOverride {
+    pub slot: ComponentSlot,
+    pub model_id: String,
+}
+
+/// Rewrites `spec` so each override's slot is filled by the donor model's file.
+///
+/// The donor's file is resolved to an absolute path first: a component carries
+/// no model id of its own, so one copied between entries unchanged would be
+/// looked up under the *borrowing* model's directory and not be there.
+///
+/// Only a slot the model already loads can be swapped. Adding one it does not
+/// have is a different model, not a setting, and belongs in the library rather
+/// than in a run.
+pub fn apply_component_overrides(
+    spec: &GenerationModelSpec,
+    donors: &[GenerationModelSpec],
+    overrides: &[ComponentOverride],
+    model_root: &Path,
+) -> Result<GenerationModelSpec, String> {
+    let mut effective = spec.clone();
+    for swap in overrides {
+        if swap.model_id == spec.id {
+            continue;
+        }
+        let donor = donors
+            .iter()
+            .find(|entry| entry.id == swap.model_id)
+            .ok_or_else(|| format!("{} is not in your library", swap.model_id))?;
+        let source = donor
+            .components
+            .iter()
+            .find(|component| component.slot == swap.slot)
+            .ok_or_else(|| format!("{} has no {}", donor.name, swap.slot.flag()))?;
+        let target = effective
+            .components
+            .iter_mut()
+            .find(|component| component.slot == swap.slot)
+            .ok_or_else(|| format!("{} does not load a {}", spec.name, swap.slot.flag()))?;
+        target.source = ComponentSource::LocalFile {
+            path: source
+                .resolved_path(model_root, &donor.id)
+                .to_string_lossy()
+                .to_string(),
+        };
+        target.size_bytes = source.size_bytes;
+    }
+    Ok(effective)
 }
 
 /// `-1` means "whatever the model was trained with", which is the only sane
@@ -1531,6 +1593,7 @@ mod tests {
             language: None,
             init_image_base64: None,
             loras: Vec::new(),
+            component_overrides: Vec::new(),
         }
     }
 
@@ -1695,6 +1758,54 @@ mod tests {
             launch_signature(&spec, root),
             launch_args(&spec, root, 0),
         );
+    }
+
+    /// Swapping a VAE is a setting; the file it points at still has to resolve
+    /// under the model that owns it, or the engine is handed a path to a file
+    /// that was never there.
+    #[test]
+    fn a_borrowed_part_resolves_under_the_model_it_came_from() {
+        let root = Path::new("/models");
+        let mut mine = video_model();
+        mine.components = vec![
+            ModelComponent::huggingface(ComponentSlot::DiffusionModel, "r", "unet.gguf", 1),
+            ModelComponent::huggingface(ComponentSlot::Vae, "r", "mine.safetensors", 1),
+        ];
+        let mut theirs = video_model();
+        theirs.id = "other-model".to_string();
+        theirs.name = "Other".to_string();
+        theirs.components = vec![
+            ModelComponent::huggingface(ComponentSlot::DiffusionModel, "r", "unet.gguf", 1),
+            ModelComponent::huggingface(ComponentSlot::Vae, "r", "theirs.safetensors", 7),
+        ];
+        let donors = vec![mine.clone(), theirs.clone()];
+
+        let swap = vec![ComponentOverride {
+            slot: ComponentSlot::Vae,
+            model_id: "other-model".to_string(),
+        }];
+        let effective = apply_component_overrides(&mine, &donors, &swap, root).expect("swap");
+        let args = launch_args(&effective, root, 8092);
+        let at = args.iter().position(|arg| arg == "--vae").expect("--vae");
+        // Under the donor's directory, not the borrower's.
+        assert_eq!(args[at + 1], "/models/other-model/theirs.safetensors");
+        assert_eq!(args.iter().filter(|arg| *arg == "--vae").count(), 1);
+        // Everything else is untouched.
+        let unet = args.iter().position(|arg| arg == "--diffusion-model").unwrap();
+        assert_eq!(args[unet + 1], "/models/wan-mine/unet.gguf");
+
+        // A slot this model does not load is a different model, not a setting.
+        let absent = vec![ComponentOverride {
+            slot: ComponentSlot::ClipL,
+            model_id: "other-model".to_string(),
+        }];
+        assert!(apply_component_overrides(&mine, &donors, &absent, root).is_err());
+
+        let unknown = vec![ComponentOverride {
+            slot: ComponentSlot::Vae,
+            model_id: "not-in-the-library".to_string(),
+        }];
+        assert!(apply_component_overrides(&mine, &donors, &unknown, root).is_err());
     }
 
     #[test]

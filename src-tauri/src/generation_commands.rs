@@ -555,6 +555,15 @@ pub async fn generation_run(
 ) -> Result<GenerationEntry, String> {
     let spec = find_registered(&app, &request.model_id)?;
     let request = generation::validate_request(&spec, &request)?;
+    // A swapped VAE or text encoder changes what the engine loads, so it is
+    // resolved before anything launches. The engine keys reuse on its launch
+    // arguments, so switching one mid-session relaunches on its own.
+    let spec = generation::apply_component_overrides(
+        &spec,
+        &registry(&app)?,
+        &request.component_overrides,
+        &model_root(&app)?,
+    )?;
 
     let media = if request.task.is_speech() {
         let _ = app.emit(

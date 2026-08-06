@@ -152,6 +152,26 @@ export interface HiresSettings {
   upscaler: string;
 }
 
+/** One per-run swap: fill `slot` with the file `modelId` uses for it. A model
+ *  id rather than a path, so a run can only ever load a file already in the
+ *  library. */
+export interface ComponentOverride {
+  slot: ComponentSlot;
+  modelId: string;
+}
+
+/** Every library model that could fill `slot`, for the generation page's
+ *  chooser. Files are added in the Models tab; here they are only picked. */
+export function partsForSlot(
+  models: GenerationModel[],
+  slot: ComponentSlot,
+): { model: GenerationModel; component: ModelComponent }[] {
+  return models.flatMap((model) => {
+    const component = model.components.find((entry) => entry.slot === slot);
+    return component && model.installed ? [{ model, component }] : [];
+  });
+}
+
 export interface GenerationRequest {
   modelId: string;
   task: GenerationTask;
@@ -181,6 +201,7 @@ export interface GenerationRequest {
   language: string | null;
   initImageBase64: string | null;
   loras: LoraSelection[];
+  componentOverrides: ComponentOverride[];
 }
 
 export interface GenerationProgressPayload {
