@@ -21,8 +21,9 @@ close the app to replace locked files, so that step waits for the click.
 
 Signing is set up as of 2026-08-04: the keypair exists, `plugins.updater.pubkey`
 holds the public half, and `TAURI_SIGNING_PRIVATE_KEY` is a repository secret.
-Two things still gate a working update — the key password secret, and
-publishing the draft release.
+One thing still gates a working update: the key password secret. Publishing is
+automatic — the `publish` job flips the draft once every matrix target has
+uploaded.
 
 To (re)do the setup from scratch:
 
@@ -48,10 +49,14 @@ To (re)do the setup from scratch:
    (`includeUpdaterJson: true`). A missing password secret fails the signing
    step, so both are required.
 
-4. **Publish the release.** The workflow creates it as a draft
-   (`releaseDraft: true`), and GitHub does not serve draft assets — the
-   endpoint keeps 404ing until the draft is published. Publishing is the step
-   that ships an update to every installed app.
+4. Nothing. Publishing is automated. `tauri-action` still creates the release
+   as a draft (`releaseDraft: true`), because six matrix jobs write to one
+   release and publishing from inside the matrix would expose whichever
+   platform finished first along with an incomplete `latest.json`. The
+   `publish` job then runs `gh release edit <version> --draft=false --latest`
+   once every target has uploaded. GitHub serves no draft assets, so that flip
+   is what ships the update to every installed app — and a failed target leaves
+   the release a draft rather than shipping a partial one.
 
 Never commit or rotate away the private key carelessly: losing it means no
 existing install can accept a future update, and leaking it lets anyone sign
