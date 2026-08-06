@@ -58,6 +58,7 @@ import {
 import { recoverDaemonDesktopTurns } from "./lib/agentLoop";
 import { paletteClient } from "./lib/paletteClient";
 import { featurePanelReducer, type FeaturePanelId } from "./lib/appShellPanels";
+import { SegmentedControl } from "./components/ui/SegmentedControl";
 import {
   AgentInbox,
   ApiContractDiffLabPanel,
@@ -103,6 +104,7 @@ import {
   SideTaskPane,
   SopCompilerPanel,
   SpreadsheetCopilotPanel,
+  StudioPanel,
   SyntheticMonitoringPanel,
   TerminalPanel,
   TrustScorecardsPanel,
@@ -274,6 +276,10 @@ function App() {
   const hasCompletedOnboarding = useOnboardingStore((s) => s.hasCompletedOnboarding);
   const restartOnboarding = useOnboardingStore((s) => s.restartOnboarding);
 
+  /** Which top-level section the window is in. Chat is everything that was
+   *  here before — sessions, code, the feature panels; Studio is image and
+   *  video generation, which shares none of that state. */
+  const [section, setSection] = useState<"chat" | "studio">("chat");
   const [workspacePanelOpen, setWorkspacePanelOpen] = useState(true);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
@@ -959,6 +965,19 @@ function App() {
           above the chat input (see ChatWindow). */}
       <aside className="app-session-sidebar flex shrink-0 flex-col border-r border-border bg-surface">
         <div data-tauri-drag-region className="h-11 shrink-0" />
+        {/* Section switcher. Below the drag strip rather than inside it, so
+            clicking a segment never starts a window drag. */}
+        <div className="px-2 pb-2">
+          <SegmentedControl
+            ariaLabel={t("App.section.switcher")}
+            active={section}
+            onChange={setSection}
+            items={[
+              { id: "chat", label: t("App.section.chat") },
+              { id: "studio", label: t("App.section.studio") },
+            ]}
+          />
+        </div>
         {/* `relative` so the update card can float over the bottom of the
             session list (Claude Desktop places it exactly there) instead of
             pushing the list up when an update lands mid-scroll. */}
@@ -1044,7 +1063,9 @@ function App() {
           }
         >
           <Suspense fallback={<LazyPanelFallback />}>
-            {globalSearchOpen ? (
+            {section === "studio" ? (
+              <StudioPanel />
+            ) : globalSearchOpen ? (
               <GlobalSearch
                 onClose={() => closeFeaturePanel("global-search")}
                 onOpenRun={(runId) => {

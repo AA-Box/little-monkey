@@ -160,7 +160,7 @@ fn curated_models() -> Vec<ModelInfo> {
 }
 
 /// Resolves (and creates, if missing) `<app_data_dir>/models`.
-fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
         .path()
         .app_data_dir()
@@ -656,7 +656,7 @@ pub async fn models_install_reference(
 /// completion. Races each chunk read against `cancel` so a
 /// `models_cancel_download` call interrupts the transfer promptly instead of
 /// waiting out the current (or remaining) chunk(s).
-async fn download_to_file(
+pub(crate) async fn download_to_file(
     app: &AppHandle,
     repo: &str,
     file: &str,
