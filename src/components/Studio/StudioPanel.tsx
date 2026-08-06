@@ -92,8 +92,8 @@ function SliderField({
   return (
     <label className="grid gap-1 text-[11px] text-muted">
       <span className="flex items-center justify-between gap-2">
-        {label}
-        {hint && <span className="font-mono text-faint">{hint}</span>}
+        <span className="truncate">{label}</span>
+        {hint && <span className="shrink-0 font-mono text-faint">{hint}</span>}
       </span>
       <span className="flex items-center gap-2">
         <input
@@ -814,7 +814,12 @@ export function StudioPanel() {
         {/* `overflow-y: auto` computes overflow-x to auto as well, so the rail
             clips sideways too and its controls need room for a focus ring. */}
         {selected && (
-        <aside className="grid w-72 shrink-0 content-start gap-3 overflow-y-auto px-1 pb-4">
+        // `pr-3` is not decoration. A macOS overlay scrollbar reserves no
+        // space, so it is drawn *on top of* whatever reaches the right edge —
+        // which is why the size hint and every number stepper looked sliced
+        // off. `scrollbar-gutter` covers the other setting, where the bar is
+        // solid and takes width instead.
+        <aside className="grid w-80 shrink-0 content-start gap-3 overflow-y-auto pb-4 pl-1 pr-3 [scrollbar-gutter:stable]">
           <div className="flex flex-wrap gap-1.5">
             {selected.tasks
               .filter((entry) => tasksFor(mode).includes(entry))
@@ -1185,16 +1190,22 @@ export function StudioPanel() {
             </details>
           )}
 
-          {/* The files the engine loads. Here as well as in the models tab
+          {/* The parts the engine loads. Here as well as in the models tab
               because "this one is missing its VAE" is something you find out
               while generating, and being sent to another tab to fix it is the
-              whole of the complaint. */}
+              whole of the complaint. Closed, it still says what is loaded —
+              which is the answer most of the time. */}
           <details className="rounded border border-border p-3">
             <summary className="cursor-pointer text-xs font-medium">
-              {t("Studio.files")}
+              {t("Studio.parts")}
+              <span className="ml-1.5 font-normal text-faint">
+                {(fileDraft ?? selected.components)
+                  .map((component) => t(`Studio.slot.${component.slot}`))
+                  .join(", ")}
+              </span>
             </summary>
             <div className="mt-3 grid gap-2">
-              <p className="text-[11px] text-faint">{t("Studio.filesHint")}</p>
+              <p className="text-[11px] text-faint">{t("Studio.partsHint")}</p>
               <ModelFiles
                 allowDownload={false}
                 components={fileDraft ?? selected.components}
@@ -1203,7 +1214,7 @@ export function StudioPanel() {
               {fileDraft && (
                 <div className="flex items-center gap-1.5">
                   <Button size="sm" variant="primary" onClick={() => void saveFiles(fileDraft)}>
-                    {t("Studio.filesSave")}
+                    {t("Studio.partsSave")}
                   </Button>
                   <Button size="sm" variant="secondary" onClick={() => setFileDraft(null)}>
                     {t("Studio.add.cancel")}
@@ -1216,7 +1227,10 @@ export function StudioPanel() {
         </aside>
         )}
 
-        <section className="flex min-h-0 flex-1 flex-col gap-2">
+        {/* `min-w-0`: a flex item's floor is its content, so without this a
+            wide result pushes the whole row past the pane and the rail is what
+            gets cut off the left of it. */}
+        <section className="flex min-h-0 min-w-0 flex-1 flex-col gap-2">
           {/* Each button sits with the field it belongs to and stretches to
               its height, so the row reads as one control rather than two. */}
           <div className="flex shrink-0 items-stretch gap-2">

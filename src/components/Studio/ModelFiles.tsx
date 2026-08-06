@@ -10,6 +10,11 @@ import {
   type ModelComponent,
 } from "../../lib/studioClient";
 
+/** The last segment of a path, which is the part anyone recognizes. */
+function basename(path: string): string {
+  return path.split(/[/\\]/).pop() ?? path;
+}
+
 function blankComponent(): ModelComponent {
   return {
     // An all-in-one checkpoint is the common case and the one whose name says
@@ -79,15 +84,18 @@ export function ModelFiles({
       {components.map((component, index) => (
         <div key={index} className="grid gap-1.5 rounded bg-background/60 p-2">
           <div className="flex items-center gap-1.5">
+            {/* What the part *is*, in words. The engine flag stays beside it
+                because it is the unambiguous version, but nobody should have
+                to know that `--clip_l` is a text encoder to fill this in. */}
             <select
-              className="min-w-0 flex-1 rounded border border-border bg-background px-1.5 py-1 font-mono text-[11px] text-foreground"
+              className="min-w-0 flex-1 rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground"
               value={component.slot}
               aria-label={t("Studio.add.slot")}
               onChange={(event) => patch(index, { slot: event.target.value as ComponentSlot })}
             >
               {COMPONENT_SLOTS.map((entry) => (
                 <option key={entry.slot} value={entry.slot}>
-                  {entry.flag}
+                  {t(`Studio.slot.${entry.slot}`)} ({entry.flag})
                 </option>
               ))}
             </select>
@@ -119,27 +127,26 @@ export function ModelFiles({
           </div>
 
           {component.source.kind === "local_file" ? (
-            <div className="flex items-center gap-1.5">
-              <input
-                className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
-                value={component.source.path}
-                placeholder="/Users/you/models/wan2.2_ti2v_5B_fp16.safetensors"
-                onChange={(event) =>
-                  patch(index, {
-                    source: { kind: "local_file", path: event.target.value },
-                  })
-                }
-              />
-              <IconButton
-                size="sm"
-                variant="secondary"
-                aria-label={t("Studio.add.browse")}
-                title={t("Studio.add.browse")}
-                onClick={() => void browse(index)}
+            // The file picker, not a path field. An absolute path is something
+            // to point at, never something to type — and the full one is on
+            // the tooltip for when it matters.
+            <button
+              type="button"
+              title={component.source.path || t("Studio.add.browse")}
+              className="flex w-full cursor-pointer items-center gap-1.5 rounded border border-border bg-background px-2 py-1 text-left text-[11px] text-foreground"
+              onClick={() => void browse(index)}
+            >
+              <FolderOpen size={12} className="shrink-0 text-muted" />
+              <span
+                className={`min-w-0 flex-1 truncate ${
+                  component.source.path ? "font-mono" : "text-faint"
+                }`}
               >
-                <FolderOpen size={12} />
-              </IconButton>
-            </div>
+                {component.source.path
+                  ? basename(component.source.path)
+                  : t("Studio.add.choose")}
+              </span>
+            </button>
           ) : (
             <div className="grid gap-1.5">
               <input
