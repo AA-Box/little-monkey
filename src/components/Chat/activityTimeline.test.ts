@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import type { ToolCall } from "../../lib/llamaClient";
 import { protectToolResult } from "../../lib/untrustedContent";
 import {
+  activityCallCommandLine,
+  activityCallCopyText,
   activityCallDiff,
   activityCallSubject,
   activityDiffStat,
@@ -244,5 +246,27 @@ describe("activityDiffStat", () => {
 
     expect(activityDiffStat(calls)).toEqual({ added: 5, removed: 2 });
     expect(activityDiffStat([])).toEqual({ added: 0, removed: 0 });
+  });
+});
+
+describe("activityCallCommandLine", () => {
+  it("renders a shell call as the command itself", () => {
+    expect(activityCallCommandLine({ id: "c1", name: "run_shell", args: '{"command":"pnpm test"}' })).toBe("$ pnpm test");
+  });
+
+  it("renders any other call as its label plus subject", () => {
+    expect(activityCallCommandLine({ id: "c1", name: "read_file", args: '{"path":"src/a.ts"}' })).toBe("Read file src/a.ts");
+  });
+});
+
+describe("activityCallCopyText", () => {
+  it("copies the command line and the call's output", () => {
+    expect(
+      activityCallCopyText({ id: "c1", name: "run_shell", args: '{"command":"pnpm test"}', result: "2667 passed" }),
+    ).toBe("$ pnpm test\n\n2667 passed");
+  });
+
+  it("copies just the command line while the call is still in flight", () => {
+    expect(activityCallCopyText({ id: "c1", name: "read_file", args: '{"path":"src/a.ts"}' })).toBe("Read file src/a.ts");
   });
 });

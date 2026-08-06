@@ -334,9 +334,12 @@ describe("the catch-up sweep", () => {
       record({ kind: "subagent", externalId: "task-a", signalIntent: stop }),
       record({ kind: "side_task", externalId: "task-b", signalIntent: suspend }),
     ];
-    invokeMock.mockImplementation((command: string) =>
-      command === "process_pending_signals" ? Promise.resolve(pending) : Promise.resolve(true),
-    );
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "process_pending_signals") return Promise.resolve(pending);
+      // The wall-budget pass rides this same sweep and reads the live set first.
+      if (command === "process_list") return Promise.resolve([]);
+      return Promise.resolve(true);
+    });
 
     const outcomes = await sweepPendingProcessSignals(MAIN);
 
@@ -351,6 +354,35 @@ describe("the catch-up sweep", () => {
   it("survives an unavailable backend without throwing", async () => {
     invokeMock.mockRejectedValue(new Error("no ledger"));
     await expect(sweepPendingProcessSignals(MAIN)).resolves.toEqual([]);
+  });
+
+  it("raises a wall-budget stop before the read that delivers it", async () => {
+    // A budget kill IS a latched stop, so it is raised on the timer that already
+    // delivers them: the row trips, is latched, comes back in this same read and
+    // winds down in this same tick rather than waiting for the next sweep.
+    // `processWallBudget.test.ts` owns the decision table; this pins the wiring.
+    const overdue = record({
+      kind: "subagent",
+      processId: "proc-overdue",
+      externalId: "task-overdue",
+      limits: { maxWallMs: 1 },
+      startedAtMs: 0,
+    });
+    const order: string[] = [];
+    invokeMock.mockImplementation((command: string) => {
+      order.push(command);
+      if (command === "process_list") return Promise.resolve([overdue]);
+      if (command === "process_pending_signals") {
+        return Promise.resolve([{ ...overdue, signalIntent: stop }]);
+      }
+      return Promise.resolve(true);
+    });
+
+    const outcomes = await sweepPendingProcessSignals(MAIN);
+
+    expect(order).toEqual(["process_list", "process_signal", "process_pending_signals"]);
+    expect(outcomes).toEqual(["stopped"]);
+    expect(cancelSubagentRunMock).toHaveBeenCalledWith("task-overdue");
   });
 });
 

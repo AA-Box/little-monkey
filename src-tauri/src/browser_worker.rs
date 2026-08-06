@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use url::Url;
 
 use crate::artifact_store::{ArtifactBlob, ArtifactStore};
+use crate::egress::{EgressDenial, EgressRule};
 
 const PROFILE_MARKER: &str = ".little-monkey-browser-profile";
 const MAX_CDP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -30,6 +31,20 @@ const MAX_DEVTOOLS_HTTP_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SELECTOR_BYTES: usize = 8 * 1024;
 const MAX_TYPE_BYTES: usize = 256 * 1024;
 const MAX_ALLOWED_ORIGINS: usize = 32;
+
+/// How often the watchdog re-examines live sessions.
+///
+/// A cadence, not a budget — the distinction is why this has a value while
+/// `max_session_ms` keeps its own user-facing default. *How long* a session may
+/// live is policy; *how promptly* an expired one is noticed is an implementation
+/// detail, and leaving it unset would mean the sweep never runs at all, which is
+/// not a bound.
+///
+/// Thirty seconds against a ten-minute default budget bounds reclaim latency at
+/// five percent of the budget, and the sweep is cheap by construction: it reads
+/// two integers and calls `try_wait` per session, and deliberately never walks a
+/// profile directory (see [`sweep_verdict`]).
+pub const BROWSER_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -106,6 +121,36 @@ impl Default for BrowserViewport {
     }
 }
 
+/// What ended a session, so a reclaim is distinguishable from a caller pressing
+/// stop. `cancelled` alone could not answer that: every teardown path set the
+/// same bool, so a Chromium the watchdog took back and one the user closed were
+/// indistinguishable afterwards.
+///
+/// Named after the bound that fired rather than after the code that noticed it,
+/// which is how [`crate::process_table::ProcessExit::reason`] already reports
+/// this ("for `LimitExceeded` this must name the limit that fired"). That is why
+/// [`Self::SessionClock`] is shared by the action path and the sweep: it is one
+/// bound with two enforcement points, and splitting it would imply the session
+/// died of different causes depending on who happened to look. The watchdog's own
+/// record of what it took is its return value,
+/// [`BrowserCommandState::sweep_expired_sessions`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BrowserCancelReason {
+    /// A caller asked: `browser_stop`, the workflow `stop` action, run shutdown,
+    /// or application exit.
+    Stopped,
+    /// The per-session action budget ran out.
+    ActionQuota,
+    /// The session wall clock ran out.
+    SessionClock,
+    /// The profile-plus-artifact disk budget ran out.
+    DiskQuota,
+    /// Chromium ended on its own and nothing here asked it to. Only the sweep can
+    /// ever report this — the action path never asked the question.
+    ChildExited,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserSessionView {
@@ -115,6 +160,10 @@ pub struct BrowserSessionView {
     pub started_at_ms: u64,
     pub action_count: u64,
     pub cancelled: bool,
+    /// Set whenever `cancelled` is, and never overwritten afterwards, so the
+    /// first cause to fire is the one reported rather than the last teardown to
+    /// run over it.
+    pub cancel_reason: Option<BrowserCancelReason>,
     pub viewport: BrowserViewport,
 }
 
@@ -265,6 +314,103 @@ impl BrowserCommandState {
         stop_browsers(browsers)
     }
 
+    /// One watchdog pass over the registry: re-examines every live session and
+    /// takes back the ones that are past their session clock or whose Chromium is
+    /// already gone.
+    ///
+    /// This exists because every bound in this module was enforced from
+    /// [`OwnedBrowser::begin_action`], which is reachable only through `with_cdp`
+    /// — that is, only when something drives the session. An idle session was
+    /// never re-examined, so its clock could not fire while nothing touched it,
+    /// and child liveness was never asked at all: `try_wait` appeared only inside
+    /// `stop()` and at launch, so a Chromium that died on its own left a session
+    /// still reporting itself alive and still holding its profile.
+    ///
+    /// **The clock is applied to every session, including one a human has open.**
+    /// Nothing here can tell a Workbench tab from a workflow step: both the
+    /// human-driven surfaces (Workbench, Visual Edit) and the automated ones
+    /// (synthetic monitors, workflow replay) go through the same `browser_start`
+    /// into this same registry, and `run_id` is caller-supplied free text, so
+    /// there is no field to filter on. The conservative reading is nonetheless to
+    /// apply it, because `begin_action` *already* enforces this exact bound with
+    /// this exact limit: an idle tab past `max_session_ms` was going to die on the
+    /// user's next click either way. The sweep changes only *when* Chromium is
+    /// released, never *whether* a session survives its next action — the one case
+    /// it genuinely changes is the leak it is here to fix, a session nobody ever
+    /// touches again.
+    ///
+    /// The cadence is not decided here; see [`run_browser_watchdog`].
+    ///
+    /// Reclaiming goes through the ordinary `stop()` teardown rather than a second
+    /// kill path, so profile removal and the marker check stay in one place. The
+    /// registry is drained before any `stop()` runs, for the reason
+    /// [`Self::shutdown_run`] gives: `stop()` can block for up to two seconds
+    /// waiting on the child, and a concurrent list or action must not be able to
+    /// retain an already-reclaimed browser during it.
+    pub fn sweep_expired_sessions(&self) -> Result<Vec<BrowserSweepOutcome>, String> {
+        self.sweep_sessions(&|browser| browser.child_exited())
+    }
+
+    /// [`Self::sweep_expired_sessions`] with the liveness probe injected, for the
+    /// reason [`crate::process_table::ProcessTable::reap_dead_hosts`] injects
+    /// `host_is_alive`: the rule is then testable without a process whose liveness
+    /// the test has to arrange. That matters more here than there, because this
+    /// module has no portable long-lived stand-in child — see `observable_child` in
+    /// the tests, where two attempts at one failed on Windows.
+    fn sweep_sessions(
+        &self,
+        child_exited: &dyn Fn(&OwnedBrowser) -> bool,
+    ) -> Result<Vec<BrowserSweepOutcome>, String> {
+        // Copied out before any per-session lock is taken, exactly as
+        // `security_grants` does: the liveness probe reaches into the child lock,
+        // and holding the global registry lock across that would let one session's
+        // teardown block every list and every action.
+        let live = self
+            .sessions
+            .lock()
+            .map_err(|_| "Browser session lock is poisoned".to_string())?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut condemned = Vec::new();
+        for browser in live {
+            match browser.sweep_verdict_now(child_exited(&browser)) {
+                SweepVerdict::Keep => {}
+                SweepVerdict::Reclaim(reason) => condemned.push((browser, Some(reason))),
+                SweepVerdict::Evict => condemned.push((browser, None)),
+            }
+        }
+
+        let mut outcomes = Vec::with_capacity(condemned.len());
+        let mut reclaimed = Vec::with_capacity(condemned.len());
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| "Browser session lock is poisoned".to_string())?;
+            for (browser, reason) in condemned {
+                // Absent means a concurrent `browser_stop` won the race and owns
+                // the teardown; session ids are fresh uuids, so this can never be
+                // a different session that took the same key.
+                if sessions.remove(&browser.session_id).is_none() {
+                    continue;
+                }
+                if let Some(reason) = reason {
+                    browser.record_cancel_reason(reason);
+                }
+                outcomes.push(BrowserSweepOutcome {
+                    session_id: browser.session_id.clone(),
+                    run_id: browser.run_id.clone(),
+                    reason: browser.cancel_reason(),
+                });
+                reclaimed.push(browser);
+            }
+        }
+        stop_browsers(reclaimed)?;
+        Ok(outcomes)
+    }
+
     /// Returns the active, exact origin grants for local posture inspection.
     /// The session map is copied before any CDP lock is taken so an audit
     /// never holds the global browser lock while waiting for an action.
@@ -293,6 +439,108 @@ impl BrowserCommandState {
         }
         grants.sort_by(|left, right| left.session_id.cmp(&right.session_id));
         Ok(grants)
+    }
+}
+
+/// What one watchdog pass decided about one session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SweepVerdict {
+    /// Live and inside its bounds. Leave it in the registry, untouched.
+    Keep,
+    /// Take it out of the registry, run the ordinary `stop()` teardown, and record
+    /// `reason` as what ended it.
+    Reclaim(BrowserCancelReason),
+    /// Already cancelled, and still in the registry because nothing removes a
+    /// session there except `browser_stop`: the quota paths latch `cancelled` and
+    /// tear the child down in place. Evict it without attributing a new cause —
+    /// the reason it already recorded is the true one.
+    Evict,
+}
+
+/// The whole watchdog rule, with no clock, no registry and no Chromium in it.
+///
+/// Ordering is the substance of this function:
+///
+/// - `cancelled` wins outright. A cancelled session has already been torn down by
+///   whichever bound fired, so asking anything else about it can only overwrite a
+///   specific cause ("action quota") with a vaguer one that merely happens to also
+///   be true by now ("session clock").
+/// - `child_exited` beats the clock. If Chromium is gone the session is unusable
+///   whatever its clock says, and "the child exited" is the more specific fact.
+/// - The clock uses the same strict `>` as [`OwnedBrowser::begin_action`], so the
+///   two enforcement points agree exactly at the boundary instead of the sweep
+///   reclaiming a session the next action would have allowed.
+///
+/// **The disk quota is deliberately absent.** `owned_directory_size` walks the
+/// whole profile tree and stats every entry, up to a 250,000-entry ceiling. That
+/// cost is acceptable once per action, when a caller is already waiting on
+/// Chromium; paying it for every live session on a timer is not, and nothing about
+/// an idle session makes its profile grow. Disk stays where it is: checked when an
+/// action or an artifact write is about to add to it.
+fn sweep_verdict(
+    elapsed_ms: u64,
+    limits: &BrowserLimits,
+    child_exited: bool,
+    cancelled: bool,
+) -> SweepVerdict {
+    if cancelled {
+        return SweepVerdict::Evict;
+    }
+    if child_exited {
+        return SweepVerdict::Reclaim(BrowserCancelReason::ChildExited);
+    }
+    if elapsed_ms > limits.max_session_ms {
+        return SweepVerdict::Reclaim(BrowserCancelReason::SessionClock);
+    }
+    SweepVerdict::Keep
+}
+
+/// One session the watchdog took back, and why.
+///
+/// This is the record that distinguishes a reclaim from a caller-initiated stop:
+/// a `browser_stop` produces no outcome here at all.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserSweepOutcome {
+    pub session_id: String,
+    pub run_id: String,
+    /// For an eviction this is the cause the session had already recorded, not one
+    /// the sweep invented. `None` only if it latched `cancelled` with no reason,
+    /// which no path in this module does.
+    pub reason: Option<BrowserCancelReason>,
+}
+
+/// Drives [`BrowserCommandState::sweep_expired_sessions`] on `interval` until
+/// `stop` is set, handing every pass to `observe`. Blocking: the caller owns the
+/// thread, so the caller also owns whether a shutdown joins it.
+///
+/// **`interval` has no default anywhere in this module and no caller is wired up
+/// here.** How promptly an idle Chromium should be released is a trade between
+/// reclaim latency and timer cost — a judgement about what this app is for, which
+/// this file cannot derive. The sweep is cheap by construction (no directory walk;
+/// see [`sweep_verdict`]), so there is no technical value that falls out either.
+/// Shipping the mechanism with the cadence unset is the point, not an oversight.
+///
+/// A sweep error does not end the loop. A poisoned registry lock is the realistic
+/// cause, and ending the watchdog on it would turn one panic elsewhere into a
+/// permanent leak of every session opened afterwards. `observe` sees the error;
+/// logging belongs to the caller, not to this module.
+///
+/// `stop` is re-read after each pass so a shutdown does not wait out a whole
+/// interval it is already known to be pointless — but a long `interval` still
+/// delays the check, which is the other reason the thread is the caller's.
+pub fn run_browser_watchdog(
+    state: &BrowserCommandState,
+    interval: Duration,
+    stop: &AtomicBool,
+    mut observe: impl FnMut(Result<Vec<BrowserSweepOutcome>, String>),
+) {
+    while !stop.load(Ordering::SeqCst) {
+        observe(state.sweep_expired_sessions());
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(interval);
     }
 }
 
@@ -459,6 +707,10 @@ struct OwnedBrowser {
     artifacts: ArtifactStore,
     limits: BrowserLimits,
     cancelled: AtomicBool,
+    /// Why `cancelled` was set. Not an `AtomicU8`-flavoured enum because the
+    /// first-writer-wins rule needs a compare-and-set anyway, and a `Mutex` states
+    /// it without hand-rolling one.
+    cancel_reason: Mutex<Option<BrowserCancelReason>>,
     action_count: AtomicU64,
     artifact_bytes: AtomicU64,
     started: Instant,
@@ -477,13 +729,18 @@ impl OwnedBrowser {
     ) -> Result<Arc<Self>, String> {
         validate_identifier("runId", &request.run_id)?;
         validate_limits(&request.limits)?;
-        let grant = ValidatedGrant::new(request.grant)?;
-        grant.validate_navigation(&request.url)?;
+        let grant = ValidatedGrant::new(
+            request.grant,
+            crate::run_scope::RunScope::run(&request.run_id),
+        )?;
+        grant
+            .validate_navigation(&request.url)
+            .map_err(denial_text)?;
         // Chromium resolves a request only after Fetch.requestPaused is
         // continued. Pin each granted hostname to an address that was already
         // classified here so a second DNS answer cannot pivot the browser to
         // a private/link-local address between our check and the socket open.
-        let resolver_rules = grant.chromium_resolver_rules()?;
+        let resolver_rules = grant.chromium_resolver_rules().map_err(denial_text)?;
         let session_id = format!("browser-{}", uuid::Uuid::new_v4());
         let profile = profile_root.join(&session_id);
         ensure_new_owned_profile(&profile_root, &profile, &session_id)?;
@@ -578,6 +835,7 @@ impl OwnedBrowser {
             artifacts,
             limits: request.limits,
             cancelled: AtomicBool::new(false),
+            cancel_reason: Mutex::new(None),
             action_count: AtomicU64::new(0),
             artifact_bytes: AtomicU64::new(0),
             started: Instant::now(),
@@ -604,6 +862,7 @@ impl OwnedBrowser {
             started_at_ms: self.started_at_ms,
             action_count: self.action_count.load(Ordering::SeqCst),
             cancelled: self.cancelled.load(Ordering::SeqCst),
+            cancel_reason: self.cancel_reason(),
             viewport: self
                 .viewport
                 .lock()
@@ -612,12 +871,66 @@ impl OwnedBrowser {
         }
     }
 
+    fn cancel_reason(&self) -> Option<BrowserCancelReason> {
+        self.cancel_reason.lock().ok().and_then(|value| *value)
+    }
+
+    /// First writer wins. Every teardown path ends at `stop()`, which records
+    /// [`BrowserCancelReason::Stopped`], so last-writer-wins would relabel every
+    /// quota trip and every reclaim as an ordinary caller-initiated stop — losing
+    /// exactly the distinction the reason exists to make.
+    fn record_cancel_reason(&self, reason: BrowserCancelReason) {
+        if let Ok(mut current) = self.cancel_reason.lock() {
+            current.get_or_insert(reason);
+        }
+    }
+
+    /// Whether Chromium ended without anything here asking it to.
+    ///
+    /// `try_wait` is the only non-blocking answer available, and it also reaps: once
+    /// it reports an exit the status is cached, so the `stop()` that follows still
+    /// completes promptly instead of blocking on a child that is already gone.
+    ///
+    /// An empty child slot is *not* reported as exited. `stop()` is the only thing
+    /// that empties it, so such a session is already torn down and `cancelled`
+    /// describes it — answering "exited" here would attribute a spontaneous crash to
+    /// a teardown this module performed.
+    fn child_exited(&self) -> bool {
+        match self.child.lock() {
+            Ok(mut slot) => match slot.as_mut() {
+                Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+                None => false,
+            },
+            // A poisoned child lock cannot be inspected. Reading that as "exited"
+            // would reclaim a live session on the strength of an unrelated panic,
+            // so it reads as live and the session keeps its next action.
+            Err(_) => false,
+        }
+    }
+
+    /// The impure half of the watchdog rule: reads the clock and the cancelled
+    /// latch, and hands them plus `child_exited` to [`sweep_verdict`], which
+    /// decides. Nothing is enforced here — this only gathers.
+    fn sweep_verdict_now(&self, child_exited: bool) -> SweepVerdict {
+        sweep_verdict(
+            self.started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            &self.limits,
+            child_exited,
+            self.cancelled.load(Ordering::SeqCst),
+        )
+    }
+
     fn begin_action(&self) -> Result<(), String> {
         if self.cancelled.load(Ordering::SeqCst) {
             return Err("Browser session is cancelled".to_string());
         }
         if self.started.elapsed() > Duration::from_millis(self.limits.max_session_ms) {
             self.cancelled.store(true, Ordering::SeqCst);
+            self.record_cancel_reason(BrowserCancelReason::SessionClock);
             let _ = self.stop();
             return Err("Browser session time quota exceeded".to_string());
         }
@@ -626,12 +939,14 @@ impl OwnedBrowser {
             > self.limits.max_disk_bytes
         {
             self.cancelled.store(true, Ordering::SeqCst);
+            self.record_cancel_reason(BrowserCancelReason::DiskQuota);
             let _ = self.stop();
             return Err("Browser session disk quota exceeded".to_string());
         }
         let next = self.action_count.fetch_add(1, Ordering::SeqCst) + 1;
         if next > self.limits.max_actions {
             self.cancelled.store(true, Ordering::SeqCst);
+            self.record_cancel_reason(BrowserCancelReason::ActionQuota);
             // The same teardown the two quotas above perform, and its absence
             // here was not a shortcut but a leak: the `cancelled` gate at the top
             // of this function makes every later call return early, so nothing
@@ -650,6 +965,7 @@ impl OwnedBrowser {
         if let Err(error) = reserve_quota(&self.artifact_bytes, artifact_limit, bytes.len() as u64)
         {
             self.cancelled.store(true, Ordering::SeqCst);
+            self.record_cancel_reason(BrowserCancelReason::DiskQuota);
             let _ = self.stop();
             return Err(error);
         }
@@ -674,8 +990,8 @@ impl OwnedBrowser {
             .map_err(|_| "Browser CDP lock is poisoned".to_string())?;
         let result = operation(&mut cdp);
         self.collect_events(&mut cdp);
-        if let Some(error) = cdp.security_error.take() {
-            return Err(error);
+        if let Some(denial) = cdp.security_error.take() {
+            return Err(denial_text(denial));
         }
         result
     }
@@ -704,7 +1020,7 @@ impl OwnedBrowser {
     fn navigate(&self, url: &str) -> Result<BrowserActionResult, String> {
         let url = url.to_string();
         self.with_cdp(|cdp| {
-            cdp.grant.validate_navigation(&url)?;
+            cdp.grant.validate_navigation(&url).map_err(denial_text)?;
             cdp.command("Page.navigate", json!({"url":url}))?;
             cdp.wait_for_load(Duration::from_millis(self.limits.timeout_ms))
         })?;
@@ -1028,8 +1344,13 @@ impl OwnedBrowser {
         })
     }
 
+    /// The single teardown path. Reclaims reuse it rather than adding a second kill
+    /// path, so the marker-checked profile removal stays in one place; they only
+    /// record their reason first, and [`Self::record_cancel_reason`] keeps that
+    /// first cause from being relabelled `Stopped` here.
     fn stop(&self) -> Result<(), String> {
         self.cancelled.store(true, Ordering::SeqCst);
+        self.record_cancel_reason(BrowserCancelReason::Stopped);
         if let Ok(mut child) = self.child.lock() {
             if let Some(mut child) = child.take() {
                 let _ = child.kill();
@@ -1064,10 +1385,42 @@ impl Drop for OwnedBrowser {
 struct ValidatedGrant {
     allowed_origins: Vec<String>,
     allow_loopback: bool,
+    /// The run this grant was issued to, so a refusal several frames down can name it.
+    ///
+    /// Carried explicitly rather than read from the ambient scope, and that is forced
+    /// rather than preferred: every browser action reaches this file through
+    /// `tokio::task::spawn_blocking`, which — like `tokio::spawn` — does **not** inherit
+    /// a task-local. So no `run_scope::scoped` at the command boundary can reach
+    /// `handle_event`'s per-subresource decisions, and pretending otherwise would record
+    /// a blank while looking instrumented.
+    ///
+    /// A field on *this* struct because it is already the per-run object: its whole
+    /// purpose is holding what one run was granted, and its refusals already say "this
+    /// run's grant". The id was the one part of the run it did not keep.
+    scope: crate::run_scope::RunScope,
 }
 
 impl ValidatedGrant {
-    fn new(grant: BrowserGrant) -> Result<Self, String> {
+    /// Builds the per-run grant from what the caller asked for.
+    ///
+    /// # Why these three refusals stay prose while the request guards are typed
+    ///
+    /// Everything below is a *configuration* defect: an empty or oversized origin
+    /// list, an entry that is not a URL at all, an entry that carries a path or
+    /// credentials. None of them is a decision about where the browser may go —
+    /// they all fire before any destination exists, and they are answered by
+    /// fixing the grant, not by granting more. An [`EgressRule`] is scoped to a
+    /// request: its code is what a denial sink stores per refused destination, and
+    /// its detail names the address or origin that tripped it. Recording
+    /// `egress.url-malformed` for a typo in a *grant entry* would put a
+    /// configuration mistake into the same counter as a page trying to reach
+    /// `169.254.169.254`, and an operator reading that counter could no longer
+    /// tell an attack from a bad config file.
+    ///
+    /// [`normalized_origin`] is the exception, because it is shared with the
+    /// request path: it returns a typed denial, and this is the one place where
+    /// that denial is rendered straight to prose rather than propagated.
+    fn new(grant: BrowserGrant, scope: crate::run_scope::RunScope) -> Result<Self, String> {
         if grant.allowed_origins.is_empty() || grant.allowed_origins.len() > MAX_ALLOWED_ORIGINS {
             return Err("Browser grant requires 1..=32 exact origins".to_string());
         }
@@ -1086,7 +1439,7 @@ impl ValidatedGrant {
                         .to_string(),
                 );
             }
-            let origin = normalized_origin(&url)?;
+            let origin = normalized_origin(&url).map_err(denial_text)?;
             if !allowed_origins.contains(&origin) {
                 allowed_origins.push(origin);
             }
@@ -1094,78 +1447,180 @@ impl ValidatedGrant {
         Ok(Self {
             allowed_origins,
             allow_loopback: grant.allow_loopback,
+            scope,
         })
     }
 
-    fn validate_navigation(&self, value: &str) -> Result<(), String> {
+    fn validate_navigation(&self, value: &str) -> Result<(), EgressDenial> {
+        let verdict = self.classify_navigation(value);
+        if let Err(denial) = &verdict {
+            self.record(denial);
+        }
+        verdict
+    }
+
+    /// Writes a refusal down under this grant's run.
+    ///
+    /// Enters the scope rather than forwarding an id, so `denial_sink::record`'s
+    /// existing lookup handles **both** arms: a run keeps its id, and an unattributed
+    /// grant keeps its coded reason. Passing `run_id: Some(..)` would forward the first
+    /// and silently flatten the second into the blank that D3 exists to distinguish
+    /// from it.
+    fn record(&self, denial: &EgressDenial) {
+        crate::run_scope::scoped_sync(self.scope.clone(), || {
+            crate::denial_sink::record(BROWSER_GUARD, denial, None);
+        });
+    }
+
+    fn classify_navigation(&self, value: &str) -> Result<(), EgressDenial> {
         let url = validate_http_url(value)?;
         let origin = normalized_origin(&url)?;
         if !self.allowed_origins.contains(&origin) {
-            return Err(format!(
-                "Navigation origin '{origin}' is outside this run's grant"
+            return Err(EgressDenial::about(
+                EgressRule::OriginNotAllowlisted,
+                format!("navigation origin '{origin}' is outside this run's grant"),
             ));
         }
         self.validate_resolved(&url, true)
     }
 
-    fn validate_request(&self, value: &str, document: bool) -> Result<(), String> {
+    fn validate_request(&self, value: &str, document: bool) -> Result<(), EgressDenial> {
+        let verdict = self.classify_request(value, document);
+        if let Err(denial) = &verdict {
+            self.record(denial);
+        }
+        verdict
+    }
+
+    fn classify_request(&self, value: &str, document: bool) -> Result<(), EgressDenial> {
         let url = validate_http_url(value)?;
-        if !self.allowed_origins.contains(&normalized_origin(&url)?) {
-            return Err(if document {
-                "Redirect/document navigation left the granted origin set".to_string()
+        let origin = normalized_origin(&url)?;
+        if !self.allowed_origins.contains(&origin) {
+            // Two rules rather than one rule with a flag, because the two are not
+            // the same event: a document hop is the page navigating itself
+            // somewhere the run was never granted, while a subresource is the page
+            // pulling in a third party. They were already two distinct sentences
+            // here on purpose, and the test that pins the distinction is the only
+            // egress refusal in this file whose text anybody asserted on.
+            let rule = if document {
+                EgressRule::RedirectLeftGrant
             } else {
-                "Page subresource left the granted origin set".to_string()
-            });
+                EgressRule::SubresourceLeftGrant
+            };
+            return Err(EgressDenial::about(
+                rule,
+                format!("'{origin}' is outside this run's grant"),
+            ));
         }
         self.validate_resolved(&url, document)
     }
 
-    fn validate_resolved(&self, url: &Url, _document: bool) -> Result<(), String> {
+    fn validate_resolved(&self, url: &Url, _document: bool) -> Result<(), EgressDenial> {
         self.resolved_addresses(url).map(|_| ())
     }
 
-    fn resolved_addresses(&self, url: &Url) -> Result<Vec<IpAddr>, String> {
-        let host = url
-            .host_str()
-            .ok_or_else(|| "Browser URL has no host".to_string())?;
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| "Browser URL has no port".to_string())?;
-        let addresses: Vec<IpAddr> = (host, port)
-            .to_socket_addrs()
-            .map_err(|error| format!("Browser DNS resolution failed: {error}"))?
-            .map(|address| address.ip())
-            .collect();
-        if addresses.is_empty() {
-            return Err("Browser DNS resolution returned no addresses".to_string());
-        }
+    /// Every address `url`'s host stands for, each one classified.
+    ///
+    /// # Why this matches on `Url::host()` and not `host_str()`
+    ///
+    /// `host_str` serializes an IPv6 literal *with* its brackets, so it answers
+    /// `"[::1]"`, and `("[::1]", port).to_socket_addrs()` does not parse that on
+    /// macOS or Linux — the literal never resolved and every IPv6-literal target
+    /// was refused as [`EgressRule::DnsResolutionFailed`] before the classifier
+    /// below was ever consulted. That failed closed, which is why it survived this
+    /// long, but "unresolvable" is not a policy verdict: it made the guard's IPv6
+    /// arms dead code on two of three platforms and left Windows — where the
+    /// bracketed host *does* resolve — as the only place they ran.
+    ///
+    /// `Url::host()` hands back the already-parsed [`url::Host`], where a literal
+    /// is a real [`IpAddr`] and there are no brackets to strip. This is the same
+    /// pattern `web.rs::classify_fetch_url` and `egress::is_loopback_target`
+    /// already use, and its comment there names this "bracket-handling class of
+    /// bug"; this file is now the third caller of the pattern rather than the last
+    /// holdout from it.
+    ///
+    /// A literal host is also not asked of the resolver at all any more, which is
+    /// how it should always have been: an address the caller already spelled out
+    /// cannot be rebound, so a lookup could only turn a known answer into a
+    /// different one.
+    fn resolved_addresses(&self, url: &Url) -> Result<Vec<IpAddr>, EgressDenial> {
+        let addresses: Vec<IpAddr> = match url
+            .host()
+            .ok_or_else(|| EgressDenial::new(EgressRule::HostMissing))?
+        {
+            url::Host::Ipv4(address) => vec![IpAddr::V4(address)],
+            url::Host::Ipv6(address) => vec![IpAddr::V6(address)],
+            url::Host::Domain(host) => {
+                let port = url
+                    .port_or_known_default()
+                    .ok_or_else(|| EgressDenial::new(EgressRule::PortMissing))?;
+                let answers: Vec<IpAddr> = (host, port)
+                    .to_socket_addrs()
+                    .map_err(|error| {
+                        EgressDenial::about(
+                            EgressRule::DnsResolutionFailed,
+                            // The host, never the URL: a path or query on a browser
+                            // target is page-supplied and may carry a session token,
+                            // and the host is the whole of what failed to resolve.
+                            format!("browser DNS resolution failed for {host}: {error}"),
+                        )
+                    })?
+                    .map(|address| address.ip())
+                    .collect();
+                if answers.is_empty() {
+                    return Err(EgressDenial::about(EgressRule::DnsNoAddresses, host));
+                }
+                answers
+            }
+        };
         for address in &addresses {
+            // Every refusal names the address that tripped it. A name can resolve
+            // to several answers and any one of them is enough to refuse the whole
+            // set, so a message that named no address at all — which is what this
+            // used to be — left no way to tell which answer was the problem.
             match classify_ip(*address) {
-                IpClass::Public => {}
-                IpClass::Loopback if self.allow_loopback => {}
-                IpClass::Loopback => return Err("Loopback browser access requires an explicit per-run grant".to_string()),
-                IpClass::Private => return Err("Private, link-local, multicast, and unspecified browser destinations are blocked".to_string()),
+                None => {}
+                Some(EgressRule::Loopback) if self.allow_loopback => {}
+                Some(EgressRule::Loopback) => {
+                    return Err(EgressDenial::about(
+                        EgressRule::Loopback,
+                        format!("{address} requires an explicit per-run loopback grant"),
+                    ))
+                }
+                Some(rule) => return Err(EgressDenial::about(rule, address.to_string())),
             }
         }
         Ok(addresses)
     }
 
-    fn chromium_resolver_rules(&self) -> Result<String, String> {
+    fn chromium_resolver_rules(&self) -> Result<String, EgressDenial> {
         let mut pinned = BTreeMap::<String, IpAddr>::new();
         for origin in &self.allowed_origins {
-            let url = Url::parse(origin).map_err(|error| error.to_string())?;
-            let host = url
-                .host_str()
-                .ok_or_else(|| "Browser origin has no host".to_string())?;
+            // Re-parsing this file's own normalized output, so a failure here is a
+            // broken invariant rather than caller input. Typed all the same: the
+            // alternative is one `String` in a function whose every other refusal
+            // is a rule, and `UrlMalformed` exists precisely so "did not parse"
+            // stays distinguishable from "a rule refused it".
+            let url = Url::parse(origin).map_err(|error| {
+                EgressDenial::about(EgressRule::UrlMalformed, error.to_string())
+            })?;
             // Literal IP hosts cannot be DNS-rebound and need no resolver rule.
-            if host.parse::<IpAddr>().is_ok() {
-                continue;
-            }
+            // Matched on the parsed host for the same reason
+            // [`Self::resolved_addresses`] is: `host_str().parse::<IpAddr>()` never
+            // recognises an IPv6 literal, because the brackets are still on it — so
+            // a granted `http://[::1]:11434` origin used to fall through to the
+            // hostname branch and emit a nonsense `MAP [::1] ...` rule for a host
+            // Chromium's resolver is never asked about.
+            let host = match url.host() {
+                Some(url::Host::Domain(host)) => host,
+                Some(_) => continue,
+                None => return Err(EgressDenial::new(EgressRule::HostMissing)),
+            };
             let address = self
                 .resolved_addresses(&url)?
                 .into_iter()
                 .next()
-                .ok_or_else(|| "Browser DNS resolution returned no addresses".to_string())?;
+                .ok_or_else(|| EgressDenial::about(EgressRule::DnsNoAddresses, host))?;
             pinned.insert(host.to_string(), address);
         }
         Ok(pinned
@@ -1182,43 +1637,194 @@ impl ValidatedGrant {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IpClass {
-    Public,
-    Loopback,
-    Private,
-}
-
-fn classify_ip(ip: IpAddr) -> IpClass {
+/// The rule that names `ip`'s address class, or `None` when no rule in this file
+/// accounts for it and the browser may be pointed at it.
+///
+/// # Why this replaced a three-variant `IpClass`
+///
+/// `IpClass::Private` was the single verdict of eleven distinct predicates, and
+/// the one sentence built from it named four of them ("Private, link-local,
+/// multicast, and unspecified") — so a refused navigation could not say whether it
+/// had hit RFC 1918, CGNAT, the benchmarking range or the broadcast address, and
+/// neither could a test. Decomposing the verdict rather than the message is what
+/// makes the difference visible to both.
+///
+/// # `Some(Loopback)` is not by itself a refusal
+///
+/// This file treats loopback specially and no other class that way: it is reachable
+/// with an explicit per-run grant, everything else never is. So the rule is
+/// *reported* here and the allow decision stays with the caller, which is the only
+/// place the grant is known. Every other `Some` is refused unconditionally.
+///
+/// # Deliberately not `web.rs`'s classifier
+///
+/// `web.rs::blocked_reason_ip` has the same shape and shares this vocabulary, but
+/// it is a different function on purpose: it refuses four classes where this
+/// refuses eleven, and unifying them would newly refuse fetches that work today
+/// (CGNAT is Tailscale's default range). See `egress`'s module doc.
+fn classify_ip(ip: IpAddr) -> Option<EgressRule> {
     if ip.is_loopback() {
-        return IpClass::Loopback;
+        return Some(EgressRule::Loopback);
     }
     match ip {
-        IpAddr::V4(ip) if is_private_v4(ip) => IpClass::Private,
-        IpAddr::V6(ip) if is_private_v6(ip) => IpClass::Private,
-        _ => IpClass::Public,
+        IpAddr::V4(ip) => classify_v4(ip),
+        IpAddr::V6(ip) => classify_v6(ip),
     }
 }
 
-fn is_private_v4(ip: Ipv4Addr) -> bool {
-    ip.is_private()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_documentation()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || matches!(
-            ip.octets(),
-            [100, 64..=127, _, _] | [198, 18..=19, _, _] | [192, 0, 0, _]
-        )
+/// One rule per class, in the order the predicate disjunction that preceded this
+/// listed them. The classes are unchanged: this names the verdict, it does not
+/// widen or narrow the set of refused addresses.
+///
+/// # Two things a reader will look for and not find
+///
+/// `240.0.0.0/4` and all of `0.0.0.0/8` except `0.0.0.0` itself are **not**
+/// refused, and no branch below returns [`EgressRule::ReservedRange`] or
+/// [`EgressRule::ThisNetwork`]. That is the behaviour this file already had;
+/// adding either rule here would refuse addresses it accepts today, which is a
+/// separate decision from naming the rules it already enforces.
+///
+/// # The loopback branch below is not redundant
+///
+/// [`classify_ip`] does answer `127.0.0.0/8` before either family helper is
+/// reached, so for a v4 address this arm never fires. It exists for the address
+/// that arrives here the other way: the IPv4-**mapped** form `::ffff:127.0.0.1` is
+/// not `Ipv6Addr::is_loopback`, so `classify_ip` passes it through to
+/// [`classify_v6`], which unwraps it to a bare `127.0.0.1` and delegates here.
+/// Without this branch that address matched nothing and was classified as an
+/// ordinary public navigation target — a loopback destination reachable without the
+/// explicit per-run loopback grant that gates `127.0.0.1` itself.
+fn classify_v4(ip: Ipv4Addr) -> Option<EgressRule> {
+    if ip.is_loopback() {
+        return Some(EgressRule::Loopback); // 127/8, reached via `::ffff:127.0.0.1`
+    }
+    if ip.is_private() {
+        return Some(EgressRule::PrivateV4); // 10/8, 172.16/12, 192.168/16
+    }
+    if ip.is_link_local() {
+        return Some(EgressRule::LinkLocal); // 169.254/16
+    }
+    if ip.is_broadcast() {
+        return Some(EgressRule::Broadcast); // 255.255.255.255
+    }
+    if ip.is_documentation() {
+        return Some(EgressRule::TestNet); // 192.0.2/24, 198.51.100/24, 203.0.113/24
+    }
+    if ip.is_unspecified() {
+        return Some(EgressRule::Unspecified); // 0.0.0.0
+    }
+    if ip.is_multicast() {
+        return Some(EgressRule::Multicast); // 224/4
+    }
+    match ip.octets() {
+        [100, 64..=127, _, _] => Some(EgressRule::Cgnat),
+        [198, 18..=19, _, _] => Some(EgressRule::Benchmarking),
+        [192, 0, 0, _] => Some(EgressRule::ProtocolAssignments),
+        // `0.0.0.0/8` beyond the `0.0.0.0` that `is_unspecified` above already
+        // caught, and `240.0.0.0/4` minus the `255.255.255.255` that
+        // `is_broadcast` caught. Both were navigable here while
+        // `knowledge_pipeline.rs` — the broadest of the four guards — refused
+        // them, so this guard called two non-routable ranges public. Ordering
+        // matters and is why these are arms rather than earlier `if`s: the two
+        // single addresses keep their own specific rules, and only the rest of
+        // each range falls through to these.
+        //
+        // Deliberately spelled the same way as the broad guard's own tests
+        // (`0.1.2.3` and `240.0.0.1`), so the two files agree by construction
+        // rather than by coincidence.
+        [0, _, _, _] => Some(EgressRule::ThisNetwork),
+        [240..=255, _, _, _] => Some(EgressRule::ReservedRange),
+        _ => None,
+    }
 }
 
-fn is_private_v6(ip: Ipv6Addr) -> bool {
-    ip.is_unspecified()
-        || ip.is_multicast()
-        || (ip.segments()[0] & 0xfe00) == 0xfc00
-        || (ip.segments()[0] & 0xffc0) == 0xfe80
-        || ip.to_ipv4_mapped().is_some_and(is_private_v4)
+/// The IPv6 half of [`classify_v4`], in the order the disjunction it replaced had.
+///
+/// # This half was dead code until IPv6 literals could resolve at all
+///
+/// [`ValidatedGrant::resolved_addresses`] used to hand `Url::host_str`'s bracketed
+/// `"[…]"` to `to_socket_addrs`, so on macOS and Linux no IPv6 literal ever got
+/// this far — it was refused as an unresolvable host first. That made the gap
+/// between this function and [`classify_v4`] invisible, and the gap was wide: the v4
+/// half refuses documentation, benchmarking and all of RFC 1918, while this half
+/// refused neither documentation nor benchmarking, covered only *half* of
+/// locally-scoped unicast (`fc00::/7` but not the `fec0::/10` that preceded it,
+/// because `0xffc0 == 0xfe80` stops at `febf`), left `fe00::/9` between the two
+/// unclassified, and called NAT64 public — `64:ff9b::7f00:1` *is* `127.0.0.1`, the
+/// same "a spelling is not a place" bypass the `::ffff:` and `::` forms are refused
+/// for.
+///
+/// Enumerating those one arm at a time is how the list got out of date in the first
+/// place, so the tail is an **allowlist**: global unicast is `2000::/3` and
+/// everything else is reserved, unassigned or special-use. The named arms stay
+/// because a refusal should say *which* class refused it, and because
+/// [`EgressRule::covered_by_private_network_grant`] reads those codes — but nothing
+/// new has to be added here when IANA assigns another range.
+///
+/// Rule codes are reused from the v4 counterparts, so an operator reading
+/// `egress.test-net` need not know which family tripped it. `fec0::/10` is the one
+/// exception and reports [`EgressRule::ReservedRange`] rather than the
+/// `UniqueLocalV6` its shape suggests, because that predicate covers `UniqueLocalV6`
+/// under a private-network grant and RFC 3879 deprecated `fec0::/10` with nothing
+/// assigned in it — so "a host the user actually runs could be here" is false.
+fn classify_v6(ip: Ipv6Addr) -> Option<EgressRule> {
+    // First, because `classify_ip` checks `is_loopback` before reaching here so
+    // `::1` is already handled — but `::127.0.0.1` is not loopback by that
+    // predicate and is not what `to_ipv4_mapped` matches, so it classified as
+    // public. See `egress::is_ipv4_compatible`.
+    if crate::egress::is_ipv4_compatible(&ip) {
+        return Some(EgressRule::Ipv4Compatible); // ::/96, minus `::` and `::1`
+    }
+    if ip.is_unspecified() {
+        return Some(EgressRule::Unspecified); // ::
+    }
+    if ip.is_multicast() {
+        return Some(EgressRule::Multicast); // ff00::/8
+    }
+    if (ip.segments()[0] & 0xfe00) == 0xfc00 {
+        return Some(EgressRule::UniqueLocalV6); // fc00::/7
+    }
+    if (ip.segments()[0] & 0xffc0) == 0xfe80 {
+        return Some(EgressRule::LinkLocal); // fe80::/10
+    }
+    // `ReservedRange` and **not** `UniqueLocalV6`, even though `fec0::/10` is where
+    // site-local unicast used to live. The two codes differ in one way that matters:
+    // `EgressRule::covered_by_private_network_grant` answers true for
+    // `UniqueLocalV6` and false for `ReservedRange`, because it answers the question
+    // "could a host the user actually runs be here?". RFC 3879 deprecated
+    // `fec0::/10` and nothing is assigned in it, so the honest answer is no — and
+    // labelling it `UniqueLocalV6` would make it reachable the moment this guard or
+    // a sibling consults that predicate.
+    if (ip.segments()[0] & 0xffc0) == 0xfec0 {
+        return Some(EgressRule::ReservedRange); // fec0::/10, deprecated site-local
+    }
+    if ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8 {
+        return Some(EgressRule::TestNet); // 2001:db8::/32, the v6 documentation range
+    }
+    if ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0002 && ip.segments()[2] == 0 {
+        return Some(EgressRule::Benchmarking); // 2001:2::/48
+    }
+    // Last, and an allowlist rather than one more blocklist arm.
+    //
+    // Everything above names a class so a refusal can say *which* class; this decides
+    // the default for everything unnamed, and in v6 the honest default is "refuse".
+    // Global unicast is `2000::/3` and every other range is reserved, unassigned or
+    // special-use — so a blocklist here is a list that has to grow every time IANA
+    // assigns something, and the arms above are the evidence that it does not get
+    // updated: `fc00::/7` was covered while `fe00::/9` between it and `fe80::/10` was
+    // not, and `64:ff9b::/96` (NAT64) classified as public even though
+    // `64:ff9b::7f00:1` *is* `127.0.0.1` — the same "a spelling is not a place"
+    // bypass the `::ffff:` and `::` forms above are refused for.
+    //
+    // Must stay after the mapped delegation, which reports whichever v4 rule the
+    // wrapped address trips rather than a rule of its own: `::ffff:10.0.0.1` is a
+    // private address, and calling it anything else would hide that from whoever
+    // reads the denial — while `::ffff:93.184.216.34` is a public one and must stay
+    // allowed.
+    ip.to_ipv4_mapped().map_or_else(
+        || ((ip.segments()[0] & 0xe000) != 0x2000).then_some(EgressRule::ReservedRange),
+        classify_v4,
+    )
 }
 
 struct CdpConnection {
@@ -1227,7 +1833,17 @@ struct CdpConnection {
     next_id: u64,
     events: VecDeque<Value>,
     grant: ValidatedGrant,
-    security_error: Option<String>,
+    /// The refusal that failed an intercepted request, held until the action that
+    /// provoked it can return it.
+    ///
+    /// Holds the denial rather than a rendered sentence. Chromium is told
+    /// `BlockedByClient` immediately and the caller only learns why on the next
+    /// `take()`, so this field is the whole of the refusal's memory on this path —
+    /// and rendering it here would mean every re-raise site below had lost the rule
+    /// before it was reached. Kept as a value, the rule survives the round trip and
+    /// only becomes prose at the `String` boundary, exactly like the returned
+    /// refusals. See [`denial_text`].
+    security_error: Option<EgressDenial>,
 }
 
 impl CdpConnection {
@@ -1237,6 +1853,13 @@ impl CdpConnection {
         if url.scheme() != "ws" || !matches!(url.host_str(), Some("127.0.0.1" | "localhost")) {
             return Err("DevTools websocket must be loopback ws:".to_string());
         }
+        // Prose, not a rule, and deliberately: this is the local DevTools control
+        // channel, so a handshake failure here is not an egress denial. Recording it
+        // under an `egress.*` code would put a local wiring fault in the same counter
+        // as a page reaching for `169.254.169.254`, which is exactly the conflation
+        // the rule codes exist to end. The loopback-`ws:` check above stays prose for
+        // the same reason — this channel *must* be loopback, so `egress.loopback`
+        // would name the rule that refuses what is required here.
         let port = url
             .port()
             .ok_or_else(|| "DevTools websocket has no port".to_string())?;
@@ -1291,8 +1914,8 @@ impl CdpConnection {
                 if let Some(error) = message.get("error") {
                     return Err(format!("CDP {method} failed: {error}"));
                 }
-                if let Some(error) = self.security_error.take() {
-                    return Err(error);
+                if let Some(denial) = self.security_error.take() {
+                    return Err(denial_text(denial));
                 }
                 return Ok(message.get("result").cloned().unwrap_or_else(|| json!({})));
             }
@@ -1462,8 +2085,8 @@ impl CdpConnection {
             self.next_id = self.next_id.saturating_add(1);
             match decision {
                 Ok(()) => self.send_json(&json!({"id":id,"method":"Fetch.continueRequest","params":{"requestId":request_id}}))?,
-                Err(error) => {
-                    self.security_error = Some(error);
+                Err(denial) => {
+                    self.security_error = Some(denial);
                     self.send_json(&json!({"id":id,"method":"Fetch.failRequest","params":{"requestId":request_id,"errorReason":"BlockedByClient"}}))?;
                 }
             }
@@ -1475,8 +2098,8 @@ impl CdpConnection {
     fn wait_for_load(&mut self, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if let Some(error) = self.security_error.take() {
-                return Err(error);
+            if let Some(denial) = self.security_error.take() {
+                return Err(denial_text(denial));
             }
             match self.read_json(Some(Duration::from_millis(100)))? {
                 Some(event)
@@ -1501,39 +2124,82 @@ impl CdpConnection {
                 None => break,
             }
         }
-        if let Some(error) = self.security_error.take() {
-            Err(error)
+        if let Some(denial) = self.security_error.take() {
+            Err(denial_text(denial))
         } else {
             Ok(())
         }
     }
 }
 
-fn validate_http_url(value: &str) -> Result<Url, String> {
+/// Renders a typed denial for one of the `String`-shaped boundaries.
+///
+/// The twelve `#[tauri::command]`s and [`BrowserWorkflowAdapter::execute`] are
+/// `Result<_, String>` by their own contract — Tauri serializes the error to the
+/// webview and the workflow engine puts it in a node result — so a denial has to
+/// become prose somewhere. It becomes prose *here*, as late as it can, and through
+/// [`EgressDenial`]'s own `Display`, which is the only rendering that carries the
+/// rule code. Every hand-built refusal string this replaced dropped the code at
+/// the refusal site instead, which is why nothing downstream could tell two
+/// refusals apart. Greppable on purpose: each `map_err(denial_text)` is a place a
+/// rule stops being a value.
+fn denial_text(denial: EgressDenial) -> String {
+    denial.to_string()
+}
+
+/// Names this guard in a denial record.
+const BROWSER_GUARD: &str = "browser.navigation";
+
+fn validate_http_url(value: &str) -> Result<Url, EgressDenial> {
     if value.len() > 16 * 1024 {
-        return Err("Browser URL exceeds 16 KiB".to_string());
+        // The length, not the URL: quoting 16 KiB of caller-supplied text into an
+        // error that surfaces in the UI is its own problem.
+        return Err(EgressDenial::about(
+            EgressRule::UrlTooLong,
+            format!(
+                "browser URL is {} bytes, over the 16 KiB limit",
+                value.len()
+            ),
+        ));
     }
-    let url = Url::parse(value).map_err(|error| format!("Invalid browser URL: {error}"))?;
+    let url = Url::parse(value)
+        .map_err(|error| EgressDenial::about(EgressRule::UrlMalformed, error.to_string()))?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err("Only http: and https: browser URLs are allowed".to_string());
+        return Err(EgressDenial::about(
+            EgressRule::SchemeNotAllowed,
+            format!(
+                "only http: and https: browser URLs are allowed, not '{}:'",
+                url.scheme()
+            ),
+        ));
     }
+    // No detail at all, and the one refusal in this file for which that is the
+    // correct choice: `EgressRule::redacts_target` is true for exactly this rule
+    // because the URL is what carries the secret. Naming the host would already be
+    // most of the way to naming the credential's owner, and the summary says
+    // everything the caller needs to fix it.
     if !url.username().is_empty() || url.password().is_some() {
-        return Err("Browser URLs cannot contain credentials".to_string());
+        return Err(EgressDenial::new(EgressRule::EmbeddedCredentials));
     }
     if url.host_str().is_none() {
-        return Err("Browser URL has no host".to_string());
+        return Err(EgressDenial::new(EgressRule::HostMissing));
     }
     Ok(url)
 }
 
-fn normalized_origin(url: &Url) -> Result<String, String> {
+fn normalized_origin(url: &Url) -> Result<String, EgressDenial> {
     let host = url
         .host_str()
-        .ok_or_else(|| "URL has no host".to_string())?;
+        .ok_or_else(|| EgressDenial::new(EgressRule::HostMissing))?;
     let default = match url.scheme() {
         "http" => 80,
         "https" => 443,
-        _ => return Err("Only HTTP origins are supported".to_string()),
+        _ => {
+            return Err(EgressDenial::about(
+                EgressRule::SchemeNotAllowed,
+                format!("only HTTP origins are supported, not '{}:'", url.scheme()),
+            ))
+        }
     };
     Ok(match url.port() {
         Some(port) if port != default => format!("{}://{}:{port}", url.scheme(), host),
@@ -2117,11 +2783,22 @@ mod tests {
     /// The child is a plain `sleep`: `stop()` only kills and reaps whatever is in
     /// `self.child`, and never asks what program it is.
     fn quota_session(max_actions: u64) -> (Arc<OwnedBrowser>, u32) {
+        quota_session_with(BrowserLimits {
+            max_actions,
+            ..BrowserLimits::default()
+        })
+    }
+
+    /// The same fixture with the whole limit set open, for the bounds the action
+    /// count is not the subject of. Session ids are unique per fixture so several
+    /// of these can share one `BrowserCommandState`, which the sweep needs.
+    fn quota_session_with(limits: BrowserLimits) -> (Arc<OwnedBrowser>, u32) {
         let root = std::env::temp_dir().join(format!("lm-browser-quota-{}", uuid::Uuid::new_v4()));
         let profiles = root.join("profiles");
-        let profile = profiles.join("session");
+        let session_id = format!("quota-session-{}", uuid::Uuid::new_v4());
+        let profile = profiles.join(&session_id);
         ensure_private_directory(&profile).unwrap();
-        std::fs::write(profile.join(PROFILE_MARKER), b"quota-session").ok();
+        std::fs::write(profile.join(PROFILE_MARKER), session_id.as_bytes()).ok();
         let artifacts = ArtifactStore::new(root.join("artifacts")).unwrap();
 
         // A CdpConnection needs a real socket; nothing in this test speaks to it.
@@ -2134,15 +2811,18 @@ mod tests {
         let child = observable_child();
         let pid = child.id();
 
-        let grant = ValidatedGrant::new(BrowserGrant {
-            allowed_origins: vec!["http://127.0.0.1:1".to_string()],
-            allow_loopback: true,
-        })
+        let grant = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["http://127.0.0.1:1".to_string()],
+                allow_loopback: true,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-1"),
+        )
         .unwrap();
 
         (
             Arc::new(OwnedBrowser {
-                session_id: "quota-session".to_string(),
+                session_id,
                 run_id: "quota-run".to_string(),
                 profile_root: profiles,
                 profile,
@@ -2156,11 +2836,9 @@ mod tests {
                     security_error: None,
                 }),
                 artifacts,
-                limits: BrowserLimits {
-                    max_actions,
-                    ..BrowserLimits::default()
-                },
+                limits,
                 cancelled: AtomicBool::new(false),
+                cancel_reason: Mutex::new(None),
                 action_count: AtomicU64::new(0),
                 artifact_bytes: AtomicU64::new(0),
                 started: Instant::now(),
@@ -2181,6 +2859,82 @@ mod tests {
     ///
     /// Asserted on the child rather than on a flag, because the flag was exactly
     /// what was already being set correctly.
+    /// `classify_ip` catches `::1` up front, but `::127.0.0.1` is not loopback by
+    /// that predicate and is not what `to_ipv4_mapped()` matches — so an
+    /// agent-driven navigation to it classified as allowed and needed no grant.
+    ///
+    /// Asserted as `Ipv4Compatible` rather than merely "not allowed": the rule is
+    /// the claim. `::127.0.0.1` is refused because the deprecated wrapper is refused
+    /// whole, *not* because anything unwrapped it and recognised loopback, and only
+    /// naming the rule says which of those two happened.
+    #[test]
+    fn the_deprecated_ipv4_compatible_form_is_not_a_public_navigation_target() {
+        use std::str::FromStr;
+        for text in ["::127.0.0.1", "::10.0.0.1"] {
+            let address = IpAddr::V6(Ipv6Addr::from_str(text).unwrap());
+            assert_eq!(
+                classify_ip(address),
+                Some(EgressRule::Ipv4Compatible),
+                "{text} must not classify as public"
+            );
+        }
+        assert_eq!(
+            classify_ip(IpAddr::V6(
+                Ipv6Addr::from_str("2606:2800:220:1:248:1893:25c8:1946").unwrap()
+            )),
+            None
+        );
+    }
+
+    /// Two non-routable IPv4 ranges classified as public navigation targets here
+    /// while `knowledge_pipeline.rs` — the broadest of the four guards — refused
+    /// them. Fail-open, not fail-closed, which is what separates this from the
+    /// bracket bug in the same guard.
+    ///
+    /// The rule is asserted rather than "not `None`", because the two ranges each
+    /// contain one address that already had its own rule and must keep it:
+    /// `0.0.0.0` is `Unspecified` and `255.255.255.255` is `Broadcast`. A test that
+    /// only checked "refused" would pass even if the new arms had swallowed those
+    /// two, which is the mistake the ordering here exists to avoid.
+    #[test]
+    fn this_network_and_the_reserved_range_are_not_public_navigation_targets() {
+        for (text, rule) in [
+            // The ranges the guard was missing.
+            ("0.1.2.3", EgressRule::ThisNetwork),
+            ("0.255.255.255", EgressRule::ThisNetwork),
+            ("240.0.0.1", EgressRule::ReservedRange),
+            ("255.255.255.254", EgressRule::ReservedRange),
+            // The two single addresses inside them that keep their own rules.
+            ("0.0.0.0", EgressRule::Unspecified),
+            ("255.255.255.255", EgressRule::Broadcast),
+        ] {
+            let address: IpAddr = text.parse().expect("test address parses");
+            assert_eq!(
+                classify_ip(address),
+                Some(rule),
+                "{text} must be refused as {}",
+                rule.code()
+            );
+        }
+
+        // Lower boundary of the new `240..=255` arm: 239 is the last multicast
+        // octet, so this proves the arm starts where it claims and has not
+        // swallowed the octet below it — and that multicast still answers with its
+        // own rule rather than with the reserved one.
+        assert_eq!(
+            classify_ip("239.255.255.255".parse::<IpAddr>().unwrap()),
+            Some(EgressRule::Multicast),
+            "239/8 is multicast, not the reserved range"
+        );
+
+        // The counter-test: "refuse everything" would pass every assertion above.
+        assert_eq!(
+            classify_ip("1.1.1.1".parse::<IpAddr>().unwrap()),
+            None,
+            "an ordinary public address must still be navigable"
+        );
+    }
+
     #[test]
     fn tripping_the_action_quota_kills_the_child_it_cancels() {
         let (browser, pid) = quota_session(1);
@@ -2236,6 +2990,329 @@ mod tests {
         browser.stop().ok();
     }
 
+    /// The whole watchdog rule, with no registry, no Chromium and no timer.
+    ///
+    /// Every bound is asserted with its counterpart immediately beside it, because
+    /// each of these branches passes trivially against a rule that fires on
+    /// everything: a sweep that reclaimed unconditionally would satisfy the
+    /// reclaim cases and destroy every live session.
+    #[test]
+    fn the_sweep_rule_bounds_the_clock_and_liveness_and_nothing_else() {
+        let limits = BrowserLimits {
+            max_session_ms: 10 * 60_000,
+            ..BrowserLimits::default()
+        };
+
+        // Live, inside the clock: untouched.
+        assert_eq!(sweep_verdict(0, &limits, false, false), SweepVerdict::Keep);
+        assert_eq!(
+            sweep_verdict(10 * 60_000 - 1, &limits, false, false),
+            SweepVerdict::Keep
+        );
+        // Exactly at the budget is still inside it, matching `begin_action`'s
+        // strict `>`. If the two disagreed here the sweep would reclaim sessions
+        // the next action would have allowed.
+        assert_eq!(
+            sweep_verdict(10 * 60_000, &limits, false, false),
+            SweepVerdict::Keep
+        );
+
+        // One millisecond past it: reclaimed, and named after the clock.
+        assert_eq!(
+            sweep_verdict(10 * 60_000 + 1, &limits, false, false),
+            SweepVerdict::Reclaim(BrowserCancelReason::SessionClock)
+        );
+
+        // A child that ended on its own is reclaimed even with the clock nowhere
+        // near its budget — the liveness question `begin_action` never asked.
+        assert_eq!(
+            sweep_verdict(0, &limits, true, false),
+            SweepVerdict::Reclaim(BrowserCancelReason::ChildExited)
+        );
+        // ...and it outranks the clock when both are true, because a gone Chromium
+        // is the more specific fact about why the session is finished.
+        assert_eq!(
+            sweep_verdict(10 * 60_000 + 1, &limits, true, false),
+            SweepVerdict::Reclaim(BrowserCancelReason::ChildExited)
+        );
+
+        // Already cancelled: evicted, never re-attributed. Both other conditions
+        // hold here, so a rule that checked them first would overwrite the real
+        // cause (say, the action quota) with one that is merely also true by now.
+        assert_eq!(
+            sweep_verdict(10 * 60_000 + 1, &limits, true, true),
+            SweepVerdict::Evict
+        );
+        assert_eq!(sweep_verdict(0, &limits, false, true), SweepVerdict::Evict);
+
+        // The disk budget is not part of this rule and has no way to become part
+        // of it: a session with a 1 MiB ceiling and a clock to spare is kept, so
+        // no sweep can trigger the profile walk that `owned_directory_size` is.
+        let tiny_disk = BrowserLimits {
+            max_disk_bytes: 1024 * 1024,
+            ..limits.clone()
+        };
+        assert_eq!(
+            sweep_verdict(0, &tiny_disk, false, false),
+            SweepVerdict::Keep
+        );
+    }
+
+    /// The registry half: the sweep must take the condemned session *out* of the
+    /// map and run the ordinary `stop()` teardown on it, and must leave everything
+    /// else exactly where it was.
+    ///
+    /// Liveness is injected (`|_| false` — every child running) so this asserts the
+    /// clock branch on every platform. The fixture has no long-lived Windows child,
+    /// so a real probe would read every session there as crashed and this could
+    /// never reach the clock at all.
+    #[test]
+    fn the_sweep_reclaims_an_idle_expired_session_and_leaves_a_live_one() {
+        let root = std::env::temp_dir().join(format!("lm-browser-sweep-{}", uuid::Uuid::new_v4()));
+        let state = BrowserCommandState::production(&root).unwrap();
+
+        // Zero means "already past its budget on the first tick", which is the
+        // only way to age a session without sleeping. It is a test input, not a
+        // proposed default — see the counterpart below, which is what stops a
+        // sweep that reclaims everything from passing this.
+        let (expired, _) = quota_session_with(BrowserLimits {
+            max_session_ms: 0,
+            ..BrowserLimits::default()
+        });
+        let (live, _) = quota_session_with(BrowserLimits::default());
+        state.insert(expired.clone()).unwrap();
+        state.insert(live.clone()).unwrap();
+
+        let outcomes = state.sweep_sessions(&|_| false).unwrap();
+
+        assert_eq!(outcomes.len(), 1, "got {outcomes:?}");
+        assert_eq!(outcomes[0].session_id, expired.session_id);
+        assert_eq!(outcomes[0].run_id, expired.run_id);
+        assert_eq!(
+            outcomes[0].reason,
+            Some(BrowserCancelReason::SessionClock),
+            "a reclaim must name the bound that fired, not the caller-stop reason"
+        );
+
+        assert!(
+            expired.child.lock().unwrap().is_none(),
+            "the reclaim must go through stop(), which takes the child, rather than \
+             only dropping the session out of the registry"
+        );
+        assert!(
+            state.get(&expired.session_id).is_err(),
+            "a reclaimed session must be gone from the registry, not left in it \
+             reporting itself alive"
+        );
+
+        // The counterpart. Without it, a sweep that reclaimed unconditionally
+        // would satisfy every assertion above while destroying working sessions.
+        assert!(
+            state.get(&live.session_id).is_ok(),
+            "a session inside its clock must stay in the registry"
+        );
+        assert!(
+            live.child.lock().unwrap().is_some(),
+            "a session inside its clock must keep its child"
+        );
+        assert_eq!(live.view().cancel_reason, None);
+        assert!(!live.view().cancelled);
+
+        live.stop().ok();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A Chromium that died on its own left a session that still reported itself
+    /// alive: `try_wait` appeared only inside `stop()` and at launch, so nothing
+    /// ever asked. Here the clock has 10 minutes to spare, so liveness is the only
+    /// thing that can reclaim it.
+    #[test]
+    fn the_sweep_reclaims_a_session_whose_chromium_died_on_its_own() {
+        let root = std::env::temp_dir().join(format!("lm-browser-dead-{}", uuid::Uuid::new_v4()));
+        let state = BrowserCommandState::production(&root).unwrap();
+        let (browser, _) = quota_session_with(BrowserLimits::default());
+        state.insert(browser.clone()).unwrap();
+
+        let outcomes = state.sweep_sessions(&|_| true).unwrap();
+
+        assert_eq!(outcomes.len(), 1, "got {outcomes:?}");
+        assert_eq!(
+            outcomes[0].reason,
+            Some(BrowserCancelReason::ChildExited),
+            "a session reclaimed because its browser is gone must not be reported \
+             as a caller-initiated stop"
+        );
+        assert!(state.get(&browser.session_id).is_err());
+        assert!(browser.child.lock().unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `child_exited` answers about the process, and the two answers it must not
+    /// confuse are "ended on its own" and "we ended it".
+    ///
+    /// The reaped case is arranged by this test rather than waited for, so it does
+    /// not depend on any external process's lifetime: `wait()` caches the status,
+    /// which is what `try_wait` then reports.
+    #[test]
+    fn a_stopped_child_is_not_reported_as_having_exited_on_its_own() {
+        let (browser, _) = quota_session_with(BrowserLimits::default());
+
+        // A live child, where one is available. On Windows the stand-in exits
+        // immediately (see `observable_child`), so this is the OS-level claim that
+        // cannot be made portably — and the reason the sweep injects liveness.
+        #[cfg(unix)]
+        assert!(
+            !browser.child_exited(),
+            "a running child must not read as having exited"
+        );
+
+        {
+            let mut slot = browser.child.lock().unwrap();
+            let child = slot.as_mut().expect("the fixture holds a child");
+            let _ = child.kill();
+            child.wait().expect("the stand-in child is reaped");
+        }
+        assert!(
+            browser.child_exited(),
+            "a child that is gone while still in the session must read as exited"
+        );
+
+        // After `stop()` the slot is empty, which is *this module's* teardown and
+        // not a spontaneous exit. Reporting it as one would make every stopped
+        // session look like a crash.
+        browser.stop().ok();
+        assert!(
+            !browser.child_exited(),
+            "a session whose child stop() already took must not read as crashed"
+        );
+    }
+
+    /// A session that a quota already cancelled is still in the registry, because
+    /// nothing removes one there except `browser_stop`. The sweep evicts it — and
+    /// must not relabel it, which is the whole reason the reason exists.
+    #[test]
+    fn the_sweep_evicts_an_already_cancelled_session_without_relabelling_it() {
+        let root = std::env::temp_dir().join(format!("lm-browser-evict-{}", uuid::Uuid::new_v4()));
+        let state = BrowserCommandState::production(&root).unwrap();
+        let (browser, _) = quota_session_with(BrowserLimits {
+            max_actions: 1,
+            ..BrowserLimits::default()
+        });
+        state.insert(browser.clone()).unwrap();
+
+        browser.begin_action().expect("the first action is allowed");
+        browser
+            .begin_action()
+            .expect_err("the second exceeds a quota of one");
+        assert_eq!(
+            browser.view().cancel_reason,
+            Some(BrowserCancelReason::ActionQuota)
+        );
+
+        // `stop()` has already emptied the child slot, so the probe is forced to
+        // "exited" to give the sweep a competing condition: a rule that checked
+        // liveness before the cancelled latch would relabel this a crash. The clock
+        // ordering cannot be staged here — a session past its clock never reaches
+        // the action quota — and is covered by the rule test instead.
+        let outcomes = state.sweep_sessions(&|_| true).unwrap();
+
+        assert_eq!(outcomes.len(), 1, "got {outcomes:?}");
+        assert_eq!(
+            outcomes[0].reason,
+            Some(BrowserCancelReason::ActionQuota),
+            "the sweep must report the cause the session already recorded, not \
+             re-attribute it to whatever is also true by the time it looks"
+        );
+        assert_eq!(
+            browser.view().cancel_reason,
+            Some(BrowserCancelReason::ActionQuota),
+            "the recorded cause must survive the reclaim's own stop()"
+        );
+        assert!(state.get(&browser.session_id).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The sweep deliberately excludes the disk quota, because
+    /// `owned_directory_size` walks the whole profile and stats every entry. This
+    /// asserts the exclusion where it would actually be reintroduced: a session
+    /// already over its disk budget is left alone by the sweep while the action
+    /// path still refuses it, so the two cannot be quietly merged.
+    #[test]
+    fn the_sweep_does_not_walk_the_profile_for_the_disk_quota() {
+        let (browser, _) = quota_session_with(BrowserLimits {
+            max_disk_bytes: 1024,
+            ..BrowserLimits::default()
+        });
+        std::fs::write(browser.profile.join("bulk"), vec![0_u8; 8 * 1024]).unwrap();
+
+        assert_eq!(
+            browser.sweep_verdict_now(false),
+            SweepVerdict::Keep,
+            "the sweep must not enforce the disk quota; it runs on a timer over \
+             every live session and the profile walk is unbounded work"
+        );
+        assert!(
+            browser
+                .begin_action()
+                .expect_err("the action path still owns the disk quota")
+                .contains("disk quota"),
+            "excluding disk from the sweep must not stop the action path enforcing it"
+        );
+        browser.stop().ok();
+    }
+
+    /// The driver contract: it keeps sweeping, and `stop` ends it.
+    #[test]
+    fn the_watchdog_loop_runs_until_it_is_stopped() {
+        let root = std::env::temp_dir().join(format!("lm-browser-loop-{}", uuid::Uuid::new_v4()));
+        let state = BrowserCommandState::production(&root).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut passes = 0_usize;
+
+        // A zero interval keeps the test off the clock entirely; the cadence is a
+        // caller's parameter precisely so nothing here has to pick one.
+        run_browser_watchdog(&state, Duration::ZERO, &stop, |outcomes| {
+            outcomes.expect("an empty registry sweeps cleanly");
+            passes += 1;
+            if passes == 3 {
+                stop.store(true, Ordering::SeqCst);
+            }
+        });
+
+        assert_eq!(
+            passes, 3,
+            "the loop must keep sweeping until stopped, not sweep once and return"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The other half of the driver contract, and the reason `stop` is re-read
+    /// after each pass rather than only at the top: a shutdown must not have to
+    /// wait out a whole interval that is already known to be pointless. Timed
+    /// rather than structural because the delay *is* the defect — the loop
+    /// terminates either way.
+    #[test]
+    fn stopping_the_watchdog_does_not_wait_out_its_interval() {
+        let root = std::env::temp_dir().join(format!("lm-browser-prompt-{}", uuid::Uuid::new_v4()));
+        let state = BrowserCommandState::production(&root).unwrap();
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+
+        // Long enough that sleeping through it is unmistakable, and never actually
+        // slept when the loop is correct.
+        run_browser_watchdog(&state, Duration::from_secs(5), &stop, |outcomes| {
+            outcomes.expect("an empty registry sweeps cleanly");
+            stop.store(true, Ordering::SeqCst);
+        });
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the loop slept out its interval after stop was set; took {:?}",
+            started.elapsed()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn websocket_accept_matches_rfc_fixture() {
         assert_eq!(
@@ -2244,17 +3321,133 @@ mod tests {
         );
     }
 
+    /// The same four claims as before, each now asserted by rule.
+    ///
+    /// `is_err()` was all this could say while these returned strings, and an
+    /// `Err` is the one thing every wrong implementation also produces: a guard
+    /// that refused `file:` for having no host, or refused a private address as a
+    /// malformed URL, passed it unchanged. The rule is what distinguishes "refused"
+    /// from "refused for the reason claimed".
     #[test]
     fn schemes_credentials_and_private_networks_are_blocked() {
-        assert!(validate_http_url("file:///etc/passwd").is_err());
-        assert!(validate_http_url("http://user:pass@example.com/").is_err());
-        assert_eq!(classify_ip("127.0.0.1".parse().unwrap()), IpClass::Loopback);
+        assert_eq!(
+            validate_http_url("file:///etc/passwd").unwrap_err().rule(),
+            EgressRule::SchemeNotAllowed
+        );
+
+        let credentials = validate_http_url("http://user:pass@example.com/").unwrap_err();
+        assert_eq!(credentials.rule(), EgressRule::EmbeddedCredentials);
+        // The one rule whose diagnostic may not quote what it refused, so the
+        // rendered sentence is asserted too and not just the rule.
+        assert!(credentials.rule().redacts_target());
+        assert_eq!(credentials.detail(), None);
+        let rendered = credentials.to_string();
+        assert!(!rendered.contains("user:pass"), "leaked: {rendered}");
+        assert!(!rendered.contains("example.com"), "leaked: {rendered}");
+
+        assert_eq!(
+            classify_ip("127.0.0.1".parse().unwrap()),
+            Some(EgressRule::Loopback)
+        );
         assert_eq!(
             classify_ip("169.254.1.1".parse().unwrap()),
-            IpClass::Private
+            Some(EgressRule::LinkLocal)
         );
-        assert_eq!(classify_ip("10.1.2.3".parse().unwrap()), IpClass::Private);
-        assert_eq!(classify_ip("8.8.8.8".parse().unwrap()), IpClass::Public);
+        assert_eq!(
+            classify_ip("10.1.2.3".parse().unwrap()),
+            Some(EgressRule::PrivateV4)
+        );
+        assert_eq!(classify_ip("8.8.8.8".parse().unwrap()), None);
+    }
+
+    /// One representative address per class this file refuses, asserted by rule.
+    ///
+    /// The list is the readable inventory of what a browser session cannot be
+    /// pointed at, which the chain of predicates is not. It also pins the
+    /// *precedence* between overlapping-looking branches: `192.0.0.1` is a protocol
+    /// assignment and not documentation, `255.255.255.255` is the broadcast address
+    /// and not multicast, and a v4-mapped v6 address reports its inner v4 rule
+    /// rather than a wrapper rule of its own.
+    #[test]
+    fn every_refused_address_class_reports_its_own_rule() {
+        for (text, expected) in [
+            // v4, in the order `classify_v4` tests them.
+            ("10.1.2.3", EgressRule::PrivateV4),
+            ("172.16.0.1", EgressRule::PrivateV4),
+            ("192.168.1.1", EgressRule::PrivateV4),
+            ("169.254.169.254", EgressRule::LinkLocal),
+            ("255.255.255.255", EgressRule::Broadcast),
+            ("192.0.2.1", EgressRule::TestNet),
+            ("198.51.100.1", EgressRule::TestNet),
+            ("203.0.113.1", EgressRule::TestNet),
+            ("0.0.0.0", EgressRule::Unspecified),
+            ("224.0.0.1", EgressRule::Multicast),
+            ("239.255.255.250", EgressRule::Multicast),
+            ("100.64.0.1", EgressRule::Cgnat),
+            ("100.127.255.255", EgressRule::Cgnat),
+            ("198.18.0.1", EgressRule::Benchmarking),
+            ("198.19.255.255", EgressRule::Benchmarking),
+            ("192.0.0.1", EgressRule::ProtocolAssignments),
+            ("127.0.0.1", EgressRule::Loopback),
+            ("127.1.2.3", EgressRule::Loopback),
+            // v6, in the order `classify_v6` tests them.
+            ("::127.0.0.1", EgressRule::Ipv4Compatible),
+            ("::93.184.216.34", EgressRule::Ipv4Compatible),
+            ("::", EgressRule::Unspecified),
+            ("ff02::1", EgressRule::Multicast),
+            ("fc00::1", EgressRule::UniqueLocalV6),
+            ("fd12:3456::1", EgressRule::UniqueLocalV6),
+            ("fe80::1", EgressRule::LinkLocal),
+            ("::1", EgressRule::Loopback),
+            // `ReservedRange` and not `UniqueLocalV6`: a private-network grant covers
+            // the latter and must not reach a range RFC 3879 deprecated.
+            ("fec0::1", EgressRule::ReservedRange),
+            ("2001:db8::1", EgressRule::TestNet),
+            ("2001:2::1", EgressRule::Benchmarking),
+            // Everything outside global unicast `2000::/3`, caught by the default
+            // rather than by an arm of its own — which is the point of making the
+            // default refuse. `fe00::/9` fell between `fc00::/7` and `fe80::/10`, and
+            // `64:ff9b::7f00:1` is NAT64 for `127.0.0.1`: a spelling, not a place.
+            ("fe00::1", EgressRule::ReservedRange),
+            ("64:ff9b::7f00:1", EgressRule::ReservedRange),
+            ("100::1", EgressRule::ReservedRange),
+            ("4000::1", EgressRule::ReservedRange),
+            // The mapped form keeps whichever rule its inner address trips, and that
+            // delegation has to win over the `2000::/3` default above — `::ffff:…`
+            // sits in `::/96`, so the default alone would call every mapped address
+            // reserved and hide the inner rule.
+            ("::ffff:10.0.0.1", EgressRule::PrivateV4),
+            ("::ffff:169.254.169.254", EgressRule::LinkLocal),
+        ] {
+            let address: IpAddr = text.parse().expect("test address parses");
+            assert_eq!(
+                classify_ip(address),
+                Some(expected),
+                "{text} must be refused as {}",
+                expected.code()
+            );
+        }
+    }
+
+    /// The counter-test, without which "refuse everything" would pass every
+    /// assertion above: real public addresses in both families still classify as
+    /// allowed.
+    #[test]
+    fn public_addresses_in_both_families_are_still_allowed() {
+        for text in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:2800:220:1:248:1893:25c8:1946",
+            "2001:4860:4860::8888",
+        ] {
+            let address: IpAddr = text.parse().expect("test address parses");
+            assert_eq!(
+                classify_ip(address),
+                None,
+                "{text} is a public address and must stay reachable"
+            );
+        }
     }
 
     #[test]
@@ -2283,58 +3476,517 @@ mod tests {
         .is_err());
     }
 
+    /// Two independent requirements, and asserting only `is_err()` could not tell
+    /// them apart: a missing loopback grant and an origin outside the grant were the
+    /// same `Err`, so a guard that refused every loopback URL regardless of the
+    /// grant — or one that refused every URL regardless of its origin — passed this
+    /// test. The rule says which requirement each case is about.
     #[test]
     fn exact_origin_and_loopback_grant_are_required() {
-        let denied = ValidatedGrant::new(BrowserGrant {
-            allowed_origins: vec!["http://127.0.0.1:3000".into()],
-            allow_loopback: false,
-        })
+        let denied = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["http://127.0.0.1:3000".into()],
+                allow_loopback: false,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-2"),
+        )
         .unwrap();
-        assert!(denied
+        let refusal = denied
             .validate_navigation("http://127.0.0.1:3000/")
-            .is_err());
-        let allowed = ValidatedGrant::new(BrowserGrant {
-            allowed_origins: vec!["http://127.0.0.1:3000".into()],
-            allow_loopback: true,
-        })
+            .unwrap_err();
+        assert_eq!(
+            refusal.rule(),
+            EgressRule::Loopback,
+            "the origin is granted; the loopback class is what is not"
+        );
+        // The address that tripped it, because a name can resolve to several and
+        // only one of them may be the loopback answer.
+        assert_eq!(
+            refusal.detail(),
+            Some("127.0.0.1 requires an explicit per-run loopback grant")
+        );
+
+        let allowed = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["http://127.0.0.1:3000".into()],
+                allow_loopback: true,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-3"),
+        )
         .unwrap();
         assert!(allowed
             .validate_navigation("http://127.0.0.1:3000/a")
             .is_ok());
-        assert!(allowed
-            .validate_navigation("http://127.0.0.1:3001/a")
+        assert_eq!(
+            allowed
+                .validate_navigation("http://127.0.0.1:3001/a")
+                .unwrap_err()
+                .rule(),
+            EgressRule::OriginNotAllowlisted,
+            "the loopback grant is held; the port is what leaves the grant"
+        );
+    }
+
+    /// Four refusals that were four identical `Err`s, now four named rules.
+    ///
+    /// Writing them down exposed something the old assertions hid: with a grant of
+    /// `https://example.com`, the two IP-literal cases never reach the address
+    /// classifier at all — their *origin* is already outside the grant, so the
+    /// origin rule answers first and the private-address rules are not what is being
+    /// tested here. That layer is tested by
+    /// [`an_allowlisted_origin_that_resolves_into_a_refused_class_is_still_blocked`],
+    /// which grants the origin so the classifier is the only thing left to refuse it.
+    #[test]
+    fn page_requests_cannot_expand_the_run_grant() {
+        let grant = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["https://example.com".into()],
+                allow_loopback: false,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-4"),
+        )
+        .unwrap();
+        let rule_for = |result: Result<(), EgressDenial>| result.unwrap_err().rule();
+
+        assert_eq!(
+            rule_for(grant.validate_request("file:///etc/passwd", false)),
+            EgressRule::SchemeNotAllowed
+        );
+        assert_eq!(
+            rule_for(grant.validate_request("http://10.10.10.10/secret", false)),
+            EgressRule::SubresourceLeftGrant,
+            "the origin rule fires before the address is ever classified"
+        );
+        assert_eq!(
+            rule_for(grant.validate_request("http://169.254.169.254/latest", false)),
+            EgressRule::SubresourceLeftGrant,
+            "the origin rule fires before the address is ever classified"
+        );
+        // The distinction this pair exists to hold: a document hop and a subresource
+        // leaving the same grant are two rules, not one sentence with two spellings.
+        assert_eq!(
+            rule_for(grant.validate_request("https://other.example/path", true)),
+            EgressRule::RedirectLeftGrant
+        );
+        let subresource = grant
+            .validate_request("https://cdn.example/path.js", false)
+            .unwrap_err();
+        assert_eq!(subresource.rule(), EgressRule::SubresourceLeftGrant);
+        assert_ne!(
+            subresource.rule(),
+            EgressRule::RedirectLeftGrant,
+            "these two must stay distinguishable by type, not by prose"
+        );
+        assert_eq!(
+            subresource.detail(),
+            Some("'https://cdn.example' is outside this run's grant")
+        );
+    }
+
+    /// The second layer, which the test above cannot reach: an origin the run *was*
+    /// granted, whose host resolves into a class this file refuses.
+    ///
+    /// A grant naming a private IP literal is a plausible mistake for a caller to
+    /// make, and the address classifier is the only thing standing behind it. Every
+    /// address here is a literal, so nothing in this test resolves a name off-box.
+    #[test]
+    fn an_allowlisted_origin_that_resolves_into_a_refused_class_is_still_blocked() {
+        for (origin, target, expected) in [
+            (
+                "http://10.10.10.10",
+                "http://10.10.10.10/secret",
+                EgressRule::PrivateV4,
+            ),
+            (
+                "http://169.254.169.254",
+                "http://169.254.169.254/latest/meta-data/",
+                EgressRule::LinkLocal,
+            ),
+            (
+                "http://192.0.0.1",
+                "http://192.0.0.1/",
+                EgressRule::ProtocolAssignments,
+            ),
+        ] {
+            let grant = ValidatedGrant::new(
+                BrowserGrant {
+                    allowed_origins: vec![origin.to_string()],
+                    allow_loopback: false,
+                },
+                crate::run_scope::RunScope::run("grant-fixture-5"),
+            )
+            .unwrap();
+            let denial = grant.validate_request(target, false).unwrap_err();
+            assert_eq!(
+                denial.rule(),
+                expected,
+                "{origin} is granted, so {} is what must refuse it",
+                expected.code()
+            );
+            // The offending address, so a multi-answer refusal says which answer.
+            assert!(
+                denial
+                    .detail()
+                    .is_some_and(|detail| detail.contains(origin.trim_start_matches("http://"))),
+                "the refusal must name the address it refused: {denial}"
+            );
+            // A document hop reaches the same classifier by the same route.
+            assert_eq!(
+                grant.validate_request(target, true).unwrap_err().rule(),
+                expected
+            );
+        }
+    }
+
+    /// Two different guards refusing, and the `guard` column keeping them apart.
+    ///
+    /// This is the column's whole justification. The four guards disagree about
+    /// which address classes they block — deliberately, since the broadest blocks
+    /// CGNAT and unifying them would refuse fetches that work today — so a sink that
+    /// recorded only the rule would average those disagreements into one number and
+    /// an operator could not tell which guard was involved.
+    ///
+    /// Drives the real guards rather than synthesising records, so it also proves
+    /// both call sites are actually wired.
+    /// D3 at this file's highest-volume decision point, and the reason the scope is
+    /// carried on the grant rather than read from the air.
+    ///
+    /// Every browser action arrives through `tokio::task::spawn_blocking`, which does
+    /// **not** inherit a task-local — the same property `run_scope`'s own test pins for
+    /// `tokio::spawn`. So a `run_scope::scoped` at the command boundary cannot reach a
+    /// per-subresource refusal here, and a version of this that relied on the ambient
+    /// scope would record a blank while looking instrumented. `ValidatedGrant` holds the
+    /// scope instead — it is already the per-run object — and enters it around the write.
+    ///
+    /// Both arms are asserted, because the point of the mechanism is that they are two
+    /// different answers rather than one blank: a run keeps its id, a grant with no run
+    /// keeps a coded reason.
+    #[test]
+    fn a_refused_subresource_names_the_run_whose_grant_refused_it() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory =
+            std::env::temp_dir().join(format!("lm-grant-scope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("creates the directory");
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+        let find = |marker: &str| {
+            crate::denial_sink::DenialSink::open(&path)
+                .expect("reopens for reading")
+                .recent(256)
+                .expect("reads")
+                .into_iter()
+                .find(|row| {
+                    row.guard == BROWSER_GUARD
+                        && row.detail.as_deref().is_some_and(|d| d.contains(marker))
+                })
+                .unwrap_or_else(|| panic!("no browser row mentioning {marker}"))
+        };
+        let grant_for = |scope| {
+            ValidatedGrant::new(
+                BrowserGrant {
+                    allowed_origins: vec!["https://allowed.example".into()],
+                    allow_loopback: false,
+                },
+                scope,
+            )
+            .expect("the grant validates")
+        };
+
+        // A run's grant. The refusal is raised inside `classify_request`, a pure function
+        // of a `&str` that is handed no run id and never will be.
+        let granted = grant_for(crate::run_scope::RunScope::run("run:subresource"));
+        assert!(granted
+            .validate_request("https://elsewhere.example/tracker.js", false)
             .is_err());
+        let row = find("elsewhere.example");
+        assert_eq!(row.run_id.as_deref(), Some("run:subresource"));
+        assert_eq!(row.unattributed_reason, None);
+
+        // A grant with deliberately no run keeps the *reason*, which is exactly what
+        // forwarding only an id would have flattened into a blank.
+        let background = grant_for(crate::run_scope::RunScope::Unattributed(
+            crate::run_scope::Unattributed::Scheduled,
+        ));
+        assert!(background
+            .validate_request("https://offgrant.example/pixel.gif", false)
+            .is_err());
+        let row = find("offgrant.example");
+        assert_eq!(row.run_id, None);
+        assert_eq!(
+            row.unattributed_reason.as_deref(),
+            Some(crate::run_scope::Unattributed::Scheduled.code())
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
-    fn page_requests_cannot_expand_the_run_grant() {
-        let grant = ValidatedGrant::new(BrowserGrant {
-            allowed_origins: vec!["https://example.com".into()],
-            allow_loopback: false,
-        })
+    fn two_guards_refusing_are_distinguishable_in_the_record() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory =
+            std::env::temp_dir().join(format!("lm-two-guards-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("creates the directory");
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+
+        // The web fetch guard, on a link-local literal.
+        let refused = crate::web::validate_fetch_url(
+            &reqwest::Url::parse("http://169.254.1.1/probe").expect("parses"),
+            false,
+        );
+        assert!(refused.is_err());
+
+        // The browser guard, on an origin outside the run's grant.
+        let grant = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["https://granted.example".to_string()],
+                allow_loopback: false,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-6"),
+        )
+        .expect("the grant is valid");
+        assert!(grant
+            .validate_navigation("https://ungranted.example/page")
+            .is_err());
+
+        let reader = crate::denial_sink::DenialSink::open(&path).expect("reopens for reading");
+        let rows = reader.recent(64).expect("reads");
+
+        let web = rows
+            .iter()
+            .find(|row| row.detail.as_deref() == Some("169.254.1.1"))
+            .expect("the web guard's refusal was recorded");
+        assert_eq!(web.rule_code, EgressRule::LinkLocal.code());
+        assert_eq!(web.guard, "web.fetch");
+
+        let browser = rows
+            .iter()
+            .find(|row| {
+                row.detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("ungranted.example"))
+            })
+            .expect("the browser guard's refusal was recorded");
+        assert_eq!(browser.rule_code, EgressRule::OriginNotAllowlisted.code());
+        assert_eq!(browser.guard, "browser.navigation");
+
+        assert_ne!(
+            web.guard, browser.guard,
+            "the column exists precisely to keep these apart"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The IPv4-**mapped** loopback form was classified as an ordinary public
+    /// navigation target: it is not `Ipv6Addr::is_loopback`, so it slipped past
+    /// [`classify_ip`]'s loopback check, and the v4 helper it then unwrapped into had
+    /// no loopback branch — because until that unwrap existed, nothing had ever
+    /// reached it with a loopback address.
+    ///
+    /// Sibling of the `::127.0.0.1` bug the shared `egress::is_ipv4_compatible`
+    /// predicate closed, and it survived that fix because the compatible form and the
+    /// mapped form are different ranges reached by different branches.
+    ///
+    /// # This used to fork on the platform, and no longer does
+    ///
+    /// `Url::host_str` serializes an IPv6 literal *with* its brackets, and
+    /// `("[::ffff:127.0.0.1]", port).to_socket_addrs()` was where the platforms
+    /// parted company: macOS and Linux refused to parse it, so the target was refused
+    /// as a resolution failure before the classifier was consulted, while **Windows
+    /// resolved it** — so on Windows this was a live bypass, and a granted
+    /// `http://[::ffff:127.0.0.1]` origin reached this machine's own loopback
+    /// services without the explicit per-run loopback grant that a plain `127.0.0.1`
+    /// requires.
+    ///
+    /// This test therefore used to accept *either* verdict, because the resolver's
+    /// answer was the platform's and not this guard's. [`ValidatedGrant::resolved_addresses`]
+    /// no longer routes a literal through the resolver, so the classifier now decides
+    /// on every platform and there is one expected answer to assert. Keeping the
+    /// alternative would have meant a revert of that fix still passed here.
+    #[test]
+    fn the_ipv4_mapped_loopback_form_is_classified_as_loopback() {
+        for text in ["::ffff:127.0.0.1", "::ffff:127.1.2.3"] {
+            let address: Ipv6Addr = text.parse().expect("parses");
+            assert!(
+                !address.is_loopback(),
+                "{text} is deliberately NOT `is_loopback`, which is the whole trap"
+            );
+            assert_eq!(
+                classify_ip(IpAddr::V6(address)),
+                Some(EgressRule::Loopback),
+                "{text} must be reported as loopback, not as a public target"
+            );
+        }
+
+        // Counter-test: a public address in the same wrapper is still reachable, so
+        // the new branch did not refuse the whole mapped range.
+        assert_eq!(
+            classify_ip(IpAddr::V6(
+                "::ffff:93.184.216.34".parse::<Ipv6Addr>().unwrap()
+            )),
+            None
+        );
+
+        // End to end, through the gate that actually decides a navigation. The origin
+        // is granted, so the only thing left to refuse it is the address.
+        let grant = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["http://[::ffff:127.0.0.1]:11434".into()],
+                allow_loopback: false,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-7"),
+        )
         .unwrap();
-        assert!(grant.validate_request("file:///etc/passwd", false).is_err());
-        assert!(grant
-            .validate_request("http://10.10.10.10/secret", false)
-            .is_err());
-        assert!(grant
-            .validate_request("http://169.254.169.254/latest", false)
-            .is_err());
-        assert!(grant
-            .validate_request("https://other.example/path", true)
-            .is_err());
-        assert!(grant
-            .validate_request("https://cdn.example/path.js", false)
-            .unwrap_err()
-            .contains("subresource"));
+        let denial = grant
+            .validate_navigation("http://[::ffff:127.0.0.1]:11434/api/tags")
+            .expect_err("loopback without a grant must never be allowed");
+        assert_eq!(
+            denial.rule(),
+            EgressRule::Loopback,
+            "the classifier must refuse this, on every platform: {denial}"
+        );
+    }
+
+    /// The bracket bug itself, from the outside: a granted IPv6-literal origin whose
+    /// address no rule refuses must be *allowed*.
+    ///
+    /// This is the one assertion the old code could not satisfy on macOS or Linux.
+    /// `Url::host_str` answered `"[2606:4700:4700::1111]"`, `to_socket_addrs` would
+    /// not parse the brackets, and the target came back refused as
+    /// [`EgressRule::DnsResolutionFailed`] — a resolution verdict standing in for a
+    /// policy one. It failed closed, so it was never a bypass; it was a guard whose
+    /// entire IPv6 half never ran, which is why the sibling test below has to exist.
+    ///
+    /// Also the counter-test for that sibling: it is what makes "refuse every IPv6
+    /// literal" an insufficient answer to this bug.
+    ///
+    /// Hermetic. A literal host is no longer handed to the resolver at all, so
+    /// nothing here touches DNS or the network — which is itself part of the claim,
+    /// since a lookup for an address the caller already spelled out could only
+    /// substitute a different answer for a known one.
+    #[test]
+    fn a_granted_public_ipv6_literal_is_reachable_now_that_its_brackets_are_gone() {
+        let grant = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["http://[2606:4700:4700::1111]".into()],
+                allow_loopback: false,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-8"),
+        )
+        .unwrap();
+        grant
+            .validate_navigation("http://[2606:4700:4700::1111]/page")
+            .expect("a public IPv6 literal is refused by no rule in this file");
+
+        // The same bug in this file's other bracket-blind line. A literal cannot be
+        // DNS-rebound, so it needs no `MAP` rule — but `host_str().parse::<IpAddr>()`
+        // never recognised one, so the origin used to fall through to the hostname
+        // path and pin a host Chromium's resolver is never asked about.
+        assert_eq!(
+            grant.chromium_resolver_rules().unwrap(),
+            "",
+            "a literal host needs no resolver rule, whatever family it is in"
+        );
+    }
+
+    /// Now that an IPv6 literal reaches [`classify_ip`] at all, every locally-scoped
+    /// or non-routable class has to be refused *by rule* — the resolution failure that
+    /// used to refuse them on macOS and Linux is gone, and it was never policy anyway.
+    ///
+    /// Each row asserts the exact rule, which is the whole point: an
+    /// [`EgressRule::DnsResolutionFailed`] here would mean the resolver had refused it
+    /// and the guard had never been consulted, and that is exactly the state this
+    /// change left behind if any of these classes were missing.
+    ///
+    /// # Five of these rows were holes until this change
+    ///
+    /// `fec0::/10`, `2001:db8::/32`, `2001:2::/48`, `fe00::/9` and `64:ff9b::/96`
+    /// classified as public. The first three had v4 counterparts [`classify_v4`]
+    /// refuses; `fe00::/9` fell in the gap between `fc00::/7` and `fe80::/10`; and
+    /// `64:ff9b::7f00:1` is NAT64 for `127.0.0.1`, whose counterpart is refused at
+    /// `classify_v4`'s loopback arm. Dormant while no IPv6 literal could resolve;
+    /// live the moment one could.
+    ///
+    /// The last three rows are not enumerated classes at all — they are the
+    /// `2000::/3` default, which is why the name says *every* rather than a count.
+    #[test]
+    fn every_scoped_ipv6_literal_is_refused_by_the_guard_and_not_by_the_resolver() {
+        for (literal, expected) in [
+            ("::1", EgressRule::Loopback),
+            ("::", EgressRule::Unspecified),
+            ("::127.0.0.1", EgressRule::Ipv4Compatible),
+            ("ff02::1", EgressRule::Multicast),
+            ("fd00::1", EgressRule::UniqueLocalV6),
+            ("fec0::1", EgressRule::ReservedRange),
+            ("fe80::1", EgressRule::LinkLocal),
+            ("2001:db8::1", EgressRule::TestNet),
+            ("2001:2::1", EgressRule::Benchmarking),
+            ("fe00::1", EgressRule::ReservedRange),
+            ("64:ff9b::7f00:1", EgressRule::ReservedRange),
+        ] {
+            let origin = format!("http://[{literal}]");
+            let grant = ValidatedGrant::new(
+                BrowserGrant {
+                    allowed_origins: vec![origin.clone()],
+                    allow_loopback: false,
+                },
+                crate::run_scope::RunScope::run("grant-fixture-9"),
+            )
+            .unwrap();
+            let denial = grant
+                .validate_navigation(&format!("{origin}/page"))
+                .unwrap_err();
+            assert_eq!(
+                denial.rule(),
+                expected,
+                "{origin} is granted, so this guard's own {} is what must refuse it \
+                 — not the resolver: {denial}",
+                expected.code()
+            );
+            // The classifier's own message names the *bare* address, because it holds
+            // a parsed `IpAddr`; the resolution failure this replaced named the
+            // bracketed string it had been handed instead. Compared against std's
+            // `Display` rather than the source text, since neither serializer keeps
+            // an embedded-v4 spelling like `::127.0.0.1` intact.
+            let address: Ipv6Addr = literal.parse().expect("the test's own literal parses");
+            assert!(
+                denial
+                    .detail()
+                    .is_some_and(|detail| detail.starts_with(&address.to_string())),
+                "the refusal must name the address the classifier saw: {denial}"
+            );
+        }
+
+        // Counter-test, so that "refuse every IPv6 literal" cannot pass this test:
+        // loopback is the one class an explicit per-run grant makes reachable, and it
+        // has to still be reachable through the very path that refuses it above.
+        let granted = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["http://[::1]:11434".into()],
+                allow_loopback: true,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-10"),
+        )
+        .unwrap();
+        granted
+            .validate_navigation("http://[::1]:11434/api/tags")
+            .expect("an explicit loopback grant still reaches ::1");
     }
 
     #[test]
     fn hostname_grants_are_pinned_before_chromium_can_resolve_again() {
-        let grant = ValidatedGrant::new(BrowserGrant {
-            allowed_origins: vec!["http://localhost:43210".into()],
-            allow_loopback: true,
-        })
+        let grant = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["http://localhost:43210".into()],
+                allow_loopback: true,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-11"),
+        )
         .unwrap();
         let rules = grant.chromium_resolver_rules().unwrap();
         assert!(rules.starts_with("MAP localhost "));

@@ -39,6 +39,7 @@ use tauri::Manager;
 use tokio::sync::Notify;
 use url::Url;
 
+use crate::egress::{EgressDenial, EgressRule};
 use crate::{permissions, AppState};
 
 /// Total request timeout (connect through full body read) for `tool_web_fetch`.
@@ -333,46 +334,94 @@ pub fn web_remove_brave_key() -> Result<(), String> {
     remove_brave_key_impl()
 }
 
-/// Checks whether `ip` falls in any of the ranges the design doc calls out:
+/// Which rule, if any, refuses `ip` — the ranges the design doc calls out:
 /// loopback, RFC1918 private, link-local, and unspecified (`0.0.0.0`).
 /// `Ipv4Addr::is_private` (the std method) already covers exactly
 /// 10.0.0.0/8, 172.16.0.0/12, and 192.168.0.0/16, so it's used as-is rather
-/// than hand-rolling the same three CIDR checks. `is_unspecified` (`0.0.0.0`)
+/// than hand-rolling the same three CIDR checks.
+///
+/// # Why this reports a rule instead of a bool
+///
+/// It used to return `bool`, and all four classes below shared one message:
+/// "target host is a local/private address". Ten distinct predicates, counting
+/// the v6 side, collapsed into one sentence — so a test could only assert that
+/// sentence's substring, and seven of them did. Naming the rule is what lets a
+/// test say *loopback* was refused rather than *something* was, and lets a log
+/// reader tell an RFC1918 target from a `0.0.0.0` one.
+///
+/// `is_unspecified` (`0.0.0.0`)
 /// is checked explicitly and separately from the other three: it isn't
 /// loopback, private, *or* link-local by any of those predicates' own
 /// definitions, yet the OS routes an outbound connection to `0.0.0.0` to
 /// `127.0.0.1` (verified empirically on macOS) — i.e. it's a real path to a
 /// loopback-bound service like `llama-server`/Ollama, not a dead address,
 /// so it must be blocked exactly like a literal `127.0.0.1`.
-fn is_blocked_ipv4(ip: &Ipv4Addr) -> bool {
-    ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+fn blocked_reason_ipv4(ip: &Ipv4Addr) -> Option<EgressRule> {
+    if ip.is_loopback() {
+        return Some(EgressRule::Loopback);
+    }
+    if ip.is_private() {
+        return Some(EgressRule::PrivateV4);
+    }
+    if ip.is_link_local() {
+        return Some(EgressRule::LinkLocal);
+    }
+    if ip.is_unspecified() {
+        return Some(EgressRule::Unspecified);
+    }
+    None
 }
 
-/// IPv6 equivalent of [`is_blocked_ipv4`]. `Ipv6Addr::is_loopback` and
+/// IPv6 equivalent of [`blocked_reason_ipv4`]. `Ipv6Addr::is_loopback` and
 /// `is_unspecified` are stable std, but the unique-local (`fc00::/7`) and
 /// link-local (`fe80::/10`) checks are hand-rolled here because the
 /// corresponding std predicates (`is_unique_local`, `is_unicast_link_local`)
 /// are still gated behind the unstable `ip` feature. An IPv4-mapped address
-/// (`::ffff:a.b.c.d`) is unwrapped and re-checked against [`is_blocked_ipv4`]
-/// so a v4-mapped private (or unspecified) address can't slip past a
-/// v6-only check.
-fn is_blocked_ipv6(ip: &Ipv6Addr) -> bool {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_blocked_ipv4(&v4);
+/// (`::ffff:a.b.c.d`) is unwrapped and re-checked against
+/// [`blocked_reason_ipv4`] so a v4-mapped private (or unspecified) address
+/// can't slip past a v6-only check.
+fn blocked_reason_ipv6(ip: &Ipv6Addr) -> Option<EgressRule> {
+    // Before the mapped unwrap, because the deprecated IPv4-*compatible* form
+    // (`::a.b.c.d`) is not what `to_ipv4_mapped` matches and fell through every
+    // branch below. See `egress::is_ipv4_compatible` for why this is a rejection
+    // rather than a second unwrap.
+    if crate::egress::is_ipv4_compatible(ip) {
+        return Some(EgressRule::Ipv4Compatible);
     }
-    if ip.is_loopback() || ip.is_unspecified() {
-        return true;
+    // A mapped address reports whichever v4 rule its inner address trips, rather
+    // than a rule of its own: `::ffff:127.0.0.1` is loopback, and calling it
+    // anything else would hide that from whoever reads the denial.
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return blocked_reason_ipv4(&v4);
+    }
+    // The third spelling of a v4 address, and the one this guard was missing:
+    // `64:ff9b::7f00:1` *is* `127.0.0.1` wherever a NAT64/CLAT path exists. Delegated
+    // to this file's own v4 rule rather than refused outright, because the prefix is
+    // live and legitimate — `64:ff9b::` plus a public address is how a v6-only network
+    // reaches a v4-only server. See `egress::nat64_embedded_ipv4`.
+    if let Some(v4) = crate::egress::nat64_embedded_ipv4(ip) {
+        return blocked_reason_ipv4(&v4);
+    }
+    if ip.is_loopback() {
+        return Some(EgressRule::Loopback);
+    }
+    if ip.is_unspecified() {
+        return Some(EgressRule::Unspecified);
     }
     let octets = ip.octets();
-    let unique_local = (octets[0] & 0xfe) == 0xfc; // fc00::/7
-    let link_local = octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80; // fe80::/10
-    unique_local || link_local
+    if (octets[0] & 0xfe) == 0xfc {
+        return Some(EgressRule::UniqueLocalV6); // fc00::/7
+    }
+    if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+        return Some(EgressRule::LinkLocal); // fe80::/10
+    }
+    None
 }
 
-fn is_blocked_ip(ip: &IpAddr) -> bool {
+fn blocked_reason_ip(ip: &IpAddr) -> Option<EgressRule> {
     match ip {
-        IpAddr::V4(v4) => is_blocked_ipv4(v4),
-        IpAddr::V6(v6) => is_blocked_ipv6(v6),
+        IpAddr::V4(v4) => blocked_reason_ipv4(v4),
+        IpAddr::V6(v6) => blocked_reason_ipv6(v6),
     }
 }
 
@@ -382,16 +431,81 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
 /// hostname resolves to. Called both on the initial URL and, from inside the
 /// custom redirect policy in [`fetch_impl`], on every redirect hop — see the
 /// module doc for why re-checking every hop is the actual security boundary.
-pub fn validate_fetch_url(url: &Url, allow_local_network: bool) -> Result<(), String> {
+pub fn validate_fetch_url(url: &Url, allow_local_network: bool) -> Result<(), EgressDenial> {
+    let verdict = classify_fetch_url(url, allow_local_network);
+    if let Err(denial) = &verdict {
+        // Recorded here, at the raise site, rather than at the command boundary —
+        // which is the whole reason the sink is reachable without a state handle.
+        // By the time this refusal reaches `tool_web_fetch` it is a `String`, and a
+        // sink fed from there would be parsing its own rule code back out of a
+        // sentence. Fail-soft and never consulted by any decision: see
+        // `denial_sink`'s module doc.
+        crate::denial_sink::record(GUARD, denial, None);
+    }
+    verdict
+}
+
+/// Names this guard in a denial record, so that two guards disagreeing about the
+/// same address class stay distinguishable in the sink.
+const GUARD: &str = "web.fetch";
+
+/// Whether a hostname's resolved answers leave anything this app may connect to.
+///
+/// Its own function purely so the quantifier is testable without the system resolver.
+/// The case the change to it is *about* — one public answer and one private one — cannot
+/// be produced hermetically through `to_socket_addrs`, and a rule that only the
+/// deployment environment can exercise is a rule with no test.
+fn classify_resolved_answers(
+    domain: &str,
+    answers: impl Iterator<Item = IpAddr>,
+) -> Result<(), EgressDenial> {
+    let mut refused = None;
+    let mut survivors = 0usize;
+    for ip in answers {
+        match blocked_reason_ip(&ip) {
+            // The address is named in the detail, not just the class: a hostname with
+            // several answers used to be refused by a message that said nothing about
+            // which answer tripped it.
+            Some(rule) => {
+                refused = Some(EgressDenial::about(
+                    rule,
+                    format!("{domain} resolves to {ip}"),
+                ));
+            }
+            None => survivors += 1,
+        }
+    }
+    if survivors == 0 {
+        // `DnsNoAddresses` when the lookup came back empty, which no rule refused;
+        // otherwise the rule that accounted for the last answer. The same two-case split
+        // the resolver makes, for the same reason: "nothing answered" and "everything
+        // that answered is refused" are different facts.
+        return Err(refused.unwrap_or_else(|| {
+            EgressDenial::about(EgressRule::DnsNoAddresses, domain.to_string())
+        }));
+    }
+    Ok(())
+}
+
+/// [`validate_fetch_url`]'s decision, without the recording.
+///
+/// Split so the guard's logic stays a pure function of its arguments: the tests
+/// below drive this one, and a test that recorded into a process-wide sink as a
+/// side effect of asserting a verdict would couple every one of them to every
+/// other test's expectations.
+fn classify_fetch_url(url: &Url, allow_local_network: bool) -> Result<(), EgressDenial> {
     if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(format!(
-            "Refusing to fetch '{}': only http/https URLs are allowed",
-            url
+        return Err(EgressDenial::about(
+            EgressRule::SchemeNotAllowed,
+            format!("only http/https URLs are allowed, not '{}'", url.scheme()),
         ));
     }
 
+    // No detail, deliberately: the URL is what carries the credential, so this is
+    // the one refusal that must not quote its target. `EgressRule::redacts_target`
+    // says the same thing where every guard can see it.
     if !url.username().is_empty() || url.password().is_some() {
-        return Err("Refusing to fetch a URL with embedded credentials".to_string());
+        return Err(EgressDenial::new(EgressRule::EmbeddedCredentials));
     }
 
     if allow_local_network {
@@ -405,42 +519,69 @@ pub fn validate_fetch_url(url: &Url, allow_local_network: bool) -> Result<(), St
     // that whole bracket-handling class of bug for IPv6 literals.
     match url
         .host()
-        .ok_or_else(|| format!("Refusing to fetch '{}': no host", url))?
+        .ok_or_else(|| EgressDenial::new(EgressRule::HostMissing))?
     {
         url::Host::Ipv4(ip) => {
-            if is_blocked_ipv4(&ip) {
-                return Err(format!(
-                    "Refusing to fetch '{}': target host is a local/private address",
-                    url
-                ));
+            if let Some(rule) = blocked_reason_ipv4(&ip) {
+                return Err(EgressDenial::about(rule, ip.to_string()));
             }
         }
         url::Host::Ipv6(ip) => {
-            if is_blocked_ipv6(&ip) {
-                return Err(format!(
-                    "Refusing to fetch '{}': target host is a local/private address",
-                    url
-                ));
+            if let Some(rule) = blocked_reason_ipv6(&ip) {
+                return Err(EgressDenial::about(rule, ip.to_string()));
             }
         }
         url::Host::Domain(domain) => {
-            // Resolve and check every address the hostname maps to. The port
-            // passed to `ToSocketAddrs` is irrelevant to the lookup itself.
-            let addrs = (domain, 0u16).to_socket_addrs().map_err(|e| {
-                format!("Refusing to fetch '{}': failed to resolve host: {}", url, e)
-            })?;
-            for addr in addrs {
-                if is_blocked_ip(&addr.ip()) {
-                    return Err(format!(
-                        "Refusing to fetch '{}': host resolves to a local/private address",
-                        url
-                    ));
-                }
-            }
+            // Resolve and check the addresses the hostname maps to. The port passed to
+            // `ToSocketAddrs` is irrelevant to the lookup itself.
+            //
+            // # Why this refuses only when *no* answer survives
+            //
+            // This used to refuse if **any** answer was blocked, which disagreed with
+            // [`SsrfGuardedResolver`] — the thing that actually enforces — and the
+            // disagreement was this gate over-blocking rather than the resolver
+            // under-blocking. The resolver prunes blocked answers and hands `reqwest`
+            // only the survivors, and since those are exactly what `reqwest` connects
+            // to, a pruned private answer is never dialled. So a legitimate host that
+            // answers with one public and one private address — ordinary split-horizon
+            // or dual-stack DNS — connects safely through the public one, and was being
+            // refused outright here for it.
+            //
+            // Matching the resolver's quantifier keeps this layer without keeping the
+            // false refusals. It stays a layer rather than being deleted because it is
+            // the only guard for a URL that never reaches a resolver at all: the
+            // literal-IP arms above, and any future caller that validates without
+            // installing the resolver. Deleting it would make that mistake silent.
+            //
+            // Note this pre-check's lookup is a *different* lookup from the resolver's,
+            // which is why it cannot be the enforcement point — see
+            // [`SsrfGuardedResolver`] for the rebinding argument. It is a fast, and now
+            // consistent, pre-filter.
+            let addrs = (domain, 0u16)
+                .to_socket_addrs()
+                .map_err(|e| EgressDenial::about(EgressRule::DnsResolutionFailed, e.to_string()))?;
+            classify_resolved_answers(domain, addrs.map(|addr| addr.ip()))?;
         }
     }
 
     Ok(())
+}
+
+/// Renders a denial the way this file's callers have always rendered a refusal:
+/// named target first, reason second.
+///
+/// The one exception is the rule that refuses *because* the URL holds a
+/// credential, where quoting the target would print the secret into the UI, the
+/// model's tool result and the CLI's stdout at once. That exception used to be
+/// hand-coded in one branch of [`validate_fetch_url`]; it now comes from
+/// [`EgressRule::redacts_target`], so the next guard to be converted inherits it
+/// instead of having to remember it.
+fn fetch_refusal(url: &Url, denial: &EgressDenial) -> String {
+    if denial.rule().redacts_target() {
+        format!("Refusing to fetch a URL: {denial}")
+    } else {
+        format!("Refusing to fetch '{url}': {denial}")
+    }
 }
 
 /// Result of a successful `web_fetch`, echoed back to the model as JSON.
@@ -621,15 +762,29 @@ const MAX_REDIRECT_HOPS: usize = 10;
 fn build_redirect_policy(allow_local_network: bool) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= MAX_REDIRECT_HOPS {
-            return attempt.error(std::io::Error::other(format!(
-                "Refusing to follow more than {MAX_REDIRECT_HOPS} redirects"
+            return attempt.error(refused(EgressDenial::about(
+                EgressRule::RedirectHopLimit,
+                format!("refusing to follow more than {MAX_REDIRECT_HOPS} redirects"),
             )));
         }
         match validate_fetch_url(attempt.url(), allow_local_network) {
             Ok(()) => attempt.follow(),
-            Err(e) => attempt.error(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)),
+            // The hop's own rule, not a rule about redirects: a hop refused for
+            // pointing at loopback should say `egress.loopback`, so the reason is
+            // the same whether the address arrived in the request or in a `302`.
+            Err(denial) => attempt.error(refused(denial)),
         }
     })
+}
+
+/// Hands a denial to a signature that wants an error.
+///
+/// The denial is passed as itself rather than as `to_string()`, so the rule
+/// survives the trip out through `reqwest` and can be recovered with
+/// `downcast_ref` instead of substring-matched. `egress.rs` has the same helper
+/// for the same reason; this one is separate only because both are private.
+fn refused(denial: EgressDenial) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, denial)
 }
 
 /// Custom `reqwest` DNS resolver that closes the check-then-connect
@@ -645,7 +800,7 @@ fn build_redirect_policy(allow_local_network: bool) -> reqwest::redirect::Policy
 /// it resolves once (async, via `tokio::net::lookup_host`, so no blocking-DNS
 /// call lands on the async runtime thread the way `validate_fetch_url`'s
 /// pre-check does) and filters the result through the exact same
-/// [`is_blocked_ip`] predicate `validate_fetch_url` uses, handing `reqwest`
+/// [`blocked_reason_ip`] classifier `validate_fetch_url` uses, handing `reqwest`
 /// only addresses that already passed the filter. Since the addresses handed
 /// back are exactly what `reqwest` connects to — not a hint checked against a
 /// separate, later lookup — there is no second resolution left for a
@@ -676,17 +831,57 @@ impl reqwest::dns::Resolve for SsrfGuardedResolver {
                 return Ok(Box::new(resolved) as reqwest::dns::Addrs);
             }
 
-            let allowed: Vec<std::net::SocketAddr> =
-                resolved.filter(|addr| !is_blocked_ip(&addr.ip())).collect();
+            // Classified rather than merely filtered, so the refusal below can
+            // name the rule that accounted for the last surviving answer instead
+            // of a sentence covering all ten classes at once.
+            let mut last_rule = None;
+            let allowed: Vec<std::net::SocketAddr> = resolved
+                .filter(|addr| match blocked_reason_ip(&addr.ip()) {
+                    Some(rule) => {
+                        last_rule = Some(rule);
+                        false
+                    }
+                    None => true,
+                })
+                .collect();
             if allowed.is_empty() {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("Refusing to connect to '{host}': host resolves only to local/private addresses"),
-                )) as Box<dyn std::error::Error + Send + Sync>);
+                // `DnsNoAddresses` when the lookup itself came back empty, which
+                // no rule refused; otherwise the rule that refused the answers.
+                let denial = match last_rule {
+                    Some(rule) => EgressDenial::about(
+                        rule,
+                        format!("{host} resolves only to addresses this rule refuses"),
+                    ),
+                    None => EgressDenial::about(EgressRule::DnsNoAddresses, host.clone()),
+                };
+                return Err(Box::new(denial) as Box<dyn std::error::Error + Send + Sync>);
             }
             Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)
         })
     }
+}
+
+/// Reads `response`'s body into memory, stopping at `max` bytes.
+///
+/// Streams rather than calling `.text()`/`.bytes()` for one reason: those read
+/// to end-of-stream, so the size of the allocation is the peer's choice. Here
+/// the cap is ours, and it holds whether or not `Content-Length` was sent and
+/// whether or not it was honest.
+///
+/// Over-long bodies are truncated rather than refused, which is the same
+/// bargain [`fetch_impl`] already made: the callers parse a best-effort
+/// document out of what arrived, and a body past these caps is pathological
+/// either way.
+async fn read_body_capped(mut response: reqwest::Response, max: usize) -> reqwest::Result<Vec<u8>> {
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() >= max {
+            bytes.truncate(max);
+            break;
+        }
+    }
+    Ok(bytes)
 }
 
 /// Core `web_fetch` logic: AppHandle-free and directly testable (against a
@@ -700,7 +895,50 @@ impl reqwest::dns::Resolve for SsrfGuardedResolver {
 /// phases 1-2 hardcoded both via module constants; this is the phase-3
 /// settings-driven version `tool_web_fetch` (and monkey-cli, phase 4) call with
 /// whatever `web_settings.json` currently holds.
+///
+/// # Why the run scope is entered here and not at the command
+///
+/// This tool has no run and will not acquire one. A `web_fetch` is a tool call
+/// inside a chat turn: the run id in this app is a `run_ledger` entity, the
+/// frontend agent loop only forwards one to `provider_chat`, and both of this
+/// function's callers — [`tool_web_fetch`] and `monkey-cli`'s agent — are a person
+/// asking for a turn. So the honest answer is a *reason*, and it is the same
+/// reason `providers.rs` gives an ordinary non-run chat stream:
+/// [`crate::run_scope::Unattributed::UserAction`], i.e. work the user asked for
+/// outside any run.
+///
+/// Entered here rather than in [`tool_web_fetch`] because this is the boundary both
+/// callers share — a scope at the command would leave `monkey-cli`'s fetches
+/// recording a blank — and because this is the one of the two that a test can drive,
+/// so the label is pinned rather than asserted in prose.
+///
+/// The consequence to know about: this is a `scoped` and therefore *shadows* an outer
+/// scope. If a durable run ever drives a fetch, this must become a
+/// [`crate::run_scope::RunScope`] parameter, exactly as `m4_runtime`'s
+/// `run_async_worker` did for the same reason — silently relabelling a run's egress
+/// as a user action would be worse than the blank this replaces.
 pub async fn fetch_impl(
+    settings: &WebSettings,
+    url: String,
+    max_chars: Option<usize>,
+    start_index: Option<usize>,
+) -> Result<FetchResult, String> {
+    crate::run_scope::scoped(
+        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+        fetch_within_scope(settings, url, max_chars, start_index),
+    )
+    .await
+}
+
+/// [`fetch_impl`]'s body, with the scope already established.
+///
+/// Split out rather than wrapping the body in an `async` block so that the
+/// `scoped` call is one readable frame and this function's own diff stays empty.
+/// Every refusal below is raised while this future is being polled, which is what
+/// puts it inside the scope: `validate_fetch_url` here, and the same function again
+/// from inside the redirect policy, which `reqwest` invokes while polling the
+/// request future this task owns.
+async fn fetch_within_scope(
     settings: &WebSettings,
     url: String,
     max_chars: Option<usize>,
@@ -710,7 +948,8 @@ pub async fn fetch_impl(
     let start_index = start_index.unwrap_or(0);
 
     let parsed = Url::parse(&url).map_err(|e| format!("Invalid URL '{}': {}", url, e))?;
-    validate_fetch_url(&parsed, settings.allow_local_network)?;
+    validate_fetch_url(&parsed, settings.allow_local_network)
+        .map_err(|denial| fetch_refusal(&parsed, &denial))?;
 
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
@@ -722,7 +961,7 @@ pub async fn fetch_impl(
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    let mut response = client
+    let response = client
         .get(parsed.clone())
         .send()
         .await
@@ -736,20 +975,9 @@ pub async fn fetch_impl(
         .unwrap_or("")
         .to_string();
 
-    // Streamed read capped at MAX_BODY_BYTES regardless of what (if
-    // anything) Content-Length claims.
-    let mut bytes: Vec<u8> = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
+    let bytes = read_body_capped(response, MAX_BODY_BYTES)
         .await
-        .map_err(|e| format!("Failed to read response body from '{}': {}", url, e))?
-    {
-        bytes.extend_from_slice(&chunk);
-        if bytes.len() >= MAX_BODY_BYTES {
-            bytes.truncate(MAX_BODY_BYTES);
-            break;
-        }
-    }
+        .map_err(|e| format!("Failed to read response body from '{}': {}", url, e))?;
 
     let body = String::from_utf8_lossy(&bytes).into_owned();
     let (title, full_content) = dispatch_content(&content_type, &body, &final_url)?;
@@ -857,6 +1085,58 @@ const DEFAULT_SEARCH_COUNT: usize = 10;
 /// arbitrary page.
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Cap on a search backend's response body, the same protection
+/// [`MAX_BODY_BYTES`] gives the fetch path. Smaller than that one because a
+/// search response is a results page or a JSON array, not an arbitrary
+/// document: DuckDuckGo's HTML runs a few hundred KB and both JSON payloads are
+/// far under it, so this only ever bites a body no honest backend sends.
+const MAX_SEARCH_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// The client all three search backends share.
+///
+/// Starts from [`crate::egress::hardened_with_read_budget`] rather than a bare
+/// `Client::builder()` for one property the three hand-rolled builders it
+/// replaces did not have: a redirect that has to stay on the origin the request
+/// was aimed at.
+///
+/// The distinction the previous code missed is between the *request* and the
+/// *response*. Each backend's request target is trustworthy — a vendor constant,
+/// or a base URL the user typed into Settings themselves — and the old doc
+/// comments were right that the untrusted query text never builds a URL. But a
+/// `302` is chosen by the response, and reqwest's default `Policy::limited(10)`
+/// follows one to any host. Two concrete consequences, both closed here:
+///
+/// - **Brave's API key could walk to a host the redirect picked.**
+///   `X-Subscription-Token` is not one of the four headers reqwest strips when a
+///   redirect crosses origins (it strips `Authorization`, `Cookie`,
+///   `Proxy-Authorization`, `WWW-Authenticate`) — the same hazard
+///   [`crate::egress::hardened`] documents for `x-api-key`.
+/// - **A hop could reach unauthenticated loopback services.** This machine's own
+///   `llama-server` and `ollama:11434` have no authentication at all.
+///   `allow_local_network` was no defence: it is consulted only on the fetch
+///   path, so every search client followed a loopback hop with the setting off.
+///
+/// A SearXNG instance is the sharpest edge of it — that base URL is the one
+/// search target a user can point anywhere, and `normalize_base_url` accepts
+/// plain `http://` on purpose, because a self-hosted instance on the LAN or on
+/// loopback is a supported setup. The rule here is deliberately *relative*
+/// (does this hop stay where it was already going?) rather than absolute (is
+/// this a public HTTPS host?), for exactly that reason: an absolute rule would
+/// refuse the self-hosted instance outright, while the relative one leaves it
+/// working and still refuses the `302` off it.
+///
+/// The total [`SEARCH_TIMEOUT`] deadline stays layered on top of the inherited
+/// connect and read budgets. That is safe here, unlike on a download path: these
+/// bodies are small and buffered, so a whole-request ceiling bounds a slow
+/// backend rather than truncating a legitimate transfer.
+fn search_client() -> Result<reqwest::Client, String> {
+    crate::egress::hardened_with_read_budget(SEARCH_TIMEOUT)
+        .timeout(SEARCH_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))
+}
+
 /// DuckDuckGo's keyless HTML results endpoint (no API key, no official API —
 /// see the module doc's "best-effort/brittle" framing). `POST` with the query
 /// in a `q` form field is what the (JS-less) `html.duckduckgo.com/html/`
@@ -947,16 +1227,13 @@ fn parse_ddg_results(html: &str, count: usize) -> Vec<SearchResult> {
 /// arm of three). AppHandle-free and directly testable, same split as
 /// [`fetch_impl`].
 ///
-/// Unlike `fetch_impl`, there is no SSRF guard here to run: the request
-/// target is DuckDuckGo's own fixed endpoint, never a user/model-supplied
-/// URL — only the query text (sent as a POST form field, not part of the
-/// URL) is untrusted.
+/// Unlike `fetch_impl`, there is no SSRF guard here to run on the request: the
+/// target is DuckDuckGo's own fixed endpoint, never a user/model-supplied URL —
+/// only the query text (sent as a POST form field, not part of the URL) is
+/// untrusted. The *response* is a different matter, and [`search_client`]
+/// handles it: a `302` off that endpoint is followed only if it stays on it.
 async fn ddg_search(query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(SEARCH_TIMEOUT)
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let client = search_client()?;
 
     let response = client
         .post(DUCKDUCKGO_HTML_ENDPOINT)
@@ -966,9 +1243,9 @@ async fn ddg_search(query: &str, count: usize) -> Result<Vec<SearchResult>, Stri
         .map_err(|e| format!("Failed to search DuckDuckGo for '{}': {}", query, e))?;
 
     let status = response.status();
-    let body = response
-        .text()
+    let body = read_body_capped(response, MAX_SEARCH_BODY_BYTES)
         .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .map_err(|e| format!("Failed to read DuckDuckGo response for '{}': {}", query, e))?;
 
     if !status.is_success() {
@@ -1036,17 +1313,17 @@ fn parse_brave_response(body: &str, count: usize) -> Result<Vec<SearchResult>, S
 /// can point it at a local fixture server instead of the real Brave API —
 /// [`brave_search`] is the real-endpoint entry point both `search_impl` and
 /// [`web_set_brave_key`]'s validate-before-store call use.
+///
+/// This is the credentialed search path — [`search_client`]'s origin-pinned
+/// redirect policy is what keeps the `X-Subscription-Token` below from riding a
+/// `302` to a host of the response's choosing.
 async fn brave_search_at(
     endpoint: &str,
     api_key: &str,
     query: &str,
     count: usize,
 ) -> Result<Vec<SearchResult>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(SEARCH_TIMEOUT)
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let client = search_client()?;
 
     let response = client
         .get(endpoint)
@@ -1058,9 +1335,9 @@ async fn brave_search_at(
         .map_err(|e| format!("Failed to search Brave for '{}': {}", query, e))?;
 
     let status = response.status();
-    let body = response
-        .text()
+    let body = read_body_capped(response, MAX_SEARCH_BODY_BYTES)
         .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .map_err(|e| format!("Failed to read Brave response for '{}': {}", query, e))?;
 
     if !status.is_success() {
@@ -1131,16 +1408,17 @@ fn parse_searxng_response(body: &str, count: usize) -> Result<Vec<SearchResult>,
 /// than a bare "HTTP 403" the user would have to go guess the cause of (the
 /// design doc's own risk note: "needs the explicit error hint or users will
 /// blame the app").
+///
+/// `base_url` is the one search target a user can point anywhere, so this is the
+/// branch [`search_client`]'s origin-pinned redirect matters most on: the
+/// configured host stays reachable, including a self-hosted instance on plain
+/// `http://` or on loopback, but a `302` off it does not.
 async fn searxng_search(
     base_url: &str,
     query: &str,
     count: usize,
 ) -> Result<Vec<SearchResult>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(SEARCH_TIMEOUT)
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let client = search_client()?;
 
     let url = format!("{}/search", base_url.trim_end_matches('/'));
     let response = client
@@ -1158,9 +1436,9 @@ async fn searxng_search(
         ));
     }
 
-    let body = response
-        .text()
+    let body = read_body_capped(response, MAX_SEARCH_BODY_BYTES)
         .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .map_err(|e| format!("Failed to read SearXNG response from '{}': {}", base_url, e))?;
 
     if !status.is_success() {
@@ -1184,12 +1462,18 @@ async fn searxng_search(
 /// and pass the result through, keeping `search_impl` trivially testable
 /// without touching the real OS keychain.
 ///
-/// Unlike `fetch_impl`, there is no SSRF guard to run for any of the three
-/// branches: Brave/SearXNG/DuckDuckGo targets are either a fixed vendor
-/// endpoint or a user-configured SearXNG base URL the user themselves typed
-/// into Settings (not a model-supplied URL) — only the query text is
+/// Unlike `fetch_impl`, there is no SSRF guard to run on the *request* for any
+/// of the three branches: Brave/SearXNG/DuckDuckGo targets are either a fixed
+/// vendor endpoint or a user-configured SearXNG base URL the user themselves
+/// typed into Settings (not a model-supplied URL) — only the query text is
 /// untrusted, and it's sent as a query/form parameter, never used to build a
 /// request to an arbitrary host.
+///
+/// The *response* is guarded, though, and by the client rather than by this
+/// function: all three branches build from [`search_client`], whose redirect
+/// policy refuses a hop that leaves the origin the request was aimed at. See its
+/// doc comment for why a trustworthy request target does not make a `302` off it
+/// trustworthy too.
 pub async fn search_impl(
     settings: &WebSettings,
     brave_key: Option<String>,
@@ -1314,84 +1598,384 @@ mod tests {
         Url::parse(s).unwrap()
     }
 
+    /// `::127.0.0.1` walked past this guard entirely: not `::1`, not unspecified,
+    /// not `fc00::/7`, not `fe80::/10`, and `to_ipv4_mapped()` returns `None` for
+    /// the deprecated compatible form, so it read as an ordinary public address —
+    /// a loopback SSRF target on a guard whose whole job is refusing those.
+    /// The rule `validate_fetch_url` refused `target` with.
+    ///
+    /// Every address test below goes through this rather than through
+    /// `unwrap_err().contains("…")`. Seven of them used to substring-match the
+    /// single string `"local/private"`, which ten different predicates shared —
+    /// so a test that meant "loopback was refused" could only prove "one of ten
+    /// classes was refused", and a guard that misclassified loopback as private
+    /// would have passed every one of them.
+    /// Drives [`classify_fetch_url`], the pure half, deliberately. Going through
+    /// [`validate_fetch_url`] would make every one of the assertions below write
+    /// into whatever process-wide sink another test happened to install.
+    fn refusing_rule(target: &str) -> EgressRule {
+        classify_fetch_url(&url(target), false)
+            .expect_err("expected a refusal")
+            .rule()
+    }
+
+    /// The recording half, and the claim K5's acceptance actually makes: a blocked
+    /// attempt becomes a durable record naming the rule that blocked it.
+    ///
+    /// Uses a file-backed sink and a second connection to read it, rather than a
+    /// test-only accessor on the installed one — which also exercises the path that
+    /// ships. The assertion filters by a host unique to this test, so it cannot be
+    /// satisfied (or broken) by a denial another test recorded into the same sink.
     #[test]
-    fn rejects_non_http_schemes() {
-        let err = validate_fetch_url(&url("file:///etc/passwd"), false).unwrap_err();
-        assert!(err.contains("only http/https"), "unexpected error: {err}");
+    fn a_refused_fetch_is_written_down_with_its_rule() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory = std::env::temp_dir().join(format!("lm-web-sink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("creates the directory");
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+
+        // A literal, so no DNS is involved and the rule is unambiguous.
+        let denial = validate_fetch_url(&url("http://169.254.169.254/latest/meta-data/"), false)
+            .expect_err("link-local must be refused");
+        assert_eq!(denial.rule(), EgressRule::LinkLocal);
+
+        let reader = crate::denial_sink::DenialSink::open(&path).expect("reopens for reading");
+        let mine: Vec<_> = reader
+            .recent(64)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.detail.as_deref() == Some("169.254.169.254"))
+            .collect();
+
+        assert_eq!(mine.len(), 1, "exactly one record for this test's address");
+        assert_eq!(mine[0].rule_code, EgressRule::LinkLocal.code());
+        assert_eq!(mine[0].guard, GUARD);
+        // Both blank, and that is the point of asserting it: this drives the guard
+        // directly, outside every scope, so it records the third honest state —
+        // "nobody said". The reason column is filled in by `fetch_impl`'s scope and
+        // by nothing inside `record` itself, which is what the test below proves and
+        // what this row is the counter-example to.
+        assert_eq!(mine[0].run_id, None, "no scope was entered, so no run id");
+        assert_eq!(
+            mine[0].unattributed_reason, None,
+            "an uninstrumented site must stay distinguishable from a deliberate one"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The other half: driven through the production entry point, the same refusal
+    /// records *why* it has no run instead of a blank.
+    ///
+    /// A literal address, so no DNS and no listener are involved — the refusal
+    /// happens before a socket is opened, which is what makes this a hermetic test of
+    /// an egress path. The address is unique to this test so a denial another test
+    /// recorded into the same process-wide sink cannot satisfy the filter.
+    ///
+    /// Sabotage check: delete the `scoped` call in `fetch_impl` and the reason column
+    /// goes back to `NULL`, failing the last assertion while the two above it still
+    /// pass. That is the whole distinction D3 exists to make.
+    #[tokio::test]
+    async fn a_refused_tool_fetch_records_the_reason_it_has_no_run() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory = std::env::temp_dir().join(format!("lm-web-scope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("creates the directory");
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+
+        let error = fetch_impl(
+            &WebSettings::default(),
+            "http://10.83.7.11/private".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a private literal must be refused");
+        assert!(
+            error.contains(EgressRule::PrivateV4.code()),
+            "unexpected error: {error}"
+        );
+
+        let reader = crate::denial_sink::DenialSink::open(&path).expect("reopens for reading");
+        let mine: Vec<_> = reader
+            .recent(64)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.detail.as_deref() == Some("10.83.7.11"))
+            .collect();
+
+        assert_eq!(mine.len(), 1, "exactly one record for this test's address");
+        assert_eq!(mine[0].guard, GUARD);
+        assert_eq!(mine[0].rule_code, EgressRule::PrivateV4.code());
+        assert_eq!(
+            mine[0].run_id, None,
+            "a chat-turn fetch has no run id to invent"
+        );
+        assert_eq!(
+            mine[0].unattributed_reason.as_deref(),
+            Some(crate::run_scope::Unattributed::UserAction.code()),
+            "it must say why it has no run rather than leaving the column blank"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The counter-test: an allowed fetch must leave no record. Without it, "record
+    /// everything unconditionally" would pass the test above.
+    #[test]
+    fn an_allowed_fetch_records_nothing() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory = std::env::temp_dir().join(format!("lm-web-ok-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("creates the directory");
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+
+        validate_fetch_url(&url("http://93.184.216.34/"), false).expect("a public literal passes");
+
+        let reader = crate::denial_sink::DenialSink::open(&path).expect("reopens for reading");
+        let mine = reader
+            .recent(64)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.detail.as_deref() == Some("93.184.216.34"))
+            .count();
+        assert_eq!(mine, 0, "nothing was refused, so nothing may be recorded");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Proves this guard *delegates* NAT64 to its own v4 rule. `64:ff9b::7f00:1` is
+    /// `127.0.0.1` wherever a NAT64/CLAT path exists, and this guard — the one the
+    /// agent's own fetch tool goes through — read it as an ordinary public address.
+    ///
+    /// The public row is the load-bearing counter-test: refusing the whole prefix would
+    /// satisfy every other row and break a v6-only network reaching a v4-only host.
+    /// The two DNS rules in this file used to disagree on the quantifier, and the
+    /// disagreement was this pre-check over-blocking rather than the resolver
+    /// under-blocking.
+    ///
+    /// `SsrfGuardedResolver` prunes blocked answers and hands `reqwest` only the
+    /// survivors — which are exactly what it connects to, so a pruned private answer is
+    /// never dialled. This gate refused the whole request if *any* answer was blocked,
+    /// so an ordinary split-horizon or dual-stack host answering with one public and one
+    /// private address was refused here while the resolver would have connected safely.
+    ///
+    /// Tested through the extracted quantifier rather than the system resolver: the
+    /// mixed case is the entire point and no hermetic hostname produces it.
+    #[test]
+    fn a_hostname_is_refused_only_when_no_answer_survives() {
+        use std::str::FromStr;
+        let ip = |text: &str| IpAddr::from_str(text).expect("parses");
+
+        // The case that was wrongly refused. Order both ways, because a loop that
+        // returns early on the first blocked answer passes one order and fails the
+        // other — which is precisely the bug.
+        for answers in [
+            vec![ip("93.184.216.34"), ip("10.0.0.1")],
+            vec![ip("10.0.0.1"), ip("93.184.216.34")],
+        ] {
+            assert!(
+                classify_resolved_answers("dual.example", answers.into_iter()).is_ok(),
+                "a host with one reachable answer must not be refused for the others"
+            );
+        }
+
+        // The counter-test, without which "allow everything" passes: every answer
+        // blocked is still refused, and the refusal names a rule rather than a blank.
+        let denial = classify_resolved_answers(
+            "private.example",
+            vec![ip("10.0.0.1"), ip("127.0.0.1")].into_iter(),
+        )
+        .expect_err("a host whose every answer is refused must be refused");
+        assert!(
+            matches!(denial.rule(), EgressRule::PrivateV4 | EgressRule::Loopback),
+            "the refusal must name one of the rules that fired: {denial}"
+        );
+        assert!(
+            denial
+                .detail()
+                .is_some_and(|detail| detail.contains("private.example resolves to")),
+            "the refusal must name the answer it refused: {denial}"
+        );
+
+        // An empty answer list is a different fact from "everything was refused", and
+        // the resolver draws the same distinction.
+        assert_eq!(
+            classify_resolved_answers("empty.example", std::iter::empty())
+                .expect_err("no answers is not a pass")
+                .rule(),
+            EgressRule::DnsNoAddresses
+        );
     }
 
     #[test]
-    fn rejects_embedded_credentials() {
-        let err = validate_fetch_url(&url("http://user:pass@example.com/"), false).unwrap_err();
-        assert!(err.contains("credentials"), "unexpected error: {err}");
+    fn nat64_reaches_this_guards_own_ipv4_rule() {
+        use std::str::FromStr;
+        for (text, expected) in [
+            ("64:ff9b::7f00:1", Some(EgressRule::Loopback)),
+            ("64:ff9b::a00:1", Some(EgressRule::PrivateV4)),
+            ("64:ff9b::c0a8:101", Some(EgressRule::PrivateV4)),
+            ("64:ff9b::a9fe:a9fe", Some(EgressRule::LinkLocal)),
+            ("64:ff9b::", Some(EgressRule::Unspecified)),
+            // The divergence proof, and the reason this delegates rather than
+            // importing a shared blocklist: `100.64.0.1` is CGNAT, which only the
+            // broadest guard refuses. This one must still allow it, in either
+            // spelling — a shared blocklist would refuse it here and newly break
+            // Tailscale users.
+            ("64:ff9b::6440:1", None),
+            ("64:ff9b::5db8:d822", None),
+        ] {
+            assert_eq!(
+                blocked_reason_ipv6(&Ipv6Addr::from_str(text).expect("parses")),
+                expected,
+                "{text} must report whichever v4 rule its embedded address trips"
+            );
+        }
+    }
+
+    #[test]
+    fn the_deprecated_ipv4_compatible_form_cannot_smuggle_loopback_past_this_guard() {
+        use std::str::FromStr;
+        // Named as its own rule rather than as loopback/private/link-local: the
+        // whole range is refused, so what it wraps never gets consulted.
+        for text in ["::127.0.0.1", "::10.0.0.1", "::169.254.1.1"] {
+            let address = Ipv6Addr::from_str(text).expect("parses");
+            assert_eq!(
+                blocked_reason_ipv6(&address),
+                Some(EgressRule::Ipv4Compatible),
+                "{text} must be refused as the deprecated compatible form"
+            );
+        }
+        // Counter-test: a real public v6 is still reachable, so this did not just
+        // block everything.
+        assert_eq!(
+            blocked_reason_ipv6(&Ipv6Addr::from_str("2606:2800:220:1:248:1893:25c8:1946").unwrap()),
+            None
+        );
+        // And the mapped form still works, which is the branch that already
+        // existed — reporting the inner address's own rule, not a wrapper rule.
+        assert_eq!(
+            blocked_reason_ipv6(&Ipv6Addr::from_str("::ffff:127.0.0.1").unwrap()),
+            Some(EgressRule::Loopback)
+        );
+    }
+
+    #[test]
+    fn rejects_non_http_schemes() {
+        assert_eq!(
+            refusing_rule("file:///etc/passwd"),
+            EgressRule::SchemeNotAllowed
+        );
+    }
+
+    /// The one refusal whose message must not quote what it refused, because the
+    /// URL is the credential. Asserted on the rendered string as well as the
+    /// rule, since the leak would be in the rendering.
+    #[test]
+    fn rejects_embedded_credentials_without_echoing_them() {
+        let target = url("http://user:hunter2@example.com/");
+        let denial = validate_fetch_url(&target, false).expect_err("expected a refusal");
+        assert_eq!(denial.rule(), EgressRule::EmbeddedCredentials);
+
+        let rendered = fetch_refusal(&target, &denial);
+        assert!(
+            !rendered.contains("hunter2") && !rendered.contains("user:"),
+            "the refusal printed the credential it was refusing: {rendered}"
+        );
+        assert!(rendered.contains("egress.embedded-credentials"));
     }
 
     #[test]
     fn rejects_loopback_ipv4_literal() {
-        let err = validate_fetch_url(&url("http://127.0.0.1:8090/v1/chat"), false).unwrap_err();
-        assert!(err.contains("local/private"), "unexpected error: {err}");
+        assert_eq!(
+            refusing_rule("http://127.0.0.1:8090/v1/chat"),
+            EgressRule::Loopback
+        );
     }
 
+    /// Both spellings of this machine's own Ollama, and both are refused for
+    /// being loopback rather than for the port — nothing here inspects a port.
     #[test]
     fn rejects_ollama_loopback_port() {
-        assert!(validate_fetch_url(&url("http://127.0.0.1:11434/api/tags"), false).is_err());
-        assert!(validate_fetch_url(&url("http://localhost:11434/api/tags"), false).is_err());
+        assert_eq!(
+            refusing_rule("http://127.0.0.1:11434/api/tags"),
+            EgressRule::Loopback
+        );
+        assert_eq!(
+            refusing_rule("http://localhost:11434/api/tags"),
+            EgressRule::Loopback
+        );
     }
 
+    /// RFC1918 and link-local are different rules, and this now proves which is
+    /// which: `169.254.1.1` used to be listed among the "private" ranges here
+    /// purely because one message covered both.
     #[test]
     fn rejects_each_private_ipv4_range() {
-        for host in [
-            "10.1.2.3",
-            "172.16.0.1",
-            "172.31.255.255",
-            "192.168.1.1",
-            "169.254.1.1",
+        for (host, expected) in [
+            ("10.1.2.3", EgressRule::PrivateV4),
+            ("172.16.0.1", EgressRule::PrivateV4),
+            ("172.31.255.255", EgressRule::PrivateV4),
+            ("192.168.1.1", EgressRule::PrivateV4),
+            ("169.254.1.1", EgressRule::LinkLocal),
         ] {
-            let target = format!("http://{host}/");
-            assert!(
-                validate_fetch_url(&url(&target), false).is_err(),
-                "expected {host} to be rejected"
+            assert_eq!(
+                refusing_rule(&format!("http://{host}/")),
+                expected,
+                "wrong rule for {host}"
             );
         }
     }
 
     #[test]
     fn rejects_ipv6_loopback_unique_local_and_link_local() {
-        for host in ["[::1]", "[fc00::1]", "[fd12:3456:789a::1]", "[fe80::1]"] {
-            let target = format!("http://{host}/");
-            assert!(
-                validate_fetch_url(&url(&target), false).is_err(),
-                "expected {host} to be rejected"
+        for (host, expected) in [
+            ("[::1]", EgressRule::Loopback),
+            ("[fc00::1]", EgressRule::UniqueLocalV6),
+            ("[fd12:3456:789a::1]", EgressRule::UniqueLocalV6),
+            ("[fe80::1]", EgressRule::LinkLocal),
+        ] {
+            assert_eq!(
+                refusing_rule(&format!("http://{host}/")),
+                expected,
+                "wrong rule for {host}"
             );
         }
     }
 
     #[test]
     fn rejects_ipv4_mapped_ipv6_private_address() {
-        let err = validate_fetch_url(&url("http://[::ffff:127.0.0.1]/"), false).unwrap_err();
-        assert!(err.contains("local/private"), "unexpected error: {err}");
+        assert_eq!(
+            refusing_rule("http://[::ffff:127.0.0.1]/"),
+            EgressRule::Loopback
+        );
     }
 
     /// `0.0.0.0`/`::` are neither loopback, private, nor link-local by any of
     /// std's own predicates, yet the OS routes an outbound connection to
     /// `0.0.0.0` to `127.0.0.1` — a real path to a loopback-bound service
     /// like `llama-server`/Ollama, not a dead address. Must be rejected the
-    /// same as a literal `127.0.0.1`.
+    /// same as a literal `127.0.0.1`, and now says so under its own name rather
+    /// than borrowing loopback's.
     #[test]
     fn rejects_unspecified_ipv4_and_ipv6() {
         for target in ["http://0.0.0.0:8090/v1/chat", "http://[::]:11434/api/tags"] {
-            let err = validate_fetch_url(&url(target), false).unwrap_err();
-            assert!(
-                err.contains("local/private"),
-                "unexpected error for {target}: {err}"
-            );
+            assert_eq!(refusing_rule(target), EgressRule::Unspecified, "{target}");
         }
     }
 
     #[test]
     fn rejects_ipv4_mapped_unspecified_ipv6_address() {
-        let err = validate_fetch_url(&url("http://[::ffff:0.0.0.0]/"), false).unwrap_err();
-        assert!(err.contains("local/private"), "unexpected error: {err}");
+        assert_eq!(
+            refusing_rule("http://[::ffff:0.0.0.0]/"),
+            EgressRule::Unspecified
+        );
     }
 
     #[tokio::test]
@@ -1404,7 +1988,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("local/private"), "unexpected error: {err}");
+        assert!(
+            err.contains(EgressRule::Unspecified.code()),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1413,6 +2000,75 @@ mod tests {
         assert!(
             validate_fetch_url(&url("http://[2606:2800:220:1:248:1893:25c8:1946]/"), false).is_ok()
         );
+    }
+
+    /// The whole inventory this guard blocks, one address per rule, in one place.
+    ///
+    /// Two things it pins that the per-case tests above cannot. First, that these
+    /// rules are the *only* ones this guard reports — it is the narrowest of the
+    /// four, and a reader should be able to see from here that CGNAT, multicast,
+    /// broadcast, TEST-NET and `240/4` are **not** refused here even though
+    /// sibling guards refuse them. Second, that no two classes report the same
+    /// rule, which is the property that made the old single message unusable.
+    #[test]
+    fn the_inventory_of_rules_this_guard_reports_is_exactly_this() {
+        use std::str::FromStr;
+
+        let cases: &[(&str, EgressRule)] = &[
+            ("127.0.0.1", EgressRule::Loopback),
+            ("0.0.0.0", EgressRule::Unspecified),
+            ("10.0.0.1", EgressRule::PrivateV4),
+            ("172.16.0.1", EgressRule::PrivateV4),
+            ("192.168.0.1", EgressRule::PrivateV4),
+            ("169.254.0.1", EgressRule::LinkLocal),
+        ];
+        for (text, expected) in cases {
+            let address = Ipv4Addr::from_str(text).expect("parses");
+            assert_eq!(
+                blocked_reason_ipv4(&address),
+                Some(*expected),
+                "wrong rule for {text}"
+            );
+        }
+
+        let v6_cases: &[(&str, EgressRule)] = &[
+            ("::1", EgressRule::Loopback),
+            ("::", EgressRule::Unspecified),
+            ("fc00::1", EgressRule::UniqueLocalV6),
+            ("fe80::1", EgressRule::LinkLocal),
+            ("::127.0.0.1", EgressRule::Ipv4Compatible),
+            ("::ffff:10.0.0.1", EgressRule::PrivateV4),
+        ];
+        for (text, expected) in v6_cases {
+            let address = Ipv6Addr::from_str(text).expect("parses");
+            assert_eq!(
+                blocked_reason_ipv6(&address),
+                Some(*expected),
+                "wrong rule for {text}"
+            );
+        }
+
+        // The counter-half: classes the siblings refuse and this guard does not.
+        // Listed rather than omitted so that widening this blocklist — which
+        // `egress.rs`'s module doc explains was deliberately left undone, because
+        // CGNAT is Tailscale's default range — has to change this test and be
+        // argued for.
+        for text in [
+            "100.64.0.1",      // CGNAT
+            "224.0.0.1",       // multicast
+            "255.255.255.255", // broadcast
+            "192.0.2.1",       // TEST-NET-1
+            "240.0.0.1",       // reserved
+            "93.184.216.34",   // genuinely public
+        ] {
+            let address = Ipv4Addr::from_str(text).expect("parses");
+            assert_eq!(
+                blocked_reason_ipv4(&address),
+                None,
+                "{text} is not refused by this guard today; widening it is a \
+                 deliberate change, not a test fix"
+            );
+        }
     }
 
     #[test]
@@ -1495,16 +2151,23 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("local/private"), "unexpected error: {err}");
+        assert!(
+            err.contains(EgressRule::Loopback.code()),
+            "unexpected error: {err}"
+        );
     }
 
+    /// The negative case, and the reason a rule code is worth more here than
+    /// anywhere else. With `allow_local_network: true` the guard must let the
+    /// target through *validation* and the request must then fail for an ordinary
+    /// transport reason — nothing listens on port 1. Told apart from a policy
+    /// block by the absence of any rule code at all, which is a claim about the
+    /// whole class of refusals. The version this replaces asserted the absence of
+    /// the substring `"local/private"`, so a policy block worded any other way —
+    /// including every rule code introduced here — would have passed it while the
+    /// guard was in fact still refusing.
     #[tokio::test]
     async fn fetch_impl_honors_settings_allow_local_network() {
-        // Same disallowed target as the test above, but with
-        // `allow_local_network: true` — the SSRF guard must let it through
-        // the *validation* step (it will then fail to connect, since nothing
-        // is actually listening on that port in the test environment, but
-        // that's a connection error, not a "local/private" rejection).
         let settings = WebSettings {
             allow_local_network: true,
             ..WebSettings::default()
@@ -1512,7 +2175,10 @@ mod tests {
         let err = fetch_impl(&settings, "http://127.0.0.1:1/".to_string(), None, None)
             .await
             .unwrap_err();
-        assert!(!err.contains("local/private"), "unexpected error: {err}");
+        assert!(
+            !err.contains("[egress."),
+            "no rule may have refused this: {err}"
+        );
     }
 
     /// Exercises the real `reqwest::redirect::Policy` (not just
@@ -1548,11 +2214,54 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = client.get(format!("http://{}/", addr)).send().await;
-        assert!(
-            result.is_err(),
-            "expected the redirect to a private IP to be blocked"
+        let error = client
+            .get(format!("http://{}/", addr))
+            .send()
+            .await
+            .expect_err("expected the redirect to a private IP to be blocked");
+
+        // `is_err()` alone would also pass on a bind failure, a connection reset,
+        // or a redirect refused for the wrong reason. The rule is recovered from
+        // the error chain instead, which is what passing the denial through
+        // `io::Error` rather than `to_string()` buys.
+        assert_eq!(
+            denied_rule(&error),
+            Some(EgressRule::PrivateV4),
+            "the hop must be refused as a private IPv4 target: {error}"
         );
+    }
+
+    /// Walks a `reqwest::Error`'s source chain looking for an [`EgressDenial`].
+    ///
+    /// The chain is what makes this possible at all: the policy hands reqwest an
+    /// `io::Error` whose inner error *is* the denial, and `reqwest::Error::source`
+    /// hands that `io::Error` straight back, so the rule is still a value on the far
+    /// side rather than a substring of `"Failed to fetch '…': …"`.
+    ///
+    /// # The `io::Error` hop has to be explicit
+    ///
+    /// `io::Error`'s own `source()` does **not** return its inner error — it
+    /// delegates to that inner error's `source()`. So a plain `source()` walk
+    /// reaches the `io::Error` and then steps over the payload it is carrying,
+    /// arriving at `None`. `get_ref()` is the only way back to it. Worth writing
+    /// down, because the first version of this helper was a plain walk and it
+    /// silently found nothing on a request that had in fact been refused by rule.
+    fn denied_rule(error: &(dyn std::error::Error + 'static)) -> Option<EgressRule> {
+        let mut current = Some(error);
+        while let Some(step) = current {
+            if let Some(denial) = step.downcast_ref::<EgressDenial>() {
+                return Some(denial.rule());
+            }
+            if let Some(denial) = step
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                .and_then(|inner| inner.downcast_ref::<EgressDenial>())
+            {
+                return Some(denial.rule());
+            }
+            current = step.source();
+        }
+        None
     }
 
     /// `reqwest::redirect::Policy::custom` does not get a redirect-loop cap
@@ -1604,9 +2313,14 @@ mod tests {
         );
         let elapsed = started.elapsed();
 
-        assert!(
-            result.is_err(),
-            "expected the redirect loop to be capped rather than followed forever"
+        let error = result.expect_err("expected the redirect loop to be capped");
+        // Which cap stopped it, not merely that something did. The wall-clock
+        // assertion below was previously the only evidence that the hop cap fired
+        // rather than a timeout, and a proxy measurement is not the claim.
+        assert_eq!(
+            denied_rule(&error),
+            Some(EgressRule::RedirectHopLimit),
+            "the loop must be stopped by the hop cap: {error}"
         );
         assert!(
             elapsed < Duration::from_secs(2),
@@ -1633,8 +2347,11 @@ mod tests {
         // `Result::expect_err`, which requires the `Ok` type to be `Debug`.
         match resolver.resolve(name).await {
             Ok(_) => panic!("localhost must not resolve through the guarded resolver"),
-            Err(err) => assert!(
-                err.to_string().contains("local/private"),
+            // Recovered as a value, not matched as prose: the resolver's signature
+            // is `Box<dyn Error>`, so the denial travels as itself.
+            Err(err) => assert_eq!(
+                denied_rule(err.as_ref()),
+                Some(EgressRule::Loopback),
                 "unexpected error: {err}"
             ),
         }
@@ -2127,6 +2844,199 @@ mod tests {
             err.contains("formats") && err.contains("settings.yml"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Spawns a local server that answers its first request with a `302 Found`
+    /// pointing at `location`, and any later request with `200 OK` carrying
+    /// `body`.
+    ///
+    /// Serves two requests rather than one because the same-origin counter-test
+    /// needs the redirect actually followed to something that answers; the
+    /// cross-origin tests only ever reach the first.
+    fn spawn_redirecting_server(location: String, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            for hop in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let response = if hop == 0 {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        format!("http://{}", addr)
+    }
+
+    /// Spawns a local server that records the raw text of the first request it
+    /// receives, then answers an empty `200 OK`.
+    ///
+    /// The recording is the assertion: anything that reached this origin shows up
+    /// as `Some(request)`, headers included.
+    fn spawn_recording_server() -> (String, std::sync::Arc<std::sync::Mutex<Option<String>>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorder = std::sync::Arc::clone(&seen);
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                *recorder.lock().unwrap() =
+                    Some(String::from_utf8_lossy(&buf[..read]).into_owned());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+
+        (format!("http://{}", addr), seen)
+    }
+
+    /// The property [`search_client`] exists for, driven through the one search
+    /// backend that carries a secret: a `302` off Brave's endpoint must not walk
+    /// `X-Subscription-Token` to whatever host the redirect names.
+    ///
+    /// Asserted on the *victim* server rather than on the error message, because
+    /// the question is not what the user was told — it is whether the key left
+    /// for an address the response picked. reqwest strips `Authorization` across
+    /// an origin change but not this header, so before `search_client` the
+    /// recording below captured the key verbatim.
+    #[tokio::test]
+    async fn a_302_does_not_carry_the_brave_key_to_another_origin() {
+        let (victim, seen) = spawn_recording_server();
+        let attacker = spawn_redirecting_server(format!("{victim}/steal"), "");
+
+        let err = brave_search_at(&attacker, "super-secret-key", "rust", 1)
+            .await
+            .expect_err("a cross-origin redirect must fail the whole request");
+
+        let captured = seen.lock().unwrap().clone();
+        assert!(
+            captured.is_none(),
+            "the redirect target was contacted at all: {captured:?}"
+        );
+        assert!(
+            !err.contains("super-secret-key"),
+            "the key must not reach the error text either: {err}"
+        );
+    }
+
+    /// The refusal is attributable by rule, not an anonymous transport failure —
+    /// which is what puts it in the denial sink under `egress.redirect-cross-origin`
+    /// rather than as a nameless "failed to search".
+    ///
+    /// Driven against the client instead of a backend because the backends return
+    /// `Result<_, String>`, and the `format!` at that boundary is where the error
+    /// chain carrying the rule ends.
+    #[tokio::test]
+    async fn the_search_client_names_the_rule_that_refused_a_cross_origin_hop() {
+        let (victim, _seen) = spawn_recording_server();
+        let attacker = spawn_redirecting_server(format!("{victim}/steal"), "");
+
+        let error = search_client()
+            .expect("build the search client")
+            .get(format!("{attacker}/search"))
+            .send()
+            .await
+            .expect_err("expected the cross-origin redirect to be refused");
+
+        assert_eq!(
+            denied_rule(&error),
+            Some(EgressRule::RedirectCrossOrigin),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    /// The counter-test that keeps the two above honest: a policy of "refuse
+    /// every redirect" passes both, and would also break the SearXNG instances
+    /// that redirect `/search` internally. A hop that stays on the configured
+    /// origin has to still be followed all the way to its results.
+    #[tokio::test]
+    async fn a_302_that_stays_on_the_searxng_origin_is_still_followed() {
+        let base = spawn_redirecting_server(
+            "/search?q=rust&format=json".to_string(),
+            SEARXNG_FIXTURE_JSON,
+        );
+
+        let results = searxng_search(&base, "rust", 10)
+            .await
+            .expect("a same-origin redirect must be followed");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Rust Programming Language");
+    }
+
+    /// `read_body_capped` stops at its cap against a peer that keeps writing —
+    /// the property `.text()` cannot offer, since it reads to end-of-stream and
+    /// so lets the peer size the allocation.
+    ///
+    /// The declared `Content-Length` is deliberately a lie about a body this
+    /// server has no intention of finishing, because an honest length is the case
+    /// that never needed a cap.
+    #[tokio::test]
+    async fn read_body_capped_stops_at_its_cap() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                if stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 104857600\r\nConnection: close\r\n\r\n",
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+                let chunk = vec![b'x'; 64 * 1024];
+                // Bounded so a reader that never stops reading cannot leave this
+                // thread spinning; 1600 × 64 KiB is the declared length.
+                for _ in 0..1600 {
+                    if stream.write_all(&chunk).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        let response = search_client()
+            .expect("build the search client")
+            .get(format!("http://{}/", addr))
+            .send()
+            .await
+            .expect("the fixture server answers");
+
+        let bytes = read_body_capped(response, 4096)
+            .await
+            .expect("read the capped body");
+
+        assert_eq!(bytes.len(), 4096);
     }
 
     #[tokio::test]

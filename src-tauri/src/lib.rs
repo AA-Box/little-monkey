@@ -43,6 +43,13 @@ pub mod runtime_adapter;
 pub mod generation;
 mod generation_commands;
 pub mod managed_runtime;
+// The stack registry and the embedding path, shared by v1 Knowledge Stacks
+// (`stacks`) and Knowledge 2.0 (`knowledge_service`/`knowledge_pipeline`).
+// Extracted out of `stacks` so that nothing shared lives in the module the v1→v2
+// collapse is going to delete. v2's call sites still reach it *through* `stacks`'s
+// re-export, so the dependency is broken structurally and not yet in fact — see
+// this module's own doc for the repointing that step needs.
+pub mod knowledge_core;
 // Knowledge Stacks 2.0 contracts and generation-based hybrid index. Kept
 // Tauri-free so desktop, daemon, CLI workflows, and connector packages share
 // the same hostile-input and citation semantics.
@@ -215,6 +222,17 @@ pub mod os_limits;
 // `tools.rs` and `verify.rs` so the two command runners cannot drift on the
 // number, the truncation direction, or the marker.
 pub mod output_cap;
+// Shared outbound-network primitives. Small on purpose: four independent SSRF
+// guards already exist, and this holds only the narrow rules all four need to
+// agree on. See `egress.rs` for why unifying their blocklists is a separate,
+// riskier change.
+pub mod denial_sink;
+pub mod egress;
+// The run a piece of work belongs to, carried as a `tokio::task_local!` rather
+// than threaded through signatures that have no other reason to hold it. See
+// `run_scope.rs` for why a thread-local would be a correctness bug here and not
+// merely a lossy shortcut.
+pub mod run_scope;
 // `pub` (unlike `sessions`/`tools`/`system`/`models`/`git`/`llama` above) so
 // `monkey-cli` (Plan/Act + risk-adaptive permissions design doc, phase 4) can
 // call `permissions::path_risk_floor` directly for its own floor-only
@@ -678,6 +696,18 @@ impl Default for AppState {
 pub fn run() {
     let app_data_dir = app_paths::data_dir()
         .expect("the operating system must provide an application data directory");
+    // Installed before anything that can refuse an outbound request, and the only
+    // initialization here that is deliberately NOT an `expect`. Every neighbour on
+    // this list is a capability the app needs to work; this one only writes refusals
+    // down. A machine that cannot open it should lose the audit trail, not the
+    // application — and it cannot fail *open*, because no guard consults the sink to
+    // decide anything. See `denial_sink`'s module doc.
+    match denial_sink::DenialSink::open(app_data_dir.join(denial_sink::SINK_FILE)) {
+        Ok(sink) => denial_sink::install(sink),
+        Err(error) => {
+            eprintln!("egress denials will not be recorded this session: {error}");
+        }
+    }
     let m3_state = m3_production::build_m3_command_state(&app_data_dir)
         .expect("failed to initialize the local runtime and API hub");
     let quantization_state = m3_production::build_quantization_command_state(&app_data_dir)
@@ -896,6 +926,48 @@ pub fn run() {
                 let reap_app = app.handle().clone();
                 let reap_state = reap_app.state::<AppState>();
                 process_commands::reap_desktop_processes_at_startup(&reap_app, reap_state.inner());
+            }
+
+            // Reclaim browser sessions nothing is driving any more. Before this,
+            // a session was bounded only inside `begin_action`, which an agent
+            // reaches only while it is actively driving the page — so an
+            // abandoned Chromium was never re-examined, its session clock could
+            // not fire, and a Chromium that died on its own left a session still
+            // reporting itself alive.
+            //
+            // `spawn_blocking` because the loop sleeps between passes. The stop
+            // flag is a `static` rather than app state: this is process-lifetime
+            // work, and the flag exists so the loop can be ended in a test
+            // without waiting out an interval.
+            {
+                static BROWSER_WATCHDOG_STOP: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                let watchdog_app = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let state = watchdog_app.state::<browser_worker::BrowserCommandState>();
+                    browser_worker::run_browser_watchdog(
+                        state.inner(),
+                        browser_worker::BROWSER_WATCHDOG_INTERVAL,
+                        &BROWSER_WATCHDOG_STOP,
+                        |result| match result {
+                            // Reclaiming is the system working, so it is worth a
+                            // line: a user whose browser tab vanished should be
+                            // able to find out why from the log.
+                            Ok(reclaimed) => {
+                                for outcome in reclaimed {
+                                    eprintln!(
+                                        "browser watchdog: reclaimed session {} of run {} ({:?})",
+                                        outcome.session_id, outcome.run_id, outcome.reason
+                                    );
+                                }
+                            }
+                            // Never fatal to the loop. A poisoned registry lock
+                            // that ended the watchdog would leak every session
+                            // opened afterwards.
+                            Err(error) => eprintln!("browser watchdog: sweep failed: {error}"),
+                        },
+                    );
+                });
             }
 
             // A persisted M3 policy represents an explicit user opt-in. Start

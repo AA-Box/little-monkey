@@ -80,7 +80,6 @@ import {
   DebatePanel,
   DeepResearchWorkspacePanel,
   DesignToAppPanel,
-  DiffPanel,
   DiffViewer,
   EvalHarnessPanel,
   EvidenceBoardPanel,
@@ -174,16 +173,24 @@ const RIGHT_TAB_LABEL_KEYS: Record<RightTabKind, string> = {
  * key hint for it rather than inventing a binding. */
 const RIGHT_TAB_SHORTCUT_IDS: Record<
   RightTabKind,
-  "openReview" | "openTerminal" | "openBrowserTab" | "openFiles" | "openBackgroundTasksPanel" | "openSideTaskPane" | null
+  | "openReview"
+  | "openDiffPanel"
+  | "openTerminal"
+  | "openBrowserTab"
+  | "openFiles"
+  | "openBackgroundTasksPanel"
+  | "openSideTaskPane"
+  | "openProcessesPanel"
+  | null
 > = {
   review: "openReview",
-  diff: null,
+  diff: "openDiffPanel",
   terminal: "openTerminal",
   browser: "openBrowserTab",
   sideTasks: "openSideTaskPane",
   files: "openFiles",
   backgroundTasks: "openBackgroundTasksPanel",
-  processes: null,
+  processes: "openProcessesPanel",
 };
 
 function RightTabIcon({ kind, size }: { kind: RightTabKind; size: number }) {
@@ -699,6 +706,8 @@ function App() {
         openBrowser: () => toggleRightTab("browser"),
         openBrowserTab: () => openRightTab("browser"),
         openReview: () => openRightTab("review"),
+        openDiffPanel: () => openRightTab("diff"),
+        openProcessesPanel: () => openRightTab("processes"),
         openFiles: () => openRightTab("files"),
         openBackgroundTasksPanel: () => openRightTab("backgroundTasks"),
         openSideTaskPane: () => toggleRightTab("sideTasks"),
@@ -1389,9 +1398,12 @@ function App() {
                 {rightTabs.map((kind) => (
                   <div key={kind} className={`absolute inset-0 ${kind === activeRightTab ? "flex flex-col" : "hidden"}`}>
                     {kind === "review" ? (
-                      <ReviewPanel onClose={() => closeRightTab("review")} />
+                      <ReviewPanel onClose={() => closeRightTab("review")} view="continuous" />
                     ) : kind === "diff" ? (
-                      <DiffPanel onClose={() => closeRightTab("diff")} />
+                      // Same component: the standalone Diff panel folded into
+                      // ReviewPanel, whose "working" base and "single" view are
+                      // exactly what it did. Both tabs and both shortcuts stay.
+                      <ReviewPanel onClose={() => closeRightTab("diff")} view="single" />
                     ) : kind === "sideTasks" ? (
                       // Side tasks are CONVERSATIONS, so this tab hosts the
                       // whole pane — its own task tab strip and its composer —

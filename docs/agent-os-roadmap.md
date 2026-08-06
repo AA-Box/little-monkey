@@ -63,7 +63,14 @@ made once and silently not take effect.
 **Today:** `server.rs` (~4.6k lines, legacy proxy) and `m3_http_server.rs`
 (~2.1k) both still serve live requests.
 
-**Shipped:** `http_policy.rs`, the shared module both listeners now draw from.
+**Shipped:** `http_policy.rs`, the shared module both listeners now draw from — and
+`tests/legacy_route_compatibility.rs`, the byte-level harness this item's own "Remaining"
+section calls "the one thing that would make the rest of the merge safe to attempt". Eight
+tests pin what `server.rs` does today: wildcard CORS on every response including failures,
+`/health` byte-for-byte, the OpenAI error envelope's exact nesting and each failure's own
+message bytes, `owned_by` values, raw SSE passthrough, and `OPTIONS /v1/*` → 204 scoped to
+`/v1/*`. Scaffolding for the merge rather than the merge: both servers are still live
+(`server.rs` 5.5k lines, `m3_http_server.rs` 2.1k).
 
 - **Admission control covers every serving path, and now actually bounds it.**
   `AdmissionGuard` / `RequestAdmission` own the concurrency permit and the
@@ -161,11 +168,44 @@ merge are blocked on decisions or on a release cycle, not on effort:
   both (pairing store first, legacy digest list as fallback, rate limiter on
   both), deprecate the legacy mint flow in the UI, then delete the legacy branch
   *a release later*. That last step is a calendar dependency.
-- **Model-id resolution is mutually exclusive.** `server.rs` treats any unknown
-  non-empty model id as an Ollama tag; m3 404s unless the model is installed or
-  an explicit runtime header is present. Both cannot hold for the same
-  `/v1/models` + `/v1/chat/completions` path. Someone has to pick and document
-  the break.
+- **Model-id resolution is mutually exclusive** — *decided, implementation reverted.*
+  `server.rs` treats any unknown non-empty model id as an Ollama tag; m3 404s unless the
+  model is installed or an explicit runtime header is present.
+
+  **The entry asked to "pick and document the break". Picking either breaks something
+  real**, which is why neither was picked:
+
+  - m3's `list_installed_models` reads *m3's own hub state*, so a tag pulled with
+    `ollama pull` is not in it. m3's rule 404s requests that work today.
+  - Worse, m3's `/api/tags` **reshapes m3's own inventory into Ollama's response shape**
+    rather than proxying Ollama. Legacy's `/v1/models` live-fetches
+    `ollama::list_tag_names` and labels each `owned_by: "ollama"` — it tells the truth;
+    m3 does not.
+
+  So the decision is **resolve and list against the union** — m3-managed models, live
+  Ollama tags when `expose_ollama` is on, provider-prefixed ids — with
+  `x-little-monkey-runtime-id` kept as the explicit override, and a 404 only when nothing
+  has it, naming where it looked.
+
+  **The implementation was written and reverted, and the reason is worth keeping.**
+  Resolution ran *before* `authorize_operation`, and `request_auth` promotes any
+  well-formed `Authorization: Bearer <anything>` to `HttpAuth::External` without
+  validating it — validity, revocation, expiry, scopes and rate limits are all enforced
+  later. So an unauthenticated caller got one outbound `/api/tags` probe per servable
+  runtime per request (unmetered: the limiter lives inside `authorize`, and
+  `MAX_ACTIVE_REQUESTS` is a concurrency cap), every runtime id echoed in the error body,
+  and a per-model-id existence oracle by 404-vs-401. That is the invariant
+  `server.rs`'s own comment states: a token not scoped for the `ollama` backend must never
+  see, or cause a request against, it. m3 honoured it *by accident* before, because
+  resolution was pure hub state.
+
+  Three further traps found while fixing it, recorded so the next attempt does not
+  rediscover them: `plan_model_resolution`'s **header and managed arms also return before
+  any authorize**, so fixing only the probe loop leaves the oracle open; `Unauthorized`
+  must `break` rather than `continue`, or one bogus token becomes N fsync'd
+  security-state writes behind a global mutex; and the same oracle still exists at
+  `discover_models` and three lifecycle paths, so this is a shared-helper fix rather than
+  a per-call-site one.
 - **Byte-level compatibility is load-bearing.** `Access-Control-Allow-Origin: *`
   on every legacy response versus m3's deny-all default; `/health` returning
   exactly `{"status":"ok"}`; the OpenAI error envelope real SDKs branch on;
@@ -225,25 +265,308 @@ Knowledge 2.0 (16 `knowledge_v*` commands in `knowledge_service.rs`).
 **Remaining.** The collapse itself, whose load-bearing step is a **data
 migration over users' existing embedded vectors**:
 
-- Extract the shared registry and embedding core out of `stacks.rs` (pure moves,
-  ~9 call sites).
+- ~~Extract the shared registry and embedding core out of `stacks.rs` (pure moves,
+  ~9 call sites).~~ **Done** — `knowledge_core.rs`. 29 items moved byte-identically, 62
+  tests split 44/18 with zero assertions changed. **The estimate was wrong: ~45 call
+  sites, not ~9** (16 `knowledge_service.rs`, 11 `portability_commands.rs`, 1
+  `diagnostics.rs`, ~17 `monkey-cli`). Harmless for the move itself, since they all
+  resolve through the re-export — but that is the size of the repointing below.
 - Port the two v1-only capabilities v2 lacks: source staleness, and the
   query-path hot cache that keeps the test-search box at keystroke latency.
-- **Synthesize a v2 generation from each v1 index without re-embedding.**
-  Feasible — `vectors.bin` rows are already L2-normalized f32 at the stack's
-  dimension, `ChunkMeta` supplies text/heading/path/hash, and `file_index.json`
-  supplies per-file SHA-256 — but it has to satisfy `validate_chunk` and
-  `validate_generation_contents` exactly, and set a `"v1-import"`
-  `pipeline_fingerprint` sentinel so the first real refresh cleanly re-extracts
-  with true v2 chunk boundaries. Imported chunks are a bridge, not a permanent
-  lie. Alternative is forcing every user to re-embed their whole corpus.
-- Then route every read through v2, delete the v1 index, and collapse the two
-  panels.
+- ~~**Synthesize a v2 generation from each v1 index without re-embedding.**~~ **Done**,
+  and the entry understated the hard part. Every factual claim in it held — the vectors
+  are reusable as-is, and all thirteen `validate_chunk`/`validate_generation_contents`
+  invariants are satisfiable. What it missed is that **a v1 stack's sources live in
+  `stacks/index.json`, not the v2 catalog**.
+
+  The first implementation gave every imported object one synthetic `v1-import:<sha256>`
+  source id, and that made the import a one-way door: `store.active()` became `Some` so
+  the agent was served v1-boundary chunks, `knowledge_v2_refresh` returned "Add and enable
+  at least one Knowledge 2.0 source" *before* reaching the fingerprint comparison so the
+  sentinel could never fire, and `remove_source_generation` filters against real catalog
+  ids (`Uuid::new_v4()`) so nothing ever matched and the objects could never be pruned.
+  Re-import was refused, so there was no undo either. "A bridge, not a permanent lie" was
+  false in the default case — caught by review, not by tests.
+
+  The shipped version seeds the catalog from `stack.sources` as part of the import, and
+  **the seeded ids are the ids the objects carry**. That one clause is the difference
+  between a real fix and a cosmetic one. All-or-nothing under the `catalog_lock`:
+  stage → `save_catalog` → activate, with a rollback to `previous_catalog` if activation
+  fails.
+- Port the remaining work: repoint the ~45 call sites off the re-export, route every
+  read through v2, delete the v1 index, and collapse the two panels. `stacks.rs` still
+  registers **12 Tauri commands**, so v1 is still live and this item is still
+  *partially built*.
 
 **Blocks:** K11 — context accounting cannot be honest while two systems
 produce context by different rules.
 
 *Maps to: ROADMAP #9.*
+
+## D3. A run identity that reaches the work it pays for *(built)*
+
+**Shipped — `run_scope.rs`, and the choice of primitive is the whole decision.** A
+`tokio::task_local!`, not a `thread_local!`, and that is a correctness argument rather
+than a preference: tokio moves a task between worker threads at every `.await`, so a
+thread-local set at a command boundary is not the value read after the first await —
+it is whatever the thread that last resumed the task happened to store. With
+concurrent runs that does not merely lose the identity, it hands one run *another
+run's*, which for the allowlist this unblocks would mean enforcing the wrong policy.
+The test that pins this awaits three times around the read across a four-thread
+runtime, because the version with no awaits passes under a thread-local too.
+
+**`RunScope` has two arms, and `current()` has three answers.** That asymmetry is the
+part worth defending. `Run(id)` and `Unattributed(reason)` are the two things work can
+*be*; `current() == None` is the third thing it can be — a site nothing has scoped
+yet. Collapsing "deliberately background" and "we lost it" into one blank is exactly
+what makes an audit trail unreadable later, so `Unattributed` carries a named reason
+with a stable code (`unattributed.user-action`, `.scheduled`, `.inbound-request`,
+`.shared-transport`,
+`.startup`) pinned by a test, for the same reason `EgressRule`'s codes are.
+
+**The first consumer is the denial sink, and it retires that module's own confession.**
+`denial_sink.rs` used to say "there are zero `task_local!` declarations in this crate
+to carry one implicitly" as the reason its recorder had to be a process-wide global.
+`record` now consults `run_scope::current()` when no explicit id is passed, so a
+refusal raised by a pure function of a `Url` or an `IpAddr` — which will never hold a
+run id — is attributable without one signature between the command layer and the
+predicate changing. An explicit id still wins, which is what keeps this a no-op at the
+sites already passing one and stops an outer scope silently relabelling a refusal
+whose owner the caller already knew.
+
+Sink schema went to V2 for the reason column, which is cheap precisely because of the
+earlier decision to give the sink its own database file rather than a `MIGRATION_V8`
+on the run ledger. The migration list is now an ordered table so V3 needs no edit to
+the applier, each version keeps its own checksum so editing V1 in place still fails,
+and a test stands up a real V1 database with a row in it and proves the upgrade keeps
+that row. The "exactly one of run id / reason" invariant is **not** a SQL `CHECK` —
+SQLite cannot add one by `ALTER` — but it does not need to be: the pair is derived
+from a two-armed enum, so the type makes it unrepresentable a layer up.
+
+**Wired at one real boundary, deliberately.** `providers_stream_chat` is a
+`#[tauri::command]` that already holds `run_id: Option<String>` and whose egress
+happens several frames below it, so both arms are live from the first commit: a
+ledgered run carries its id, and an ordinary chat is not a run and says
+`unattributed.user-action` instead of arriving as a blank.
+
+**What this does not do, and why not.** `tokio::spawn` does not inherit a task-local,
+and that is left alone rather than worked around — a spawned task may outlive the run
+that spawned it, so copying the scope in would attribute work to a run that has
+already finished. Work continuing in a spawned task re-enters the scope itself. Pinned
+by a test so the next reader meets it as a documented property rather than as a blank
+column they assume is a bug.
+
+**First adoption — `m4_runtime.rs`, and the diagnosis below was wrong.** This item
+called it "two unforwarded model branches … the one case where the gap is a single
+unpassed parameter rather than a missing mechanism". Reading the file settles it the
+other way. `run_async_worker` is the single place M4 crosses from sync into async, and
+it does so by spawning a **fresh OS thread with a fresh current-thread runtime**. A
+task-local follows a task, and the task being blocked on is created *there* — so no
+ambient scope can survive that bridge no matter what the caller was running under.
+`run_scope::current()` inside any of it answered `None` unconditionally, which means the
+gap was never two branches: it was all eight async egress paths in the file, MCP tool
+calls and delivery pushes and PR review included. Two of those already received
+`request.run_id` and still lost it, which is precisely why "a single unpassed
+parameter" read as the whole story.
+
+So the fix goes at the bridge rather than at the branches: `run_async_worker` takes a
+`RunScope` and wraps the future in `run_scope::scoped`. Required, not optional — all
+eight sites are forced to answer "whose work is this?", and the two possible answers are
+the enum's two arms. Five sites now carry the run (model, model discovery, MCP,
+delivery, PR review; plus the legacy-recipe model path, which reaches
+`providers::read_key` and so is the credentialed one). The three OAuth sites answer
+`unattributed.user-action` through a named constant whose doc states the ceiling: the
+`OAuthTransport` trait fixes those signatures, so a token refresh driven from *inside* a
+run would still record as a user action. Widening that means changing the trait and both
+test doubles, so it waits for a caller that needs it.
+
+Three tests pin the bridge, and the second exists because the first is not enough: a
+`thread_local!` would also pass "the scope survives the thread hop", since the worker
+builds a *current-thread* runtime. The one that awaits four times inside the worker is
+the one it would fail. The third runs eight bridges on eight threads and checks none
+reads another's run — the failure being not a missing label but one run's egress
+attributed to another, which under a per-run allowlist is the wrong policy against the
+wrong host. Verified by sabotage: dropping the `scoped` wrapper turns all three red and
+leaves the file's other nine tests green.
+
+### `browser_worker.rs` — adopted, and `spawn_blocking` decided the shape
+
+The highest-volume egress decision in the tree, and the reason it needed a second entry
+point rather than a `scoped` call. Every browser action reaches this file through
+`tokio::task::spawn_blocking`, which does **not** inherit a task-local — the same
+property this module's own test pins for `tokio::spawn`. So no scope set at a command
+boundary can reach `handle_event`'s per-subresource decisions, and an adoption that
+relied on the ambient scope would have recorded a blank *while looking instrumented*.
+Sabotage confirms it: dropping the scope entry fails with `left: None` where the run id
+should be.
+
+Two pieces. `run_scope::scoped_sync` wraps tokio's own `LocalKey::sync_scope`, which
+exists for exactly this case, so D3 is usable from blocking code at all — this will not
+be the last such site. And `ValidatedGrant` gains the scope as a field, because it was
+already the per-run object: its entire purpose is holding what one run was granted, and
+its refusals already said "outside this run's grant". The id was the one part of the run
+it did not keep.
+
+The two recording wrappers **enter** the scope rather than forwarding a run id, and that
+is the part worth defending. `denial_sink::record` already resolves both arms from the
+ambient scope, so entering it keeps a run's id *and* an unattributed grant's coded
+reason. Passing `run_id: Some(..)` would have carried the first and silently flattened
+the second into the blank the whole two-armed design exists to distinguish from it. Both
+arms are asserted.
+
+**Nothing left.** All twelve `denial_sink::record` sites across seven files either carry
+a run id or a coded reason. `run_commands.rs`'s two pass `Some(run_id)` explicitly, which
+needs no scope; every other site sits under one.
+
+The count in the original analysis was the wrong denominator and is worth correcting
+rather than quietly dropping: "65 client construction sites" counted *clients*, most of
+which never record anything. The number that mattered was **8** recording sites at the
+time of the audit, twelve now. A figure that large made the work look mechanical when the
+actual difficulty was per-site — whether a `tokio::spawn` or `spawn_blocking` sat between
+the scope and the record, which had to be traced one site at a time.
+
+### `mcp.rs` — the question is answered, and the answer is "shared"
+
+Measured rather than assumed, because the shared-client framing understates it. A tool
+call reaches the network like this:
+
+```
+call_tool_once → peer.send_cancellable_request(…) → [rmcp service loop task] → HTTP
+```
+
+`send_cancellable_request` puts the request on a channel and returns a handle the
+caller awaits. The request is issued by the task `rmcp::serve_client` spawned at connect
+time — `rmcp-2.2.0/src/service.rs:945` is a bare `tokio::spawn(future)` for the service
+loop, and the send itself goes through `send_task_set.spawn(…)` at `:1131`, so it is two
+levels of spawn away from the caller. `tokio::spawn` does not inherit a task-local, a
+property `run_scope`'s own test pins deliberately, so **no scope set at any call
+boundary reaches the request**. This is not a case where a `scoped` wrapper in the right
+place would do it, and the shared client is the second problem rather than the first.
+
+Four shapes, and none is free:
+
+- **Scope the service loop with the run that connected.** Wrong answer, not just a
+  costly one: the connection is cached process-wide and serves every later run, so this
+  attributes every run's egress to whoever connected first — a confident wrong label,
+  which is worse than the honest blank.
+- **Rebuild the client per call.** Gives up connection reuse and the reconnect-driven
+  OAuth refresh that `call_tool_with_cancel_classified` depends on to survive an access
+  token expiring mid-session.
+- **Carry the run through rmcp's request channel.** The correct shape, and it needs
+  per-request context in rmcp's peer API, which does not exist today. That is an
+  upstream change or a fork.
+- **Key the connection cache by `(server_id, run)`.** Makes every run attributable and
+  keeps refresh working per connection. Costs one transport per run per server — and
+  for stdio servers, one **child process** per run, which is the expensive one.
+
+**So this stays unbuilt on purpose, and the reason is sequencing rather than
+difficulty.** The only consumer that needs it is K5's per-run egress allowlist, which
+is not built either, and the choice above turns on what that allowlist actually asks
+for: if it is per-run, the last shape is the only one that works and its process cost
+has to be accepted; if it settles for per-connection policy with the run recorded
+where it is known, the third shape becomes optional. Picking now would be guessing at a
+requirement that does not exist yet, and the guess that costs a child process per run
+is not one to make speculatively.
+
+**Answered: yes, shared — and the egress that cannot be attributed says so instead of
+recording a blank.** Three reasons, in the order they mattered:
+
+- A stdio MCP server is a **child process**. One transport per run per server multiplies
+  process count by concurrency: five parallel runs against four servers is twenty
+  processes instead of four. That is a resource regression a user feels, traded for a
+  label.
+- Per-run connections multiply OAuth token refreshes, which is how a provider rate limit
+  gets hit by a feature nobody asked for.
+- What would become attributable is the transport's *own* traffic — the SSE notification
+  stream, its `Last-Event-ID` reconnects, the session delete. That traffic genuinely
+  belongs to the connection, which outlives every run that uses it. Attaching one run's
+  id to it would be a confident wrong label, and this file's history is that those are
+  worse than an honest blank.
+
+So `Unattributed::SharedTransport` is a fifth reason with its own stable code, and
+`connect_impl` enters it. What that covers is stated precisely rather than generously:
+the OAuth token fetch and the keychain read, which really do run in the caller's task —
+and **none** of the transport's requests, because `rmcp::serve_client` spawns the service
+loop (`rmcp-2.2.0/src/service.rs:945`) and `Transport::send` only pushes onto an mpsc
+channel, so even the `initialize` POST that `serve_client` awaits is issued by the worker
+task. Those record neither a run nor a reason, which is `run_scope`'s third state doing
+its job.
+
+The seam that could close the rest is a `StreamableHttpClient` wrapper entering the scope
+per request. It is not worth it yet: implementing that trait means naming `sse_stream::Sse`
+and `http::HeaderName`, neither of which rmcp re-exports nor this crate depends on
+directly — two dependencies and a stream wrapper to establish a scope that no policy reads
+today.
+
+**The ceiling, named here rather than left to be found:** the one credentialed in-task
+round-trip this covers is the OAuth refresh, and the reauth retry in
+`call_tool_with_cancel_impl` reaches it from *inside* a run's scope. So once a per-run
+allowlist reads `current()`, a run-triggered refresh is evaluated under the connection's
+policy, not that run's. That is the right default — the token belongs to the connection
+and is shared by every later run, so refreshing it on one run's narrower allowlist would
+let whichever run tripped the refresh decide whether every other run's connection
+survives — but it is a choice to re-read when K5's allowlist lands, not a detail to
+rediscover.
+
+Verified by sabotage: dropping the wrapper on `connect_impl` fails with
+`left: Some(Run("run:establishes-a-connection"))` where the connection reason belongs. The
+test drives the real call path rather than `run_scope::scoped` directly, which is what the
+two earlier adoptions set as the bar.
+
+---
+
+### Original analysis, kept because the measurements are what justified the design
+
+**Why this is its own item.** It was discovered as the reason K5's per-run egress
+allowlist could not be built, and then turned out to be the same wall K6's
+per-process resource ledger will hit. Two items depending on one missing mechanism
+makes it a prerequisite, not a footnote inside either.
+
+**Today:** there is no ambient notion of "the run this work belongs to". Measured
+rather than asserted:
+
+- **Zero `task_local!` and zero `thread_local!` declarations** across the crate's 96
+  source files, so nothing can be carried implicitly down a call chain.
+- **`AppState` has no run field.** Every per-work-unit map is keyed by `turn_id`,
+  `request_id`, `job_id`, or a destination filename. `turn_id` is the closest thing
+  that exists, and `permissions.rs` already validates its `turn` parameter against
+  the run ledger — so at the tool-command boundary a run identity *is* present under
+  another name. It stops there.
+- **30 files construct an outbound HTTP client, at 65 sites.** A run id can only
+  reach any of them as an explicit parameter, and most signatures between the command
+  layer and the request have no reason to carry one.
+
+**Three concrete shapes the gap takes**, each already blocking something:
+
+- `browser_worker.rs` decides per subresource and per redirect inside
+  `CdpConnection::handle_event`, on a struct with no run id and no path to one. This
+  is the highest-volume egress decision in the tree.
+- `mcp.rs` builds one client per *server connection* and caches it process-wide, so
+  one transport serves every run. Per-run policy means rebuilding it per call and
+  losing the connection reuse and OAuth refresh the design depends on.
+- `m4_runtime.rs` forwards the run id to its MCP, browser and shell branches but not
+  to its two model branches — the one case where the gap is a single unpassed
+  parameter rather than a missing mechanism. *(Wrong, and corrected above: the branches
+  that did receive the id lost it again at `run_async_worker`, so the gap was the
+  sync-to-async bridge and covered all eight of the file's async egress paths.)*
+
+**And the part that any design has to answer first: some work legitimately has no
+run.** Timer-driven knowledge refresh, connector verification in Settings, model
+downloads, update checks, and every inbound HTTP request to `server.rs` are not runs
+and never will be. A mechanism that assumes a run is always present will either
+refuse that work or quietly invent an identity for it, and both are worse than the
+current honesty. So the acceptance below deliberately asks for "attributable or
+explicitly unattributed", not "always attributed".
+
+**Acceptance:** any code that egresses, spawns, or consumes a measurable resource can
+name the run it belongs to, or state that it has none — without threading a parameter
+through every intervening signature. Work with no run is a first-class case with a
+name, not a `None` that means "we lost it". A test proves an identity set at a command
+boundary is visible at an egress site several frames down, and that concurrent runs
+never observe each other's.
+
+**Blocks:** K5's per-run host/port/protocol allowlist (four of whose five acceptance
+clauses are already corrected for this reason) and K6's per-process resource ledger.
 
 ---
 
@@ -687,30 +1010,32 @@ three platforms is a framework. Also K21 concretely — its conformance suite mu
 cover the isolation guarantees, which cannot be asserted uniformly while two
 platforms have none.
 
-## K4. Enforced per-process resource limits
+## K4. Enforced per-process resource limits *(userspace built; platform legs deferred)*
 
-**Today:** there is **no kernel-level resource enforcement anywhere** — no
-`setrlimit`, no cgroup, no job object, no `prctl`, no `seccomp`. An earlier draft
-of this file claimed `rlimit` was used in `browser_worker.rs`; that was a
-case-insensitive grep matching the `BrowserLimits` struct, which is cooperative
-userspace bookkeeping checked on each agent action (`begin_action`) with no
-watchdog — so an idle Chromium child is never checked at all. Agent shell and
-tool execution inherits whatever the host allows. The offload planner reasons
-about memory *before* a load but does not bound a running process.
+**Where this stands.** Every bound this app can enforce without a platform
+mechanism is built, and the entries below are the record of each slice. What
+remains is two per-platform mechanisms, and auditing them established that
+**neither should be built as this item's acceptance describes** — see *Deferred,
+with reasons* at the end. So K4 is not "half done"; its userspace half is
+finished and its platform half has been re-scoped rather than skipped.
 
-A process record now carries a **declared** limit set (`ProcessLimits`, K1), and
-the daemon populates it from its own `max_runtime_ms`/`max_memory_bytes`/
-`max_log_bytes`. Declaring is not enforcing, and the field docs say so rather
-than implying a guarantee that does not exist.
+What is enforced today: kernel-held `setrlimit` bounds on all four app-side spawn
+sites, process-group termination on every timeout, a sampling watchdog over daemon
+jobs that measures memory across the whole process group, a per-kind declared limit
+set, a bounded cap on the shell output that reaches a model, a browser-session
+watchdog, and a wall-clock budget mechanism for the four WebView kinds. A limit kill
+records as `limit_exceeded` rather than as an indistinguishable cancel, on every
+host.
 
-**Correction to the "Today" above, found by auditing it rather than re-reading
-it.** "No enforcement anywhere" was wrong in the other direction: there *is* a
-working userspace watchdog, in the daemon's job runner, killing on wall clock, on
-RSS sampled every 100–1000 ms, and on log-file size. Two things kept that from
-being visible — the memory budget is opt-in (`--max-memory-mb`, no default) and
-the wall-clock default is seven days — but the mechanism exists and works. What
-was missing is enforcement at the *tool* level, and the honest summary is
-"cooperative bounds, scattered and partial" rather than "none".
+**Two earlier drafts of this section were wrong in opposite directions**, which is
+worth keeping as a caution about how this file gets written. The first claimed
+`rlimit` was already used in `browser_worker.rs` — that was a case-insensitive grep
+matching the `BrowserLimits` struct, which is cooperative userspace bookkeeping. The
+second over-corrected to "no kernel-level resource enforcement anywhere, and no
+enforcement at all", which missed a working userspace watchdog in the daemon's job
+runner that had been killing on wall clock, sampled RSS, and log size the whole
+time. The honest summary before this item's work began was "cooperative bounds,
+scattered and partial" — neither "already handled" nor "none".
 
 **Shipped — the memory budget measures the process tree.** That watchdog sampled
 `ps -o rss= -p <pid>`: the direct child only. For an agent job the direct child is
@@ -1017,25 +1342,117 @@ the child's pipes into the model's context window.
   passing shell command and would only show up later as a flooded context.
   Sabotage: flipping it fails with `left: None / right: Some(20000)`.
 
-**Still open in K4:** no cgroups v2, no Windows job objects — `os_limits::apply`
-is a documented no-op on Windows, whose equivalent (`SetInformationJobObject` with
-`JOBOBJECT_EXTENDED_LIMIT_INFORMATION`) would cover *more* than `setrlimit` does on
-unix, bounding committed memory, CPU time and process count for a whole tree. The
-daemon's memory watchdog is still cooperative userspace, and it runs in a different
-OS process from the app-side children, so it cannot simply be extended to cover
-them. RSS is nowhere kernel-enforced on any platform.
+**Shipped — the last two userspace bounds K4 was missing.** Both built in parallel
+because they share no source and no toolchain, then integrated together.
 
-Still genuinely missing, after the corrections above narrowed the list:
+**A watchdog now re-examines browser sessions nothing is driving.** Before this a
+session was bounded only inside `begin_action`, which an agent reaches only while
+actively driving the page — so an abandoned Chromium was never looked at again, its
+session clock could not fire, and a Chromium that died on its own left a session
+still reporting itself alive. `try_wait` appeared only in `stop()` and at launch.
 
-- **No wall-clock budget for the four WebView-hosted kinds** — `chat_turn`,
-  `subagent`, `crew_member`, `side_task`. The mechanism is within reach (the 2 s
-  sweep, `max_wall_ms`, and the durable stop latch all exist) but a precondition
-  does not: `ProcessState` cannot distinguish a turn that is working from one
-  parked on an unanswered permission prompt, so any default budget would kill a
-  turn for the user's own slowness. Suspended time also counts, since
-  `started_at_ms` deliberately survives resume and nothing accumulates
-  suspended-ms. And such a budget is a floor, not a ceiling: a turn inside a 120 s
-  shell timeout cannot observe the latch until that tool returns.
+- **The rule is a pure function** (`sweep_verdict`) over elapsed time, limits, child
+  liveness and the cancelled flag, so the whole decision table is asserted with no
+  Chromium and no timers. Ordering is the substance: `cancelled` wins outright so a
+  session already killed by the action quota is never relabelled, liveness beats the
+  clock because a gone Chromium is the more specific fact, and the clock uses the
+  same strict `>` as `begin_action` so the two enforcement points agree exactly at
+  the boundary.
+- **The disk quota is excluded from the timer, structurally.** `owned_directory_size`
+  may stat a very large profile; that is affordable once per action with a caller
+  already waiting on Chromium, and not affordable per session per tick. Nothing about
+  an idle session makes its profile grow. A test asserts the sweep and the action
+  path deliberately *disagree* here, so they cannot be quietly merged later.
+- **A cancel reason now names the bound that fired** (`ActionQuota`, `SessionClock`,
+  `ChildExited`, …), recorded first-writer-wins. Last-writer-wins would relabel every
+  quota trip as `Stopped`, because every path ends at `stop()`.
+- **An empty child slot reads as "not exited", not as a crash**, since only `stop()`
+  empties it, and a poisoned lock reads as live — so an unrelated panic cannot cause
+  a reclaim.
+- **The 30-second cadence is chosen, unlike the budget values elsewhere in K4.** The
+  distinction is real: how long a session may live is policy, but how promptly an
+  expired one is noticed is an implementation detail, and leaving it unset would mean
+  the sweep never ran at all, which is not a bound. The sweep loop was delivered with
+  no call site; wiring it was part of integrating this.
+- **Sessions cannot be told apart by whether a human is attached**, so the clock
+  applies to all of them. That is the conservative reading rather than an invented
+  distinction, and it is a real limitation: an idle Workbench tab past its budget
+  loses its session.
+
+**A wall-clock budget is now enforced for the four kinds that had none** —
+`chat_turn`, `subagent`, `crew_member`, `side_task` — entirely by reuse. No new timer
+and no new delivery path: the existing 2-second sweep reads the live rows of those
+kinds, and a row past its budget gets the existing durable stop latch, delivered the
+same tick by the existing fan-out.
+
+- **Shipped enforced but *unset*, and that is the honest state rather than an
+  unfinished one.** `ProcessState` has no state for "parked on an unanswered
+  permission prompt" — such a turn reads as `Running` — so any default budget would
+  kill a turn for the user's own slowness. The mechanism is live and fires for
+  nobody; the number is a settings decision this work does not make.
+- **`workflow_node` is excluded by an allow-list, not by omission.**
+  `deliverProcessSignal` answers `"no-primitive"` for it and `signal_support` refuses
+  suspend/resume on the documented grounds that a node has no independent pause
+  mechanism, so a latch there would be committed and never delivered — leaving the row
+  reading as stopping forever. A test asserts the node kind is not in the list.
+- **The exit classification lives in Rust, not the frontend, and that was a
+  correction during integration.** The first draft classified it in TypeScript, which
+  would have been a second mechanism covering only the four loops and only after four
+  separate adoptions. `ProcessTable::transition` already reads the row's
+  `signal_reason` on its way to writing the exit, so one upgrade there covers every
+  host — the loops, the daemon, and `monkey processes` alike. It only ever upgrades a
+  `cancelled`: a turn that failed on its own while a budget stop was in flight
+  failed, and relabelling that would hide a real error behind a limit.
+- **The marker crosses a language boundary with no compiler to check it.** The
+  enforcer runs in the WebView and cannot import a Rust const, so the literal exists
+  on both sides with `process_table.rs` as the authority and a test pinning the string
+  on each — renaming either would otherwise silently stop budget kills being recorded
+  as `limit_exceeded`.
+- **Known limits, stated at the definitions rather than discovered later.** A budget
+  is a floor, not a ceiling: a turn inside a 120-second shell timeout cannot observe
+  the latch until that tool returns, so the real bound is the budget plus the longest
+  in-flight tool timeout. And suspended time counts against it, because
+  `started_at_ms` deliberately survives resume and there is no accumulated-suspended
+  column — a long-parked turn trips the moment it resumes.
+
+### Deferred, with reasons — the two platform legs
+
+Both are named in the acceptance below. Auditing them established that neither is
+"the remaining coding work", so they are recorded here rather than left implying a
+sprint's worth of effort.
+
+**Linux cgroups v2 — likely unobtainable in the target environment, not merely
+unbuilt.** An unprivileged desktop app cannot count on a writable, controller-enabled
+cgroup: `/sys/fs/cgroup` is root-owned, the no-internal-process rule forces the app
+to migrate its *own* process into a sibling leaf before it can enable controllers,
+the parent scope belongs to `systemd --user`, and delegation is only sanctioned under
+`Delegate=yes` — which a `.desktop` launch does not have. It fails outright on
+v1/hybrid hosts, without systemd, and in containers. The route that *does* work is a
+**systemd transient scope over D-Bus**, which is a different mechanism than this leg
+describes. It also has no honest CI story: GitHub's ubuntu runner has no
+`systemd --user` session (this repo's own `ci.yml` has to `dbus-launch` its own bus).
+A `sudo` variant would test the Linux kernel, which nobody doubts, and prove nothing
+about whether the app can obtain a cgroup; a probe-and-skip test would be green while
+asserting nothing, which reads as coverage. **If wanted, file the transient-scope
+route as its own item with an `Unavailable(reason)` surfaced to the user.**
+
+**Windows job objects — real and CI-testable, but the sharpest asymmetric hazard in
+this item.** `KILL_ON_JOB_CLOSE` makes a dropped guard tear down the whole tree on
+Windows while being a silent no-op on macOS: invisible on the machine the code is
+written on, fatal on the platform that cannot be typechecked there (Homebrew rustc,
+`aarch64-apple-darwin` only). `background_shell.rs` is exactly the wrong-owner case —
+its child is *meant* to outlive the spawning call — so a misplaced guard would kill
+every Windows background shell instantly. It also needs a signature change, since
+`apply` returns `()` while a job handle is an owned resource whose lifetime must span
+the child, plus four call-site changes. **It is not the fill-in-the-no-op the
+acceptance wording implies, and it should be built with CI in the loop from the first
+commit rather than written blind.**
+
+### Still genuinely missing, after the corrections above narrowed the list
+
+- The four WebView kinds' wall budget is **enforced but unset** (see below): the
+  mechanism fires for nobody until a number is configured, and choosing that number
+  is blocked on a precondition, not on effort.
 - The foreground shell's **intermediate heap buffer** is still unbounded even
   though its returned output is now capped (see below): `wait_with_output`
   materializes both streams in full before any cap applies, so
@@ -1045,12 +1462,13 @@ Still genuinely missing, after the corrections above narrowed the list:
   wrong and a chatty-stderr child deadlocks once the 64 KiB pipe buffer fills,
   turning a working command into a timeout. Its own slice, not a line to smuggle
   into the cap.
-- **No browser-worker watchdog.** `begin_action` is reachable only from `with_cdp`,
-  so an idle session is never re-examined; child liveness is never checked at all,
-  and the pid is never recorded, so nothing outside the owning process can even
-  name the child. `browser_worker.rs` is also the one app-side spawn site with no
-  `process_group(0)`, so Chromium's renderer and GPU children are exactly the
-  surviving-grandchild case the process-tree slices claim to have closed.
+- The browser worker's **pid is still not recorded**, so nothing outside the owning
+  process can name its Chromium — a crash still leaves an orphan that a startup
+  sweep can collect the profile of but never kill. `browser_worker.rs` also remains
+  the one app-side spawn site with no `process_group(0)`, so Chromium's renderer and
+  GPU children are exactly the surviving-grandchild case the process-tree slices
+  claim to have closed. The watchdog below reclaims sessions this app still knows
+  about; it does not solve either of these.
 - **No `ProcessKind` for a foreground shell or a browser session**, so neither gets
   a row and neither's per-call bounds can be declared in the table. Adding a
   browser kind needs a numbered SQLite migration to relax the `CHECK` on
@@ -1075,15 +1493,26 @@ resources cannot come from `rlimit` at all on macOS: RSS is a no-op there, proce
 count is per-uid rather than per-tree, and wall clock is already delivered by the
 timeouts. So "`rlimit` plus a supervising watchdog on macOS" understates how much
 of the macOS story has to be the watchdog, and the Linux/Windows legs (cgroups v2,
-job objects) are carrying more of this item than the wording implies. The
-distinguishable-exit half is done (see the `limit_exceeded` slice above); the
-enforcement half is mostly still ahead, and it is platform work rather than
-`rlimit` work.
+job objects) are carrying more of this item than the wording implies — and both of
+those are now deferred with reasons above, so the wording is carrying weight nothing
+is going to pick up soon.
+
+**Amend the acceptance rather than leaving it standing.** Of its six resources, three
+cannot be delivered by the mechanism it names: RSS is nowhere kernel-enforced on any
+platform, "open files" has no Windows job-object equivalent so it is permanently
+unix-only, and "disk written" has no field in
+`JOBOBJECT_EXTENDED_LIMIT_INFORMATION` at all. A job-object committed-memory limit
+also makes allocations *fail* rather than terminating the process, so it would not
+satisfy "terminates the process with a distinguishable exit status" even once built.
+The distinguishable-exit half of the acceptance **is** met, on every host. What the
+criteria should say is that CPU time, wall clock and captured output are bounded,
+that memory is bounded by a sampling watchdog rather than by the kernel, and that
+process count and disk written need a mechanism this app does not have.
 
 **Blocks:** K7, K8 — admission control that cannot bound what it admits is a
 guess.
 
-## K5. Per-process egress policy
+## K5. Per-run egress policy *(renamed from per-process — see the acceptance correction)*
 
 **Today:** nothing gates outbound network by process. `privacy_firewall.rs` is a
 **content scanner plus a persisted per-workspace policy**, not a network gate: it
@@ -1093,15 +1522,758 @@ sending anything, and its only callers are in the frontend
 site bypasses it entirely, including `providers.rs`'s own chat request. An
 earlier draft of this file described it as gating sends; that was wrong.
 
-There are **23 `reqwest` client construction sites and no shared client
-factory** — 13 of them bare `reqwest::Client::new()` with no timeout, redirect
-policy, or resolver — so egress cannot be centralized without touching each one.
-Only `web.rs` has an SSRF-guarded resolver; `connectors.rs`,
-`knowledge_service.rs`, and `browser_worker.rs` pin DNS per request; everything
-else does no pinning. `browser_pane.rs` (user browsing) has a scheme filter and
-no origin policy at all, while `browser_worker.rs` (agent-driven) enforces exact
-origins with DNS rechecks. CORS and bind-interface restrictions are **inbound
-only**.
+There is **no shared client factory**, which is true, and the numbers this section
+used to give for it were wrong. Counted: **53 `reqwest` client construction sites**
+across 29 files, 43 of them outside `#[cfg(test)]`; **21 bare
+`reqwest::Client::new()`**, 15 in production. The old figures (23 sites, 13 bare)
+match nothing — not sites, not production sites, not files.
+
+**"Egress cannot be centralized without touching each one" was also false**, and it
+is the claim that most distorted the shape of this item. Two funnels already exist:
+`monkey-cli` builds one client in `main.rs` and threads `&reqwest::Client` through
+about forty signatures, so one edit hardens nearly the whole CLI; and
+`providers.rs`'s `build_chat_request` already *accepts* an injected client — its
+callers each construct their own only by convention. Hardening every credentialed
+remote path is roughly eight edits, not forty-three.
+
+What the defaults actually are, since "no redirect policy" understated it: reqwest
+defaults to `Policy::limited(10)`, so the 25 production sites that set no policy
+**follow up to ten hops to arbitrary hosts** rather than following none. 22 set no
+client-level timeout. 42 say nothing about proxying and so inherit `HTTP(S)_PROXY`
+from the environment. 39 do not pin DNS.
+
+**There are four independent SSRF guards, not one, and `web.rs`'s is the
+narrowest.** The old text credited `web.rs` alone; in fact `knowledge_pipeline.rs`
+(broadest), `browser_worker.rs`, and `model_sources.rs` each have their own, with
+four different blocklists — so which guard a request happens to hit decides what
+leaks. `web.rs` misses CGNAT, IPv4 multicast and broadcast, TEST-NET, `240/4` and
+IPv6 `ff00::/8`, all of which `knowledge_pipeline.rs` blocks. `web.rs` is the only
+one with a custom *resolver*, which is all the original claim was true about.
+
+`browser_worker.rs` was also undersold rather than oversold: it pins once per
+Chromium launch via `--host-resolver-rules` and re-resolves and re-classifies on
+every navigation, which is the closest thing in the tree to this item's own
+"DNS answers are pinned for the process's lifetime". It holds no `reqwest` client at
+all, so no client factory can reach it.
+
+`browser_pane.rs` (user browsing) has a scheme filter and no origin policy — and
+makes its own outbound requests, fetching `https://{host}/favicon.ico` for any host
+from the page URL plus a third-party icon service, with an 8-second timeout and
+default redirects. CORS and bind-interface restrictions remain **inbound only**;
+there is no outbound gate anywhere.
+
+**Shipped — hardened defaults on the credentialed remote paths.** `egress::hardened()`
+returns a `ClientBuilder` with a connect timeout, a read (silence) timeout, and a
+validating redirect policy, adopted at the seven sites that carry a credential to a
+configurable remote: both `providers.rs` clients, `triage.rs`, `mcp.rs`,
+`hosted_oauth.rs` (via one shared helper), and the single `monkey-cli` client that is
+threaded through about forty signatures, so one edit propagates across the CLI.
+
+This is a **precondition** for a per-run egress policy, not the delivery of one — it
+creates the one place a policy consult can later be added. Nothing here is
+deny-by-default and nothing here is keyed to a run.
+
+- **The hole that made this worth doing first:** reqwest strips `Authorization`,
+  `Cookie`, `Proxy-Authorization` and `WWW-Authenticate` across a cross-host
+  redirect, but **not** `x-api-key` — which `providers.rs` sets for Anthropic. Since
+  a custom provider's `base_url` is user-configurable, a 302 could walk that key to
+  a redirect-chosen host.
+- **`read_timeout`, never `ClientBuilder::timeout`.** The latter is a total-request
+  deadline covering body read, so it would truncate streaming chat and break the
+  30- and 60-minute companion budgets. `read_timeout` resets after each successful
+  read, so it bounds *silence* rather than elapsed time.
+- **`Policy::custom` does not inherit reqwest's loop cap**, which the sabotage run
+  measured concretely: with the explicit cap removed, a same-origin redirect loop
+  followed 1385 hops in ten seconds.
+- **One deliberate exception to "refuse every cross-origin hop":** `http` → `https`
+  on an otherwise identical authority is followed. `301` to the same host over TLS
+  is the most common redirect on the web, `validate_base_url` accepts `http://` by
+  design, and the destination is the host the request was always aimed at — so no
+  credential moves anywhere new. The inverse downgrade is refused, and both
+  directions are tested.
+- **The default silence budget is a floor, not a ceiling.** `mcp.rs` has a
+  per-server tool timeout users may set above it, so it passes
+  `max(default, configured)` — otherwise a server configured for fifteen minutes
+  that sends no progress notifications would have been cut at ten, turning a
+  supported configuration into a failure.
+- **Diagnostics name only `scheme://host:port`.** These paths put tokens in query
+  strings, so a refusal must not log the whole URL.
+- **A ratcheting source-scan test** pins the remaining bare `Client::new()` sites
+  per file, so a new one fails `cargo test` with a message naming
+  `egress::hardened()`. Bare production sites went from 13 to 8. Not clippy: this
+  repo has no `clippy.toml`, no `[lints]`, and CI never invokes clippy, so a lint
+  would have enforced nothing.
+- **The ~12 loopback-only clients were deliberately left alone.** They are not
+  egress targets, and custom providers at `http://127.0.0.1:1234/v1` (LM Studio,
+  vLLM, LiteLLM) are a supported configuration — any public-only or cleartext-refusing
+  rule would break local inference.
+- `server.rs`'s forwarding clients were pinned in the ratchet rather than
+  converted: one client served **both** loopback inference and cloud providers, so
+  no single policy fitted it and splitting it was its own change — *now done, see
+  below*.
+
+**Shipped — the deprecated IPv4-compatible form no longer walks past any of the four
+guards.** All four unwrapped v4-in-v6 with `to_ipv4_mapped()`, which by design
+matches only `::ffff:a.b.c.d`. So `::127.0.0.1` fell through every branch of every
+guard — not `::1`, not unspecified, not `fc00::/7`, not `fe80::/10` — and was
+classified as an ordinary public address by three of them and as a public navigation
+target by the fourth.
+
+- **The obvious one-word fix is worse than the bug, and a test now pins that.**
+  Swapping `to_ipv4_mapped()` for `to_ipv4()` matches both forms, but maps `::1` to
+  `0.0.0.1`, which is not loopback, private, link-local or unspecified — so in the
+  two guards where the unwrap branch returns early it would have made **loopback
+  allowed**. The fix rejects the whole `::/96` range instead.
+- **One shared predicate in a new `egress.rs`**, because this is the narrow case
+  where all four guards agreed *and were wrong the same way*. Unifying their
+  blocklists is deliberately **not** part of it: the broadest blocks CGNAT
+  (`100.64/10`), which is Tailscale's default range and live on some consumer ISPs,
+  so adopting it everywhere would newly refuse fetches that work today.
+- `::` and `::1` are left to the rules that already name them, so a denial still
+  says which rule fired rather than collapsing three causes into one.
+- Each guard has its own test plus a counter-test that a real public address is
+  still reachable; sabotaging the shared predicate fails all four independently.
+
+**Shipped — a refusal is now a value, not only a sentence.** `egress::EgressRule`
+names every rule the four guards enforce, and `EgressDenial` carries the rule plus
+per-request detail. This is the enabling half of "every blocked attempt is a ledger
+event with the rule that blocked it": nothing is recorded yet, but there is now
+something recordable, which is why it had to land before the sink rather than with
+it.
+
+- **The defect, stated concretely.** `knowledge_pipeline.rs` mapped a `Url::parse`
+  failure and a loopback block onto the same `UrlRejected(String)`, and one of its
+  tests asserted five different refusals — loopback, embedded credentials, a
+  `file://` scheme, an over-length URL, an `[::1]` literal — with the identical
+  `Err(UrlRejected(_))` pattern. `web.rs`'s one string
+  `"target host is a local/private address"` was the verdict of ten address
+  predicates, substring-matched by seven tests. `browser_worker.rs`'s message named
+  four classes while the predicate behind it blocked eleven, so the prose was not
+  merely vague, it was **wrong**.
+- **Codes, not variant names, are the identity.** `egress.loopback` and its 31
+  siblings are what a sink will store, so a test pins the whole list against a
+  written-out copy: renaming one orphans every denial already recorded under the old
+  name, and that has to be a deliberate two-place edit rather than a one-character
+  one.
+- **The enum, its code table and its `ALL` list are declared once**, by a small
+  macro, because hand-written they can drift: a variant missing from `ALL` compiles
+  fine, and `ALL` is exactly what the tests iterate — so the one mistake that
+  matters most would be the one the tests could not see.
+- **Denials travel through reqwest as themselves.** Both places a guard must hand
+  its verdict to somebody else's signature — `reqwest::dns::Resolve` and
+  `redirect::Attempt::error` — accept any `std::error::Error`, so the denial is
+  passed rather than `to_string()`ed and is recovered on the far side with
+  `downcast_ref`. Two tests now walk a real `reqwest::Error`'s source chain and
+  assert the rule. Previously the only machine-readable signal on that path was an
+  `io::ErrorKind::PermissionDenied` that the caller's own `format!` destroyed.
+- **One rule may not name its target**, and it is the rule whose target is the
+  secret: `EgressRule::redacts_target` is true only for embedded credentials.
+  `web.rs` already had this right by hand — its credentials refusal was the only one
+  of seven that omitted the URL — so this makes an accident of one guard's care into
+  a property the next guard inherits.
+- **The tests got stronger, not merely different.** The load-bearing one was
+  `fetch_impl_honors_settings_allow_local_network`, which asserted the *absence* of
+  the substring `"local/private"` to prove the guard let a target through. Any
+  reworded policy block would have passed it. It now asserts the absence of any rule
+  code at all, which is a claim about the whole class.
+- **Blocklists are unchanged.** Every predicate keeps its exact ranges; this
+  splits verdicts apart, it does not move a boundary. Where a guard checks a class
+  its siblings do not, that asymmetry is now visible in an inventory test rather
+  than hidden inside four differently-worded sentences.
+
+**Shipped — `::ffff:127.0.0.1` is no longer a public navigation target.** Found by
+writing `browser_worker.rs`'s address classes down: the IPv4-**mapped** loopback form
+is not `Ipv6Addr::is_loopback`, so it passed the loopback check, and the v4 helper it
+then unwrapped into had no loopback branch — until that unwrap existed, nothing had
+ever reached it with a loopback address. Sibling of the `::127.0.0.1` bug the shared
+predicate closed, and it survived that fix because the compatible and mapped forms
+are different ranges reached by different branches.
+
+- **It was reachable end to end on Windows, and CI is what established that.** The
+  bracket bug below — `Url::host_str` keeps an IPv6 literal's brackets — is where the
+  platforms part company: macOS and Linux refuse to parse
+  `("[::ffff:127.0.0.1]", port)` and refuse the target as a resolution failure before
+  the classifier is consulted, while **Windows resolves it**, so there a granted
+  `http://[::ffff:127.0.0.1]` origin reached this machine's loopback services without
+  the per-run loopback grant that a plain `127.0.0.1` requires. A first draft of this
+  entry claimed the weaker "classifier hole, not a demonstrated bypass" on the
+  strength of a macOS observation; the Windows leg of CI disproved it.
+- **A guard's reachability can be platform-dependent, which nothing here accounted
+  for.** The lesson generalizes past this bug: an SSRF guard reached through
+  `to_socket_addrs` inherits the host resolver's parsing, so "unreachable" has to be
+  established per platform or not claimed. The test asserted the one invariant that
+  held everywhere — loopback without a grant is never allowed — and pinned neither
+  platform's resolver behaviour as the expected answer. *(Superseded: once the bracket
+  fix below took the resolver out of the literal path entirely, the platforms stopped
+  disagreeing and the test tightened to assert `Loopback` on all three. The lesson
+  stands; the workaround it justified is gone, which is the better outcome — a guard
+  whose verdict depends on the host resolver is the thing that was wrong.)*
+- The only range this section moves. Everything else in the conversion is
+  behaviour-preserving.
+
+**Shipped — the API server's outbound client is split by target class.** One client
+per server instance used to serve all three upstreams: the bundled `llama-server` on
+`127.0.0.1:{llama_port}`, the local Ollama daemon on the hardcoded
+`OLLAMA_BASE_URL`, and a configured cloud provider carrying the user's API key. There
+is now a `local_client` and a `cloud_client`, the latter from `egress::hardened()`,
+chosen by the route.
+
+- **Why one client could not be hardened in place**, which is the whole argument for
+  a split rather than an adoption: a silence budget on the loopback half would be
+  actively wrong, because prompt processing on a large context legitimately produces
+  no bytes for minutes and that is exactly where it happens. Leaving it bare left an
+  `x-api-key` exposed to a `302`. Neither policy is defective; they just do not
+  belong to the same client.
+- **The choice is a pure function of the route, `client_for`**, not a `match` inlined
+  at each send site. `reqwest::Client` exposes nothing about its own timeouts or
+  redirect policy — there is no `client.redirect_policy()` to read — so an inlined
+  match would be correct and completely unassertable. As a function, the decision is
+  testable by pointer identity.
+- **Streaming survives, and the reason is the same one that made `hardened()` usable
+  at all:** the SSE path is a byte-level `bytes_stream()` passthrough, and
+  `read_timeout` bounds *silence* and resets after each read, so a provider that
+  keeps producing chunks runs as long as it likes. A `ClientBuilder::timeout` here
+  would have truncated every streamed completion.
+- **A failure to build the hardened client is fatal, not a fallback.** Falling back
+  to the bare client would mean serving cloud requests with no redirect policy —
+  precisely the hole being closed.
+- Two behavioural tests, in opposite directions: the cloud client must refuse a
+  cross-origin hop *and never contact the target*, and the local client must still
+  follow the same redirect. The second is what makes it a test of the split rather
+  than a second test of `egress::hardened`.
+
+**Correction to this item's own description of that route.** Verified against the
+code rather than re-read:
+
+- **"Forwards an external caller's body verbatim" is exactly right.**
+  `handle_chat_completions` clones the parsed body and rewrites only `model`, from
+  `"{provider_id}/{model_id}"` to the bare `model_id`. It deliberately does *not*
+  use `providers::build_chat_request`, which would reconstruct a narrow body and
+  force `stream: true`.
+- **"A second Rust bypass of the Privacy Firewall" is also right.** `server.rs` and
+  `providers.rs` contain no reference to `privacy_firewall` at all; its only Rust
+  callers are `lib.rs`, `knowledge_pipeline.rs` and `runtime_pr_watcher.rs`.
+- **"Reachable by any bearer-token holder" overstates it, and the gates are worth
+  naming** because they are what makes this a smaller hole than the sentence implied.
+  Three conditions, all required: `expose_providers` must be on, and it defaults to
+  **`false`** in `ApiServerConfig::default`; the token must carry `Scope::Chat`; and
+  it must list `Backend::Providers`. Tokens are individually scoped, so this is "a
+  token holder scoped for chat *and* the providers backend, on a server whose
+  operator turned the toggle on" — not any bearer-token holder.
+
+**Found while typing the guards, and left alone deliberately** — each is a real
+defect that naming rules made visible, and each is a behaviour change rather than a
+rename:
+
+- ~~**`web.rs`'s two DNS rules disagree on the quantifier.** Its pre-check refuses a
+  hostname if **any** resolved answer is blocked; its resolver *prunes* blocked
+  answers and refuses only if **all** of them are. A dual-stack host answering with
+  one public and one private address is refused by the first and would have been
+  allowed by the second.~~ **Fixed, and the entry left out which side was wrong.**
+
+  It reads as a hole in the permissive half. It is the opposite: the pre-check was
+  over-blocking. `SsrfGuardedResolver` prunes blocked answers and hands `reqwest` only
+  the survivors, and — as its own doc says — those are *exactly* what `reqwest`
+  connects to, so a pruned private answer is never dialled. Pruning is therefore safe,
+  and refusing the whole request because one of several answers was private turned an
+  ordinary split-horizon or dual-stack host into a fetch that could not be made, with a
+  denial naming a rule the connection would never have tripped.
+
+  The pre-check now matches the resolver's quantifier. Kept as a layer rather than
+  deleted, even though the resolver is the only enforcement: it is the sole guard for a
+  URL that never reaches a resolver — the literal-IP arms, and any future caller that
+  validates without installing one — and deleting it would make that mistake silent.
+  Verified that no such caller exists today before loosening it: the only production
+  caller is `fetch_impl` and the redirect policy it builds, both on a client carrying
+  the guarded resolver.
+
+  The quantifier is extracted into `classify_resolved_answers` purely so it has a test.
+  The case the change is *about* — one public answer and one private — cannot be
+  produced hermetically through `to_socket_addrs`, and a rule only the deployment
+  environment can exercise is a rule with no test. Asserted in both orders, because a
+  loop that returns early on the first blocked answer passes one order and fails the
+  other, which is exactly the old bug. Counter-tests keep "allow everything" out: every
+  answer blocked is still refused and still names a rule, and an empty answer list
+  stays `egress.dns-no-addresses` — a different fact from "everything was refused", the
+  same split the resolver already made.
+- ~~**`browser_worker.rs` does not block `240/4`,** nor `0.0.0.0/8` other than
+  `0.0.0.0` itself.~~ **Fixed.** Two arms in `classify_v4`, spelled the same way as
+  the broad guard's own tests (`0.1.2.3`, `240.0.0.1`) so the two files agree by
+  construction rather than by coincidence. This was the fail-*open* half of this
+  guard's gaps, which is what separates it from the bracket bug below: those ranges
+  read as public navigation targets while `knowledge_pipeline.rs` refused them.
+
+  Ordering is the whole subtlety, and the test pins it rather than merely asserting
+  "refused". Each new range contains one address that already had a more specific
+  rule — `0.0.0.0` is `Unspecified`, `255.255.255.255` is `Broadcast` — so the arms
+  sit after the `if` chain and only the *rest* of each range reaches them. Verified
+  by sabotage in both directions: dropping the arms fails with `0.1.2.3 must be
+  refused as egress.this-network`, and dropping the `is_unspecified` check ahead of
+  them fails with `0.0.0.0 must be refused as egress.unspecified`. `239.255.255.255`
+  pins the lower boundary as `Multicast`, and `1.1.1.1` is the counter-test that
+  "refuse everything" cannot pass.
+- ~~**`browser_worker.rs` cannot handle an IPv6 literal host on macOS or Linux.**
+  `Url::host_str()` serializes one *with its brackets*, so
+  `("[::1]", port).to_socket_addrs()` fails to parse there and every IPv6-literal
+  browser target is refused as a resolution failure rather than classified.
+  Fail-closed, so not a hole — but this guard's IPv6-literal path is unreachable on
+  two of three platforms and reachable on the third, which is how the mapped-loopback
+  bug above stayed hidden. `web.rs` avoids it entirely by matching on `Url::host()`,
+  the parsed enum, and its own comment names this exact "bracket-handling class of
+  bug". Fixing it widens what is reachable on macOS and Linux (a public v6 literal
+  would become allowed), so it is a behaviour change and its own review.~~
+  **Fixed, and the review it wanted found more than the bracket.** Matching on
+  `Url::host()` means a literal arrives as a real `IpAddr` and is not asked of the
+  resolver at all, which is how it should always have been — an address the caller
+  spelled out cannot be rebound, so a lookup could only substitute a different answer
+  for a known one. The same blindness was in the origin-to-resolver-rule loop, where
+  `host_str().parse::<IpAddr>()` never recognised a literal and so emitted a nonsense
+  `MAP [::1] …` rule for a host Chromium is never asked about.
+
+  The widening this entry predicted is real and is why the change is half classifier
+  work. With literals reaching `classify_ip`, five ranges were classifying as public:
+  `fec0::/10`, `2001:db8::/32` and `2001:2::/48` (v4 counterparts all refused),
+  `fe00::/9` (it fell in the gap between `fc00::/7` and `fe80::/10`), and
+  `64:ff9b::/96` — NAT64, where `64:ff9b::7f00:1` *is* `127.0.0.1`, the same "a
+  spelling is not a place" bypass as the mapped-loopback entry above. Enumerating them
+  one arm at a time is how the list fell behind to begin with, so the tail is now an
+  **allowlist**: global unicast is `2000::/3` and everything else is reserved. The
+  named arms stay, because a refusal should say which class refused it.
+
+  `fec0::/10` reports `ReservedRange` and deliberately **not** the `UniqueLocalV6` its
+  shape suggests: `covered_by_private_network_grant` answers true for `UniqueLocalV6`,
+  and RFC 3879 deprecated `fec0::/10` with nothing assigned in it, so "a host the user
+  actually runs could be here" is false. Getting that code wrong would have made a
+  dead range reachable under a grant the moment any guard consulted that predicate.
+
+  Sabotage is platform-conditional and worth stating as such: restoring the bracketed
+  host turns three tests red on macOS and Linux, quoting the original bug back
+  (`browser DNS resolution failed for [::1]`), while on Windows — where a bracketed
+  literal does resolve — only the new classifier rows and the resolver-rule assertion
+  are load-bearing. CI runs all three legs.
+- ~~**Three of the four guards read NAT64 as a public address.**~~ **Fixed.** Found by
+  auditing the other three against what `browser_worker.rs` gained above, and it is a
+  loopback bypass rather than a parity nit: `64:ff9b::7f00:1` **is** `127.0.0.1`
+  wherever a NAT64/CLAT path exists, which is every modern iOS device and a growing
+  share of mobile networks. `web.rs`, `knowledge_pipeline.rs` and `model_sources.rs` all
+  classified it as ordinary public. `browser_worker.rs` was the exception, and only
+  since its `2000::/3` allowlist tail landed.
+
+  The same class as the `::/96` and `::ffff:` forms, and fixed the same way: a shared
+  `egress::nat64_embedded_ipv4` beside `egress::is_ipv4_compatible`, which is exactly
+  the remit that module's doc claims — "the narrow subset where all four agreed *and
+  were all wrong the same way*". Nothing here decides whether `127.0.0.1` is refused,
+  only that `64:ff9b::7f00:1` is the same place.
+
+  **An unwrap, where `::/96` is a rejection**, and the difference matters. RFC 4291
+  deprecated the compatible form so refusing its whole range costs nothing. NAT64 is
+  live and standard — `64:ff9b::` plus a *public* v4 address is how a v6-only network
+  reaches a v4-only server — so refusing the prefix would break that. Each guard
+  therefore unwraps and re-checks against its **own** v4 blocklist, which is what keeps
+  the deliberate divergence intact rather than smuggling in the blocklist unification
+  `egress.rs` defers. Pinned by test: `64:ff9b::6440:1` embeds CGNAT `100.64.0.1`, so
+  `knowledge_pipeline.rs` refuses it as `egress.cgnat` while `web.rs` and
+  `model_sources.rs` allow it — the same asymmetry those guards already have in v4, now
+  reachable through the v6 spelling too. A shared blocklist would have refused it
+  everywhere and newly broken Tailscale users.
+
+  Only the well-known prefix is recognised, and that limit is deliberate: RFC 6052 also
+  allows network-specific prefixes, which cannot be detected from an address alone —
+  finding them needs RFC 7050's DNS lookup, and a guard that consulted the network to
+  decide policy would be taking instructions from the thing it guards against.
+
+  Sabotage-verified per guard: removing any one delegation turns that guard's own test
+  red, and loosening the prefix check from /96 to its first two segments is caught by
+  the counter-test with `64:ff9b:0:0:1::7f00:1` — a network-specific-prefix shape whose
+  low bytes would otherwise be judged as an address.
+- ~~**`knowledge_pipeline.rs` blocks all of `198.51/16`** where TEST-NET-2 is only
+  `198.51.100/24` — over-blocking, not a hole, but it is a real range a user could
+  legitimately need.~~ **Fixed.** Narrowed to the `198.51.100/24` RFC 5737 actually
+  reserves. The 65,280 addresses it over-blocked are ordinary public space, so this was
+  a guard refusing traffic no rule entitled it to refuse, and the failure mode was a
+  knowledge source that simply could not be fetched behind a denial naming a
+  documentation range the address is not in. Its two sibling arms (`192.0.2/24`,
+  `203.0.113/24`) were already spelled to the RFC; this one was the outlier.
+
+  Worth noting how this landed: the earlier renaming change deliberately preserved the
+  /16 because narrowing it newly *allows* fetches and that is not a decision to smuggle
+  into a rename — and it left a test pinning `198.51.0.1` as refused precisely so the
+  narrowing would have to be a visible, deliberate edit. That worked. The pin is now
+  four counter-test rows instead: both neighbours of the real /24 and both ends of the
+  /16, because narrowing a range is where an off-by-one shows up, and getting it wrong
+  either leaks the documentation range or under-narrows. Sabotage-verified — restoring
+  the /16 fails with `198.51.0.1 is ordinary public space and must not be refused`.
+- ~~**`PipelineLimits::validate` never validates `max_redirects`,** so `max_redirects:
+  0` is accepted and silently forbids every redirect.~~ **Fixed — and this entry had
+  the danger the wrong way round.** `0` is a coherent setting: refusing every redirect
+  is a choice, and the refusal it produces names the limit, so it is not silent
+  either. Clamping it away would have been the opposite mistake. The real gap was the
+  absence of an *upper* bound — `max_redirects` was the one field of the thirteen
+  `validate` never read, so a value large enough that the downstream
+  `redirect_chain.len() > limits.max_redirects` check can never fire counted as
+  "consistent", which is a bound that has stopped being one. Now a ceiling of
+  `MAX_REDIRECT_CHAIN` = 10, matching `web.rs`, `egress.rs` and reqwest's own
+  `Policy::limited(10)` so no guard in this tree follows a longer chain than any
+  other; the pipeline's own default stays 3. Tested at zero, at the ceiling, and one
+  past it, because a test of only the middle value passes for a gate that rejects
+  everything or nothing.
+
+  ~~Found while fixing it: `knowledge_service.rs`'s OCR-sidecar path builds a
+  `PipelineLimits`, raises `max_file_bytes` and `max_total_bytes` to 256 MiB, and
+  never calls `validate()` at all. The two values it sets are consistent, so nothing
+  is wrong today — but it is a production caller outside the gate, which is worth
+  knowing before that gate is relied on for anything.~~ **Fixed, and the missing
+  `validate()` was the least of it.** A first attempt added the `validate()` call this
+  entry asked for and stopped there; adversarial review of that attempt found the
+  entry's "nothing is wrong today" to be false. `fetch_http` does not take
+  `max_file_bytes` as given — it enforces `max_file_bytes.min(MAX_HTTP_BYTES)`, and
+  `MAX_HTTP_BYTES` is 32 MiB. So the raise to 256 MiB never did anything, and a
+  sidecar between the two sizes passed every up-front check and then died mid transfer
+  with "Source response exceeds the byte limit". The declared gate and the enforced one
+  disagreed by a factor of eight, and a `validate()` call could not have found that,
+  because the limit set was internally *consistent* — just unenforced.
+
+  The cap is now derived from `MAX_HTTP_BYTES` so the two cannot drift again, and the
+  smaller number wins on purpose: `fetch_http` buffers the whole body in memory, so
+  that ceiling bounds a heap allocation an upstream server sizes. A sidecar larger than
+  it wants a streaming download to disk, not a bigger buffer. `max_total_bytes` is left
+  at its default because `fetch_http` never reads it — assigning it looked like a bound
+  and was inert — and `ocr_install_limits` is infallible, because with one caller and
+  no parameters `validate()` cannot fail, and the fallible version's only test pinned a
+  parameter that existed to make an unreachable error path reachable.
+
+  The lesson worth keeping: this entry described a *missing check* when the defect was
+  a *disagreement between two numbers*. Fixing what an entry says rather than what the
+  code does is how a cosmetic change ships with a confident comment on it.
+- ~~**`model_sources.rs` caps redirects at 8 while `egress.rs` caps at 10,** and it
+  hand-builds its client rather than starting from `egress::hardened()`.~~ **Closed as
+  "will not do", and the entry was asking for something that breaks model downloads.**
+  The read timeout half is fixed (see the shipped note below). What follows is why the
+  other two halves are being retired rather than done.
+
+  **`egress::hardened()` cannot be adopted here.** It installs
+  `same_origin_redirect_policy`, whose `may_follow` requires the next hop to keep the
+  **same host** — a scheme upgrade on the same host is the only exception. Model
+  downloads are cross-host by construction: Hugging Face redirects
+  `huggingface.co/…/resolve/…` to a CDN host, and the Ollama registry redirects blob
+  requests likewise. Adopting `hardened()` would refuse every one of them with
+  `egress.redirect-cross-origin`.
+
+  That is not a guess. This file has **three** separate post-redirect re-checks —
+  `probe_remote_gguf`, the model download, and the registry token — each phrased "final
+  URL refused" specifically so a refusal can be placed *after* the chain. Those exist
+  because the final URL routinely differs from the requested one. And this file's own
+  per-hop policy validates "any public HTTPS host" rather than one origin, which is the
+  same fact stated as policy.
+
+  So the two designs answer different questions. `hardened()` protects a client that
+  **carries a credential** and must not hand it to another origin — its refusal message
+  is literally "refusing to carry credentials from … to …". This file's client fetches
+  content whose integrity is guaranteed by a **SHA-256 check**, over a chain where
+  changing host is the norm; reqwest strips `Authorization` cross-host anyway, so the
+  credential concern that motivates the origin pin does not apply. Neither is the
+  general case, and forcing one on the other loses either the feature or the guarantee.
+
+  **The 8-vs-10 cap is not worth reconciling either.** Both are finite, both refuse a
+  loop, and the number only decides the fate of pathological chains no real registry
+  produces. Changing it changes which chains this app accepts in exchange for nothing —
+  the definition of churn. Recorded as deliberate divergence, like the four blocklists.
+
+  **The one real residue is the ratchet blind spot**, and it is a property of the
+  scanner rather than of this file: `Client::builder()` is not the string the
+  bare-client scan looks for. That is worth fixing in the *scan* if it is worth fixing
+  at all — a file that sets `connect_timeout`, `read_timeout`, a hop cap and a per-hop
+  SSRF check is not the risk the ratchet was built to catch.
+
+**Shipped — the two unbounded download clients no longer hang on a silent peer.**
+Both set a silence budget now. `model_sources.rs`'s was the worst outbound site in
+the tree and the reason is not the missing timeout on its own:
+
+- Its download loop is `while let Some(chunk) = stream.next().await` with no
+  `select!` and no timeout; `models_install_reference` has **no cancellation token**,
+  unlike its `models_download` sibling; and `INSTALL_MUTEX` is held across the whole
+  install. So a peer that completed its handshake and then stopped writing froze the
+  progress bar with no error and no Cancel — *and* every later managed-model install
+  in the session blocked on the mutex at zero progress with nothing shown. Only an
+  app restart cleared it.
+- `models.rs`'s `download_to_file` had **no timeout of any kind**. Same hang, less
+  severe only because `cancel` is wired, so a user could escape it by hand.
+- `read_timeout`, never `ClientBuilder::timeout`: any total deadline large enough for
+  a 40 GB download is far too large to notice a dead peer. Both reuse
+  `egress::READ_TIMEOUT` so there is one number, not three.
+- Sabotage-verified against a real listener that accepts and never answers: without
+  the budget the request waits `30.011s`, until the *peer* gives up.
+
+**Shipped — the same hang existed in two Tauri commands, and loopback was the reason
+it survived.** `ollama_list_models` and `ollama_remove_model` used reqwest's bare
+constructor, which sets no timeout at all, and neither has a cancellation token or
+anything racing it. A daemon that accepted the connection and then went quiet left the
+`invoke` unresolved forever — a UI spinner with no error and no way out but a restart.
+Both were sitting in the bare-client ratchet's allow-list under "loopback-only", which
+is a fair exemption from the *redirect* and credential rules and no exemption at all
+from having a deadline. That entry is now removed rather than annotated, and every
+Ollama call goes through one `ollama_client(total)`: 10 seconds for the read-only calls,
+60 for the delete, since Ollama unlinks a model's blobs before it answers. A total
+deadline is the right shape for these, unlike on a download path — the bodies are small
+and fully buffered.
+
+Worth recording as a lesson about the ratchet itself: writing the doc comment for the
+fix broke the ratchet, because it spelled the bare constructor out and the scan counts
+that literal string anywhere in the production half of a file. `egress.rs`'s own doc
+comments already talk around it for exactly this reason. A ratchet that greps source
+text also greps the prose explaining it.
+
+**The audit that found it also found the shape of the remaining problem, which is the
+inverse.** A ratchet on "builder with no timeout" would catch 7 sites, of which only
+3 are real (the other 4 are bounded at the application layer by `run_bounded` or an
+outer `tokio::time::timeout`). Meanwhile **8 sites pair a *total* `ClientBuilder::timeout`
+with `bytes_stream()`**, which is a truncation bug rather than a safety net — the exact
+hazard `egress::hardened`'s doc warns about, already shipped. Two are load-bearing:
+`portability_commands.rs`'s 45-second budget against an archive capped at
+`2 × max_archive_bytes`, and `knowledge_service.rs`'s two 45-second budgets against
+`max_file_bytes`. That, not "no timeout", is the rule worth ratcheting.
+
+**Those three are now fixed, and the numbers were worse than "load-bearing" conveys.**
+`webdav_client()`'s 45-second total against a 1 GiB cap needs **23 MB/s sustained for
+the whole request**, so WebDAV backup could not complete a snapshot past a couple of
+hundred megabytes on an ordinary connection — the upload half had the same ceiling, and
+the failure surfaced as a transport error rather than as "too slow". `knowledge_service`'s
+two clients needed **745 KB/s** against a 32 MiB `max_file_bytes`, so a large PDF from a
+slow or rate-limited host truncated. All three now take a *silence* budget of the same
+45 seconds via `egress::hardened_with_read_budget`, overriding its redirect policy back
+to `Policy::none()` (WebDAV pins every path to the configured origin in `remote_url`;
+`knowledge_service` pins the dialled address with `.resolve()`, and the pipeline follows
+redirects itself so each hop gets its own guarded lookup). The two duplicate
+`knowledge_service` builders collapsed into one `pinned_http_client` helper.
+
+One thing the new shape does not cover, accepted deliberately and written into
+`webdav_client`'s doc: reqwest has no *write* timeout, so a server that accepts a
+connection and then stops reading during an upload is no longer bounded. That needs a
+pathological peer, whereas the truncation it replaces broke every large backup against a
+healthy one.
+
+The proof is one test in `egress.rs` rather than three per call site, because the property
+belongs to the two options and not to any one caller:
+`a_total_deadline_aborts_a_trickling_body_where_a_read_budget_does_not` trickles a body
+one byte at a time and asserts both halves — the read budget lets all 12 bytes through,
+and the *identical* trickle fails once that same 400ms becomes a deadline for the whole
+request. Either half alone would be misleading. Sabotage-verified by widening the total
+to 30 seconds, which fails the second assertion, confirming the `Err` comes from the
+deadline and not from the fixture.
+
+**The ratchet is real and deferred one PR, because writing it found 18 sites, not 8.**
+Scanning `Client::builder()` chains for their own `.timeout(` reports:
+`bin/monkey-cli/daemon/remote/client.rs` 1, `browser_pane.rs` 1, `connectors.rs` 1,
+`diagnostics.rs` 1, `m4_runtime.rs` 2, `m5_delivery/reviewer.rs` 1, `m7_companion.rs` 3,
+`ollama.rs` 3, `runtime_pr_watcher.rs` 1, `web.rs` 4. Most are legitimate — a total
+deadline is correct when the response is small and fully buffered, as with
+`connectors.rs`'s 64 KiB cap under 15 seconds — but an allow-list is only worth having if
+every entry names the cap that makes its deadline proportionate, and verifying 18 of those
+is its own change rather than a rider on a bug fix. Two known gaps in the scan to settle
+there: a chain starting from `hardened()` instead of `Client::builder()` escapes it, and
+`.timeout(` on a *`RequestBuilder`* is a different, usually-correct thing that the
+substring cannot distinguish.
+
+**Shipped — and the premise "a total deadline is fine when the body is small and
+buffered" turned out to be too simple.** Auditing all 15 sites (10 verifiers, each
+verdict then adversarially challenged by a second reader instructed to refute it) turned
+up **three** distinct failure modes, not one:
+
+- **(A) A large download.** The truncation the rule is named for. Two sites, both
+  converted rather than allow-listed. `bin/monkey-cli/daemon/remote/client.rs`'s
+  `fetch_artifact` reads a whole artifact out of one JSON body — the runner inlines it as
+  `content_base64` — so a `max_artifact_bytes` at its 32 MiB ceiling arrives as ~43 MiB
+  through a single `bytes()` call under a 30-second total: **1.4 MB/s sustained**.
+  `m7_companion`'s ComfyUI `{base}/view` download is bounded only by the caller's 256 MiB
+  `MAX_MEDIA_BYTES`, checked after the fact, so 30 seconds meant **8.9 MB/s**. Localhost
+  never noticed; `endpoint.base_url` is user-configured.
+- **(B) A large *upload*.** `ClientBuilder::timeout` covers writing the request body, and
+  it is easy to score only the response and miss this — the first reader did on both
+  sites, and the challenger caught it. `m7_companion`'s image-edit multipart (1800s) and
+  its transcription upload (3600s) each carry a body bounded only by `MAX_MEDIA_BYTES`:
+  149 KB/s and 74 KB/s respectively, *plus* the provider's own render or transcription
+  time inside the same budget.
+- **(C) Work that is not network at all.** A `"stream": false` request to a local model
+  sends nothing until generation finishes, so the deadline is a ceiling on *inference* and
+  a slow model surfaces as a transport failure. `m4_runtime`'s 120s workflow client,
+  `m5_delivery/reviewer`'s 900s, and `ollama.rs`'s 60s `/api/embed` — where
+  `EMBED_BATCH_SIZE` caps the vector *count* at 32, not the bytes and not the work, while
+  a spec may declare up to 65,536 dimensions.
+
+B and C are recorded rather than converted: each needs a decision about what the ceiling
+*should* be, and a `read_timeout` alone would let a wedged local model hang forever. The
+allow-list entries say which category they are, so the debt is visible at the site.
+
+Two things about the ratchet itself worth writing down, both found by trying to break it:
+
+- **The scan counted a doc comment as a use.** `web.rs`'s `search_client` doc mentions
+  `Client::builder()` only to say it deliberately does *not* use it, and the scan picked up
+  a `.timeout(` thirty-odd lines below as if it belonged to that chain. This is the third
+  time prose has tripped a ratchet in this file, so the fix went into the scan — both
+  ratchets now strip comment-only lines — rather than into another instruction to talk
+  around a spelling. The window is verified irrelevant at 25, 40 and 80 lines, which is
+  the property that says the parse is no longer accidental.
+- **Three of the nine counts I wrote by hand were wrong,** which is the argument for the
+  ratchet in one line: nobody holds this inventory in their head. `web.rs` is 1 rather
+  than 2 precisely *because* `search_client` starts from `hardened_with_read_budget` — the
+  documented hole, and the one that will let a future total deadline through.
+
+Sabotage-verified both directions: a new `Client::builder().timeout(..)` is caught and
+named, and a `.timeout(` on a *`RequestBuilder`* correctly does not trip it.
+- ~~**`hugging_face_license` discards a refusal *once*, silently — not twice.**~~
+  **Fixed — the `Url::parse` failure is recorded, and only when it is really a
+  refusal.** A malformed absolute link now writes `egress.url-malformed`. A *relative*
+  one does not, and that exclusion is the part worth stating: `license_link: "LICENSE"`
+  is the shape Hugging Face's own cards use and is this file's own fixture, the fallback
+  resolves a pinned repo URL for it, so nothing was denied — and recording it would add
+  a row per resolution to a table bounded at 10,000, evicting real denials and making
+  the rule code stop meaning "something was blocked".
+
+  Found while fixing it: the sink's `detail` column had no per-row bound at all, so
+  `MAX_ROWS` was only half a bound. A card can carry a 16 MB `license_link` that
+  *parses*, which reaches `validate_public_https_url` and records the whole thing. The
+  cap now lives in `denial_sink::record` next to `MAX_ROWS`, where all four guards route
+  through it — a first attempt put it at this call site, which guarded the one path that
+  change had just created while leaving the two that already existed open.
+
+  Original analysis, kept because its correction is the reasoning that mattered: the
+  policy verdict at the
+  `validate_public_https_url(&parsed).is_ok()` call *is* recorded, because that
+  function is the single choke point all thirteen model-source call sites pass
+  through and it writes to the denial sink itself before returning. So a
+  `license_link` pointing at `https://127.0.0.1/license` does land in the sink under
+  `model-sources.url`; what is thrown away is the denial *value*, which nothing here
+  needs. The one genuinely invisible case is the `Url::parse` failure in the same
+  expression: a malformed `license_link` produces no `egress.url-malformed` record
+  anywhere, so it is indistinguishable from a card that carried no link at all. Both
+  paths fall back to the repo's own `LICENSE` file, which is the right behaviour and
+  is not what wants changing.
+- ~~**`validate_ollama_auth_url` constrains only the host,** so
+  `https://auth.ollama.ai:8443/anything` passes: the port and path of a
+  bearer-token endpoint are unpinned.~~ **Fixed, and the port was the small half.**
+  The port is pinned to 443 via `port_or_known_default`, so the explicit `:443`
+  spelling stays the same destination rather than becoming a surprise. Low severity as
+  this entry implied — that request carries no credential, it is the one that goes to
+  *fetch* one — and the path stays unpinned on purpose, because `/token` is the
+  registry's to change and a path does not decide which server answers.
+
+  What this entry missed is that **host and port only pin the request as sent.**
+  `build_http_client`'s redirect policy judges every hop with
+  `validate_public_https_url` alone — no ollama allowlist, no port — so a challenge
+  naming the real realm could 302 up to eight times to any public HTTPS host, and the
+  `token` in *that* host's body became the bearer attached to the follow-up registry
+  request. `validate_ollama_auth_url`'s own doc opens by naming exactly that shape ("a
+  *response* gets to propose where this app sends a credential request"), so pinning
+  only the pre-flight spelling left the response half of its own threat model open. Now
+  re-checked after `send()`, the same post-redirect pattern `probe_remote_gguf` uses.
+
+  The entry below is where that should have been caught, and its safety argument is why
+  it was not — see the correction there.
+- **Nothing pins a model download to the origin that resolved it.** The redirect
+  policy admits a hop to any public HTTPS host; reqwest strips `Authorization`
+  cross-host so the bearer does not travel, and the SHA-256 check is what actually
+  makes this safe — but that reliance was undocumented.
+
+  **Correcting the safety argument, because it does not cover every request this
+  client makes.** Both of its two legs assume the app is *sending* something it must
+  protect: stripping `Authorization` matters when a credential travels outward, and a
+  SHA-256 check matters when the payload is a file whose content is pinned. The
+  registry *token fetch* has neither property — it sends no credential, so there is
+  nothing to strip, and it receives one, so there is no digest to compare. So "the
+  redirect policy admits a hop to any public HTTPS host" was not benign there, and the
+  entry above is now what closes it. The generalisation worth keeping: a per-client
+  redirect policy is only as strong as the weakest thing any of its callers does with
+  the response, so a policy justified by what *one* caller sends needs re-checking per
+  caller.
+- ~~**`web.rs` builds four clients and installs the SSRF guard on one.**~~ **Fixed**
+  — and the fix found that the hole was worse than this entry described. The three
+  search clients did not need the SSRF guard (their *request* targets are trustworthy,
+  as their doc comments correctly argued); they needed a redirect policy, because a
+  `302` is chosen by the response. All three now build from one `search_client()`
+  helper on top of `egress::hardened_with_read_budget`, whose origin-pinned policy
+  answers the loopback question this entry was stuck on: the rule is *relative* (does
+  this hop stay where it was already going?), so a self-hosted SearXNG on plain
+  `http://` or on loopback keeps working while a `302` off it does not.
+
+  **The Brave leak was demonstrated, not theorised.** Sabotaging `search_client()`
+  back to the old builder makes the second origin record, verbatim:
+
+  ```
+  GET /steal HTTP/1.1
+  x-subscription-token: super-secret-key
+  referer: http://127.0.0.1:58198/?q=rust&count=1
+  ```
+
+  reqwest strips `Authorization` across an origin change but not
+  `X-Subscription-Token`, so the user's Brave API key travelled to whatever host the
+  redirect named — with `referer` carrying the search query alongside it. This is the
+  same hazard `egress::hardened`'s doc records for `x-api-key`; the search path simply
+  was not built from it. `allow_local_network` was never a defence here: it is read
+  only on the fetch path, so all three search clients followed a loopback hop with the
+  setting off.
+
+  Also fixed in passing: the three clients read their bodies with `.text()`, which
+  reads to end-of-stream and so let the backend size the allocation. They now share
+  `fetch_impl`'s streaming read under a `MAX_SEARCH_BODY_BYTES` cap.
+- ~~**`knowledge_pipeline.rs` compares `max_url_chars` against bytes**
+  (`value.len()`).~~ **Fixed, by moving the name to the measurement rather than the
+  measurement to the name.** The field is `max_url_bytes` now. Changing the
+  comparison to `chars().count()` was the other option and it is the wrong one: it
+  would have *widened* this guard, since 2,048 characters of three-byte glyphs is
+  6 KiB, and bytes are what actually fill a buffer and a log line. `serde` keeps
+  `max_url_chars` as an alias, because the struct derives `Deserialize` for a config
+  surface it does not have yet and a rename should not become a breaking change the
+  day it gets one. The test pins a two-byte-per-character path that is under the
+  limit in characters and over it in bytes, so the comparison cannot be quietly
+  "tidied" back later.
+- ~~**`allow_private_networks` is one switch over fourteen distinct rules.**~~
+  **Fixed — it is a per-class allowance now**, which is the thing this entry said the
+  named rules made possible. `EgressRule::covered_by_private_network_grant` decides
+  it, and the switch covers exactly six classes: loopback, RFC 1918, link-local,
+  unique-local IPv6, CGNAT (`100.64/10` is Tailscale's default range and live on some
+  consumer ISPs, so a real peer lives there) and the unspecified address — that last
+  because an outbound connection to `0.0.0.0` is routed to `127.0.0.1`, so it reaches
+  the *same* service the loopback grant already covers and refusing it would be
+  inconsistent about one destination rather than protective of anything.
+
+  It no longer covers multicast, broadcast, `0/8` past `0.0.0.0`, `192.0.0/24`, the
+  documentation and benchmarking ranges, `240/4`, or the deprecated IPv4-compatible
+  form. That last is the one worth naming: it is not a class of destination but an
+  alternative *spelling* of one, so blanketing it did not widen the reachable network
+  — it offered a second way to write any address at all past the classifier that
+  refuses it.
+
+  **Scope, stated plainly: this changes no shipped behaviour.** All three production
+  callers of `UrlSourcePolicy::new` — two in `knowledge_service.rs` and one in
+  `connectors.rs` — pass `false` for this switch, and nothing in the frontend sets
+  it. So this is a latent-correctness fix that makes the setting mean its name before
+  anything turns it on, not a live hole being closed. Worth being exact about, rather
+  than filed under the security fixes above it.
+
+  Written as an exhaustive `match` rather than a `matches!` over the covered set, so
+  a rule added to `EgressRule` later is a compile error until somebody decides which
+  side of the line it belongs on — the failure mode being guarded is not a wrong
+  answer for a rule someone considered, it is a new rule landing on the permissive
+  side by default.
+
+**Two things the denial sink will have to handle, learnt from doing this first.**
+Neither is a defect in the sink's absence, which is precisely why finding them now
+was worth the ordering:
+
+- **Rule identity dies at every command boundary.** `knowledge_service.rs` and
+  `connectors.rs` both `.map_err(|error| error.to_string())` the moment a refusal
+  leaves the pipeline, and `web.rs`'s commands hand the UI a `String`. The code
+  survives *inside* the prose, so a human can grep it, but nothing can branch on the
+  rule. A sink fed from these call sites would be parsing its own output back out of
+  a sentence; the denial has to be recorded where it is raised, not where it is
+  displayed.
+- **Not every refusal is a request.** Some fire while *building* a policy from
+  configured origins, before anything is requested. Recording those as `egress.*`
+  denials would put phantom blocked requests in an operator's log for what is a typo
+  in settings. Most are kept off the rule path deliberately, but `origin_for_url` is
+  shared between the request and configuration paths, so a configuration error can
+  still surface `egress.host-missing` — the sink needs to know the difference rather
+  than trusting that every rule code means a request happened.
 
 **Acceptance:** each process record carries a deny-by-default egress policy —
 allowed hosts, ports, and protocols — that is narrower than or equal to its
@@ -1109,6 +2281,172 @@ workspace policy and cannot be widened at runtime by the model, a skill, a
 package, or a routing decision. DNS answers are pinned for the process's
 lifetime so a rebind cannot move an allowed name. Every blocked attempt is a
 ledger event with the rule that blocked it.
+
+**Correction to that acceptance — three of its four clauses name something that does
+not exist, and one names the wrong key.** Found by auditing the codebase against it
+rather than by reading it again.
+
+**The key is the run, not the process, and this item should be renamed
+accordingly.** No HTTP call site in this crate can learn which process it belongs
+to: there are zero `task_local!` and zero `thread_local!` declarations anywhere,
+`ProcessRecord`'s only budget field is `ProcessLimits` with no network member, and
+entry points like `ollama_list_models` are bare `#[tauri::command]`s with no process
+handle in scope. Two ways out, and the second is chosen:
+
+- *Thread process identity to the call sites* via a task-local egress scope entered
+  by each command that owns a process. Universal, but it needs a command-wrapper
+  layer this app does not have.
+- **Key off the immutable run spec instead.** `provider_endpoint_for_run` already
+  does exactly this for a neighbouring problem — it refuses to trust the caller's
+  claimed target and reads the frozen one back out of the run spec.
+
+The second is not merely easier, it is **safer**, and the reason is specific:
+`process_admit` copies limits verbatim out of the WebView's IPC payload with no
+clamp against the kind default or any ceiling, and admission is fail-soft. So keying
+a deny-by-default policy off the process row would mean choosing between "no record
+→ no network", which breaks every turn whenever the ledger blips, and "no record →
+allow", which reintroduces the hole the policy exists to close. A run spec is frozen
+at submission and is not writable by the party the policy constrains — which is what
+"cannot be widened at runtime by the model" actually requires.
+
+**"Narrower than or equal to its workspace policy" has nothing to be narrower
+than.** There is no per-workspace network policy: `privacy_firewall.rs`'s
+`PrivacyPolicy` carries no host, port, protocol or address field, and `workspace.rs`
+holds only roots. The only network policy in the tree is
+`PermissionPolicySnapshot::allow_network` — run-scoped, sourced from the global
+web-tools setting, and expanding to an all-or-nothing Seatbelt clause for sandboxed
+shell children on macOS only. This clause is greenfield, and the roadmap should say
+so rather than implying a hierarchy exists to slot into.
+
+**Shipped — the run's own network permission is binding, and it was enforced
+nowhere.** `PermissionPolicySnapshot::allow_network` has been in every frozen
+`RunSpec` since the protocol was written. Nothing on any outbound path read it.
+Its only readers were `recipes.rs`, which compares it against a tool profile and
+enforces nothing, and `sandbox.rs`'s **same-named but different** field, which
+governs sandboxed shell children. So a run submitted with `allow_network: false` —
+the default when a submitter omits it — reached every cloud provider unimpeded.
+
+- **Enforced in `provider_endpoint_for_run`**, which already loads the frozen spec
+  by run id, refuses to trust the caller's claimed target, and is fail-closed on an
+  unknown run. The endpoint it returns *is* the destination the permission is about,
+  so a separate consult would be a second read of the same row with a chance of
+  disagreeing with the first.
+- **This is deny-by-default in the only sense a run can express today**, and it does
+  satisfy "cannot be widened at runtime by the model, a skill, a package, or a
+  routing decision": the permission is frozen at submission, the spec row is written
+  once, and no update path to it exists.
+- **Loopback is exempt, and that is not a loophole.** A local-inference run carries
+  `allow_network: false` quite correctly — it uses no network in the sense the flag
+  means. Reading the flag as "no sockets at all" would refuse every local run, which
+  is not a stricter policy but a broken one.
+- **Three submitters were under-declaring and are now fixed** — `compareRunner.ts`
+  (both sites) and `paletteActions.ts` omitted `allowNetwork`, which freezes `false`,
+  and then used the network. Enforcement turns a dormant inaccuracy into a refused
+  run, so they had to be corrected in the same change.
+- Denials carry the run id, which is what finally populates the sink column that
+  every production call site had been passing `None` for.
+
+**Correction — the fourth acceptance clause cannot be delivered as written, and this
+is the reason.** "Each record carries a deny-by-default egress policy — allowed
+hosts, ports, and protocols" assumes every egress site can name its run. Audited
+against the code, most cannot, and several *never* will:
+
+- **There are zero `task_local!` and zero `thread_local!` declarations in the crate**,
+  and `AppState` has no notion of a current run — every per-work-unit map is keyed by
+  `turn_id`, `request_id` or `job_id`. A run id can only reach an egress site as an
+  explicit parameter.
+- **30 files construct an outbound client at 65 sites.** The single highest-volume
+  egress decision in the tree — `browser_worker.rs`'s per-subresource and per-redirect
+  check inside `CdpConnection::handle_event` — is made on a struct that has no run id
+  and no path to one.
+- **`mcp.rs` builds one client per *server connection*, cached process-wide**, so one
+  transport serves every run. Making it per-run means rebuilding the transport per
+  call and losing the connection reuse and OAuth refresh the design depends on.
+- **Some egress legitimately has no run, and cannot.** Scheduled knowledge refresh is
+  timer-driven; connector verification happens in Settings before any run exists;
+  model downloads and update checks are not runs. Deny-by-default keyed to a run would
+  silently disable all of them.
+- **`server.rs` is the clause's own counter-example in literal form.** An inbound HTTP
+  caller's request body picks which of two egress policies applies, via
+  `route_model` → `client_for`. There is no run to attach to, because an inbound
+  request is not one.
+
+So the clause's shape is wrong for this architecture, not merely unimplemented. What
+is deliverable — and what the entry above delivers — is enforcement at the paths where
+a run *is* nameable, plus the honest statement that a per-run host/port/protocol
+allowlist would need a context-propagation layer this app does not have. That layer is
+now **D3**, its own item, because K6's per-process resource ledger turns out to need
+the same thing — two dependents make it a prerequisite rather than a footnote here.
+
+**Shipped — every blocked attempt is written down with the rule that blocked it.**
+`denial_sink.rs` is an append-only store in its **own database file**
+(`egress-denials-v1.sqlite3`), written at the raise site by all four guards.
+
+- **The migration hazard was designed out, not decided.** The open question was
+  whether the ledger should tolerate a database newer than the binary. Both answers
+  were bad: relaxing `apply_migrations`' `version > MIGRATION_V7` guard would let an
+  older build write into a schema it does not understand, and keeping it while
+  bumping to V8 would mean a rolled-back build — which the in-app updater makes an
+  ordinary event — could not open its run history **at all**. Not a degraded
+  feature: no runs, no events, no approvals. A separate file removes the question
+  entirely. The ledger stays at V7 and an older binary opens it exactly as before.
+- **The sink keeps the same forward-only discipline, but the blast radius is
+  contained**, and that containment is the point of the separate file rather than a
+  side effect of it: a rolled-back build meeting a newer sink declines to record and
+  everything else keeps working, because nothing but that module reads the file.
+- **Recording is fail-soft and cannot fail open.** The write happens *after* the
+  refusal, and no guard consults the sink to decide anything, so a sink failure
+  costs a log line and can never unblock a request. It is also the only entry in
+  `lib.rs`'s startup list that is deliberately not an `expect`.
+- **The rows are bounded, because the volume is attacker-influenced.** A page under
+  the browser guard can request as many refused subresources as it likes. An
+  unbounded audit table whose row count a remote page controls is a disk-exhaustion
+  primitive, not an audit trail; the oldest rows beyond ten thousand are dropped in
+  the same statement batch as the insert, not by a background task.
+- **`run_id` is a plain nullable column, deliberately not a foreign key** — making it
+  one is exactly what `run_events` does and exactly why `run_events` cannot host
+  these rows.
+- **Recorded at the raise site, not the command boundary**, which is what the
+  previous slice's own finding demanded: by the time a refusal reaches a command it
+  is a `String`, and a sink fed from there would be parsing its rule code back out of
+  a sentence. Since `validate_fetch_url` and `classify_ip` are pure functions of a
+  `Url` and an `IpAddr` with no state handle — and this crate has zero `task_local!`
+  declarations to carry one implicitly — the recorder is a process-wide install and
+  the refusal calls it, rather than the other way round. Acceptable precisely because
+  the sink is append-only and no decision reads it, so a global cannot change what
+  any guard allows.
+- Each guard names itself in the record, so the four guards' deliberate
+  disagreements about which address classes they block stay visible instead of
+  averaging into one number. A test drives two guards and asserts both names.
+- Sabotage-verified: removing the row bound overshoots to 10,250, and silencing one
+  guard's recording fails that guard's test.
+
+**"Every blocked attempt is a ledger event" cannot use `run_events` as built.**
+`run_events.run_id` is `NOT NULL REFERENCES runs(run_id)` behind a trigger that
+demands a gapless `sequence = last_sequence + 1`, refuses any event after a terminal
+one, and caps the total. Meanwhile a denial can come from work with no run at all,
+and one arriving after a run ended would be rejected outright. None of `RunEvent`'s
+variants is a policy denial, and `PermissionDecided` carries no rule identity. This
+needs its own non-run-scoped table, and that table must not land before something
+writes to it — the caution being `ProcessLimits`' own doc, three of whose four fields
+are declaration-only to this day. *Addressed: it became its own **database** rather
+than one more table, for the migration reason in the shipped note above, and all four
+guards write to it in the same change.*
+
+**Nothing in the tree named a rule** — *addressed; see the shipped note above.*
+Every refusal was hardcoded prose (`web.rs`, `knowledge_pipeline.rs`'s
+`UrlRejected(String)`), so a test asserting `is_err()` could not tell a policy block
+from a typo in a URL, and neither could an operator reading a log. `EgressRule` now
+names all four guards' rules, which is why it landed before the sink rather than
+with it: a sink built first would have recorded unparseable strings.
+
+**Also missing from the "Today" above:** the inbound OpenAI-compatible
+`POST /v1/chat/completions` route forwards an external caller's body verbatim to a
+cloud provider — *through a bare client, until the split above; see the correction
+there for which parts of this claim held and which overstated the reach.* It remains a
+second Rust bypass of the Privacy Firewall, which no longer follows from the client
+being bare: hardened defaults decide *where* a request may go, and say nothing about
+what is in its body.
 
 **Blocks:** K17 — placing a run on a remote node is only safe if the run's
 egress travels with it.
@@ -1188,7 +2526,7 @@ sequence.
 class, cost ceiling, latency target, data sensitivity, or tool requirement;
 per-turn inspection of which policy chose the target and why; reorder and
 disable without editing code. A policy can never widen a permission, bypass
-the Privacy Firewall, or widen a process's egress policy (K5).
+the Privacy Firewall, or widen a run's egress policy (K5).
 
 **Note:** in OS terms K8 decides *when* a process runs and K9 decides *which
 device* executes it. They are separable and K8 is the harder half. Shipping
@@ -1325,7 +2663,7 @@ the runner. Placement is a human decision — an operator starts work on a node.
 
 **Acceptance:** the scheduler (K8) can place a process on a paired node by
 capability, measured throughput (K6), and a data-residency rule, subject to
-the node's own admission control (K7); the process's egress policy (K5) and
+the node's own admission control (K7); the run's egress policy (K5) and
 resource limits (K4) travel with it and are enforced by the node, not
 assumed; and a node going away is a process-level failure with a defined
 restart policy (K2), not a lost run. No relay, consistent with the existing

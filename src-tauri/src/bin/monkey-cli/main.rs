@@ -1023,7 +1023,17 @@ async fn main() {
         return;
     }
 
-    let client = reqwest::Client::new();
+    // The one client the whole CLI shares — threaded through as
+    // `&reqwest::Client` by every subcommand below — so hardening it here is
+    // the whole binary's egress posture in one line. See
+    // `little_monkey_lib::egress::hardened` for what it supplies; note in
+    // particular that it adds no HTTPS-only or public-address rule, because
+    // this same client also talks to the bundled `llama-server` and a local
+    // Ollama daemon over plain `http://127.0.0.1`.
+    let client = match little_monkey_lib::egress::hardened().build() {
+        Ok(client) => client,
+        Err(error) => fail(&format!("could not build the HTTP client: {error}")),
+    };
 
     if let Some(cmd) = &cli.cmd {
         if let Some(prompt) = cli.model_or_prompt.as_ref().or(cli.prompt.as_ref()) {

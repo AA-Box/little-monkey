@@ -190,9 +190,6 @@ export const ArtifactPane = lazy(() =>
 export const FileTree = lazy(() =>
   import("../components/Workspace/FileTree").then(({ FileTree }) => ({ default: FileTree })),
 );
-export const DiffPanel = lazy(() =>
-  import("../components/Workspace/DiffPanel").then(({ DiffPanel }) => ({ default: DiffPanel })),
-);
 export const DiffViewer = lazy(() =>
   import("../components/Workspace/DiffViewer").then(({ DiffViewer }) => ({ default: DiffViewer })),
 );

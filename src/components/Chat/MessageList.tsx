@@ -5,7 +5,6 @@ import {
   BookOpen,
   Bot,
   Brain,
-  CheckCircle2,
   ChevronRight,
   ClipboardCheck,
   Eye,
@@ -71,10 +70,12 @@ import SubagentRow from "./SubagentRow";
 import SubagentGroupCard, { type SubagentGroupTask } from "./SubagentGroupCard";
 import { CheckpointPreviewModal } from "./CheckpointPreviewModal";
 import { useT } from "../../lib/i18n";
+import { StepCopyButton, ToolStepRow, TOOL_STEP_LIST_CLASSES } from "./ToolStepRow";
 import {
+  activityCallCommandLine,
+  activityCallCopyText,
   activityCallDiff,
   activityCallLabel,
-  activityCallSubject,
   activityDiffStat,
   activityProgress,
   formatActivityResult,
@@ -361,44 +362,24 @@ function diffBlock(text: string, marker: "-" | "+"): string {
     .join("\n");
 }
 
+/** One tool call as a step of `ActivityRow`'s list: its command line and copy
+ * button, then any diff it produced and whatever it returned. Wrapped in the
+ * `ToolStepRow` chrome a subagent's own steps use, so the parent transcript
+ * and a subagent card read identically. */
 const ActivityCallDetail = memo(function ActivityCallDetail({ call }: { call: ActivityCall }) {
   const pending = call.result === undefined;
   const failed = call.result !== undefined && resultLooksLikeError(call.result);
-  const statusLabel = pending ? "Running" : failed ? "Failed" : "Completed";
-  const StatusIcon = pending ? LoaderCircle : failed ? TriangleAlert : CheckCircle2;
-  const Icon = toolIcon(call.name);
-  const subject = activityCallSubject(call);
   const diff = activityCallDiff(call);
   const result = call.result === undefined ? null : formatActivityResult(call.result);
 
   return (
-    <li className="min-w-0 rounded-md border border-border bg-background px-3 py-2.5">
-      <div className="flex min-w-0 items-center gap-2">
-        <Icon size={13} className="shrink-0 text-faint" aria-hidden />
-        <span className="truncate text-xs font-medium text-foreground">{activityCallLabel(call.name)}</span>
-        <code
-          title={call.name}
-          className="max-w-[38%] shrink truncate rounded bg-surface-2 px-1.5 py-0.5 text-[10px] text-faint"
-        >
-          {call.name}
-        </code>
-        <span
-          className={`ml-auto flex shrink-0 items-center gap-1 text-[10px] font-medium ${
-            failed ? "text-danger" : pending ? "text-warning" : "text-success"
-          }`}
-        >
-          <StatusIcon
-            size={12}
-            className={pending ? "animate-spin motion-reduce:animate-none" : ""}
-            aria-hidden
-          />
-          {statusLabel}
-        </span>
+    <ToolStepRow title={activityCallCommandLine(call)} failed={failed}>
+      <div className="flex items-start gap-2">
+        <pre className="min-w-0 flex-1 whitespace-pre-wrap break-all font-mono text-[11px] text-foreground">
+          {activityCallCommandLine(call)}
+        </pre>
+        <StepCopyButton text={activityCallCopyText(call)} />
       </div>
-
-      <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded bg-surface-2 px-2 py-1.5 font-mono text-[11px] text-muted">
-        {subject}
-      </pre>
 
       {diff && (
         <div
@@ -437,24 +418,21 @@ const ActivityCallDetail = memo(function ActivityCallDetail({ call }: { call: Ac
         </div>
       )}
 
-      <div className="mt-2">
-        <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-faint">Result</div>
-        {result ? (
-          <pre
-            className={`max-h-56 overflow-auto whitespace-pre-wrap break-all rounded px-2 py-1.5 font-mono text-[11px] ${
-              failed ? "bg-danger-soft text-danger" : "bg-surface-2 text-muted"
-            }`}
-          >
-            {result.text || "(no output)"}
-          </pre>
-        ) : (
-          <div className="flex items-center gap-1.5 rounded bg-surface-2 px-2 py-1.5 text-[11px] text-muted">
-            <LoaderCircle size={12} className="animate-spin motion-reduce:animate-none" aria-hidden />
-            Waiting for result…
-          </div>
-        )}
-      </div>
-    </li>
+      {result ? (
+        <pre
+          className={`mt-1.5 max-h-56 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] ${
+            failed ? "text-danger" : "text-muted"
+          }`}
+        >
+          {result.text || "(no output)"}
+        </pre>
+      ) : (
+        <div className="mt-1.5 flex items-center gap-1.5 font-mono text-[11px] text-muted">
+          <LoaderCircle size={12} className="animate-spin motion-reduce:animate-none" aria-hidden />
+          {pending ? "Waiting for result…" : ""}
+        </div>
+      )}
+    </ToolStepRow>
   );
 });
 
@@ -494,12 +472,10 @@ const ActivityRow = memo(function ActivityRow({ calls }: { calls: ActivityCall[]
           />
         </button>
         {open && (
-          <div id={detailsId} className="mt-1 border-l border-border py-2 pl-4">
-            <ol className="space-y-2">
-              {calls.map((call) => (
-                <ActivityCallDetail key={call.id} call={call} />
-              ))}
-            </ol>
+          <div id={detailsId} className={`mt-1.5 max-w-[85%] ${TOOL_STEP_LIST_CLASSES}`}>
+            {calls.map((call) => (
+              <ActivityCallDetail key={call.id} call={call} />
+            ))}
           </div>
         )}
       </div>

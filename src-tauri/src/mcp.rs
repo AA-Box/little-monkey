@@ -75,6 +75,34 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// `DEFAULT_TIMEOUT_SECS`'s analogous role for [`call_tool_with_cancel_impl`].
 pub const CONNECT_TIMEOUT_SECS: u64 = 30;
 
+/// The scope every MCP connection's own work runs under.
+///
+/// A named constant rather than the literal at the one call site, because the
+/// value *is* the decision recorded in
+/// [`crate::run_scope::Unattributed::SharedTransport`]'s doc comment — one
+/// connection per configured server, shared by every run — and a reader who lands
+/// on [`connect_impl`] should be sent there rather than left to infer it.
+///
+/// # The ceiling this carries, stated rather than left to be discovered
+///
+/// `run_scope` exists for K5's per-run egress allowlist, and nothing reads
+/// `current()` for policy yet — no site in `mcp.rs`, `mcp_oauth.rs` or
+/// `hosted_oauth.rs` calls `denial_sink::record` at all. When a policy *does* read
+/// it, entering this scope has an enforcement consequence beyond attribution: the
+/// one credentialed in-task round-trip it covers is the OAuth refresh, which is
+/// reachable from the reauth retry in [`call_tool_with_cancel_impl`] — and that
+/// retry runs *inside* a run's scope. So a refresh driven by a run would be
+/// evaluated under the connection's policy rather than that run's.
+///
+/// That is the right default for the reason the decision gives: the token belongs
+/// to the connection, is shared by every later run, and refreshing it on one run's
+/// narrower allowlist would let whichever run happened to trigger the refresh
+/// decide whether every other run's connection survives. But it is a real choice,
+/// not an oversight, and the day a per-run allowlist lands it should be re-read
+/// rather than rediscovered.
+const CONNECTION_SCOPE: crate::run_scope::RunScope =
+    crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::SharedTransport);
+
 /// Keychain service name for HTTP servers' bearer tokens — same string
 /// `providers.rs` uses for provider API keys (a separate private constant
 /// there; keychain entries are disambiguated by *account*, not service, so
@@ -350,10 +378,87 @@ pub struct McpConnection {
 /// call in [`CONNECT_TIMEOUT_SECS`] — the same division of labor
 /// [`call_tool_with_cancel_impl`] documents for permission/timeout/
 /// cancellation around a tool call.
+///
+/// # Why this enters `CONNECTION_SCOPE`, shadowing any run it was called from
+///
+/// A connection here is shared by every run — see
+/// [`crate::run_scope::Unattributed::SharedTransport`] for why that was chosen
+/// over one transport per run — so the work of establishing it is the
+/// connection's, not the caller's. The shadowing is the load-bearing half: this
+/// function is also called from [`call_tool_with_cancel_impl`]'s
+/// re-authorization retry, which *is* inside a run's scope, and without entering
+/// a scope here the first run unlucky enough to trip a 401 would be billed for
+/// re-handshaking a connection that four other runs go on to use.
+///
+/// # Which egress that actually reaches, and which it provably does not
+///
+/// This is worth stating exactly, because the tempting version of this comment
+/// would claim more than the mechanism allows. `tokio::spawn` does not inherit a
+/// task-local (`run_scope`'s own
+/// `a_spawned_task_does_not_inherit_the_scope` pins it), and the streamable-HTTP
+/// transport is built out of two bare `tokio::spawn`s:
+///
+/// - `StreamableHttpClientTransport::with_client` is `WorkerTransport::spawn`,
+///   a `tokio::spawn` at rmcp-2.2.0's `transport/worker.rs:115`. Every HTTP
+///   request the transport ever issues runs in that task.
+/// - `rmcp::serve_client` ends in `serve_inner`, which spawns the service loop
+///   with `tokio::spawn` at rmcp-2.2.0's `service.rs:945`.
+///
+/// And `Transport::send` for a `WorkerTransport` (`transport/worker.rs:189`) only
+/// pushes onto an mpsc channel, so even the `initialize` POST that
+/// `serve_client` *awaits in this task* is issued by the worker task, not here.
+/// So the scope covers the OAuth token fetch below (a real, credentialed
+/// round-trip that does run in this task), the keychain read in `read_http_token`,
+/// and the pre-connect validation — and covers **none** of the transport's own
+/// requests:
+/// the POSTs, the SSE notification stream, its `Last-Event-ID` reconnects, the
+/// session delete. Those are outside every scope and record neither a run nor a
+/// reason, which is `run_scope`'s honest third state rather than a blank standing
+/// in for one.
+///
+/// That is not a gap left open for want of trying. The only seam that could carry
+/// a scope into the worker task is a `StreamableHttpClient` wrapper entering it
+/// per request, and implementing that trait means naming `sse_stream::Sse` and
+/// `http::HeaderName` — neither of which rmcp re-exports nor this crate depends
+/// on directly. Two new dependencies and a stream wrapper, to establish a scope
+/// that nothing on this path reads today: no site in `mcp.rs`, `mcp_oauth.rs` or
+/// `hosted_oauth.rs` calls `denial_sink::record` at all. When one does, the
+/// caller-task egress above is already labelled; the worker's still won't be, and
+/// the fix then is a wrapper, not a wider comment.
 pub async fn connect_impl(
     state: &AppState,
     entry: &McpServerEntry,
 ) -> Result<(Vec<CachedMcpTool>, Option<String>), String> {
+    crate::run_scope::scoped(CONNECTION_SCOPE, connect_in_scope(state, entry)).await
+}
+
+/// What scope [`connect_in_scope`] actually observed, for the test that pins it.
+///
+/// A test-only observation point rather than an assertion inside production code. The
+/// claim being pinned — that connect-time work runs under [`CONNECTION_SCOPE`] and not
+/// under whatever run called it — is otherwise unfalsifiable from outside: every
+/// alternative test passes with the wrapper deleted, because they exercise
+/// `run_scope::scoped` directly rather than this call path. Two earlier D3 adoptions set
+/// the bar at "reverting the wrapper turns a test red", and this is what meets it here.
+#[cfg(test)]
+static OBSERVED_CONNECT_SCOPE: std::sync::Mutex<Option<crate::run_scope::RunScope>> =
+    std::sync::Mutex::new(None);
+
+/// [`connect_impl`]'s body, split out only so the scope entry above is a single
+/// readable line instead of an `async move` block wrapping the whole function.
+async fn connect_in_scope(
+    state: &AppState,
+    entry: &McpServerEntry,
+) -> Result<(Vec<CachedMcpTool>, Option<String>), String> {
+    // Recorded before any transport branch, so the cheapest possible failure — a blank
+    // command or URL, which returns without opening a socket — still exercises it.
+    #[cfg(test)]
+    {
+        *OBSERVED_CONNECT_SCOPE
+            .lock()
+            .expect("the observation point is never held across a panic") =
+            crate::run_scope::current();
+    }
     let service = match &entry.transport {
         McpTransport::Stdio { command, args, env } => {
             if command.trim().is_empty() {
@@ -423,10 +528,34 @@ pub async fn connect_impl(
                 }
             }
 
-            let transport = rmcp::transport::StreamableHttpClientTransport::with_client(
-                reqwest::Client::new(),
-                config,
-            );
+            // The client handed to `rmcp` carries whatever token the block above
+            // resolved (OAuth bearer or a pasted static one) on *every* request
+            // the transport makes, including any it makes after a redirect. A
+            // default client would follow up to ten hops to an arbitrary host —
+            // `url` is user-configurable, so that host could be a loopback
+            // service with no authentication of its own.
+            //
+            // The read timeout `hardened()` brings is defence in depth here
+            // rather than the only bound: `mcp_connect` already wraps
+            // [`connect_impl`] in [`CONNECT_TIMEOUT_SECS`] and
+            // [`call_tool_with_cancel_impl`] bounds each call by the per-server
+            // `timeout_secs`. It matters for what those do not cover — the
+            // standalone SSE notification stream, which rmcp's
+            // `SseAutoReconnectStream` resumes with `Last-Event-ID` after an
+            // error, so a stalled stream reconnects instead of going quiet
+            // forever.
+            // The silence budget must never be tighter than the budget this server
+            // was explicitly configured with, or a long-running tool that sends no
+            // progress notifications would be cut short of its own timeout. So the
+            // default acts as a floor here, not a ceiling.
+            let configured =
+                Duration::from_secs(entry.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+            let budget = configured.max(crate::egress::READ_TIMEOUT);
+            let http_client = crate::egress::hardened_with_read_budget(budget)
+                .build()
+                .map_err(|e| format!("Failed to build the MCP HTTP client: {e}"))?;
+            let transport =
+                rmcp::transport::StreamableHttpClientTransport::with_client(http_client, config);
 
             rmcp::serve_client((), transport)
                 .await
@@ -1616,6 +1745,152 @@ mod tests {
 
         let err = connect_impl(&state, &entry).await.unwrap_err();
         assert!(err.contains("no URL configured"), "unexpected error: {err}");
+    }
+
+    // --- connection scope (D3) -------------------------------------------
+
+    /// The load-bearing one: drives `connect_impl` itself from inside a run and checks
+    /// what scope its body actually saw.
+    ///
+    /// Every other test in this section exercises `run_scope::scoped` directly, so all of
+    /// them stay green with the wrapper on `connect_impl` deleted — which makes them pins
+    /// on `run_scope`, not on this adoption. Reverting that wrapper turns this one red
+    /// with `Some(Run("run:establishes-a-connection"))` where the connection reason
+    /// belongs.
+    ///
+    /// Hermetic: the blank URL returns before any socket is opened, and the observation
+    /// point is written before the transport branch is chosen.
+    #[tokio::test]
+    async fn connect_runs_under_the_connection_scope_even_when_a_run_established_it() {
+        let entry = McpServerEntry {
+            id: "http-srv".to_string(),
+            label: "HTTP server".to_string(),
+            transport: McpTransport::Http {
+                url: "   ".to_string(),
+            },
+            enabled: true,
+            tool_allowlist: None,
+            timeout_secs: None,
+        };
+
+        let observed = crate::run_scope::scoped(
+            crate::run_scope::RunScope::run("run:establishes-a-connection"),
+            async {
+                let state = AppState::default();
+                // The caller really is inside a run at this point, which is the case the
+                // reauth retry in `call_tool_with_cancel_impl` creates.
+                assert_eq!(
+                    crate::run_scope::current_run_id().as_deref(),
+                    Some("run:establishes-a-connection")
+                );
+                let _ = connect_impl(&state, &entry).await;
+                OBSERVED_CONNECT_SCOPE
+                    .lock()
+                    .expect("observation point")
+                    .clone()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            observed,
+            Some(CONNECTION_SCOPE),
+            "connect-time work belongs to the connection, not to whichever run opened it"
+        );
+
+        // Counter-assertion: the probe can see a run when there is one to see, so the
+        // result above is the shadowing working rather than the observation point being
+        // blind. Without this, an implementation that never recorded anything would pass.
+        crate::run_scope::scoped(crate::run_scope::RunScope::run("run:direct"), async {
+            *OBSERVED_CONNECT_SCOPE.lock().expect("observation point") =
+                crate::run_scope::current();
+        })
+        .await;
+        assert_eq!(
+            OBSERVED_CONNECT_SCOPE
+                .lock()
+                .expect("observation point")
+                .as_ref()
+                .and_then(crate::run_scope::RunScope::run_id),
+            Some("run:direct")
+        );
+    }
+
+    /// A connection's own work is the *connection's*, even when the call that
+    /// establishes it came from inside a run — which the reauth retry in
+    /// [`call_tool_with_cancel_impl`] does.
+    ///
+    /// The counter-assertion is the half that makes this test able to fail:
+    /// without it, an implementation that simply never carried a run id would
+    /// pass, and so would a probe that could not see a scope at all. So the same
+    /// probe is run once inside the connection scope and once outside it, and the
+    /// two answers have to differ.
+    #[tokio::test]
+    async fn a_connection_scopes_its_own_work_to_the_connection_and_not_the_calling_run() {
+        let probe = || async { crate::run_scope::current() };
+
+        let inside = crate::run_scope::scoped(
+            crate::run_scope::RunScope::run("run:calls-a-tool"),
+            crate::run_scope::scoped(CONNECTION_SCOPE, probe()),
+        )
+        .await;
+
+        assert_eq!(
+            inside
+                .as_ref()
+                .and_then(crate::run_scope::RunScope::unattributed)
+                .map(|reason| reason.code()),
+            Some("unattributed.shared-transport"),
+            "a shared transport's own work must carry the connection's reason"
+        );
+        assert_eq!(
+            inside.as_ref().and_then(crate::run_scope::RunScope::run_id),
+            None,
+            "and must not be billed to whichever run happened to trigger the connect"
+        );
+
+        // Same probe, same enclosing run, no connection scope: it sees the run.
+        let outside =
+            crate::run_scope::scoped(crate::run_scope::RunScope::run("run:calls-a-tool"), probe())
+                .await;
+        assert_eq!(
+            outside.and_then(|scope| scope.run_id().map(str::to_string)),
+            Some("run:calls-a-tool".to_string()),
+            "the probe can see a run when one is in scope, so the assertion above is not vacuous"
+        );
+    }
+
+    /// The real [`connect_impl`], end to end: entering a scope for the connection
+    /// must not corrupt the caller's.
+    ///
+    /// Uses the blank-URL entry so the whole call is hermetic — it returns before
+    /// any keychain read or socket — while still going through the actual scope
+    /// wrapper rather than a stand-in for it.
+    #[tokio::test]
+    async fn a_connect_leaves_the_calling_run_s_scope_intact() {
+        let state = AppState::default();
+        let entry = McpServerEntry {
+            id: "http-srv".to_string(),
+            label: "HTTP server".to_string(),
+            transport: McpTransport::Http {
+                url: "   ".to_string(),
+            },
+            enabled: true,
+            tool_allowlist: None,
+            timeout_secs: None,
+        };
+
+        let after = crate::run_scope::scoped(crate::run_scope::RunScope::run("run:outer"), async {
+            assert!(connect_impl(&state, &entry).await.is_err());
+            crate::run_scope::current_run_id()
+        })
+        .await;
+
+        assert_eq!(
+            after.as_deref(),
+            Some("run:outer"),
+            "the run that asked for the connection keeps its identity afterwards"
+        );
     }
 
     #[test]
