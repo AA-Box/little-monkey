@@ -1557,6 +1557,26 @@ pub async fn cancel_job(client: &reqwest::Client, base_url: &str, job_id: &str) 
 mod tests {
     use super::*;
 
+    /// A path the host agrees is absolute.
+    ///
+    /// `/Users/somebody/x` is absolute on Unix and *not* on Windows, which has
+    /// no drive letter to anchor it — and absoluteness is exactly what the
+    /// rules under test are about, so a hardcoded POSIX literal tests nothing
+    /// on Windows but the fixture.
+    fn absolute(parts: &[&str]) -> String {
+        let mut path = std::env::temp_dir();
+        path.extend(parts);
+        path.to_string_lossy().to_string()
+    }
+
+    /// The same join the code under test performs, so an expectation carries
+    /// the host's own separator rather than a `/` that only Unix produces.
+    fn under(root: &str, parts: &[&str]) -> String {
+        let mut path = PathBuf::from(root);
+        path.extend(parts);
+        path.to_string_lossy().to_string()
+    }
+
     /// A model exactly as a user would have added it: files they chose, slots
     /// they assigned. There is no built-in catalogue to borrow from.
     fn model(id: &str, tasks: Vec<GenerationTask>, grid: FrameGrid) -> GenerationModelSpec {
@@ -1720,7 +1740,7 @@ mod tests {
         spec.components = vec![ModelComponent {
             slot: ComponentSlot::Checkpoint,
             source: ComponentSource::LocalFile {
-                path: "/Users/somebody/models/my-own.safetensors".to_string(),
+                path: absolute(&["models", "my-own.safetensors"]),
             },
             size_bytes: 1,
         }];
@@ -1729,7 +1749,7 @@ mod tests {
                 .windows(2)
                 .find(|pair| pair[0] == "--model")
                 .map(|pair| pair[1].clone()),
-            Some("/Users/somebody/models/my-own.safetensors".to_string())
+            Some(absolute(&["models", "my-own.safetensors"]))
         );
         // Missing from disk, but still not downloadable — the app has no repo
         // to fetch it from and must not report a download size for it.
@@ -1754,7 +1774,7 @@ mod tests {
             ("--audio-vae", "audio.safetensors"),
         ] {
             let at = args.iter().position(|arg| arg == flag).expect(flag);
-            assert_eq!(args[at + 1], format!("/models/wan-mine/{file}"), "{flag}");
+            assert_eq!(args[at + 1], under("/models", &["wan-mine", file]), "{flag}");
         }
         assert!(args.windows(2).any(|pair| pair == ["--listen-port", "8092"]));
         assert!(args.contains(&"--diffusion-fa".to_string()));
@@ -1800,12 +1820,12 @@ mod tests {
             PartAsset {
                 slot: ComponentSlot::Vae,
                 name: "Better VAE".to_string(),
-                path: "/Users/somebody/parts/better_vae.safetensors".to_string(),
+                path: absolute(&["parts", "better_vae.safetensors"]),
             },
             PartAsset {
                 slot: ComponentSlot::T5xxl,
                 name: "umt5".to_string(),
-                path: "/Users/somebody/parts/umt5.safetensors".to_string(),
+                path: absolute(&["parts", "umt5.safetensors"]),
             },
         ];
 
@@ -1829,12 +1849,12 @@ mod tests {
         let t5 = args.iter().position(|arg| arg == "--t5xxl").expect("--t5xxl");
         assert_eq!(args[t5 + 1], parts[1].path);
         let unet = args.iter().position(|arg| arg == "--diffusion-model").unwrap();
-        assert_eq!(args[unet + 1], "/models/wan-mine/unet.gguf");
+        assert_eq!(args[unet + 1], under("/models", &["wan-mine", "unet.gguf"]));
 
         // A path the library does not hold is not loadable, whatever the UI says.
         let forged = vec![ComponentOverride {
             slot: ComponentSlot::Vae,
-            path: "/etc/passwd".to_string(),
+            path: absolute(&["not-in-the-library.safetensors"]),
         }];
         assert!(apply_component_overrides(&spec, &parts, &forged).is_err());
 
@@ -1849,7 +1869,7 @@ mod tests {
         let denoiser = vec![PartAsset {
             slot: ComponentSlot::Checkpoint,
             name: "Another model".to_string(),
-            path: "/Users/somebody/parts/other.safetensors".to_string(),
+            path: absolute(&["parts", "other.safetensors"]),
         }];
         assert!(apply_component_overrides(
             &spec,
@@ -1866,7 +1886,7 @@ mod tests {
     fn a_library_lora_is_named_and_absolute() {
         let good = LoraAsset {
             name: "Detail slider".to_string(),
-            path: "/Users/somebody/loras/detail.safetensors".to_string(),
+            path: absolute(&["loras", "detail.safetensors"]),
         };
         assert!(validate_lora_asset(&good).is_ok());
 
@@ -1974,12 +1994,12 @@ mod tests {
         let mut request = video_request(GenerationTask::TextToVideo);
         request.loras = vec![
             LoraSelection {
-                path: "/loras/style.safetensors".to_string(),
+                path: absolute(&["loras", "style.safetensors"]),
                 multiplier: 0.8,
                 is_high_noise: false,
             },
             LoraSelection {
-                path: "/loras/motion.safetensors".to_string(),
+                path: absolute(&["loras", "motion.safetensors"]),
                 multiplier: -0.4,
                 is_high_noise: true,
             },
@@ -1988,7 +2008,7 @@ mod tests {
         let body = request_body(&wan, &normalized);
         let loras = body["lora"].as_array().expect("lora array");
         assert_eq!(loras.len(), 2);
-        assert_eq!(loras[0]["path"], json!("/loras/style.safetensors"));
+        assert_eq!(loras[0]["path"], json!(absolute(&["loras", "style.safetensors"])));
         // Negative strengths are meaningful — they subtract a style.
         assert_eq!(loras[1]["multiplier"], json!(-0.4));
         assert_eq!(loras[1]["is_high_noise"], json!(true));
@@ -2018,7 +2038,7 @@ mod tests {
         spec.components.push(ModelComponent {
             slot: ComponentSlot::Vae,
             source: ComponentSource::LocalFile {
-                path: "/Users/somebody/vae.safetensors".to_string(),
+                path: absolute(&["vae.safetensors"]),
             },
             size_bytes: 5,
         });
@@ -2263,19 +2283,19 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
 
         let mut request = video_request(GenerationTask::TextToSpeech);
         request.model_id = spec.id.clone();
-        request.speaker_file = Some("/Users/somebody/reference.wav".to_string());
+        request.speaker_file = Some(absolute(&["reference.wav"]));
         request.language = Some("EN".to_string());
         let normalized = validate_request(&spec, &request).unwrap();
         assert_eq!(normalized.width, 0);
 
         let args = speech_args(&spec, Path::new("/m"), &normalized, Path::new("/out.wav")).unwrap();
         for (flag, value) in [
-            ("--model", "/m/voice/backbone.gguf"),
-            ("--mmproj", "/m/voice/mmproj.gguf"),
-            ("--prompt", "a lovely cat"),
-            ("--output", "/out.wav"),
-            ("--tts-speaker-file", "/Users/somebody/reference.wav"),
-            ("--tts-lang", "en"),
+            ("--model", under("/m", &["voice", "backbone.gguf"])),
+            ("--mmproj", under("/m", &["voice", "mmproj.gguf"])),
+            ("--prompt", "a lovely cat".to_string()),
+            ("--output", Path::new("/out.wav").to_string_lossy().to_string()),
+            ("--tts-speaker-file", absolute(&["reference.wav"])),
+            ("--tts-lang", "en".to_string()),
         ] {
             let at = args.iter().position(|arg| arg == flag).expect(flag);
             assert_eq!(args[at + 1], value, "{flag}");
