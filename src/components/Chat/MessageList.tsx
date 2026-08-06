@@ -5,7 +5,6 @@ import {
   BookOpen,
   Bot,
   Brain,
-  CheckCircle2,
   ChevronRight,
   ClipboardCheck,
   Eye,
@@ -71,10 +70,13 @@ import SubagentRow from "./SubagentRow";
 import SubagentGroupCard, { type SubagentGroupTask } from "./SubagentGroupCard";
 import { CheckpointPreviewModal } from "./CheckpointPreviewModal";
 import { useT } from "../../lib/i18n";
+import { StepCopyButton, ToolStepRow, TOOL_STEP_LIST_CLASSES } from "./ToolStepRow";
 import {
+  activityCallCommandLine,
+  activityCallCopyText,
   activityCallDiff,
   activityCallLabel,
-  activityCallSubject,
+  activityDiffStat,
   activityProgress,
   formatActivityResult,
   groupAssistantRound,
@@ -360,44 +362,24 @@ function diffBlock(text: string, marker: "-" | "+"): string {
     .join("\n");
 }
 
+/** One tool call as a step of `ActivityRow`'s list: its command line and copy
+ * button, then any diff it produced and whatever it returned. Wrapped in the
+ * `ToolStepRow` chrome a subagent's own steps use, so the parent transcript
+ * and a subagent card read identically. */
 const ActivityCallDetail = memo(function ActivityCallDetail({ call }: { call: ActivityCall }) {
   const pending = call.result === undefined;
   const failed = call.result !== undefined && resultLooksLikeError(call.result);
-  const statusLabel = pending ? "Running" : failed ? "Failed" : "Completed";
-  const StatusIcon = pending ? LoaderCircle : failed ? TriangleAlert : CheckCircle2;
-  const Icon = toolIcon(call.name);
-  const subject = activityCallSubject(call);
   const diff = activityCallDiff(call);
   const result = call.result === undefined ? null : formatActivityResult(call.result);
 
   return (
-    <li className="min-w-0 rounded-md border border-border bg-background px-3 py-2.5">
-      <div className="flex min-w-0 items-center gap-2">
-        <Icon size={13} className="shrink-0 text-faint" aria-hidden />
-        <span className="truncate text-xs font-medium text-foreground">{activityCallLabel(call.name)}</span>
-        <code
-          title={call.name}
-          className="max-w-[38%] shrink truncate rounded bg-surface-2 px-1.5 py-0.5 text-[10px] text-faint"
-        >
-          {call.name}
-        </code>
-        <span
-          className={`ml-auto flex shrink-0 items-center gap-1 text-[10px] font-medium ${
-            failed ? "text-danger" : pending ? "text-warning" : "text-success"
-          }`}
-        >
-          <StatusIcon
-            size={12}
-            className={pending ? "animate-spin motion-reduce:animate-none" : ""}
-            aria-hidden
-          />
-          {statusLabel}
-        </span>
+    <ToolStepRow title={activityCallCommandLine(call)} failed={failed}>
+      <div className="flex items-start gap-2">
+        <pre className="min-w-0 flex-1 whitespace-pre-wrap break-all font-mono text-[11px] text-foreground">
+          {activityCallCommandLine(call)}
+        </pre>
+        <StepCopyButton text={activityCallCopyText(call)} />
       </div>
-
-      <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded bg-surface-2 px-2 py-1.5 font-mono text-[11px] text-muted">
-        {subject}
-      </pre>
 
       {diff && (
         <div
@@ -436,24 +418,21 @@ const ActivityCallDetail = memo(function ActivityCallDetail({ call }: { call: Ac
         </div>
       )}
 
-      <div className="mt-2">
-        <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-faint">Result</div>
-        {result ? (
-          <pre
-            className={`max-h-56 overflow-auto whitespace-pre-wrap break-all rounded px-2 py-1.5 font-mono text-[11px] ${
-              failed ? "bg-danger-soft text-danger" : "bg-surface-2 text-muted"
-            }`}
-          >
-            {result.text || "(no output)"}
-          </pre>
-        ) : (
-          <div className="flex items-center gap-1.5 rounded bg-surface-2 px-2 py-1.5 text-[11px] text-muted">
-            <LoaderCircle size={12} className="animate-spin motion-reduce:animate-none" aria-hidden />
-            Waiting for result…
-          </div>
-        )}
-      </div>
-    </li>
+      {result ? (
+        <pre
+          className={`mt-1.5 max-h-56 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] ${
+            failed ? "text-danger" : "text-muted"
+          }`}
+        >
+          {result.text || "(no output)"}
+        </pre>
+      ) : (
+        <div className="mt-1.5 flex items-center gap-1.5 font-mono text-[11px] text-muted">
+          <LoaderCircle size={12} className="animate-spin motion-reduce:animate-none" aria-hidden />
+          {pending ? "Waiting for result…" : ""}
+        </div>
+      )}
+    </ToolStepRow>
   );
 });
 
@@ -465,53 +444,38 @@ const ActivityRow = memo(function ActivityRow({ calls }: { calls: ActivityCall[]
   const detailsId = useId();
   const summary = summarizeActivity(calls);
   const progress = activityProgress(calls);
-  const ProgressIcon = progress.status === "running"
-    ? LoaderCircle
-    : progress.status === "failed"
-      ? TriangleAlert
-      : CheckCircle2;
+  const { added, removed } = activityDiffStat(calls);
 
   return (
     <div className="flex justify-start">
-      <div className="w-full max-w-[92%] min-w-0">
+      <div className="w-full min-w-0">
         <button
           type="button"
           aria-expanded={open}
           aria-controls={detailsId}
           onClick={() => setOpen((prev) => !prev)}
-          className="flex min-h-11 w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background motion-reduce:transition-none"
+          className="flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-[13px] text-muted transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent motion-reduce:transition-none"
         >
+          <span className="min-w-0 truncate">{summary}</span>
+          {added > 0 && <span className="shrink-0 text-success">+{added}</span>}
+          {removed > 0 && <span className="shrink-0 text-danger">-{removed}</span>}
+          {progress.status === "running" && (
+            <LoaderCircle size={12} className="shrink-0 animate-spin text-faint motion-reduce:animate-none" aria-hidden />
+          )}
+          {progress.status === "failed" && (
+            <span className="shrink-0 text-danger">{progress.label}</span>
+          )}
           <ChevronRight
             size={13}
             className={`shrink-0 text-faint transition-transform duration-150 motion-reduce:transition-none ${open ? "rotate-90" : ""}`}
             aria-hidden
           />
-          <ListChecks size={15} className="shrink-0 text-faint" aria-hidden />
-          <span className="min-w-0 truncate font-medium text-foreground">{summary}</span>
-          <span
-            className={`ml-auto flex shrink-0 items-center gap-1 text-[10px] font-medium ${
-              progress.status === "failed"
-                ? "text-danger"
-                : progress.status === "running"
-                  ? "text-warning"
-                  : "text-success"
-            }`}
-          >
-            <ProgressIcon
-              size={12}
-              className={progress.status === "running" ? "animate-spin motion-reduce:animate-none" : ""}
-              aria-hidden
-            />
-            {progress.label}
-          </span>
         </button>
         {open && (
-          <div id={detailsId} className="ml-5 border-l border-border py-2 pl-4">
-            <ol className="space-y-2">
-              {calls.map((call) => (
-                <ActivityCallDetail key={call.id} call={call} />
-              ))}
-            </ol>
+          <div id={detailsId} className={`mt-1.5 max-w-[85%] ${TOOL_STEP_LIST_CLASSES}`}>
+            {calls.map((call) => (
+              <ActivityCallDetail key={call.id} call={call} />
+            ))}
           </div>
         )}
       </div>
@@ -1196,8 +1160,10 @@ export default function MessageList({
               );
             }
             if (item.kind === "activity") {
+              // An activity line belongs to the answer around it, so it sits
+              // 8px from both neighbours rather than the list's own 24px.
               return (
-                <div key={item.key} className="space-y-3">
+                <div key={item.key} className="-mt-4 -mb-4 space-y-3">
                   <ActivityRow calls={item.calls} />
                   {item.calls.map((call) => {
                     if (call.name !== "generate_image") return null;
@@ -1268,7 +1234,7 @@ export default function MessageList({
               and "thinking…" would be wrong during a verify command. */}
           {turnStatus && !runningVerifyLabel && <TurnStatusLine status={turnStatus} />}
           {showRetry && (
-            <div className="flex justify-start">
+            <div className="-mt-4 flex justify-start">
               <button
                 type="button"
                 onClick={onRetry}

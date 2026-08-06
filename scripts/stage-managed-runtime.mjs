@@ -1,9 +1,15 @@
 #!/usr/bin/env node
-// Downloads one pinned official llama.cpp archive for the current release
-// target, verifies its SHA-256, extracts only llama-server + its adjacent
-// runtime libraries/license, and stages that self-contained tree as a Tauri
+// Downloads one pinned official runtime archive for the current release
+// target, verifies its SHA-256, extracts only the server binary + its adjacent
+// runtime libraries/licenses, and stages that self-contained tree as a Tauri
 // resource. The resulting runtime is owned by Little Monkey; end users do not
-// need Ollama or a system llama.cpp installation.
+// need Ollama, a system llama.cpp, ComfyUI, or a Python environment.
+//
+// Usage: node scripts/stage-managed-runtime.mjs [runtime-id]
+//   llama (default) — llama.cpp `llama-server`
+//   sd              — stable-diffusion.cpp `sd-server`
+// The target triple comes from MANAGED_RUNTIME_TARGET, CLI_SIDECAR_TARGET, or
+// the host. A runtime that publishes no binary for the target exits non-zero.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -27,34 +33,39 @@ import { fileURLToPath } from "node:url";
 
 import { hostTriple } from "./lib/cliSidecarPlaceholder.mjs";
 import {
-  MANAGED_LLAMA_ASSETS,
-  MANAGED_LLAMA_VERSION,
+  managedRuntime,
+  serverFileName,
+  stagedRuntimeDirectory,
 } from "./lib/managedRuntimeManifest.mjs";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const runtime = managedRuntime(process.argv[2] ?? "llama");
 const target =
   process.env.MANAGED_RUNTIME_TARGET ||
   process.env.CLI_SIDECAR_TARGET ||
   hostTriple();
-const asset = MANAGED_LLAMA_ASSETS[target];
+const asset = runtime.assets[target];
 if (!asset) {
-  throw new Error(
-    `No managed llama.cpp runtime is pinned for target ${target}. ` +
-      `Supported targets: ${Object.keys(MANAGED_LLAMA_ASSETS).join(", ")}`,
-  );
+  const detail =
+    `No managed ${runtime.manifestRuntime} runtime is pinned for target ${target}. ` +
+    `Supported targets: ${Object.keys(runtime.assets).join(", ")}`;
+  // An optional runtime simply does not exist on some hosts. Skipping is the
+  // correct outcome — the app already treats an absent tree as "this feature
+  // is unavailable here" — so a release build for such a target must not fail.
+  if (!runtime.optional) throw new Error(detail);
+  console.log(`[stage-managed-runtime] ${detail} Skipping.`);
+  process.exit(0);
 }
 
+const serverName = serverFileName(runtime, target);
 const stageRoot = join(
   repoRoot,
   "src-tauri",
   "resources",
   "managed-runtime",
-  `llama-${MANAGED_LLAMA_VERSION}`,
+  stagedRuntimeDirectory(runtime),
 );
-const stagedBinary = join(
-  stageRoot,
-  target.includes("windows") ? "llama-server.exe" : "llama-server",
-);
+const stagedBinary = join(stageRoot, serverName);
 const stagedManifest = join(stageRoot, "runtime-manifest.json");
 
 function sha256File(path) {
@@ -67,7 +78,8 @@ function cachedStageIsCurrent() {
     const manifest = JSON.parse(readFileSync(stagedManifest, "utf8"));
     if (
       manifest.schemaVersion !== 1 ||
-      manifest.version !== MANAGED_LLAMA_VERSION ||
+      manifest.runtime !== runtime.manifestRuntime ||
+      manifest.version !== runtime.version ||
       manifest.target !== target ||
       manifest.archiveSha256 !== asset.sha256
     ) {
@@ -89,12 +101,14 @@ function cachedStageIsCurrent() {
 
 if (cachedStageIsCurrent()) {
   console.log(
-    `[stage-managed-runtime] ${MANAGED_LLAMA_VERSION} already staged for ${target}`,
+    `[stage-managed-runtime] ${runtime.id} ${runtime.version} already staged for ${target}`,
   );
   process.exit(0);
 }
 
-const workRoot = mkdtempSync(join(tmpdir(), "little-monkey-llama-runtime-"));
+const workRoot = mkdtempSync(
+  join(tmpdir(), `little-monkey-${runtime.id}-runtime-`),
+);
 const archivePath = join(workRoot, basename(asset.archive));
 const extractRoot = join(workRoot, "extract");
 const publishRoot = join(workRoot, "publish");
@@ -138,27 +152,40 @@ try {
   };
   walk(extractRoot);
 
-  const serverName = target.includes("windows")
-    ? "llama-server.exe"
-    : "llama-server";
   const server = candidates.find((path) => basename(path) === serverName);
   if (!server) {
     throw new Error(`Verified archive did not contain ${serverName}`);
   }
   const serverDirectory = dirname(server);
 
+  // Extra executables the runtime ships and the app also launches.
+  const extraNames = (runtime.extraBinaries ?? []).map((name) =>
+    target.includes("windows") ? `${name}.exe` : name,
+  );
+  for (const name of extraNames) {
+    if (!candidates.some((path) => basename(path) === name)) {
+      throw new Error(`Verified archive did not contain ${name}`);
+    }
+  }
+  const executableNames = new Set([serverName, ...extraNames]);
+
   const shouldStage = (path) => {
     if (dirname(path) !== serverDirectory) return false;
     const name = basename(path);
-    if (name === serverName || name === "LICENSE") return true;
+    // `.txt` covers stable-diffusion.cpp's ggml.txt / stable-diffusion.cpp.txt
+    // license notices, which upstream ships instead of a bare LICENSE file.
+    if (executableNames.has(name) || name === "LICENSE") return true;
+    if (extname(name).toLowerCase() === ".txt") return true;
     if (target.includes("windows")) return extname(name).toLowerCase() === ".dll";
     if (target.includes("apple")) return name.endsWith(".dylib");
     return name.includes(".so");
   };
 
   const selected = candidates.filter(shouldStage);
-  if (!selected.some((path) => basename(path) === serverName)) {
-    throw new Error(`Runtime staging lost ${serverName}`);
+  for (const name of executableNames) {
+    if (!selected.some((path) => basename(path) === name)) {
+      throw new Error(`Runtime staging lost ${name}`);
+    }
   }
 
   for (const source of selected) {
@@ -167,7 +194,7 @@ try {
     // all remain valid after Tauri packages it.
     const destination = join(publishRoot, basename(source));
     copyFileSync(source, destination);
-    if (!target.includes("windows") && basename(source) === serverName) {
+    if (!target.includes("windows") && executableNames.has(basename(source))) {
       chmodSync(destination, 0o755);
     }
   }
@@ -179,15 +206,15 @@ try {
       name,
       sha256: sha256File(join(publishRoot, name)),
       sizeBytes: statSync(join(publishRoot, name)).size,
-      executable: name === serverName,
+      executable: executableNames.has(name),
     }));
   writeFileSync(
     join(publishRoot, "runtime-manifest.json"),
     `${JSON.stringify(
       {
         schemaVersion: 1,
-        runtime: "llama.cpp",
-        version: MANAGED_LLAMA_VERSION,
+        runtime: runtime.manifestRuntime,
+        version: runtime.version,
         target,
         sourceUrl: asset.url,
         archiveSha256: asset.sha256,
@@ -202,7 +229,7 @@ try {
   mkdirSync(dirname(stageRoot), { recursive: true });
   cpSync(publishRoot, stageRoot, { recursive: true });
   console.log(
-    `[stage-managed-runtime] staged ${files.length} files for ${target} at ${stageRoot}`,
+    `[stage-managed-runtime] staged ${files.length} ${runtime.id} files for ${target} at ${stageRoot}`,
   );
 } finally {
   rmSync(workRoot, { recursive: true, force: true });

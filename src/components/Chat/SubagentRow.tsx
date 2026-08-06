@@ -1,19 +1,20 @@
-import { memo, useId, useState } from "react";
-import { Bot, ChevronRight } from "lucide-react";
+import { memo, useEffect, useId, useState } from "react";
+import { Asterisk, ChevronRight } from "lucide-react";
 
 import { textContent, type ChatMessage } from "../../lib/llamaClient";
 import { CANCELLED_TOOL_RESULT } from "../../lib/turnEngine";
 import { unwrapUntrustedContent } from "../../lib/untrustedContent";
 import { useSubagentStore, type SubagentStatus } from "../../store/subagentStore";
 import { useSessionStore } from "../../store/sessionStore";
-import { StatusPill, type PillTone } from "../ui";
+import { formatCompactTokens, formatElapsed } from "../../lib/taskFormat";
 import { useT } from "../../lib/i18n";
-import { ToolCallRow, resultLooksLikeError } from "./MessageList";
-
-/** Same `en-US` grouping-separator formatting `ContextUsageIndicator.tsx` uses for the parent session's own token count — kept local (rather than shared) since the two components have no other coupling and this is a one-line function. */
-function formatTokenCount(value: number): string {
-  return value.toLocaleString("en-US");
-}
+import {
+  activityCallCommandLine,
+  activityCallCopyText,
+  formatActivityResult,
+  resultLooksLikeError,
+} from "./activityTimeline";
+import { StepCopyButton, ToolStepRow, TOOL_STEP_LIST_CLASSES } from "./ToolStepRow";
 
 export interface SubagentRowProps {
   /** The session this `task` tool_call belongs to — used only to look up
@@ -70,31 +71,82 @@ export interface ChildToolCallRow {
   result?: string;
 }
 
-/** Pairs up the child's own `tool_calls`/`tool` messages the same way
+/** One round of the child's work: the calls a single assistant message made,
+ * under the narration that came with (or immediately before) them —
+ * Claude-Code-desktop-style step grouping instead of one flat row per call. */
+export interface ChildToolGroup {
+  key: string;
+  /** The child's own narration for this round; `null` when it said nothing. */
+  title: string | null;
+  calls: ChildToolCallRow[];
+}
+
+const GROUP_TITLE_MAX = 100;
+
+/** First non-blank line of an assistant message, capped — a group header is
+ * one line, and a child's narration is often a paragraph. */
+function groupTitle(text: string): string | null {
+  const line = text
+    .split("\n")
+    .map((part) => part.trim())
+    .find((part) => part.length > 0);
+  if (!line) return null;
+  return line.length > GROUP_TITLE_MAX ? `${line.slice(0, GROUP_TITLE_MAX - 1)}…` : line;
+}
+
+/** Groups the child's own `tool_calls`/`tool` messages by the assistant round
+ * that issued them, pairing each call with its result the same way
  * `MessageList.tsx`'s `buildTimeline` does for the parent transcript — a
  * deliberately simpler pass since a subagent's local transcript has none of
  * the parent's notices (no checkpoints/memory/plan/verify/sources rows can
- * appear inside a child run in this slice). */
-export function extractChildToolCalls(messages: ChatMessage[]): ChildToolCallRow[] {
+ * appear inside a child run in this slice).
+ *
+ * A text-only assistant message carries its narration forward to the next
+ * round that actually calls tools (models commonly say what they're about to
+ * do in one message and do it in the next), so the group reads as a titled
+ * step rather than an anonymous batch. */
+export function groupChildToolCalls(messages: ChatMessage[]): ChildToolGroup[] {
   const resultByCallId = new Map<string, string>();
   for (const message of messages) {
     if (message.role === "tool" && message.tool_call_id) {
       resultByCallId.set(message.tool_call_id, textContent(message.content));
     }
   }
-  const rows: ChildToolCallRow[] = [];
+  const groups: ChildToolGroup[] = [];
+  let pendingTitle: string | null = null;
   for (const message of messages) {
     if (message.role !== "assistant") continue;
-    for (const toolCall of message.tool_calls ?? []) {
-      rows.push({
+    const title = groupTitle(textContent(message.content));
+    const toolCalls = message.tool_calls ?? [];
+    if (toolCalls.length === 0) {
+      pendingTitle = title ?? pendingTitle;
+      continue;
+    }
+    groups.push({
+      key: toolCalls[0].id,
+      title: title ?? pendingTitle,
+      calls: toolCalls.map((toolCall) => ({
         key: toolCall.id,
         name: toolCall.function.name,
         args: toolCall.function.arguments,
         result: resultByCallId.get(toolCall.id),
-      });
-    }
+      })),
+    });
+    pendingTitle = null;
   }
-  return rows;
+  return groups;
+}
+
+/** Flat, ordered view of every child call — the count/"no activity" source,
+ * and what a single untitled group renders as. */
+export function extractChildToolCalls(messages: ChatMessage[]): ChildToolCallRow[] {
+  return groupChildToolCalls(messages).flatMap((group) => group.calls);
+}
+
+/** A child call in the shape `activityTimeline`'s per-tool formatters take
+ * (`key` here is the same tool_call id their `id` means). */
+function asActivityCall(call: ChildToolCallRow) {
+  return { id: call.key, name: call.name, args: call.args, result: call.result };
 }
 
 export function statusLabelKey(status: SubagentStatus): string {
@@ -128,6 +180,40 @@ export function resolveSubagentStatus(liveStatus: SubagentStatus | undefined, re
   return "done";
 }
 
+/** One step of a subagent's mini-transcript: the round's narration as the
+ * step title, expanding to each call's command and output with its own copy
+ * button — the same `ToolStepRow` chrome the parent transcript's
+ * `ActivityRow` uses for its own steps. */
+const ChildToolGroupRow = memo(function ChildToolGroupRow({ group }: { group: ChildToolGroup }) {
+  const failed = group.calls.some((call) => call.result !== undefined && resultLooksLikeError(call.result));
+  // Untitled round: its own command line is the only thing to name it by.
+  const title = group.title ?? activityCallCommandLine(asActivityCall(group.calls[0]));
+
+  return (
+    <ToolStepRow title={title} failed={failed}>
+      <div className="space-y-3">
+        {group.calls.map((call) => {
+          const activityCall = asActivityCall(call);
+          const result = call.result === undefined ? null : formatActivityResult(call.result);
+          return (
+            <div key={call.key} className="min-w-0">
+              <div className="flex items-start gap-2">
+                <pre className="min-w-0 flex-1 whitespace-pre-wrap break-all font-mono text-[11px] text-foreground">
+                  {activityCallCommandLine(activityCall)}
+                </pre>
+                <StepCopyButton text={activityCallCopyText(activityCall)} />
+              </div>
+              <pre className="mt-1.5 max-h-56 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-muted">
+                {result ? result.text || "(no output)" : "…"}
+              </pre>
+            </div>
+          );
+        })}
+      </div>
+    </ToolStepRow>
+  );
+});
+
 /**
  * Renders a `task` tool_call as a dedicated timeline row (see
  * `MessageList.tsx`'s `buildTimeline`, which special-cases `name === 'task'`
@@ -153,78 +239,78 @@ const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result 
   // transient store is gone (post-restart), see ChatSession.subagentRunMeta.
   const persistedMeta = useSessionStore((state) => state.sessions.find((s) => s.id === sessionId)?.subagentRunMeta?.[taskId]);
 
-  const { description, profile } = parseTaskArgs(args);
+  const { description } = parseTaskArgs(args);
   const status: SubagentStatus = resolveSubagentStatus(live?.status, result);
   const running = status === "running";
   const transcript = live?.liveMessages ?? persisted ?? [];
-  const childToolCalls = extractChildToolCalls(transcript);
-  const toolCallCount = live?.toolCallCount ?? persistedMeta?.toolCallCount ?? childToolCalls.length;
+  const childGroups = groupChildToolCalls(transcript);
   const usage = live?.usage ?? persistedMeta?.usage;
+  // Elapsed comes from whichever stats source exists — the live entry while
+  // the run is going, the finish-time snapshot afterwards (see
+  // ChatSession.subagentRunMeta).
+  const stats = live ?? persistedMeta;
 
-  const tone: PillTone = status === "running" ? "warning" : status === "error" ? "danger" : status === "cancelled" ? "neutral" : "success";
+  // A 1s tick, active only while the run is live, so the footer's elapsed
+  // label advances without any store churn — same approach
+  // `SubagentGroupCard` takes for its own ticking label.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!running) return;
+    const interval = setInterval(() => setTick((value) => value + 1), 1000);
+    return () => clearInterval(interval);
+  }, [running]);
+
+  // The header names what the run is doing right now while it works (the
+  // child's own last tool boundary), and what it was asked to do once done.
+  const headerTitle = running ? live?.lastActivity || description : description;
+  const elapsed = stats ? formatElapsed((stats.finishedAt ?? Date.now()) - stats.startedAt) : null;
+  const footerParts = [
+    status === "error" ? t("SubagentRow.statusFailed") : status === "cancelled" ? t("SubagentRow.statusCancelled") : null,
+    elapsed,
+    usage ? t("SubagentRow.tokenUsage", { count: formatCompactTokens(usage.totalTokens) }) : null,
+  ].filter(Boolean);
 
   return (
     <div className="flex justify-start">
-      <div className="max-w-[85%] min-w-0 overflow-hidden rounded-md border border-border bg-surface-2">
+      <div className="w-full min-w-0">
         <button
           type="button"
           aria-expanded={open}
           aria-controls={detailsId}
           onClick={() => setOpen((prev) => !prev)}
-          className="flex min-h-11 w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-xs text-muted transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-inset motion-reduce:transition-none"
+          className="flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-[13px] text-muted transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent motion-reduce:transition-none"
         >
+          <span className="min-w-0 truncate">{headerTitle}</span>
+          {running && (
+            <span className="flex shrink-0 items-center gap-1" aria-hidden>
+              <span className="h-1 w-1 animate-bounce rounded-full bg-faint [animation-delay:-0.3s]" />
+              <span className="h-1 w-1 animate-bounce rounded-full bg-faint [animation-delay:-0.15s]" />
+              <span className="h-1 w-1 animate-bounce rounded-full bg-faint" />
+            </span>
+          )}
           <ChevronRight
-            size={12}
+            size={13}
             className={`shrink-0 text-faint transition-transform duration-150 motion-reduce:transition-none ${open ? "rotate-90" : ""}`}
+            aria-hidden
           />
-          <Bot size={13} className="shrink-0 text-faint" />
-          <span className="truncate font-medium text-foreground">{description}</span>
-          <span className="shrink-0 rounded-full bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-faint">
-            {t(profile === "code" ? "SubagentRow.profileCode" : "SubagentRow.profileExplore")}
-          </span>
-          <StatusPill tone={tone}>{t(statusLabelKey(status))}</StatusPill>
-          {usage && (
-            <span className="shrink-0 font-mono text-[10px] text-faint">
-              {t("SubagentRow.tokenUsage", { count: formatTokenCount(usage.totalTokens) })}
-            </span>
-          )}
-          {running && live?.lastActivity && (
-            <span className="ml-auto flex min-w-0 shrink items-center gap-1 truncate text-faint">
-              <span className="flex items-center gap-1">
-                <span className="h-1 w-1 animate-bounce rounded-full bg-faint [animation-delay:-0.3s]" />
-                <span className="h-1 w-1 animate-bounce rounded-full bg-faint [animation-delay:-0.15s]" />
-                <span className="h-1 w-1 animate-bounce rounded-full bg-faint" />
-              </span>
-              <span className="truncate font-mono">{live.lastActivity}</span>
-            </span>
-          )}
         </button>
         {open && (
-          <div id={detailsId} className="space-y-2 border-t border-border bg-background px-3 py-2 font-mono text-[11px] text-muted">
-            <div className="flex items-center gap-2 text-faint">
-              <span>
-                {toolCallCount === 1
-                  ? t("SubagentRow.toolCallCountOne")
-                  : t("SubagentRow.toolCallCountMany", { count: toolCallCount })}
-              </span>
-              {usage && (
-                <>
-                  <span>·</span>
-                  <span>{t("SubagentRow.tokenUsage", { count: formatTokenCount(usage.totalTokens) })}</span>
-                </>
+          <div id={detailsId} className="mt-1.5 max-w-[85%]">
+            <div className={TOOL_STEP_LIST_CLASSES}>
+              {childGroups.length === 0 ? (
+                <div className="px-3 py-2.5 text-[13px] text-faint">{t("SubagentRow.noActivity")}</div>
+              ) : (
+                childGroups.map((group) => <ChildToolGroupRow key={group.key} group={group} />)
               )}
             </div>
-            {childToolCalls.length === 0 ? (
-              <div className="text-faint">{t("SubagentRow.noActivity")}</div>
-            ) : (
-              <div className="space-y-1.5">
-                {childToolCalls.map((row) => (
-                  <ToolCallRow key={row.key} name={row.name} args={row.args} result={row.result} />
-                ))}
+            {footerParts.length > 0 && (
+              <div className="mt-1.5 flex items-center gap-1.5 px-1 text-[11px] text-faint">
+                <Asterisk size={12} className="shrink-0 text-accent" aria-hidden />
+                <span className="truncate font-mono">{footerParts.join(" · ")}</span>
               </div>
             )}
             {result !== undefined && (
-              <div>
+              <div className="mt-2 px-1 font-mono text-[11px] text-muted">
                 <div className="mb-1 text-faint">{t("SubagentRow.reportLabel")}</div>
                 <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all">{result}</pre>
               </div>

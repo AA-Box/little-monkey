@@ -125,7 +125,13 @@ use crate::{ollama, providers, AppState};
 
 /// LM Studio-compatible default port, so drop-in clients that hardcode 1234
 /// need no configuration at all.
-const DEFAULT_PORT: u16 = 1234;
+///
+/// Drawn from `http_policy` rather than repeating the literal: that module's
+/// bind-error message branches on `port == DEFAULT_HTTP_PORT` to name the *other*
+/// listener as the likely conflict, so a listener with its own copy of the number
+/// could be moved off 1234 and silently make that diagnosis wrong. The shared
+/// constant is what makes the collision a stated fact instead of a coincidence.
+const DEFAULT_PORT: u16 = crate::http_policy::DEFAULT_HTTP_PORT;
 
 /// Prefix on every generated bearer token, so a leaked token is
 /// self-describing (`lmk-<32 hex chars>`) the same way e.g. GitHub's
@@ -157,6 +163,135 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// [`handle_request`] can return one concrete type regardless of which route
 /// it took.
 type ResponseBody = BoxBody<Bytes, BoxError>;
+
+/// Keeps an [`AdmissionGuard`] alive until the response body it belongs to is
+/// finished or the client stops reading it.
+///
+/// The bug this fixes: the accept loop dropped its guard as soon as
+/// `serve_one_request` *returned a `Response`*, which for the dominant traffic
+/// shape is far too early. A streaming `/v1/chat/completions` returns as soon as
+/// upstream headers arrive and hands back a [`StreamBody`] wrapping reqwest's
+/// `bytes_stream` — not one byte of which has been read yet. So the permit was
+/// released before the request did any of its work, and concurrent SSE streams
+/// were not bounded by [`http_policy::MAX_ACTIVE_REQUESTS`] at all: the counter
+/// measured time-to-first-header, not time in flight.
+///
+/// Wrapping the body rather than threading the guard into each handler is
+/// deliberate. The guard belongs to the accept loop, the body is built deep
+/// inside a route, and every route already funnels through one `Response` — so
+/// this attaches at the one place both facts are available, and no handler
+/// signature has to learn that admission control exists. `m3_http_server.rs`
+/// reaches the same end by moving its guard into `sse_body`'s unfold state; it
+/// can, because it constructs its own stream and has exactly one streaming shape.
+///
+/// [`http_body_util::BodyStream`] rather than `into_data_stream` so trailers
+/// survive: nothing legacy sends them today, and a wrapper that silently ate
+/// them would be a trap for whatever does first.
+fn hold_permit_until_body_ends(
+    body: ResponseBody,
+    guard: crate::http_policy::AdmissionGuard,
+) -> ResponseBody {
+    // Racing the guard's own token here is safe, and the ordering is the reason:
+    // the token is cancelled by `AdmissionGuard::drop`, and the guard lives in
+    // this stream's state — so it cannot fire from this stream's own teardown
+    // while the stream is still being polled. It fires only from the *parent*
+    // token, which the accept loop cancels when it exits. That is a stopping
+    // server, and this is where a stream in flight finds out about it.
+    let cancel = guard.cancellation();
+    // The guard lives in the unfold state, so it drops when the stream finishes
+    // *or* when hyper drops the body because the client went away — which is the
+    // release this needs, and the reason there is no explicit drop below.
+    let stream = futures_util::stream::unfold(
+        (http_body_util::BodyStream::new(body), guard, cancel, false),
+        |(mut frames, guard, cancel, done)| async move {
+            if done {
+                return None;
+            }
+            tokio::select! {
+                frame = frames.next() => frame.map(|frame| (frame, (frames, guard, cancel, false))),
+                _ = cancel.cancelled() => {
+                    // An error, not a clean end. A truncated SSE stream that
+                    // closes successfully is indistinguishable to the client from
+                    // a completed one that happens to lack `[DONE]` — it would
+                    // read a partial answer as the whole answer. `done` ends the
+                    // stream on the next poll so the error is emitted exactly
+                    // once.
+                    let error: BoxError = Box::new(std::io::Error::other(
+                        "The API server stopped while this response was streaming",
+                    ));
+                    Some((Err(error), (frames, guard, cancel, true)))
+                }
+            }
+        },
+    );
+    BodyExt::boxed(StreamBody::new(stream))
+}
+
+/// Awaits `work` unless this request is cancelled first.
+///
+/// `reqwest` has no cancel method, so cancellation is a race against the request
+/// future — dropping the loser is what aborts the connection. `None` means
+/// cancelled, and callers owe the client an answer that says so rather than a
+/// `502` blaming the upstream for a stop this app initiated.
+async fn unless_cancelled<T>(
+    cancel: &tokio_util::sync::CancellationToken,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        value = work => Some(value),
+        _ = cancel.cancelled() => None,
+    }
+}
+
+/// The answer a request gets when the server stops mid-flight.
+///
+/// `503` and not `502`: the upstream did nothing wrong, and a client that retries
+/// on `502` would be retrying against a listener that is gone.
+fn cancelled_response() -> Response<ResponseBody> {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "The API server stopped before this request completed",
+        "server_stopping",
+    )
+}
+
+/// The one implementation of "this listener admits a request".
+///
+/// Both accept loops call it, which is the point: the legacy listener had two
+/// serving paths and only one of them was admitted. `run_cli_server`
+/// (`monkey-cli api-serve`) spawned an unbounded task per connection with no
+/// permit, no counters and no cancellation, serving the *identical* route set
+/// through the same `serve_one_request` — so every legacy route stayed reachable
+/// with admission control fully bypassed, while the doc comment above
+/// [`run_accept_loop`]'s admission claimed a route could no longer do that.
+///
+/// `serve` returns the response *and* performs the per-request bookkeeping each
+/// loop does differently (token-used records, request logging), so the two loops
+/// share the rule without sharing their `ServerDeps` construction. It receives the
+/// guard's cancellation token, which is how that token reaches `ServerDeps` — a
+/// handler cannot be written that silently ignores it, because there is no way to
+/// build the deps without one.
+async fn serve_with_admission<Fut>(
+    admission: &crate::http_policy::RequestAdmission,
+    server_shutdown: &tokio_util::sync::CancellationToken,
+    serve: impl FnOnce(tokio_util::sync::CancellationToken) -> Fut,
+) -> Response<ResponseBody>
+where
+    Fut: std::future::Future<Output = Response<ResponseBody>>,
+{
+    let Some(guard) = admission.try_admit(server_shutdown) else {
+        // Refused rather than queued without bound. The legacy OpenAI error
+        // envelope is preserved so existing SDK clients still parse it.
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The API server active-request quota is exhausted",
+            "server_busy",
+        );
+    };
+    serve(guard.cancellation())
+        .await
+        .map(|body| hold_permit_until_body_ends(body, guard))
+}
 
 /// In-memory lifecycle state for the managed API server process — mirrors
 /// `llama::LlamaState` field-for-field. No token material lives here as of
@@ -690,6 +825,27 @@ pub fn route_model(
     ModelRoute::Ollama
 }
 
+/// Which of the two clients a route's upstream is allowed to be reached with.
+///
+/// Split out as a pure function of the route so the choice is *assertable*. A
+/// `match` inlined at each send site would be equally correct and completely
+/// untestable: `reqwest::Client` exposes nothing about its own timeouts or
+/// redirect policy, so the only way to prove a route uses the hardened client is
+/// to compare which client it picked — which needs the picking to be a function.
+///
+/// `Unknown` never reaches a send site (it 404s earlier), and returning the local
+/// client for it is the safe direction: that client reaches only this machine.
+fn client_for<'deps>(deps: &'deps ServerDeps, route: &ModelRoute) -> &'deps reqwest::Client {
+    match route {
+        // Hardcoded loopback both: `127.0.0.1:{llama_port}` and
+        // `ollama::OLLAMA_BASE_URL`. Neither is user-configurable at this layer.
+        ModelRoute::Llama | ModelRoute::Ollama | ModelRoute::Unknown => &deps.local_client,
+        // The provider's `base_url` is whatever the user configured, and the
+        // request carries their API key.
+        ModelRoute::Providers { .. } => &deps.cloud_client,
+    }
+}
+
 /// Maps a routing decision to the [`Backend`] a token's `backends` list is
 /// checked against — `Unknown` never reaches here (handled earlier as a
 /// 404).
@@ -843,7 +999,45 @@ pub struct ServerDeps {
     /// only gates whether a `Providers` route is actually served.
     pub providers: Vec<ProviderSummary>,
     tokens: Vec<StoredToken>,
-    pub client: reqwest::Client,
+    /// The client for peers on this machine: the bundled `llama-server` and the
+    /// local Ollama daemon. Deliberately a default `reqwest::Client`, with no
+    /// timeout and reqwest's stock ten-hop redirect policy.
+    ///
+    /// Kept permissive on purpose rather than by neglect. There is no credential
+    /// to forward — neither peer has any authentication at all — and both are
+    /// reached at a hardcoded loopback address, so a redirect policy has nothing
+    /// to protect. A silence budget would be the actively wrong thing here:
+    /// prompt processing on a large context legitimately produces no bytes for
+    /// minutes, and this side of the split is where that happens.
+    pub local_client: reqwest::Client,
+    /// The client for a configured cloud provider, from [`crate::egress::hardened`].
+    ///
+    /// This is the half that carries a credential to an address the user typed,
+    /// so it gets the connect timeout, the silence budget and the redirect policy
+    /// that refuses to walk an `x-api-key` to a host a `302` chose. See
+    /// `egress::hardened`'s doc for the three holes that closes.
+    ///
+    /// One client per policy rather than one client per server is the whole point
+    /// of this split: the field it replaced served both of these roles, so
+    /// hardening it would have applied a silence budget to loopback inference and
+    /// leaving it bare left a credential exposed to a redirect. No single policy
+    /// fits both, and that is not a defect in either policy.
+    pub cloud_client: reqwest::Client,
+    /// This request's cancellation token, from its [`http_policy::AdmissionGuard`].
+    ///
+    /// A field rather than a parameter so no handler signature has to learn that
+    /// cancellation exists — handlers already receive `&ServerDeps`.
+    ///
+    /// **What this is actually for is server shutdown, not client disconnect.**
+    /// A disconnecting client is already handled by drop: hyper drops the service
+    /// future, which drops the reqwest future with it. Stopping the API server was
+    /// the real hole — `stop_server_core` awaits only the accept loop's task, and
+    /// every connection is a separate `tokio::spawn` that nothing joins, so
+    /// requests it already accepted kept streaming from upstream after the user
+    /// pressed Stop and the UI said "stopped". The accept loop's drop-guard
+    /// cancels the parent token on exit, and every guard's token is a child of it,
+    /// so honouring this is what makes that stop real.
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 /// A decoded HTTP request. Deliberately not `hyper::Request<Incoming>`
@@ -1071,7 +1265,7 @@ async fn handle_models(deps: &ServerDeps, authed: Option<&TokenAuth>) -> Respons
     // request against) it, exactly like `handle_chat_completions` already
     // enforces for that backend.
     if deps.expose_ollama && backend_visible(authed, Backend::Ollama) {
-        match ollama::list_tag_names(&deps.client).await {
+        match ollama::list_tag_names(&deps.local_client).await {
             Ok(tags) => {
                 for tag in tags {
                     data.push(json!({ "id": tag, "object": "model", "owned_by": "ollama" }));
@@ -1196,16 +1390,14 @@ async fn handle_chat_completions(
     }
 
     let request_builder = match &route {
-        ModelRoute::Llama => deps
-            .client
+        ModelRoute::Llama => client_for(deps, &route)
             .post(format!(
                 "http://127.0.0.1:{}/v1/chat/completions",
                 deps.llama_port
             ))
             .header(header::CONTENT_TYPE, "application/json")
             .body(body),
-        ModelRoute::Ollama => deps
-            .client
+        ModelRoute::Ollama => client_for(deps, &route)
             .post(format!("{}/v1/chat/completions", deps.ollama_base_url))
             .header(header::CONTENT_TYPE, "application/json")
             .body(body),
@@ -1252,8 +1444,7 @@ async fn handle_chat_completions(
             // reused verbatim, unmodified.
             let mut outgoing = parsed.clone();
             outgoing["model"] = json!(model_id);
-            let request = deps
-                .client
+            let request = client_for(deps, &route)
                 .post(format!("{base_url}/chat/completions"))
                 .bearer_auth(&api_key)
                 .json(&outgoing);
@@ -1262,7 +1453,10 @@ async fn handle_chat_completions(
         ModelRoute::Unknown => unreachable!("handled above"),
     };
 
-    let upstream = match request_builder.send().await {
+    let Some(sent) = unless_cancelled(&deps.cancel, request_builder.send()).await else {
+        return cancelled_response();
+    };
+    let upstream = match sent {
         Ok(resp) => resp,
         Err(e) => {
             return error_response(
@@ -1300,7 +1494,12 @@ async fn handle_chat_completions(
                 "building a streaming response from an upstream status + content-type never fails",
             )
     } else {
-        match upstream.bytes().await {
+        // Reading the body is where a slow upstream actually spends its time, so
+        // cancelling only the send would leave the request running past a stop.
+        let Some(read) = unless_cancelled(&deps.cancel, upstream.bytes()).await else {
+            return cancelled_response();
+        };
+        match read {
             Ok(bytes) => Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, content_type)
@@ -1411,14 +1610,15 @@ async fn handle_embeddings(
         ModelRoute::Providers { .. } | ModelRoute::Unknown => unreachable!("handled above"),
     };
 
-    let upstream = match deps
-        .client
+    let request = client_for(deps, &route)
         .post(&upstream_url)
         .header(header::CONTENT_TYPE, "application/json")
         .body(body)
-        .send()
-        .await
-    {
+        .send();
+    let Some(sent) = unless_cancelled(&deps.cancel, request).await else {
+        return cancelled_response();
+    };
+    let upstream = match sent {
         Ok(resp) => resp,
         Err(e) => {
             return error_response(
@@ -1431,7 +1631,10 @@ async fn handle_embeddings(
 
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    match upstream.bytes().await {
+    let Some(read) = unless_cancelled(&deps.cancel, upstream.bytes()).await else {
+        return cancelled_response();
+    };
+    match read {
         Ok(bytes) => Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")
@@ -1869,7 +2072,10 @@ pub async fn handle_request(
 /// `ServerDeps` (which additionally reads `AppState::llama`'s live status
 /// and `api_server.json`'s live token list — see [`build_deps`]).
 struct ServerRuntime {
-    client: reqwest::Client,
+    /// See [`ServerDeps::local_client`] — built once per server, cloned per request.
+    local_client: reqwest::Client,
+    /// See [`ServerDeps::cloud_client`].
+    cloud_client: reqwest::Client,
     ollama_base_url: String,
     require_token: bool,
     expose_ollama: bool,
@@ -1927,7 +2133,11 @@ fn tokens_from_config(config: &ApiServerConfig) -> Vec<StoredToken> {
         .collect()
 }
 
-fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
+fn build_deps(
+    app: &AppHandle,
+    runtime: &ServerRuntime,
+    cancel: tokio_util::sync::CancellationToken,
+) -> ServerDeps {
     let state = app.state::<AppState>();
     let (llama_port, llama_ready, llama_model_stem, llama_embeddings_enabled) = {
         let llama = state.llama.lock().unwrap();
@@ -1962,7 +2172,9 @@ fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
         expose_providers: runtime.expose_providers,
         providers: build_provider_catalog(app),
         tokens,
-        client: runtime.client.clone(),
+        local_client: runtime.local_client.clone(),
+        cloud_client: runtime.cloud_client.clone(),
+        cancel,
     }
 }
 
@@ -2160,6 +2372,23 @@ async fn run_accept_loop(
     shutdown: Arc<Notify>,
     runtime: Arc<ServerRuntime>,
 ) {
+    // Bounded admission, shared with the compatibility listener and with
+    // `run_cli_server` — see [`serve_with_admission`], which is the whole rule.
+    // Before this, every connection here spawned an unbounded task with no permit
+    // and no in-flight accounting.
+    //
+    // The permit is now held until the response *body* ends rather than until the
+    // handler returns, so the bound covers streaming requests. Cancellation is a
+    // separate matter and is still not wired: the guard carries a token, and no
+    // legacy handler reads it — see [`serve_with_admission`].
+    let admission = Arc::new(crate::http_policy::RequestAdmission::new(
+        crate::http_policy::MAX_ACTIVE_REQUESTS,
+    ));
+    // Cancelled when the loop exits, so every in-flight request is torn down
+    // rather than outliving the listener that accepted it.
+    let server_shutdown = tokio_util::sync::CancellationToken::new();
+    let _shutdown_on_exit = server_shutdown.clone().drop_guard();
+
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
@@ -2171,18 +2400,42 @@ async fn run_accept_loop(
                 let io = TokioIo::new(stream);
                 let app_for_conn = app.clone();
                 let runtime_for_conn = runtime.clone();
+                let admission_for_conn = admission.clone();
+                let shutdown_for_conn = server_shutdown.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |req: Request<Incoming>| {
                         let app_for_req = app_for_conn.clone();
-                        let deps = build_deps(&app_for_req, &runtime_for_conn);
+                        let runtime_for_req = runtime_for_conn.clone();
+                        let admission_for_req = admission_for_conn.clone();
+                        let shutdown_for_req = shutdown_for_conn.clone();
                         async move {
-                            let (resp, matched_token_id) =
-                                serve_one_request(deps, req, Some(&app_for_req)).await?;
-                            if let Some(token_id) = matched_token_id {
-                                record_token_used(&app_for_req, &token_id);
-                            }
-                            bump_request_count(&app_for_req);
-                            Ok::<_, Infallible>(resp)
+                            let response = serve_with_admission(
+                                &admission_for_req,
+                                &shutdown_for_req,
+                                |cancel| async move {
+                                    // Built inside, so the deps carry this
+                                    // request's token; there is no way to
+                                    // construct them without one.
+                                    let deps =
+                                        build_deps(&app_for_req, &runtime_for_req, cancel);
+                                    let (resp, matched_token_id) =
+                                        match serve_one_request(deps, req, Some(&app_for_req)).await
+                                        {
+                                            Ok(pair) => pair,
+                                            // `serve_one_request`'s error type is
+                                            // `Infallible`, so this arm is
+                                            // unreachable rather than swallowed.
+                                            Err(never) => match never {},
+                                        };
+                                    if let Some(token_id) = matched_token_id {
+                                        record_token_used(&app_for_req, &token_id);
+                                    }
+                                    bump_request_count(&app_for_req);
+                                    resp
+                                },
+                            )
+                            .await;
+                            Ok::<_, Infallible>(response)
                         }
                     });
                     let _ = http1::Builder::new().serve_connection(io, service).await;
@@ -2199,9 +2452,14 @@ async fn run_accept_loop(
 /// directly unit-testable without a `#[tauri::command]`/`AppHandle` — see
 /// `tests::bind_conflict_surfaces_as_status_error`.
 async fn bind_listener(port: u16) -> Result<TcpListener, String> {
-    TcpListener::bind(("127.0.0.1", port))
-        .await
-        .map_err(|e| format!("Failed to bind 127.0.0.1:{port} — {e}"))
+    TcpListener::bind(("127.0.0.1", port)).await.map_err(|error| {
+        crate::http_policy::describe_bind_error(
+            crate::http_policy::ListenerRole::LegacyProxy,
+            "127.0.0.1",
+            port,
+            &error,
+        )
+    })
 }
 
 fn record_bind_error(state: &mut ApiServerState, message: String) {
@@ -2245,7 +2503,15 @@ pub async fn run_cli_server(
     let listener = bind_listener(port).await?;
     println!("Little Monkey API server listening on http://127.0.0.1:{port}/v1 (Ctrl+C to stop)");
 
-    let client = reqwest::Client::new();
+    // Two clients, one per policy — see `ServerDeps::local_client` for why one
+    // client cannot serve both loopback inference and a credentialed cloud
+    // provider. A failure to build the hardened one is fatal rather than a silent
+    // fallback to the bare client: falling back would mean serving cloud requests
+    // with no redirect policy, which is the hole this split exists to close.
+    let local_client = reqwest::Client::new();
+    let cloud_client = crate::egress::hardened()
+        .build()
+        .map_err(|error| format!("Failed to build the cloud-provider HTTP client: {error}"))?;
     let llama_port = crate::llama::LlamaState::default().port;
     let request_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let load_custom_providers = Arc::new(load_custom_providers);
@@ -2259,6 +2525,22 @@ pub async fn run_cli_server(
     // temp+rename write in `save_config_impl` bounds it to "last writer
     // wins", never a torn file.
     let cli_state = Arc::new(AppState::default());
+    // The same bound the GUI loop has, for the same routes. This loop serves the
+    // identical route set through the same `serve_one_request`, so without this
+    // every legacy route was reachable with admission control bypassed simply by
+    // running `monkey-cli api-serve` — which is what made the GUI loop's "a route
+    // on this listener can no longer bypass admission control" untrue.
+    //
+    // Constructed once, out here: a `RequestAdmission` created inside the
+    // connection task would bound each connection separately, which looks correct
+    // and bounds nothing.
+    let admission = Arc::new(crate::http_policy::RequestAdmission::new(
+        crate::http_policy::MAX_ACTIVE_REQUESTS,
+    ));
+    // This loop owns its process, so its shutdown token is only ever cancelled by
+    // the process ending. It exists because a guard's token is derived from one;
+    // it is not a claim that `api-serve` has a graceful stop.
+    let server_shutdown = tokio_util::sync::CancellationToken::new();
 
     loop {
         let (stream, _addr) = match listener.accept().await {
@@ -2266,54 +2548,76 @@ pub async fn run_cli_server(
             Err(_) => continue, // transient accept error — keep serving
         };
         let io = TokioIo::new(stream);
-        let client = client.clone();
+        let local_client = local_client.clone();
+        let cloud_client = cloud_client.clone();
         let config_path = config_path.clone();
         let request_count = request_count.clone();
         let load_custom_providers = load_custom_providers.clone();
         let cli_state = cli_state.clone();
+        let admission_for_conn = admission.clone();
+        let shutdown_for_conn = server_shutdown.clone();
 
         tokio::spawn(async move {
             let service = service_fn(move |req: Request<Incoming>| {
-                let client = client.clone();
+                let local_client = local_client.clone();
+                let cloud_client = cloud_client.clone();
                 let config_path = config_path.clone();
                 let request_count = request_count.clone();
                 let load_custom_providers = load_custom_providers.clone();
                 let cli_state = cli_state.clone();
+                let admission_for_req = admission_for_conn.clone();
+                let shutdown_for_req = shutdown_for_conn.clone();
                 async move {
-                    let config = load_config_impl(&config_path).unwrap_or_default();
-                    let (llama_ready, llama_model_stem) =
-                        probe_llama_server(&client, llama_port).await;
-                    let deps = ServerDeps {
-                        llama_port,
-                        llama_ready,
-                        llama_model_stem,
-                        // The CLI can't know whether the GUI started
-                        // llama-server with `--embeddings` (that flag lives
-                        // only in the GUI's in-memory `LlamaState`, not on
-                        // disk) — conservatively `false`, so
-                        // `POST /v1/embeddings` 501s with a clear message
-                        // instead of guessing.
-                        llama_embeddings_enabled: false,
-                        ollama_base_url: ollama::OLLAMA_BASE_URL.to_string(),
-                        require_token: config.require_token,
-                        expose_ollama: config.expose_ollama,
-                        expose_providers: config.expose_providers,
-                        providers: provider_catalog_from(load_custom_providers()),
-                        tokens: tokens_from_config(&config),
-                        client,
-                    };
+                    let response = serve_with_admission(
+                        &admission_for_req,
+                        &shutdown_for_req,
+                        |cancel| async move {
+                            let config = load_config_impl(&config_path).unwrap_or_default();
+                            let (llama_ready, llama_model_stem) =
+                                probe_llama_server(&local_client, llama_port).await;
+                            let deps = ServerDeps {
+                                llama_port,
+                                llama_ready,
+                                llama_model_stem,
+                                // The CLI can't know whether the GUI started
+                                // llama-server with `--embeddings` (that flag lives
+                                // only in the GUI's in-memory `LlamaState`, not on
+                                // disk) — conservatively `false`, so
+                                // `POST /v1/embeddings` 501s with a clear message
+                                // instead of guessing.
+                                llama_embeddings_enabled: false,
+                                ollama_base_url: ollama::OLLAMA_BASE_URL.to_string(),
+                                require_token: config.require_token,
+                                expose_ollama: config.expose_ollama,
+                                expose_providers: config.expose_providers,
+                                providers: provider_catalog_from(load_custom_providers()),
+                                tokens: tokens_from_config(&config),
+                                local_client,
+                                cloud_client,
+                                cancel,
+                            };
 
-                    let (resp, matched_token_id) = serve_one_request(deps, req, None).await?;
-                    let n = request_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if let Some(token_id) = &matched_token_id {
-                        record_token_used_with_state(&cli_state, &config_path, token_id);
-                    }
-                    eprintln!(
-                        "[api-serve] request #{n} {} -> {}",
-                        req_log_hint(matched_token_id.as_deref()),
-                        resp.status()
-                    );
-                    Ok::<_, Infallible>(resp)
+                            let (resp, matched_token_id) =
+                                match serve_one_request(deps, req, None).await {
+                                    Ok(pair) => pair,
+                                    // `Infallible`: unreachable, not swallowed.
+                                    Err(never) => match never {},
+                                };
+                            let n =
+                                request_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if let Some(token_id) = &matched_token_id {
+                                record_token_used_with_state(&cli_state, &config_path, token_id);
+                            }
+                            eprintln!(
+                                "[api-serve] request #{n} {} -> {}",
+                                req_log_hint(matched_token_id.as_deref()),
+                                resp.status()
+                            );
+                            resp
+                        },
+                    )
+                    .await;
+                    Ok::<_, Infallible>(response)
                 }
             });
             let _ = http1::Builder::new().serve_connection(io, service).await;
@@ -2382,8 +2686,14 @@ async fn start_server_core(app: &AppHandle) -> Result<ApiServerStatusPayload, St
     };
     emit_status(app, &payload);
 
+    // Two clients, one per policy — see `ServerDeps::local_client`. Fatal rather
+    // than falling back to the bare client, for the reason `run_cli_server` gives.
+    let cloud_client = crate::egress::hardened()
+        .build()
+        .map_err(|error| format!("Failed to build the cloud-provider HTTP client: {error}"))?;
     let runtime = Arc::new(ServerRuntime {
-        client: reqwest::Client::new(),
+        local_client: reqwest::Client::new(),
+        cloud_client,
         ollama_base_url: ollama::OLLAMA_BASE_URL.to_string(),
         require_token: config.require_token,
         expose_ollama: config.expose_ollama,
@@ -2742,7 +3052,27 @@ mod tests {
                 test_provider("anthropic", "https://api.anthropic.com/v1"),
             ],
             tokens: Vec::new(),
-            client: reqwest::Client::new(),
+            local_client: reqwest::Client::new(),
+            // The real hardened client, not a stand-in: the tests below assert its
+            // actual redirect behaviour, so a bare client here would make them pass
+            // for the wrong reason.
+            cloud_client: crate::egress::hardened()
+                .build()
+                .expect("the hardened client builds"),
+            // Never cancelled, so every existing test keeps asserting the
+            // uncancelled path. The cancellation tests build their own token.
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    /// `test_deps` with a token the caller controls, for the cancellation paths.
+    fn test_deps_cancelled_by(
+        ollama_base_url: String,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> ServerDeps {
+        ServerDeps {
+            cancel,
+            ..test_deps(ollama_base_url)
         }
     }
 
@@ -2790,6 +3120,23 @@ mod tests {
 
     async fn body_bytes(resp: Response<ResponseBody>) -> Bytes {
         resp.into_body().collect().await.unwrap().to_bytes()
+    }
+
+    /// A body that yields its frame only when the test releases it, so a response
+    /// can be "returned but still streaming" — the state the old `drop(guard)`
+    /// mishandled, and the state a shutdown has to cut without looking clean.
+    /// Shared by the `admission` and `cancellation` modules, which assert opposite
+    /// halves of the same lifetime.
+    fn gated_body(release: tokio::sync::oneshot::Receiver<()>) -> ResponseBody {
+        let stream = futures_util::stream::unfold(Some(release), |release| async move {
+            let release = release?;
+            let _ = release.await;
+            Some((
+                Ok::<Frame<Bytes>, BoxError>(Frame::data(Bytes::from_static(b"data: [DONE]\n\n"))),
+                None,
+            ))
+        });
+        BodyExt::boxed(StreamBody::new(stream))
     }
 
     fn temp_config_path() -> PathBuf {
@@ -2926,6 +3273,115 @@ mod tests {
             Some(Backend::Providers)
         );
         assert_eq!(route_backend(&ModelRoute::Unknown), None);
+    }
+
+    /// Every route's client, by identity. The interesting half is the third case:
+    /// a provider route must not be reachable with the permissive loopback client.
+    ///
+    /// Asserted by pointer rather than by behaviour because `reqwest::Client`
+    /// exposes nothing about its own policy — there is no `client.redirect_policy()`
+    /// to read. Behaviour is asserted separately, in the test below.
+    #[test]
+    fn each_route_is_sent_with_the_client_its_target_class_requires() {
+        let deps = test_deps("http://127.0.0.1:11434".to_string());
+
+        for route in [ModelRoute::Llama, ModelRoute::Ollama, ModelRoute::Unknown] {
+            assert!(
+                std::ptr::eq(client_for(&deps, &route), &deps.local_client),
+                "{route:?} reaches only this machine and must use the local client"
+            );
+        }
+
+        let cloud = ModelRoute::Providers {
+            provider_id: "openai".to_string(),
+            model_id: "gpt-4o".to_string(),
+        };
+        assert!(
+            std::ptr::eq(client_for(&deps, &cloud), &deps.cloud_client),
+            "a provider route carries an API key to a configured host and must use \
+             the hardened client"
+        );
+        // The claim only means something if the two are actually different clients.
+        assert!(!std::ptr::eq(&deps.local_client, &deps.cloud_client));
+    }
+
+    /// The behavioural half, and the hole the split exists to close: a provider's
+    /// `base_url` is user-configured, so a `302` from it must not carry the caller's
+    /// API key to whatever host the response named. reqwest strips `Authorization`
+    /// across hosts but **not** `x-api-key`, which `providers::add_anthropic_headers`
+    /// sets — see `egress::hardened`.
+    ///
+    /// Driven through `deps.cloud_client` directly rather than through
+    /// `handle_chat_completions`, because that path calls `providers::read_key`,
+    /// which reads the OS keychain — untestable here, and not what this asserts.
+    ///
+    /// The counter-assertion is the one that makes this a test of the *split* rather
+    /// than of `egress::hardened`: the same redirect, followed by the local client,
+    /// proves the two halves really do have different policies and that this file
+    /// has not quietly hardened its loopback path.
+    #[tokio::test]
+    async fn the_cloud_client_refuses_a_redirect_the_local_client_follows() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        /// One-shot listener: answers `answer`, records whether it was reached.
+        fn spawn(answer: String) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = hits.clone();
+            std::thread::spawn(move || {
+                while let Ok((mut stream, _)) = listener.accept() {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buffer = [0u8; 1024];
+                    let _ = stream.read(&mut buffer);
+                    let _ = stream.write_all(answer.as_bytes());
+                }
+            });
+            (origin, hits)
+        }
+
+        let (target, target_hits) = spawn(
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nhi!".to_string(),
+        );
+        let (entry, entry_hits) = spawn(format!(
+            "HTTP/1.1 302 Found\r\nLocation: {target}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+
+        let deps = test_deps("http://127.0.0.1:11434".to_string());
+
+        let refused = deps
+            .cloud_client
+            .get(&entry)
+            .header("x-api-key", "sk-do-not-forward-me")
+            .send()
+            .await;
+
+        // Asserted before the `Err`, because "the target was contacted" names the
+        // actual defect where "the request failed" names only a symptom.
+        assert_eq!(
+            target_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the redirect target must never be contacted by the cloud client"
+        );
+        assert!(refused.is_err(), "a cross-origin hop must fail the request");
+        assert_eq!(entry_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Counter-test: the local client still follows it. If this ever starts
+        // failing, the loopback half has been hardened too, and the reason it must
+        // not be is in `ServerDeps::local_client`'s doc.
+        let followed = deps
+            .local_client
+            .get(&entry)
+            .send()
+            .await
+            .expect("the local client keeps reqwest's stock redirect policy");
+        assert!(followed.status().is_success());
+        assert_eq!(
+            target_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the local client is deliberately permissive and must have followed"
+        );
     }
 
     #[test]
@@ -4606,6 +5062,415 @@ mod tests {
             assert!(
                 rebound.is_ok(),
                 "rebinding after joining the accept loop's task must succeed, not race the old listener's teardown: {rebound:?}"
+            );
+        }
+    }
+    /// The admission rule, tested where it actually lives.
+    ///
+    /// `serve_with_admission` exists as its own function precisely so this is
+    /// reachable without 65 sockets and without standing up either accept loop:
+    /// the loops differ only in how they build `ServerDeps`, and they must not
+    /// differ in whether a request is admitted. That difference is what the bug
+    /// was — `run_cli_server` served the identical route set with no permit at
+    /// all — so the rule being one function is part of the fix, not a test
+    /// convenience.
+    mod admission {
+        use super::*;
+        use crate::http_policy::RequestAdmission;
+        use tokio_util::sync::CancellationToken;
+
+        #[tokio::test]
+        async fn a_refusal_uses_the_legacy_error_envelope_verbatim() {
+            // Byte-asserted rather than status-asserted: an SDK client parses
+            // this shape, and the refusal is the one response on this listener
+            // that no test covered.
+            let admission = RequestAdmission::new(1);
+            let shutdown = CancellationToken::new();
+            let held = admission.try_admit(&shutdown).expect("first request admits");
+
+            let refused = serve_with_admission(&admission, &shutdown, |_cancel| async {
+                panic!("the handler must not run once the quota is exhausted")
+            })
+            .await;
+
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: serde_json::Value =
+                serde_json::from_slice(&body_bytes(refused).await).unwrap();
+            assert_eq!(
+                body,
+                json!({
+                    "error": {
+                        "message": "The API server active-request quota is exhausted",
+                        "type": "invalid_request_error",
+                        "code": "server_busy",
+                    }
+                })
+            );
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn the_permit_is_held_until_a_streaming_body_ends_not_until_the_handler_returns() {
+            // The defect this closes. A streaming `/v1/chat/completions` returns
+            // as soon as upstream headers arrive, so releasing the permit there
+            // measured time-to-first-header and bounded nothing: any number of
+            // concurrent SSE streams could be in flight against a pool of one.
+            let admission = Arc::new(RequestAdmission::new(1));
+            let shutdown = CancellationToken::new();
+            let (release, wait_for_release) = tokio::sync::oneshot::channel();
+
+            let streaming = serve_with_admission(&admission, &shutdown, |_cancel| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(gated_body(wait_for_release))
+                    .unwrap()
+            })
+            .await;
+            assert_eq!(streaming.status(), StatusCode::OK);
+            assert_eq!(
+                admission.active_requests(),
+                1,
+                "the handler returned, but its body has not produced a byte — the request is still in flight"
+            );
+
+            let refused = serve_with_admission(&admission, &shutdown, |_cancel| async {
+                panic!("a second request must not be admitted while the first is still streaming")
+            })
+            .await;
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            release.send(()).unwrap();
+            let bytes = body_bytes(streaming).await;
+            assert_eq!(&bytes[..], b"data: [DONE]\n\n");
+            assert_eq!(
+                admission.active_requests(),
+                0,
+                "the permit must be released when the body ends"
+            );
+
+            let admitted_again = serve_with_admission(&admission, &shutdown, |_cancel| async {
+                Response::builder().status(StatusCode::OK).body(full_body("ok")).unwrap()
+            })
+            .await;
+            assert_eq!(admitted_again.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn a_client_that_goes_away_mid_stream_releases_its_permit() {
+            // Otherwise the pool leaks one permit per abandoned stream and the
+            // listener wedges at the quota with nothing running — strictly worse
+            // than the unbounded behaviour it replaced.
+            let admission = Arc::new(RequestAdmission::new(1));
+            let shutdown = CancellationToken::new();
+            let (_release, wait_for_release) = tokio::sync::oneshot::channel();
+
+            let streaming = serve_with_admission(&admission, &shutdown, |_cancel| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(gated_body(wait_for_release))
+                    .unwrap()
+            })
+            .await;
+            assert_eq!(admission.active_requests(), 1);
+
+            // What hyper does when the connection dies: it drops the body without
+            // ever polling it to completion.
+            drop(streaming);
+
+            assert_eq!(
+                admission.active_requests(),
+                0,
+                "dropping the response body must release the permit"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_buffered_response_survives_the_wrapper_byte_for_byte() {
+            // Every non-streaming route is now wrapped too, so the wrapper must
+            // be transparent — including for a body that is already complete.
+            let admission = RequestAdmission::new(4);
+            let shutdown = CancellationToken::new();
+
+            let response = serve_with_admission(&admission, &shutdown, |_cancel| async {
+                json_response(StatusCode::OK, json!({"object": "list", "data": []}))
+            })
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/json"
+            );
+            assert_eq!(
+                &body_bytes(response).await[..],
+                br#"{"data":[],"object":"list"}"#
+            );
+        }
+
+        /// Structural: both accept loops must reach `serve_one_request` through
+        /// the admission helper.
+        ///
+        /// A behavioural test cannot cover this — it would have to bind a socket
+        /// per loop and saturate a pool — and the defect was exactly a *second*
+        /// serving path that looked fine in isolation. Asserting on the source is
+        /// the cheap guard that a third path cannot be added silently.
+        #[test]
+        fn no_serving_path_reaches_a_route_without_admission() {
+            let source = include_str!("server.rs");
+            let production = source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .map(|(before, _)| before)
+                .expect("server.rs has a #[cfg(test)] module");
+
+            assert_eq!(
+                production.matches("serve_one_request(").count(),
+                3,
+                "production `serve_one_request` sites changed: one definition plus one \
+                 call per accept loop. A new call site must go through \
+                 `serve_with_admission`, or that loop bypasses the quota exactly as \
+                 `run_cli_server` used to."
+            );
+            assert!(production.contains("async fn serve_with_admission<Fut>("));
+            assert_eq!(
+                // The definition is generic, so its name is followed by `<Fut>`
+                // and is not counted here — this is calls only, one per loop.
+                production.matches("serve_with_admission(").count(),
+                2,
+                "one call per accept loop"
+            );
+            assert!(
+                !production.contains("drop(guard)"),
+                "the guard must be owned by the response body, not dropped when the \
+                 handler returns — see `hold_permit_until_body_ends`"
+            );
+        }
+    }
+    /// Cancellation, which the guard carried and nothing read.
+    ///
+    /// The target is **server shutdown**, not client disconnect. A disconnecting
+    /// client is already handled by drop — hyper drops the service future and the
+    /// reqwest future with it. Stopping the server was the hole:
+    /// `stop_server_core` awaits only the accept loop's task, while every
+    /// connection is a separate `tokio::spawn` nothing joins, so requests already
+    /// accepted kept streaming from upstream after the UI said "stopped".
+    mod cancellation {
+        use super::*;
+        use crate::http_policy::RequestAdmission;
+        use tokio_util::sync::CancellationToken;
+
+        /// An upstream that accepts a connection, announces it, and then says
+        /// nothing until the test releases it.
+        ///
+        /// The announcement is the point. A first version cancelled after a fixed
+        /// 50ms and passed locally, then failed once with `502` — the fake upstream
+        /// had closed its socket first, so `send()` errored before cancellation
+        /// won. That is a race, and a loaded CI runner would lose it more often
+        /// than a laptop. `connected` makes the ordering explicit: the test cancels
+        /// *because* the request is in flight, not after a duration guessed to
+        /// coincide with it, and `release` keeps the socket open until the
+        /// assertions are done so the upstream can never end the request first.
+        struct SilentUpstream {
+            base_url: String,
+            release: std::sync::mpsc::Sender<()>,
+            handle: std::thread::JoinHandle<()>,
+        }
+
+        impl SilentUpstream {
+            /// Returns the upstream and its "a client connected" signal separately,
+            /// so a test can move the signal into a waiter task and still own the
+            /// upstream for `finish`.
+            fn start() -> (Self, std::sync::mpsc::Receiver<()>) {
+                let listener =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+                listener
+                    .set_nonblocking(true)
+                    .expect("upstream listener goes non-blocking");
+                let addr = listener.local_addr().expect("upstream address");
+                let (connected_tx, connected) = std::sync::mpsc::channel();
+                let (release, release_rx) = std::sync::mpsc::channel();
+                // Non-blocking with a deadline rather than a plain `accept()`: one
+                // of these tests asserts that *nothing ever connects*, and a
+                // blocking accept would never return, so joining would hang the
+                // very test it is meant to prove.
+                let handle = std::thread::spawn(move || {
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let mut accepted = None;
+                    while std::time::Instant::now() < deadline {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                let _ = connected_tx.send(());
+                                accepted = Some(stream);
+                                break;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                if release_rx.try_recv().is_ok() {
+                                    return;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    if accepted.is_some() {
+                        // Never answered, and never closed early — the request can
+                        // only end by being cancelled.
+                        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+                    }
+                });
+                (
+                    SilentUpstream {
+                        base_url: format!("http://{addr}"),
+                        release,
+                        handle,
+                    },
+                    connected,
+                )
+            }
+
+            fn finish(self) {
+                let _ = self.release.send(());
+                let _ = self.handle.join();
+            }
+        }
+
+        #[tokio::test]
+        async fn a_stopping_server_answers_an_in_flight_request_instead_of_hanging_on_upstream() {
+            let (upstream, connected) = SilentUpstream::start();
+            let cancel = CancellationToken::new();
+            let deps = test_deps_cancelled_by(upstream.base_url.clone(), cancel.clone());
+
+            // Cancels once the upstream has the connection, so this asserts
+            // "cancellation beats an in-flight request" rather than "cancellation
+            // beats a 50ms sleep" — which is the race that flaked.
+            let cancel_on_connect = cancel.clone();
+            let waiter = tokio::task::spawn_blocking(move || {
+                let _ = connected.recv_timeout(std::time::Duration::from_secs(5));
+                cancel_on_connect.cancel();
+            });
+
+            let (resp, _) = handle_request(
+                &deps,
+                post_request(
+                    "/v1/chat/completions",
+                    r#"{"model":"llama3.1:8b","stream":false}"#,
+                ),
+            )
+            .await;
+
+            // 503 and not 502: the upstream did nothing wrong, and a client that
+            // retries on 502 would retry against a listener that is gone.
+            let status = resp.status();
+            let body: serde_json::Value =
+                serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={body}");
+            assert_eq!(body["error"]["code"], "server_stopping");
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            let _ = waiter.await;
+            upstream.finish();
+        }
+
+        #[tokio::test]
+        async fn an_already_cancelled_request_never_reaches_upstream_at_all() {
+            // The upstream here would block for its full sleep if contacted, so
+            // returning promptly *is* the assertion that no connection was made.
+            let (upstream, _connected) = SilentUpstream::start();
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let deps = test_deps_cancelled_by(upstream.base_url.clone(), cancel);
+
+            let started = std::time::Instant::now();
+            let (resp, _) = handle_request(
+                &deps,
+                post_request("/v1/embeddings", r#"{"model":"llama3.1:8b","input":"hi"}"#),
+            )
+            .await;
+
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(400),
+                "a cancelled request waited on upstream anyway: {:?}",
+                started.elapsed()
+            );
+            upstream.finish();
+        }
+
+        #[tokio::test]
+        async fn a_stream_cut_short_by_shutdown_ends_in_an_error_not_a_clean_close() {
+            // The important half. A truncated SSE stream that closes *successfully*
+            // is indistinguishable to a client from a complete one that happens to
+            // lack `[DONE]` — it would read a partial answer as the whole answer.
+            let admission = RequestAdmission::new(2);
+            let server_shutdown = CancellationToken::new();
+            let (_release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
+
+            let streaming = serve_with_admission(&admission, &server_shutdown, |_cancel| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(gated_body(wait_for_release))
+                    .unwrap()
+            })
+            .await;
+            assert_eq!(streaming.status(), StatusCode::OK);
+
+            // What stopping the server does: the accept loop's drop-guard cancels
+            // the parent, and every guard's token is a child of it.
+            server_shutdown.cancel();
+
+            let collected = streaming.into_body().collect().await;
+            let error = collected.err().expect("a cut stream must not collect cleanly");
+            assert!(
+                error.to_string().contains("stopped while this response was streaming"),
+                "unexpected stream error: {error}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_completed_stream_is_not_reported_as_cut_by_its_own_guard_dropping() {
+            // `AdmissionGuard::drop` cancels the token, and the guard lives in the
+            // stream's own state — so a naive implementation would race its own
+            // teardown and turn every successful stream into an error.
+            let admission = RequestAdmission::new(2);
+            let server_shutdown = CancellationToken::new();
+            let (release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
+
+            let streaming = serve_with_admission(&admission, &server_shutdown, |_cancel| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(gated_body(wait_for_release))
+                    .unwrap()
+            })
+            .await;
+            release.send(()).unwrap();
+
+            let bytes = body_bytes(streaming).await;
+            assert_eq!(&bytes[..], b"data: [DONE]\n\n");
+        }
+
+        #[tokio::test]
+        async fn the_token_handed_to_a_handler_is_a_child_of_the_servers() {
+            // The link that makes one stop reach every request. Asserted because
+            // the guard could be built from a fresh token and every test above
+            // would still pass.
+            let admission = RequestAdmission::new(2);
+            let server_shutdown = CancellationToken::new();
+            let seen: Arc<std::sync::Mutex<Option<CancellationToken>>> =
+                Arc::new(std::sync::Mutex::new(None));
+
+            let captured = seen.clone();
+            let response = serve_with_admission(&admission, &server_shutdown, |cancel| async move {
+                *captured.lock().unwrap() = Some(cancel);
+                json_response(StatusCode::OK, json!({"ok": true}))
+            })
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let token = seen.lock().unwrap().clone().expect("handler received a token");
+            assert!(!token.is_cancelled());
+            server_shutdown.cancel();
+            assert!(
+                token.is_cancelled(),
+                "cancelling the server must reach a request's own token"
             );
         }
     }

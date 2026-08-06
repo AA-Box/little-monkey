@@ -323,17 +323,19 @@ function FixtureRows({ fixture, result, expanded, tone, onToggleExpand, onRun, o
           {fixture.expectedOutcome === "blocked" ? t("RedTeamLab.expectedBlocked") : t("RedTeamLab.expectedRequiresApproval")}
         </td>
         <td className="px-3 py-2 text-xs text-muted">
-          {result ? (
-            result.gate.decision === "auto_approved" ? (
-              t("RedTeamLab.actualAutoApproved")
-            ) : result.gate.decision === "blocked" ? (
-              t("RedTeamLab.actualBlocked")
-            ) : (
-              t("RedTeamLab.actualRequiresPrompt")
-            )
-          ) : (
-            t("RedTeamLab.actualNotRun")
-          )}
+          {!result
+            ? t("RedTeamLab.actualNotRun")
+            : result.gate.unavailable
+              ? t("RedTeamLab.actualGateUnavailable")
+              : result.gate.decision === "auto_approved"
+                ? t("RedTeamLab.actualAutoApproved")
+                : result.gate.decision === "grant_approved"
+                  ? t("RedTeamLab.actualGrantApproved")
+                  : result.gate.decision === "blocked"
+                    ? t("RedTeamLab.actualBlocked")
+                    : result.gate.decision === "sandbox_rejected"
+                      ? t("RedTeamLab.actualSandboxRejected")
+                      : t("RedTeamLab.actualRequiresPrompt")}
         </td>
         <td className="px-3 py-2">
           <StatusPill tone={tone}>

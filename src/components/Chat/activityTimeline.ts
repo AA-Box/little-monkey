@@ -162,12 +162,83 @@ function formatSummaryRun(kind: SummaryKind, count: number): string {
   }
 }
 
-/** Produces a past-tense summary in actual call order. Only adjacent calls
- * with the same human action are folded together, so read → shell → edit
- * remains "Read …, ran …, edited …". */
+/** Verbs for the actions that name their file instead of counting files. */
+const FILE_VERBS: Partial<Record<SummaryKind, string>> = {
+  "read-file": "read",
+  "edit-file": "edited",
+  "attempted-file-edit": "tried to edit",
+  "proposed-file-edit": "proposed edits to",
+};
+
+/** How many named files a summary will list before it falls back to counts —
+ * past this the line is longer than the row can show anyway. */
+const MAX_NAMED_FILES = 3;
+
+function fileName(call: ActivityCall): string {
+  const path = stringArg(parseArgs(call.args), "path");
+  return path.split(/[\\/]/).pop() ?? "";
+}
+
+function joinVerbs(verbs: string[]): string {
+  if (verbs.length < 2) return verbs[0] ?? "";
+  return `${verbs.slice(0, -1).join(", ")} and ${verbs[verbs.length - 1]}`;
+}
+
+type SummaryRun =
+  | { key: string; file: string; verbs: string[] }
+  | { key: string; kind: SummaryKind; count: number };
+
+function sentence(phrases: string[]): string {
+  return phrases
+    .map((phrase, index) => (index === 0
+      ? `${phrase.charAt(0).toUpperCase()}${phrase.slice(1)}`
+      : `${phrase.charAt(0).toLowerCase()}${phrase.slice(1)}`))
+    .join(", ");
+}
+
+/** Folds a round into "edited and read process_table.rs, ran 3 commands":
+ * calls on the same file collapse into one named phrase however far apart
+ * they were, other actions collapse into counts, and groups appear in order
+ * of first occurrence. */
 export function summarizeActivity(calls: ActivityCall[]): string {
   if (calls.length === 0) return "Worked on the task";
 
+  const runs: SummaryRun[] = [];
+  const runByKey = new Map<string, SummaryRun>();
+  const namedFiles = new Set<string>();
+
+  for (const call of calls) {
+    const kind = summaryKind(call);
+    const verb = FILE_VERBS[kind];
+    const file = verb ? fileName(call) : "";
+    const named = verb && file ? { verb, file } : null;
+    const key = named ? `file:${named.file}` : `kind:${kind}`;
+    if (named) namedFiles.add(named.file);
+
+    const existing = runByKey.get(key);
+    if (!existing) {
+      const run: SummaryRun = named
+        ? { key, file: named.file, verbs: [named.verb] }
+        : { key, kind, count: 1 };
+      runByKey.set(key, run);
+      runs.push(run);
+    } else if ("file" in existing) {
+      if (named && !existing.verbs.includes(named.verb)) existing.verbs.push(named.verb);
+    } else {
+      existing.count += 1;
+    }
+  }
+
+  if (namedFiles.size > MAX_NAMED_FILES) return summarizeByCount(calls);
+
+  return sentence(runs.map((run) => (
+    "file" in run ? `${joinVerbs(run.verbs)} ${run.file}` : formatSummaryRun(run.kind, run.count)
+  )));
+}
+
+/** Count-only fallback for rounds touching too many files to name. Adjacent
+ * calls sharing an action fold together, so the order of work still shows. */
+function summarizeByCount(calls: ActivityCall[]): string {
   const runs: Array<{ kind: SummaryKind; count: number }> = [];
   for (const call of calls) {
     const kind = summaryKind(call);
@@ -175,13 +246,7 @@ export function summarizeActivity(calls: ActivityCall[]): string {
     if (previous?.kind === kind) previous.count += 1;
     else runs.push({ kind, count: 1 });
   }
-
-  return runs
-    .map(({ kind, count }, index) => {
-      const phrase = formatSummaryRun(kind, count);
-      return index === 0 ? phrase : `${phrase.charAt(0).toLowerCase()}${phrase.slice(1)}`;
-    })
-    .join(", ");
+  return sentence(runs.map(({ kind, count }) => formatSummaryRun(kind, count)));
 }
 
 export type ActivityProgressStatus = "running" | "failed" | "completed";
@@ -367,6 +432,21 @@ export function activityCallLabel(name: string): string {
   }
 }
 
+/** The one-line command a call is shown as inside an expanded step — a shell
+ * call reads as the command itself (`$ …`), anything else as its human label
+ * plus subject. */
+export function activityCallCommandLine(call: ActivityCall): string {
+  const subject = activityCallSubject(call);
+  return call.name === "run_shell" ? `$ ${subject}` : `${activityCallLabel(call.name)} ${subject}`;
+}
+
+/** Plain text a step's copy button puts on the clipboard: the command line,
+ * then whatever the call returned. */
+export function activityCallCopyText(call: ActivityCall): string {
+  const command = activityCallCommandLine(call);
+  return call.result === undefined ? command : `${command}\n\n${formatActivityResult(call.result).text}`;
+}
+
 export interface ActivityDiff {
   kind: "edit" | "write";
   state: "applied" | "attempted" | "proposed";
@@ -408,6 +488,35 @@ export function activityCallDiff(call: ActivityCall): ActivityDiff | null {
     before: capActivityText(oldString, DIFF_MAX_CHARS, DIFF_MAX_LINES),
     after: capActivityText(newString, DIFF_MAX_CHARS, DIFF_MAX_LINES),
   };
+}
+
+export interface ActivityDiffStat {
+  added: number;
+  removed: number;
+}
+
+function countLines(text: string): number {
+  if (text === "") return 0;
+  return text.replace(/\n$/, "").split("\n").length;
+}
+
+/** Added/removed line counts for a round's applied mutations, read straight
+ * from the call args (never the workspace) so old transcripts stay stable.
+ * Failed and still-pending calls changed nothing, so they don't count. */
+export function activityDiffStat(calls: ActivityCall[]): ActivityDiffStat {
+  let added = 0;
+  let removed = 0;
+  for (const call of calls) {
+    if (call.result === undefined || resultLooksLikeError(call.result)) continue;
+    const args = parseArgs(call.args);
+    if (call.name === "write_file") {
+      added += countLines(stringArg(args, "content"));
+    } else if (call.name === "edit_file") {
+      added += countLines(stringArg(args, "new_string"));
+      removed += countLines(stringArg(args, "old_string"));
+    }
+  }
+  return { added, removed };
 }
 
 export function formatActivityResult(raw: string): CappedActivityText {

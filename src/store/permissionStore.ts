@@ -21,7 +21,11 @@ export interface PermissionRequest {
   risk_reason?: string;
   /** True when `risk_level`/`risk_reason` came from the authoritative,
    * un-overridable `path_risk_floor` rather than the LLM judge — lets the
-   * modal show a stronger "sensitive path" warning. */
+   * modal show a stronger "sensitive path" warning and withhold "Allow for
+   * session" (see `PermissionModal.tsx`'s `canRememberForSession`). Unlike
+   * `risk_level`, this one is not purely informative: a floored target prompts
+   * in every mode below `bypass`, and no remembered grant can answer it. Both
+   * are enforced in `permissions.rs`; the modal only mirrors them. */
   risk_floored?: boolean;
   /** The description of the `code`-profile subagent (p3) this call
    * originated from, if any — a dedicated field (NOT parsed back out of

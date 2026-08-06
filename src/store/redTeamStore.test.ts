@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn().mockResolvedValue(undefined),
+  invoke: (...args: unknown[]) => invokeMock(...args),
   isTauri: () => false,
 }));
 
@@ -26,6 +27,20 @@ function resetStore() {
 describe("redTeamStore", () => {
   beforeEach(() => {
     resetStore();
+    // The gate verdict comes from `permissions::permission_dry_run` now, so the
+    // store's runs cross IPC. Stub it the same way `redTeamRunner.test.ts` does:
+    // echo the asked-about mode, refuse under plan.
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command !== "permission_dry_run") return undefined;
+      const mode = typeof args?.mode === "string" ? args.mode : "manual";
+      return {
+        decision: mode === "plan" ? "blocked" : "requires_prompt",
+        mode,
+        reason: `stubbed verdict for ${mode}`,
+        riskFloored: false,
+      };
+    });
   });
 
   it("seeds fixtures from the built-in library", () => {
@@ -33,8 +48,8 @@ describe("redTeamStore", () => {
     expect(fixtures.length).toBe(BUILTIN_FIXTURES.length);
   });
 
-  it("runAll populates a result for every fixture", () => {
-    useRedTeamStore.getState().runAll();
+  it("runAll populates a result for every fixture", async () => {
+    await useRedTeamStore.getState().runAll();
     const { results, fixtures } = useRedTeamStore.getState();
     expect(Object.keys(results).length).toBe(fixtures.length);
     for (const fixture of fixtures) {
@@ -43,23 +58,23 @@ describe("redTeamStore", () => {
     }
   });
 
-  it("runOne populates only the requested fixture's result", () => {
+  it("runOne populates only the requested fixture's result", async () => {
     const targetId = BUILTIN_FIXTURES[0].id;
-    useRedTeamStore.getState().runOne(targetId);
+    await useRedTeamStore.getState().runOne(targetId);
     const { results } = useRedTeamStore.getState();
     expect(Object.keys(results)).toEqual([targetId]);
   });
 
-  it("setMode updates the mode used by subsequent runs", () => {
+  it("setMode updates the mode used by subsequent runs", async () => {
     useRedTeamStore.getState().setMode("smart");
     expect(useRedTeamStore.getState().mode).toBe("smart");
-    useRedTeamStore.getState().runAll();
+    await useRedTeamStore.getState().runAll();
     const { results } = useRedTeamStore.getState();
     expect(Object.values(results).every((r) => r.gate.mode === "smart" || r.gate.mode === "plan")).toBe(true);
   });
 
-  it("clearResults empties the results map", () => {
-    useRedTeamStore.getState().runAll();
+  it("clearResults empties the results map", async () => {
+    await useRedTeamStore.getState().runAll();
     useRedTeamStore.getState().clearResults();
     expect(useRedTeamStore.getState().results).toEqual({});
   });
@@ -98,7 +113,7 @@ describe("redTeamStore", () => {
     expect(useRedTeamStore.getState().formError).toMatch(/JSON/);
   });
 
-  it("addFixture appends a valid custom fixture, runnable like any built-in one", () => {
+  it("addFixture appends a valid custom fixture, runnable like any built-in one", async () => {
     const ok = useRedTeamStore.getState().addFixture({
       title: "Custom hostile connector reply",
       sourceType: "connector_payload",
@@ -116,7 +131,7 @@ describe("redTeamStore", () => {
     expect(fixtures.length).toBe(BUILTIN_FIXTURES.length + 1);
     const added = fixtures[fixtures.length - 1];
     expect(added.builtin).toBe(false);
-    useRedTeamStore.getState().runOne(added.id);
+    await useRedTeamStore.getState().runOne(added.id);
     expect(useRedTeamStore.getState().results[added.id]).toBeDefined();
   });
 

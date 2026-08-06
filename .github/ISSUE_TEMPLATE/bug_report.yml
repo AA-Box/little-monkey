@@ -1,0 +1,139 @@
+name: Bug report
+description: Something in Little Monkey behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security issues do not belong here.** Open a
+        [private advisory](https://github.com/AA-Box/little-monkey/security/advisories/new)
+        instead — see [SECURITY.md](https://github.com/AA-Box/little-monkey/blob/develop/SECURITY.md).
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, in a sentence or two.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Be specific. Include sample input where you can.
+      placeholder: |
+        1. Open …
+        2. Set permission mode to …
+        3. Send …
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: What you expected would happen, and what actually happened.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: App version and commit SHA
+      placeholder: "1.2.0 (b140792)"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      placeholder: "macOS 15.2, Apple Silicon (M3) / Windows 11 x64 / Ubuntu 24.04 x64"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Active runtime
+      options:
+        - Managed llama.cpp
+        - Ollama
+        - MLX
+        - Cloud / BYOK provider
+        - OpenAI-compatible local endpoint
+        - Not applicable
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      placeholder: "llama3.2:3b / hf.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF:Q4_K_M / gpt-4.1-mini"
+
+  - type: dropdown
+    id: permission_mode
+    attributes:
+      label: Permission mode
+      description: Required if the bug involves tools, shell, or file edits.
+      options:
+        - manual
+        - plan
+        - acceptEdits
+        - smart
+        - auto
+        - bypass
+        - Not applicable
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - Chat / Compare / Crew
+        - Workspace sidebar (files, review, terminal, browser, tasks)
+        - Agent tools, permissions, or checkpoints
+        - Knowledge Stacks
+        - Runtime Hub / API server
+        - Skills, plugins, MCP, or workflows
+        - Agent workbenches
+        - monkey CLI
+        - IDE extension (VS Code / JetBrains)
+        - Daemon, companion, or remote handoff
+        - Other / unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, errors, or support bundle
+      description: >-
+        For runtime issues, export a redacted bundle from
+        **Runtime Hub → Telemetry**. It previews exactly what is included, and
+        strips prompt/response text, keys, and home-directory usernames by
+        default. Paste errors verbatim.
+      render: text
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: What you already tried, and any theory about why it fails.
+
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Before submitting
+      options:
+        - label: >-
+            This is not a security vulnerability (those go to a private
+            advisory).
+          required: true
+        - label: >-
+            I checked [ROADMAP.md](https://github.com/AA-Box/little-monkey/blob/develop/ROADMAP.md)
+            and the README's Current limitations — this isn't a known-unbuilt
+            feature or a stated limit.
+          required: true

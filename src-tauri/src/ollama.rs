@@ -304,7 +304,9 @@ async fn check_capabilities(client: &reqwest::Client, name: &str) -> (bool, bool
 /// hint fetched concurrently for all models.
 #[tauri::command]
 pub async fn ollama_list_models() -> Result<Vec<OllamaModelInfo>, String> {
-    let client = reqwest::Client::new();
+    // Bounds `/api/tags` and every concurrent `/api/show` hint below, since
+    // `check_capabilities` borrows this same client.
+    let client = ollama_client(Duration::from_secs(10))?;
 
     let resp = client
         .get(format!("{OLLAMA_BASE_URL}/api/tags"))
@@ -405,11 +407,34 @@ async fn fetch_running_models(
     Ok(normalize_running_models(parsed))
 }
 
-fn residency_client() -> Result<reqwest::Client, String> {
+/// A client for one of this file's calls to the local Ollama daemon, with
+/// `total` as the deadline for the whole request.
+///
+/// A *total* deadline is the right shape here, unlike on a download path: every
+/// caller reads a small, fully buffered JSON body from a loopback peer, so the
+/// deadline can be proportionate to the response instead of racing it.
+///
+/// Exists because two commands had no deadline of any kind. reqwest's bare
+/// constructor sets none, and a `#[tauri::command]` that never returns is worse
+/// than one that fails: `ollama_list_models` and `ollama_remove_model` are both
+/// `invoke`d from the UI with nothing racing them and no cancellation token, so a
+/// daemon that accepted the connection and then went quiet left the caller
+/// waiting forever with no error to show. The other calls in this file already
+/// passed a budget; these two were simply missed, which is what the bare-client
+/// ratchet in `egress.rs` now records as fixed rather than allowed.
+///
+/// Prose here avoids spelling that constructor out: the ratchet counts the exact
+/// string across the tree, so a doc comment naming it would count as a site — the
+/// same reason `egress.rs`'s own doc comments talk around it.
+fn ollama_client(total: Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(total)
         .build()
-        .map_err(|e| format!("Failed to create Ollama residency client: {e}"))
+        .map_err(|e| format!("Failed to create Ollama HTTP client: {e}"))
+}
+
+fn residency_client() -> Result<reqwest::Client, String> {
+    ollama_client(Duration::from_secs(10))
 }
 
 /// List the models currently loaded in Ollama memory. Callers can snapshot
@@ -579,22 +604,17 @@ fn validate_tag(tag: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Spawns `child` (already configured with piped stdout/stderr) and streams
-/// its combined output line-by-line as `ollama://pull-progress` events
-/// tagged with `tag` — shared by both `ollama_pull_model` (`ollama pull`)
-/// and `ollama_import_model` (`ollama create`), since the frontend's
-/// progress/error UI treats "getting a model named `tag` ready" identically
-/// regardless of which CLI subcommand produced it. On failure, the error is
-/// the last ~20 output lines joined, so auth/validation errors (e.g. "you
-/// are not signed in") surface verbatim.
-async fn stream_ollama_progress(
+/// Streams `stdout`/`stderr`'s combined output line-by-line as
+/// `ollama://pull-progress` events tagged with `tag`, returning the last ~20
+/// lines seen once both streams reach EOF — for composing a failure message.
+/// Does not wait on the child itself; callers own that (see
+/// [`stream_ollama_progress`] and [`ollama_pull_model`]).
+async fn stream_process_output(
     app: &AppHandle,
-    mut child: tokio::process::Child,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
     tag: &str,
-) -> Result<(), String> {
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
+) -> std::collections::VecDeque<String> {
     let last_lines = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::<
         String,
     >::with_capacity(21)));
@@ -645,6 +665,32 @@ async fn stream_ollama_progress(
         let _ = task.await;
     }
 
+    let result = last_lines.lock().await.clone();
+    result
+}
+
+/// Spawns `child` (already configured with piped stdout/stderr) and streams
+/// its combined output line-by-line as `ollama://pull-progress` events
+/// tagged with `tag` — shared by `ollama_import_model` and
+/// `ollama_create_from_modelfile` (both `ollama create`), since the
+/// frontend's progress/error UI treats "getting a model named `tag` ready"
+/// identically regardless of which CLI subcommand produced it. On failure,
+/// the error is the last ~20 output lines joined, so auth/validation errors
+/// (e.g. "you are not signed in") surface verbatim.
+///
+/// `ollama_pull_model` doesn't use this: it needs the `Child` reachable from
+/// `state.ollama_pulls` for cancellation, so it calls
+/// [`stream_process_output`] directly and waits on the child itself.
+async fn stream_ollama_progress(
+    app: &AppHandle,
+    mut child: tokio::process::Child,
+    tag: &str,
+) -> Result<(), String> {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let last_lines = stream_process_output(app, stdout, stderr, tag).await;
+
     let status = child
         .wait()
         .await
@@ -653,8 +699,7 @@ async fn stream_ollama_progress(
     if status.success() {
         Ok(())
     } else {
-        let buf = last_lines.lock().await;
-        let joined = buf.iter().cloned().collect::<Vec<_>>().join("\n");
+        let joined = last_lines.iter().cloned().collect::<Vec<_>>().join("\n");
         Err(if joined.is_empty() {
             format!("Failed (exit status: {status})")
         } else {
@@ -667,14 +712,23 @@ async fn stream_ollama_progress(
 /// stdout+stderr line-by-line as `ollama://pull-progress` events. Errors
 /// (including auth-required errors like "you are not signed in") surface
 /// verbatim via the last captured output lines.
+///
+/// Unlike [`stream_ollama_progress`]'s other two callers, this keeps the
+/// spawned child in `state.ollama_pulls` (keyed by `tag`) for the duration of
+/// the pull, so [`ollama_cancel_pull`] can kill it from a separate command
+/// invocation — the frontend's Cancel button while a pull is in flight.
 #[tauri::command]
-pub async fn ollama_pull_model(app: AppHandle, tag: String) -> Result<(), String> {
+pub async fn ollama_pull_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    tag: String,
+) -> Result<(), String> {
     validate_tag(&tag)?;
     let tag = tag.trim().to_string();
 
     let binary = find_ollama_binary().unwrap_or_else(|| "ollama".to_string());
 
-    let child = tokio::process::Command::new(&binary)
+    let mut child = tokio::process::Command::new(&binary)
         .arg("pull")
         .arg(&tag)
         .stdin(Stdio::null())
@@ -683,7 +737,63 @@ pub async fn ollama_pull_model(app: AppHandle, tag: String) -> Result<(), String
         .spawn()
         .map_err(|e| format!("Failed to spawn `ollama pull {tag}`: {e}"))?;
 
-    stream_ollama_progress(&app, child, &tag).await
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    {
+        let mut pulls = state.ollama_pulls.lock().map_err(|e| e.to_string())?;
+        pulls.insert(tag.clone(), child);
+    }
+
+    let last_lines = stream_process_output(&app, stdout, stderr, &tag).await;
+
+    // If `ollama_cancel_pull` already removed and killed this entry, there's
+    // nothing left to wait on — report the cancellation rather than a
+    // misleading "Failed" from a status this task never observed.
+    let removed = {
+        let mut pulls = state.ollama_pulls.lock().map_err(|e| e.to_string())?;
+        pulls.remove(&tag)
+    };
+    let Some(mut child) = removed else {
+        return Err("Cancelled".to_string());
+    };
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Failed to wait for process: {e}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        let joined = last_lines.iter().cloned().collect::<Vec<_>>().join("\n");
+        Err(if joined.is_empty() {
+            format!("Failed (exit status: {status})")
+        } else {
+            joined
+        })
+    }
+}
+
+/// Cancels an in-flight [`ollama_pull_model`] pull for `tag`, if one is
+/// running — kills the underlying `ollama pull` child process. A no-op
+/// (`Ok`) if no pull for this tag is currently tracked, e.g. it already
+/// finished or was already cancelled.
+#[tauri::command]
+pub async fn ollama_cancel_pull(state: State<'_, AppState>, tag: String) -> Result<(), String> {
+    let tag = tag.trim().to_string();
+    let child = {
+        let mut pulls = state.ollama_pulls.lock().map_err(|e| e.to_string())?;
+        pulls.remove(&tag)
+    };
+    let Some(mut child) = child else {
+        return Ok(());
+    };
+    child
+        .start_kill()
+        .map_err(|e| format!("Failed to cancel pull: {e}"))?;
+    let _ = child.wait().await;
+    Ok(())
 }
 
 /// Import a local model — either a single `.gguf` file or a directory of
@@ -806,7 +916,9 @@ pub async fn ollama_remove_model(tag: String) -> Result<(), String> {
     validate_tag(&tag)?;
     let tag = tag.trim().to_string();
 
-    let client = reqwest::Client::new();
+    // Longer than the read-only calls: Ollama unlinks the tag's blobs before it
+    // answers, and a large model's blobs are large files.
+    let client = ollama_client(Duration::from_secs(60))?;
     let resp = client
         .delete(format!("{OLLAMA_BASE_URL}/api/delete"))
         .json(&json!({ "model": tag }))
@@ -904,6 +1016,45 @@ pub async fn ollama_signin(_app: AppHandle) -> Result<String, String> {
 #[cfg(test)]
 mod residency_tests {
     use super::*;
+
+    /// A daemon that accepts and then goes quiet must not hold a command open.
+    ///
+    /// Driven against a silent loopback listener with an injected 200ms budget,
+    /// because the production budgets are 10 and 60 seconds and a test that waited
+    /// one out would not be a test. The listener is *held*, not dropped: dropping
+    /// sends `FIN`, which reqwest reports as a connection error, and this would
+    /// then pass with no deadline configured at all — the exact bug it exists to
+    /// catch.
+    #[tokio::test]
+    async fn a_daemon_that_accepts_and_goes_quiet_does_not_hold_a_command_open() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a silent peer");
+        let address = listener.local_addr().expect("peer address");
+
+        let held = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+
+        let started = std::time::Instant::now();
+        let result = ollama_client(Duration::from_millis(200))
+            .expect("client builds")
+            .get(format!("http://{address}/api/tags"))
+            .send()
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a daemon that never answers must not be waited on forever"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "gave up after {:?}, which is not the 200ms budget",
+            started.elapsed()
+        );
+        // Proves the peer accepted, so the error above is the deadline rather
+        // than a refused connection — `is_err()` alone cannot tell them apart.
+        assert!(
+            held.join().expect("accept thread joins").is_ok(),
+            "the request must have reached the peer"
+        );
+    }
 
     fn parse_running_models(json: &str) -> Vec<OllamaRunningModelInfo> {
         let raw: RawRunningModelsResponse =

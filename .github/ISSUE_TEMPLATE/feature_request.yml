@@ -1,0 +1,79 @@
+name: Feature request
+description: Propose a capability or a change to an existing one
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Open-ended ideas are usually better as a
+        [Discussion](https://github.com/AA-Box/little-monkey/discussions).
+        Use this template when you have a concrete, scoped proposal.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: >-
+        What can't you do today? Describe the situation, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should happen instead.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface it would live in
+      options:
+        - Chat / Compare / Crew
+        - Workspace sidebar (files, review, terminal, browser, tasks)
+        - Agent tools, permissions, or checkpoints
+        - Knowledge Stacks
+        - Runtime Hub / API server
+        - Skills, plugins, MCP, or workflows
+        - Agent workbenches
+        - monkey CLI
+        - IDE extension (VS Code / JetBrains)
+        - Daemon, companion, or remote handoff
+        - Other / unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance boundary
+      description: >-
+        How would we know this is genuinely done rather than partially done?
+        Name what it requires — hardware, a credential, a signed feed, a
+        network, an external service — and what it would honestly *not* cover
+        in a first version.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including existing features that partly solve this.
+
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Before submitting
+      options:
+        - label: >-
+            I checked [ROADMAP.md](https://github.com/AA-Box/little-monkey/blob/develop/ROADMAP.md)
+            — this isn't already planned with a stated acceptance boundary.
+          required: true
+        - label: >-
+            I checked the README's Current limitations — this isn't an
+            intentional scope boundary (persistent authenticated browser
+            profiles, containers/VMs, a hosted relay, account service, or GPU).
+          required: true

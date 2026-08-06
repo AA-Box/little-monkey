@@ -296,7 +296,16 @@ fn pinned_client(certificate_pem: &str, expected_sha256: &str) -> Result<reqwest
         .tls_info(true)
         .https_only(true)
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
+        // A silence budget, not a deadline for the whole request. The 30 seconds
+        // this replaces covered the body, and `fetch_artifact` reads a whole
+        // artifact out of one JSON response: the runner inlines it as
+        // `content_base64`, so a `max_artifact_bytes` at its 32 MiB ceiling
+        // arrives as ~43 MiB of JSON through `call`'s single `bytes()` read.
+        // Thirty seconds for that is 1.4 MB/s sustained, so an artifact fetch over
+        // anything slower failed mid-body and reported a transport error. Reset on
+        // every read instead, a peer that stops sending is still cut off while one
+        // still sending is not.
+        .read_timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| format!("Could not build pinned remote client: {error}"))

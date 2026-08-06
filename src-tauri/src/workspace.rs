@@ -1,7 +1,9 @@
 //! Multi-root workspace management: which folders are attached (one
 //! "primary" plus any number of "secondary" folders), sandboxed path
-//! resolution across all of them, and a small on-disk "recently opened"
-//! list backing the primary-folder picker's "Recent" dropdown.
+//! resolution across all of them, a small on-disk "recently opened"
+//! list backing the primary-folder picker's "Recent" dropdown, and an
+//! on-disk snapshot of the currently-attached set so a relaunch reopens the
+//! folder the user was working in instead of starting with no workspace.
 //!
 //! Every agent tool in `tools.rs` resolves paths through
 //! [`resolve_path_and_root`] rather than assuming a single root: a plain
@@ -58,6 +60,11 @@ pub struct RecentWorkspaceEntry {
 
 const RECENT_WORKSPACES_FILE: &str = "recent_workspaces.json";
 const MAX_RECENT_ENTRIES: usize = 12;
+
+/// Paths of every attached folder, primary first, as of the last change.
+/// Distinct from [`RECENT_WORKSPACES_FILE`]: "recent" is a history the user
+/// picks from, this is the live set restored on the next launch.
+const OPEN_WORKSPACE_ROOTS_FILE: &str = "open_workspace_roots.json";
 
 fn roots_lock(state: &AppState) -> Result<MutexGuard<'_, Vec<WorkspaceRoot>>, String> {
     state
@@ -377,6 +384,7 @@ pub fn set_primary_workspace_root(
         state.terminal.kill_all(Some(&app));
     }
     record_recent(&app, Path::new(&info.path), &info.label);
+    write_open_roots(&app, state.inner());
     Ok(info)
 }
 
@@ -418,10 +426,13 @@ pub(crate) fn add_secondary_workspace_root_impl(
 /// path, and attaching a folder is itself an explicit, visible user action.
 #[tauri::command]
 pub fn add_secondary_workspace_root(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<WorkspaceRootInfo, String> {
-    add_secondary_workspace_root_impl(state.inner(), path)
+    let info = add_secondary_workspace_root_impl(state.inner(), path)?;
+    write_open_roots(&app, state.inner());
+    Ok(info)
 }
 
 fn remove_secondary_workspace_root_impl(state: &AppState, id: String) -> Result<(), String> {
@@ -447,6 +458,7 @@ pub fn remove_secondary_workspace_root(
 ) -> Result<(), String> {
     remove_secondary_workspace_root_impl(state.inner(), id.clone())?;
     state.terminal.kill_workspace(&id, Some(&app));
+    write_open_roots(&app, state.inner());
     Ok(())
 }
 
@@ -463,17 +475,17 @@ pub fn get_workspace_roots(
         .collect())
 }
 
-fn recent_workspaces_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+fn app_data_file(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {}", e))?;
-    Ok(dir.join(RECENT_WORKSPACES_FILE))
+    Ok(dir.join(name))
 }
 
 fn read_recent(app: &tauri::AppHandle) -> Vec<RecentWorkspaceEntry> {
-    let Ok(file_path) = recent_workspaces_path(app) else {
+    let Ok(file_path) = app_data_file(app, RECENT_WORKSPACES_FILE) else {
         return Vec::new();
     };
     let Ok(raw) = std::fs::read_to_string(&file_path) else {
@@ -483,7 +495,7 @@ fn read_recent(app: &tauri::AppHandle) -> Vec<RecentWorkspaceEntry> {
 }
 
 fn write_recent(app: &tauri::AppHandle, entries: &[RecentWorkspaceEntry]) {
-    let Ok(file_path) = recent_workspaces_path(app) else {
+    let Ok(file_path) = app_data_file(app, RECENT_WORKSPACES_FILE) else {
         return;
     };
     if let Ok(json) = serde_json::to_string_pretty(entries) {
@@ -522,6 +534,115 @@ fn record_recent(app: &tauri::AppHandle, path: &Path, label: &str) {
 #[tauri::command]
 pub fn get_recent_workspaces(app: tauri::AppHandle) -> Result<Vec<RecentWorkspaceEntry>, String> {
     Ok(read_recent(&app))
+}
+
+/// Reads the snapshot file, tolerating every way it can be unusable — absent
+/// (first launch), unreadable, or written by an older/corrupted build. None
+/// of those are worth failing a launch over; the user just gets the normal
+/// "open a folder" state.
+fn read_open_roots_file(file_path: &Path) -> Vec<String> {
+    let Ok(raw) = std::fs::read_to_string(file_path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+fn write_open_roots_file(file_path: &Path, paths: &[String]) {
+    if let Ok(json) = serde_json::to_string_pretty(paths) {
+        let _ = std::fs::write(file_path, json);
+    }
+}
+
+fn read_open_roots(app: &tauri::AppHandle) -> Vec<String> {
+    let Ok(file_path) = app_data_file(app, OPEN_WORKSPACE_ROOTS_FILE) else {
+        return Vec::new();
+    };
+    read_open_roots_file(&file_path)
+}
+
+/// Snapshot the attached folders (primary first) so the next launch can
+/// reattach them. Best-effort like [`write_recent`]: a workspace change must
+/// not fail because this convenience file could not be written.
+fn write_open_roots(app: &tauri::AppHandle, state: &AppState) {
+    let Ok(paths) = attached_root_paths(state) else {
+        return;
+    };
+    let Ok(file_path) = app_data_file(app, OPEN_WORKSPACE_ROOTS_FILE) else {
+        return;
+    };
+    write_open_roots_file(&file_path, &paths);
+}
+
+/// The lock is taken and released here rather than held across the file
+/// write in [`write_open_roots`] — nothing else about persisting needs the
+/// roots list to stay frozen.
+fn attached_root_paths(state: &AppState) -> Result<Vec<String>, String> {
+    let roots = roots_lock(state)?;
+    Ok(roots
+        .iter()
+        .map(|r| r.path.to_string_lossy().to_string())
+        .collect())
+}
+
+/// Core logic behind [`restore_workspace_roots`], factored out so it's
+/// directly testable without a `tauri::AppHandle`.
+///
+/// Restoring is a no-op when a workspace is already attached: every window
+/// shares one `AppState`, so the second window's boot call must return what
+/// the first one restored rather than re-open (and thereby reset permission
+/// grants for) a workspace the user is already working in.
+///
+/// A path that no longer resolves to a directory — the folder was deleted,
+/// moved, or lives on an unmounted volume — is skipped rather than treated
+/// as a failure, and the first path that *does* resolve becomes the primary.
+/// The caller re-persists the surviving set so dead entries stop being
+/// retried on every launch.
+fn restore_workspace_roots_impl(
+    state: &AppState,
+    paths: Vec<String>,
+) -> Result<Vec<WorkspaceRootInfo>, String> {
+    {
+        let roots = roots_lock(state)?;
+        if !roots.is_empty() {
+            return Ok(roots
+                .iter()
+                .enumerate()
+                .map(|(i, r)| r.to_info(i == 0))
+                .collect());
+        }
+    }
+
+    let mut infos: Vec<WorkspaceRootInfo> = Vec::new();
+    let mut remaining = paths.into_iter();
+    for path in remaining.by_ref() {
+        if let Ok((_, info)) = set_primary_workspace_root_impl(state, path) {
+            infos.push(info);
+            break;
+        }
+    }
+    if infos.is_empty() {
+        return Ok(infos);
+    }
+    for path in remaining {
+        if let Ok(info) = add_secondary_workspace_root_impl(state, path) {
+            infos.push(info);
+        }
+    }
+    Ok(infos)
+}
+
+/// Reattach the folders that were open when the app last quit, primary
+/// first. Returns an empty list — not an error — when there is nothing to
+/// restore (first launch, or every remembered folder is gone), so the UI
+/// falls back to its normal "open a folder" state.
+#[tauri::command]
+pub fn restore_workspace_roots(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<WorkspaceRootInfo>, String> {
+    let infos = restore_workspace_roots_impl(state.inner(), read_open_roots(&app))?;
+    write_open_roots(&app, state.inner());
+    Ok(infos)
 }
 
 #[cfg(test)]
@@ -840,6 +961,167 @@ mod tests {
             .lock()
             .unwrap()
             .contains("write_file"));
+    }
+
+    #[test]
+    fn restore_workspace_roots_reattaches_primary_and_secondaries_in_order() {
+        let primary = TempWorkspace::new();
+        let secondary = TempWorkspace::new();
+        let state = AppState::default();
+
+        let infos = restore_workspace_roots_impl(
+            &state,
+            vec![
+                primary.path.to_string_lossy().to_string(),
+                secondary.path.to_string_lossy().to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(infos.len(), 2);
+        assert!(infos[0].is_primary);
+        assert!(!infos[1].is_primary);
+        assert_eq!(
+            attached_root_paths(&state).unwrap(),
+            vec![
+                primary
+                    .path
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+                secondary
+                    .path
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_workspace_roots_skips_folders_that_no_longer_exist() {
+        let missing = std::env::temp_dir().join("little_monkey_workspace_test_deleted_root");
+        let _ = std::fs::remove_dir_all(&missing);
+        let primary = TempWorkspace::new();
+        let state = AppState::default();
+
+        let infos = restore_workspace_roots_impl(
+            &state,
+            vec![
+                missing.to_string_lossy().to_string(),
+                primary.path.to_string_lossy().to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            infos.len(),
+            1,
+            "a deleted folder must not block the next remembered one from becoming primary"
+        );
+        assert!(infos[0].is_primary);
+        assert_eq!(
+            infos[0].path,
+            primary
+                .path
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn restore_workspace_roots_returns_empty_when_nothing_is_restorable() {
+        let state = AppState::default();
+
+        let infos = restore_workspace_roots_impl(&state, Vec::new()).unwrap();
+
+        assert!(infos.is_empty());
+        assert!(roots_lock(&state).unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_workspace_roots_leaves_an_already_open_workspace_alone() {
+        let open = TempWorkspace::new();
+        let other = TempWorkspace::new();
+        let state = state_with_primary(&open.path);
+        state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .insert("write_file".to_string());
+
+        let infos =
+            restore_workspace_roots_impl(&state, vec![other.path.to_string_lossy().to_string()])
+                .unwrap();
+
+        assert_eq!(infos.len(), 1);
+        assert_eq!(
+            infos[0].path,
+            open.path
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            "a second window's boot restore must not swap the workspace out from under the first"
+        );
+        assert!(
+            state
+                .permissions
+                .session_allow
+                .lock()
+                .unwrap()
+                .contains("write_file"),
+            "a no-op restore must not reset session permission grants"
+        );
+    }
+
+    /// The end-to-end shape of the reported bug: attach folders in one
+    /// process, persist, then start from a fresh `AppState` (a relaunch) and
+    /// come back with the same workspace attached, so a resumed session can
+    /// still resolve its files.
+    #[test]
+    fn open_roots_snapshot_survives_a_simulated_relaunch() {
+        let primary = TempWorkspace::new();
+        let secondary = TempWorkspace::new();
+        let snapshot_dir = TempWorkspace::new();
+        let snapshot = snapshot_dir.path.join(OPEN_WORKSPACE_ROOTS_FILE);
+
+        let before_quit = state_with_primary(&primary.path);
+        add_secondary_workspace_root_impl(
+            &before_quit,
+            secondary.path.to_string_lossy().to_string(),
+        )
+        .unwrap();
+        write_open_roots_file(&snapshot, &attached_root_paths(&before_quit).unwrap());
+
+        let after_relaunch = AppState::default();
+        let infos =
+            restore_workspace_roots_impl(&after_relaunch, read_open_roots_file(&snapshot)).unwrap();
+
+        assert_eq!(infos.len(), 2);
+        std::fs::write(primary.path.join("file.txt"), "hi").unwrap();
+        let (resolved, _) = resolve_path_and_root(&after_relaunch, "file.txt").unwrap();
+        assert_eq!(
+            resolved,
+            primary.path.canonicalize().unwrap().join("file.txt"),
+            "files in the restored workspace must resolve again after a relaunch"
+        );
+    }
+
+    #[test]
+    fn open_roots_snapshot_reads_as_empty_when_absent_or_corrupt() {
+        let dir = TempWorkspace::new();
+        let missing = dir.path.join("never-written.json");
+        let corrupt = dir.path.join("corrupt.json");
+        std::fs::write(&corrupt, "{ not json").unwrap();
+
+        assert!(read_open_roots_file(&missing).is_empty());
+        assert!(read_open_roots_file(&corrupt).is_empty());
     }
 
     fn get_workspace_roots_for_test(state: &AppState) -> Vec<WorkspaceRootInfo> {

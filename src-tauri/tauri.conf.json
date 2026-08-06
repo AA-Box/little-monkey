@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Little Monkey",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "identifier": "com.littlemonkey.app",
   "build": {
-    "beforeDevCommand": "pnpm stage:runtime && pnpm stage:cli && pnpm dev",
+    "beforeDevCommand": "pnpm stage:runtime && pnpm stage:runtime:tts && pnpm stage:runtime:sd && pnpm stage:cli && pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm stage:runtime && pnpm codesign:runtime && pnpm stage:cli && pnpm build",
+    "beforeBuildCommand": "pnpm stage:runtime && pnpm codesign:runtime && pnpm stage:runtime:tts && pnpm codesign:runtime:tts && pnpm stage:runtime:sd && pnpm codesign:runtime:sd && pnpm stage:cli && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -23,11 +23,20 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* artifact: http://artifact.localhost; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; frame-src 'self' blob:",
-      "devCsp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* ws://localhost:1420 artifact: http://artifact.localhost; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; frame-src 'self' blob:"
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* artifact: http://artifact.localhost; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; frame-src 'self' blob:",
+      "devCsp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* ws://localhost:1420 artifact: http://artifact.localhost; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; frame-src 'self' blob:"
     }
   },
   "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/AA-Box/little-monkey/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU2NTBCNUJGMUVDRkE5MDYKUldRR3FjOGV2N1ZRNXJ6bWtWWmNiVFNpMEJtd0d1ejB4eW9nOUsxczdFaUV5bXZUa0FzdWRpbUkK",
+      "windows": {
+        "installMode": "passive"
+      }
+    },
     "deep-link": {
       "desktop": [
         {
@@ -38,6 +47,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "icon": [
       "icons/32x32.png",
