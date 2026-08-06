@@ -46,6 +46,14 @@ export interface WorkspaceStore {
 
   /** Re-fetch the attached-folders list from the backend. */
   refreshRoots: () => Promise<void>;
+  /**
+   * Reattach the folders that were open when the app last quit. `roots`
+   * lives only in memory on the Rust side, so without this a relaunch left
+   * every session with no workspace — the chat was still there but no file
+   * could be read or edited from it. Safe to call from every window: the
+   * backend no-ops (returning the current set) once a workspace is open.
+   */
+  restoreRoots: () => Promise<void>;
   /** Re-fetch the persisted recent-workspaces list from the backend. */
   refreshRecent: () => Promise<void>;
   /** Open (or re-open) the primary workspace folder. If this actually
@@ -68,6 +76,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   refreshRoots: async () => {
     const roots = await invoke<WorkspaceRootInfo[]>("get_workspace_roots");
     set({ roots });
+  },
+
+  restoreRoots: async () => {
+    const roots = await invoke<WorkspaceRootInfo[]>("restore_workspace_roots");
+    // Bump `rootsVersion` unconditionally: the file tree, git status, and
+    // diff viewer all key off it, and at boot they have nothing loaded yet
+    // whether or not a workspace came back.
+    set((state) => ({ roots, rootsVersion: state.rootsVersion + 1 }));
   },
 
   refreshRecent: async () => {

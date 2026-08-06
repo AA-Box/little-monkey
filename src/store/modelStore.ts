@@ -204,8 +204,6 @@ export interface CloudModelRetirementWarning {
   replacement_note: string;
 }
 
-/** Context window size used when starting llama-server. */
-const DEFAULT_CTX_SIZE = 4096;
 /** GPU layers to offload to the GPU; a large value offloads the full model. */
 const DEFAULT_GPU_LAYERS = 999;
 
@@ -268,6 +266,8 @@ export interface ModelStore {
   refresh: () => Promise<void>;
   /** Download a curated model's GGUF weights, then refresh the installed list. */
   download: (model: ModelInfo) => Promise<void>;
+  /** Cancel an in-flight `download()` for `model.file` — interrupts the backend stream and clears its progress entry. */
+  cancelDownload: (model: ModelInfo) => Promise<void>;
   /** Resolve an Ollama tag or Hugging Face reference into a verified public GGUF artifact. */
   resolveModelReference: (reference: string) => Promise<ResolvedModelReference>;
   /** Install a previously-resolved artifact and refresh the installed model list. */
@@ -307,6 +307,8 @@ export interface ModelStore {
   startOllama: () => Promise<void>;
   /** Pull a model tag via the Ollama CLI, tracking progress/errors for it. */
   pullOllamaModel: (tag: string) => Promise<void>;
+  /** Cancel an in-flight `pullOllamaModel` pull for `tag` — kills the underlying `ollama pull` process. */
+  cancelOllamaPull: (tag: string) => Promise<void>;
   /** Import a local `.gguf` file or Safetensors model directory into Ollama under `name` (via `ollama create`), tracking progress/errors the same way as `pullOllamaModel`. */
   importOllamaModel: (name: string, path: string) => Promise<void>;
   /** Create a model from a full, user-authored Modelfile via Modelfile Studio's hardened `ollama_create_from_modelfile` command — re-parses/re-validates `modelfileText` server-side regardless of any prior preview, then streams `ollama create` output the same way as `pullOllamaModel`/`importOllamaModel` (keyed by `shortName`). */
@@ -449,11 +451,27 @@ export const useModelStore = create<ModelStore>((set, get) => ({
   },
 
   download: async (model) => {
-    await invoke<string>("models_download", {
-      repo: model.repo,
-      file: model.file,
-    });
+    try {
+      await invoke<string>("models_download", {
+        repo: model.repo,
+        file: model.file,
+      });
+    } catch (error) {
+      // A cancelled or failed download must not leave a stale progress
+      // entry behind — `isDownloading` in ModelCard keys off its presence,
+      // so without this the card would be stuck showing a progress bar
+      // (with no Pull button to retry) forever.
+      set((state) => {
+        const { [model.file]: _removed, ...rest } = state.downloadProgress;
+        return { downloadProgress: rest };
+      });
+      throw error;
+    }
     await get().refresh();
+  },
+
+  cancelDownload: async (model) => {
+    await invoke("models_cancel_download", { file: model.file });
   },
 
   resolveModelReference: async (reference) =>
@@ -473,15 +491,29 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       throw new Error(`Model "${model.name}" has not been downloaded yet`);
     }
     set({ active: model, llamaStatus: "starting", activeProvider: "local" });
-    await invoke("llama_start", {
-      modelPath: model.path,
-      ctxSize: DEFAULT_CTX_SIZE,
-      gpuLayers: DEFAULT_GPU_LAYERS,
-      embeddings: get().embeddingsEnabled,
-    });
+    let resolvedCtxSize: number;
+    try {
+      // `ctxSize` is omitted so the backend auto-sizes the context window
+      // from the model's own GGUF metadata (`llama.rs::resolve_ctx_size`)
+      // instead of one fixed guess for every model — it returns whatever it
+      // actually launched with.
+      resolvedCtxSize = await invoke<number>("llama_start", {
+        modelPath: model.path,
+        gpuLayers: DEFAULT_GPU_LAYERS,
+        embeddings: get().embeddingsEnabled,
+      });
+    } catch (err) {
+      // `llama_start` can reject before ever spawning the process (e.g.
+      // model verification or runtime binary resolution failure) — those
+      // paths never emit a `llama://status` event, so without this the
+      // optimistic "starting" set above would never be corrected and the
+      // UI would be stuck showing "Starting..." indefinitely.
+      set({ llamaStatus: "error" });
+      throw err;
+    }
     // The context limit for a local model is exactly the ctx_size it was
     // started with.
-    useUsageStore.getState().setContextLimit(DEFAULT_CTX_SIZE);
+    useUsageStore.getState().setContextLimit(resolvedCtxSize);
   },
 
   stop: async () => {
@@ -544,6 +576,10 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       }));
       throw err;
     }
+  },
+
+  cancelOllamaPull: async (tag) => {
+    await invoke("ollama_cancel_pull", { tag });
   },
 
   importOllamaModel: async (name, path) => {

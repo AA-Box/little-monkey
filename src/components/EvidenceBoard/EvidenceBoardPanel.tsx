@@ -5,6 +5,7 @@ import { useT } from "../../lib/i18n";
 import type { Claim, ClaimConfidence, ClaimStatus } from "../../lib/evidenceBoard";
 import { useEvidenceBoardStore } from "../../store/evidenceBoardStore";
 import { useSessionStore } from "../../store/sessionStore";
+import { ModelSwitcher } from "../Chat/ModelSwitcher";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
 import { errorMessage } from "../../lib/errors";
 
@@ -225,6 +226,11 @@ export function EvidenceBoardPanel({ sessionId, onClose }: EvidenceBoardPanelPro
                 <RefreshCw size={13} className={extracting ? "animate-spin" : ""} />
                 {extracting ? t("EvidenceBoard.extracting") : t("EvidenceBoard.reExtract")}
               </Button>
+              {/* Extraction runs against the app's active chat target
+                  (`evidenceBoardStore.runExtraction`), so the picker belongs
+                  next to the button — otherwise "Select and connect a chat
+                  model" is unactionable without leaving the panel. */}
+              <ModelSwitcher placement="down" />
               <IconButton
                 size="sm"
                 onClick={() => deleteBoard(activeBoard.id)}

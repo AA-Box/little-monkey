@@ -1,6 +1,6 @@
 [package]
 name = "little-monkey"
-version = "1.1.0"
+version = "1.2.0"
 description = "Little Monkey — a local model runner with agentic file/shell tools"
 authors = ["you"]
 license = "MIT"
@@ -33,6 +33,16 @@ tauri-plugin-dialog = "2.7.1"
 tauri-plugin-fs = "2.5.1"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-window-state = "2"
+# In-app updates (docs/auto-update.md): background check against the signed
+# `latest.json` published by the release workflow, silent download+install on
+# macOS/Linux, and a "Relaunch to update" card. With an empty
+# `plugins.updater.pubkey` every check fails signature verification and the
+# frontend swallows it, so an unconfigured build behaves as if updates didn't
+# exist.
+tauri-plugin-updater = "2.10.1"
+# Only used for `relaunch()` after an update installs — the second half of the
+# "Relaunch to update" click. Separate crate from the updater itself.
+tauri-plugin-process = "2.3.1"
 # hosted_oauth.rs: receives the littlemonkey:// deep link Cloudflare Worker
 # redirects to after a Slack/Google OAuth exchange (see
 # Cargo.toml's own `reqwest`/`rmcp` comments for why the *loopback* OAuth
@@ -222,11 +232,13 @@ libc = "0.2"
 winreg = "0.56"
 # cli_install.rs: broadcasts WM_SETTINGCHANGE after the PATH registry write
 # so already-open shells/Explorer notice without a logoff — the same
-# notification Windows installers send. Only the two Win32 feature modules
-# actually used (SendMessageTimeoutW plus the HWND/WPARAM/LPARAM/LRESULT
-# type aliases it needs) are enabled. 0.61 verified current on crates.io at
-# implementation time.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging"] }
+# notification Windows installers send. Only the Win32 feature modules
+# actually used are enabled: SendMessageTimeoutW plus the
+# HWND/WPARAM/LPARAM/LRESULT type aliases it needs, and Threading for
+# `os_signal::process_is_alive` (OpenProcess/WaitForSingleObject — the unix
+# side of that answer is `kill(pid, 0)`, which needs no feature). 0.61 verified
+# current on crates.io at implementation time.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [features]
 default = ["pdf-extraction"]

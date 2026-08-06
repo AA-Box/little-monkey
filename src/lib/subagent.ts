@@ -28,6 +28,8 @@ import {
 import type { ChatMessage, ToolCall, ToolDef } from './llamaClient';
 import type { McpToolRegistry } from './mcpTools';
 import { useWorkspaceStore } from '../store/workspaceStore';
+import { admitProcess, exitProcess, markProcessRunning } from './processTable';
+import { honourPause, forgetPause } from './pauseRegistry';
 import { useSubagentStore } from '../store/subagentStore';
 import { useSessionStore } from '../store/sessionStore';
 import { useSettingsStore } from '../store/settingsStore';
@@ -297,6 +299,23 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
   // dispatches it — not just once the first `attemptStream` call settles.
   useSubagentStore.getState().start({ sessionId, taskId: storeKey, cancelId: taskId, description, profile });
 
+  // Projected onto the unified process table as a child of the turn that
+  // dispatched it. `taskId` (the cancel id) is the surface identifier rather
+  // than `storeKey`, because `storeKey` is the originating `ToolCall.id` and a
+  // provider fallback id like `call_0` is not unique. The parent is named by its
+  // turn id, which is all this function is given; resolution happens in Rust.
+  // Fail-soft — see `processTable.ts`.
+  const processIdPromise = admitProcess({
+    kind: 'subagent',
+    externalId: taskId,
+    parentExternalId: runId ?? null,
+    parentKind: 'chat_turn',
+    profile,
+  }).then(async (id) => {
+    if (id) await markProcessRunning(id);
+    return id;
+  });
+
   // This run's OWN signal: aborted by the parent turn's Stop (relayed from
   // `parentSignal`) OR by `cancelSubagentRun` targeting just this run from
   // the Background-tasks drawer. Everything below checks/passes `signal`,
@@ -320,6 +339,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
    * after a restart wipes the transient store. */
   const finish = (status: 'done' | 'error' | 'cancelled', result: string): string => {
     activeSubagentControllers.delete(taskId);
+    forgetPause(taskId);
     const live = useSubagentStore.getState().runs[storeKey];
     useSubagentStore.getState().finish(storeKey, status);
     useSessionStore.getState().setSubagentRun(
@@ -338,6 +358,19 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
           }
         : undefined,
     );
+    // Not awaited: `finish` is synchronous and is the single exit point every
+    // return routes through, so blocking it on IPC would change the loop's
+    // shape. The projection is best-effort by design.
+    void processIdPromise.then((id) => {
+      if (!id) return;
+      const outcome =
+        status === 'done'
+          ? { status: 'succeeded' as const, reason: null }
+          : status === 'cancelled'
+            ? { status: 'cancelled' as const, reason: 'stopped' }
+            : { status: 'failed' as const, reason: result.slice(0, 500) };
+      return exitProcess(id, outcome.status, outcome.reason);
+    });
     return result;
   };
 
@@ -355,6 +388,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
     const resolvedTarget = resolveSubagentTarget(target, profile);
 
     for (let iteration = 0; iteration < MAX_SUBAGENT_ITERATIONS; iteration++) {
+      await honourPause(taskId, processIdPromise, signal);
       if (signal.aborted) return finish('cancelled', CANCELLED_TOOL_RESULT);
 
       const wireHistory: ChatMessage[] = [{ role: 'system', content: systemPrompt }, ...messages];
@@ -485,6 +519,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
         }
       }
 
+      await honourPause(taskId, processIdPromise, signal);
       if (signal.aborted) return finish('cancelled', CANCELLED_TOOL_RESULT);
       // Loop again: the child model gets its own tool results appended.
     }

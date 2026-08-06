@@ -21,6 +21,7 @@ mod modelfile;
 mod ollama_api;
 mod permission;
 mod plugins_cli;
+mod processes_cli;
 mod providers_cli;
 mod repl;
 mod security_cli;
@@ -397,6 +398,12 @@ enum Cmd {
     /// Inspect local security posture and apply narrowly-scoped safe fixes.
     #[command(subcommand)]
     Security(security_cli::SecurityCmd),
+    /// Inspect agent processes across every execution surface.
+    ///
+    /// Named `processes` because `monkey ps` is the Ollama-compatible
+    /// "list running models" command.
+    #[command(subcommand, alias = "proc")]
+    Processes(processes_cli::ProcessesCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -1016,7 +1023,17 @@ async fn main() {
         return;
     }
 
-    let client = reqwest::Client::new();
+    // The one client the whole CLI shares — threaded through as
+    // `&reqwest::Client` by every subcommand below — so hardening it here is
+    // the whole binary's egress posture in one line. See
+    // `little_monkey_lib::egress::hardened` for what it supplies; note in
+    // particular that it adds no HTTPS-only or public-address rule, because
+    // this same client also talks to the bundled `llama-server` and a local
+    // Ollama daemon over plain `http://127.0.0.1`.
+    let client = match little_monkey_lib::egress::hardened().build() {
+        Ok(client) => client,
+        Err(error) => fail(&format!("could not build the HTTP client: {error}")),
+    };
 
     if let Some(cmd) = &cli.cmd {
         if let Some(prompt) = cli.model_or_prompt.as_ref().or(cli.prompt.as_ref()) {
@@ -1299,6 +1316,14 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                     let workspace = workspace.canonicalize().ok();
                     security_cli::run(action, &data_dir, workspace.as_deref())
                 }
+                Err(error) => Err(error),
+            }
+        }
+        Cmd::Processes(action) => {
+            let data_dir = app_data_dir()
+                .ok_or_else(|| "Could not resolve the app data directory".to_string());
+            match data_dir {
+                Ok(data_dir) => processes_cli::run(action, &data_dir),
                 Err(error) => Err(error),
             }
         }

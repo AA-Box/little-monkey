@@ -4,6 +4,7 @@ import { useT } from "../../lib/i18n";
 import type { PmRiskSeverity } from "../../lib/pmCopilot";
 import { usePmCopilotStore } from "../../store/pmCopilotStore";
 import { useWorkspaceStore, primaryRoot } from "../../store/workspaceStore";
+import { ModelSwitcher } from "../Chat/ModelSwitcher";
 import { Button, IconButton } from "../ui";
 
 interface PmCopilotPanelProps {
@@ -68,37 +69,40 @@ export function PmCopilotPanel({ onClose }: PmCopilotPanelProps) {
             </div>
           )}
 
+          {/* The goal itself is typed in chat (`/pm-plan <goal>`), never here —
+              one input surface, and the chat composer already has the model
+              picker this generation runs against. This card only shows what
+              was asked for and lets it be re-run. */}
           <div className="rounded-lg border border-border bg-background p-4">
-            <label className="block text-sm font-medium text-foreground" htmlFor="pm-copilot-goal">
-              {t("PmCopilotPanel.goalLabel")}
-            </label>
-            <textarea
-              id="pm-copilot-goal"
-              className={`${TEXTAREA} mt-2`}
-              rows={4}
-              placeholder={t("PmCopilotPanel.goalPlaceholder")}
-              value={state.goal}
-              onChange={(event) => state.setGoal(event.target.value)}
-              disabled={generating}
-            />
+            <p className="text-sm font-medium text-foreground">{t("PmCopilotPanel.goalLabel")}</p>
+            <p className="mt-1 text-sm text-muted">{state.goal.trim() || t("PmCopilotPanel.noGoal")}</p>
             <div className="mt-3 flex items-center gap-2">
-              <Button
-                type="button"
-                variant="primary"
-                onClick={() => void state.generate()}
-                disabled={generating || !state.goal.trim()}
-              >
-                {generating
-                  ? t("PmCopilotPanel.generatingButton")
-                  : plan
-                    ? t("PmCopilotPanel.regenerateButton")
-                    : t("PmCopilotPanel.generateButton")}
-              </Button>
+              {state.goal.trim() && (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => void state.generate()}
+                  disabled={generating}
+                >
+                  {generating
+                    ? t("PmCopilotPanel.generatingButton")
+                    : plan
+                      ? t("PmCopilotPanel.regenerateButton")
+                      : t("PmCopilotPanel.generateButton")}
+                </Button>
+              )}
               {generating && (
                 <Button type="button" variant="ghost" onClick={() => state.cancelGenerate()}>
                   {t("PmCopilotPanel.cancelButton")}
                 </Button>
               )}
+              {/* Regeneration runs against the app's active chat target
+                  (`pmCopilot.ts`'s `activeTarget`), so the picker belongs next
+                  to it — otherwise "Select and connect a chat model" is
+                  unactionable without leaving the panel. */}
+              <div className="ml-auto min-w-0">
+                <ModelSwitcher placement="down" />
+              </div>
             </div>
             {state.status === "error" && state.error && (
               <p role="alert" className="mt-2 text-xs text-danger">
@@ -108,7 +112,7 @@ export function PmCopilotPanel({ onClose }: PmCopilotPanelProps) {
           </div>
 
           {!plan && state.status !== "generating" && (
-            <p className="px-1 text-sm text-faint">{t("PmCopilotPanel.emptyState")}</p>
+            <p className="px-1 text-sm text-faint">{t("PmCopilotPanel.chatOnlyEmptyState")}</p>
           )}
 
           {plan && (

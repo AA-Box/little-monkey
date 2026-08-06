@@ -160,7 +160,7 @@ fn curated_models() -> Vec<ModelInfo> {
 }
 
 /// Resolves (and creates, if missing) `<app_data_dir>/models`.
-fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
         .path()
         .app_data_dir()
@@ -512,8 +512,17 @@ fn validate_filename(file: &str) -> Result<(), String> {
 /// ({file, downloaded, total}) as bytes arrive. Downloads to a temporary
 /// `.part` file first and atomically renames on success, so a crashed or
 /// cancelled download is never mistaken for an installed model.
+///
+/// Cancellable via the `CancellationToken` registered in
+/// `AppState::model_downloads` under `file` (see `models_cancel_download`) —
+/// same pattern as `stacks::reindex_impl`/`stacks_cancel_index`.
 #[tauri::command]
-pub async fn models_download(app: AppHandle, repo: String, file: String) -> Result<String, String> {
+pub async fn models_download(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    repo: String,
+    file: String,
+) -> Result<String, String> {
     validate_repo(&repo)?;
     validate_filename(&file)?;
 
@@ -536,7 +545,24 @@ pub async fn models_download(app: AppHandle, repo: String, file: String) -> Resu
         return Err(format!("Invalid file name '{file}'"));
     }
 
-    match download_to_file(&app, &repo, &file, &tmp_path).await {
+    let cancel = {
+        let mut cancels = state
+            .model_downloads
+            .lock()
+            .map_err(|_| "Model-download-cancel lock poisoned".to_string())?;
+        cancels
+            .entry(file.clone())
+            .or_insert_with(|| std::sync::Arc::new(tokio_util::sync::CancellationToken::new()))
+            .clone()
+    };
+    // RAII-style cleanup so the cancel handle never lingers past this
+    // download, whether it finishes normally, errors, or is cancelled.
+    let _cleanup = DownloadCancelCleanup {
+        state: &state,
+        file: file.clone(),
+    };
+
+    match download_to_file(&app, &repo, &file, &tmp_path, &cancel).await {
         Ok(()) => {
             tokio::fs::rename(&tmp_path, &dest_path)
                 .await
@@ -553,6 +579,37 @@ pub async fn models_download(app: AppHandle, repo: String, file: String) -> Resu
             Err(e)
         }
     }
+}
+
+/// Removes `file`'s cancellation handle from `AppState::model_downloads` on
+/// drop, so a finished/errored/cancelled download never leaves a stale entry
+/// behind for a later `models_cancel_download` call to (harmlessly, but
+/// pointlessly) find.
+struct DownloadCancelCleanup<'a> {
+    state: &'a AppState,
+    file: String,
+}
+
+impl Drop for DownloadCancelCleanup<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut cancels) = self.state.model_downloads.lock() {
+            cancels.remove(&self.file);
+        }
+    }
+}
+
+/// Best-effort cancellation, like `stacks_cancel_index`: if no download is
+/// currently running for `file`, this is simply a no-op (nothing to cancel).
+#[tauri::command]
+pub fn models_cancel_download(state: tauri::State<'_, AppState>, file: String) -> Result<(), String> {
+    let cancels = state
+        .model_downloads
+        .lock()
+        .map_err(|_| "Model-download-cancel lock poisoned".to_string())?;
+    if let Some(token) = cancels.get(&file) {
+        token.cancel();
+    }
+    Ok(())
 }
 
 /// Resolves a public Ollama or Hugging Face reference to immutable,
@@ -596,17 +653,28 @@ pub async fn models_install_reference(
 
 /// Performs the actual streaming GET + write-to-disk for `models_download`,
 /// emitting progress events roughly every 200ms plus a final event at
-/// completion.
-async fn download_to_file(
+/// completion. Races each chunk read against `cancel` so a
+/// `models_cancel_download` call interrupts the transfer promptly instead of
+/// waiting out the current (or remaining) chunk(s).
+pub(crate) async fn download_to_file(
     app: &AppHandle,
     repo: &str,
     file: &str,
     tmp_path: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(), String> {
     let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
 
+    // Same silence budget as every other download path, for the same reason: this
+    // client had no timeout of any kind, so a Hugging Face connection that
+    // completed its handshake and then stopped writing left the progress bar
+    // stopped at N bytes indefinitely, with no error and no self-recovery. Less
+    // severe than the managed-model installer's version of this bug only because
+    // `cancel` is wired here, so a user could get out of it by hand.
     let client = reqwest::Client::builder()
         .user_agent("LittleMonkey-Desktop/0.1")
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(crate::egress::READ_TIMEOUT)
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
@@ -633,7 +701,15 @@ async fn download_to_file(
     let mut downloaded: u64 = 0;
     let mut last_emit = std::time::Instant::now();
 
-    while let Some(chunk_result) = stream.next().await {
+    loop {
+        let chunk_result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err("Download cancelled".to_string()),
+            next = stream.next() => next,
+        };
+        let Some(chunk_result) = chunk_result else {
+            break;
+        };
         let chunk = chunk_result.map_err(|e| format!("Download stream error for {file}: {e}"))?;
 
         out.write_all(&chunk)

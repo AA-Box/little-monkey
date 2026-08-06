@@ -174,6 +174,13 @@ pub struct GgufHeaderInfo {
     pub architecture: Option<String>,
     pub name: Option<String>,
     pub quantization_version: Option<String>,
+    /// The model's own trained context window, read straight from its
+    /// `<architecture>.context_length` metadata key (e.g.
+    /// `llama.context_length`, `qwen2.context_length`) — the authoritative
+    /// source for how large a context this model was actually trained for,
+    /// used to auto-size `llama-server`'s `-c` instead of one fixed guess
+    /// for every model (see `llama.rs::resolve_ctx_size`).
+    pub context_length: Option<u64>,
     pub declared_license: Option<String>,
     /// Kept internal so callers can validate runtime compatibility without
     /// exposing a potentially large template in reports or over IPC.
@@ -250,13 +257,21 @@ const GGUF_TYPE_UINT64: u32 = 10;
 const GGUF_TYPE_INT64: u32 = 11;
 const GGUF_TYPE_FLOAT64: u32 = 12;
 
-/// Reads (and, for strings, returns) one metadata value of `value_type`,
-/// recursing for arrays up to [`MAX_GGUF_VALUE_NESTING`] deep.
+/// A parsed scalar metadata value worth keeping around after the read —
+/// everything else (`read_gguf_value`'s other branches) is discarded once
+/// its bytes are consumed, since nothing today needs it.
+enum GgufScalar {
+    Text(String),
+    UInt(u64),
+}
+
+/// Reads (and, for strings/integers, returns) one metadata value of
+/// `value_type`, recursing for arrays up to [`MAX_GGUF_VALUE_NESTING`] deep.
 fn read_gguf_value<R: Read>(
     reader: &mut R,
     value_type: u32,
     depth: u32,
-) -> QuantizationResult<Option<String>> {
+) -> QuantizationResult<Option<GgufScalar>> {
     if depth > MAX_GGUF_VALUE_NESTING {
         return Err(QuantizationError::Invalid(
             "GGUF metadata array nesting exceeded the safety bound".to_string(),
@@ -268,26 +283,36 @@ fn read_gguf_value<R: Read>(
             reader
                 .read_exact(&mut byte)
                 .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF scalar: {error}")))?;
-            Ok(None)
+            Ok(Some(GgufScalar::UInt(byte[0] as u64)))
         }
         GGUF_TYPE_UINT16 | GGUF_TYPE_INT16 => {
             let mut bytes = [0_u8; 2];
             reader
                 .read_exact(&mut bytes)
                 .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF scalar: {error}")))?;
-            Ok(None)
+            Ok(Some(GgufScalar::UInt(u16::from_le_bytes(bytes) as u64)))
         }
-        GGUF_TYPE_UINT32 | GGUF_TYPE_INT32 | GGUF_TYPE_FLOAT32 => {
+        GGUF_TYPE_UINT32 | GGUF_TYPE_INT32 => {
+            let value = read_u32(reader)
+                .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF scalar: {error}")))?;
+            Ok(Some(GgufScalar::UInt(value as u64)))
+        }
+        GGUF_TYPE_FLOAT32 => {
             read_u32(reader)
                 .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF scalar: {error}")))?;
             Ok(None)
         }
-        GGUF_TYPE_UINT64 | GGUF_TYPE_INT64 | GGUF_TYPE_FLOAT64 => {
+        GGUF_TYPE_UINT64 | GGUF_TYPE_INT64 => {
+            let value = read_u64(reader)
+                .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF scalar: {error}")))?;
+            Ok(Some(GgufScalar::UInt(value)))
+        }
+        GGUF_TYPE_FLOAT64 => {
             read_u64(reader)
                 .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF scalar: {error}")))?;
             Ok(None)
         }
-        GGUF_TYPE_STRING => Ok(Some(read_gguf_string(reader)?)),
+        GGUF_TYPE_STRING => Ok(Some(GgufScalar::Text(read_gguf_string(reader)?))),
         GGUF_TYPE_ARRAY => {
             let element_type = read_u32(reader)
                 .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF array header: {error}")))?;
@@ -356,6 +381,7 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
     let mut architecture = None;
     let mut name = None;
     let mut quantization_version = None;
+    let mut context_length = None;
     let mut declared_license = None;
     let mut chat_template = None;
     for _ in 0..metadata_kv_count {
@@ -364,14 +390,24 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
             .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF value type: {error}")))?;
         let value = read_gguf_value(&mut reader, value_type, 0)?;
         match (key.as_str(), value) {
-            ("general.architecture", Some(text)) => architecture = Some(text),
-            ("general.name", Some(text)) => name = Some(text),
-            ("general.quantization_version", Some(text)) => quantization_version = Some(text),
-            ("tokenizer.chat_template", Some(text)) => chat_template = Some(text),
-            ("general.license" | "general.license.name" | "general.license.spdx", Some(text))
-                if declared_license.is_none() =>
-            {
+            ("general.architecture", Some(GgufScalar::Text(text))) => architecture = Some(text),
+            ("general.name", Some(GgufScalar::Text(text))) => name = Some(text),
+            ("general.quantization_version", Some(GgufScalar::Text(text))) => {
+                quantization_version = Some(text)
+            }
+            ("tokenizer.chat_template", Some(GgufScalar::Text(text))) => chat_template = Some(text),
+            (
+                "general.license" | "general.license.name" | "general.license.spdx",
+                Some(GgufScalar::Text(text)),
+            ) if declared_license.is_none() => {
                 declared_license = Some(text);
+            }
+            // Keyed per-architecture (`llama.context_length`,
+            // `qwen2.context_length`, ...) rather than a fixed name, so match
+            // the suffix instead of one exact key. Only one such key exists
+            // per real GGUF file.
+            (key, Some(GgufScalar::UInt(value))) if key.ends_with(".context_length") => {
+                context_length = Some(value);
             }
             _ => {}
         }
@@ -407,6 +443,7 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
         architecture,
         name,
         quantization_version,
+        context_length,
         declared_license,
         chat_template,
     })
@@ -1324,11 +1361,23 @@ mod tests {
         license: Option<&str>,
         chat_template: Option<&str>,
     ) -> Vec<u8> {
+        build_minimal_gguf_full(architecture, license, chat_template, None)
+    }
+
+    fn build_minimal_gguf_full(
+        architecture: &str,
+        license: Option<&str>,
+        chat_template: Option<&str>,
+        context_length: Option<u32>,
+    ) -> Vec<u8> {
         let mut buffer = Vec::new();
         buffer.extend_from_slice(&GGUF_MAGIC);
         write_u32(&mut buffer, 3);
         write_u64(&mut buffer, 1); // tensor_count
-        let metadata_count = 1 + u64::from(license.is_some()) + u64::from(chat_template.is_some());
+        let metadata_count = 1
+            + u64::from(license.is_some())
+            + u64::from(chat_template.is_some())
+            + u64::from(context_length.is_some());
         write_u64(&mut buffer, metadata_count);
 
         write_string(&mut buffer, "general.architecture");
@@ -1345,6 +1394,12 @@ mod tests {
             write_string(&mut buffer, "tokenizer.chat_template");
             write_u32(&mut buffer, GGUF_TYPE_STRING);
             write_string(&mut buffer, chat_template);
+        }
+
+        if let Some(context_length) = context_length {
+            write_string(&mut buffer, &format!("{architecture}.context_length"));
+            write_u32(&mut buffer, GGUF_TYPE_UINT32);
+            write_u32(&mut buffer, context_length);
         }
 
         // One tensor: name, 1 dimension, ggml type 0 (F32), offset 0.
@@ -1395,6 +1450,20 @@ mod tests {
         assert_eq!(header.metadata_kv_count, 2);
         assert_eq!(header.architecture.as_deref(), Some("llama"));
         assert_eq!(header.declared_license.as_deref(), Some("apache-2.0"));
+    }
+
+    #[test]
+    fn sniffs_context_length_keyed_by_architecture() {
+        let bytes = build_minimal_gguf_full("qwen2", None, None, Some(32_768));
+        let header = sniff_gguf_header(Cursor::new(bytes)).expect("valid GGUF fixture must parse");
+        assert_eq!(header.context_length, Some(32_768));
+    }
+
+    #[test]
+    fn context_length_absent_when_no_such_key_exists() {
+        let bytes = build_minimal_gguf("llama", None);
+        let header = sniff_gguf_header(Cursor::new(bytes)).expect("valid GGUF fixture must parse");
+        assert_eq!(header.context_length, None);
     }
 
     #[test]

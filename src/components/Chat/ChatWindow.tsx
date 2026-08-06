@@ -63,6 +63,7 @@ import {
   type BuiltInSlashCommandName,
 } from "../../lib/slashCommands";
 import { runSideQuestion, stopSideQuestion } from "../../lib/sideQuestion";
+import { usePmCopilotStore } from "../../store/pmCopilotStore";
 import { useSideChatStore } from "../../store/sideChatStore";
 import SideChatPanel from "./SideChatPanel";
 import { TASK_TOOL, PRESENT_PLAN_TOOL, buildTools } from "../../lib/tools";
@@ -324,9 +325,15 @@ interface ChatWindowProps {
    * branch). Optional so hosts without the right-sidebar region (none
    * today) simply get a non-clickable chip. */
   onOpenBackgroundTasks?: () => void;
+  /** Opens the Product Manager Copilot panel — `/pm-plan`'s target surface,
+   * where the plain-text goal typed here becomes an editable, savable plan.
+   * Optional for the same reason as `onOpenBackgroundTasks`: a host without
+   * the feature-panel region still runs the command, it just can't reveal the
+   * panel. */
+  onOpenPmCopilot?: () => void;
 }
 
-export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks }: ChatWindowProps) {
+export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot }: ChatWindowProps) {
   const messages = useSessionStore(selectSessionMessages(sessionId));
   const persistError = useSessionStore((state) => state.persistError);
   const roots = useWorkspaceStore((state) => state.roots);
@@ -818,6 +825,26 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       await runSideQuestion(sessionId, commandArguments);
       return;
     }
+    if (command === "pm-plan") {
+      if (!commandArguments) throw new Error("Use /pm-plan <product goal>.");
+      // Generation runs against the same active chat target this composer's
+      // ModelSwitcher selects (`pmCopilot.ts`'s `activeTarget`), so the goal
+      // is typed here and only edited/saved in the panel.
+      onOpenPmCopilot?.();
+      await usePmCopilotStore.getState().startFromGoal(commandArguments);
+      const drafted = usePmCopilotStore.getState();
+      // `generate()` records failures in its own state rather than throwing,
+      // so surface them here as a failed command notice.
+      if (drafted.status === "error") throw new Error(drafted.error ?? "Plan generation failed.");
+      const plan = drafted.plan;
+      appendCommandNotice(
+        command,
+        plan
+          ? `Drafted a plan with ${plan.userStories.length} user stories and ${plan.milestones.length} milestones. Review, edit, and save it in Product Manager Copilot.`
+          : "Product Manager Copilot is open. No plan was drafted.",
+      );
+      return;
+    }
     if (command === "new") {
       requireNoArguments();
       useSessionStore.getState().newSession();
@@ -935,7 +962,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       );
       onOpenSettingsTab("prompts");
     }
-  }, [appendCommandNotice, availableSkills, onOpenSettingsTab, sessionId]);
+  }, [appendCommandNotice, availableSkills, onOpenPmCopilot, onOpenSettingsTab, sessionId]);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();

@@ -47,11 +47,14 @@ const VERIFY_CONFIGS_FILE: &str = "verify_configs.json";
 /// routinely outlive that.
 const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 300;
 
-/// Each of stdout/stderr is tail-capped at this many chars (Rust-side) before
-/// ever leaving this module — a runaway test suite's output must not flood
-/// the model's context window. "Tail" because a failure's most useful detail
-/// is almost always printed last.
-const VERIFY_OUTPUT_CAP: usize = 20_000;
+/// Each of stdout/stderr is tail-capped before ever leaving this module — a
+/// runaway test suite's output must not flood the model's context window.
+///
+/// The number, the truncation direction and the marker now live in
+/// [`crate::output_cap`], shared with `tools.rs`'s shell tool, which had no cap at
+/// all. Previously documented as bounding "chars" while measuring `s.len()`, which
+/// is bytes.
+const VERIFY_OUTPUT_CAP: usize = crate::output_cap::MODEL_OUTPUT_CAP;
 
 /// One user-configured verification command.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -174,19 +177,14 @@ fn find_command<'a>(config: &'a VerifyConfig, command_id: &str) -> Option<&'a Ve
     config.commands.iter().find(|c| c.id == command_id)
 }
 
-/// Tail-caps `s` at [`VERIFY_OUTPUT_CAP`] chars, keeping the END of the
-/// string (a failure's most useful detail is usually printed last) and
-/// prefixing a truncation marker. Splits on a UTF-8 char boundary so it never
-/// panics on a truncation point that lands mid-codepoint.
+/// Tail-caps `s` at [`VERIFY_OUTPUT_CAP`] bytes.
+///
+/// A thin wrapper over [`crate::output_cap::cap_tail`], kept so this module's two
+/// call sites stay readable. `VerifyResult` has no truncation flag on the wire, so
+/// the marker in the text is the only signal here — unlike the shell tool, whose
+/// callers may need to parse the output as a whole document.
 fn cap_output(s: String) -> String {
-    if s.len() <= VERIFY_OUTPUT_CAP {
-        return s;
-    }
-    let mut start = s.len() - VERIFY_OUTPUT_CAP;
-    while start < s.len() && !s.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("… (truncated)\n{}", &s[start..])
+    crate::output_cap::cap_tail(s, VERIFY_OUTPUT_CAP).0
 }
 
 /// Core, `AppHandle`-free execution logic — a near-copy of
@@ -226,6 +224,19 @@ pub async fn run_command_impl(
         // the in-flight `wait_with_output` future (and the child with it) —
         // without this, the spawned process would keep running orphaned.
         .kill_on_drop(true);
+    // Its own process group, so a timeout can end the whole tree rather than the
+    // shell alone — `kill_on_drop` reaps one pid, which for `sh -c "npm test"`
+    // leaves the test runner alive. Mirrors `tools.rs`'s own spawn.
+    #[cfg(unix)]
+    command_builder.process_group(0);
+    // Kernel-held bounds that outlive this app's supervision — see `os_limits`
+    // for why only core dumps are refused and not CPU time or memory. A verify
+    // command that segfaults mid-build should not leave gigabytes of core in the
+    // repository it was checking.
+    crate::os_limits::apply(
+        crate::os_limits::ChildLimits::baseline(),
+        &mut command_builder,
+    );
 
     let timeout = Duration::from_secs(
         cmd.timeout_secs
@@ -260,6 +271,10 @@ pub async fn run_command_impl(
             .clone()
     });
 
+    // Captured before `wait_with_output` consumes the child; with
+    // `process_group(0)` above, the child's own pid is also its group id.
+    let child_pgid = child.id();
+
     let (outcome, timed_out): (Result<std::process::Output, String>, bool) = match &cancel {
         Some(cancel) => tokio::select! {
             result = child.wait_with_output() => (result.map_err(|e| format!("Failed to run command: {}", e)), false),
@@ -273,6 +288,18 @@ pub async fn run_command_impl(
             _ = tokio::time::sleep(timeout) => (Err(format!("Command timed out after {} seconds", timeout.as_secs())), true),
         },
     };
+
+    // End the tree on a timeout or a cancel. A verify command is typically a
+    // build or a test runner, so the process that matters is almost always a
+    // grandchild of the `sh -c` this spawned — exactly the process `kill_on_drop`
+    // does not touch.
+    if outcome.is_err() {
+        if let Some(pgid) = child_pgid {
+            if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
+                eprintln!("verify: could not terminate process group {pgid}: {error}");
+            }
+        }
+    }
 
     // Drop this turn's channel once no other verify/shell command of the
     // same turn still holds it — same strong-count cleanup as

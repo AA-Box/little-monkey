@@ -1950,9 +1950,39 @@ pub fn portable_webdav_config_save(
     Ok(config)
 }
 
+/// The client every WebDAV operation shares.
+///
+/// [`WEB_DAV_TIMEOUT_SECONDS`] is a **silence** budget here, not a deadline for
+/// the whole request, and the difference is the difference between a working
+/// backup and one that cannot succeed. `reqwest::ClientBuilder::timeout` covers
+/// the body too, so pairing it with the streaming download in
+/// [`portable_webdav_download_snapshot`] meant a snapshot had 45 seconds to
+/// arrive in full — against a cap of `2 × max_archive_bytes`, i.e. 1 GiB, which
+/// needs 23 MB/s sustained for the entire request. Any backup past a couple of
+/// hundred megabytes was aborted mid-stream on an ordinary connection, and the
+/// upload half had the same ceiling.
+///
+/// `read_timeout` is the right shape because it resets on every read: a peer
+/// that stops sending for 45 seconds is still declared dead, while one that
+/// keeps making progress is allowed to take as long as the transfer honestly
+/// takes. The bound on *size* stays where it already was — the `Content-Length`
+/// pre-check and the running total in the download loop.
+///
+/// Built on [`crate::egress::hardened_with_read_budget`] for the connect timeout
+/// and the budget, then overriding its redirect policy back to `none`: a WebDAV
+/// server has no business redirecting, [`remote_url`] pins every path to the
+/// configured origin, and refusing outright is stricter than the same-origin
+/// rule `hardened` supplies.
+///
+/// # What this does not bound
+///
+/// A server that accepts a connection and then stops *reading* during an upload.
+/// reqwest has no write timeout, so the old total deadline did cover that case
+/// and this does not. Accepted deliberately: it needs a pathological peer,
+/// whereas the truncation it replaces broke every large backup against a
+/// perfectly healthy one.
 fn webdav_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(WEB_DAV_TIMEOUT_SECONDS))
+    crate::egress::hardened_with_read_budget(Duration::from_secs(WEB_DAV_TIMEOUT_SECONDS))
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("LittleMonkey/0.1 WebDAVBackup")
         .build()

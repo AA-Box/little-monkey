@@ -8,6 +8,7 @@
 //! original reference and requires the caller's previously observed SHA-256
 //! to still match before any bytes are written.
 
+use crate::egress::{EgressDenial, EgressRule};
 use crate::process_lock::{acquire_cross_process_lock, CrossProcessFileLock};
 use futures_util::StreamExt;
 use reqwest::header::{
@@ -43,6 +44,15 @@ const MAX_PROVENANCE_BYTES: u64 = 64 * 1024;
 const PROVENANCE_SCHEMA_VERSION: u32 = 2;
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+/// Hop cap for the redirect policy in [`build_http_client`].
+///
+/// Named rather than inlined only so the refusal can say what it refused. The
+/// number is unchanged: eight hops, which is what this file has always allowed
+/// and deliberately **not** the ten that `egress::MAX_REDIRECT_HOPS` gives the
+/// shared hardened client. Reconciling the two would change which chains this
+/// app accepts, so it belongs with the wider adoption of `egress::hardened()`
+/// here — which this file still does not do — rather than with naming the rules.
+const MAX_MODEL_SOURCE_REDIRECTS: usize = 8;
 
 static INSTALL_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -210,7 +220,40 @@ struct HfCardData {
     license_link: Option<String>,
 }
 
+/// Resolves a public reference to immutable, digest-pinned metadata.
+///
+/// # The scope, and why `UserAction` is the honest arm
+///
+/// Everything below this point that refuses a destination —
+/// [`validate_public_https_url`] at thirteen call sites, `validate_ollama_auth_url`,
+/// and the unparseable-`license_link` record in [`hugging_face_license`] — writes into
+/// the denial sink, and every one of those rows was blank. This is where the label can
+/// be applied: the two callers are `models_resolve_reference` (a Tauri command behind
+/// the Settings model picker) and `monkey-cli model resolve`, and both are a person
+/// asking for a model. `run_scope`'s own doc names this case — "starting a model
+/// download" — as [`crate::run_scope::Unattributed::UserAction`].
+///
+/// The interesting rows here are the ones a *remote* server causes: a hostile
+/// `license_link`, a redirect off the allowlist, an auth realm naming another host.
+/// Those are precisely the ones an operator would want attributed, and they were the
+/// least readable rows in the table.
+///
+/// No `spawn` sits between this scope and any of those sites. The two
+/// `spawn_blocking` calls in this file — the cross-process install lock and the
+/// SHA-256 hash — record nothing, so nothing is lost to a task-local that does not
+/// cross them. If a durable run ever installs a model, this and
+/// [`install_reference`] must take a [`crate::run_scope::RunScope`] instead of
+/// hardcoding one, for the reason `m4_runtime::run_async_worker` states.
 pub async fn resolve_reference(reference: &str) -> Result<ResolvedModelReference, String> {
+    crate::run_scope::scoped(
+        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+        resolve_within_scope(reference),
+    )
+    .await
+}
+
+/// [`resolve_reference`]'s body, with the scope already established.
+async fn resolve_within_scope(reference: &str) -> Result<ResolvedModelReference, String> {
     let client = build_http_client()?;
     Ok(resolve_reference_with_client(&client, reference)
         .await?
@@ -238,7 +281,29 @@ fn validate_expected_digest(
 /// holding a cross-process destination lock. If a process is killed between
 /// those two renames, the next pull re-hashes the orphan and reconstructs its
 /// sidecar instead of downloading a duplicate multi-gigabyte file.
+///
+/// Enters the same scope [`resolve_reference`] does, for the same reasons — see that
+/// function's doc. Split into a wrapper plus `install_within_scope` rather than
+/// wrapping the body in an `async` block, so the scope is one readable frame and the
+/// body it covers is unchanged.
 pub async fn install_reference<F>(
+    models_dir: &Path,
+    reference: &str,
+    expected_sha256: &str,
+    on_progress: F,
+) -> Result<InstalledModelReference, String>
+where
+    F: FnMut(ModelDownloadProgress),
+{
+    crate::run_scope::scoped(
+        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+        install_within_scope(models_dir, reference, expected_sha256, on_progress),
+    )
+    .await
+}
+
+/// [`install_reference`]'s body, with the scope already established.
+async fn install_within_scope<F>(
     models_dir: &Path,
     reference: &str,
     expected_sha256: &str,
@@ -372,6 +437,28 @@ where
 ///
 /// A missing sidecar is `Ok(None)`. A corrupt or mismatched sidecar is an
 /// error so callers can fail closed instead of inventing capabilities.
+///
+/// # Why the scope is entered inside this function
+///
+/// [`validate_provenance`] runs the same destination gate the download path does, so a
+/// sidecar naming a non-public `downloadUrl` records a denial — and every one of them
+/// recorded a blank. The four callers are `models_list_installed`, `llama_start`,
+/// `embed_server_start` and `monkey-cli`, and all four are one answer: a person asked
+/// for a model list or clicked Start, so [`crate::run_scope::Unattributed::UserAction`].
+///
+/// Two of the four cannot deliver that answer from their own boundary.
+/// `llama_start`/`embed_server_start` reach here through
+/// `tokio::task::spawn_blocking`, and a spawned blocking task inherits no task-local —
+/// a `scoped` at either command would have produced exactly the failure this repo has
+/// already been bitten by: code that reads as instrumented and still writes `NULL`. So
+/// the nearest boundary that can carry the label is this function, and it uses
+/// [`crate::run_scope::scoped_sync`] because there is no future here to wrap.
+///
+/// If a durable run ever validates provenance, this must take a
+/// [`crate::run_scope::RunScope`] parameter instead — `m4_runtime::run_async_worker`
+/// made that exact move for the same reason. A `scoped_sync` shadows an outer scope,
+/// so leaving it hardcoded once a run reaches here would relabel that run's egress as
+/// a user action, which is a worse record than none.
 pub fn load_provenance(model_path: &Path) -> Result<Option<ManagedModelProvenance>, String> {
     let sidecar = provenance_path(model_path)?;
     let metadata = match fs::symlink_metadata(&sidecar) {
@@ -402,7 +489,13 @@ pub fn load_provenance(model_path: &Path) -> Result<Option<ManagedModelProvenanc
             sidecar.display()
         )
     })?;
-    validate_provenance(model_path, &provenance)?;
+    // Only the validation call is wrapped, not the whole body: the reads above cannot
+    // refuse an egress destination, and a scope around them would only widen what the
+    // label appears to cover.
+    crate::run_scope::scoped_sync(
+        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+        || validate_provenance(model_path, &provenance),
+    )?;
     Ok(Some(provenance))
 }
 
@@ -1054,10 +1147,33 @@ fn hugging_face_license(
         _ => None,
     };
     if let Some(link) = card_data.license_link {
-        if let Ok(parsed) = Url::parse(&link) {
-            if validate_public_https_url(&parsed).is_ok() {
-                return Ok((license_name, Some(parsed.to_string())));
+        match Url::parse(&link) {
+            Ok(parsed) => {
+                // A refusal here is already attributable: `validate_public_https_url`
+                // writes its own denial down before returning it.
+                if validate_public_https_url(&parsed).is_ok() {
+                    return Ok((license_name, Some(parsed.to_string())));
+                }
             }
+            // A bare relative link — `LICENSE`, which is the shape Hugging Face's own
+            // cards use and this file's own fixture — is not a refusal and must not be
+            // recorded as one. The fallback below resolves a pinned repo LICENSE URL
+            // for exactly this case, so nothing was denied; writing a row per
+            // resolution would evict real denials from a table bounded at 10,000 and
+            // make `egress.url-malformed` stop meaning "something was blocked".
+            Err(url::ParseError::RelativeUrlWithoutBase) => {}
+            // A link that *tried* to be absolute and failed never reaches that gate,
+            // so this was the one refusal on this path that left no record at all —
+            // the card was simply ignored. `UrlMalformed` exists for exactly this
+            // distinction: "we could not read the link" is a different fact from "we
+            // read it and a rule refused where it pointed", and only the first was
+            // invisible. The detail is bounded by the sink itself, which is where a
+            // bound on remote text belongs — see `denial_sink::MAX_DETAIL_CHARS`.
+            Err(_) => crate::denial_sink::record(
+                MODEL_SOURCE_GUARD,
+                &EgressDenial::about(EgressRule::UrlMalformed, link),
+                None,
+            ),
         }
     }
     let license_file = metadata.siblings.iter().find(|sibling| {
@@ -1155,7 +1271,8 @@ async fn fetch_registry_token(
     client: &Client,
     challenge: &RegistryAuthChallenge,
 ) -> Result<String, String> {
-    validate_ollama_auth_url(&challenge.realm)?;
+    validate_ollama_auth_url(&challenge.realm)
+        .map_err(|denial| format!("Ollama registry token URL refused: {denial}"))?;
     let mut url = challenge.realm.clone();
     {
         let mut query = url.query_pairs_mut();
@@ -1173,6 +1290,19 @@ async fn fetch_registry_token(
         .send()
         .await
         .map_err(|error| format!("Failed to obtain Ollama registry token: {error}"))?;
+    // The pre-flight check above pins the realm the *challenge* named. It does not
+    // pin where the request ends up: `build_http_client`'s redirect policy judges
+    // every hop with `validate_public_https_url` only — no ollama allowlist, no port
+    // — so any of eight hops could leave the allowlist for another public HTTPS host,
+    // and the `token` in that host's body would become the bearer attached to the
+    // follow-up registry request. This function's own doc opens by naming that threat:
+    // a *response* gets to propose where a credential request goes. Pinning only the
+    // pre-flight spelling left the response half of it open.
+    //
+    // Same post-redirect shape `probe_remote_gguf` uses, and a distinct message so a
+    // refusal can be placed before or after the chain.
+    validate_ollama_auth_url(response.url())
+        .map_err(|denial| format!("Ollama registry token final URL refused: {denial}"))?;
     let response = require_success(response, "Ollama registry token", None)?;
     let bytes = response_bytes_bounded(response, 64 * 1024, "Ollama registry token").await?;
     let token: RegistryTokenResponse = serde_json::from_slice(&bytes)
@@ -1222,7 +1352,11 @@ fn parse_registry_auth_challenge(value: &str) -> Result<RegistryAuthChallenge, S
         service,
         scope,
     };
-    validate_ollama_auth_url(&challenge.realm)?;
+    // The only egress rule in this parser. Every other refusal above is about the
+    // *shape* of the challenge; this one is about where the token request may go,
+    // so it is the one that names a rule.
+    validate_ollama_auth_url(&challenge.realm)
+        .map_err(|denial| format!("Ollama registry auth realm refused: {denial}"))?;
     Ok(challenge)
 }
 
@@ -1231,7 +1365,8 @@ async fn probe_remote_gguf(
     url: Url,
     bearer_token: Option<&str>,
 ) -> Result<(), String> {
-    validate_public_https_url(&url)?;
+    validate_public_https_url(&url)
+        .map_err(|denial| format!("GGUF probe URL refused: {denial}"))?;
     let response = send_get(client, url, bearer_token, Some("bytes=0-3")).await?;
     if !matches!(
         response.status(),
@@ -1242,7 +1377,11 @@ async fn probe_remote_gguf(
             response.status()
         ));
     }
-    validate_public_https_url(response.url())?;
+    // Distinct from the pre-flight message above on purpose: both used to render
+    // the identical string, so a refusal could not be placed before or after the
+    // redirect chain.
+    validate_public_https_url(response.url())
+        .map_err(|denial| format!("GGUF probe final URL refused: {denial}"))?;
     let mut stream = response.bytes_stream();
     let mut magic = Vec::with_capacity(GGUF_MAGIC.len());
     while magic.len() < GGUF_MAGIC.len() {
@@ -1266,7 +1405,8 @@ async fn send_get(
     bearer_token: Option<&str>,
     range: Option<&str>,
 ) -> Result<Response, String> {
-    validate_public_https_url(&url)?;
+    validate_public_https_url(&url)
+        .map_err(|denial| format!("Model download URL refused: {denial}"))?;
     let mut request = client.get(url).header(ACCEPT_ENCODING, "identity");
     if let Some(token) = bearer_token {
         request = request.header(
@@ -1282,7 +1422,10 @@ async fn send_get(
         .send()
         .await
         .map_err(|error| format!("Model download request failed: {error}"))?;
-    validate_public_https_url(response.url())?;
+    // As in `probe_remote_gguf`, this says "final" so that a post-redirect
+    // refusal is not word-for-word identical to the pre-flight one above.
+    validate_public_https_url(response.url())
+        .map_err(|denial| format!("Model download final URL refused: {denial}"))?;
     Ok(response)
 }
 
@@ -1311,7 +1454,8 @@ where
     }
     let download_url = Url::parse(&resolution.public.download_url)
         .map_err(|error| format!("Resolved model URL is invalid: {error}"))?;
-    validate_public_https_url(&download_url)?;
+    validate_public_https_url(&download_url)
+        .map_err(|denial| format!("Resolved model download URL refused: {denial}"))?;
     let range_header = (offset > 0).then(|| format!("bytes={offset}-"));
     let response = send_get(
         client,
@@ -1824,11 +1968,13 @@ fn validate_provenance(
     validate_model_size(provenance.size_bytes)?;
     let download_url = Url::parse(&provenance.download_url)
         .map_err(|error| format!("Invalid provenance download URL: {error}"))?;
-    validate_public_https_url(&download_url)?;
+    validate_public_https_url(&download_url)
+        .map_err(|denial| format!("Provenance download URL refused: {denial}"))?;
     if let Some(url) = &provenance.license_url {
         let url =
             Url::parse(url).map_err(|error| format!("Invalid provenance license URL: {error}"))?;
-        validate_public_https_url(&url)?;
+        validate_public_https_url(&url)
+            .map_err(|denial| format!("Provenance license URL refused: {denial}"))?;
     }
     if let Some(name) = &provenance.license_name {
         validate_human_text(name, "licenseName", 4096)?;
@@ -1970,7 +2116,8 @@ fn hugging_face_metadata_url(reference: &HuggingFaceReference) -> Result<Url, St
         }
     }
     url.query_pairs_mut().append_pair("blobs", "true");
-    validate_public_https_url(&url)?;
+    validate_public_https_url(&url)
+        .map_err(|denial| format!("Hugging Face metadata URL refused: {denial}"))?;
     Ok(url)
 }
 
@@ -2003,7 +2150,8 @@ fn hugging_face_file_url(
     if operation == "resolve" {
         url.query_pairs_mut().append_pair("download", "true");
     }
-    validate_public_https_url(&url)?;
+    validate_public_https_url(&url)
+        .map_err(|denial| format!("Hugging Face file URL refused: {denial}"))?;
     Ok(url)
 }
 
@@ -2030,7 +2178,8 @@ fn ollama_registry_url(
             .map_err(|_| "Ollama registry URL cannot accept path segments")?;
         segments.extend(["v2", namespace, model, operation, value]);
     }
-    validate_public_https_url(&url)?;
+    validate_public_https_url(&url)
+        .map_err(|denial| format!("Ollama registry URL refused: {denial}"))?;
     Ok(url)
 }
 
@@ -2204,90 +2353,343 @@ fn build_http_client() -> Result<Client, String> {
     Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(20))
+        // Bounds *silence*, not elapsed time, and resets after every successful
+        // read — so a multi-gigabyte GGUF that keeps producing chunks runs as long
+        // as it needs to, while a peer that completes the TCP handshake and then
+        // stops writing is abandoned. `ClientBuilder::timeout` would be the wrong
+        // tool twice over: it is a total-request deadline, so any value large
+        // enough for a 40 GB download is far too large to detect a dead peer.
+        //
+        // # Why this mattered more here than at any other timeout-less site
+        //
+        // The download loop is `while let Some(chunk) = stream.next().await` with
+        // no `select!` and no timeout, `models_install_reference` has no
+        // cancellation token (unlike its `models_download` sibling), and
+        // `INSTALL_MUTEX` is held across the whole install. A silent peer therefore
+        // froze the progress bar with no error and no Cancel, *and* every later
+        // managed-model install in the session blocked on the mutex at zero
+        // progress. Only an app restart cleared it.
+        .read_timeout(crate::egress::READ_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 8 {
-                return attempt.error("too many model-source redirects");
+            if attempt.previous().len() >= MAX_MODEL_SOURCE_REDIRECTS {
+                return attempt.error(refused(EgressDenial::about(
+                    EgressRule::RedirectHopLimit,
+                    format!(
+                        "refusing to follow more than {MAX_MODEL_SOURCE_REDIRECTS} model-source redirects"
+                    ),
+                )));
             }
-            if validate_public_https_url(attempt.url()).is_ok() {
-                attempt.follow()
-            } else {
-                attempt.error("unsafe model-source redirect")
+            // The hop is judged by exactly the same rules as the original URL,
+            // and a refusal now travels as *the rule that fired*. It used to be
+            // discarded: every possible verdict from `validate_public_https_url`
+            // collapsed into one "unsafe model-source redirect" sentence, so a
+            // `302` to plain `http`, to `127.0.0.1`, and to `169.254.169.254`
+            // were indistinguishable in a log and in a test.
+            match validate_public_https_url(attempt.url()) {
+                Ok(()) => attempt.follow(),
+                Err(denial) => attempt.error(refused(denial)),
             }
         }))
         .build()
         .map_err(|error| format!("Failed to build model-source HTTP client: {error}"))
 }
 
-fn validate_public_https_url(url: &Url) -> Result<(), String> {
-    if url.scheme() != "https"
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-        || url.host().is_none()
-    {
-        return Err("Model-source URL must be credential-free HTTPS with a host".to_string());
+/// Wraps a denial for `redirect::Attempt::error`, whose signature wants an error
+/// rather than a verdict.
+///
+/// `PermissionDenied` plus the denial passed **as itself** rather than as
+/// `to_string()`, so that `io::Error::into_inner`/`downcast_ref` can still
+/// recover an [`EgressDenial`] on the far side of reqwest instead of a flattened
+/// string. This mirrors `egress.rs`'s own `refused` helper, which is private to
+/// that module; the two lines are written out again here rather than exported,
+/// because widening that module's surface is not this change's to make.
+fn refused(denial: EgressDenial) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, denial)
+}
+
+/// The one network-destination gate for every model-source request: public
+/// HTTPS, no credential in the URL, no fragment, and not an address that points
+/// back at this machine or its network.
+///
+/// # Why the verdict is a rule and not a sentence
+///
+/// This function used to return four `String`s, and the first of them stood for
+/// five different reasons at once: a plain-`http` URL, a `user@` URL, a
+/// `user:password@` URL, a `#fragment` and a hostless URL all produced
+/// "Model-source URL must be credential-free HTTPS with a host". Nothing
+/// downstream could tell them apart — least of all the redirect policy in
+/// [`build_http_client`], which threw the sentence away entirely and substituted
+/// one of its own. Each reason now names its own [`EgressRule`], so a refusal is
+/// a value that survives the trip to a caller, a log, or a test.
+///
+/// The composite `if` is therefore split into one `if` per reason. That is not a
+/// behaviour change: the checks are in the original short-circuit order, so the
+/// set of refused URLs is identical and a URL that trips several reasons still
+/// reports the first reason it always would have.
+///
+/// # Why the diagnostics name no URL
+///
+/// Callers render the denial behind a short label saying which of the thirteen
+/// call sites refused, and none of them quote the URL. That is deliberate:
+/// [`EgressRule::redacts_target`] is true for exactly
+/// [`EgressRule::EmbeddedCredentials`], the one rule that fires *because* the URL
+/// contains a secret, and the cheapest way never to leak it is for no site to
+/// interpolate a model-source URL at all. The per-request specifics that are safe
+/// to print — the offending host, the offending address — ride in the denial's
+/// own detail instead.
+fn validate_public_https_url(url: &Url) -> Result<(), EgressDenial> {
+    let verdict = classify_public_https_url(url);
+    if let Err(denial) = &verdict {
+        // The single choke point all thirteen call sites pass through, so one line
+        // covers every model-source destination check — pre-flight and post-redirect
+        // alike.
+        crate::denial_sink::record(MODEL_SOURCE_GUARD, denial, None);
     }
+    verdict
+}
+
+/// Names this guard in a denial record.
+const MODEL_SOURCE_GUARD: &str = "model-sources.url";
+
+/// [`validate_public_https_url`]'s decision, without the recording.
+fn classify_public_https_url(url: &Url) -> Result<(), EgressDenial> {
+    if url.scheme() != "https" {
+        return Err(EgressDenial::about(
+            EgressRule::SchemeNotAllowed,
+            url.scheme().to_string(),
+        ));
+    }
+    // Username and password are one rule rather than two: both are `userinfo`,
+    // and what the rule says is that the URL carries a credential at all.
+    if !url.username().is_empty() || url.password().is_some() {
+        // Deliberately detail-free. This is the rule `redacts_target` singles
+        // out, and the detail field is the one place the secret could reappear.
+        return Err(EgressDenial::new(EgressRule::EmbeddedCredentials));
+    }
+    if url.fragment().is_some() {
+        return Err(EgressDenial::new(EgressRule::FragmentNotAllowed));
+    }
+    if url.host().is_none() {
+        // Unreachable in practice, and kept anyway: `https` is a special scheme,
+        // so `Url` guarantees a non-empty host for anything that got past the
+        // scheme check above (`https:///x` does not parse at all). Deleting the
+        // check would make that a property of the `url` crate instead of a
+        // property of this gate, which is not a trade a destination gate should
+        // make.
+        return Err(EgressDenial::new(EgressRule::HostMissing));
+    }
+    // Every `Host` variant is handled and there is no wildcard arm: if the `url`
+    // crate ever adds a host kind, that must be a compile error here rather than
+    // a new shape of host quietly treated as public.
     match url.host() {
         Some(Host::Domain(domain)) => {
-            let domain = domain.trim_end_matches('.');
-            if domain.is_empty()
-                || domain.eq_ignore_ascii_case("localhost")
-                || domain.to_ascii_lowercase().ends_with(".localhost")
+            let trimmed = domain.trim_end_matches('.');
+            if trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("localhost")
+                || trimmed.to_ascii_lowercase().ends_with(".localhost")
             {
-                return Err("Model-source URL cannot target localhost".to_string());
+                // One rule for all three spellings: a name that is nothing but
+                // dots, `localhost`, and `anything.localhost` are the same
+                // destination by policy — this machine — and RFC 6761 reserves
+                // the whole `.localhost` tree for loopback. The untrimmed name is
+                // the detail so that the `.`-only case still says something.
+                return Err(EgressDenial::about(EgressRule::Loopback, domain));
             }
         }
-        Some(Host::Ipv4(address)) if !public_ipv4(address) => {
-            return Err("Model-source URL cannot target a private IPv4 address".to_string())
+        Some(Host::Ipv4(address)) => {
+            if let Some(rule) = non_public_ipv4_rule(address) {
+                return Err(EgressDenial::about(rule, address.to_string()));
+            }
         }
-        Some(Host::Ipv6(address)) if !public_ipv6(address) => {
-            return Err("Model-source URL cannot target a private IPv6 address".to_string())
+        Some(Host::Ipv6(address)) => {
+            if let Some(rule) = non_public_ipv6_rule(address) {
+                return Err(EgressDenial::about(rule, address.to_string()));
+            }
         }
-        Some(_) => {}
-        None => return Err("Model-source URL has no host".to_string()),
+        // Unreachable for the same reason as the `host().is_none()` check above,
+        // which has already refused this case. Kept refusing rather than deleted
+        // or `unwrap`ped: a hostless URL reaching here would mean the invariant
+        // this gate depends on has changed, and "no host, so nothing to check" is
+        // the wrong direction for a guard to fail in.
+        None => return Err(EgressDenial::new(EgressRule::HostMissing)),
     }
     Ok(())
 }
 
-fn validate_ollama_auth_url(url: &Url) -> Result<(), String> {
+/// [`validate_public_https_url`] plus the one origin allowlist in this file.
+///
+/// An Ollama registry `WWW-Authenticate` challenge names the realm the bearer
+/// token is fetched from, which means a *response* gets to propose where this app
+/// sends a credential request. That makes the host restriction below an egress
+/// rule and not a parsing rule: it decides where a request may go.
+///
+/// Records what it refuses, which the host allowlist did not: the call to
+/// [`validate_public_https_url`] wrote its own denials down and this function's
+/// returned past the sink, so an off-allowlist realm — the one refusal here a
+/// remote server can actually cause — was the least attributable of the two.
+fn validate_ollama_auth_url(url: &Url) -> Result<(), EgressDenial> {
     validate_public_https_url(url)?;
+    let verdict = classify_ollama_auth_url(url);
+    if let Err(denial) = &verdict {
+        crate::denial_sink::record(MODEL_SOURCE_GUARD, denial, None);
+    }
+    verdict
+}
+
+/// The only port an Ollama auth realm may name.
+///
+/// The allowlist below pins the host, which still leaves a challenge free to
+/// propose `https://auth.ollama.ai:9000/token` — the allowlisted name, a service
+/// nobody publishes there. Low severity on purpose: this request carries no
+/// credential, it is the request that goes to *fetch* one, so the cost of a
+/// surprising port is a request to an unexpected service and not a leaked secret.
+/// Pinned anyway because it costs production nothing — the real realm is
+/// `https://auth.ollama.ai/token`, the scheme's default port.
+///
+/// The *path* is deliberately not pinned. `/token` is the registry's to change, and
+/// pinning it buys nothing: a path does not decide which server answers.
+///
+/// Host and port do decide that, but only for the request as *sent*. Where it ends up
+/// is decided by the redirect chain, which this constant cannot reach — see the
+/// post-redirect re-check in [`fetch_registry_token`], which is the other half of the
+/// same rule and without which either half is bypassable by a response.
+const OLLAMA_AUTH_PORT: u16 = 443;
+
+/// [`validate_ollama_auth_url`]'s decision, without the recording.
+///
+/// Split out for the same reason [`classify_public_https_url`] is: a verdict can
+/// then be asserted on without the assertion writing into whatever process-wide
+/// sink another test happened to install.
+fn classify_ollama_auth_url(url: &Url) -> Result<(), EgressDenial> {
     let host = url
         .host_str()
-        .ok_or("Ollama authentication URL has no host")?
+        // Unreachable for the same reason as the `None` arm in
+        // `validate_public_https_url`: the caller has already refused a hostless
+        // URL. Kept refusing rather than `unwrap`ped, because the wrong way to fail
+        // here is "there is no host, so there is nothing to check against the
+        // allowlist".
+        .ok_or_else(|| EgressDenial::new(EgressRule::HostMissing))?
         .to_ascii_lowercase();
-    if host == "ollama.ai"
+    if !(host == "ollama.ai"
         || host.ends_with(".ollama.ai")
         || host == "ollama.com"
-        || host.ends_with(".ollama.com")
+        || host.ends_with(".ollama.com"))
     {
-        Ok(())
-    } else {
-        Err("Ollama authentication challenge points outside ollama.ai/ollama.com".to_string())
+        // The host is the detail because the host is the whole reason, and naming
+        // it is safe: it is a host, not a URL that could carry userinfo.
+        return Err(EgressDenial::about(EgressRule::OriginNotAllowlisted, host));
     }
+    let port = url
+        .port_or_known_default()
+        // Unreachable: the caller has already required `https`, which the `url`
+        // crate has a default port for. Refused rather than `unwrap`ped, for the
+        // same reason as the hostless arm above.
+        .ok_or_else(|| EgressDenial::new(EgressRule::PortMissing))?;
+    // `port_or_known_default` and not `port`: `https://auth.ollama.ai:443/token`
+    // and `https://auth.ollama.ai/token` are the same destination, and the `url`
+    // crate normalises the default away — so comparing the *resolved* port is what
+    // keeps the explicit spelling from being treated as a surprise.
+    if port != OLLAMA_AUTH_PORT {
+        // The same rule as an off-allowlist host, because a port is part of an
+        // origin. `host:port` names both halves of what was refused and both are
+        // safe to print.
+        return Err(EgressDenial::about(
+            EgressRule::OriginNotAllowlisted,
+            format!("{host}:{port}"),
+        ));
+    }
+    Ok(())
 }
 
-fn public_ipv4(address: Ipv4Addr) -> bool {
-    !(address.is_private()
-        || address.is_loopback()
-        || address.is_link_local()
-        || address.is_broadcast()
-        || address.is_documentation()
-        || address.is_unspecified()
-        || address.is_multicast())
+/// The rule that makes `address` non-public, or `None` if it is publicly
+/// routable.
+///
+/// The predicates and their order are exactly the `||` chain this replaces, so
+/// the set of refused addresses is unchanged — not one range is added, removed,
+/// widened or narrowed. What changes is that the verdict now says *which* class
+/// matched, where before seven distinct classes shared the single sentence
+/// "Model-source URL cannot target a private IPv4 address" — which was literally
+/// true of exactly one of them. None of these seven ranges overlap, so the order
+/// below cannot affect which rule is reported either; it is preserved because a
+/// future range that *does* overlap should inherit the chain's original
+/// precedence rather than a new one.
+fn non_public_ipv4_rule(address: Ipv4Addr) -> Option<EgressRule> {
+    if address.is_private() {
+        return Some(EgressRule::PrivateV4);
+    }
+    if address.is_loopback() {
+        return Some(EgressRule::Loopback);
+    }
+    if address.is_link_local() {
+        return Some(EgressRule::LinkLocal);
+    }
+    if address.is_broadcast() {
+        return Some(EgressRule::Broadcast);
+    }
+    if address.is_documentation() {
+        return Some(EgressRule::TestNet);
+    }
+    if address.is_unspecified() {
+        return Some(EgressRule::Unspecified);
+    }
+    if address.is_multicast() {
+        return Some(EgressRule::Multicast);
+    }
+    None
 }
 
-fn public_ipv6(address: Ipv6Addr) -> bool {
+/// The IPv6 counterpart of [`non_public_ipv4_rule`], with the same guarantee: the
+/// same addresses are refused as before, and only the naming is new.
+fn non_public_ipv6_rule(address: Ipv6Addr) -> Option<EgressRule> {
+    // Checked before the mapped unwrap: `::a.b.c.d` is not `::ffff:a.b.c.d`, and
+    // without this it was reported as public. See `egress::is_ipv4_compatible`,
+    // whose doc also explains why the range is refused outright instead of being
+    // unwrapped and re-classified — doing that would turn `::1` into `0.0.0.1`,
+    // which every predicate above calls public.
+    if crate::egress::is_ipv4_compatible(&address) {
+        return Some(EgressRule::Ipv4Compatible);
+    }
     if let Some(address) = address.to_ipv4_mapped() {
-        return public_ipv4(address);
+        // A mapped address keeps whichever v4 rule its inner address reports, so
+        // `::ffff:127.0.0.1` is `Loopback` and `::ffff:10.0.0.1` is `PrivateV4`
+        // rather than both being some v6-flavoured approximation.
+        return non_public_ipv4_rule(address);
+    }
+    // The third spelling, handled the same way: `64:ff9b::7f00:1` is `127.0.0.1`
+    // wherever a NAT64/CLAT path exists. Unwrapped rather than refused as a range,
+    // because `64:ff9b::` plus a public v4 address is a legitimate way to reach a
+    // v4-only model host from a v6-only network. See `egress::nat64_embedded_ipv4`.
+    if let Some(address) = crate::egress::nat64_embedded_ipv4(&address) {
+        return non_public_ipv4_rule(address);
     }
     let segments = address.segments();
-    !(address.is_loopback()
-        || address.is_unspecified()
-        || address.is_multicast()
-        || address.is_unique_local()
-        || address.is_unicast_link_local()
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-        || (segments[0] & 0xffc0) == 0xfec0)
+    if address.is_loopback() {
+        return Some(EgressRule::Loopback);
+    }
+    if address.is_unspecified() {
+        return Some(EgressRule::Unspecified);
+    }
+    if address.is_multicast() {
+        return Some(EgressRule::Multicast);
+    }
+    if address.is_unique_local() {
+        return Some(EgressRule::UniqueLocalV6);
+    }
+    if address.is_unicast_link_local() {
+        return Some(EgressRule::LinkLocal);
+    }
+    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        return Some(EgressRule::TestNet);
+    }
+    // Site-local, `fec0::/10`. Reported as `UniqueLocalV6` rather than getting a
+    // rule of its own: RFC 3879 deprecated site-local *in favour of* unique-local
+    // `fc00::/7`, so the two are the same policy about the same kind of
+    // destination, and `EgressRule` has no site-local variant to invent one from.
+    // The range itself is untouched — this arm still refuses exactly `fec0::/10`.
+    if (segments[0] & 0xffc0) == 0xfec0 {
+        return Some(EgressRule::UniqueLocalV6);
+    }
+    None
 }
 
 fn require_success(
@@ -2589,6 +2991,334 @@ mod tests {
             "little-monkey-model-source-{label}-{}",
             Uuid::new_v4().simple()
         ))
+    }
+
+    /// The same deprecated form that fooled the other three guards reported
+    /// `::127.0.0.1` as a *public* address here, which is what gates a model
+    /// download URL.
+    ///
+    /// A peer that completes the handshake and then goes silent must be abandoned.
+    ///
+    /// Driven against a real listener that accepts and writes nothing, because that
+    /// is the only way to tell the fix apart from its absence: before the read
+    /// timeout, this request never returned at all.
+    ///
+    /// Bounded here by a short budget injected through a locally built client
+    /// rather than by `build_http_client`'s production ten minutes — a test that
+    /// waited that out would not be a test. The assertion that the *production*
+    /// budget exists is separate, below.
+    #[tokio::test]
+    async fn a_model_source_that_stops_writing_is_abandoned() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let origin = format!("http://{}", listener.local_addr().expect("has an address"));
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        std::thread::spawn(move || {
+            // Accept, read the request, then hold the socket open and never answer.
+            while let Ok((mut stream, _)) = listener.accept() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer);
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
+
+        let client = Client::builder()
+            .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(20))
+            .read_timeout(Duration::from_millis(250))
+            .build()
+            .expect("the client builds");
+
+        let started = std::time::Instant::now();
+        let result = client.get(&origin).send().await;
+
+        assert!(
+            result.is_err(),
+            "a peer that never writes must not be waited on forever"
+        );
+        // The peer *did* accept, so this is a read timeout and not a refused
+        // connection — an `Err` alone would not distinguish the two, and the
+        // connection being refused is exactly what this test must not measure.
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the request must have reached the peer"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "gave up after {:?}, which is not the 250ms read budget",
+            started.elapsed()
+        );
+    }
+
+    /// The production client carries a silence budget at all.
+    ///
+    /// `reqwest::Client` exposes nothing about its own timeouts, so this asserts
+    /// the one observable consequence: the builder that ships is the shared
+    /// constant's, and the constant is finite. Deleting `.read_timeout(...)` from
+    /// `build_http_client` is caught by the wiring test above only if it is run
+    /// against the production builder, which it deliberately is not — so this pins
+    /// the constant instead of the client.
+    #[test]
+    fn the_production_download_budget_is_finite_and_shared() {
+        assert!(
+            build_http_client().is_ok(),
+            "the shipped builder must build"
+        );
+        assert!(
+            crate::egress::READ_TIMEOUT > Duration::from_secs(0),
+            "a zero silence budget would abandon every download immediately"
+        );
+        assert!(
+            crate::egress::READ_TIMEOUT <= Duration::from_secs(3600),
+            "a budget this large stops being a way to notice a dead peer"
+        );
+    }
+
+    /// Now asserts the exact rule, which is stronger than "not public" in the one
+    /// way that matters: `::10.0.0.1` must be refused as `Ipv4Compatible` — the
+    /// wrapper — and not as `PrivateV4`, because a wrapper carrying a *public* v4
+    /// address has to be refused too and a v4 blocklist would let that through.
+    /// Proves this guard *delegates* NAT64 to its own v4 rule. The shared predicate's
+    /// own tests pin what `64:ff9b::/96` embeds; only this pins that this file asks.
+    ///
+    /// The public row is the load-bearing counter-test: refusing the whole prefix would
+    /// satisfy every other row here and break a v6-only network reaching a v4-only
+    /// model host.
+    #[test]
+    fn nat64_reaches_this_guards_own_ipv4_rule() {
+        use std::str::FromStr;
+        for (text, expected) in [
+            ("64:ff9b::7f00:1", Some(EgressRule::Loopback)),
+            ("64:ff9b::a00:1", Some(EgressRule::PrivateV4)),
+            ("64:ff9b::a9fe:a9fe", Some(EgressRule::LinkLocal)),
+            // The divergence proof, and the reason this delegates rather than
+            // importing a shared blocklist: `100.64.0.1` is CGNAT, which only the
+            // broadest guard refuses. This one must still allow it, in either
+            // spelling — a shared blocklist would refuse it here and newly break
+            // Tailscale users.
+            ("64:ff9b::6440:1", None),
+            ("64:ff9b::5db8:d822", None),
+        ] {
+            assert_eq!(
+                non_public_ipv6_rule(Ipv6Addr::from_str(text).expect("parses")),
+                expected,
+                "{text} must report whichever v4 rule its embedded address trips"
+            );
+        }
+    }
+
+    #[test]
+    fn the_deprecated_ipv4_compatible_form_is_not_public() {
+        use std::str::FromStr;
+        for text in ["::127.0.0.1", "::10.0.0.1", "::93.184.216.34"] {
+            assert_eq!(
+                non_public_ipv6_rule(Ipv6Addr::from_str(text).expect("parses")),
+                Some(EgressRule::Ipv4Compatible),
+                "{text} must be refused as the deprecated wrapper it is"
+            );
+        }
+        assert_eq!(
+            non_public_ipv6_rule(Ipv6Addr::from_str("2606:2800:220:1:248:1893:25c8:1946").unwrap()),
+            None
+        );
+        // The *mapped* form keeps the rule of the address it wraps, which is how a
+        // reader tells this case apart from the compatible one above.
+        assert_eq!(
+            non_public_ipv6_rule(Ipv6Addr::from_str("::ffff:127.0.0.1").unwrap()),
+            Some(EgressRule::Loopback)
+        );
+    }
+
+    /// One representative address per class, asserting the exact rule.
+    ///
+    /// The decomposition replaced two boolean predicates with two classifiers, and
+    /// a classifier can be wrong in a way a boolean could not: it can refuse the
+    /// right address under the wrong name. Only an exact-rule assertion per class
+    /// can see that, and the pair of tests below is deliberately split so that
+    /// neither "refuse everything" nor "allow everything" passes both.
+    #[test]
+    fn every_blocked_address_class_reports_its_own_rule() {
+        use std::str::FromStr;
+
+        for (text, rule) in [
+            ("10.0.0.1", EgressRule::PrivateV4),
+            ("172.16.0.1", EgressRule::PrivateV4),
+            ("192.168.1.1", EgressRule::PrivateV4),
+            ("127.0.0.1", EgressRule::Loopback),
+            // The cloud instance-metadata address, which is the reason this class
+            // is worth naming separately from "private".
+            ("169.254.169.254", EgressRule::LinkLocal),
+            ("255.255.255.255", EgressRule::Broadcast),
+            ("192.0.2.1", EgressRule::TestNet),
+            ("0.0.0.0", EgressRule::Unspecified),
+            ("224.0.0.1", EgressRule::Multicast),
+        ] {
+            assert_eq!(
+                non_public_ipv4_rule(Ipv4Addr::from_str(text).expect("parses")),
+                Some(rule),
+                "{text} must report its own rule"
+            );
+        }
+
+        for (text, rule) in [
+            ("::127.0.0.1", EgressRule::Ipv4Compatible),
+            // Mapped, so the inner v4 rule is what surfaces.
+            ("::ffff:10.0.0.1", EgressRule::PrivateV4),
+            ("::ffff:169.254.169.254", EgressRule::LinkLocal),
+            ("::1", EgressRule::Loopback),
+            ("::", EgressRule::Unspecified),
+            ("ff02::1", EgressRule::Multicast),
+            ("fc00::1", EgressRule::UniqueLocalV6),
+            ("fd12:3456::1", EgressRule::UniqueLocalV6),
+            ("fe80::1", EgressRule::LinkLocal),
+            ("2001:db8::1", EgressRule::TestNet),
+            // Deprecated site-local. Reported as unique-local, its RFC 3879
+            // successor, because there is no site-local rule to report and the
+            // policy is identical — pinned here so that choice is visible rather
+            // than inferred from the classifier's source.
+            ("fec0::1", EgressRule::UniqueLocalV6),
+            ("feff::1", EgressRule::UniqueLocalV6),
+        ] {
+            assert_eq!(
+                non_public_ipv6_rule(Ipv6Addr::from_str(text).expect("parses")),
+                Some(rule),
+                "{text} must report its own rule"
+            );
+        }
+    }
+
+    /// The counter-test, so that "refuse everything" cannot pass the one above.
+    ///
+    /// A real public v4 and a real public v6 address must classify as `None` and
+    /// still be accepted as model-source URLs, including as bare IP literals,
+    /// which is what the classifiers actually gate.
+    #[test]
+    fn a_genuinely_public_address_is_refused_by_no_class() {
+        use std::str::FromStr;
+
+        assert_eq!(non_public_ipv4_rule(Ipv4Addr::new(93, 184, 216, 34)), None);
+        assert_eq!(
+            non_public_ipv6_rule(Ipv6Addr::from_str("2606:2800:220:1:248:1893:25c8:1946").unwrap()),
+            None
+        );
+        for text in [
+            "https://93.184.216.34/model.gguf",
+            "https://[2606:2800:220:1:248:1893:25c8:1946]/model.gguf",
+            "https://huggingface.co/model.gguf",
+            // A trailing dot is a fully qualified name, not an empty one.
+            "https://huggingface.co./model.gguf",
+        ] {
+            assert!(
+                validate_public_https_url(&Url::parse(text).unwrap()).is_ok(),
+                "{text} must still be accepted"
+            );
+        }
+    }
+
+    /// Each reason the composite `if` used to flatten into one sentence now names
+    /// its own rule.
+    ///
+    /// The refusals themselves are unchanged — every URL here was refused before
+    /// this split, by the same function, with the same effect. What the split buys
+    /// is that "you typed `http`" and "you embedded a password" stop being the
+    /// same string.
+    ///
+    /// Four of the composite's five reasons are covered. The fifth, `HostMissing`,
+    /// has no test case because it has no input: `https` is a special scheme, so a
+    /// hostless URL cannot get past the scheme check — see the comment on that
+    /// guard. The three `localhost` spellings ride along here because they were
+    /// the *second* flattened message and are refused by the same walk.
+    #[test]
+    fn each_reason_the_composite_flattened_now_names_its_own_rule() {
+        for (text, rule) in [
+            (
+                "http://huggingface.co/model.gguf",
+                EgressRule::SchemeNotAllowed,
+            ),
+            (
+                "ftp://huggingface.co/model.gguf",
+                EgressRule::SchemeNotAllowed,
+            ),
+            (
+                "https://user@huggingface.co/model.gguf",
+                EgressRule::EmbeddedCredentials,
+            ),
+            (
+                "https://user:secret@huggingface.co/model.gguf",
+                EgressRule::EmbeddedCredentials,
+            ),
+            (
+                "https://huggingface.co/model.gguf#fragment",
+                EgressRule::FragmentNotAllowed,
+            ),
+            ("https://localhost/model.gguf", EgressRule::Loopback),
+            (
+                "https://registry.localhost/model.gguf",
+                EgressRule::Loopback,
+            ),
+            ("https://localhost./model.gguf", EgressRule::Loopback),
+        ] {
+            let denial = validate_public_https_url(&Url::parse(text).unwrap())
+                .expect_err("this URL must be refused");
+            assert_eq!(denial.rule(), rule, "{text} named the wrong rule");
+        }
+
+        // Scheme and credentials were the same message before; now the scheme
+        // refusal says which scheme, and the credentials refusal deliberately says
+        // nothing at all. `redacts_target` is true for exactly that rule, and an
+        // empty detail is the only way a secret cannot reappear in a log.
+        let scheme =
+            validate_public_https_url(&Url::parse("http://huggingface.co/m.gguf").unwrap())
+                .expect_err("plain http must be refused");
+        assert_eq!(scheme.detail(), Some("http"));
+
+        let credentials = validate_public_https_url(
+            &Url::parse("https://user:secret@huggingface.co/m.gguf").unwrap(),
+        )
+        .expect_err("userinfo must be refused");
+        assert!(credentials.rule().redacts_target());
+        assert_eq!(
+            credentials.detail(),
+            None,
+            "the one rule that fires because the URL holds a secret must not quote it"
+        );
+        assert!(
+            !credentials.to_string().contains("secret"),
+            "rendering a credentials denial must not leak the credential"
+        );
+    }
+
+    /// A refused redirect hop must arrive at reqwest carrying the rule that
+    /// refused it.
+    ///
+    /// The policy in `build_http_client` used to answer every refused hop with the
+    /// flat string "unsafe model-source redirect", discarding whichever rule
+    /// `validate_public_https_url` had actually reported. This drives the same
+    /// wrapper the policy uses and proves the denial survives as a value —
+    /// `Attempt::error` takes it by the same `Into<Box<dyn Error>>` path.
+    #[test]
+    fn a_refused_redirect_hop_carries_the_rule_that_refused_it() {
+        let denial =
+            validate_public_https_url(&Url::parse("http://127.0.0.1:11434/api/tags").unwrap())
+                .expect_err("a cleartext loopback hop must be refused");
+        // Scheme first, matching the original short-circuit order: this hop is
+        // both cleartext and loopback, and it reports the reason it always did.
+        assert_eq!(denial.rule(), EgressRule::SchemeNotAllowed);
+
+        let error = refused(denial);
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let inner = error
+            .into_inner()
+            .expect("the denial must be passed as an error, not as a string");
+        let recovered = inner
+            .downcast_ref::<EgressDenial>()
+            .expect("an `EgressDenial` must be recoverable on the far side of reqwest");
+        assert_eq!(recovered.rule(), EgressRule::SchemeNotAllowed);
     }
 
     #[test]
@@ -2900,6 +3630,299 @@ mod tests {
             .is_some_and(|url| url.contains("/blob/") && url.ends_with("/LICENSE")));
     }
 
+    /// A `license_link` that does not parse used to vanish. It never reached
+    /// `validate_public_https_url`, which is the only thing on this path that writes
+    /// a denial down, so a hostile or broken model card lost its refusal in silence
+    /// while a link that *did* parse and pointed somewhere refused was recorded.
+    ///
+    /// Asserted through a file-backed sink read by a second connection, which is the
+    /// path that ships. The filters use values unique to this test, so nothing
+    /// another test records into the same process-wide sink can satisfy them.
+    #[test]
+    fn a_license_link_that_does_not_parse_is_written_down_rather_than_dropped() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory = test_dir("license-link-sink");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+        let read_details = |marker: String| -> Vec<crate::denial_sink::DenialRecord> {
+            crate::denial_sink::DenialSink::open(&path)
+                .expect("reopens for reading")
+                .recent(256)
+                .expect("reads")
+                .into_iter()
+                .filter(|row| row.detail.as_deref() == Some(marker.as_str()))
+                .collect()
+        };
+
+        // A link that *tried* to be absolute and failed. Deliberately not a bare
+        // relative word: `Url::parse("LICENSE")` is `RelativeUrlWithoutBase`, which is
+        // the normal Hugging Face card shape and is excluded from recording, so a
+        // fixture like that would assert nothing while looking like it did.
+        const UNPARSEABLE: &str = "https://[model-sources-test-not-an-address";
+        assert!(
+            matches!(
+                Url::parse(UNPARSEABLE),
+                Err(url::ParseError::InvalidIpv6Address)
+            ),
+            "the fixture must fail for a real reason, not for being relative"
+        );
+        let mut metadata = hf_metadata(vec![HfSibling {
+            rfilename: "LICENSE".to_string(),
+            size: Some(12),
+            lfs: None,
+        }]);
+        metadata.card_data = Some(HfCardData {
+            license: Some(serde_json::Value::String("apache-2.0".to_string())),
+            license_link: Some(UNPARSEABLE.to_string()),
+        });
+
+        // The card is still usable: the refusal is recorded, not escalated into a
+        // failed resolution.
+        let (name, url) = hugging_face_license(&metadata, "owner/repo", &"a".repeat(40)).unwrap();
+        assert_eq!(name.as_deref(), Some("apache-2.0"));
+        assert!(url.as_deref().is_some_and(|url| url.ends_with("/LICENSE")));
+
+        let mine = read_details(UNPARSEABLE.to_string());
+        assert_eq!(mine.len(), 1, "exactly one record for this test's link");
+        assert_eq!(mine[0].rule_code, EgressRule::UrlMalformed.code());
+        assert_eq!(mine[0].guard, MODEL_SOURCE_GUARD);
+
+        // A bare relative link is the shape Hugging Face's own cards use, and this
+        // file's other fixture uses it too. It is not a refusal — the fallback below
+        // resolves a pinned repo LICENSE URL — so it must leave no row. Recording it
+        // would write one per resolution into a table bounded at 10,000 and evict real
+        // denials.
+        metadata.card_data = Some(HfCardData {
+            license: None,
+            license_link: Some("LICENSE".to_string()),
+        });
+        let (_, url) = hugging_face_license(&metadata, "owner/repo", &"a".repeat(40)).unwrap();
+        assert!(
+            url.as_deref().is_some_and(|url| url.ends_with("/LICENSE")),
+            "a relative link must still resolve through the fallback"
+        );
+        assert!(
+            read_details("LICENSE".to_string()).is_empty(),
+            "a relative link is the normal card shape, not a refusal"
+        );
+
+        // The counter-test: a link that parses and points somewhere allowed is
+        // *used*, so recording it would be a lie. Without this, recording every link
+        // unconditionally would pass every assertion above.
+        const ALLOWED: &str = "https://huggingface.co/owner/repo/blob/main/LICENSE";
+        metadata.card_data = Some(HfCardData {
+            license: None,
+            license_link: Some(ALLOWED.to_string()),
+        });
+        let (_, url) = hugging_face_license(&metadata, "owner/repo", &"a".repeat(40)).unwrap();
+        assert_eq!(url.as_deref(), Some(ALLOWED));
+        assert!(
+            read_details(ALLOWED.to_string()).is_empty(),
+            "nothing was refused, so nothing may be recorded"
+        );
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The provenance gate's refusals now say *why* they have no run, and the shape
+    /// this pins is the one the repo has already been bitten by.
+    ///
+    /// `llama_start` and `embed_server_start` reach [`load_provenance`] through
+    /// `tokio::task::spawn_blocking`, which inherits no task-local — so the scope has
+    /// to be entered below the spawn or it does not exist at the recording site at
+    /// all. This test drives it through a real `spawn_blocking`, which is the only
+    /// version of the assertion that can fail for the right reason: move the
+    /// `scoped_sync` up to a caller and this goes back to a blank column while a test
+    /// that called `load_provenance` directly would still pass.
+    ///
+    /// Hermetic and network-free: the download-URL check in `validate_provenance` runs
+    /// before the GGUF itself is ever opened, so a sidecar and a path are the whole
+    /// fixture. The address is unique to this test, so nothing another test records
+    /// into the same process-wide sink can satisfy the filter.
+    #[tokio::test]
+    async fn a_refused_provenance_url_survives_the_spawn_that_validates_it() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory = test_dir("provenance-scope");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+
+        // A private address rather than loopback: `10.66.4.21` appears nowhere else in
+        // this crate's tests, so the filter below cannot be satisfied by another one.
+        const REFUSED_HOST: &str = "10.66.4.21";
+        let model_path = directory.join("model.gguf");
+        let provenance = ManagedModelProvenance {
+            schema_version: PROVENANCE_SCHEMA_VERSION,
+            source: ModelReferenceSource::HuggingFace,
+            requested_reference: "hf:owner/repo".to_string(),
+            canonical_reference: "hf:owner/repo".to_string(),
+            display_name: "Provenance Scope Fixture".to_string(),
+            repo: "owner/repo".to_string(),
+            revision: "a".repeat(40),
+            source_file_name: "model.gguf".to_string(),
+            local_file_name: "model.gguf".to_string(),
+            download_url: format!("https://{REFUSED_HOST}/model.gguf"),
+            sha256: digest('c'),
+            size_bytes: 4_096,
+            tool_calling: false,
+            license_name: None,
+            license_url: None,
+            installed_at_ms: 1,
+        };
+        // Written directly rather than through `save_provenance`, which validates
+        // first and would therefore refuse to produce this fixture at all — the
+        // tampered-sidecar case is the only way this gate is reachable offline.
+        fs::write(
+            provenance_path(&model_path).unwrap(),
+            serde_json::to_vec(&provenance).unwrap(),
+        )
+        .unwrap();
+
+        let verification_path = model_path.clone();
+        let error = tokio::task::spawn_blocking(move || {
+            verify_managed_model_for_runtime(&verification_path)
+        })
+        .await
+        .expect("the blocking task joins")
+        .expect_err("a private download URL must be refused");
+        assert!(
+            error.contains(EgressRule::PrivateV4.code()),
+            "unexpected error: {error}"
+        );
+
+        let rows: Vec<_> = crate::denial_sink::DenialSink::open(&path)
+            .expect("reopens for reading")
+            .recent(256)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.detail.as_deref() == Some(REFUSED_HOST))
+            .collect();
+
+        assert_eq!(rows.len(), 1, "exactly one record for this test's address");
+        assert_eq!(rows[0].guard, MODEL_SOURCE_GUARD);
+        assert_eq!(rows[0].rule_code, EgressRule::PrivateV4.code());
+        assert_eq!(
+            rows[0].run_id, None,
+            "starting a local runtime is not a run, so there is no id to invent"
+        );
+        assert_eq!(
+            rows[0].unattributed_reason.as_deref(),
+            Some(crate::run_scope::Unattributed::UserAction.code()),
+            "the reason must survive `spawn_blocking`, which no task-local does"
+        );
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The counter-test to the one above: the provenance gate is not simply refusing
+    /// every sidecar it reads, which is what would satisfy that test without the gate
+    /// working at all.
+    ///
+    /// Asserted on the *absence of any rule code*, not on the sink, and deliberately:
+    /// the sink is process-wide and several tests in this file record into it without
+    /// taking `test_lock`, so "this file's sink is empty" is not a claim a parallel test
+    /// binary can make. The absence of `[egress.` covers the whole class of refusals at
+    /// once — the same idiom `web.rs`'s `fetch_impl_honors_settings_allow_local_network`
+    /// uses, and for the same reason a per-rule assertion would be weaker.
+    #[test]
+    fn an_accepted_provenance_url_is_not_refused_by_the_destination_gate() {
+        let directory = test_dir("provenance-scope-ok");
+        fs::create_dir_all(&directory).unwrap();
+
+        let model_path = directory.join("model.gguf");
+        let provenance = ManagedModelProvenance {
+            schema_version: PROVENANCE_SCHEMA_VERSION,
+            source: ModelReferenceSource::HuggingFace,
+            requested_reference: "hf:owner/repo".to_string(),
+            canonical_reference: "hf:owner/repo".to_string(),
+            display_name: "Provenance Scope Fixture".to_string(),
+            repo: "owner/repo".to_string(),
+            revision: "a".repeat(40),
+            source_file_name: "model.gguf".to_string(),
+            local_file_name: "model.gguf".to_string(),
+            download_url: "https://huggingface.co/owner/repo/resolve/main/model.gguf".to_string(),
+            sha256: digest('d'),
+            size_bytes: 4_096,
+            tool_calling: false,
+            license_name: None,
+            license_url: None,
+            installed_at_ms: 1,
+        };
+        fs::write(
+            provenance_path(&model_path).unwrap(),
+            serde_json::to_vec(&provenance).unwrap(),
+        )
+        .unwrap();
+
+        // It still fails — on the GGUF that is not there — and that is the point: it
+        // got past the destination gate, so the failure names no egress rule.
+        let error = load_provenance(&model_path).expect_err("the GGUF itself is missing");
+        assert!(
+            !error.contains("[egress."),
+            "no rule may have refused this: {error}"
+        );
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The two network entry points must each enter a run scope, so that the thirteen
+    /// `validate_public_https_url` call sites below them stop recording a blank.
+    ///
+    /// A source ratchet rather than a sink assertion, and the reason is the same one
+    /// that makes `the_registry_token_request_rechecks_where_the_redirect_chain_ended`
+    /// one: neither of these paths can be made to refuse anything offline. Every URL
+    /// they build comes from a hardcoded public origin, and the refusals that *are*
+    /// reachable — a hostile `license_link`, a redirect off the allowlist, an auth realm
+    /// naming another host — all sit behind a live HTTP response. The mechanism itself
+    /// is pinned against a real sink by the provenance test above; what is unprovable
+    /// here is only that these two callers still enter it.
+    ///
+    /// Comment lines are stripped first, because the prose explaining a scan is exactly
+    /// what a scan for that prose's subject matches — a mistake this repo has made
+    /// three times.
+    #[test]
+    fn both_model_source_network_entry_points_name_the_work_as_a_user_action() {
+        let source = include_str!("model_sources.rs");
+        let stripped = source
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for signature in [
+            "pub async fn resolve_reference(",
+            "pub async fn install_reference<F>(",
+        ] {
+            let body = stripped
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("{signature} is declared"))
+                .1
+                .split_once("\n}\n")
+                .expect("its body ends")
+                .0;
+            assert!(
+                body.contains("crate::run_scope::scoped("),
+                "{signature} must enter a run scope, or every destination refusal \
+                 beneath it records an unexplained blank"
+            );
+            assert!(
+                body.contains("Unattributed::UserAction"),
+                "{signature} must name the reason it has no run, not pick any arm"
+            );
+        }
+    }
+
     #[test]
     fn registry_bearer_challenge_is_parsed_and_origin_restricted() {
         let challenge = parse_registry_auth_challenge(
@@ -2912,22 +3935,201 @@ mod tests {
             challenge.scope.as_deref(),
             Some("repository:library/qwen3:pull")
         );
-        assert!(parse_registry_auth_challenge(
-            r#"Bearer realm="https://evil.example/token",service="registry.ollama.ai""#
+        // `is_err()` alone could not tell this apart from a malformed challenge:
+        // this parser refuses eight other ways (no space, wrong scheme, a
+        // parameter without `=`, an unparseable realm URL, a missing realm...) and
+        // every one of them was also just `Err(String)`. The realm here parses
+        // perfectly — it is refused because of *where it points*, so the assertion
+        // is on the rule.
+        let error = parse_registry_auth_challenge(
+            r#"Bearer realm="https://evil.example/token",service="registry.ollama.ai""#,
         )
-        .is_err());
+        .expect_err("a realm outside ollama.ai/ollama.com must be refused");
+        assert!(
+            error.contains(EgressRule::OriginNotAllowlisted.code()),
+            "the refusal must name the allowlist rule, not just fail: {error}"
+        );
+        assert!(
+            error.contains("evil.example"),
+            "the refusal must name the realm host it refused: {error}"
+        );
+
+        // The same verdict in typed form, so the rule is pinned and not only its
+        // rendering, plus the counter-case: a realm that really is on the
+        // allowlist is still accepted.
+        assert_eq!(
+            classify_ollama_auth_url(&Url::parse("https://evil.example/token").unwrap())
+                .expect_err("an off-allowlist realm must be refused")
+                .rule(),
+            EgressRule::OriginNotAllowlisted
+        );
+        assert!(
+            classify_ollama_auth_url(&Url::parse("https://auth.ollama.ai/token").unwrap()).is_ok()
+        );
+        assert!(classify_ollama_auth_url(&Url::parse("https://ollama.com/token").unwrap()).is_ok());
+        // A near-miss host that merely *contains* the allowlisted name.
+        assert_eq!(
+            classify_ollama_auth_url(&Url::parse("https://ollama.ai.evil.example/token").unwrap())
+                .expect_err("a suffix attack must be refused")
+                .rule(),
+            EgressRule::OriginNotAllowlisted
+        );
     }
 
+    /// The allowlist is bypassable by a *response* unless the final URL is re-checked,
+    /// and that half cannot be reached from a unit test: the pre-flight check refuses
+    /// every host this process could stand a local listener on, so a real redirect out
+    /// of the allowlist is unreachable without overriding DNS.
+    ///
+    /// So this reads the source, in the style `egress.rs`'s two ratchets established
+    /// for the same reason. Comment lines are stripped first, because the prose
+    /// explaining a scan is exactly what a scan for that prose's own subject matches —
+    /// a mistake this repo has now made three times.
+    ///
+    /// What it pins: `fetch_registry_token` sends, and then judges `response.url()`
+    /// with the *ollama* validator. Not `validate_public_https_url`, which is what
+    /// `build_http_client`'s redirect policy already uses and which allows any public
+    /// HTTPS host — so a hop off the allowlist passes it. The credential shape is why
+    /// this matters: the `token` in the final host's body becomes the bearer attached
+    /// to the follow-up registry request.
+    #[test]
+    fn the_registry_token_request_rechecks_where_the_redirect_chain_ended() {
+        let source = include_str!("model_sources.rs");
+        let stripped = source
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = stripped
+            .split_once("async fn fetch_registry_token(")
+            .expect("fetch_registry_token is declared")
+            .1
+            .split_once("\n}\n")
+            .expect("its body ends")
+            .0;
+        assert!(
+            body.contains("validate_ollama_auth_url(response.url())"),
+            "fetch_registry_token must re-check the final URL against the ollama \
+             allowlist; the redirect policy's own check allows any public HTTPS host"
+        );
+        // The pre-flight check must survive too. Both halves, or the rule is
+        // bypassable from one side: without the pre-flight a challenge names any host
+        // directly, and without the re-check a response redirects to one.
+        assert!(
+            body.contains("validate_ollama_auth_url(&challenge.realm)"),
+            "the pre-flight realm check must not be dropped in favour of the re-check"
+        );
+    }
+
+    /// The allowlist above pins the host, which is only half a destination: a
+    /// challenge could name `https://auth.ollama.ai:9000/token` — the allowlisted
+    /// host, a port nobody publishes a service on — and the token request would have
+    /// gone there. Low severity, deliberately: that request carries no credential,
+    /// it is the one that goes to *fetch* one, so the cost was a request to an
+    /// unexpected service rather than a leaked secret.
+    ///
+    /// Also pins the recording, which the allowlist half never did: this is the one
+    /// refusal in this file a remote server gets to cause, and it used to return past
+    /// the sink because only `validate_public_https_url` wrote anything down.
+    #[test]
+    fn an_auth_realm_on_a_surprising_port_is_refused_while_the_real_realm_still_works() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory = test_dir("auth-realm-port-sink");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+
+        assert_eq!(
+            validate_ollama_auth_url(&Url::parse("https://auth.ollama.ai:9000/token").unwrap())
+                .expect_err("a realm on an unpublished port must be refused")
+                .rule(),
+            EgressRule::OriginNotAllowlisted
+        );
+        // The same refusal at the call site that a remote server actually reaches, so
+        // the challenge is rejected where it is parsed and before a request is built
+        // from it.
+        let error = parse_registry_auth_challenge(
+            r#"Bearer realm="https://auth.ollama.ai:9000/token",service="registry.ollama.ai""#,
+        )
+        .expect_err("a challenge naming an unpublished port must be refused");
+        assert!(
+            error.contains(EgressRule::OriginNotAllowlisted.code()),
+            "the refusal must name the allowlist rule: {error}"
+        );
+        assert!(
+            error.contains("auth.ollama.ai:9000"),
+            "the refusal must name the origin it refused, port included: {error}"
+        );
+
+        // The counter-tests, and the reason this pin is safe to ship: the real
+        // production realm, that realm with its default port spelled out — the same
+        // destination, which is why the *resolved* port is what gets compared — and a
+        // realm whose path the registry moved must all still be accepted. "Refuse
+        // every realm" would pass every assertion above.
+        for realm in [
+            "https://auth.ollama.ai/token",
+            "https://auth.ollama.ai:443/token",
+            "https://auth.ollama.ai/v2/token",
+            "https://ollama.com/token",
+        ] {
+            validate_ollama_auth_url(&Url::parse(realm).unwrap())
+                .unwrap_or_else(|denial| panic!("{realm} must keep working: {denial}"));
+        }
+
+        let rows = crate::denial_sink::DenialSink::open(&path)
+            .expect("reopens for reading")
+            .recent(256)
+            .expect("reads");
+        let with_detail = |marker: &str| {
+            rows.iter()
+                .filter(|row| row.detail.as_deref() == Some(marker))
+                .collect::<Vec<_>>()
+        };
+        // Two: the typed call above and the challenge parse, each of which refuses
+        // once.
+        let refused = with_detail("auth.ollama.ai:9000");
+        assert_eq!(refused.len(), 2, "both refusals must be written down");
+        assert_eq!(
+            refused[0].rule_code,
+            EgressRule::OriginNotAllowlisted.code()
+        );
+        assert_eq!(refused[0].guard, MODEL_SOURCE_GUARD);
+        assert!(
+            with_detail("auth.ollama.ai:443").is_empty(),
+            "an accepted realm must leave no record"
+        );
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// Before this asserted rules, the two blocks below were indistinguishable:
+    /// both were `is_err()`, so the test passed just as well if the v4-mapped
+    /// unwrap and the documentation range had been collapsed into one another —
+    /// or if the whole function had started refusing everything.
     #[test]
     fn url_validation_rejects_ipv4_mapped_loopback_and_documentation_ipv6() {
-        assert!(validate_public_https_url(
-            &Url::parse("https://[::ffff:127.0.0.1]/model.gguf").unwrap()
-        )
-        .is_err());
-        assert!(validate_public_https_url(
-            &Url::parse("https://[2001:db8::1]/model.gguf").unwrap()
-        )
-        .is_err());
+        assert_eq!(
+            validate_public_https_url(
+                &Url::parse("https://[::ffff:127.0.0.1]/model.gguf").unwrap()
+            )
+            .expect_err("a mapped loopback address must be refused")
+            .rule(),
+            EgressRule::Loopback
+        );
+        assert_eq!(
+            validate_public_https_url(&Url::parse("https://[2001:db8::1]/model.gguf").unwrap())
+                .expect_err("a documentation address must be refused")
+                .rule(),
+            EgressRule::TestNet
+        );
         assert!(validate_public_https_url(
             &Url::parse("https://huggingface.co/model.gguf").unwrap()
         )

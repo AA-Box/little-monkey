@@ -92,6 +92,22 @@ export const SHORTCUTS = [
     bindings: [{ key: "g", code: "KeyG", control: true, shift: true }],
   },
   {
+    id: "openDiffPanel",
+    scope: "global",
+    labelKey: "App.diffPanelTitle",
+    descriptionKey: "KeyboardShortcutsPanel.openDiffPanelDescription",
+    // `primary` (the table's default), not `control` like `openReview` — that
+    // one is Control on macOS only because the reference it mirrors is.
+    bindings: [{ key: "d", code: "KeyD", primary: true, shift: true }],
+  },
+  {
+    id: "openProcessesPanel",
+    scope: "global",
+    labelKey: "App.rightPanelProcesses",
+    descriptionKey: "KeyboardShortcutsPanel.openProcessesPanelDescription",
+    bindings: [{ key: "p", code: "KeyP", primary: true, shift: true }],
+  },
+  {
     id: "toggleRightSidebar",
     scope: "global",
     labelKey: "App.rightPanelMenuTitle",

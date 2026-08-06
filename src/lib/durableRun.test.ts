@@ -54,10 +54,32 @@ describe("durable run snapshots", () => {
   });
 
   it("builds a default-deny repository policy from canonical roots", () => {
+    // `WorkspaceRootInfo.id` is the canonicalized path in production (see
+    // `workspace.rs`), so the fixture uses one. It used to say `root-1`, which
+    // is already id-shaped — which is exactly why nothing caught that the raw
+    // value was being passed through as a protocol id.
     const wire = workspaceToRunWire([
-      { id: "root-1", path: "/workspace/project", label: "project", is_primary: true },
+      { id: "/workspace/project", path: "/workspace/project", label: "project", is_primary: true },
     ]);
-    expect(wire?.primary_root_id).toBe("root-1");
+
+    // Every id the protocol validates must start and end alphanumeric. A path
+    // starts with `/`, so this failed for every run carrying a workspace.
+    const idShape = /^[A-Za-z0-9][A-Za-z0-9_.:-]*[A-Za-z0-9]$/;
+    expect(wire?.primary_root_id).toMatch(idShape);
+    expect(wire?.workspace_id).toMatch(idShape);
+    for (const root of wire?.roots ?? []) expect(root.root_id).toMatch(idShape);
+    expect(wire?.repository_policy?.root_id).toMatch(idShape);
+
+    // The path is not lost — it travels beside the id, which is what makes
+    // deriving the id safe.
+    expect(wire?.roots[0]?.canonical_path).toBe("/workspace/project");
+
+    // And the cross-references still resolve: the protocol rejects a
+    // `primary_root_id` or policy root that names no granted root.
+    const grantedIds = (wire?.roots ?? []).map((root) => root.root_id);
+    expect(grantedIds).toContain(wire?.primary_root_id);
+    expect(grantedIds).toContain(wire?.repository_policy?.root_id);
+
     expect(wire?.repository_policy).toMatchObject({ allow_commit: true, allow_push: false, allow_merge: false });
   });
 

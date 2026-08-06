@@ -980,6 +980,8 @@ export interface GgufHeaderInfo {
   architecture: string | null;
   name: string | null;
   quantizationVersion: string | null;
+  /** The model's own trained context window, from its `<arch>.context_length` GGUF metadata key, when present. */
+  contextLength: number | null;
   declaredLicense: string | null;
 }
 

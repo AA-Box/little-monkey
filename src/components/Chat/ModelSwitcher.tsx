@@ -36,8 +36,13 @@ function retirementTooltip(
  * installed local (llama.cpp) model and a pulled Ollama tag. Rendered in
  * ChatWindow's bottom input row, mirroring ModeSelector's floating-panel
  * idiom (absolute dropdown, outside-pointerdown-to-close).
+ *
+ * `placement` defaults to "up" for that bottom-row use; panels that render it
+ * near the TOP of a scroll container (e.g. `PmCopilotPanel`, whose generation
+ * runs against this same active target) pass "down" so the dropdown isn't
+ * clipped by the container's overflow.
  */
-export function ModelSwitcher() {
+export function ModelSwitcher({ placement = "up" }: { placement?: "up" | "down" } = {}) {
   const installed = useModelStore((s) => s.installed);
   const ollamaModels = useModelStore((s) => s.ollamaModels);
   const active = useModelStore((s) => s.active);
@@ -131,101 +136,109 @@ export function ModelSwitcher() {
       </button>
 
       {open && (
-        <div className="absolute bottom-full right-0 z-20 mb-1 max-h-[70vh] w-64 overflow-y-auto rounded-lg border border-border bg-background py-1 shadow-lg">
-          <p className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint">{t("ModelSwitcher.localSectionLabel")}</p>
-          {installedChatModels.length === 0 ? (
-            <p className="px-3 py-1.5 text-xs text-faint">{t("ModelSwitcher.noLocalModelsInstalled")}</p>
-          ) : (
-            installedChatModels.map((model) => {
-              const isActive = activeProvider === "local" && active?.path === model.path;
-              return (
-                <button
-                  key={model.id}
-                  type="button"
-                  onClick={() => handleSelectLocal(model)}
-                  className="flex w-full cursor-pointer items-center justify-between px-3 py-1.5 text-left text-sm hover:bg-surface-2"
-                >
-                  <span className="truncate">{model.name}</span>
-                  {isActive && <Check size={14} className="shrink-0 text-accent" />}
-                </button>
-              );
-            })
+        <div
+          className={`absolute right-0 z-20 max-h-[70vh] w-64 overflow-y-auto rounded-lg border border-border bg-background py-1 shadow-lg ${
+            placement === "down" ? "top-full mt-1" : "bottom-full mb-1"
+          }`}
+        >
+          {installedChatModels.length > 0 && (
+            <>
+              <p className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint">{t("ModelSwitcher.localSectionLabel")}</p>
+              {installedChatModels.map((model) => {
+                const isActive = activeProvider === "local" && active?.path === model.path;
+                return (
+                  <button
+                    key={model.id}
+                    type="button"
+                    onClick={() => handleSelectLocal(model)}
+                    className="flex w-full cursor-pointer items-center justify-between px-3 py-1.5 text-left text-sm hover:bg-surface-2"
+                  >
+                    <span className="truncate">{model.name}</span>
+                    {isActive && <Check size={14} className="shrink-0 text-accent" />}
+                  </button>
+                );
+              })}
+            </>
           )}
 
-          {connectedProviders.length === 0 ? (
+          {connectedProviders.map((provider) => {
+            const filter = providerModelFilters[provider.id] ?? DEFAULT_PROVIDER_MODEL_FILTER;
+            const availableModels = providerModels[provider.id] ?? [];
+            const models = visibleProviderModelsForProvider(
+              provider.id,
+              availableModels,
+              filter,
+              { activeProvider, activeProviderId, activeProviderModel },
+            );
+            if (models.length === 0) return null;
+            return (
+              <div key={provider.id}>
+                <p className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint">{provider.label}</p>
+                {models.map((model) => {
+                  const isActive =
+                    activeProvider === "provider" && activeProviderId === provider.id && activeProviderModel === model.id;
+                  const retirement = cloudModelRetirementWarning(provider.id, model.id);
+                  return (
+                    <button
+                      key={`${provider.id}/${model.id}`}
+                      type="button"
+                      onClick={() => handleSelectProvider(provider.id, model.id)}
+                      className="flex w-full cursor-pointer items-center justify-between gap-1.5 px-3 py-1.5 text-left text-sm hover:bg-surface-2"
+                    >
+                      <span className="truncate">{model.id}</span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        {retirement && (
+                          <span title={retirementTooltip(t, retirement)}>
+                            <TriangleAlert size={13} className="text-warning" aria-label={t("ModelSwitcher.retiredBadge")} />
+                          </span>
+                        )}
+                        {isActive && <Check size={14} className="text-accent" />}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            );
+          })}
+
+          {ollamaModels.length > 0 && (
             <>
-              <p className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint">{t("ModelSwitcher.cloudSectionLabel")}</p>
-              <p className="px-3 py-1.5 text-xs text-faint">{t("ModelSwitcher.noCloudModelsConfigured")}</p>
+              <p className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint">{t("ModelSwitcher.ollamaSectionLabel")}</p>
+              {ollamaModels.map((model) => {
+                const isActive = activeProvider === "ollama" && activeOllamaModel === model.name;
+                return (
+                  <button
+                    key={model.name}
+                    type="button"
+                    onClick={() => handleSelectOllama(model)}
+                    className="flex w-full cursor-pointer items-center justify-between px-3 py-1.5 text-left text-sm hover:bg-surface-2"
+                  >
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      <span className="truncate">{model.name}</span>
+                      {model.is_cloud && <span className="shrink-0 text-[10px] text-faint">{t("ModelSwitcher.cloudBadge")}</span>}
+                    </span>
+                    {isActive && <Check size={14} className="shrink-0 text-accent" />}
+                  </button>
+                );
+              })}
             </>
-          ) : (
-            connectedProviders.map((provider) => {
+          )}
+
+          {installedChatModels.length === 0 &&
+            connectedProviders.every((provider) => {
               const filter = providerModelFilters[provider.id] ?? DEFAULT_PROVIDER_MODEL_FILTER;
               const availableModels = providerModels[provider.id] ?? [];
-              const models = visibleProviderModelsForProvider(
-                provider.id,
-                availableModels,
-                filter,
-                { activeProvider, activeProviderId, activeProviderModel },
-              );
               return (
-                <div key={provider.id}>
-                  <p className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint">{provider.label}</p>
-                  {models.length === 0 ? (
-                    <p className="px-3 py-1.5 text-xs text-faint">
-                      {t(providerModelsEmptyStateKey(availableModels.length))}
-                    </p>
-                  ) : (
-                    models.map((model) => {
-                      const isActive =
-                        activeProvider === "provider" && activeProviderId === provider.id && activeProviderModel === model.id;
-                      const retirement = cloudModelRetirementWarning(provider.id, model.id);
-                      return (
-                        <button
-                          key={`${provider.id}/${model.id}`}
-                          type="button"
-                          onClick={() => handleSelectProvider(provider.id, model.id)}
-                          className="flex w-full cursor-pointer items-center justify-between gap-1.5 px-3 py-1.5 text-left text-sm hover:bg-surface-2"
-                        >
-                          <span className="truncate">{model.id}</span>
-                          <span className="flex shrink-0 items-center gap-1.5">
-                            {retirement && (
-                              <span title={retirementTooltip(t, retirement)}>
-                                <TriangleAlert size={13} className="text-warning" aria-label={t("ModelSwitcher.retiredBadge")} />
-                              </span>
-                            )}
-                            {isActive && <Check size={14} className="text-accent" />}
-                          </span>
-                        </button>
-                      );
-                    })
-                  )}
-                </div>
+                visibleProviderModelsForProvider(provider.id, availableModels, filter, {
+                  activeProvider,
+                  activeProviderId,
+                  activeProviderModel,
+                }).length === 0
               );
-            })
-          )}
-
-          <p className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint">{t("ModelSwitcher.ollamaSectionLabel")}</p>
-          {ollamaModels.length === 0 ? (
-            <p className="px-3 py-1.5 text-xs text-faint">{t("ModelSwitcher.noOllamaModelsPulled")}</p>
-          ) : (
-            ollamaModels.map((model) => {
-              const isActive = activeProvider === "ollama" && activeOllamaModel === model.name;
-              return (
-                <button
-                  key={model.name}
-                  type="button"
-                  onClick={() => handleSelectOllama(model)}
-                  className="flex w-full cursor-pointer items-center justify-between px-3 py-1.5 text-left text-sm hover:bg-surface-2"
-                >
-                  <span className="flex min-w-0 items-center gap-1.5">
-                    <span className="truncate">{model.name}</span>
-                    {model.is_cloud && <span className="shrink-0 text-[10px] text-faint">{t("ModelSwitcher.cloudBadge")}</span>}
-                  </span>
-                  {isActive && <Check size={14} className="shrink-0 text-accent" />}
-                </button>
-              );
-            })
-          )}
+            }) &&
+            ollamaModels.length === 0 && (
+              <p className="px-3 py-1.5 text-xs text-faint">{t("ModelSwitcher.noModel")}</p>
+            )}
         </div>
       )}
     </div>

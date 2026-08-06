@@ -58,6 +58,12 @@ import {
 import { useSessionStore } from '../store/sessionStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { protectToolResult } from './untrustedContent';
+import {
+  admitProcess,
+  exitProcess,
+  markProcessRunning,
+  markProcessSuspended,
+} from './processTable';
 import { errorMessage } from "./errors";
 
 /** Hard cap on model/tool round trips for one side task attempt — same
@@ -220,27 +226,44 @@ const controllers = new Map<string, AbortController>();
  * effect at the next safe checkpoint, never mid-stream" posture the rest of
  * the app's cancellation already has (see `turnEngine.ts`'s
  * `executeToolCall` abort race) — pause is the same idea, just resumable
- * instead of terminal. */
-export function waitUntilResumed(taskId: string, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const stillPaused = () => useSideTaskStore.getState().tasks[taskId]?.status === 'paused';
-    if (signal.aborted || !stillPaused()) {
-      resolve();
-      return;
-    }
-    const unsubscribe = useSideTaskStore.subscribe(() => {
+ * instead of terminal.
+ *
+ * `processId` is optional (and may be a promise, since admission is
+ * fire-and-forget) so the process table's `state` stays honest around the
+ * wait — `suspended` only once actually parked here, `running` again only
+ * once actually resumed — instead of sitting at `running` forever while
+ * `signalIntent.suspendRequested` is latched, which was the gap between this
+ * kind's local `paused` status and the durable, cross-process signal. */
+export function waitUntilResumed(
+  taskId: string,
+  signal: AbortSignal,
+  processId?: string | null | Promise<string | null>,
+): Promise<void> {
+  const stillPaused = () => useSideTaskStore.getState().tasks[taskId]?.status === 'paused';
+  if (signal.aborted || !stillPaused()) return Promise.resolve();
+  return (async () => {
+    const id = processId != null ? await processId : null;
+    if (id) await markProcessSuspended(id);
+    await new Promise<void>((resolve) => {
       if (signal.aborted || !stillPaused()) {
-        unsubscribe();
-        signal.removeEventListener('abort', onAbort);
         resolve();
+        return;
       }
+      const unsubscribe = useSideTaskStore.subscribe(() => {
+        if (signal.aborted || !stillPaused()) {
+          unsubscribe();
+          signal.removeEventListener('abort', onAbort);
+          resolve();
+        }
+      });
+      const onAbort = () => {
+        unsubscribe();
+        resolve();
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
     });
-    const onAbort = () => {
-      unsubscribe();
-      resolve();
-    };
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
+    if (id && !signal.aborted) await markProcessRunning(id);
+  })();
 }
 
 /** Cancels a side task's in-flight (or paused) attempt: aborts this
@@ -255,12 +278,34 @@ export function cancelSideTask(taskId: string): void {
   controllers.get(taskId)?.abort();
 }
 
+/** Process-table ids for live attempts, keyed like `controllers`. Lets pause and
+ * resume project the state change, so the process table agrees with the store
+ * whichever way the pause arrived — the drawer's button or a delivered `suspend`
+ * signal (see `processSignalDelivery.ts`). Entries are removed on terminal. */
+const processIds = new Map<string, string>();
+
+/** Projects the store's *resulting* status, never the requested one.
+ *
+ * Both store actions are guarded no-ops — `pause` ignores a queued or terminal
+ * task, `resume` a task that is not paused — so projecting on request would make
+ * the process table claim a suspension that never happened, and leave the
+ * signal's latch acknowledged with nothing behind it. */
+function projectSideTaskStatus(taskId: string): void {
+  const processId = processIds.get(taskId);
+  if (!processId) return;
+  const status = useSideTaskStore.getState().tasks[taskId]?.status;
+  if (status === 'paused') void markProcessSuspended(processId);
+  else if (status === 'running') void markProcessRunning(processId);
+}
+
 export function pauseSideTask(taskId: string): void {
   useSideTaskStore.getState().pause(taskId);
+  projectSideTaskStatus(taskId);
 }
 
 export function resumeSideTask(taskId: string): void {
   useSideTaskStore.getState().resume(taskId);
+  projectSideTaskStatus(taskId);
 }
 
 /** Builds the "produced artifacts" list (acceptance criterion: outputs
@@ -332,6 +377,33 @@ export async function runSideTask(taskId: string): Promise<void> {
   controllers.set(taskId, controller);
   const mutatedPaths: string[] = [];
 
+  // Projected onto the unified process table. A side task is deliberately NOT a
+  // child of the chat turn that started it — that is the whole point of a side
+  // task, and `sessionId` on the record is an association, not a parent process.
+  // Fail-soft — see `processTable.ts`.
+  const processIdPromise = admitProcess({
+    kind: 'side_task',
+    externalId: taskId,
+    profile: useSideTaskStore.getState().tasks[taskId]?.profile ?? null,
+  }).then(async (id) => {
+    if (id) {
+      // `finishTerminal` may already have run — a task cancelled while the admit
+      // was still in flight — and it clears this map, so don't resurrect an entry
+      // it has cleaned up. `controllers` is the liveness test because it is set
+      // before the admit and cleared on the same terminal path.
+      if (controllers.has(taskId)) processIds.set(taskId, id);
+      await markProcessRunning(id);
+      // A pause that arrived while the admit was still in flight had no id to
+      // project with, so catch it here rather than leaving the record claiming to
+      // run — and leaving a delivered `suspend` unacknowledged, which would make
+      // every later sweep re-deliver it.
+      if (useSideTaskStore.getState().tasks[taskId]?.status === 'paused') {
+        projectSideTaskStatus(taskId);
+      }
+    }
+    return id;
+  });
+
   const finishTerminal = (
     status: 'completed' | 'error' | 'cancelled',
     finalReport: string | null,
@@ -342,6 +414,16 @@ export async function runSideTask(taskId: string): Promise<void> {
     if (task) store.setArtifacts(taskId, buildArtifacts(task.messages, mutatedPaths));
     store.finish(taskId, status, finalReport, error);
     controllers.delete(taskId);
+    processIds.delete(taskId);
+    // Not awaited: this helper is synchronous and is the single terminal path
+    // every outcome routes through, so blocking it on IPC would change the
+    // loop's shape.
+    void processIdPromise.then((id) => {
+      if (!id) return;
+      const exitStatus =
+        status === 'completed' ? 'succeeded' : status === 'cancelled' ? 'cancelled' : 'failed';
+      return exitProcess(id, exitStatus, error ?? null);
+    });
   };
 
   try {
@@ -378,7 +460,7 @@ export async function runSideTask(taskId: string): Promise<void> {
     let messages: ChatMessage[] = initialTask.messages;
 
     for (let iteration = 0; iteration < MAX_SIDE_TASK_ITERATIONS; iteration++) {
-      await waitUntilResumed(taskId, controller.signal);
+      await waitUntilResumed(taskId, controller.signal, processIdPromise);
       if (controller.signal.aborted) return finishTerminal('cancelled', null, null);
 
       const wireHistory: ChatMessage[] = [{ role: 'system', content: systemPrompt }, ...messages];
@@ -411,7 +493,7 @@ export async function runSideTask(taskId: string): Promise<void> {
       useSideTaskStore.getState().appendMessage(taskId, assistantMessage);
 
       for (const toolCall of attempt.toolCalls) {
-        await waitUntilResumed(taskId, controller.signal);
+        await waitUntilResumed(taskId, controller.signal, processIdPromise);
         const aborted = controller.signal.aborted;
 
         useSideTaskStore.getState().recordToolProposed(taskId, {

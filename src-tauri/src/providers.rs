@@ -25,6 +25,7 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Notify;
 
+use crate::run_scope::{RunScope, Unattributed};
 use crate::AppState;
 
 const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
@@ -360,7 +361,14 @@ pub async fn fetch_models(
     provider_id: &str,
     api_key: &str,
 ) -> Result<Vec<ProviderModelInfo>, String> {
-    let client = reqwest::Client::new();
+    // `egress::hardened()` rather than a default client because `base_url` is
+    // user-configurable and [`add_anthropic_headers`] attaches `x-api-key`,
+    // which reqwest does NOT strip across a cross-host redirect (it strips only
+    // `Authorization`, `Cookie`, `Proxy-Authorization`, `WWW-Authenticate`) —
+    // so a `302` from here could hand the key to a host the response chose.
+    let client = crate::egress::hardened()
+        .build()
+        .map_err(|e| format!("Failed to build the provider HTTP client: {e}"))?;
     let request = add_anthropic_headers(
         client
             .get(format!("{base_url}/models"))
@@ -645,16 +653,28 @@ pub async fn providers_stream_chat(
         .lock()
         .unwrap()
         .insert(request_id.clone(), cancel.clone());
-    let result = run_stream_chat(
-        &app,
-        &request_id,
-        &provider_id,
-        &model,
-        messages,
-        tools,
-        effort,
-        cancel,
-        frozen_endpoint,
+    // The scope covers the whole stream, so every refusal raised anywhere inside it
+    // is attributable without `run_stream_chat` — or the SSRF predicates several
+    // frames below it — taking a run id they have no other use for. Both arms are
+    // real here: a ledgered run carries its id, and an ordinary chat is not a run
+    // and says so, rather than arriving at the sink as an unexplained blank.
+    let scope = match run_id.as_deref() {
+        Some(run_id) => RunScope::run(run_id),
+        None => RunScope::Unattributed(Unattributed::UserAction),
+    };
+    let result = crate::run_scope::scoped(
+        scope,
+        run_stream_chat(
+            &app,
+            &request_id,
+            &provider_id,
+            &model,
+            messages,
+            tools,
+            effort,
+            cancel,
+            frozen_endpoint,
+        ),
     )
     .await;
 
@@ -769,7 +789,14 @@ async fn run_stream_chat(
     };
     let api_key = read_key(provider_id)?;
 
-    let client = reqwest::Client::new();
+    // Same `x-api-key`-across-a-redirect reasoning as [`fetch_models`]. Note
+    // that `egress::hardened()` sets a *read* timeout and never a total one:
+    // this request is `"stream": true` and its body is consumed chunk by chunk
+    // for as long as the model generates, so a total deadline would truncate a
+    // long answer rather than catch a dead peer.
+    let client = crate::egress::hardened()
+        .build()
+        .map_err(|e| format!("Failed to build the provider HTTP client: {e}"))?;
     let request = build_chat_request(
         &client,
         &base_url,

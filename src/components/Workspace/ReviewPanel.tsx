@@ -10,15 +10,19 @@ import {
   Folder,
   GitPullRequest,
   ListCollapse,
-  RefreshCw,
   Rows3,
+  RefreshCw,
   Search,
+  SquareSplitVertical,
+  StretchVertical,
   X,
 } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
 import { Button, IconButton } from "../ui";
-import { computeDiff, type DiffLine } from "./DiffViewer";
+import { CriteriaCoverageSection } from "./CriteriaCoverageSection";
+import { DiffViewer, computeDiff, type DiffLine } from "./DiffViewer";
+import type { ReviewCoverageInput } from "../../lib/reviewCoverage";
 
 /** Mirrors Rust `ReviewFilePayload` / `ReviewPayload` in src-tauri/src/git.rs. */
 interface ReviewFilePayload {
@@ -40,8 +44,29 @@ interface ReviewPayload {
   pr_url: string | null;
 }
 
+/** Mirrors Rust `GitChangedFile` in src-tauri/src/git.rs (camelCase there). */
+interface GitChangedFile {
+  path: string;
+  status: string;
+}
+
+/** Mirrors Rust `GitFileDiff` in src-tauri/src/git.rs (camelCase there). */
+interface GitFileDiff {
+  original: string;
+  current: string;
+  binary: boolean;
+  oversize: boolean;
+}
+
 type ReviewBase = "branch" | "working";
 type DiffLayout = "unified" | "split";
+/**
+ * How the changed files are laid out. `continuous` stacks every file's diff in
+ * one scroll; `single` shows one selected file at a time, which is what the
+ * separate Diff panel used to be before it folded into this component — the
+ * `diff` right-sidebar tab still opens here, just with `single` as its default.
+ */
+export type ReviewView = "continuous" | "single";
 
 const LAYOUT_STORAGE_KEY = "little-monkey-review-diff-layout";
 /** Runs of unchanged lines longer than this collapse behind a
@@ -49,12 +74,106 @@ const LAYOUT_STORAGE_KEY = "little-monkey-review-diff-layout";
 const COLLAPSE_RUN_THRESHOLD = 8;
 const COLLAPSE_CONTEXT = 3;
 
+const STATUS_CLASSES: Record<string, string> = {
+  A: "text-success",
+  M: "text-warning",
+  D: "text-danger",
+  R: "text-accent",
+};
+
 function readInitialLayout(): DiffLayout {
   try {
     return localStorage.getItem(LAYOUT_STORAGE_KEY) === "split" ? "split" : "unified";
   } catch {
     return "unified";
   }
+}
+
+/**
+ * One row this panel can render. `git_review` carries content for the files it
+ * returns, but it stops at `MAX_REVIEW_FILES` (300, src-tauri/src/git.rs) — in
+ * `working` mode the complete list comes from the uncapped `git_changed_files`
+ * instead, and anything past the cap arrives with `content: null` and is
+ * fetched per file from `git_file_diff` when the user actually opens it. That
+ * lazy path is why folding the old Diff panel in here lost nothing: it is the
+ * same two commands that panel used, on the same HEAD-vs-disk base.
+ */
+interface ReviewFileRow {
+  path: string;
+  /** `A`/`M`/`D`/`R`. Real porcelain output in `working` mode; derived from the
+   * payload's own content and counts in `branch` mode, which has no porcelain
+   * equivalent (a file committed on the branch is clean in the worktree). */
+  status: string;
+  added: number;
+  deleted: number;
+  binary: boolean;
+  oversize: boolean;
+  /** null while unfetched — see the note above. */
+  content: { old: string; new: string } | null;
+}
+
+/** `git_review` reports binary and oversized files under one `binary` flag
+ * (git.rs collapses them), so a payload row can only ever say "binary". A
+ * lazily fetched row keeps them apart, because `git_file_diff` does. */
+function rowFromPayload(file: ReviewFilePayload): ReviewFileRow {
+  return {
+    path: file.path,
+    status: deriveStatus(file),
+    added: file.added,
+    deleted: file.deleted,
+    binary: file.binary,
+    oversize: false,
+    content: file.binary ? null : { old: file.old_content, new: file.new_content },
+  };
+}
+
+/** Status letter for a file `git_changed_files` cannot speak about. Content
+ * decides it when there is content; counts decide it for a binary file.
+ * Exported for `ReviewPanel.test.ts` — this repo has no DOM test harness, so
+ * the pure functions that decide what renders are tested directly, as
+ * `PermissionModal` does with `canRememberForSession`. */
+export function deriveStatus(file: ReviewFilePayload): string {
+  if (!file.binary) {
+    if (file.old_content === "" && file.new_content !== "") return "A";
+    if (file.new_content === "" && file.old_content !== "") return "D";
+    return "M";
+  }
+  if (file.deleted === 0 && file.added > 0) return "A";
+  if (file.added === 0 && file.deleted > 0) return "D";
+  return "M";
+}
+
+/**
+ * The rows to render for one refresh. `changed` is `git_changed_files`'s
+ * uncapped list, passed only in `working` mode; `null` in `branch` mode, where
+ * porcelain output describes a different set of files entirely.
+ *
+ * This is the function that makes folding the old Diff panel in here
+ * lossless: with `changed` present, every path porcelain reports gets a row —
+ * including the ones `git_review` dropped at its 300-file cap, which arrive
+ * with `content: null` and load on open. Exported so a test can pin that.
+ */
+export function buildRows(
+  files: ReviewFilePayload[],
+  changed: GitChangedFile[] | null,
+): ReviewFileRow[] {
+  if (changed === null) return files.map(rowFromPayload);
+  const byPath = new Map(files.map((file) => [file.path, file]));
+  return changed.map((entry) => {
+    const file = byPath.get(entry.path);
+    // Porcelain's letter wins over the derived one — it is the real thing.
+    return file
+      ? { ...rowFromPayload(file), status: entry.status }
+      : {
+          path: entry.path,
+          status: entry.status,
+          added: 0,
+          deleted: 0,
+          binary: false,
+          oversize: false,
+          content: null,
+        };
+  });
 }
 
 /** A renderable segment of one file's diff: either visible lines or a
@@ -162,18 +281,30 @@ function CollapsedBar({ count, onExpand, label }: { count: number; onExpand: () 
   );
 }
 
-function FileDiff({ file, layout, expanded, onToggle, t }: {
-  file: ReviewFilePayload;
+/** The unavailable-content notice a row shows instead of a diff, or null when
+ * the row does have content. Kept in one place so the continuous and single
+ * views cannot drift into disagreeing about why a file has no diff. */
+export function unavailableKey(row: ReviewFileRow, loading: boolean): string | null {
+  if (row.binary) return "ReviewPanel.binaryFile";
+  if (row.oversize) return "ReviewPanel.oversizeFile";
+  if (row.content === null) return loading ? "ReviewPanel.loadingFile" : "ReviewPanel.notLoadedFile";
+  return null;
+}
+
+function FileDiff({ row, layout, expanded, loading, onToggle, t }: {
+  row: ReviewFileRow;
   layout: DiffLayout;
   expanded: boolean;
+  loading: boolean;
   onToggle: () => void;
   t: (key: string, vars?: Record<string, string | number>) => string;
 }) {
   const [expandedRuns, setExpandedRuns] = useState<Set<number>>(new Set());
   const segments = useMemo(
-    () => (file.binary ? [] : segmentDiff(computeDiff(file.old_content, file.new_content))),
-    [file],
+    () => (row.content === null ? [] : segmentDiff(computeDiff(row.content.old, row.content.new))),
+    [row.content],
   );
+  const unavailable = unavailableKey(row, loading);
 
   return (
     <section className="border-b border-border">
@@ -184,14 +315,14 @@ function FileDiff({ file, layout, expanded, onToggle, t }: {
       >
         {expanded ? <ChevronDown size={13} className="shrink-0 text-faint" /> : <ChevronRight size={13} className="shrink-0 text-faint" />}
         <FileText size={13} className="shrink-0 text-faint" />
-        <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">{file.path}</span>
-        <span className="shrink-0 font-mono text-[11px] text-success">+{file.added}</span>
-        <span className="shrink-0 font-mono text-[11px] text-danger">-{file.deleted}</span>
+        <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">{row.path}</span>
+        <span className="shrink-0 font-mono text-[11px] text-success">+{row.added}</span>
+        <span className="shrink-0 font-mono text-[11px] text-danger">-{row.deleted}</span>
       </button>
 
       {expanded && (
-        file.binary ? (
-          <p className="px-4 py-3 text-xs text-faint">{t("ReviewPanel.binaryFile")}</p>
+        unavailable !== null ? (
+          <p className="px-4 py-3 text-xs text-faint">{t(unavailable)}</p>
         ) : (
           <div className="font-mono text-xs leading-relaxed">
             {segments.map((segment, segmentIndex) => {
@@ -235,25 +366,45 @@ function FileDiff({ file, layout, expanded, onToggle, t }: {
 }
 
 /**
- * Branch-review surface for the right sidebar's "Review" tab: full diff of
- * the working tree against the branch's merge-base with its upstream (or
- * against HEAD in "working" mode), with per-file collapse, collapsible
- * unmodified runs, unified/split layouts, a filterable file list, and a
- * compare-URL "Create PR" hand-off. Read-only over `git_review`.
+ * Branch-review surface for the right sidebar's "Review" and "Diff" tabs: full
+ * diff of the working tree against the branch's merge-base with its upstream
+ * (or against HEAD in "working" mode), with per-file collapse, collapsible
+ * unmodified runs, unified/split layouts, a filterable file list, criteria
+ * coverage, and a compare-URL "Create PR" hand-off.
+ *
+ * Two view modes, because this panel absorbed the former standalone Diff
+ * panel rather than replacing it: `continuous` stacks every file's diff in one
+ * scroll, `single` shows one file at a time through `DiffViewer`. The `diff`
+ * tab opens with `view="single"` and the `review` tab with `continuous`; either
+ * can be switched from the toolbar, and both tabs keep their own shortcut.
+ *
+ * Reads `git_review`, plus — in `working` mode only — the uncapped
+ * `git_changed_files` for the complete file list and `git_file_diff` for
+ * content past `git_review`'s 300-file cap. All three are read-only.
  */
-export function ReviewPanel({ onClose }: { onClose?: () => void }) {
+export function ReviewPanel({ onClose, view: initialView = "continuous" }: {
+  onClose?: () => void;
+  view?: ReviewView;
+}) {
   const { t } = useT();
   const [review, setReview] = useState<ReviewPayload | null>(null);
+  const [rows, setRows] = useState<ReviewFileRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [base, setBase] = useState<ReviewBase>("branch");
   const [baseMenuOpen, setBaseMenuOpen] = useState(false);
   const [layout, setLayoutState] = useState<DiffLayout>(readInitialLayout);
+  const [view, setView] = useState<ReviewView>(initialView);
   const [filesPaneOpen, setFilesPaneOpen] = useState(true);
   const [filter, setFilter] = useState("");
   const [allExpanded, setAllExpanded] = useState(true);
   /** Per-file overrides on top of `allExpanded` — cleared when it flips. */
   const [expandOverrides, setExpandOverrides] = useState<Record<string, boolean>>({});
+  /** Selected path in `single` view. */
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  /** Paths with a `git_file_diff` fetch in flight, so a row can say "loading"
+   * rather than "not loaded" and a second open cannot double-fetch. */
+  const [fetching, setFetching] = useState<Record<string, boolean>>({});
   const fileRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   const setLayout = useCallback((value: DiffLayout) => {
@@ -281,6 +432,17 @@ export function ReviewPanel({ onClose }: { onClose?: () => void }) {
     try {
       const payload = await invoke<ReviewPayload>("git_review", { mode: nextBase });
       setReview(payload);
+      setFetching({});
+
+      // `git status --porcelain` is HEAD-relative, which is exactly what
+      // "working" means here — so it can supply the complete list `git_review`
+      // caps, and its real status letters. It is meaningless in "branch" mode:
+      // a file committed on the branch is clean in the worktree and would be
+      // missing from porcelain entirely.
+      const changed = nextBase === "working"
+        ? await invoke<GitChangedFile[]>("git_changed_files")
+        : null;
+      setRows(buildRows(payload.files, changed));
     } catch (invokeError) {
       setError(String(invokeError));
     } finally {
@@ -292,17 +454,68 @@ export function ReviewPanel({ onClose }: { onClose?: () => void }) {
     void refresh(base);
   }, [base, refresh]);
 
-  const files = review?.files ?? [];
-  const filteredFiles = useMemo(() => {
+  /** Fills one row's content from `git_file_diff`. Only reachable in `working`
+   * mode, where HEAD-vs-disk is the right base. */
+  const loadRow = useCallback((path: string) => {
+    setFetching((current) => {
+      if (current[path]) return current;
+      void invoke<GitFileDiff>("git_file_diff", { path })
+        .then((diff) => {
+          setRows((currentRows) => currentRows.map((row) => (
+            row.path === path
+              ? {
+                  ...row,
+                  binary: diff.binary,
+                  oversize: diff.oversize,
+                  content: diff.binary || diff.oversize ? null : { old: diff.original, new: diff.current },
+                }
+              : row
+          )));
+        })
+        .catch((fetchError) => setError(String(fetchError)))
+        .finally(() => setFetching((inFlight) => {
+          const next = { ...inFlight };
+          delete next[path];
+          return next;
+        }));
+      return { ...current, [path]: true };
+    });
+  }, []);
+
+  const filteredRows = useMemo(() => {
     const needle = filter.trim().toLocaleLowerCase();
-    if (!needle) return files;
-    return files.filter((file) => file.path.toLocaleLowerCase().includes(needle));
-  }, [files, filter]);
+    if (!needle) return rows;
+    return rows.filter((row) => row.path.toLocaleLowerCase().includes(needle));
+  }, [rows, filter]);
 
   const isExpanded = useCallback(
     (path: string) => expandOverrides[path] ?? allExpanded,
     [allExpanded, expandOverrides],
   );
+
+  // Any row that is on screen and still unfetched gets fetched: every visible
+  // row in `continuous`, the selected one in `single`.
+  useEffect(() => {
+    if (base !== "working") return;
+    const wanted = view === "single"
+      ? filteredRows.filter((row) => row.path === selectedPath)
+      : filteredRows.filter((row) => isExpanded(row.path));
+    for (const row of wanted) {
+      if (row.content === null && !row.binary && !row.oversize) loadRow(row.path);
+    }
+  }, [base, view, filteredRows, selectedPath, isExpanded, loadRow]);
+
+  // Keep a selection in `single` view: the current one while it still exists,
+  // otherwise the first row, so the pane opens straight onto a diff.
+  useEffect(() => {
+    if (view !== "single") return;
+    setSelectedPath((current) =>
+      current !== null && filteredRows.some((row) => row.path === current)
+        ? current
+        : (filteredRows[0]?.path ?? null),
+    );
+  }, [view, filteredRows]);
+
   const toggleFile = useCallback((path: string) => {
     setExpandOverrides((current) => ({ ...current, [path]: !(current[path] ?? allExpanded) }));
   }, [allExpanded]);
@@ -311,7 +524,8 @@ export function ReviewPanel({ onClose }: { onClose?: () => void }) {
     setExpandOverrides({});
   }, []);
 
-  const scrollToFile = useCallback((path: string) => {
+  const revealFile = useCallback((path: string) => {
+    setSelectedPath(path);
     setExpandOverrides((current) => ({ ...current, [path]: true }));
     fileRefs.current[path]?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
@@ -319,6 +533,30 @@ export function ReviewPanel({ onClose }: { onClose?: () => void }) {
   const openPr = useCallback(() => {
     if (review?.pr_url) window.open(review.pr_url, "_blank", "noopener,noreferrer");
   }, [review?.pr_url]);
+
+  /** What the coverage pass reads. A row with no fetched content is passed as
+   * `binary` — `reviewCoverage.ts` already treats that as "no content to
+   * cite" and reports it in `uncitableFilePaths`, which is exactly true here
+   * rather than a fudge. */
+  const coverageInput = useMemo<ReviewCoverageInput | null>(() => {
+    if (review === null) return null;
+    return {
+      branch: review.branch,
+      target: review.target,
+      total_added: review.total_added,
+      total_deleted: review.total_deleted,
+      files: rows.map((row) => ({
+        path: row.path,
+        old_content: row.content?.old ?? "",
+        new_content: row.content?.new ?? "",
+        added: row.added,
+        deleted: row.deleted,
+        binary: row.content === null,
+      })),
+    };
+  }, [review, rows]);
+
+  const selectedRow = filteredRows.find((row) => row.path === selectedPath) ?? null;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -374,21 +612,34 @@ export function ReviewPanel({ onClose }: { onClose?: () => void }) {
         <IconButton
           size="sm"
           variant="ghost"
-          onClick={toggleAll}
-          aria-label={t(allExpanded ? "ReviewPanel.collapseAllDiffs" : "ReviewPanel.expandAllDiffs")}
-          title={t(allExpanded ? "ReviewPanel.collapseAllDiffs" : "ReviewPanel.expandAllDiffs")}
+          onClick={() => setView(view === "continuous" ? "single" : "continuous")}
+          aria-label={t(view === "continuous" ? "ReviewPanel.switchToSingle" : "ReviewPanel.switchToContinuous")}
+          title={t(view === "continuous" ? "ReviewPanel.switchToSingle" : "ReviewPanel.switchToContinuous")}
         >
-          {allExpanded ? <FoldVertical size={14} /> : <ListCollapse size={14} />}
+          {view === "continuous" ? <SquareSplitVertical size={14} /> : <StretchVertical size={14} />}
         </IconButton>
-        <IconButton
-          size="sm"
-          variant="ghost"
-          onClick={() => setLayout(layout === "unified" ? "split" : "unified")}
-          aria-label={t(layout === "unified" ? "ReviewPanel.switchToSplit" : "ReviewPanel.switchToUnified")}
-          title={t(layout === "unified" ? "ReviewPanel.switchToSplit" : "ReviewPanel.switchToUnified")}
-        >
-          {layout === "unified" ? <Columns2 size={14} /> : <Rows3 size={14} />}
-        </IconButton>
+        {view === "continuous" && (
+          <IconButton
+            size="sm"
+            variant="ghost"
+            onClick={toggleAll}
+            aria-label={t(allExpanded ? "ReviewPanel.collapseAllDiffs" : "ReviewPanel.expandAllDiffs")}
+            title={t(allExpanded ? "ReviewPanel.collapseAllDiffs" : "ReviewPanel.expandAllDiffs")}
+          >
+            {allExpanded ? <FoldVertical size={14} /> : <ListCollapse size={14} />}
+          </IconButton>
+        )}
+        {view === "continuous" && (
+          <IconButton
+            size="sm"
+            variant="ghost"
+            onClick={() => setLayout(layout === "unified" ? "split" : "unified")}
+            aria-label={t(layout === "unified" ? "ReviewPanel.switchToSplit" : "ReviewPanel.switchToUnified")}
+            title={t(layout === "unified" ? "ReviewPanel.switchToSplit" : "ReviewPanel.switchToUnified")}
+          >
+            {layout === "unified" ? <Columns2 size={14} /> : <Rows3 size={14} />}
+          </IconButton>
+        )}
         {onClose && (
           <IconButton size="sm" variant="ghost" onClick={onClose} aria-label={t("App.closeRightTab")} title={t("App.closeRightTab")}>
             <X size={14} />
@@ -414,21 +665,63 @@ export function ReviewPanel({ onClose }: { onClose?: () => void }) {
         </div>
       )}
 
+      {/* Criteria coverage over the whole change, so it spans both columns. */}
+      <CriteriaCoverageSection review={coverageInput} mode={base} t={t} onRevealPath={revealFile} />
+
       <div className="flex min-h-0 flex-1">
-        {/* Main: per-file diffs. */}
-        <div className="min-h-0 flex-1 overflow-auto [overscroll-behavior:contain]">
+        {/*
+          Main: every file's diff stacked, or just the selected one. Which
+          element scrolls differs by view and is not interchangeable:
+          `DiffViewer` scrolls its own body off a `h-full min-h-0` root, so in
+          `single` view this column must hand it a bounded height and NOT
+          scroll itself — a wrapper with auto height leaves that `h-full` with
+          nothing to resolve against and nothing scrolls at all. In
+          `continuous` view this column is the scroller.
+        */}
+        {/* `min-w-0`: a flex item defaults to `min-width:auto`, so one long
+            unbreakable path or token would refuse to shrink and push the panel
+            past the sidebar's width instead of wrapping inside it. */}
+        <div
+          className={`flex min-h-0 min-w-0 flex-1 flex-col ${
+            view === "single" ? "overflow-hidden" : "overflow-auto [overscroll-behavior:contain]"
+          }`}
+        >
           {review && !review.is_repo ? (
             <p className="p-4 text-sm text-faint">{t("ReviewPanel.notARepo")}</p>
-          ) : filteredFiles.length === 0 ? (
+          ) : filteredRows.length === 0 ? (
             <p className="p-4 text-sm text-faint">{loading ? t("ReviewPanel.loading") : t("ReviewPanel.noChanges")}</p>
+          ) : view === "single" ? (
+            selectedRow === null ? (
+              <p className="p-4 text-sm text-muted">{t("ReviewPanel.selectHint")}</p>
+            ) : (
+              (() => {
+                const unavailable = unavailableKey(selectedRow, Boolean(fetching[selectedRow.path]));
+                return unavailable !== null ? (
+                  <p className="p-4 text-sm text-muted">{t(unavailable)}</p>
+                ) : (
+                  <div className="flex min-h-0 flex-1 flex-col p-3">
+                    <DiffViewer
+                      fileName={selectedRow.path}
+                      oldValue={selectedRow.content?.old ?? ""}
+                      newValue={selectedRow.content?.new ?? ""}
+                      oldTitle={t(base === "branch" ? "ReviewPanel.oldTitleBranch" : "ReviewPanel.oldTitle")}
+                      newTitle={t("ReviewPanel.newTitle")}
+                    />
+                  </div>
+                );
+              })()
+            )
           ) : (
-            filteredFiles.map((file) => (
-              <div key={file.path} ref={(node) => { fileRefs.current[file.path] = node; }}>
+            filteredRows.map((row) => (
+              // `shrink-0`: the column above is a flex container, so without it
+              // a long stack would be compressed to fit instead of scrolling.
+              <div key={row.path} className="shrink-0" ref={(node) => { fileRefs.current[row.path] = node; }}>
                 <FileDiff
-                  file={file}
+                  row={row}
                   layout={layout}
-                  expanded={isExpanded(file.path)}
-                  onToggle={() => toggleFile(file.path)}
+                  expanded={isExpanded(row.path)}
+                  loading={Boolean(fetching[row.path])}
+                  onToggle={() => toggleFile(row.path)}
                   t={t}
                 />
               </div>
@@ -450,24 +743,27 @@ export function ReviewPanel({ onClose }: { onClose?: () => void }) {
               />
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2 [overscroll-behavior:contain]">
-              {filteredFiles.map((file) => {
-                const segments = file.path.split("/");
-                const name = segments.pop() ?? file.path;
+              {filteredRows.map((row) => {
+                const segments = row.path.split("/");
+                const name = segments.pop() ?? row.path;
                 const dir = segments.join("/");
+                const selected = view === "single" && row.path === selectedPath;
                 return (
                   <button
-                    key={file.path}
+                    key={row.path}
                     type="button"
-                    onClick={() => scrollToFile(file.path)}
-                    title={file.path}
-                    className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs hover:bg-surface-2"
+                    onClick={() => revealFile(row.path)}
+                    title={row.path}
+                    aria-current={selected ? "true" : undefined}
+                    className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs ${selected ? "bg-surface-2 text-foreground" : "hover:bg-surface-2"}`}
                   >
-                    <FileText size={12} className="shrink-0 text-faint" />
+                    <span className={`w-3 shrink-0 text-center font-mono font-semibold ${STATUS_CLASSES[row.status] ?? "text-faint"}`}>
+                      {row.status}
+                    </span>
                     <span className="min-w-0 flex-1 truncate">
                       {dir && <span className="text-faint">{dir}/</span>}
                       <span className="text-foreground">{name}</span>
                     </span>
-                    <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-warning" />
                   </button>
                 );
               })}

@@ -10,6 +10,8 @@ export const sandboxLocale: Record<string, string> = {
   "SandboxPanel.allowNetwork": "Allow network access",
   "SandboxPanel.isolation.os_sandboxed": "OS-sandboxed (macOS Seatbelt)",
   "SandboxPanel.isolation.process_only": "Process isolation only (no OS sandbox on this platform)",
+  "SandboxPanel.enforcement.process_only": "No OS sandbox on this platform. The command gets a copied workspace, a restricted working directory and a scrubbed environment, but nothing stops it reading or writing your real files by absolute path. Review the command before running it.",
+  "SandboxPanel.enforcement.unavailable": "This platform sandboxes through /usr/bin/sandbox-exec and it is missing, so the run will fail to start rather than run unconfined.",
   "SandboxPanel.exitCode": "Exit code",
   "SandboxPanel.duration": "Duration",
   "SandboxPanel.timedOut": "Timed out",

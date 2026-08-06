@@ -54,6 +54,15 @@ pub struct SharedLedger {
 }
 
 impl SharedLedger {
+    /// The unified agent process table on this connection.
+    ///
+    /// The daemon reads and writes it through the same typed view the desktop
+    /// and `monkey processes` use, so the state machine has one implementation
+    /// rather than a daemon-shaped copy.
+    pub fn process_table(&self) -> little_monkey_lib::process_table::ProcessTable<'_> {
+        little_monkey_lib::process_table::ProcessTable::new(&self.connection)
+    }
+
     pub fn open(path: &Path) -> Result<Self, String> {
         RunLedger::open(path).map_err(|error| error.to_string())?;
         let connection = Connection::open(path).map_err(|error| error.to_string())?;

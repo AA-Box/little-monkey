@@ -46,12 +46,21 @@ const DEFAULT_TONES: Record<string, PillTone> = {
   waiting_for_permission: "warning",
   cancelling: "warning",
   retrying: "warning",
+  // A suspend is latched but the loop has not reached its safe point yet, so
+  // the process is still running — see `processTable.ts`'s
+  // `processDisplayState`. Warning rather than neutral precisely because it is
+  // NOT paused yet; `paused`/`suspended` below are the inert, arrived states.
+  pause_pending: "warning",
+  stopping: "warning",
 
   // Inert.
   queued: "neutral",
   idle: "neutral",
   draft: "neutral",
   paused: "neutral",
+  suspended: "neutral",
+  admitted: "neutral",
+  exited: "neutral",
   cancelled: "neutral",
   canceled: "neutral",
   skipped: "neutral",

@@ -1,7 +1,7 @@
 {
   "name": "little-monkey",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.2.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -20,7 +20,11 @@
     "test:rust": "pnpm stage:cli:placeholder && cargo test --manifest-path src-tauri/Cargo.toml",
     "i18n:lint": "vitest run src/lib/i18n/keyLint.test.ts",
     "stage:runtime": "node scripts/stage-managed-runtime.mjs",
+    "stage:runtime:tts": "node scripts/stage-managed-runtime.mjs llama-tts",
+    "stage:runtime:sd": "node scripts/stage-managed-runtime.mjs sd",
     "codesign:runtime": "node scripts/codesign-managed-runtime.mjs",
+    "codesign:runtime:tts": "node scripts/codesign-managed-runtime.mjs llama-tts",
+    "codesign:runtime:sd": "node scripts/codesign-managed-runtime.mjs sd",
     "stage:cli": "node scripts/stage-cli-sidecar.mjs",
     "stage:cli:placeholder": "node scripts/ensure-cli-sidecar-placeholder.mjs",
     "icon:mac-liquid": "tauri-liquid-icon --icon ./src-tauri/icons/AppIcon.icon --name AppIcon --output ./src-tauri/resources --tauri-dir ./src-tauri"
@@ -30,6 +34,8 @@
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-fs": "^2.5.1",
     "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "lucide-react": "^1.23.0",
