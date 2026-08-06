@@ -134,12 +134,17 @@ try {
   }
   writeFileSync(archivePath, bytes);
 
-  // bsdtar is present on GitHub's macOS/Linux/Windows images and on supported
-  // local developer platforms. Passing each argument separately avoids a
-  // shell and keeps archive paths inert.
-  execFileSync("tar", ["-xf", archivePath, "-C", extractRoot], {
-    stdio: "inherit",
-  });
+  // Only Windows and macOS ship `tar` as bsdtar, which reads zip archives too.
+  // Linux `tar` is GNU tar and cannot ("This does not look like a tar
+  // archive"), so zips go through unzip everywhere except Windows, whose
+  // images have no unzip. Passing each argument separately avoids a shell and
+  // keeps archive paths inert.
+  const [extractCommand, extractArgs] =
+    extname(archivePath).toLowerCase() === ".zip" &&
+    process.platform !== "win32"
+      ? ["unzip", ["-q", archivePath, "-d", extractRoot]]
+      : ["tar", ["-xf", archivePath, "-C", extractRoot]];
+  execFileSync(extractCommand, extractArgs, { stdio: "inherit" });
 
   const candidates = [];
   const walk = (directory) => {
