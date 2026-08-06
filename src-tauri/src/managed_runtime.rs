@@ -519,17 +519,29 @@ pub fn find_managed_server(
 /// process still goes through [`find_managed_server`] and pays for the full
 /// verification there.
 pub fn managed_server_present(spec: &ManagedRuntimeSpec, app_data_dir: Option<&Path>) -> bool {
-    if explicit_runtime_override(spec).is_some_and(|path| path.is_file()) {
-        return true;
+    managed_server_path_unverified(spec, app_data_dir).is_some()
+}
+
+/// Where [`managed_server_present`] found the binary. Same unverified answer,
+/// with the path — for callers that need to ask the binary itself something
+/// (see `generation_commands::engine_starts`) without paying for a full tree
+/// hash or materializing the bundle.
+pub fn managed_server_path_unverified(
+    spec: &ManagedRuntimeSpec,
+    app_data_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(path) = explicit_runtime_override(spec).filter(|path| path.is_file()) {
+        return Some(path);
     }
-    let installed = app_data_dir.is_some_and(|root| {
-        managed_runtime_dir_for(spec, root)
-            .join(spec.executable())
-            .is_file()
-    });
-    installed
-        || bundled_runtime_near_current_exe(spec)
-            .is_some_and(|directory| directory.join(spec.executable()).is_file())
+    let installed = app_data_dir
+        .map(|root| managed_runtime_dir_for(spec, root).join(spec.executable()))
+        .filter(|path| path.is_file());
+    if installed.is_some() {
+        return installed;
+    }
+    bundled_runtime_near_current_exe(spec)
+        .map(|directory| directory.join(spec.executable()))
+        .filter(|path| path.is_file())
 }
 
 pub fn find_managed_llama_server(app_data_dir: Option<&Path>) -> Option<PathBuf> {
