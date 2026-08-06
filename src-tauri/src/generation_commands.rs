@@ -33,6 +33,10 @@ const ACCEPTED_LICENSES_FILE: &str = "studio-accepted-licenses.json";
 /// The user's LoRA library. Separate from the model registry because a LoRA is
 /// not a model: it fills no slot, launches no engine, and is chosen per run.
 const LORAS_FILE: &str = "studio-loras.json";
+/// The user's loose weight files — CLIPs, text encoders, VAEs. Separate from
+/// the model registry because a model entry must be a whole model, and these
+/// are shared between them.
+const PARTS_FILE: &str = "studio-parts.json";
 /// Keeps a corrupt or hand-edited gallery from being read without bound.
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 /// A long clip on a constrained machine can legitimately sample for a long
@@ -428,6 +432,45 @@ pub fn generation_add_lora(
     Ok(loras)
 }
 
+/// The user's loose parts: CLIPs, text encoders, VAEs.
+#[tauri::command]
+pub fn generation_parts(app: AppHandle) -> Result<Vec<generation::PartAsset>, String> {
+    read_state(&app, PARTS_FILE)
+}
+
+/// Adds a part, keyed on its path so re-adding the same file corrects it
+/// rather than listing it twice.
+#[tauri::command]
+pub fn generation_add_part(
+    app: AppHandle,
+    asset: generation::PartAsset,
+) -> Result<Vec<generation::PartAsset>, String> {
+    generation::validate_part_asset(&asset)?;
+    if !PathBuf::from(&asset.path).is_file() {
+        return Err(format!("{} is not a file on this machine", asset.path));
+    }
+    let mut parts: Vec<generation::PartAsset> = read_state(&app, PARTS_FILE)?;
+    match parts.iter_mut().find(|entry| entry.path == asset.path) {
+        Some(existing) => *existing = asset,
+        None => parts.push(asset),
+    }
+    parts.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    write_state(&app, PARTS_FILE, &parts)?;
+    Ok(parts)
+}
+
+/// Forgets a part. The file itself is the user's and stays where it is.
+#[tauri::command]
+pub fn generation_remove_part(
+    app: AppHandle,
+    path: String,
+) -> Result<Vec<generation::PartAsset>, String> {
+    let mut parts: Vec<generation::PartAsset> = read_state(&app, PARTS_FILE)?;
+    parts.retain(|entry| entry.path != path);
+    write_state(&app, PARTS_FILE, &parts)?;
+    Ok(parts)
+}
+
 /// Forgets a LoRA. The file itself is the user's and stays where it is.
 #[tauri::command]
 pub fn generation_remove_lora(
@@ -560,9 +603,8 @@ pub async fn generation_run(
     // arguments, so switching one mid-session relaunches on its own.
     let spec = generation::apply_component_overrides(
         &spec,
-        &registry(&app)?,
+        &read_state::<Vec<generation::PartAsset>>(&app, PARTS_FILE)?,
         &request.component_overrides,
-        &model_root(&app)?,
     )?;
 
     let media = if request.task.is_speech() {

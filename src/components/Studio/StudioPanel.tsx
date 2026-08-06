@@ -44,8 +44,11 @@ import {
   type LoraAsset,
   type LoraSelection,
   type ModelComponent,
-  partsForSlot,
+  choosableSlots,
+  COMPONENT_SLOTS,
   type ComponentOverride,
+  type ComponentSlot,
+  type PartAsset,
 } from "../../lib/studioClient";
 
 /** The canvas and sampling controls for one run. Seeded from the model but
@@ -215,8 +218,9 @@ export function StudioPanel() {
   const [language, setLanguage] = useState("");
   const [loras, setLoras] = useState<LoraSelection[]>([]);
   const [loraLibrary, setLoraLibrary] = useState<LoraAsset[]>([]);
-  /** Which library model's file fills a slot for this run. Empty means the
-   *  selected model's own, which is almost always the answer. */
+  const [parts, setParts] = useState<PartAsset[]>([]);
+  /** Which library part fills a slot for this run. A slot with no entry is
+   *  left as the model has it — its own file, or nothing. */
   const [overrides, setOverrides] = useState<ComponentOverride[]>([]);
   /** A model's parts, being edited in the Models tab. Keyed by model id so an
    *  edit survives the list re-rendering around it. */
@@ -268,34 +272,33 @@ export function StudioPanel() {
   const shown = shownGallery[0] ?? null;
   const shownHistory = shownGallery.slice(1);
 
-  // Slots this model loads that the library can fill more than one way. One
-  // option means there is nothing to choose, so it never reaches the rail.
-  const swappable = useMemo(() => {
-    if (!selected) return [];
-    return selected.components
-      .map((component) => {
-        const others = partsForSlot(models, component.slot).filter(
-          (entry) => entry.model.id !== selected.id,
-        );
-        // The model's own file leads the list whether or not it is installed,
-        // so the control always has the value it is showing.
-        return { slot: component.slot, options: [{ model: selected, component }, ...others] };
-      })
-      .filter((entry) => entry.options.length > 1);
-  }, [selected, models]);
+  // One chooser per slot the library has a part for. Not per slot the *model*
+  // has: a checkpoint that needs a separate VAE does not name one, so keying
+  // off the model is exactly the case that offers nothing.
+  const choosable = useMemo(
+    () =>
+      choosableSlots(parts).map((slot) => ({
+        slot,
+        options: parts.filter((part) => part.slot === slot),
+        own: selected?.components.find((component) => component.slot === slot) ?? null,
+      })),
+    [parts, selected],
+  );
 
   const refresh = useCallback(async () => {
     try {
-      const [engine, list, entries, assets] = await Promise.all([
+      const [engine, list, entries, assets, loose] = await Promise.all([
         studioClient.engineStatus(),
         studioClient.models(),
         studioClient.gallery(),
         studioClient.loras(),
+        studioClient.parts(),
       ]);
       setStatus(engine);
       setModels(list);
       setGallery([...entries].reverse());
       setLoraLibrary(assets);
+      setParts(loose);
       const usable = list.filter((model) =>
         mode === "models" || model.tasks.some((entry) => tasksFor(mode).includes(entry)),
       );
@@ -397,6 +400,27 @@ export function StudioPanel() {
       setError(errorText(reason));
     } finally {
       setDownloadingId(null);
+    }
+  };
+
+  /** Adds a loose part from a file picker. Its slot is read off the file name
+   *  and stays editable in the list — that guess is the one that matters, and
+   *  a wrong one fails inside the engine rather than here. */
+  const addPart = async () => {
+    setError(null);
+    const picked = await open({ multiple: false, directory: false });
+    if (typeof picked !== "string") return;
+    const hint = describeWeightFile(picked);
+    try {
+      setParts(
+        await studioClient.addPart({
+          slot: hint.slot ?? "vae",
+          name: hint.name || (picked.split(/[/\\]/).pop() ?? picked),
+          path: picked,
+        }),
+      );
+    } catch (reason) {
+      setError(errorText(reason));
     }
   };
 
@@ -806,6 +830,67 @@ export function StudioPanel() {
               </div>
             );
           })}
+        </div>
+
+        {/* The loose files: CLIPs, text encoders, VAEs. A model entry has to
+            be a whole model, so the pieces shared between models are added
+            here and chosen per generation. */}
+        <div className="mt-6">
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="text-xs font-medium text-muted">{t("Studio.partsLibrary")}</h2>
+            <Button size="sm" variant="secondary" onClick={() => void addPart()}>
+              <Plus size={13} />
+              {t("Studio.partsAdd")}
+            </Button>
+          </div>
+          {parts.length === 0 ? (
+            <p className="text-xs text-faint">{t("Studio.partsLibraryEmpty")}</p>
+          ) : (
+            <div className="grid gap-1.5">
+              {parts.map((part) => (
+                <div
+                  key={part.path}
+                  className="flex items-center gap-2 rounded border border-border p-2"
+                >
+                  {/* The slot stays editable: it is read off the file name,
+                      and a wrong one fails inside the engine rather than here. */}
+                  <select
+                    className="shrink-0 rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground"
+                    aria-label={t("Studio.add.slot")}
+                    value={part.slot}
+                    onChange={(event) =>
+                      void studioClient
+                        .addPart({ ...part, slot: event.target.value as ComponentSlot })
+                        .then(setParts)
+                        .catch((reason) => setError(errorText(reason)))
+                    }
+                  >
+                    {COMPONENT_SLOTS.map((entry) => (
+                      <option key={entry.slot} value={entry.slot}>
+                        {t(`Studio.slot.${entry.slot}`)}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-xs">{part.name}</span>
+                    <span className="block truncate text-[11px] text-faint">{part.path}</span>
+                  </span>
+                  <IconButton
+                    size="sm"
+                    aria-label={t("Studio.partsForget")}
+                    onClick={() =>
+                      void studioClient
+                        .removePart(part.path)
+                        .then(setParts)
+                        .catch((reason) => setError(errorText(reason)))
+                    }
+                  >
+                    <Trash2 size={12} />
+                  </IconButton>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* LoRAs are a library of their own: they fill no slot, launch no
@@ -1268,32 +1353,35 @@ export function StudioPanel() {
               setting — so this offers the alternatives the library holds and
               nothing else. Hidden entirely when there are none, because a
               column of fixed dropdowns is just noise. */}
-          {swappable.length > 0 && (
-            <details className="rounded border border-border p-3">
+          {choosable.length > 0 && (
+            <details open className="rounded border border-border p-3">
               <summary className="cursor-pointer text-xs font-medium">
                 {t("Studio.parts")}
               </summary>
               <div className="mt-3 grid gap-2 [&>*]:min-w-0">
                 <p className="text-[11px] text-faint">{t("Studio.partsHint")}</p>
-                {swappable.map(({ slot, options }) => (
+                {choosable.map(({ slot, options, own }) => (
                   <label key={slot} className="grid gap-1 text-[11px] text-muted">
                     {t(`Studio.slot.${slot}`)}
                     <select
                       className="min-w-0 rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground"
-                      value={overrides.find((entry) => entry.slot === slot)?.modelId ?? selected.id}
+                      value={overrides.find((entry) => entry.slot === slot)?.path ?? ""}
                       onChange={(event) =>
                         setOverrides((current) => [
                           ...current.filter((entry) => entry.slot !== slot),
-                          ...(event.target.value === selected.id
-                            ? []
-                            : [{ slot, modelId: event.target.value }]),
+                          ...(event.target.value ? [{ slot, path: event.target.value }] : []),
                         ])
                       }
                     >
-                      {options.map(({ model, component }) => (
-                        <option key={model.id} value={model.id}>
-                          {componentFileName(component)}
-                          {model.id === selected.id ? ` (${t("Studio.parts.own")})` : ""}
+                      {/* Empty is "leave the model alone" — which means its own
+                          file when it has one, and nothing when it does not. */}
+                      <option value="">
+                        {own ? componentFileName(own) : t("Studio.parts.none")}
+                        {own ? ` (${t("Studio.parts.own")})` : ""}
+                      </option>
+                      {options.map((part) => (
+                        <option key={part.path} value={part.path}>
+                          {part.name}
                         </option>
                       ))}
                     </select>

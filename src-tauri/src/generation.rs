@@ -693,61 +693,87 @@ pub struct GenerationRequest {
     pub component_overrides: Vec<ComponentOverride>,
 }
 
-/// One per-run swap: fill `slot` with the file another library model uses for
-/// the same slot.
+/// A loose weight file in the user's library: a CLIP, a text encoder, a VAE.
 ///
-/// A model id rather than a path on purpose. The caller is the UI, and letting
-/// it name an arbitrary absolute path would make every generation request a
-/// way to hand the engine any file on the machine. Naming a library entry
-/// keeps the set of loadable files exactly the set the user added.
+/// A model entry has to be a whole model — exactly one checkpoint or diffusion
+/// model, see [`validate_model_spec`] — so the encoders and VAEs that are used
+/// *across* models cannot live there. This is where they live: added once, and
+/// picked per generation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartAsset {
+    pub slot: ComponentSlot,
+    pub name: String,
+    pub path: String,
+}
+
+pub fn validate_part_asset(asset: &PartAsset) -> Result<(), String> {
+    if asset.name.trim().is_empty() || asset.name.len() > 200 {
+        return Err("A part needs a name".to_string());
+    }
+    if !Path::new(&asset.path).is_absolute() {
+        return Err("A part needs an absolute path".to_string());
+    }
+    Ok(())
+}
+
+/// One per-run choice: fill `slot` with this file from the parts library.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComponentOverride {
     pub slot: ComponentSlot,
-    pub model_id: String,
+    pub path: String,
 }
 
-/// Rewrites `spec` so each override's slot is filled by the donor model's file.
+/// Rewrites `spec` to load the parts chosen for this run.
 ///
-/// The donor's file is resolved to an absolute path first: a component carries
-/// no model id of its own, so one copied between entries unchanged would be
-/// looked up under the *borrowing* model's directory and not be there.
+/// A chosen part replaces the model's own file for that slot, or is added when
+/// the model has no file for it — which is the common case, since a checkpoint
+/// that needs a separate VAE does not name one.
 ///
-/// Only a slot the model already loads can be swapped. Adding one it does not
-/// have is a different model, not a setting, and belongs in the library rather
-/// than in a run.
+/// Every path is checked against the library rather than trusted. The caller is
+/// the UI, and accepting an arbitrary absolute path would turn every generation
+/// request into a way to hand the engine any file on the machine; checking it
+/// keeps the loadable set exactly the set the user added.
 pub fn apply_component_overrides(
     spec: &GenerationModelSpec,
-    donors: &[GenerationModelSpec],
+    parts: &[PartAsset],
     overrides: &[ComponentOverride],
-    model_root: &Path,
 ) -> Result<GenerationModelSpec, String> {
     let mut effective = spec.clone();
-    for swap in overrides {
-        if swap.model_id == spec.id {
-            continue;
+    for choice in overrides {
+        let part = parts
+            .iter()
+            .find(|entry| entry.slot == choice.slot && entry.path == choice.path)
+            .ok_or_else(|| {
+                format!("{} is not a {} in your library", choice.path, choice.slot.flag())
+            })?;
+        // A denoiser is what the model *is*; replacing it from a per-run
+        // dropdown would silently make this a different model.
+        if matches!(
+            part.slot,
+            ComponentSlot::Checkpoint | ComponentSlot::DiffusionModel
+        ) {
+            return Err("The checkpoint is chosen with the model, not per run".to_string());
         }
-        let donor = donors
-            .iter()
-            .find(|entry| entry.id == swap.model_id)
-            .ok_or_else(|| format!("{} is not in your library", swap.model_id))?;
-        let source = donor
-            .components
-            .iter()
-            .find(|component| component.slot == swap.slot)
-            .ok_or_else(|| format!("{} has no {}", donor.name, swap.slot.flag()))?;
-        let target = effective
+        let source = ComponentSource::LocalFile {
+            path: part.path.clone(),
+        };
+        match effective
             .components
             .iter_mut()
-            .find(|component| component.slot == swap.slot)
-            .ok_or_else(|| format!("{} does not load a {}", spec.name, swap.slot.flag()))?;
-        target.source = ComponentSource::LocalFile {
-            path: source
-                .resolved_path(model_root, &donor.id)
-                .to_string_lossy()
-                .to_string(),
-        };
-        target.size_bytes = source.size_bytes;
+            .find(|component| component.slot == part.slot)
+        {
+            Some(existing) => {
+                existing.source = source;
+                existing.size_bytes = 0;
+            }
+            None => effective.components.push(ModelComponent {
+                slot: part.slot,
+                source,
+                size_bytes: 0,
+            }),
+        }
     }
     Ok(effective)
 }
@@ -1760,52 +1786,80 @@ mod tests {
         );
     }
 
-    /// Swapping a VAE is a setting; the file it points at still has to resolve
-    /// under the model that owns it, or the engine is handed a path to a file
-    /// that was never there.
+    /// A checkpoint that needs a separate VAE does not name one, so the common
+    /// case is adding a slot the model never had — not swapping one it did.
     #[test]
-    fn a_borrowed_part_resolves_under_the_model_it_came_from() {
+    fn a_chosen_part_is_added_or_swapped_and_never_invented() {
         let root = Path::new("/models");
-        let mut mine = video_model();
-        mine.components = vec![
+        let mut spec = video_model();
+        spec.components = vec![
             ModelComponent::huggingface(ComponentSlot::DiffusionModel, "r", "unet.gguf", 1),
-            ModelComponent::huggingface(ComponentSlot::Vae, "r", "mine.safetensors", 1),
+            ModelComponent::huggingface(ComponentSlot::Vae, "r", "own.safetensors", 1),
         ];
-        let mut theirs = video_model();
-        theirs.id = "other-model".to_string();
-        theirs.name = "Other".to_string();
-        theirs.components = vec![
-            ModelComponent::huggingface(ComponentSlot::DiffusionModel, "r", "unet.gguf", 1),
-            ModelComponent::huggingface(ComponentSlot::Vae, "r", "theirs.safetensors", 7),
+        let parts = vec![
+            PartAsset {
+                slot: ComponentSlot::Vae,
+                name: "Better VAE".to_string(),
+                path: "/Users/somebody/parts/better_vae.safetensors".to_string(),
+            },
+            PartAsset {
+                slot: ComponentSlot::T5xxl,
+                name: "umt5".to_string(),
+                path: "/Users/somebody/parts/umt5.safetensors".to_string(),
+            },
         ];
-        let donors = vec![mine.clone(), theirs.clone()];
 
-        let swap = vec![ComponentOverride {
-            slot: ComponentSlot::Vae,
-            model_id: "other-model".to_string(),
-        }];
-        let effective = apply_component_overrides(&mine, &donors, &swap, root).expect("swap");
+        let chosen = vec![
+            ComponentOverride {
+                slot: ComponentSlot::Vae,
+                path: parts[0].path.clone(),
+            },
+            ComponentOverride {
+                slot: ComponentSlot::T5xxl,
+                path: parts[1].path.clone(),
+            },
+        ];
+        let effective = apply_component_overrides(&spec, &parts, &chosen).expect("chosen");
         let args = launch_args(&effective, root, 8092);
-        let at = args.iter().position(|arg| arg == "--vae").expect("--vae");
-        // Under the donor's directory, not the borrower's.
-        assert_eq!(args[at + 1], "/models/other-model/theirs.safetensors");
+        let vae = args.iter().position(|arg| arg == "--vae").expect("--vae");
+        assert_eq!(args[vae + 1], parts[0].path);
+        // Swapped, not duplicated.
         assert_eq!(args.iter().filter(|arg| *arg == "--vae").count(), 1);
-        // Everything else is untouched.
+        // The model had no text encoder at all; choosing one adds it.
+        let t5 = args.iter().position(|arg| arg == "--t5xxl").expect("--t5xxl");
+        assert_eq!(args[t5 + 1], parts[1].path);
         let unet = args.iter().position(|arg| arg == "--diffusion-model").unwrap();
         assert_eq!(args[unet + 1], "/models/wan-mine/unet.gguf");
 
-        // A slot this model does not load is a different model, not a setting.
-        let absent = vec![ComponentOverride {
-            slot: ComponentSlot::ClipL,
-            model_id: "other-model".to_string(),
-        }];
-        assert!(apply_component_overrides(&mine, &donors, &absent, root).is_err());
-
-        let unknown = vec![ComponentOverride {
+        // A path the library does not hold is not loadable, whatever the UI says.
+        let forged = vec![ComponentOverride {
             slot: ComponentSlot::Vae,
-            model_id: "not-in-the-library".to_string(),
+            path: "/etc/passwd".to_string(),
         }];
-        assert!(apply_component_overrides(&mine, &donors, &unknown, root).is_err());
+        assert!(apply_component_overrides(&spec, &parts, &forged).is_err());
+
+        // Nor is a real part offered under the wrong slot.
+        let mismatched = vec![ComponentOverride {
+            slot: ComponentSlot::ClipL,
+            path: parts[0].path.clone(),
+        }];
+        assert!(apply_component_overrides(&spec, &parts, &mismatched).is_err());
+
+        // The denoiser is what the model is, and is not a per-run dropdown.
+        let denoiser = vec![PartAsset {
+            slot: ComponentSlot::Checkpoint,
+            name: "Another model".to_string(),
+            path: "/Users/somebody/parts/other.safetensors".to_string(),
+        }];
+        assert!(apply_component_overrides(
+            &spec,
+            &denoiser,
+            &[ComponentOverride {
+                slot: ComponentSlot::Checkpoint,
+                path: denoiser[0].path.clone(),
+            }],
+        )
+        .is_err());
     }
 
     #[test]

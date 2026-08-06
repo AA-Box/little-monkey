@@ -71,9 +71,15 @@ export const studioLocale: Record<string, string> = {
   "Studio.lora.forget": "Remove from library",
   "Studio.parts": "Model parts",
   "Studio.partsHint":
-    "Use another model's file for one of these. Files are added in the Models tab — this only picks between the ones already there.",
-  "Studio.parts.own": "this model's",
+    "Pick which CLIP, text encoder or VAE this run loads. Add them in the Models tab; this only chooses between them.",
+  "Studio.parts.own": "the model's own",
+  "Studio.parts.none": "None",
   "Studio.partsSave": "Save",
+  "Studio.partsLibrary": "CLIPs, text encoders & VAEs",
+  "Studio.partsAdd": "Add a part",
+  "Studio.partsForget": "Remove from library",
+  "Studio.partsLibraryEmpty":
+    "None yet. A checkpoint that needs a separate VAE or text encoder does not name one — add the file here and pick it when you generate.",
   "Studio.slot.checkpoint": "Checkpoint",
   "Studio.slot.diffusion_model": "Diffusion model",
   "Studio.slot.high_noise_diffusion_model": "Diffusion model, high noise",

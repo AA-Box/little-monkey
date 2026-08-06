@@ -152,24 +152,28 @@ export interface HiresSettings {
   upscaler: string;
 }
 
-/** One per-run swap: fill `slot` with the file `modelId` uses for it. A model
- *  id rather than a path, so a run can only ever load a file already in the
- *  library. */
-export interface ComponentOverride {
+/** A loose weight file in the library — a CLIP, a text encoder, a VAE. A model
+ *  entry has to be a whole model, so the pieces shared between models live
+ *  here instead: added once in the Models tab, picked per generation. */
+export interface PartAsset {
   slot: ComponentSlot;
-  modelId: string;
+  name: string;
+  path: string;
 }
 
-/** Every library model that could fill `slot`, for the generation page's
- *  chooser. Files are added in the Models tab; here they are only picked. */
-export function partsForSlot(
-  models: GenerationModel[],
-  slot: ComponentSlot,
-): { model: GenerationModel; component: ModelComponent }[] {
-  return models.flatMap((model) => {
-    const component = model.components.find((entry) => entry.slot === slot);
-    return component && model.installed ? [{ model, component }] : [];
-  });
+/** One per-run choice: fill `slot` with this library part. */
+export interface ComponentOverride {
+  slot: ComponentSlot;
+  path: string;
+}
+
+/** The slots the generation page offers a chooser for: everything the library
+ *  has a part for. A denoiser is what the model *is*, so it is never one. */
+export function choosableSlots(parts: PartAsset[]): ComponentSlot[] {
+  const fixed: ComponentSlot[] = ["checkpoint", "diffusion_model"];
+  return [...new Set(parts.map((part) => part.slot))].filter(
+    (slot) => !fixed.includes(slot),
+  );
 }
 
 export interface GenerationRequest {
@@ -228,6 +232,9 @@ export const studioClient = {
     invoke<void>("generation_download_model", { modelId }),
   cancelDownload: (modelId: string) =>
     invoke<boolean>("generation_cancel_download", { modelId }),
+  parts: () => invoke<PartAsset[]>("generation_parts"),
+  addPart: (asset: PartAsset) => invoke<PartAsset[]>("generation_add_part", { asset }),
+  removePart: (path: string) => invoke<PartAsset[]>("generation_remove_part", { path }),
   loras: () => invoke<LoraAsset[]>("generation_loras"),
   addLora: (asset: LoraAsset) => invoke<LoraAsset[]>("generation_add_lora", { asset }),
   removeLora: (path: string) => invoke<LoraAsset[]>("generation_remove_lora", { path }),
