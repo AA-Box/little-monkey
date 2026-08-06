@@ -92,6 +92,9 @@ function profileFor(path: string, family: string): FamilyProfile | null {
   return FAMILY_PROFILES[family] ?? null;
 }
 
+/** One trailing quantization or variant tag: `-Q4_K_M`, `_fp16`, `.pruned`. */
+const QUANTIZATION_TAG = /[._-](q\d[_a-z0-9]*|fp\d+|bf\d+|int\d+|pruned)$/i;
+
 /**
  * Reads a name, a family and a slot out of a weight file's own file name.
  *
@@ -100,11 +103,20 @@ function profileFor(path: string, family: string): FamilyProfile | null {
  * which is why it only answers when the file name actually says something.
  */
 export function describeWeightFile(raw: string): WeightFileHint {
-  const base = (raw.split(/[/\\]/).pop() ?? raw)
-    .replace(/\.(safetensors|gguf|ckpt|pt|bin|pth)$/i, "")
-    // Repeated as one group: `_pruned-Q4_K_M` is two tags, and an anchored
-    // single match would only ever strip the last one.
-    .replace(/([._-](q\d[_a-z0-9]*|fp\d+|bf\d+|int\d+|pruned))+$/i, "");
+  let base = (raw.split(/[/\\]/).pop() ?? raw).replace(
+    /\.(safetensors|gguf|ckpt|pt|bin|pth)$/i,
+    "",
+  );
+  // One tag per pass. `_pruned-Q4_K_M` is two tags, and the obvious way to
+  // strip both — wrapping the alternation in `(...)+$` — nests a quantifier
+  // inside a repeated group whose body can itself match a separator: `_q0`
+  // is both a whole tag and a tail of `q\d[_a-z0-9]*`. Every extra `_q0`
+  // doubles the ways the engine can split the string, and the anchor makes
+  // it try all of them before failing. An 82-character name took two
+  // seconds on the UI thread. The loop is linear and strictly shrinks.
+  while (QUANTIZATION_TAG.test(base)) {
+    base = base.replace(QUANTIZATION_TAG, "");
+  }
   // The slot reads the whole path, not just the file name: repositories lay
   // these out as `split_files/diffusion_models/…`, `text_encoders/…`, `vae/…`,
   // so the directory names the component even when the file does not.

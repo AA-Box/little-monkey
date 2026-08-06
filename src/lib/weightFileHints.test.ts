@@ -47,6 +47,19 @@ describe("describeWeightFile", () => {
     }
   });
 
+  /** The tag stripper used to be one repeated group, which let the engine
+   *  split `_q0_q0_q0…` exponentially many ways before failing at the anchor:
+   *  82 characters took two seconds on the UI thread, and file names reach
+   *  this straight from a picker. */
+  it("strips repeated tags without backtracking on a name built to trip it", () => {
+    expect(describeWeightFile("minimax_h3_ref2va_pruned-Q4_K_M.gguf").name).toBe(
+      "minimax h3 ref2va",
+    );
+    const started = performance.now();
+    describeWeightFile(`vae-q0${"_q0".repeat(40)}!.safetensors`);
+    expect(performance.now() - started).toBeLessThan(100);
+  });
+
   it("stays quiet when the file name says nothing, rather than inventing", () => {
     // An all-in-one checkpoint is exactly this case: the name carries no
     // component token, so the row keeps its own default instead of being
