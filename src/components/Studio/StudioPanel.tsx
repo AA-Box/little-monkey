@@ -999,7 +999,7 @@ export function StudioPanel() {
                 {t("Studio.speakerFile")}
                 <input
                   className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
-                  placeholder="/Users/you/voices/narrator.wav"
+                  placeholder={t("Studio.speakerPlaceholder")}
                   value={speakerFile}
                   onChange={(event) => setSpeakerFile(event.target.value)}
                 />
@@ -1009,7 +1009,7 @@ export function StudioPanel() {
                 {t("Studio.language")}
                 <input
                   className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
-                  placeholder="en"
+                  placeholder={t("Studio.languagePlaceholder")}
                   maxLength={2}
                   value={language}
                   onChange={(event) =>

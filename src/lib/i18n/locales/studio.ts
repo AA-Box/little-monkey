@@ -41,6 +41,17 @@ export const studioLocale: Record<string, string> = {
     "Each part is named from its own file name where that says enough — check them. A part named wrong fails inside the engine as a tensor-shape error, not here.",
   "Studio.add.slot": "What this part is",
   "Studio.add.source": "Where it comes from",
+  // Example inputs. They are here so every string the panel renders has one
+  // home, but they stay identical in every locale: a repo id, a path inside a
+  // repo and an engine flag are not English, they are the literal thing to
+  // type, and translating one would produce an example that does not work.
+  "Studio.add.repoPlaceholder": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+  "Studio.add.repoFilePlaceholder": "split_files/vae/wan2.2_vae.safetensors",
+  "Studio.add.namePlaceholder": "Wan 2.2 TI2V 5B",
+  "Studio.add.familyPlaceholder": "Wan",
+  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --offload-to-cpu",
+  "Studio.speakerPlaceholder": "/Users/you/voices/narrator.wav",
+  "Studio.languagePlaceholder": "en",
   "Studio.add.name": "Name",
   "Studio.add.family": "Family",
   "Studio.add.tasks": "What it can do",

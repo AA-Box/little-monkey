@@ -114,7 +114,7 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
         <input
           className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
           value={spec.name}
-          placeholder="Wan 2.2 TI2V 5B"
+          placeholder={t("Studio.add.namePlaceholder")}
           onChange={(event) => patch({ name: event.target.value })}
         />
       </label>
@@ -124,7 +124,7 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
         <input
           className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
           value={spec.family}
-          placeholder="Wan"
+          placeholder={t("Studio.add.familyPlaceholder")}
           onChange={(event) => patch({ family: event.target.value })}
         />
       </label>
@@ -193,7 +193,7 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
         <input
           className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
           value={spec.extraLaunchArgs.join(" ")}
-          placeholder="--diffusion-fa --offload-to-cpu"
+          placeholder={t("Studio.add.engineArgsPlaceholder")}
           onChange={(event) =>
             patch({
               extraLaunchArgs: event.target.value.split(/\s+/).filter(Boolean),

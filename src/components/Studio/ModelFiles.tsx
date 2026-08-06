@@ -150,7 +150,7 @@ export function ModelFiles({
               <input
                 className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
                 value={component.source.repo}
-                placeholder="Comfy-Org/Wan_2.2_ComfyUI_Repackaged"
+                placeholder={t("Studio.add.repoPlaceholder")}
                 onChange={(event) =>
                   patch(index, {
                     source: {
@@ -164,7 +164,7 @@ export function ModelFiles({
               <input
                 className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
                 value={component.source.file}
-                placeholder="split_files/vae/wan2.2_vae.safetensors"
+                placeholder={t("Studio.add.repoFilePlaceholder")}
                 onChange={(event) =>
                   patch(index, {
                     source: {
