@@ -24,6 +24,8 @@ use url::{Host, Url};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use crate::egress::{EgressDenial, EgressRule};
+
 pub const KNOWLEDGE_PIPELINE_SCHEMA_VERSION: u32 = 1;
 pub const CONNECTOR_CONTRACT_VERSION: u32 = 1;
 pub const EXTRACTOR_CONTRACT_VERSION: u32 = 1;
@@ -49,7 +51,28 @@ pub enum PipelineError {
     InvalidArgument(String),
     LimitExceeded(String),
     PathRejected(String),
-    UrlRejected(String),
+    /// An outbound request was refused by the URL policy, named by the rule that
+    /// refused it.
+    ///
+    /// # Why this one variant is typed when its neighbours are prose
+    ///
+    /// It used to be `UrlRejected(String)`, and it stood for two unrelated
+    /// things: a `Url::parse` failure (a typo in configuration) and a loopback
+    /// SSRF block (a policy decision). The consequence was visible in this
+    /// module's own tests — one of them asserted five semantically different
+    /// refusals (loopback, embedded credentials, a `file://` scheme, an
+    /// over-length URL and an `[::1]` literal) with the identical
+    /// `Err(UrlRejected(_))` pattern, so it would have passed just as happily if
+    /// every one of those five had been refused for the wrong reason. Carrying
+    /// [`EgressDenial`] makes the rule a value: a test can name it, and a log
+    /// reader gets a stable `egress.*` code rather than a sentence to
+    /// substring-match.
+    ///
+    /// Only *egress policy* refusals live here. A byte cap, a filesystem
+    /// rejection or a malformed configured origin is not a statement about where
+    /// this app may send a request, and keeping those as prose is what stops this
+    /// variant from decaying back into a general-purpose bucket.
+    UrlRejected(EgressDenial),
     ResolutionRequired(String),
     UnsupportedFormat(String),
     UnsafeDocument(String),
@@ -71,7 +94,10 @@ impl fmt::Display for PipelineError {
             Self::InvalidArgument(message) => write!(formatter, "invalid argument: {message}"),
             Self::LimitExceeded(message) => write!(formatter, "limit exceeded: {message}"),
             Self::PathRejected(message) => write!(formatter, "local path rejected: {message}"),
-            Self::UrlRejected(message) => write!(formatter, "URL rejected: {message}"),
+            // The prefix is kept exactly as it was, so an operator reading a log
+            // sees the same opening words as before; what is new is the rule code
+            // `EgressDenial` appends.
+            Self::UrlRejected(denial) => write!(formatter, "URL rejected: {denial}"),
             Self::ResolutionRequired(message) => {
                 write!(formatter, "validated DNS resolution required: {message}")
             }
@@ -152,6 +178,14 @@ fn validate_stable_id(label: &str, value: &str) -> PipelineResult<()> {
     Ok(())
 }
 
+/// Ceiling for [`PipelineLimits::max_redirects`].
+///
+/// Ten, matching `web.rs`'s and `egress.rs`'s own `MAX_REDIRECT_HOPS` and
+/// reqwest's default `Policy::limited(10)`, so no guard in this tree will follow a
+/// longer chain than any other. The pipeline's own default is 3 and stays there —
+/// this is the point past which a configuration is refused, not a recommendation.
+const MAX_REDIRECT_CHAIN: usize = 10;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PipelineLimits {
@@ -162,7 +196,20 @@ pub struct PipelineLimits {
     pub max_extracted_chars: usize,
     pub max_chunks: usize,
     pub max_chunk_chars: usize,
-    pub max_url_chars: usize,
+    /// Named for bytes because it is measured in bytes: the check is
+    /// `value.len()`, not `value.chars().count()`.
+    ///
+    /// It was `max_url_chars`, and the two differ the moment a URL carries a
+    /// multibyte character — a 2,048-character URL of three-byte glyphs is 6 KiB.
+    /// The byte reading is the one worth keeping, since bytes are what fill a
+    /// buffer and a log line, so the name moved to the measurement rather than the
+    /// measurement moving to the name: changing the comparison instead would have
+    /// *widened* what this accepts, which is not a thing to do by accident while
+    /// tidying a name. `serde` keeps the old spelling as an alias, because the
+    /// struct derives `Deserialize` for a config surface it does not have yet and
+    /// a rename should not become a breaking change the day it gets one.
+    #[serde(alias = "max_url_chars")]
+    pub max_url_bytes: usize,
     pub max_redirects: usize,
     pub max_query_chars: usize,
     pub max_results: usize,
@@ -180,7 +227,7 @@ impl Default for PipelineLimits {
             max_extracted_chars: 64 * 1024 * 1024,
             max_chunks: 100_000,
             max_chunk_chars: 16_000,
-            max_url_chars: 2_048,
+            max_url_bytes: 2_048,
             max_redirects: 3,
             max_query_chars: 8_192,
             max_results: 100,
@@ -199,11 +246,18 @@ impl PipelineLimits {
             || self.max_extracted_chars == 0
             || self.max_chunks == 0
             || self.max_chunk_chars < 64
-            || self.max_url_chars < 64
+            || self.max_url_bytes < 64
             || self.max_query_chars == 0
             || self.max_results == 0
             || self.max_ocr_pages == 0
             || self.max_diagnostic_candidates < self.max_results
+            // `max_redirects` was the one field of the thirteen that this gate
+            // never looked at, so any value at all was "consistent" — including one
+            // large enough that the `redirect_chain.len() > limits.max_redirects`
+            // check downstream can never fire, which turns a bound into a
+            // decoration. A ceiling rather than a range because zero is a coherent
+            // setting: refusing every redirect is a choice, not an inconsistency.
+            || self.max_redirects > MAX_REDIRECT_CHAIN
         {
             return Err(PipelineError::InvalidArgument(
                 "pipeline limits are internally inconsistent".to_string(),
@@ -526,6 +580,27 @@ pub struct ValidatedFile {
     pub extension: String,
 }
 
+/// A URL refusal with nothing to add beyond the rule that fired.
+///
+/// Reached for whenever [`EgressRule::summary`] already says everything the old
+/// hand-written sentence said. The rule is the part a test or a denial sink
+/// branches on, so a detail that only re-words the summary is noise in two
+/// places at once.
+fn url_refused(rule: EgressRule) -> PipelineError {
+    PipelineError::UrlRejected(EgressDenial::new(rule))
+}
+
+/// A URL refusal carrying the request-specific specifics: the address that
+/// tripped it, the origin that was not allowlisted, the parse error.
+///
+/// `detail` is prose for a human and must never be the only place the *reason*
+/// lives. It must also never be the whole URL when the rule
+/// [`redacts_target`](EgressRule::redacts_target) — for that one rule the URL is
+/// the secret being reported.
+fn url_refused_about(rule: EgressRule, detail: impl Into<String>) -> PipelineError {
+    PipelineError::UrlRejected(EgressDenial::about(rule, detail))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UrlSourcePolicy {
@@ -566,31 +641,71 @@ impl UrlSourcePolicy {
         resolved_addresses: &[IpAddr],
         limits: &PipelineLimits,
     ) -> PipelineResult<ValidatedUrl> {
-        if value.len() > limits.max_url_chars || value.chars().any(char::is_control) {
-            return Err(PipelineError::UrlRejected(
-                "URL is over the length limit or contains control characters".to_string(),
+        let verdict = self.classify(value, resolved_addresses, limits);
+        // Recorded here rather than in `knowledge_service.rs`, which is where this
+        // error becomes a `String` and the rule stops being a value. Only the
+        // request-time ladder is recorded: `normalize_origin`'s configuration-shape
+        // refusals fire while a policy is being *built*, and a denial sink that
+        // counted those would put a settings typo in the same column as a source
+        // reaching for `169.254.169.254`.
+        if let Err(PipelineError::UrlRejected(denial)) = &verdict {
+            crate::denial_sink::record(URL_SOURCE_GUARD, denial, None);
+        }
+        verdict
+    }
+
+    fn classify(
+        &self,
+        value: &str,
+        resolved_addresses: &[IpAddr],
+        limits: &PipelineLimits,
+    ) -> PipelineResult<ValidatedUrl> {
+        // Two rules, not one condition. These were `if over_length || has_control`
+        // with a single message naming both, which meant a 40 KB URL and a URL
+        // carrying a `\r` were indistinguishable to anything downstream — and one
+        // of those two is an injection attempt, not a mistake. The length test
+        // stays first so the ordering of the original `||` is preserved.
+        if value.len() > limits.max_url_bytes {
+            return Err(url_refused_about(
+                EgressRule::UrlTooLong,
+                // Lengths only. The URL itself may carry userinfo, and a refusal
+                // is not the place to copy that into a log.
+                format!(
+                    "{} bytes against a maximum of {}",
+                    value.len(),
+                    limits.max_url_bytes
+                ),
             ));
         }
-        let url =
-            Url::parse(value).map_err(|error| PipelineError::UrlRejected(error.to_string()))?;
+        // Kept ahead of the parse, as it always was: `Url::parse` silently strips
+        // tabs and newlines, so a URL smuggling one past a log or an allowlist
+        // would arrive here looking clean if this ran the other way round.
+        if value.chars().any(char::is_control) {
+            return Err(url_refused(EgressRule::UrlControlCharacters));
+        }
+        let url = Url::parse(value)
+            .map_err(|error| url_refused_about(EgressRule::UrlMalformed, error.to_string()))?;
         if !matches!(url.scheme(), "https" | "http") {
-            return Err(PipelineError::UrlRejected(
-                "only https URLs (or explicitly enabled loopback http) are allowed".to_string(),
+            return Err(url_refused_about(
+                EgressRule::SchemeNotAllowed,
+                "only https URLs (or explicitly enabled loopback http) are allowed",
             ));
         }
+        // No detail, deliberately: the URL is what carries the credential, so this
+        // is the one refusal that must not quote its target.
+        // `EgressRule::redacts_target` says so where every guard can see it.
         if !url.username().is_empty() || url.password().is_some() {
-            return Err(PipelineError::UrlRejected(
-                "credentials in source URLs are disabled".to_string(),
-            ));
+            return Err(url_refused(EgressRule::EmbeddedCredentials));
         }
         if url.fragment().is_some() {
-            return Err(PipelineError::UrlRejected(
-                "URL fragments are not accepted as source identity".to_string(),
+            return Err(url_refused_about(
+                EgressRule::FragmentNotAllowed,
+                "URL fragments are not accepted as source identity",
             ));
         }
-        let host = url.host().ok_or_else(|| {
-            PipelineError::UrlRejected("URL must have an explicit host".to_string())
-        })?;
+        let host = url
+            .host()
+            .ok_or_else(|| url_refused(EgressRule::HostMissing))?;
         let literal_address = match host {
             Host::Ipv4(address) => Some(IpAddr::V4(address)),
             Host::Ipv6(address) => Some(IpAddr::V6(address)),
@@ -605,9 +720,10 @@ impl UrlSourcePolicy {
         };
         let origin = origin_for_url(&url)?;
         if !self.allowed_origins.contains(&origin) {
-            return Err(PipelineError::UrlRejected(format!(
-                "origin is not allowlisted: {origin}"
-            )));
+            // The origin, not the URL: `origin_for_url` has already dropped the
+            // path, the query and any userinfo, which is exactly the reduction a
+            // diagnostic wants.
+            return Err(url_refused_about(EgressRule::OriginNotAllowlisted, origin));
         }
         let mut addresses = resolved_addresses.to_vec();
         if let Some(address) = literal_address {
@@ -622,22 +738,36 @@ impl UrlSourcePolicy {
         addresses.sort();
         addresses.dedup();
         for address in &addresses {
-            if is_non_public_address(*address) && !self.allow_private_networks {
-                let is_loopback_http =
-                    address.is_loopback() && url.scheme() == "http" && self.allow_http_loopback;
-                if !is_loopback_http {
-                    return Err(PipelineError::UrlRejected(format!(
-                        "non-public resolved address is blocked: {address}"
-                    )));
+            // Every address class this guard knows about used to end in the one
+            // sentence "non-public resolved address is blocked", so a refusal
+            // could not say whether it had caught this machine's own loopback
+            // service, a Tailscale peer or a documentation range. The classifier
+            // now hands back which one, and the address rides along as detail.
+            if let Some(rule) = non_public_address_rule(*address) {
+                // The grant is per rule, not per classifier verdict. It used to be
+                // `!self.allow_private_networks` alone, which made one boolean named
+                // for private networks stand for all fourteen classes this
+                // classifier can return — so a user switching it on to reach a NAS
+                // also permitted multicast, `255.255.255.255`, the documentation
+                // ranges, `240/4`, and the deprecated IPv4-compatible form that is a
+                // *spelling* of an address rather than a class of one.
+                let granted =
+                    self.allow_private_networks && rule.covered_by_private_network_grant();
+                if !granted {
+                    let is_loopback_http =
+                        address.is_loopback() && url.scheme() == "http" && self.allow_http_loopback;
+                    if !is_loopback_http {
+                        return Err(url_refused_about(rule, address.to_string()));
+                    }
                 }
             }
         }
         if url.scheme() == "http"
             && !(self.allow_http_loopback && addresses.iter().all(IpAddr::is_loopback))
         {
-            return Err(PipelineError::UrlRejected(
-                "cleartext HTTP is allowed only for explicit loopback development origins"
-                    .to_string(),
+            return Err(url_refused_about(
+                EgressRule::CleartextNotAllowed,
+                "cleartext HTTP is allowed only for explicit loopback development origins",
             ));
         }
         Ok(ValidatedUrl {
@@ -648,15 +778,31 @@ impl UrlSourcePolicy {
     }
 }
 
+/// Canonicalizes one *configured* allowed origin.
+///
+/// Runs while a policy is being built, before any request exists, which is why
+/// its shape complaint below is an `InvalidArgument` and not a rule: nothing has
+/// been refused an egress destination, an operator has mistyped a setting. A
+/// request-scoped rule code would tell a denial sink that this app blocked an
+/// outbound request, which would be false.
+///
+/// The parse failure is the exception, and deliberately so:
+/// [`EgressRule::UrlMalformed`] exists precisely to be *distinguishable* from a
+/// policy decision, so using it here loses nothing and keeps one spelling for
+/// "this text is not a URL" across both entry points.
+/// Names this guard in a denial record.
+const URL_SOURCE_GUARD: &str = "knowledge.url-source";
+
 fn normalize_origin(value: &str) -> PipelineResult<String> {
-    let url = Url::parse(value).map_err(|error| PipelineError::UrlRejected(error.to_string()))?;
+    let url = Url::parse(value)
+        .map_err(|error| url_refused_about(EgressRule::UrlMalformed, error.to_string()))?;
     if url.path() != "/"
         || url.query().is_some()
         || url.fragment().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
     {
-        return Err(PipelineError::UrlRejected(
+        return Err(PipelineError::InvalidArgument(
             "an allowed origin cannot contain a path, query, fragment, or credentials".to_string(),
         ));
     }
@@ -666,13 +812,17 @@ fn normalize_origin(value: &str) -> PipelineResult<String> {
 fn origin_for_url(url: &Url) -> PipelineResult<String> {
     let host = url
         .host_str()
-        .ok_or_else(|| PipelineError::UrlRejected("URL must have an explicit host".to_string()))?;
+        .ok_or_else(|| url_refused(EgressRule::HostMissing))?;
     let default_port = match url.scheme() {
         "https" => 443,
         "http" => 80,
         _ => {
-            return Err(PipelineError::UrlRejected(
-                "origin must use http or https".to_string(),
+            // Same rule as the scheme check in `validate`, different detail: this
+            // one is reachable through `normalize_origin` as well, and a reader of
+            // the denial should be able to tell which of the two spoke.
+            return Err(url_refused_about(
+                EgressRule::SchemeNotAllowed,
+                "origin must use http or https",
             ));
         }
     };
@@ -689,34 +839,148 @@ fn origin_for_url(url: &Url) -> PipelineResult<String> {
     }
 }
 
-fn is_non_public_address(address: IpAddr) -> bool {
+/// Which rule, if any, refuses `address` — `None` means ordinary public space.
+///
+/// # Why this reports a rule instead of a bool
+///
+/// This is the broadest of the four SSRF guards in this tree: twenty predicates
+/// across the two families, fourteen distinct rules between them — and until now
+/// all of it collapsed into one bool and one sentence, "non-public resolved
+/// address is blocked". So a refusal could not distinguish this machine's own
+/// unauthenticated loopback services, the class that actually matters, from a
+/// Tailscale CGNAT peer, a documentation range, or a `240/4` address nothing
+/// routes. Naming the rule is what lets a test assert *loopback* was refused
+/// rather than *something*, and what lets a denial sink count the classes
+/// separately.
+///
+/// The predicates and their order are unchanged from the bool this replaces.
+/// That is load-bearing twice over: the ranges must not shift, and the *order*
+/// decides which rule a member of two classes reports. `0.0.0.0` is in both the
+/// unspecified class and `0.0.0.0/8`, and `is_unspecified` runs first so it is
+/// reported as [`EgressRule::Unspecified`]; `255.255.255.255` is in both the
+/// broadcast class and `240/4`, and is reported as
+/// [`EgressRule::Broadcast`] for the same reason.
+fn non_public_address_rule(address: IpAddr) -> Option<EgressRule> {
     match address {
-        IpAddr::V4(address) => {
-            address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_multicast()
-                || address.is_unspecified()
-                || address == Ipv4Addr::BROADCAST
-                || address.octets()[0] == 0
-                || matches!(address.octets(), [100, value, _, _] if (64..=127).contains(&value))
-                || matches!(address.octets(), [192, 0, 0, _])
-                || matches!(address.octets(), [192, 0, 2, _])
-                || matches!(address.octets(), [198, value, _, _] if matches!(value, 18 | 19 | 51))
-                || matches!(address.octets(), [203, 0, 113, _])
-                || address.octets()[0] >= 240
-        }
-        IpAddr::V6(address) => {
-            address.is_loopback()
-                || address.is_unspecified()
-                || address.is_multicast()
-                || is_ipv6_unique_local(address)
-                || is_ipv6_link_local(address)
-                || address
-                    .to_ipv4_mapped()
-                    .is_some_and(|mapped| is_non_public_address(IpAddr::V4(mapped)))
-        }
+        IpAddr::V4(address) => non_public_ipv4_rule(address),
+        IpAddr::V6(address) => non_public_ipv6_rule(address),
     }
+}
+
+/// The IPv4 half of [`non_public_address_rule`].
+///
+/// `Ipv4Addr::is_private` covers exactly `10/8`, `172.16/12` and `192.168/16`, so
+/// it is used as-is rather than hand-rolling those three CIDRs.
+fn non_public_ipv4_rule(address: Ipv4Addr) -> Option<EgressRule> {
+    if address.is_private() {
+        return Some(EgressRule::PrivateV4);
+    }
+    if address.is_loopback() {
+        return Some(EgressRule::Loopback);
+    }
+    if address.is_link_local() {
+        return Some(EgressRule::LinkLocal);
+    }
+    if address.is_multicast() {
+        return Some(EgressRule::Multicast);
+    }
+    // Ahead of the `0.0.0.0/8` test below, which would otherwise swallow it. The
+    // OS routes an outbound connection to `0.0.0.0` to `127.0.0.1`, so this is a
+    // live path to a loopback-bound service and deserves its own name.
+    if address.is_unspecified() {
+        return Some(EgressRule::Unspecified);
+    }
+    // Ahead of the `240/4` test below for the same reason.
+    if address == Ipv4Addr::BROADCAST {
+        return Some(EgressRule::Broadcast);
+    }
+    if address.octets()[0] == 0 {
+        return Some(EgressRule::ThisNetwork);
+    }
+    if matches!(address.octets(), [100, value, _, _] if (64..=127).contains(&value)) {
+        return Some(EgressRule::Cgnat); // 100.64/10
+    }
+    if matches!(address.octets(), [192, 0, 0, _]) {
+        return Some(EgressRule::ProtocolAssignments);
+    }
+    if matches!(address.octets(), [192, 0, 2, _]) {
+        return Some(EgressRule::TestNet); // TEST-NET-1
+    }
+    // One arm in the bool this replaces tested `[198, 18 | 19 | 51, _, _]`
+    // together, which merged two unrelated classes: `198.18/15` is reserved for
+    // inter-network benchmarking and `198.51.100/24` is a documentation range.
+    // Splitting them is what makes the rule nameable, and changes no verdict —
+    // both halves were blocked before and both are blocked now.
+    if matches!(address.octets(), [198, 18 | 19, _, _]) {
+        return Some(EgressRule::Benchmarking);
+    }
+    // `198.51.100/24` and no wider, which is what RFC 5737 actually reserves for
+    // TEST-NET-2. This arm was `[198, 51, _, _]` — a /16 — and the earlier renaming
+    // change preserved that on purpose, because narrowing it newly *allows* fetches and
+    // that is not a decision to smuggle into a rename. It left a test pinning
+    // `198.51.0.1` as refused so the narrowing would have to be a visible, deliberate
+    // edit. This is that edit.
+    //
+    // The 65,280 addresses it over-blocked are ordinary public space, so this was a
+    // guard refusing traffic no rule entitles it to refuse — the failure mode being a
+    // knowledge source that simply cannot be fetched, with a denial naming a
+    // documentation range the address is not in. The two sibling arms are already spelled
+    // to the RFC (`192.0.2/24`, `203.0.113/24`); this one was the outlier.
+    if matches!(address.octets(), [198, 51, 100, _]) {
+        return Some(EgressRule::TestNet); // TEST-NET-2
+    }
+    if matches!(address.octets(), [203, 0, 113, _]) {
+        return Some(EgressRule::TestNet); // TEST-NET-3
+    }
+    if address.octets()[0] >= 240 {
+        return Some(EgressRule::ReservedRange);
+    }
+    None
+}
+
+/// The IPv6 half of [`non_public_address_rule`].
+///
+/// The unique-local (`fc00::/7`) and link-local (`fe80::/10`) tests are
+/// hand-rolled below because the corresponding std predicates are still gated
+/// behind the unstable `ip` feature.
+fn non_public_ipv6_rule(address: Ipv6Addr) -> Option<EgressRule> {
+    if address.is_loopback() {
+        return Some(EgressRule::Loopback);
+    }
+    if address.is_unspecified() {
+        return Some(EgressRule::Unspecified);
+    }
+    if address.is_multicast() {
+        return Some(EgressRule::Multicast);
+    }
+    // `::a.b.c.d` is not what `to_ipv4_mapped` matches, so without this it read
+    // as public. See `egress::is_ipv4_compatible` for why the whole range is
+    // rejected rather than unwrapped and re-checked — and note that this must
+    // stay *below* the loopback and unspecified tests above, because `::` and
+    // `::1` are in `::/96` too and their own rules are the informative ones.
+    if crate::egress::is_ipv4_compatible(&address) {
+        return Some(EgressRule::Ipv4Compatible);
+    }
+    if is_ipv6_unique_local(address) {
+        return Some(EgressRule::UniqueLocalV6);
+    }
+    if is_ipv6_link_local(address) {
+        return Some(EgressRule::LinkLocal);
+    }
+    // A mapped address reports whichever v4 rule its inner address trips rather
+    // than a rule of its own: `::ffff:10.0.0.1` is a private address, and calling
+    // it anything else would hide that from whoever reads the denial. NAT64 is the
+    // third spelling of the same thing and gets the same treatment — this guard is
+    // the broadest of the four, so it is the one where letting `64:ff9b::7f00:1`
+    // through as public would have been least defensible.
+    //
+    // Delegating rather than refusing the prefix also keeps this guard's breadth its
+    // own: it blocks CGNAT, so it blocks `64:ff9b::64.64.0.1` too, and a narrower
+    // guard delegating to *its* v4 rule will not.
+    address
+        .to_ipv4_mapped()
+        .or_else(|| crate::egress::nat64_embedded_ipv4(&address))
+        .and_then(non_public_ipv4_rule)
 }
 
 fn is_ipv6_unique_local(address: Ipv6Addr) -> bool {
@@ -1024,13 +1288,29 @@ impl SourceConnector for UrlSnapshotConnector {
                 ));
             }
         };
+        // An egress refusal rather than a `LimitExceeded`, which is what it used
+        // to be: a hop cap is a statement about where this app will follow a
+        // *response*, not about how big something is, and it is the same rule
+        // `egress::same_origin_redirect_policy` enforces on the live path. Every
+        // other cap in this connector — the byte cap below among them — stays a
+        // `LimitExceeded`, because those are about size and nothing else.
         if self.snapshot.redirect_chain.len() > limits.max_redirects {
-            return Err(PipelineError::LimitExceeded(
-                "URL redirect chain exceeds configured maximum".to_string(),
+            return Err(url_refused_about(
+                EgressRule::RedirectHopLimit,
+                format!(
+                    "{} hops against a maximum of {}",
+                    self.snapshot.redirect_chain.len(),
+                    limits.max_redirects
+                ),
             ));
         }
         self.policy
             .validate(original, &self.snapshot.initial_resolved_addresses, limits)?;
+        // Each hop goes through the entire ladder, so a refused hop already
+        // reports the rule that refused it — an off-allowlist origin comes back as
+        // `OriginNotAllowlisted`, a hop resolving to loopback as `Loopback`. There
+        // is deliberately no separate "a redirect was refused" rule wrapped round
+        // this: it would replace the informative verdict with a vaguer one.
         for redirect in &self.snapshot.redirect_chain {
             self.policy
                 .validate(&redirect.url, &redirect.resolved_addresses, limits)?;
@@ -4486,6 +4766,50 @@ mod tests {
         }
     }
 
+    /// `max_redirects` was the one field of the thirteen `validate` never read, so
+    /// any value at all passed as "consistent" — including one big enough that the
+    /// `redirect_chain.len() > limits.max_redirects` check downstream could never
+    /// fire, which is a bound that has stopped being one.
+    ///
+    /// Asserted in three parts because a ceiling has three interesting values, and
+    /// a test of only the middle one would pass for a gate that rejected
+    /// everything or nothing. Zero has to stay legal in particular: refusing every
+    /// redirect is a choice, and clamping it away would be the opposite mistake.
+    #[test]
+    fn validate_rejects_a_redirect_bound_that_could_never_fire() {
+        let at_ceiling = PipelineLimits {
+            max_redirects: MAX_REDIRECT_CHAIN,
+            ..PipelineLimits::default()
+        };
+        assert!(
+            at_ceiling.validate().is_ok(),
+            "the ceiling itself is a legal setting"
+        );
+
+        let none_at_all = PipelineLimits {
+            max_redirects: 0,
+            ..PipelineLimits::default()
+        };
+        assert!(
+            none_at_all.validate().is_ok(),
+            "following no redirects at all is a coherent configuration, not an \
+             inconsistency"
+        );
+
+        let past_ceiling = PipelineLimits {
+            max_redirects: MAX_REDIRECT_CHAIN + 1,
+            ..PipelineLimits::default()
+        };
+        assert!(
+            matches!(
+                past_ceiling.validate(),
+                Err(PipelineError::InvalidArgument(_))
+            ),
+            "a chain longer than every other guard in this tree admits must be \
+             refused here"
+        );
+    }
+
     fn test_limits() -> PipelineLimits {
         PipelineLimits {
             max_sources: 8,
@@ -4495,7 +4819,7 @@ mod tests {
             max_extracted_chars: 1024 * 1024,
             max_chunks: 1_000,
             max_chunk_chars: 1_024,
-            max_url_chars: 512,
+            max_url_bytes: 512,
             max_redirects: 2,
             max_query_chars: 512,
             max_results: 20,
@@ -4591,6 +4915,167 @@ mod tests {
         }
     }
 
+    /// The rule a refusal names, or a panic saying what actually came back.
+    ///
+    /// Written as a helper rather than a `matches!` per case because the whole
+    /// point of the change these tests cover is that `Err(UrlRejected(_))` was
+    /// indistinguishable between five different reasons; a helper that yields the
+    /// rule makes every assertion below name one.
+    fn refused_rule<T: fmt::Debug>(result: PipelineResult<T>) -> EgressRule {
+        match result {
+            Err(PipelineError::UrlRejected(denial)) => denial.rule(),
+            other => panic!("expected a URL policy refusal, got {other:?}"),
+        }
+    }
+
+    /// This is the broadest of the four SSRF guards and it had the same hole:
+    /// `::127.0.0.1` is not what `to_ipv4_mapped()` matches, so a knowledge source
+    /// URL resolving there was accepted as public.
+    /// Proves this guard *delegates* NAT64 to its own v4 rule — and this is the guard
+    /// where letting `64:ff9b::7f00:1` through was least defensible, since it is
+    /// documented as the broadest of the four.
+    ///
+    /// The CGNAT row is what shows delegation preserves that breadth rather than
+    /// flattening the four guards into one: only this guard refuses `100.64/10`, so
+    /// only this guard refuses the NAT64 spelling of it. The public row is the
+    /// counter-test against refusing the prefix outright.
+    #[test]
+    fn nat64_reaches_this_guards_own_ipv4_rule() {
+        use std::str::FromStr;
+        for (text, expected) in [
+            ("64:ff9b::7f00:1", Some(EgressRule::Loopback)),
+            ("64:ff9b::a00:1", Some(EgressRule::PrivateV4)),
+            ("64:ff9b::6440:1", Some(EgressRule::Cgnat)),
+            ("64:ff9b::5db8:d822", None),
+        ] {
+            assert_eq!(
+                non_public_ipv6_rule(Ipv6Addr::from_str(text).expect("parses")),
+                expected,
+                "{text} must report whichever v4 rule its embedded address trips"
+            );
+        }
+    }
+
+    #[test]
+    fn the_deprecated_ipv4_compatible_form_is_non_public() {
+        use std::net::Ipv6Addr;
+        use std::str::FromStr;
+        for text in ["::127.0.0.1", "::192.168.1.1"] {
+            assert_eq!(
+                non_public_address_rule(IpAddr::V6(Ipv6Addr::from_str(text).unwrap())),
+                Some(EgressRule::Ipv4Compatible),
+                "{text} must be refused, and as the deprecated wrapper rather than \
+                 as whatever it wraps — the wrapper is the reason, and a v4 \
+                 blocklist cannot be relied on to see inside it"
+            );
+        }
+        assert_eq!(
+            non_public_address_rule(IpAddr::V6(
+                Ipv6Addr::from_str("2606:2800:220:1:248:1893:25c8:1946").unwrap()
+            )),
+            None
+        );
+    }
+
+    /// One representative address per class, each asserting the *exact* rule.
+    ///
+    /// Every class this guard blocks used to share one bool and one sentence, so
+    /// nothing could tell them apart; this is the inventory that keeps them
+    /// apart. Note the two cases that pin the order rather than a range:
+    /// `0.0.0.0` is in `0.0.0.0/8` as well as being the unspecified address, and
+    /// `255.255.255.255` is in `240/4` as well as being the broadcast address, and
+    /// in both the more specific rule has to win.
+    #[test]
+    fn every_non_public_address_class_reports_its_own_rule() {
+        for (text, expected) in [
+            ("10.0.0.1", EgressRule::PrivateV4),
+            ("172.16.0.1", EgressRule::PrivateV4),
+            ("192.168.1.1", EgressRule::PrivateV4),
+            ("127.0.0.1", EgressRule::Loopback),
+            ("169.254.169.254", EgressRule::LinkLocal),
+            ("224.0.0.1", EgressRule::Multicast),
+            ("0.0.0.0", EgressRule::Unspecified),
+            ("255.255.255.255", EgressRule::Broadcast),
+            ("0.1.2.3", EgressRule::ThisNetwork),
+            ("100.64.0.1", EgressRule::Cgnat),
+            ("100.127.255.255", EgressRule::Cgnat),
+            ("192.0.0.1", EgressRule::ProtocolAssignments),
+            ("192.0.2.1", EgressRule::TestNet),
+            ("198.18.0.1", EgressRule::Benchmarking),
+            ("198.19.255.255", EgressRule::Benchmarking),
+            ("198.51.100.1", EgressRule::TestNet),
+            ("198.51.100.255", EgressRule::TestNet),
+            ("203.0.113.1", EgressRule::TestNet),
+            ("240.0.0.1", EgressRule::ReservedRange),
+            ("::1", EgressRule::Loopback),
+            ("::", EgressRule::Unspecified),
+            ("ff02::1", EgressRule::Multicast),
+            ("fc00::1", EgressRule::UniqueLocalV6),
+            ("fe80::1", EgressRule::LinkLocal),
+            // The mapped recursion: the wrapper is transparent, so the inner v4
+            // rule is what a reader of the denial gets.
+            ("::ffff:10.0.0.1", EgressRule::PrivateV4),
+            ("::ffff:127.0.0.1", EgressRule::Loopback),
+            // And the counterpart that must NOT unwrap: `::127.0.0.1` is the
+            // deprecated compatible form, so it reports the wrapper rather than
+            // `Loopback`. Reporting `Loopback` here would mean the range had been
+            // unwrapped, which `egress::is_ipv4_compatible` documents as unsafe.
+            ("::127.0.0.1", EgressRule::Ipv4Compatible),
+            ("::93.184.216.34", EgressRule::Ipv4Compatible),
+        ] {
+            let address = text.parse::<IpAddr>().expect("test address parses");
+            assert_eq!(
+                non_public_address_rule(address),
+                Some(expected),
+                "{text} must be refused as {}",
+                expected.code()
+            );
+        }
+    }
+
+    /// The counter-test without which "refuse everything" would pass the
+    /// inventory above. Several of these sit one octet outside a blocked range,
+    /// which is where an over-widened predicate shows up first.
+    #[test]
+    fn ordinary_public_addresses_are_not_refused_at_all() {
+        for text in [
+            "93.184.216.34",
+            "8.8.8.8",
+            "1.1.1.1",
+            // Just outside 172.16/12, 100.64/10, 192.0.0/24, 192.0.2/24,
+            // 198.18/15, 198.51/16, 203.0.113/24 and the 224/4 multicast block
+            // respectively. `223.255.255.254` is the last address below multicast
+            // and so the tightest guard against the top-octet tests widening.
+            "172.32.0.1",
+            "100.128.0.1",
+            "192.0.1.1",
+            "192.0.3.1",
+            "198.20.0.1",
+            "198.52.0.1",
+            "203.0.114.1",
+            // The 65,280 addresses this guard used to over-block. TEST-NET-2 is
+            // `198.51.100/24` and nothing wider, so every other `198.51.x` is ordinary
+            // public space. Both neighbours of the real /24 plus both ends of the /16,
+            // because narrowing a range is where an off-by-one shows up: get it wrong and
+            // either the documentation range leaks through or the fix under-narrows.
+            "198.51.0.1",
+            "198.51.99.255",
+            "198.51.101.0",
+            "198.51.255.254",
+            "223.255.255.254",
+            "2606:2800:220:1:248:1893:25c8:1946",
+            // A mapped *public* address: the unwrap must not refuse it either.
+            "::ffff:93.184.216.34",
+        ] {
+            let address = text.parse::<IpAddr>().expect("test address parses");
+            assert_eq!(
+                non_public_address_rule(address),
+                None,
+                "{text} is ordinary public space and must not be refused"
+            );
+        }
+    }
+
     #[test]
     fn local_policy_rejects_traversal_hidden_oversize_and_symlink() {
         let directory = TestDirectory::new("local-policy");
@@ -4648,36 +5133,147 @@ mod tests {
             .validate("https://example.com/docs?q=one", &[public], &limits)
             .expect("public allowlisted URL");
         assert_eq!(validated.origin, "https://example.com");
+        // Left as a variant match: `ResolutionRequired` is already its own variant
+        // and is already distinguishable from every refusal below, so it needs no
+        // rule to be told apart. Asserted here to hold that separation — a name
+        // with no resolved addresses is an unmet interface contract, not a blocked
+        // destination.
         assert!(matches!(
             policy.validate("https://example.com/docs", &[], &limits),
             Err(PipelineError::ResolutionRequired(_))
         ));
-        assert!(matches!(
-            policy.validate(
+        // Every case below used to be `Err(PipelineError::UrlRejected(_))`, which
+        // is the same pattern five times over five different reasons: the test
+        // would have passed had the loopback case been refused for its scheme, or
+        // the `file://` case for a parse error. Each now names the rule it means.
+        assert_eq!(
+            refused_rule(policy.validate(
                 "https://example.com/docs",
                 &["127.0.0.1".parse().expect("loopback")],
                 &limits
-            ),
-            Err(PipelineError::UrlRejected(_))
-        ));
-        assert!(matches!(
-            policy.validate("https://user:pass@example.com/docs", &[public], &limits),
-            Err(PipelineError::UrlRejected(_))
-        ));
-        assert!(matches!(
-            policy.validate("file:///etc/passwd", &[], &limits),
-            Err(PipelineError::UrlRejected(_))
-        ));
-        let overlong = format!("https://example.com/{}", "x".repeat(limits.max_url_chars));
-        assert!(matches!(
-            policy.validate(&overlong, &[public], &limits),
-            Err(PipelineError::UrlRejected(_))
-        ));
+            )),
+            EgressRule::Loopback,
+            "an allowlisted name resolving to loopback is an SSRF block, and must \
+             not be reportable as anything else"
+        );
+        assert_eq!(
+            refused_rule(policy.validate("https://user:pass@example.com/docs", &[public], &limits)),
+            EgressRule::EmbeddedCredentials
+        );
+        // And the reason that rule exists: the refusal must not quote the URL it
+        // refused, because the URL is where the password is.
+        match policy.validate("https://user:pass@example.com/docs", &[public], &limits) {
+            Err(PipelineError::UrlRejected(denial)) => {
+                assert!(denial.rule().redacts_target());
+                assert_eq!(denial.detail(), None);
+                assert!(!denial.to_string().contains("pass"));
+            }
+            other => panic!("expected a credentials refusal, got {other:?}"),
+        }
+        assert_eq!(
+            refused_rule(policy.validate("file:///etc/passwd", &[], &limits)),
+            EgressRule::SchemeNotAllowed,
+            "`file:///etc/passwd` parses perfectly well, so this proves the scheme \
+             rule fired and not `UrlMalformed`"
+        );
+        let overlong = format!("https://example.com/{}", "x".repeat(limits.max_url_bytes));
+        assert_eq!(
+            refused_rule(policy.validate(&overlong, &[public], &limits)),
+            EgressRule::UrlTooLong
+        );
+        // The limit is bytes, which is what its name now says. A path of `é` — two
+        // bytes each — trips it at half as many characters, and pinning that here is
+        // what stops the comparison being "corrected" to `chars().count()` later:
+        // that would not be a tidy-up, it would widen this guard to accept a URL
+        // several times the byte length it was written to bound.
+        let multibyte = format!(
+            "https://example.com/{}",
+            "é".repeat(limits.max_url_bytes / 2)
+        );
+        assert!(
+            multibyte.chars().count() < limits.max_url_bytes,
+            "the fixture must be under the limit in characters, or it proves nothing"
+        );
+        assert_eq!(
+            refused_rule(policy.validate(&multibyte, &[public], &limits)),
+            EgressRule::UrlTooLong,
+            "{} characters but {} bytes must be refused on bytes",
+            multibyte.chars().count(),
+            multibyte.len()
+        );
+        // The other half of the condition that used to be one `if`: a control
+        // character is an injection attempt, not an oversized URL, and `Url::parse`
+        // would have quietly stripped the `\r` had this been checked after it.
+        assert_eq!(
+            refused_rule(policy.validate("https://example.com/do\rcs", &[public], &limits)),
+            EgressRule::UrlControlCharacters
+        );
+        assert_eq!(
+            refused_rule(policy.validate("https://elsewhere.example/docs", &[public], &limits)),
+            EgressRule::OriginNotAllowlisted
+        );
+        // A genuinely unparseable URL, so that `UrlMalformed` is proved reachable
+        // and proved distinct from the policy decisions above. This is the pair the
+        // single `UrlRejected(String)` variant could not tell apart at all.
+        assert_eq!(
+            refused_rule(policy.validate("not a url", &[public], &limits)),
+            EgressRule::UrlMalformed
+        );
         let ipv6 = UrlSourcePolicy::new(["https://[::1]"], false, false).expect("IPv6 policy");
-        assert!(matches!(
-            ipv6.validate("https://[::1]/", &[], &limits),
-            Err(PipelineError::UrlRejected(_))
-        ));
+        assert_eq!(
+            refused_rule(ipv6.validate("https://[::1]/", &[], &limits)),
+            EgressRule::Loopback,
+            "an `[::1]` literal is refused as loopback — same rule as the v4 \
+             literal and the name that resolves there"
+        );
+    }
+
+    /// `allow_private_networks` used to be one boolean over every class this
+    /// classifier can return, so switching it on to reach a NAS at `192.168.1.10`
+    /// also permitted multicast, `255.255.255.255`, the documentation ranges,
+    /// `240/4` and the deprecated IPv4-compatible form.
+    ///
+    /// Both halves are asserted together because each alone describes a different
+    /// bug: without the first this is "refuse everything", which is not what a
+    /// user asking for their LAN wants; without the second it is the blanket that
+    /// was already there.
+    ///
+    /// The refusals name their rule rather than merely being refusals — a grant
+    /// that leaked would most likely show up as the *wrong* rule surviving, and
+    /// `Err(UrlRejected(_))` cannot tell those apart.
+    #[test]
+    fn a_private_network_grant_reaches_a_lan_host_and_nothing_that_routes_nowhere() {
+        let limits = test_limits();
+        let policy = UrlSourcePolicy::new(["https://example.com"], false, true).expect("policy");
+
+        for text in ["192.168.1.10", "10.0.0.1", "172.16.0.1", "100.64.0.1"] {
+            let address = text.parse::<IpAddr>().expect("private address parses");
+            assert!(
+                policy
+                    .validate("https://example.com/docs", &[address], &limits)
+                    .is_ok(),
+                "{text} is what the setting is for and must be reachable with it on"
+            );
+        }
+
+        for (text, rule) in [
+            ("224.0.0.1", EgressRule::Multicast),
+            ("255.255.255.255", EgressRule::Broadcast),
+            ("0.1.2.3", EgressRule::ThisNetwork),
+            ("192.0.0.8", EgressRule::ProtocolAssignments),
+            ("192.0.2.1", EgressRule::TestNet),
+            ("198.18.0.1", EgressRule::Benchmarking),
+            ("240.0.0.1", EgressRule::ReservedRange),
+            ("::127.0.0.1", EgressRule::Ipv4Compatible),
+        ] {
+            let address = text.parse::<IpAddr>().expect("address parses");
+            assert_eq!(
+                refused_rule(policy.validate("https://example.com/docs", &[address], &limits)),
+                rule,
+                "{text} must stay refused as {} even with private networks allowed",
+                rule.code()
+            );
+        }
     }
 
     #[test]
@@ -4709,10 +5305,75 @@ mod tests {
                 modified_unix_ms: None,
             },
         };
-        assert!(matches!(
-            connector.collect(&source, &limits, &CancellationToken::new(), &mut |_| {}),
-            Err(PipelineError::UrlRejected(_))
-        ));
+        // The claim this test exists to make is specific — the
+        // `https://evil.example/steal` hop was refused because its origin is not
+        // on the allowlist — and `Err(UrlRejected(_))` did not make it. The same
+        // pattern would have passed had the *first* URL been refused, or the final
+        // one, or any hop refused for any other reason, i.e. it could not tell a
+        // working redirect check from one that never ran.
+        assert_eq!(
+            refused_rule(connector.collect(
+                &source,
+                &limits,
+                &CancellationToken::new(),
+                &mut |_| {}
+            )),
+            EgressRule::OriginNotAllowlisted
+        );
+    }
+
+    /// The hop cap, which no test covered while it was a `LimitExceeded`.
+    ///
+    /// Every hop here is on the allowlisted origin and resolves to a public
+    /// address, so nothing else in the ladder can refuse them — the only reason
+    /// left is that there are more of them than `max_redirects` permits.
+    #[test]
+    fn url_snapshot_refuses_a_chain_longer_than_the_hop_limit() {
+        let limits = test_limits();
+        let public = "93.184.216.34".parse::<IpAddr>().expect("public IP");
+        let source = SourceDescriptor {
+            contract_version: CONNECTOR_CONTRACT_VERSION,
+            source_id: "source:url".to_string(),
+            connector_id: "builtin.url-snapshot.v1".to_string(),
+            locator: SourceLocator::Url("https://example.com/start".to_string()),
+            enabled: true,
+            refresh_token: None,
+        };
+        let hop = |index: usize| ResolvedUrlHop {
+            url: format!("https://example.com/hop-{index}"),
+            resolved_addresses: vec![public],
+        };
+        let connector = UrlSnapshotConnector {
+            policy: UrlSourcePolicy::new(["https://example.com"], false, false).expect("policy"),
+            snapshot: UrlSnapshot {
+                source: source.clone(),
+                initial_resolved_addresses: vec![public],
+                final_url: "https://example.com/final".to_string(),
+                redirect_chain: (0..=limits.max_redirects).map(hop).collect(),
+                final_resolved_addresses: vec![public],
+                media_type: "text/html".to_string(),
+                bytes: b"<p>safe snapshot</p>".to_vec(),
+                etag: None,
+                modified_unix_ms: None,
+            },
+        };
+        assert_eq!(
+            refused_rule(connector.collect(
+                &source,
+                &limits,
+                &CancellationToken::new(),
+                &mut |_| {}
+            )),
+            EgressRule::RedirectHopLimit
+        );
+
+        // Counter-test: a chain exactly at the cap is still accepted, so "refuse
+        // every chain" cannot pass the assertion above.
+        let mut within = connector.clone();
+        within.snapshot.redirect_chain.pop();
+        assert!(within
+            .collect(&source, &limits, &CancellationToken::new(), &mut |_| {})
+            .is_ok());
     }
 
     #[test]

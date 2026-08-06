@@ -19,11 +19,13 @@ export function OllamaPullForm() {
   const ollamaPullError = useModelStore((s) => s.ollamaPullError);
   const ollamaSigninMessage = useModelStore((s) => s.ollamaSigninMessage);
   const pullOllamaModel = useModelStore((s) => s.pullOllamaModel);
+  const cancelOllamaPull = useModelStore((s) => s.cancelOllamaPull);
   const signinOllama = useModelStore((s) => s.signinOllama);
 
   const [tag, setTag] = useState("");
   const [submittedTag, setSubmittedTag] = useState<string | null>(null);
   const [isPulling, setIsPulling] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
 
   const trimmedTag = tag.trim();
   const disabled = !trimmedTag || (isPulling && submittedTag === trimmedTag);
@@ -32,6 +34,7 @@ export function OllamaPullForm() {
     if (!trimmedTag || (isPulling && submittedTag === trimmedTag)) return;
     setSubmittedTag(trimmedTag);
     setIsPulling(true);
+    setIsCancelling(false);
     try {
       await pullOllamaModel(trimmedTag);
     } catch {
@@ -39,8 +42,22 @@ export function OllamaPullForm() {
       // store; nothing further to do here.
     } finally {
       setIsPulling(false);
+      setIsCancelling(false);
     }
   }, [trimmedTag, isPulling, submittedTag, pullOllamaModel]);
+
+  const handleCancel = useCallback(async () => {
+    if (!submittedTag || isCancelling) return;
+    setIsCancelling(true);
+    try {
+      await cancelOllamaPull(submittedTag);
+    } catch {
+      // Best-effort — if this fails the pull is still tracked server-side
+      // and the user can retry cancelling.
+    } finally {
+      setIsCancelling(false);
+    }
+  }, [submittedTag, isCancelling, cancelOllamaPull]);
 
   const progressLine = submittedTag ? ollamaPullProgress[submittedTag] : undefined;
   const errorMessage = submittedTag ? ollamaPullError[submittedTag] : undefined;
@@ -59,6 +76,16 @@ export function OllamaPullForm() {
         <Button variant="primary" size="sm" onClick={() => void handlePull()} disabled={disabled}>
           {t("OllamaPullForm.pullButton")}
         </Button>
+        {isPulling && (
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => void handleCancel()}
+            disabled={isCancelling}
+          >
+            {t("OllamaPullForm.cancelButton")}
+          </Button>
+        )}
       </div>
 
       {ollamaExampleTags.length > 0 && (

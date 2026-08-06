@@ -72,6 +72,11 @@ export const BackgroundTasksPanel = lazy(() =>
     default: BackgroundTasksPanel,
   })),
 );
+export const ProcessesPanel = lazy(() =>
+  import("../components/Processes/ProcessesPanel").then(({ ProcessesPanel }) => ({
+    default: ProcessesPanel,
+  })),
+);
 export const GlobalSearch = lazy(() =>
   import("../components/Search/GlobalSearch").then(({ GlobalSearch }) => ({ default: GlobalSearch })),
 );
@@ -185,9 +190,6 @@ export const ArtifactPane = lazy(() =>
 export const FileTree = lazy(() =>
   import("../components/Workspace/FileTree").then(({ FileTree }) => ({ default: FileTree })),
 );
-export const DiffPanel = lazy(() =>
-  import("../components/Workspace/DiffPanel").then(({ DiffPanel }) => ({ default: DiffPanel })),
-);
 export const DiffViewer = lazy(() =>
   import("../components/Workspace/DiffViewer").then(({ DiffViewer }) => ({ default: DiffViewer })),
 );
@@ -201,4 +203,7 @@ export const ApprovalChainModal = lazy(() =>
 );
 export const ReviewPanel = lazy(() =>
   import("../components/Workspace/ReviewPanel").then(({ ReviewPanel }) => ({ default: ReviewPanel })),
+);
+export const StudioPanel = lazy(() =>
+  import("../components/Studio/StudioPanel").then(({ StudioPanel }) => ({ default: StudioPanel })),
 );

@@ -1,12 +1,13 @@
 import { Suspense, useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Columns2, FileDiff, FolderTree, GitPullRequest, Globe2, ListTodo, Maximize2, Minimize2, PanelRight, Plus, SquareTerminal, X } from "lucide-react";
+import { Activity, Columns2, FileDiff, FolderTree, GitPullRequest, Globe2, ListTodo, Maximize2, Minimize2, PanelRight, Plus, SquareTerminal, X } from "lucide-react";
 
 import ChatSessionList from "./components/Chat/ChatSessionList";
 import ChatWindow from "./components/Chat/ChatWindow";
 import { PrivacyFirewallGate } from "./components/Chat/PrivacyFirewallGate";
 import { AppMenu } from "./components/AppMenu";
+import { UpdateCard } from "./components/Update";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useBrowserPaneStore } from "./store/browserPaneStore";
 import { useApprovalChainStore } from "./store/approvalChainStore";
@@ -35,6 +36,8 @@ import { hydrateAutomations } from "./store/automationsStore";
 import { useOnboardingStore } from "./store/onboardingStore";
 import { startScheduler } from "./lib/scheduler";
 import { startBackupScheduler } from "./lib/backupScheduler";
+import { startUpdateWatcher } from "./lib/appUpdater";
+import { useUpdateStore } from "./store/updateStore";
 import { startSyntheticMonitoringScheduler } from "./store/syntheticMonitoringStore";
 import { useT } from "./lib/i18n";
 import {
@@ -46,9 +49,16 @@ import {
 } from "./lib/shortcuts";
 import { onRunCancellationRequested } from "./lib/runProtocol";
 import { cancelRegisteredRun } from "./lib/runCancellationRegistry";
+import { onProcessesChanged } from "./lib/processTable";
+import {
+  PENDING_SIGNAL_SWEEP_INTERVAL_MS,
+  deliverProcessSignal,
+  sweepPendingProcessSignals,
+} from "./lib/processSignalDelivery";
 import { recoverDaemonDesktopTurns } from "./lib/agentLoop";
 import { paletteClient } from "./lib/paletteClient";
 import { featurePanelReducer, type FeaturePanelId } from "./lib/appShellPanels";
+import { SegmentedControl } from "./components/ui/SegmentedControl";
 import {
   AgentInbox,
   ApiContractDiffLabPanel,
@@ -70,7 +80,6 @@ import {
   DebatePanel,
   DeepResearchWorkspacePanel,
   DesignToAppPanel,
-  DiffPanel,
   DiffViewer,
   EvalHarnessPanel,
   EvidenceBoardPanel,
@@ -85,6 +94,7 @@ import {
   OnboardingWizard,
   PermissionModal,
   PmCopilotPanel,
+  ProcessesPanel,
   ProductionDebuggingPanel,
   RedTeamLabPanel,
   ReviewPanel,
@@ -94,6 +104,7 @@ import {
   SideTaskPane,
   SopCompilerPanel,
   SpreadsheetCopilotPanel,
+  StudioPanel,
   SyntheticMonitoringPanel,
   TerminalPanel,
   TrustScorecardsPanel,
@@ -132,6 +143,7 @@ type RightTabKind =
   | "terminal"
   | "files"
   | "backgroundTasks"
+  | "processes"
   | "browser"
   | "sideTasks";
 
@@ -143,6 +155,7 @@ const RIGHT_TAB_KINDS: readonly RightTabKind[] = [
   "sideTasks",
   "files",
   "backgroundTasks",
+  "processes",
 ];
 
 const RIGHT_TAB_LABEL_KEYS: Record<RightTabKind, string> = {
@@ -153,21 +166,31 @@ const RIGHT_TAB_LABEL_KEYS: Record<RightTabKind, string> = {
   sideTasks: "App.sideTaskPaneTitle",
   files: "App.rightPanelWorkspace",
   backgroundTasks: "App.rightPanelBackgroundTasks",
+  processes: "App.rightPanelProcesses",
 };
 
 /** Null for a tab with no dedicated accelerator — the picker just omits the
  * key hint for it rather than inventing a binding. */
 const RIGHT_TAB_SHORTCUT_IDS: Record<
   RightTabKind,
-  "openReview" | "openTerminal" | "openBrowserTab" | "openFiles" | "openBackgroundTasksPanel" | "openSideTaskPane" | null
+  | "openReview"
+  | "openDiffPanel"
+  | "openTerminal"
+  | "openBrowserTab"
+  | "openFiles"
+  | "openBackgroundTasksPanel"
+  | "openSideTaskPane"
+  | "openProcessesPanel"
+  | null
 > = {
   review: "openReview",
-  diff: null,
+  diff: "openDiffPanel",
   terminal: "openTerminal",
   browser: "openBrowserTab",
   sideTasks: "openSideTaskPane",
   files: "openFiles",
   backgroundTasks: "openBackgroundTasksPanel",
+  processes: "openProcessesPanel",
 };
 
 function RightTabIcon({ kind, size }: { kind: RightTabKind; size: number }) {
@@ -185,6 +208,8 @@ function RightTabIcon({ kind, size }: { kind: RightTabKind; size: number }) {
       return <Columns2 size={size} className={className} />;
     case "files":
       return <FolderTree size={size} className={className} />;
+    case "processes":
+      return <Activity size={size} className={className} />;
     default:
       return <ListTodo size={size} className={className} />;
   }
@@ -238,7 +263,7 @@ function App() {
   );
   const closeSplit = useSessionStore((s) => s.closeSplit);
   const rootsVersion = useWorkspaceStore((s) => s.rootsVersion);
-  const refreshRoots = useWorkspaceStore((s) => s.refreshRoots);
+  const restoreRoots = useWorkspaceStore((s) => s.restoreRoots);
   const refreshRecent = useWorkspaceStore((s) => s.refreshRecent);
   const refreshModels = useModelStore((s) => s.refresh);
   const refreshOllama = useModelStore((s) => s.refreshOllama);
@@ -251,6 +276,10 @@ function App() {
   const hasCompletedOnboarding = useOnboardingStore((s) => s.hasCompletedOnboarding);
   const restartOnboarding = useOnboardingStore((s) => s.restartOnboarding);
 
+  /** Which top-level section the window is in. Chat is everything that was
+   *  here before — sessions, code, the feature panels; Studio is image and
+   *  video generation, which shares none of that state. */
+  const [section, setSection] = useState<"chat" | "studio">("chat");
   const [workspacePanelOpen, setWorkspacePanelOpen] = useState(true);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
@@ -677,6 +706,8 @@ function App() {
         openBrowser: () => toggleRightTab("browser"),
         openBrowserTab: () => openRightTab("browser"),
         openReview: () => openRightTab("review"),
+        openDiffPanel: () => openRightTab("diff"),
+        openProcessesPanel: () => openRightTab("processes"),
         openFiles: () => openRightTab("files"),
         openBackgroundTasksPanel: () => openRightTab("backgroundTasks"),
         openSideTaskPane: () => toggleRightTab("sideTasks"),
@@ -726,13 +757,16 @@ function App() {
     };
   }, [openCommandPalette]);
 
+  // Boot: reattach the folders that were open at last quit rather than just
+  // reading the (empty at process start) in-memory root list, so a session
+  // resumed after a restart can still read and edit its workspace files.
   useEffect(() => {
-    void refreshRoots();
+    void restoreRoots().catch(() => undefined);
     void refreshRecent();
     void refreshModels();
     void refreshOllama();
     void refreshProviders();
-  }, [refreshRoots, refreshRecent, refreshModels, refreshOllama, refreshProviders]);
+  }, [restoreRoots, refreshRecent, refreshModels, refreshOllama, refreshProviders]);
 
   useEffect(() => {
     void refreshRecipes();
@@ -754,9 +788,13 @@ function App() {
       startScheduler();
       const stopBackupScheduler = startBackupScheduler();
       const stopSyntheticMonitoringScheduler = startSyntheticMonitoringScheduler();
+      // Same main-window-only reasoning: a second window sharing this install
+      // would download and install the identical bundle again.
+      const stopUpdateWatcher = startUpdateWatcher(useUpdateStore.getState().check);
       return () => {
         stopBackupScheduler();
         stopSyntheticMonitoringScheduler();
+        stopUpdateWatcher();
       };
     }
     return undefined;
@@ -776,6 +814,44 @@ function App() {
     return () => {
       disposed = true;
       unlisten?.();
+    };
+  }, []);
+
+  // Durable signal intent (`process_signal`) reaches the desktop's own loops.
+  // Recording the intent and delivering it are deliberately separate — that is
+  // what lets a stop survive a restart and cross a process boundary — so
+  // something has to read the latch. The daemon does it once per tick for its
+  // jobs; this is the same read for everything the desktop owns.
+  //
+  // Every window subscribes, not just main: a chat turn's AbortController lives
+  // in the one WebView that started it, so only that window can deliver, and a
+  // miss elsewhere is a map lookup with no IPC behind it. The main window
+  // additionally owns the Rust-side kinds (background shells, workflow runs),
+  // which any window could reach and therefore exactly one should.
+  //
+  // The interval exists because `monkey processes signal` writes from a different
+  // OS process and cannot emit a Tauri event, so no listener will ever hear it —
+  // see `processSignalDelivery.ts` for why that is one indexed query rather than
+  // per-round polling.
+  useEffect(() => {
+    if (!isTauri()) return undefined;
+    const options = { ownsGlobalKinds: getCurrentWindow().label === "main" };
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void onProcessesChanged((record) => {
+      void deliverProcessSignal(record, options);
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    void sweepPendingProcessSignals(options);
+    const timer = setInterval(() => {
+      void sweepPendingProcessSignals(options);
+    }, PENDING_SIGNAL_SWEEP_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      unlisten?.();
+      clearInterval(timer);
     };
   }, []);
 
@@ -889,8 +965,27 @@ function App() {
           above the chat input (see ChatWindow). */}
       <aside className="app-session-sidebar flex shrink-0 flex-col border-r border-border bg-surface">
         <div data-tauri-drag-region className="h-11 shrink-0" />
-        <div className="min-h-0 flex-1 overflow-y-auto [overscroll-behavior:contain]">
-          <ChatSessionList />
+        {/* Section switcher. Below the drag strip rather than inside it, so
+            clicking a segment never starts a window drag. */}
+        <div className="px-2 pb-2">
+          <SegmentedControl
+            ariaLabel={t("App.section.switcher")}
+            active={section}
+            onChange={setSection}
+            items={[
+              { id: "chat", label: t("App.section.chat") },
+              { id: "studio", label: t("App.section.studio") },
+            ]}
+          />
+        </div>
+        {/* `relative` so the update card can float over the bottom of the
+            session list (Claude Desktop places it exactly there) instead of
+            pushing the list up when an update lands mid-scroll. */}
+        <div className="relative min-h-0 flex-1">
+          <div className="h-full overflow-y-auto [overscroll-behavior:contain]">
+            <ChatSessionList />
+          </div>
+          <UpdateCard />
         </div>
         <AppMenu
           onOpenSettings={() => openFeaturePanel("settings")}
@@ -968,7 +1063,9 @@ function App() {
           }
         >
           <Suspense fallback={<LazyPanelFallback />}>
-            {globalSearchOpen ? (
+            {section === "studio" ? (
+              <StudioPanel />
+            ) : globalSearchOpen ? (
               <GlobalSearch
                 onClose={() => closeFeaturePanel("global-search")}
                 onOpenRun={(runId) => {
@@ -1114,6 +1211,7 @@ function App() {
                 onOpenSettingsTab={openSettingsTab}
                 headerActionsSlot={chatHeaderActionsEl}
                 onOpenBackgroundTasks={openBackgroundTasksPanel}
+                onOpenPmCopilot={() => openFeaturePanel("pm-copilot")}
               />
             )}
           </Suspense>
@@ -1150,6 +1248,7 @@ function App() {
                   onManagePrompts={handleManagePrompts}
                   onOpenSettingsTab={openSettingsTab}
                   onOpenBackgroundTasks={openBackgroundTasksPanel}
+                  onOpenPmCopilot={() => openFeaturePanel("pm-copilot")}
                 />
               )}
             </Suspense>
@@ -1299,9 +1398,12 @@ function App() {
                 {rightTabs.map((kind) => (
                   <div key={kind} className={`absolute inset-0 ${kind === activeRightTab ? "flex flex-col" : "hidden"}`}>
                     {kind === "review" ? (
-                      <ReviewPanel onClose={() => closeRightTab("review")} />
+                      <ReviewPanel onClose={() => closeRightTab("review")} view="continuous" />
                     ) : kind === "diff" ? (
-                      <DiffPanel onClose={() => closeRightTab("diff")} />
+                      // Same component: the standalone Diff panel folded into
+                      // ReviewPanel, whose "working" base and "single" view are
+                      // exactly what it did. Both tabs and both shortcuts stay.
+                      <ReviewPanel onClose={() => closeRightTab("diff")} view="single" />
                     ) : kind === "sideTasks" ? (
                       // Side tasks are CONVERSATIONS, so this tab hosts the
                       // whole pane — its own task tab strip and its composer —
@@ -1332,6 +1434,8 @@ function App() {
                       />
                     ) : kind === "backgroundTasks" ? (
                       <BackgroundTasksPanel sessionId={activeSessionId} onClose={() => closeRightTab("backgroundTasks")} />
+                    ) : kind === "processes" ? (
+                      <ProcessesPanel onClose={() => closeRightTab("processes")} />
                     ) : (
                       <div className={`flex h-full flex-col ${workspacePanelOpen ? "w-full" : "w-12"}`}>
                         <div className="flex h-9 shrink-0 items-center justify-between gap-1 border-b border-border px-3">
@@ -1478,6 +1582,19 @@ function App() {
               {runningBackgroundTaskCount > 9 ? "9+" : runningBackgroundTaskCount}
             </span>
           )}
+        </IconButton>
+        {/* Deliberately its own toggle rather than a section inside Background
+            tasks: that panel is scoped to what THIS session started, while the
+            process table is every kind across every window, the daemon, and the
+            CLI — the two answer different questions. */}
+        <IconButton
+          size="sm"
+          variant={rightTabShowing("processes") ? "active" : "ghost"}
+          onClick={() => toggleRightTab("processes")}
+          aria-label={rightTabShowing("processes") ? t("App.closeProcesses") : t("App.openProcesses")}
+          title={rightTabShowing("processes") ? t("App.closeProcesses") : t("App.openProcesses")}
+        >
+          <Activity size={15} />
         </IconButton>
         {/* Only present while the right region has something to fullscreen
             — mirrors the reference layout, where this button appears

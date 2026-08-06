@@ -332,6 +332,130 @@ describe("runSideTask / pause and resume", () => {
     expect(attemptStreamMock).toHaveBeenCalledTimes(2);
     expect(useSideTaskStore.getState().tasks[record.id].status).toBe("completed");
   });
+
+  it("an inbound pause (mirroring App.tsx's process-table fan-in calling pauseSideTask directly) marks the process suspended, then running again on resume", async () => {
+    // Every other test in this file leaves `process_admit`/`process_transition`
+    // unhandled (the default `vi.fn()` resolves `undefined`), which makes
+    // `admitProcess` catch a `TypeError` and resolve `null` — so this is the
+    // one test that gives `waitUntilResumed` a real process id to actually
+    // transition, exercising the path the others silently no-op through.
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "process_admit") return { processId: "p-side-task-test" };
+      return undefined;
+    });
+
+    let releaseFirst!: () => void;
+    attemptStreamMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseFirst = () =>
+            resolve({ content: "", toolCalls: [toolCall("read_file")], streamError: null, contentStarted: true });
+        }),
+    );
+    attemptStreamMock.mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("ok");
+    const record = seedTask();
+
+    const run = runSideTask(record.id);
+    await vi.waitFor(() => expect(useSideTaskStore.getState().tasks[record.id].status).toBe("running"));
+    pauseSideTask(record.id);
+    releaseFirst();
+
+    await vi.waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "process_transition",
+        expect.objectContaining({
+          args: expect.objectContaining({ processId: "p-side-task-test", state: "suspended" }),
+        }),
+      ),
+    );
+    expect(executeToolCallMock).not.toHaveBeenCalled();
+
+    resumeSideTask(record.id);
+    await run;
+
+    expect(invokeMock).toHaveBeenCalledWith(
+      "process_transition",
+      expect.objectContaining({
+        args: expect.objectContaining({ processId: "p-side-task-test", state: "running" }),
+      }),
+    );
+    expect(useSideTaskStore.getState().tasks[record.id].status).toBe("completed");
+
+    invokeMock.mockReset();
+  });
+});
+
+/**
+ * A side task is the one desktop kind whose `suspend` is honoured, so it is the
+ * one whose pause has to reach the process table: the latch is acknowledged by
+ * the record's *state*, which means a pause the table never hears about would be
+ * re-delivered by every sweep forever (see `processSignalDelivery.ts`).
+ *
+ * Both store actions are guarded no-ops, so the projection has to follow what the
+ * store actually did rather than what was asked for.
+ */
+describe("pause and resume project onto the process table", () => {
+  function transitionsFor(processId: string): string[] {
+    return invokeMock.mock.calls
+      .filter(([command]) => command === "process_transition")
+      .map(([, payload]) => payload as { args: { processId: string; state: string } })
+      .filter(({ args }) => args.processId === processId)
+      .map(({ args }) => args.state);
+  }
+
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    invokeMock.mockReset();
+    invokeMock.mockImplementation((command: string) =>
+      command === "process_admit"
+        ? Promise.resolve({ processId: "proc-side-1" })
+        : Promise.resolve(undefined),
+    );
+  });
+
+  it("records suspended on pause and running again on resume", async () => {
+    let releaseFirst!: () => void;
+    attemptStreamMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseFirst = () =>
+            resolve({ content: "", toolCalls: [toolCall("read_file")], streamError: null, contentStarted: true });
+        }),
+    );
+    attemptStreamMock.mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("ok");
+    const record = seedTask();
+
+    const run = runSideTask(record.id);
+    await vi.waitFor(() => expect(invokeMock).toHaveBeenCalledWith("process_admit", expect.anything()));
+    await vi.waitFor(() => expect(useSideTaskStore.getState().tasks[record.id].status).toBe("running"));
+
+    pauseSideTask(record.id);
+    await vi.waitFor(() => expect(transitionsFor("proc-side-1")).toContain("suspended"));
+
+    resumeSideTask(record.id);
+    releaseFirst();
+    await run;
+
+    // running (admit) -> suspended (pause) -> running (resume) -> exited.
+    expect(transitionsFor("proc-side-1")).toEqual(["running", "suspended", "running", "exited"]);
+  });
+
+  it("does not record a suspension the store refused", async () => {
+    // `pause` ignores a task that is not running, and projecting anyway would
+    // acknowledge a signal with nothing behind it.
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    const record = seedTask();
+    await runSideTask(record.id);
+
+    pauseSideTask(record.id);
+
+    expect(transitionsFor("proc-side-1")).not.toContain("suspended");
+    expect(useSideTaskStore.getState().tasks[record.id].status).toBe("completed");
+  });
 });
 
 describe("startSideTask / doesn't block the caller", () => {

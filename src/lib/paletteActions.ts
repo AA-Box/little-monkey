@@ -246,6 +246,10 @@ export async function runSearchKnowledge(
     roots,
     permissionMode: usePermissionStore.getState().mode,
     workspaceAccess: "read_only",
+    // Declared rather than defaulted to `false`: this run queries a knowledge
+    // stack, whose retrieval can reach a cloud embedding provider. Omitting the
+    // flag froze a permission the run could then contradict.
+    allowNetwork: target.kind === "provider" || (target.kind === "ollama" && target.isCloud === true),
   });
   try {
     const response = await useKnowledgeV2Store

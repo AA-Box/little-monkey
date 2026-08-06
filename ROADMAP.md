@@ -13,6 +13,12 @@ README. "Partially built" entries name the shipped part honestly, because a
 half-built feature that the README already describes is still roadmap work
 for the remainder — not a done item.
 
+For the same work viewed as OS subsystems — process model, enforced isolation,
+scheduling, and a versioned platform contract — see
+[docs/agent-os-roadmap.md](docs/agent-os-roadmap.md). It cross-references the
+items below rather than duplicating them, and adds the kernel-level gaps that
+have no entry here.
+
 ---
 
 ## 1. Policy-driven model routing
@@ -110,10 +116,14 @@ the requested split.
 
 ## 8. Updater and release hardening
 
-**Today:** no updater exists at all. Signing is macOS-only. Ten locales are
-each missing the same ~650 of 1,726 keys (they fall back to English at
-runtime). There is no dependency scanning, SBOM, accessibility CI, or
-penetration test.
+**Today:** the in-app updater ships on all three desktop platforms — background
+checks, a staged bundle, a relaunch card, and Windows deferring its installer to
+the click so an update cannot kill a turn mid-flight — and releases publish
+themselves once every matrix target has uploaded. What is missing: rollback, a
+manual check control, a visible failed check, Linux coverage beyond the AppImage,
+and a startup self-integrity check. Signing is macOS-only. Ten locales are each
+missing the same ~650 of 1,726 keys (they fall back to English at runtime). There
+is no dependency scanning, SBOM, accessibility CI, or penetration test.
 
 **Acceptance:** signed, verifiable in-app updates with rollback on every
 supported platform; signed/notarized installers per platform; clean-machine
@@ -131,9 +141,6 @@ These are not features, but they change what shipping the above costs.
   invoked) runs in parallel with Knowledge 2.0 (`knowledge_v*`). Retrieval
   changes must be duplicated or a user's results depend on which path their
   stack happens to use.
-- **Red-Team Lab tests a mirror.** Its fixtures exercise a copy of the tool
-  loop rather than the live pipeline, so the two can drift apart while the
-  lab stays green. Acceptance: fixtures drive the real pipeline.
 
 ---
 

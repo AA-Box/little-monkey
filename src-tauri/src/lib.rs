@@ -38,7 +38,18 @@ pub mod m5_delivery;
 // the same validation, cancellation, residency, and scheduling semantics.
 pub mod runtime_adapter;
 // Verified app-owned llama.cpp runtime shared by desktop, CLI, and M3.
+// Model-agnostic image and video generation over the managed
+// stable-diffusion.cpp runtime. Tauri-free so the CLI can share it.
+pub mod generation;
+mod generation_commands;
 pub mod managed_runtime;
+// The stack registry and the embedding path, shared by v1 Knowledge Stacks
+// (`stacks`) and Knowledge 2.0 (`knowledge_service`/`knowledge_pipeline`).
+// Extracted out of `stacks` so that nothing shared lives in the module the v1→v2
+// collapse is going to delete. v2's call sites still reach it *through* `stacks`'s
+// re-export, so the dependency is broken structurally and not yet in fact — see
+// this module's own doc for the repointing that step needs.
+pub mod knowledge_core;
 // Knowledge Stacks 2.0 contracts and generation-based hybrid index. Kept
 // Tauri-free so desktop, daemon, CLI workflows, and connector packages share
 // the same hostile-input and citation semantics.
@@ -199,6 +210,29 @@ mod tools;
 // Long-running agent shell commands that outlive the turn that started them
 // (`run_shell` with `run_in_background: true`) — see `background_shell.rs`.
 pub mod background_shell;
+// Real OS suspend/resume of a process group this app owns, shared by the
+// daemon's job runner and by `background_shell.rs`.
+pub mod os_signal;
+// Kernel-enforced ceilings on a spawned child (`setrlimit` via `pre_exec`), as
+// opposed to `os_signal`'s cooperative teardown. Sits beside it because the two
+// are the same concern from opposite ends: one bounds a child the kernel holds to
+// it, the other ends one this app is still watching.
+pub mod os_limits;
+// One bound on how much captured subprocess output may reach a model. Shared by
+// `tools.rs` and `verify.rs` so the two command runners cannot drift on the
+// number, the truncation direction, or the marker.
+pub mod output_cap;
+// Shared outbound-network primitives. Small on purpose: four independent SSRF
+// guards already exist, and this holds only the narrow rules all four need to
+// agree on. See `egress.rs` for why unifying their blocklists is a separate,
+// riskier change.
+pub mod denial_sink;
+pub mod egress;
+// The run a piece of work belongs to, carried as a `tokio::task_local!` rather
+// than threaded through signatures that have no other reason to hold it. See
+// `run_scope.rs` for why a thread-local would be a correctness bug here and not
+// merely a lossy shortcut.
+pub mod run_scope;
 // `pub` (unlike `sessions`/`tools`/`system`/`models`/`git`/`llama` above) so
 // `monkey-cli` (Plan/Act + risk-adaptive permissions design doc, phase 4) can
 // call `permissions::path_risk_floor` directly for its own floor-only
@@ -239,6 +273,17 @@ pub mod run_protocol;
 // idempotency, leases, triggers, and the migration-controlled profile schema.
 // Like the protocol module, this remains reusable by non-Tauri clients.
 pub mod run_ledger;
+// The one process abstraction shared by every execution surface — desktop
+// turns, daemon jobs, subagents, crew members, workflow runs/nodes, remote
+// runs, background shells, side tasks. Public for the same reason the two
+// modules above are: the CLI's `monkey ps` and the daemon both read it, and
+// neither should grow a second copy of the state machine.
+pub mod process_table;
+mod process_commands;
+// Policy shared by the two HTTP listeners, which default to the same port and
+// today report a bare "address already in use" naming neither the winner nor
+// the reason. Where the shared pieces accumulate as D1 collapses them into one.
+pub mod http_policy;
 // Migration-controlled authoritative profile/session/search storage. Kept
 // reusable by the desktop, CLI, daemon, export/import, and restore paths.
 pub mod portability;
@@ -307,6 +352,10 @@ use tauri::Manager;
 /// `LlamaState::default()` for both) can't express. See the manual `impl
 /// Default for AppState` below.
 pub struct AppState {
+    /// The one `sd-server` behind Studio's image and video generation. Its
+    /// weight set is bound at launch, so switching models restarts it; see
+    /// `generation::GenerationEngineState`.
+    pub generation_engine: generation::GenerationEngineState,
     pub llama: std::sync::Mutex<llama::LlamaState>,
     /// The second, embeddings-only managed `llama-server` instance (port
     /// 8091, started with `--embeddings --pooling mean`) used by
@@ -316,6 +365,18 @@ pub struct AppState {
     /// the same server slot. See `llama::embed_server_start`.
     pub embed_llama: std::sync::Mutex<llama::LlamaState>,
     pub ollama: std::sync::Mutex<ollama::OllamaState>,
+    /// In-flight `ollama pull`/`ollama create` child processes, keyed by tag
+    /// (or short name) — lets `ollama::ollama_cancel_pull` kill a pull the
+    /// user started. See `ollama::ollama_pull_model`.
+    pub ollama_pulls: std::sync::Mutex<std::collections::HashMap<String, tokio::process::Child>>,
+    /// Cancellation handles for in-flight `models_download` calls, keyed by
+    /// the destination file name — mirrors `index_cancels`/`ollama_pulls`,
+    /// but a `CancellationToken` rather than a killable child process since
+    /// the download is an in-process `reqwest` stream. See
+    /// `models::models_cancel_download`.
+    pub model_downloads: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    >,
     /// Attached workspace folders, primary first. Empty means no workspace
     /// is open. See `workspace.rs`.
     pub workspace_roots: std::sync::Mutex<Vec<workspace::WorkspaceRoot>>,
@@ -355,6 +416,20 @@ pub struct AppState {
     /// the other pane's turn is still running.
     pub tool_cancel:
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
+    /// Process-group ids of the foreground `tool_run_shell` children each turn
+    /// currently owns, keyed the same way `tool_cancel` is (the owning turn's
+    /// id, empty string for callers that don't thread one).
+    ///
+    /// This is what makes suspending a chat turn honest. The turn's own
+    /// cooperative pause only lands at the loop's next safe point, so a
+    /// twenty-minute `run_shell` would otherwise keep burning CPU for twenty
+    /// minutes after the user asked for a pause. Suspending the turn SIGSTOPs
+    /// these groups immediately, and resuming SIGCONTs them — see
+    /// `process_commands::process_signal`. Entries are removed the moment the
+    /// child is reaped, so a pid is never signalled after the kernel could
+    /// have reused it.
+    pub shell_process_groups:
+        std::sync::Mutex<std::collections::HashMap<String, tools::TurnShellGroups>>,
     /// Serializes `memories.json` read-modify-write cycles (see `memory.rs`)
     /// so two concurrent split-pane `tool_remember` calls can never race and
     /// clobber each other's fact — the whole file is rewritten on every add
@@ -574,9 +649,12 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         AppState {
+            generation_engine: Default::default(),
             llama: Default::default(),
             embed_llama: std::sync::Mutex::new(llama::LlamaState::for_embeddings()),
             ollama: Default::default(),
+            ollama_pulls: Default::default(),
+            model_downloads: Default::default(),
             workspace_roots: Default::default(),
             terminal: Default::default(),
             background_shell: Default::default(),
@@ -585,6 +663,7 @@ impl Default for AppState {
             checkpoints: Default::default(),
             checkpoint_locks: Default::default(),
             tool_cancel: Default::default(),
+            shell_process_groups: Default::default(),
             memory_lock: Default::default(),
             mcp_config_lock: Default::default(),
             connectors_config_lock: Default::default(),
@@ -617,6 +696,18 @@ impl Default for AppState {
 pub fn run() {
     let app_data_dir = app_paths::data_dir()
         .expect("the operating system must provide an application data directory");
+    // Installed before anything that can refuse an outbound request, and the only
+    // initialization here that is deliberately NOT an `expect`. Every neighbour on
+    // this list is a capability the app needs to work; this one only writes refusals
+    // down. A machine that cannot open it should lose the audit trail, not the
+    // application — and it cannot fail *open*, because no guard consults the sink to
+    // decide anything. See `denial_sink`'s module doc.
+    match denial_sink::DenialSink::open(app_data_dir.join(denial_sink::SINK_FILE)) {
+        Ok(sink) => denial_sink::install(sink),
+        Err(error) => {
+            eprintln!("egress denials will not be recorded this session: {error}");
+        }
+    }
     let m3_state = m3_production::build_m3_command_state(&app_data_dir)
         .expect("failed to initialize the local runtime and API hub");
     let quantization_state = m3_production::build_quantization_command_state(&app_data_dir)
@@ -713,6 +804,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(global_shortcuts)
         .manage(AppState::default())
         .manage(m3_state)
@@ -824,6 +917,59 @@ pub fn run() {
                 }
             });
 
+            // A previous session's chat turns, subagents, crew members,
+            // background shells and side tasks died with that process, so any
+            // still marked live in the process table are stale. Reaped here,
+            // before any new turn can admit one, and scoped to the kinds this
+            // app owns so live daemon work is never declared lost.
+            {
+                let reap_app = app.handle().clone();
+                let reap_state = reap_app.state::<AppState>();
+                process_commands::reap_desktop_processes_at_startup(&reap_app, reap_state.inner());
+            }
+
+            // Reclaim browser sessions nothing is driving any more. Before this,
+            // a session was bounded only inside `begin_action`, which an agent
+            // reaches only while it is actively driving the page — so an
+            // abandoned Chromium was never re-examined, its session clock could
+            // not fire, and a Chromium that died on its own left a session still
+            // reporting itself alive.
+            //
+            // `spawn_blocking` because the loop sleeps between passes. The stop
+            // flag is a `static` rather than app state: this is process-lifetime
+            // work, and the flag exists so the loop can be ended in a test
+            // without waiting out an interval.
+            {
+                static BROWSER_WATCHDOG_STOP: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                let watchdog_app = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let state = watchdog_app.state::<browser_worker::BrowserCommandState>();
+                    browser_worker::run_browser_watchdog(
+                        state.inner(),
+                        browser_worker::BROWSER_WATCHDOG_INTERVAL,
+                        &BROWSER_WATCHDOG_STOP,
+                        |result| match result {
+                            // Reclaiming is the system working, so it is worth a
+                            // line: a user whose browser tab vanished should be
+                            // able to find out why from the log.
+                            Ok(reclaimed) => {
+                                for outcome in reclaimed {
+                                    eprintln!(
+                                        "browser watchdog: reclaimed session {} of run {} ({:?})",
+                                        outcome.session_id, outcome.run_id, outcome.reason
+                                    );
+                                }
+                            }
+                            // Never fatal to the loop. A poisoned registry lock
+                            // that ended the watchdog would leak every session
+                            // opened afterwards.
+                            Err(error) => eprintln!("browser watchdog: sweep failed: {error}"),
+                        },
+                    );
+                });
+            }
+
             // A persisted M3 policy represents an explicit user opt-in. Start
             // its separate, capability-scoped compatibility listener without
             // blocking app launch; failures remain visible in Runtime Hub.
@@ -883,6 +1029,7 @@ pub fn run() {
             ollama::ollama_unload_model,
             ollama::ollama_example_cloud_tags,
             ollama::ollama_pull_model,
+            ollama::ollama_cancel_pull,
             ollama::ollama_import_model,
             ollama::ollama_create_from_modelfile,
             ollama::ollama_remove_model,
@@ -913,12 +1060,27 @@ pub fn run() {
             models::models_list_curated,
             models::models_list_installed,
             models::models_download,
+            models::models_cancel_download,
             models::models_resolve_reference,
             models::models_install_reference,
             models::models_delete,
             models::models_add_external,
             models::models_remove_external,
+            process_commands::process_list,
+            process_commands::process_get,
+            process_commands::process_descendants,
+            process_commands::process_live_counts,
+            process_commands::process_admit,
+            process_commands::process_reconcile,
+            process_commands::process_signal,
+            process_commands::process_signal_support,
+            process_commands::process_pending_signals,
+            process_commands::process_deliver_os_signal,
+            process_commands::process_transition,
+            process_commands::process_link_run,
+            process_commands::process_reap_missing,
             permissions::permission_respond,
+            permissions::permission_dry_run,
             permissions::set_permission_mode,
             permissions::set_permission_mode_for_turn,
             permissions::clear_permission_mode_for_turn,
@@ -1009,6 +1171,7 @@ pub fn run() {
             workspace::add_secondary_workspace_root,
             workspace::remove_secondary_workspace_root,
             workspace::get_workspace_roots,
+            workspace::restore_workspace_roots,
             workspace::get_recent_workspaces,
             git::git_status,
             git::git_commit,
@@ -1098,6 +1261,7 @@ pub fn run() {
             run_commands::run_events,
             run_commands::run_integrity_check,
             sandbox::sandbox_run,
+            sandbox::sandbox_enforcement_probe,
             sandbox::sandbox_list,
             sandbox::sandbox_diff,
             sandbox::sandbox_prepare_promote,
@@ -1316,6 +1480,25 @@ pub fn run() {
             m7_companion::m7_transcribe_audio,
             m7_companion::m7_tts_speak,
             m7_companion::m7_job_cancel,
+            generation_commands::generation_engine_status,
+            generation_commands::generation_models,
+            generation_commands::generation_add_model,
+            generation_commands::generation_remove_model,
+            generation_commands::generation_accept_license,
+            generation_commands::generation_download_model,
+            generation_commands::generation_cancel_download,
+            generation_commands::generation_parts,
+            generation_commands::generation_add_part,
+            generation_commands::generation_remove_part,
+            generation_commands::generation_loras,
+            generation_commands::generation_add_lora,
+            generation_commands::generation_remove_lora,
+            generation_commands::generation_run,
+            generation_commands::generation_cancel,
+            generation_commands::generation_gallery,
+            generation_commands::generation_delete_entry,
+            generation_commands::generation_media_data_url,
+            generation_commands::generation_unload_engine,
             m7_companion::m7_image_generate,
             m7_companion::m7_image_gallery,
             m7_companion::m7_image_data_url,

@@ -3,8 +3,11 @@ import { describe, expect, it } from "vitest";
 import type { ToolCall } from "../../lib/llamaClient";
 import { protectToolResult } from "../../lib/untrustedContent";
 import {
+  activityCallCommandLine,
+  activityCallCopyText,
   activityCallDiff,
   activityCallSubject,
+  activityDiffStat,
   activityProgress,
   capActivityText,
   formatActivityResult,
@@ -76,25 +79,41 @@ describe("groupAssistantRound", () => {
 });
 
 describe("summarizeActivity", () => {
-  it("writes a compact human summary in the original action order", () => {
+  it("names each file once, listing every action taken on it", () => {
+    const calls = [
+      activity("edit_file", { path: "src/process_table.rs" }),
+      activity("read_file", { path: "src/process_table.rs" }),
+      activity("run_shell", { command: "cargo build" }),
+      activity("run_shell", { command: "cargo test" }),
+      activity("run_shell", { command: "cargo clippy" }),
+    ];
+    expect(summarizeActivity(calls)).toBe("Edited and read process_table.rs, ran 3 commands");
+  });
+
+  it("folds a file's actions together however far apart the calls were", () => {
+    const calls = [
+      activity("read_file", { path: "a.ts" }),
+      activity("run_shell", { command: "pnpm test" }),
+      activity("edit_file", { path: "a.ts" }),
+      activity("run_shell", { command: "pnpm lint" }),
+    ];
+    expect(summarizeActivity(calls)).toBe("Read and edited a.ts, ran 2 commands");
+  });
+
+  it("falls back to counts once too many files to name were touched", () => {
     const calls = [
       activity("read_file", { path: "a.ts" }),
       activity("read_file", { path: "b.ts" }),
       activity("read_file", { path: "c.ts" }),
+      activity("read_file", { path: "d.ts" }),
       activity("run_shell", { command: "pnpm test" }),
-      activity("edit_file", { path: "a.ts" }),
-      activity("write_file", { path: "b.ts" }),
     ];
-    expect(summarizeActivity(calls)).toBe("Read 3 files, ran a command, edited 2 files");
+    expect(summarizeActivity(calls)).toBe("Read 4 files, ran a command");
   });
 
-  it("does not merge actions that happened on opposite sides of another action", () => {
-    const calls = [
-      activity("read_file"),
-      activity("run_shell"),
-      activity("read_file"),
-    ];
-    expect(summarizeActivity(calls)).toBe("Read a file, ran a command, read a file");
+  it("counts unnamed files rather than dropping them from the summary", () => {
+    expect(summarizeActivity([activity("read_file"), activity("run_shell"), activity("read_file")]))
+      .toBe("Read 2 files, ran a command");
   });
 
   it("never describes pending or failed file mutations as completed edits", () => {
@@ -104,7 +123,7 @@ describe("summarizeActivity", () => {
       { ...activity("write_file", { path: "pending.ts" }), result: undefined },
     ];
     expect(summarizeActivity(calls)).toBe(
-      "Edited a file, attempted a file edit, proposed a file edit",
+      "Edited done.ts, tried to edit failed.ts, proposed edits to pending.ts",
     );
   });
 });
@@ -209,5 +228,45 @@ describe("activity detail helpers", () => {
     expect(liveActivityLabel("read_file")).toBe("Reading files");
     expect(liveActivityLabel("edit_file")).toBe("Editing files");
     expect(liveActivityLabel("run_shell")).toBe("Running a command");
+  });
+});
+
+describe("activityDiffStat", () => {
+  it("counts applied mutation lines and ignores failed, pending and non-mutating calls", () => {
+    const calls: ActivityCall[] = [
+      activity("edit_file", { path: "a.rs", old_string: "one\ntwo", new_string: "1\n2\n3" }),
+      activity("write_file", { path: "b.rs", content: "x\ny\n" }),
+      activity("run_shell", { command: "cargo test" }),
+      { ...activity("edit_file", { path: "c.rs", old_string: "keep", new_string: "gone" }), result: undefined },
+      {
+        ...activity("edit_file", { path: "d.rs", old_string: "keep", new_string: "gone" }),
+        result: protectToolResult("edit_file", JSON.stringify({ error: "no match" })),
+      },
+    ];
+
+    expect(activityDiffStat(calls)).toEqual({ added: 5, removed: 2 });
+    expect(activityDiffStat([])).toEqual({ added: 0, removed: 0 });
+  });
+});
+
+describe("activityCallCommandLine", () => {
+  it("renders a shell call as the command itself", () => {
+    expect(activityCallCommandLine({ id: "c1", name: "run_shell", args: '{"command":"pnpm test"}' })).toBe("$ pnpm test");
+  });
+
+  it("renders any other call as its label plus subject", () => {
+    expect(activityCallCommandLine({ id: "c1", name: "read_file", args: '{"path":"src/a.ts"}' })).toBe("Read file src/a.ts");
+  });
+});
+
+describe("activityCallCopyText", () => {
+  it("copies the command line and the call's output", () => {
+    expect(
+      activityCallCopyText({ id: "c1", name: "run_shell", args: '{"command":"pnpm test"}', result: "2667 passed" }),
+    ).toBe("$ pnpm test\n\n2667 passed");
+  });
+
+  it("copies just the command line while the call is still in flight", () => {
+    expect(activityCallCopyText({ id: "c1", name: "read_file", args: '{"path":"src/a.ts"}' })).toBe("Read file src/a.ts");
   });
 });

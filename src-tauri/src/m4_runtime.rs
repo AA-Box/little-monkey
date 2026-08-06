@@ -39,6 +39,8 @@ use crate::package_ecosystem::{
     signed_first_party_catalog, InstallEnvironment, InstallTrustPolicy, PackageLimits,
     RingEd25519SignatureVerifier, SemanticVersion, FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS,
 };
+use crate::process_table::{LedgerProcessProjector, LedgerSignalSource};
+use crate::run_scope::{RunScope, Unattributed};
 use crate::workflow_core::{
     ArtifactReference, DaemonCapability, EffectClass, FailureClass, LegacyRecipeV1,
     NodeAdapterResult, NodeExecutionRequest, ResourceUsage, SecretBinding,
@@ -472,7 +474,24 @@ async fn bounded_response_bytes(response: reqwest::Response) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
-fn run_async_worker<T, F>(label: &str, future: F) -> Result<T, String>
+/// Bridges this module's synchronous adapters into async work, under a stated
+/// [`RunScope`].
+///
+/// # Why the scope has to be a parameter here
+///
+/// This is the one place in M4 where sync code enters async code, and it does so by
+/// spawning a **fresh OS thread with a fresh current-thread runtime**. A
+/// `tokio::task_local!` follows a task, and the task this blocks on is created here —
+/// so there is no ambient scope for it to inherit no matter what the caller was
+/// running under. Reading `run_scope::current()` inside `future` without this wrapper
+/// would therefore always answer `None`, and every egress M4 performs would record as
+/// "nobody told us" rather than as the run that paid for it.
+///
+/// Making it a required parameter rather than an `Option` is the point: all eight call
+/// sites are forced to answer "whose work is this?", and the two answers are the two
+/// arms of [`RunScope`] — a run id, or an explicitly named reason there is none. That
+/// is D3's acceptance criterion applied at the only boundary that can honour it.
+fn run_async_worker<T, F>(label: &str, scope: RunScope, future: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: std::future::Future<Output = Result<T, String>> + Send + 'static,
@@ -486,7 +505,7 @@ where
                 .enable_all()
                 .build()
                 .map_err(|e| format!("create {thread_label} runtime: {e}"))?;
-            runtime.block_on(future)
+            runtime.block_on(crate::run_scope::scoped(scope, future))
         })
         .map_err(|e| format!("start {label} worker: {e}"))?
         .join()
@@ -499,6 +518,21 @@ pub struct ReqwestOAuthTransport {
 }
 
 impl ReqwestOAuthTransport {
+    /// The scope every one of this transport's three operations runs under.
+    ///
+    /// Connector OAuth is authorized by a person in Settings — they click connect,
+    /// reconnect, or disconnect — and `mcp_app_core`'s three call sites are all on that
+    /// path. So this work is unattributed on purpose, not by omission.
+    ///
+    /// It is a constant rather than a parameter because [`OAuthTransport`] fixes these
+    /// signatures and none of them carries a run id. That is a real ceiling: if a token
+    /// refresh is ever driven from *inside* a run — which is plausible, since an MCP
+    /// call mid-run can find an expired token — the refresh would still record as a
+    /// user action. Fixing that means giving the trait a scope, which is a change to
+    /// every implementor including the two test doubles, so it waits until a caller
+    /// actually needs it.
+    const CONNECTOR_SCOPE: RunScope = RunScope::Unattributed(Unattributed::UserAction);
+
     pub fn new() -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -554,7 +588,7 @@ impl OAuthTransport for ReqwestOAuthTransport {
             ("redirect_uri", request.redirect_uri),
             ("code_verifier", request.pkce_verifier.expose().to_string()),
         ];
-        run_async_worker("oauth-code-exchange", async move {
+        run_async_worker("oauth-code-exchange", Self::CONNECTOR_SCOPE, async move {
             let response = client
                 .post(request.token_endpoint)
                 .form(&form)
@@ -585,7 +619,7 @@ impl OAuthTransport for ReqwestOAuthTransport {
                 scopes.iter().cloned().collect::<Vec<_>>().join(" "),
             ),
         ];
-        run_async_worker("oauth-refresh", async move {
+        run_async_worker("oauth-refresh", Self::CONNECTOR_SCOPE, async move {
             let response = client
                 .post(request.token_endpoint)
                 .form(&form)
@@ -611,7 +645,7 @@ impl OAuthTransport for ReqwestOAuthTransport {
             ("client_id", client_id.to_string()),
             ("token", token.expose().to_string()),
         ];
-        run_async_worker("oauth-revoke", async move {
+        run_async_worker("oauth-revoke", Self::CONNECTOR_SCOPE, async move {
             let response = client
                 .post(endpoint)
                 .form(&form)
@@ -1127,9 +1161,10 @@ impl ProductionWorkflowNodeExecutor {
         model: String,
         prompt: String,
         bearer: Option<String>,
+        scope: RunScope,
     ) -> Result<(String, ResourceUsage), String> {
         let client = self.http.clone();
-        run_async_worker("workflow-model", async move {
+        run_async_worker("workflow-model", scope, async move {
             let ollama = endpoint.ends_with(":11434") || endpoint.contains(":11434/");
             let url = if ollama {
                 format!("{}/api/chat", endpoint.trim_end_matches('/'))
@@ -1196,14 +1231,17 @@ impl ProductionWorkflowNodeExecutor {
         })
     }
 
-    fn default_ollama_model(&self) -> Result<String, String> {
+    /// Model discovery on behalf of a run is that run's egress — it is a request to
+    /// Ollama that happens because the run asked for a model it did not name — so it
+    /// takes the same scope rather than defaulting to unattributed.
+    fn default_ollama_model(&self, scope: RunScope) -> Result<String, String> {
         if let Ok(model) = std::env::var("LITTLE_MONKEY_WORKFLOW_MODEL") {
             if !model.trim().is_empty() {
                 return Ok(model);
             }
         }
         let client = self.http.clone();
-        run_async_worker("workflow-model-discovery", async move {
+        run_async_worker("workflow-model-discovery", scope, async move {
             let response = client
                 .get(format!("{}/api/tags", crate::ollama::OLLAMA_BASE_URL))
                 .send()
@@ -1233,8 +1271,9 @@ impl ProductionWorkflowNodeExecutor {
         profile: &str,
         prompt: &str,
         subagent: bool,
+        scope: RunScope,
     ) -> Result<NodeAdapterResult, String> {
-        let model = self.default_ollama_model()?;
+        let model = self.default_ollama_model(scope.clone())?;
         let role = if subagent {
             "bounded subagent"
         } else {
@@ -1254,6 +1293,7 @@ impl ProductionWorkflowNodeExecutor {
             model,
             prompt,
             None,
+            scope,
         ) {
             Ok((content, usage)) => Ok(Self::success(WorkflowValue::String(content), usage)),
             Err(error) => Ok(Self::failure(FailureClass::Transient, error, true)),
@@ -1279,7 +1319,8 @@ impl ProductionWorkflowNodeExecutor {
         let tool = tool_name.to_string();
         let timeout = Duration::from_secs(entry.timeout_secs.unwrap_or(60).clamp(1, 600));
         let _gate = lock(&self.mcp_gate, "workflow MCP adapter")?;
-        let outcome = run_async_worker("workflow-mcp", async move {
+        let scope = RunScope::run(&request.run_id);
+        let outcome = run_async_worker("workflow-mcp", scope, async move {
             tokio::time::timeout(
                 Duration::from_secs(mcp::CONNECT_TIMEOUT_SECS),
                 mcp::connect_impl(&state, &entry),
@@ -1468,6 +1509,7 @@ impl ProductionWorkflowNodeExecutor {
         arguments: &Value,
         git: bool,
         expected_external: bool,
+        scope: RunScope,
     ) -> Result<NodeAdapterResult, String> {
         let mutation = Self::delivery_mutation(arguments)?;
         let valid_family = if git {
@@ -1496,7 +1538,7 @@ impl ProductionWorkflowNodeExecutor {
             .to_string();
         let state = self.mcp_state.clone();
         let call_digest = digest.clone();
-        let outcome = run_async_worker("workflow-delivery", async move {
+        let outcome = run_async_worker("workflow-delivery", scope, async move {
             crate::m5_delivery::execute_mutation_impl(mutation, call_digest, confirmation, &state)
                 .await
         });
@@ -1525,6 +1567,7 @@ impl ProductionWorkflowNodeExecutor {
         &self,
         action: &str,
         inputs: &BTreeMap<String, WorkflowValue>,
+        scope: RunScope,
     ) -> Result<NodeAdapterResult, String> {
         let arguments = Self::require_json(inputs, "arguments")?;
         let value = match action {
@@ -1540,9 +1583,9 @@ impl ProductionWorkflowNodeExecutor {
             }
             "prepare_mutation" => return self.prepare_delivery_mutation(arguments, true),
             "execute_local_mutation" => {
-                return self.execute_delivery_mutation(arguments, true, false)
+                return self.execute_delivery_mutation(arguments, true, false, scope)
             }
-            "execute_push" => return self.execute_delivery_mutation(arguments, true, true),
+            "execute_push" => return self.execute_delivery_mutation(arguments, true, true, scope),
             _ => return Err(format!("unsupported Git workflow action: {action}")),
         };
         Ok(Self::success(
@@ -1555,6 +1598,7 @@ impl ProductionWorkflowNodeExecutor {
         &self,
         action: &str,
         inputs: &BTreeMap<String, WorkflowValue>,
+        scope: RunScope,
     ) -> Result<NodeAdapterResult, String> {
         let arguments = Self::require_json(inputs, "arguments")?;
         let worktree_id = || Self::json_string(arguments, "worktreeId").map(str::to_string);
@@ -1576,7 +1620,7 @@ impl ProductionWorkflowNodeExecutor {
                     pr_number: number()?,
                     model: Self::json_string(arguments, "model")?.to_string(),
                 };
-                return run_async_worker("workflow-pr-review", async move {
+                return run_async_worker("workflow-pr-review", scope, async move {
                     crate::m5_delivery::m5_review_pull_request(request)
                         .await
                         .and_then(|report| {
@@ -1592,9 +1636,11 @@ impl ProductionWorkflowNodeExecutor {
             .map_err(|error| error.to_string())?,
             "prepare_mutation" => return self.prepare_delivery_mutation(arguments, false),
             "execute_external_mutation" => {
-                return self.execute_delivery_mutation(arguments, false, true)
+                return self.execute_delivery_mutation(arguments, false, true, scope)
             }
-            "execute_patch_task" => return self.execute_delivery_mutation(arguments, false, false),
+            "execute_patch_task" => {
+                return self.execute_delivery_mutation(arguments, false, false, scope)
+            }
             _ => {
                 return Err(format!(
                     "unsupported pull-request workflow action: {action}"
@@ -1611,6 +1657,7 @@ impl ProductionWorkflowNodeExecutor {
         &self,
         recipe: &LegacyRecipeV1,
         inputs: &BTreeMap<String, WorkflowValue>,
+        scope: RunScope,
     ) -> Result<NodeAdapterResult, String> {
         let mut prompt = recipe.prompt.clone();
         for (name, value) in inputs {
@@ -1656,7 +1703,7 @@ impl ProductionWorkflowNodeExecutor {
         } else {
             return Err("legacy recipe target is incomplete".to_string());
         };
-        let (content, usage) = self.run_model(endpoint, model, prompt, bearer)?;
+        let (content, usage) = self.run_model(endpoint, model, prompt, bearer, scope)?;
         Ok(Self::success(WorkflowValue::String(content), usage))
     }
 
@@ -1780,6 +1827,11 @@ impl WorkflowNodeExecutor for ProductionWorkflowNodeExecutor {
                 false,
             ));
         }
+        // Every branch below that egresses gets the run's own scope. `execute` is the
+        // lowest frame in M4 that still holds a run id, and `NodeExecutionRequest.run_id`
+        // is a non-optional `String`, so there is no case here where the honest answer is
+        // "unattributed" — a workflow node always belongs to the run executing it.
+        let scope = RunScope::run(&request.run_id);
         match &request.node.kind {
             WorkflowNodeKind::PromptModel { model_selector } => {
                 let (backend, model) = model_selector
@@ -1798,6 +1850,7 @@ impl WorkflowNodeExecutor for ProductionWorkflowNodeExecutor {
                     model.to_string(),
                     prompt,
                     None,
+                    scope,
                 ) {
                     Ok((content, usage)) => {
                         Ok(Self::success(WorkflowValue::String(content), usage))
@@ -1807,11 +1860,11 @@ impl WorkflowNodeExecutor for ProductionWorkflowNodeExecutor {
             }
             WorkflowNodeKind::Agent { agent_profile, .. } => {
                 let prompt = Self::require_string(&request.inputs, "prompt")?;
-                self.execute_agent(agent_profile, prompt, false)
+                self.execute_agent(agent_profile, prompt, false, scope)
             }
             WorkflowNodeKind::Subagent { agent_profile, .. } => {
                 let prompt = Self::require_string(&request.inputs, "prompt")?;
-                self.execute_agent(agent_profile, prompt, true)
+                self.execute_agent(agent_profile, prompt, true, scope)
             }
             WorkflowNodeKind::Tool { tool_id, .. } => self.execute_tool(tool_id, &request.inputs),
             WorkflowNodeKind::Mcp {
@@ -1822,9 +1875,11 @@ impl WorkflowNodeExecutor for ProductionWorkflowNodeExecutor {
             WorkflowNodeKind::Browser { action, effect } => {
                 self.execute_browser(action, *effect, &request, cancel)
             }
-            WorkflowNodeKind::Git { action, .. } => self.execute_git(action, &request.inputs),
+            WorkflowNodeKind::Git { action, .. } => {
+                self.execute_git(action, &request.inputs, scope)
+            }
             WorkflowNodeKind::PullRequest { action, .. } => {
-                self.execute_pull_request(action, &request.inputs)
+                self.execute_pull_request(action, &request.inputs, scope)
             }
             WorkflowNodeKind::Shell { shell_profile } => {
                 let command = Self::require_string(&request.inputs, "command")?;
@@ -1908,7 +1963,7 @@ impl WorkflowNodeExecutor for ProductionWorkflowNodeExecutor {
                 ResourceUsage::default(),
             )),
             WorkflowNodeKind::LegacyRecipe { recipe } => {
-                self.execute_legacy(recipe, &request.inputs)
+                self.execute_legacy(recipe, &request.inputs, scope)
             }
             WorkflowNodeKind::Verify { verifier_id } => Ok(Self::failure(
                 FailureClass::Validation,
@@ -2215,8 +2270,22 @@ fn production_workflow_service_with_browser(
         Some(registrar),
         approvals,
     )
-    .map(Arc::new)
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?
+    // Every production path — desktop start, replay, and a daemon-hosted
+    // trigger delivery — reaches this service, so attaching the projector here
+    // is what makes workflow runs and their node instances visible in the
+    // unified process table rather than only in their own JSON history store.
+    .with_process_projector(Arc::new(LedgerProcessProjector::new(
+        app_data_dir.join("profile-v1.sqlite3"),
+    )))
+    // Same reasoning as the projector above: every production path — desktop
+    // start, replay, and a daemon-hosted trigger delivery — reaches this
+    // service, so attaching the read port here is what lets a workflow run's
+    // level boundary see a pause requested from any of them.
+    .with_signal_source(Arc::new(LedgerSignalSource::new(
+        app_data_dir.join("profile-v1.sqlite3"),
+    )));
+    let service = Arc::new(service);
     Ok((service, browser))
 }
 
@@ -2389,6 +2458,80 @@ mod tests {
         }
     }
 
+    /// The claim this file's D3 adoption rests on: `run_async_worker` spawns a fresh OS
+    /// thread with a fresh current-thread runtime, so the scope it is *handed* is the
+    /// only one its future can ever see. If the `scoped` wrapper is dropped from
+    /// `run_async_worker`, this reads `None` and fails.
+    #[test]
+    fn a_scope_handed_to_the_async_bridge_arrives_on_the_other_side_of_it() {
+        let observed = run_async_worker("scope-arrives", RunScope::run("run-alpha"), async {
+            Ok(crate::run_scope::current())
+        })
+        .expect("worker");
+        assert_eq!(observed, Some(RunScope::run("run-alpha")));
+    }
+
+    /// Counter-test to the one above: a scope that survives the thread hop is worth
+    /// nothing if it does not also survive an `.await`, which is the whole reason this
+    /// carries a `task_local!` rather than a `thread_local!`. The bridge builds a
+    /// current-thread runtime, so a thread-local would in fact pass the test above —
+    /// this is the one that would not.
+    #[test]
+    fn the_bridge_keeps_the_scope_across_awaits_inside_the_worker() {
+        let observed = run_async_worker("scope-survives-await", RunScope::run("run-beta"), async {
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            Ok(crate::run_scope::current_run_id())
+        })
+        .expect("worker");
+        assert_eq!(observed.as_deref(), Some("run-beta"));
+    }
+
+    /// Two bridges running at once must not see each other's run. Each gets its own
+    /// thread and its own runtime, so this is what proves the ambient state is
+    /// per-worker rather than shared — the failure mode being attributing one run's
+    /// egress to another, which for a per-run allowlist is the wrong policy against the
+    /// wrong host rather than a missing label.
+    #[test]
+    fn concurrent_bridges_never_observe_each_others_run() {
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    let expected = format!("run-{index}");
+                    let observed = run_async_worker(
+                        "scope-isolation",
+                        RunScope::run(expected.clone()),
+                        async move {
+                            tokio::task::yield_now().await;
+                            Ok(crate::run_scope::current_run_id())
+                        },
+                    )
+                    .expect("worker");
+                    (expected, observed)
+                })
+            })
+            .collect();
+        for handle in handles {
+            let (expected, observed) = handle.join().expect("isolation thread");
+            assert_eq!(observed.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    /// The three OAuth operations answer "no run, and here is why" rather than
+    /// arriving as a blank — the distinction [`crate::run_scope`] exists to keep. Pins
+    /// the code too, because that string is what gets persisted.
+    #[test]
+    fn connector_oauth_states_a_reason_rather_than_leaving_it_blank() {
+        let scope = ReqwestOAuthTransport::CONNECTOR_SCOPE;
+        assert_eq!(scope.run_id(), None);
+        assert_eq!(
+            scope.unattributed().map(Unattributed::code),
+            Some("unattributed.user-action")
+        );
+    }
+
     #[test]
     fn private_atomic_write_never_overwrites_create_new_records() {
         let directory = TempDirectory::new("atomic-write");
@@ -2465,6 +2608,7 @@ mod tests {
                 }),
                 true,
                 false,
+                RunScope::run("delivery-confirmation-fixture"),
             )
             .unwrap_err();
         assert!(error.contains("user-supplied confirmation"));

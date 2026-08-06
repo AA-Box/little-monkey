@@ -275,7 +275,17 @@ export async function runDependencyAudit(options: { cwd?: string } = {}): Promis
   const toolCall: ToolCall = {
     id: 'security-autofix-scan-pnpm-audit',
     type: 'function',
-    function: { name: 'run_shell', arguments: JSON.stringify({ command: 'pnpm audit --json', cwd: options.cwd }) },
+    // `full_output` is load-bearing here, not a preference. `run_shell` caps each
+    // stream at 20,000 bytes for the model's context, but this stdout is
+    // `JSON.parse`d below rather than read by a model — `pnpm audit --json` on a
+    // real dependency tree exceeds that easily, and a truncated tail is not a
+    // shorter answer but an unparseable one. The parse failure would surface as
+    // zero findings: a silent "no vulnerabilities" from a security scan. Only the
+    // parsed findings ever reach a model, never this raw output.
+    function: {
+      name: 'run_shell',
+      arguments: JSON.stringify({ command: 'pnpm audit --json', cwd: options.cwd, full_output: true }),
+    },
   };
   const raw = await executeToolCall(toolCall, null, AUDIT_TURN_ID, emptyMcpRegistry());
   try {

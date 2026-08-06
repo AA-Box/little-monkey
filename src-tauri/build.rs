@@ -34,11 +34,28 @@ fn main() {
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 }
 
+/// Each staged runtime's manifest digest is baked into the binary so
+/// `managed_runtime.rs` can authenticate the tree before parsing any name or
+/// checksum out of it. The staged directory names must stay in step with
+/// `MANAGED_LLAMA_VERSION` / `MANAGED_SD_VERSION` in `src/managed_runtime.rs`;
+/// a mismatch emits no digest, which fails discovery closed rather than open.
 fn emit_managed_runtime_trust() {
+    emit_runtime_digest("llama-b9637", "LITTLE_MONKEY_TRUSTED_RUNTIME_MANIFEST_SHA256");
+    emit_runtime_digest(
+        "llama-tts-b10278",
+        "LITTLE_MONKEY_TRUSTED_TTS_MANIFEST_SHA256",
+    );
+    emit_runtime_digest(
+        "sd-master-812-ea7f0c8",
+        "LITTLE_MONKEY_TRUSTED_SD_MANIFEST_SHA256",
+    );
+}
+
+fn emit_runtime_digest(staged_directory: &str, env_name: &str) {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("resources")
         .join("managed-runtime")
-        .join("llama-b9637")
+        .join(staged_directory)
         .join("runtime-manifest.json");
     println!("cargo:rerun-if-changed={}", manifest.display());
 
@@ -47,7 +64,7 @@ fn emit_managed_runtime_trust() {
     // closed until `pnpm stage:runtime` is run and the crate is rebuilt.
     if let Ok(bytes) = std::fs::read(&manifest) {
         println!(
-            "cargo:rustc-env=LITTLE_MONKEY_TRUSTED_RUNTIME_MANIFEST_SHA256={:x}",
+            "cargo:rustc-env={env_name}={:x}",
             Sha256::digest(bytes)
         );
     }

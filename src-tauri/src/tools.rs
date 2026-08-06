@@ -699,6 +699,123 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
     Ok(format!("Edited {}", path))
 }
 
+/// The foreground shells one turn currently owns, plus whether that turn is
+/// suspended — the value type of `AppState::shell_process_groups`.
+///
+/// A turn's cooperative pause only lands at its loop's next safe point, which
+/// for a long `run_shell` can be many minutes away. Tracking the children's
+/// process groups here lets `process_commands::process_signal` SIGSTOP them
+/// the moment a suspend is signalled, so a paused turn actually stops
+/// consuming the machine instead of merely promising to.
+#[derive(Default)]
+pub struct TurnShellGroups {
+    /// Process-group ids of this turn's live foreground shells. On unix, a
+    /// group id equals the pid of the child that leads it (`process_group(0)`
+    /// at spawn); on other platforms the pid is signalled directly.
+    pub groups: std::collections::HashSet<u32>,
+    /// Whether the owning process record currently has `suspend_requested`
+    /// latched. Kept here rather than re-read from the ledger so the timeout
+    /// below never touches SQLite on its polling path, and so a resume can
+    /// still find the entry after the last shell has been deregistered.
+    pub suspended: bool,
+}
+
+/// Adds `pgid` to `turn_key`'s live set, returning whether the caller should
+/// deregister it later. If the turn is *already* suspended when the child
+/// registers, the child is stopped immediately — otherwise a command spawned
+/// in the same tool round the pause landed in would keep running.
+fn register_shell_process_group(state: &AppState, turn_key: &str, pgid: u32) -> bool {
+    let Ok(mut guard) = state.shell_process_groups.lock() else {
+        return false;
+    };
+    let entry = guard.entry(turn_key.to_string()).or_default();
+    entry.groups.insert(pgid);
+    if entry.suspended {
+        let _ = crate::os_signal::suspend_process_group(pgid);
+    }
+    true
+}
+
+/// Removes `pgid` from `turn_key`'s live set, dropping the whole entry once
+/// nothing is left to signal. The entry is kept while `suspended` is still
+/// latched so a later resume has something to clear.
+fn forget_shell_process_group(state: &AppState, turn_key: &str, pgid: u32) {
+    let Ok(mut guard) = state.shell_process_groups.lock() else {
+        return;
+    };
+    let Some(entry) = guard.get_mut(turn_key) else {
+        return;
+    };
+    entry.groups.remove(&pgid);
+    if entry.groups.is_empty() && !entry.suspended {
+        guard.remove(turn_key);
+    }
+}
+
+/// Resolves once `SHELL_TIMEOUT` of *unsuspended* wall time has passed for
+/// `turn_key`.
+///
+/// A suspended command is SIGSTOPped: it cannot make progress, so counting
+/// that time against its timeout would turn "pause this" into "kill this in
+/// two minutes". Time only accrues while the turn is running, so a pause is
+/// genuinely a pause. Polling (rather than waiting on a notify) is deliberate
+/// — this future is only ever raced against the child's own exit inside a
+/// `select!`, so a slice of granularity costs nothing and keeps the suspend
+/// path lock-free of async machinery.
+async fn shell_timeout_elapsed(state: &AppState, turn_key: &str) {
+    const SLICE: Duration = Duration::from_millis(250);
+    let mut remaining = SHELL_TIMEOUT;
+    loop {
+        tokio::time::sleep(SLICE).await;
+        let suspended = state
+            .shell_process_groups
+            .lock()
+            .map(|guard| guard.get(turn_key).is_some_and(|entry| entry.suspended))
+            .unwrap_or(false);
+        if suspended {
+            continue;
+        }
+        remaining = remaining.saturating_sub(SLICE);
+        if remaining.is_zero() {
+            return;
+        }
+    }
+}
+
+/// Delivers a suspend/resume to every foreground shell `turn_key` owns and
+/// records the new intent, so a command spawned moments later inherits it.
+///
+/// Returns the number of process groups actually signalled — zero is a normal
+/// outcome (the turn may simply not be running a shell right now), not an
+/// error, which is why the caller treats this as best-effort.
+pub fn signal_turn_shells(state: &AppState, turn_key: &str, suspend: bool) -> usize {
+    let Ok(mut guard) = state.shell_process_groups.lock() else {
+        return 0;
+    };
+    if !suspend && !guard.contains_key(turn_key) {
+        return 0;
+    }
+    let entry = guard.entry(turn_key.to_string()).or_default();
+    entry.suspended = suspend;
+    let mut delivered = 0;
+    for pgid in &entry.groups {
+        let result = if suspend {
+            crate::os_signal::suspend_process_group(*pgid)
+        } else {
+            crate::os_signal::resume_process_group(*pgid)
+        };
+        if result.is_ok() {
+            delivered += 1;
+        }
+    }
+    // A resumed turn with nothing left running has no state worth keeping —
+    // the child may have been reaped while the entry was pinned by `suspended`.
+    if !suspend && entry.groups.is_empty() {
+        guard.remove(turn_key);
+    }
+    delivered
+}
+
 /// Run a shell command (via `sh -c`, or `cmd /C` on Windows) rooted at `cwd`
 /// (defaults to the workspace root), with a hard timeout. Permission-gated.
 /// `checkpoint_id` is injected by the frontend agent loop (not the model), the
@@ -734,6 +851,7 @@ pub async fn tool_run_shell(
     risk_level: Option<String>,
     risk_reason: Option<String>,
     agent_label: Option<String>,
+    full_output: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let risk = permissions::compute_risk(None, risk_level, risk_reason);
     permissions::request_permission(
@@ -775,10 +893,35 @@ pub async fn tool_run_shell(
         // without this, the spawned process would keep running orphaned
         // after a timeout or a Stop-button cancellation.
         .kill_on_drop(true);
+    // Its own process group, so suspending this turn SIGSTOPs exactly this
+    // command's process tree and nothing else. Without it the child inherits
+    // the app's group and `kill -STOP -<pid>` would target the whole app —
+    // mirrors `background_shell.rs`'s own spawn.
+    // (`tokio::process::Command` exposes this natively on unix — no
+    // `std::os::unix::process::CommandExt` import needed.)
+    #[cfg(unix)]
+    command_builder.process_group(0);
+    // Kernel-held bounds, in contrast to everything else here: the timeout above
+    // and the group termination below both need this app alive to enforce them.
+    // Not under `cfg(unix)` — `apply` is a documented no-op on Windows, whose
+    // equivalent is a job object and is not built.
+    //
+    // Only the baseline. A file-size or descriptor ceiling would be a guess about
+    // what an agent shell is for — this is the site that legitimately downloads a
+    // 40 GB model — and `os_limits` explains why the tempting resources
+    // (`RLIMIT_CPU`, `NPROC`, `RSS`, `AS`) are the wrong tool. Real per-kind
+    // values need the process class K4 still lacks.
+    crate::os_limits::apply(
+        crate::os_limits::ChildLimits::baseline(),
+        &mut command_builder,
+    );
 
     let child = command_builder
         .spawn()
         .map_err(|e| format!("Failed to spawn shell: {}", e))?;
+    // Captured before `wait_with_output` consumes the child. With
+    // `process_group(0)` above, the child's own pid is also its group id.
+    let child_pgid = child.id();
 
     // Each turn gets its own cancellation channel so Stop in one pane never
     // kills a command the other pane's turn is still running. Callers that
@@ -792,6 +935,15 @@ pub async fn tool_run_shell(
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Notify::new()))
         .clone();
 
+    // Registered for the whole life of the child so a `process_signal
+    // <chat_turn> suspend` arriving mid-command can SIGSTOP it immediately,
+    // rather than the pause only landing whenever this command happens to
+    // finish. Deregistered right after the wait below, before the pid could
+    // be recycled by the kernel.
+    let registered_pgid = child_pgid.and_then(|pgid| {
+        register_shell_process_group(state.inner(), &cancel_key, pgid).then_some(pgid)
+    });
+
     let outcome = tokio::select! {
         result = child.wait_with_output() => {
             result.map_err(|e| format!("Failed to run command: {}", e))
@@ -799,13 +951,34 @@ pub async fn tool_run_shell(
         _ = cancel.notified() => {
             Err("Command cancelled by the user".to_string())
         }
-        _ = tokio::time::sleep(SHELL_TIMEOUT) => {
+        _ = shell_timeout_elapsed(state.inner(), &cancel_key) => {
             Err(format!(
                 "Command timed out after {} seconds",
                 SHELL_TIMEOUT.as_secs()
             ))
         }
     };
+
+    // A timeout or a Stop must end the whole tree, not the shell we spawned.
+    //
+    // `kill_on_drop` (set above) SIGKILLs exactly one pid, so `sh -c "cargo
+    // build"` reaped the shell and left the compiler running — consuming the
+    // machine long after the tool reported "timed out after 120 seconds". The pgid
+    // was already known here and used for suspend/resume; it simply was not used
+    // for the kill. TERM first, so a build can flush and clean up its temp files.
+    if outcome.is_err() {
+        if let Some(pgid) = registered_pgid {
+            if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
+                // Swallowed: `kill_on_drop` still reaps the direct child below, so
+                // the worst case is the orphan this used to leave every time.
+                eprintln!("run_shell: could not terminate process group {pgid}: {error}");
+            }
+        }
+    }
+
+    if let Some(pgid) = registered_pgid {
+        forget_shell_process_group(state.inner(), &cancel_key, pgid);
+    }
 
     // Drop this turn's channel once no other shell of the same turn still
     // holds it (strong count 2 = the map's Arc + our clone), so the map
@@ -825,11 +998,67 @@ pub async fn tool_run_shell(
     }
 
     let output = outcome?;
+    // Both streams were unbounded from the child's pipes all the way into the
+    // model's context. Of the app's command-running paths this was the only
+    // uncapped one, and the only one whose output a model reads directly:
+    // `verify.rs` and `background_shell.rs` have always capped theirs.
+    //
+    // `full_output` exists for callers that parse the result as a *document*
+    // rather than showing it to a model. `securityAutofix.ts` is the case that
+    // forced it: it runs `pnpm audit --json` and `JSON.parse`s stdout, so a
+    // truncated tail is not a shorter answer but an unparseable one — and its
+    // failure mode is reporting zero vulnerabilities, a silent false negative in
+    // a security tool. That output never reaches a model; only the parsed
+    // findings do.
+    //
+    // Deliberately a flag and not a byte count: nothing needs a *different*
+    // ceiling, and `Some(0)` meaning "unlimited" would be exactly the
+    // zero-versus-absent overloading this codebase avoids elsewhere.
+    let cap = stream_cap(full_output);
+    let (stdout, stdout_truncated) = cap_stream(&output.stdout, cap);
+    let (stderr, stderr_truncated) = cap_stream(&output.stderr, cap);
     Ok(serde_json::json!({
-        "stdout": String::from_utf8_lossy(&output.stdout),
-        "stderr": String::from_utf8_lossy(&output.stderr),
+        "stdout": stdout,
+        "stderr": stderr,
         "code": output.status.code(),
+        // Additive, so existing readers are unaffected. Reported separately from
+        // the in-text marker because a command is free to print that text itself,
+        // and a caller deciding whether it holds a whole document needs an answer
+        // it does not have to pattern-match prose for.
+        "stdoutTruncated": stdout_truncated,
+        "stderrTruncated": stderr_truncated,
     }))
+}
+
+/// The ceiling one `run_shell` call's streams are held to.
+///
+/// Split out so the *default* is assertable: the whole point is that a caller who
+/// says nothing gets the cap, since every model-initiated call says nothing. An
+/// inverted default would be invisible in a passing shell command and would only
+/// show up as a flooded context window.
+fn stream_cap(full_output: Option<bool>) -> Option<usize> {
+    if full_output.unwrap_or(false) {
+        None
+    } else {
+        Some(crate::output_cap::MODEL_OUTPUT_CAP)
+    }
+}
+
+/// Decodes one captured stream and applies `cap`, if any.
+///
+/// `None` means the caller asked for the whole thing. Note what this does *not*
+/// fix: `wait_with_output` has already materialized both streams in full by the
+/// time this runs, so the app's own heap stays unbounded even when the returned
+/// tail is capped. Bounding the read itself means draining both pipes
+/// concurrently with the wait — which is the service `wait_with_output` currently
+/// performs, and getting it wrong deadlocks a chatty-stderr child once the pipe
+/// buffer fills. That is a separate change, not a line to smuggle in here.
+fn cap_stream(raw: &[u8], cap: Option<usize>) -> (String, bool) {
+    let decoded = String::from_utf8_lossy(raw).to_string();
+    match cap {
+        Some(cap) => crate::output_cap::cap_tail(decoded, cap),
+        None => (decoded, false),
+    }
 }
 
 /// Save a short durable fact about the current project/user preferences to
@@ -1032,8 +1261,258 @@ pub fn list_workspace_paths(
 
 // Sandbox/multi-root resolution tests live in workspace.rs now, alongside
 // resolve_path_and_root itself.
+/// Pairing a turn's cooperative pause with a real SIGSTOP of the shell
+/// children it owns — the half of the pause that is not cooperative and
+/// therefore has to be proven against the actual OS, not a fake.
+#[cfg(all(test, unix))]
+mod shell_suspend_tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::Duration;
+
+    fn process_state(pid: u32) -> String {
+        let output = Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps runs");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Whether `ps` reports the process as stopped.
+    ///
+    /// Only the FIRST character is the state; BSD `ps` appends flag characters
+    /// after it (`<` raised priority, `+` foreground group, `s` session leader),
+    /// so a stopped process can read as `T<` rather than `T` depending on how
+    /// the host schedules it. Comparing the whole field passes locally and fails
+    /// on a CI runner, which is exactly what it did.
+    fn is_stopped(pid: u32) -> bool {
+        process_state(pid).starts_with('T')
+    }
+
+    /// A real child in its own process group, registered under `turn` exactly
+    /// as `tool_run_shell` registers one.
+    ///
+    /// Two details here are load-bearing, and both were learned from a CI
+    /// hang rather than guessed:
+    ///
+    /// 1. **Every stdio handle is `null`.** A child that inherits the test
+    ///    harness's stderr keeps that pipe open for as long as it lives, and
+    ///    `cargo test` does not finish until the pipe reaches EOF.
+    /// 2. **Teardown runs on drop, not at the end of the test body.** A failed
+    ///    assertion panics and unwinds straight past any explicit `kill`. Leak
+    ///    a *running* child and the pipe closes when it exits 30s later; leak a
+    ///    *stopped* one and it never exits, never closes the pipe, and the job
+    ///    hangs until its timeout. That is precisely what happened: 48 minutes
+    ///    on Linux for an assertion that failed in milliseconds on macOS.
+    struct TestShell {
+        child: std::process::Child,
+        pgid: u32,
+    }
+
+    impl TestShell {
+        fn spawn(state: &AppState, turn: &str) -> Self {
+            use std::os::unix::process::CommandExt;
+            let mut command = Command::new("sleep");
+            command
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command.process_group(0);
+            let child = command.spawn().expect("sleep spawns");
+            let pgid = child.id();
+            assert!(register_shell_process_group(state, turn, pgid));
+            Self { child, pgid }
+        }
+    }
+
+    impl Drop for TestShell {
+        fn drop(&mut self) {
+            // Resumed before killing. SIGKILL does terminate a stopped process,
+            // but this is the one path where being wrong about that costs a
+            // hung CI job rather than a failed assertion.
+            let _ = crate::os_signal::resume_process_group(self.pgid);
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    fn suspending_a_turn_stops_its_foreground_shell_and_resuming_starts_it_again() {
+        let state = AppState::default();
+        let shell = TestShell::spawn(&state, "turn-1");
+        let pgid = shell.pgid;
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!is_stopped(pgid), "child should start out running");
+
+        assert_eq!(signal_turn_shells(&state, "turn-1", true), 1);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            is_stopped(pgid),
+            "a suspended turn's shell must actually be stopped, not just latched; ps said {}",
+            process_state(pgid)
+        );
+
+        assert_eq!(signal_turn_shells(&state, "turn-1", false), 1);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!is_stopped(pgid), "resume must restart the child");
+
+        forget_shell_process_group(&state, "turn-1", pgid);
+    }
+
+    #[test]
+    fn a_shell_spawned_into_an_already_suspended_turn_is_stopped_on_registration() {
+        // The race the `suspended` flag exists for: the pause is signalled
+        // while the loop is mid-tool-round, and the command starts after.
+        let state = AppState::default();
+        assert_eq!(signal_turn_shells(&state, "turn-2", true), 0);
+
+        let shell = TestShell::spawn(&state, "turn-2");
+        let pgid = shell.pgid;
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(is_stopped(pgid), "ps said {}", process_state(pgid));
+
+        signal_turn_shells(&state, "turn-2", false);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!is_stopped(pgid));
+
+        forget_shell_process_group(&state, "turn-2", pgid);
+    }
+
+    #[test]
+    fn one_turns_pause_never_touches_another_turns_shell() {
+        let state = AppState::default();
+        let paused = TestShell::spawn(&state, "turn-a");
+        let running = TestShell::spawn(&state, "turn-b");
+        let (paused_pgid, running_pgid) = (paused.pgid, running.pgid);
+        std::thread::sleep(Duration::from_millis(100));
+
+        signal_turn_shells(&state, "turn-a", true);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(is_stopped(paused_pgid), "ps said {}", process_state(paused_pgid));
+        assert!(
+            !is_stopped(running_pgid),
+            "the other pane's command must keep running"
+        );
+
+        signal_turn_shells(&state, "turn-a", false);
+        forget_shell_process_group(&state, "turn-a", paused_pgid);
+        forget_shell_process_group(&state, "turn-b", running_pgid);
+    }
+
+    #[test]
+    fn deregistering_the_last_shell_of_a_running_turn_drops_the_entry() {
+        // A pid is never signalled after its child is reaped — the kernel is
+        // free to reuse it, and a stale entry would eventually SIGSTOP an
+        // unrelated process.
+        let state = AppState::default();
+        let pgid = {
+            let shell = TestShell::spawn(&state, "turn-3");
+            shell.pgid
+        };
+
+        forget_shell_process_group(&state, "turn-3", pgid);
+        assert!(
+            !state
+                .shell_process_groups
+                .lock()
+                .expect("lock")
+                .contains_key("turn-3")
+        );
+        assert_eq!(signal_turn_shells(&state, "turn-3", false), 0);
+    }
+
+    #[test]
+    fn a_suspended_turn_keeps_its_entry_until_resumed() {
+        // The entry has to outlive its last shell while suspended, so a resume
+        // that arrives after the child was reaped still clears the flag rather
+        // than leaving the next command to be stopped on arrival.
+        let state = AppState::default();
+        let pgid = {
+            let shell = TestShell::spawn(&state, "turn-4");
+            signal_turn_shells(&state, "turn-4", true);
+            shell.pgid
+        };
+        forget_shell_process_group(&state, "turn-4", pgid);
+
+        assert!(
+            state
+                .shell_process_groups
+                .lock()
+                .expect("lock")
+                .contains_key("turn-4")
+        );
+        signal_turn_shells(&state, "turn-4", false);
+        assert!(
+            !state
+                .shell_process_groups
+                .lock()
+                .expect("lock")
+                .contains_key("turn-4")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The shell tool was the only command-running path in this app with no
+    /// output bound, and the only one whose output a model reads directly.
+    ///
+    /// Asserted on `stream_cap` rather than on `tool_run_shell`, which needs a
+    /// `tauri::State` and an `AppHandle` — the same reason `verify.rs` tests its
+    /// `run_command_impl` core instead of its command wrapper.
+    #[test]
+    fn a_caller_that_says_nothing_gets_the_model_output_cap() {
+        use crate::output_cap::MODEL_OUTPUT_CAP;
+
+        // Every model-initiated call is this case: the tool schema shown to models
+        // sets `additionalProperties: false` and does not list the flag, so a model
+        // cannot ask for the uncapped form.
+        assert_eq!(super::stream_cap(None), Some(MODEL_OUTPUT_CAP));
+        assert_eq!(super::stream_cap(Some(false)), Some(MODEL_OUTPUT_CAP));
+
+        // The opt-out exists for callers that parse the result as a document.
+        // `securityAutofix.ts` runs `pnpm audit --json` and `JSON.parse`s stdout,
+        // where a truncated tail is unparseable rather than merely shorter, and the
+        // parse failure would read as zero vulnerabilities.
+        assert_eq!(super::stream_cap(Some(true)), None);
+    }
+
+    #[test]
+    fn a_capped_stream_keeps_its_tail_and_reports_that_it_was_cut() {
+        let raw = b"0123456789";
+
+        let (value, truncated) = super::cap_stream(raw, Some(4));
+        assert!(truncated, "a cut stream must say so on the wire");
+        assert!(
+            value.ends_with("6789"),
+            "the tail is what a failing command puts its diagnostic in, got {value:?}"
+        );
+
+        let (value, truncated) = super::cap_stream(raw, Some(64));
+        assert_eq!(value, "0123456789");
+        assert!(!truncated, "output inside the cap is not truncated");
+
+        let (value, truncated) = super::cap_stream(raw, None);
+        assert_eq!(value, "0123456789");
+        assert!(
+            !truncated,
+            "an uncapped stream is whole, so nothing was dropped"
+        );
+    }
+
+    /// Command output is bytes, not text, and a stream cut mid-codepoint by the
+    /// child itself must not lose the rest of the output.
+    #[test]
+    fn invalid_utf8_in_a_stream_is_replaced_rather_than_dropped() {
+        let (value, truncated) = super::cap_stream(&[b'o', b'k', 0xff, b'!'], Some(64));
+        assert!(!truncated);
+        assert!(
+            value.starts_with("ok") && value.ends_with('!'),
+            "the surrounding bytes must survive a lossy decode, got {value:?}"
+        );
+    }
+
     use super::*;
 
     #[test]

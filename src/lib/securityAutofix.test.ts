@@ -302,6 +302,20 @@ describe("runDependencyAudit", () => {
     expect(JSON.parse(toolCall.function.arguments)).toMatchObject({ command: "pnpm audit --json" });
   });
 
+  it("asks run_shell for the full output, because a truncated audit would read as zero findings", async () => {
+    // `run_shell` caps each stream at 20,000 bytes for the model's context. This
+    // stdout is JSON.parsed, not shown to a model, and `pnpm audit --json` on a
+    // real dependency tree exceeds that easily — so a capped tail is unparseable
+    // rather than merely shorter, and the parse failure surfaces as "no
+    // vulnerabilities" from a security scan.
+    mocks.executeToolCall.mockResolvedValue(JSON.stringify({ stdout: "{}", stderr: "", code: 0 }));
+
+    await runDependencyAudit();
+
+    const [toolCall] = mocks.executeToolCall.mock.calls[0] as [{ function: { arguments: string } }];
+    expect(JSON.parse(toolCall.function.arguments)).toMatchObject({ full_output: true });
+  });
+
   it("reports the command's own stderr as an error when nothing parseable came back", async () => {
     mocks.executeToolCall.mockResolvedValue(JSON.stringify({ stdout: "", stderr: "pnpm: command not found", code: 127 }));
     const result = await runDependencyAudit();

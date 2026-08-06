@@ -368,6 +368,24 @@ if (runtime.error || runtime.status !== 0 || !(runtime.stdout || '').includes('$
   return `node -e "eval(Buffer.from(process.argv[1],'base64').toString('utf8'))" "${base64Utf8(bootstrap)}" "${base64Utf8(code)}" "${base64Utf8(JSON.stringify(spec))}" "${base64Utf8(MCP_PROBE_SERVER_STUB)}"`;
 }
 
+/**
+ * Names the isolation the probe actually got, for the summary the panel shows.
+ *
+ * The summary used to say "in an isolated local probe" on every platform. This is
+ * model-authored code being executed, and on Windows and Linux the sandbox has no
+ * kernel boundary — the run gets a copied workspace, a restricted directory and a
+ * scrubbed environment, and can still reach real files by absolute path. Calling
+ * that "isolated" without qualification is the one claim here worth being precise
+ * about. `null` means the probe never ran, so there is no isolation to describe.
+ */
+function describeProbeIsolation(isolation: 'os_sandboxed' | 'process_only' | null): string {
+  if (isolation === 'os_sandboxed') return 'OS-sandboxed';
+  if (isolation === 'process_only') {
+    return 'no OS sandbox on this platform — restricted directory and environment only';
+  }
+  return 'isolation not reported';
+}
+
 export async function probeGeneratedMcpArtifact(
   code: string,
   spec: McpServerSpec,
@@ -406,7 +424,7 @@ export async function probeGeneratedMcpArtifact(
     executed,
     probedToolCount,
     summary: clean
-      ? `Typechecked and executed ${probedToolCount} generated tool handler(s) in an isolated local probe.`
+      ? `Typechecked and executed ${probedToolCount} generated tool handler(s) in a local probe (${describeProbeIsolation(result.isolation)}).`
       : `Generated artifact probe failed${result.stderrExcerpt ? `: ${result.stderrExcerpt}` : '.'}`,
     stdoutExcerpt: result.stdoutExcerpt,
     stderrExcerpt: result.stderrExcerpt,

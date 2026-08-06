@@ -507,6 +507,15 @@ impl DaemonStore {
             .map_err(|error| error.to_string())
     }
 
+    /// Move a job to `state`.
+    ///
+    /// `attempt` counts **attempts started**, so it moves only on the edge that
+    /// starts one: leaving the queue for `running`. It used to increment on every
+    /// arrival at `running`, which also caught resuming from `paused` and
+    /// returning from `waiting_approval` — neither of which is a new attempt.
+    /// That silently spent a job's retry budget: a job with `max_attempts: 3`
+    /// paused and resumed twice had no attempts left to fail with, and
+    /// `backoff_elapsed` charged it a retry backoff it had never earned.
     pub fn transition(
         &mut self,
         job_id: &str,
@@ -524,7 +533,9 @@ impl DaemonStore {
                      started_at_ms=CASE WHEN ?2='running' AND started_at_ms IS NULL THEN ?3 ELSE started_at_ms END,
                      finished_at_ms=CASE WHEN ?4=1 THEN ?3 ELSE finished_at_ms END,
                      process_id=?5,
-                     attempt=CASE WHEN ?2='running' THEN attempt + 1 ELSE attempt END,
+                     attempt=CASE
+                         WHEN ?2='running' AND state IN ('preparing','queued')
+                         THEN attempt + 1 ELSE attempt END,
                      last_error=COALESCE(?6, last_error)
                  WHERE job_id=?1",
                 params![
@@ -996,6 +1007,51 @@ mod tests {
             .transition("one", JobState::Failed, 3, None, Some("test"))
             .unwrap();
         store.insert_preparing(&new_job("two", 4), 1).unwrap();
+    }
+
+    #[test]
+    fn attempt_counts_starts_not_arrivals_at_running() {
+        let mut store = DaemonStore::open_in_memory().unwrap();
+        let mut job = new_job("counted", 1);
+        job.max_attempts = 5;
+        store.insert_preparing(&job, 8).unwrap();
+        store.mark_queued("counted", "run-counted", 1).unwrap();
+        let attempt = |store: &DaemonStore| store.get_job("counted").unwrap().unwrap().attempt;
+
+        assert_eq!(attempt(&store), 0, "a queued job has started nothing yet");
+
+        // Leaving the queue is the only edge that starts an attempt.
+        store
+            .transition("counted", JobState::Running, 2, Some(10), None)
+            .unwrap();
+        assert_eq!(attempt(&store), 1);
+
+        // Every other arrival at `running` is the same attempt resuming. This
+        // used to increment, which spent the job's retry budget without it ever
+        // failing, and charged it a `backoff_elapsed` wait it never earned.
+        for interrupted in [JobState::Paused, JobState::WaitingApproval] {
+            store
+                .transition("counted", interrupted, 3, Some(10), None)
+                .unwrap();
+            store
+                .transition("counted", JobState::Running, 4, Some(10), None)
+                .unwrap();
+            assert_eq!(
+                attempt(&store),
+                1,
+                "returning from {interrupted:?} is not a new attempt"
+            );
+        }
+
+        // A real retry does count: back to the queue, then out of it again.
+        store
+            .transition("counted", JobState::Queued, 5, None, Some("boom"))
+            .unwrap();
+        assert_eq!(attempt(&store), 1, "requeueing is not itself a start");
+        store
+            .transition("counted", JobState::Running, 6, Some(11), None)
+            .unwrap();
+        assert_eq!(attempt(&store), 2);
     }
 
     #[test]

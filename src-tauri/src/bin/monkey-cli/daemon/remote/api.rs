@@ -359,6 +359,14 @@ impl RemoteApi {
                 require_action(scopes, RemoteAction::Cancel)
                     .and_then(|_| self.cancel(scopes, run_id, &request.body, now_ms))
             }
+            ("POST", ["v1", "remote", "runs", run_id, "pause"]) => {
+                require_action(scopes, RemoteAction::Pause)
+                    .and_then(|_| self.set_paused(scopes, run_id, true, now_ms))
+            }
+            ("POST", ["v1", "remote", "runs", run_id, "resume"]) => {
+                require_action(scopes, RemoteAction::Pause)
+                    .and_then(|_| self.set_paused(scopes, run_id, false, now_ms))
+            }
             ("POST", ["v1", "remote", "kill"]) => require_action(scopes, RemoteAction::Kill)
                 .and_then(|_| self.kill(device_id, now_ms)),
             ("POST", ["v1", "remote", "desktop-control", "start"]) => {
@@ -700,6 +708,51 @@ impl RemoteApi {
         Ok((
             202,
             serde_json::json!({"status":"cancellation_requested"}),
+            Some(run_id.to_string()),
+        ))
+    }
+
+    /// Suspend or resume a run without ending it.
+    ///
+    /// The gap this closes: the daemon has supported pause locally since it had
+    /// a `pause_requested` bit, but the remote protocol had no action for it, so
+    /// a paired controller's only way to stop a run consuming the machine was to
+    /// cancel it — destroying the work to stop it temporarily.
+    ///
+    /// Writes only the daemon's own bit, exactly as the local path does. Intent
+    /// flows one way — latch to daemon bits, never the reverse — because
+    /// `daemon_jobs` and `agent_processes` live in different databases with no
+    /// transaction spanning them, so two writers would be a race with no
+    /// arbitration primitive.
+    fn set_paused(
+        &self,
+        scopes: &RemoteScopes,
+        run_id: &str,
+        paused: bool,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let run = self.authorized_run(scopes, run_id)?;
+        // A terminal run is reported rather than errored, matching `cancel`: the
+        // controller asked for a state the run is already past, which is not a
+        // failure on its part.
+        if run.status.is_terminal() {
+            return Ok((
+                200,
+                serde_json::json!({"status":"already_terminal"}),
+                Some(run_id.to_string()),
+            ));
+        }
+        let mut store = DaemonStore::open(&self.paths).map_err(internal)?;
+        // `request_pause` refuses a terminal job itself, so a race between the
+        // check above and this call still cannot resurrect finished work.
+        store
+            .request_pause(run_id, paused, now_ms)
+            .map_err(|error| (409, error))?;
+        Ok((
+            202,
+            serde_json::json!({
+                "status": if paused { "pause_requested" } else { "resume_requested" }
+            }),
             Some(run_id.to_string()),
         ))
     }
@@ -1485,6 +1538,19 @@ mod tests {
     }
 
     fn fixture() -> (PathBuf, RemoteApi, Arc<FakeSecrets>, String, Vec<u8>) {
+        fixture_with(BTreeSet::from([
+            RemoteAction::ViewRuns,
+            RemoteAction::ViewEvents,
+            RemoteAction::Approve,
+            RemoteAction::Cancel,
+        ]))
+    }
+
+    /// The same fixture with an explicit grant, so a test can prove an action
+    /// is refused without it as well as honoured with it.
+    fn fixture_with(
+        actions: BTreeSet<RemoteAction>,
+    ) -> (PathBuf, RemoteApi, Arc<FakeSecrets>, String, Vec<u8>) {
         let root =
             std::env::temp_dir().join(format!("little-monkey-remote-api-{}", uuid::Uuid::new_v4()));
         let paths = DaemonPaths::under(&root);
@@ -1565,12 +1631,7 @@ mod tests {
         };
         let mut store = RemoteStore::open(&paths.root).unwrap();
         let scopes = RemoteScopes {
-            actions: BTreeSet::from([
-                RemoteAction::ViewRuns,
-                RemoteAction::ViewEvents,
-                RemoteAction::Approve,
-                RemoteAction::Cancel,
-            ]),
+            actions,
             run_ids: BTreeSet::from(["run-one".into()]),
             workspace_ids: BTreeSet::new(),
             max_artifact_bytes: 1_024,
@@ -1636,6 +1697,87 @@ mod tests {
         );
         assert_eq!(response.status, 404);
         assert!(!String::from_utf8_lossy(&response.body).contains("scope"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pausing_requires_its_own_grant_and_is_not_implied_by_cancel() {
+        // The weaker action is not free. A controller trusted to destroy a run
+        // is a different decision from one trusted to suspend it, and neither
+        // implies the other — otherwise adding this action would silently widen
+        // every pairing that already had `cancel`.
+        let (root, api, _secrets, device, secret) = fixture();
+        let response = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-pause-denied",
+                "POST",
+                "/v1/remote/runs/run-one/pause",
+                b"{}",
+            ),
+            2_000,
+        );
+        assert_eq!(response.status, 403);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pause_and_resume_move_the_daemons_own_bit() {
+        // The gap this closes: the daemon has supported pause since it had a
+        // `pause_requested` bit, but no remote action reached it, so a paired
+        // controller could only stop a run by destroying it.
+        let (root, api, _secrets, device, secret) = fixture_with(BTreeSet::from([
+            RemoteAction::ViewRuns,
+            RemoteAction::Pause,
+        ]));
+        let paths = DaemonPaths::under(&root);
+
+        let paused = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-pause",
+                "POST",
+                "/v1/remote/runs/run-one/pause",
+                b"{}",
+            ),
+            2_000,
+        );
+        assert_eq!(paused.status, 202);
+        assert!(
+            DaemonStore::open(&paths)
+                .unwrap()
+                .get_job("run-one")
+                .unwrap()
+                .expect("job exists")
+                .pause_requested,
+            "a remote pause must reach the daemon's own bit, not just return 202"
+        );
+
+        let resumed = api.handle(
+            signed(
+                &device,
+                &secret,
+                2,
+                "cmd-resume",
+                "POST",
+                "/v1/remote/runs/run-one/resume",
+                b"{}",
+            ),
+            2_001,
+        );
+        assert_eq!(resumed.status, 202);
+        assert!(
+            !DaemonStore::open(&paths)
+                .unwrap()
+                .get_job("run-one")
+                .unwrap()
+                .expect("job exists")
+                .pause_requested
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
