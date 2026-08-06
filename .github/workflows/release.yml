@@ -33,22 +33,33 @@ jobs:
 
   release:
     needs: preflight
+    # `label` exists only so the job reads as "release (Linux x86_64)" instead of
+    # "release (ubuntu-22.04, x86_64-unknown-linux-gnu)". The `unknown` there is
+    # the vendor field of the Rust target triple (arch-vendor-os-abi), not a
+    # misconfiguration; `target` stays the triple because cargo and tauri need it.
+    name: release (${{ matrix.label }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: macos-latest
             target: aarch64-apple-darwin
+            label: macOS arm64
           - platform: macos-latest
             target: x86_64-apple-darwin
+            label: macOS x86_64
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            label: Linux x86_64
           - platform: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            label: Linux arm64
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
+            label: Windows x86_64
           - platform: windows-11-arm
             target: aarch64-pc-windows-msvc
+            label: Windows arm64
 
     runs-on: ${{ matrix.platform }}
 
@@ -59,7 +70,7 @@ jobs:
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential xdg-utils
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential xdg-utils unzip
 
       - uses: pnpm/action-setup@v4
         with:
