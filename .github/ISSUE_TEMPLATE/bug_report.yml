@@ -41,7 +41,7 @@ body:
     id: version
     attributes:
       label: App version and commit SHA
-      placeholder: "1.1.0 (b140792)"
+      placeholder: "1.2.0 (b140792)"
     validations:
       required: true
 
