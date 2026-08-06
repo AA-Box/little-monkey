@@ -1,12 +1,17 @@
-//! Verified app-owned llama.cpp runtime discovery and materialization.
+//! Verified app-owned native runtime discovery and materialization.
 //!
-//! Release builds bundle a pinned `llama-server` tree under Tauri resources
-//! (staged by `scripts/stage-managed-runtime.mjs`). This module verifies that
-//! tree against its per-file manifest and atomically copies it into the
-//! shared Little Monkey app-data directory, where both the desktop process
-//! and the separately installed `monkey` CLI can find it. System
-//! `llama-server` discovery remains a development fallback in `llama.rs`; it
-//! is not the shipped product path.
+//! Release builds bundle pinned runtime trees under Tauri resources (staged by
+//! `scripts/stage-managed-runtime.mjs`). This module verifies such a tree
+//! against its per-file manifest and atomically copies it into the shared
+//! Little Monkey app-data directory, where both the desktop process and the
+//! separately installed `monkey` CLI can find it.
+//!
+//! Two runtimes ride these rails: [`LLAMA`] (`llama-server`, chat/embeddings)
+//! and [`STABLE_DIFFUSION`] (`sd-server`, image and video generation). Each is
+//! described by a [`ManagedRuntimeSpec`] and gets its own versioned directory,
+//! its own compile-time trusted manifest digest, and its own install lock, so
+//! publishing one can never disturb the other. System `llama-server` discovery
+//! remains a development fallback in `llama.rs`; it is not the shipped path.
 
 use crate::process_lock::acquire_cross_process_lock;
 use serde::Deserialize;
@@ -21,11 +26,133 @@ use uuid::Uuid;
 use std::os::unix::fs::PermissionsExt;
 
 pub const MANAGED_LLAMA_VERSION: &str = "b9637";
+/// Pinned llama.cpp release for speech, deliberately ahead of the chat pin.
+/// `llama-tts` was rewritten onto libmtmd between the two: the newer binary
+/// takes a backbone plus an `--mmproj` and clones a voice from a plain audio
+/// clip, where [`MANAGED_LLAMA_VERSION`]'s rejects those weights outright with
+/// `unknown model architecture: 'qwen3tts'`. Two pins keep speech from
+/// re-qualifying every chat and embedding path.
+pub const MANAGED_TTS_VERSION: &str = "b10278";
+/// Pinned stable-diffusion.cpp release. Upstream tags releases as
+/// `master-<build>-<commit>`; the whole tag is the version so the staged
+/// directory name is unambiguous across rebuilds of the same commit.
+pub const MANAGED_SD_VERSION: &str = "master-812-ea7f0c8";
 const MANIFEST_FILE: &str = "runtime-manifest.json";
 const MAX_RUNTIME_FILES: usize = 256;
 const MAX_RUNTIME_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const TRUSTED_RUNTIME_MANIFEST_SHA256: Option<&str> =
     option_env!("LITTLE_MONKEY_TRUSTED_RUNTIME_MANIFEST_SHA256");
+const TRUSTED_TTS_MANIFEST_SHA256: Option<&str> =
+    option_env!("LITTLE_MONKEY_TRUSTED_TTS_MANIFEST_SHA256");
+const TRUSTED_SD_MANIFEST_SHA256: Option<&str> =
+    option_env!("LITTLE_MONKEY_TRUSTED_SD_MANIFEST_SHA256");
+
+/// One managed native runtime: what to verify, where to publish it, and which
+/// binary inside the tree is the one callers actually launch.
+#[derive(Clone, Copy, Debug)]
+pub struct ManagedRuntimeSpec {
+    /// Directory segment under `<app-data>/runtimes/` and in the staged
+    /// resource name (`managed-runtime/<id>-<version>`).
+    pub id: &'static str,
+    /// Value the manifest's `runtime` field must carry.
+    pub manifest_runtime: &'static str,
+    pub version: &'static str,
+    /// Release URL prefix the manifest's `sourceUrl` must start with.
+    pub source_url_prefix: &'static str,
+    /// Development/CI override pointing at a directory or the binary itself.
+    pub override_env: &'static str,
+    /// Host targets this runtime publishes binaries for. A host outside the
+    /// list has no managed runtime rather than a mismatched one.
+    pub supported_targets: &'static [&'static str],
+    executable_unix: &'static str,
+    executable_windows: &'static str,
+    trusted_manifest_sha256: Option<&'static str>,
+}
+
+impl ManagedRuntimeSpec {
+    /// The launchable binary's flat file name inside the runtime tree.
+    pub fn executable(&self) -> &'static str {
+        if cfg!(target_os = "windows") {
+            self.executable_windows
+        } else {
+            self.executable_unix
+        }
+    }
+
+    fn trusted_manifest_digest(&self) -> Result<&'static str, String> {
+        self.trusted_manifest_sha256
+            .filter(|digest| valid_sha256(digest))
+            .ok_or_else(|| {
+                format!(
+                    "No trusted managed {} manifest is embedded in this build; source-build developers must run `pnpm stage:runtime` and rebuild",
+                    self.id
+                )
+            })
+    }
+}
+
+/// llama.cpp — chat and embedding inference. Ships for every desktop target.
+pub const LLAMA: ManagedRuntimeSpec = ManagedRuntimeSpec {
+    id: "llama",
+    manifest_runtime: "llama.cpp",
+    version: MANAGED_LLAMA_VERSION,
+    source_url_prefix: "https://github.com/ggml-org/llama.cpp/releases/",
+    override_env: "LITTLE_MONKEY_LLAMA_RUNTIME",
+    supported_targets: &[
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-pc-windows-msvc",
+        "x86_64-pc-windows-msvc",
+    ],
+    executable_unix: "llama-server",
+    executable_windows: "llama-server.exe",
+    trusted_manifest_sha256: TRUSTED_RUNTIME_MANIFEST_SHA256,
+};
+
+/// llama.cpp again, pinned separately for speech. Same six targets and the
+/// same plain CPU archives as [`LLAMA`], but its own directory, its own trusted
+/// manifest digest and its own install lock, so the two versions coexist and
+/// either can move without the other.
+pub const LLAMA_TTS: ManagedRuntimeSpec = ManagedRuntimeSpec {
+    id: "llama-tts",
+    manifest_runtime: "llama.cpp",
+    version: MANAGED_TTS_VERSION,
+    source_url_prefix: "https://github.com/ggml-org/llama.cpp/releases/",
+    override_env: "LITTLE_MONKEY_TTS_RUNTIME",
+    supported_targets: &[
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-pc-windows-msvc",
+        "x86_64-pc-windows-msvc",
+    ],
+    executable_unix: "llama-tts",
+    executable_windows: "llama-tts.exe",
+    trusted_manifest_sha256: TRUSTED_TTS_MANIFEST_SHA256,
+};
+
+/// stable-diffusion.cpp — image and video generation. Upstream publishes
+/// prebuilt binaries for three hosts only (Metal on Apple silicon, Vulkan on
+/// x86_64 Windows and Linux), so the other targets get no managed runtime and
+/// the Studio surface stays unavailable there rather than failing at launch.
+pub const STABLE_DIFFUSION: ManagedRuntimeSpec = ManagedRuntimeSpec {
+    id: "sd",
+    manifest_runtime: "stable-diffusion.cpp",
+    version: MANAGED_SD_VERSION,
+    source_url_prefix: "https://github.com/leejet/stable-diffusion.cpp/releases/",
+    override_env: "LITTLE_MONKEY_SD_RUNTIME",
+    supported_targets: &[
+        "aarch64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+    ],
+    executable_unix: "sd-server",
+    executable_windows: "sd-server.exe",
+    trusted_manifest_sha256: TRUSTED_SD_MANIFEST_SHA256,
+};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -49,21 +176,37 @@ struct RuntimeManifest {
 }
 
 pub fn llama_server_filename() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "llama-server.exe"
-    } else {
-        "llama-server"
-    }
+    LLAMA.executable()
+}
+
+pub fn sd_server_filename() -> &'static str {
+    STABLE_DIFFUSION.executable()
+}
+
+/// `llama-tts` — speech generation and voice cloning, from its own pinned
+/// tree rather than the chat one. See [`LLAMA_TTS`] for why the pins differ.
+pub fn llama_tts_filename() -> &'static str {
+    LLAMA_TTS.executable()
+}
+
+/// The verified `llama-tts` in the speech runtime's own directory.
+pub fn find_managed_llama_tts(app_data_dir: Option<&Path>) -> Option<PathBuf> {
+    find_managed_server(&LLAMA_TTS, app_data_dir)
+}
+
+pub fn managed_runtime_dir_for(spec: &ManagedRuntimeSpec, app_data_dir: &Path) -> PathBuf {
+    app_data_dir
+        .join("runtimes")
+        .join(spec.id)
+        .join(spec.version)
 }
 
 pub fn managed_runtime_dir(app_data_dir: &Path) -> PathBuf {
-    app_data_dir
-        .join("runtimes")
-        .join("llama")
-        .join(MANAGED_LLAMA_VERSION)
+    managed_runtime_dir_for(&LLAMA, app_data_dir)
 }
 
-fn expected_runtime_target() -> Option<&'static str> {
+/// The host triple, independent of which runtime is being verified.
+fn host_target() -> Option<&'static str> {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Some("aarch64-apple-darwin")
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
@@ -79,6 +222,17 @@ fn expected_runtime_target() -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// The host target, but only when `spec` actually publishes a binary for it.
+fn expected_runtime_target(spec: &ManagedRuntimeSpec) -> Option<&'static str> {
+    host_target().filter(|target| spec.supported_targets.contains(target))
+}
+
+/// Whether this host can run `spec` at all. Callers use it to hide a surface
+/// rather than to offer it and fail at launch.
+pub fn runtime_supported_here(spec: &ManagedRuntimeSpec) -> bool {
+    expected_runtime_target(spec).is_some()
 }
 
 fn is_safe_flat_name(name: &str) -> bool {
@@ -178,16 +332,8 @@ fn read_trusted_manifest(
     Ok((manifest, bytes))
 }
 
-fn embedded_trusted_manifest_sha256() -> Result<&'static str, String> {
-    TRUSTED_RUNTIME_MANIFEST_SHA256
-        .filter(|digest| valid_sha256(digest))
-        .ok_or_else(|| {
-            "No trusted managed runtime manifest is embedded in this build; source-build developers must run `pnpm stage:runtime` and rebuild"
-                .to_string()
-        })
-}
-
 fn verify_runtime_directory_with_digest(
+    spec: &ManagedRuntimeSpec,
     directory: &Path,
     trusted_manifest_sha256: &str,
 ) -> Result<PathBuf, String> {
@@ -195,21 +341,23 @@ fn verify_runtime_directory_with_digest(
     // parsing any filenames or checksums from it.
     let (manifest, _) = read_trusted_manifest(directory, trusted_manifest_sha256)?;
     if manifest.schema_version != 1
-        || manifest.runtime != "llama.cpp"
-        || manifest.version != MANAGED_LLAMA_VERSION
+        || manifest.runtime != spec.manifest_runtime
+        || manifest.version != spec.version
     {
         return Err(format!(
             "Unsupported managed runtime manifest: schema {}, runtime {}, version {}",
             manifest.schema_version, manifest.runtime, manifest.version
         ));
     }
-    let expected_target = expected_runtime_target()
-        .ok_or_else(|| "Managed llama.cpp runtime is unsupported on this platform".to_string())?;
+    let expected_target = expected_runtime_target(spec).ok_or_else(|| {
+        format!(
+            "Managed {} runtime is unsupported on this platform",
+            spec.manifest_runtime
+        )
+    })?;
     if manifest.target != expected_target
         || !valid_sha256(&manifest.archive_sha256)
-        || !manifest
-            .source_url
-            .starts_with("https://github.com/ggml-org/llama.cpp/releases/")
+        || !manifest.source_url.starts_with(spec.source_url_prefix)
     {
         return Err("Managed runtime provenance is invalid".to_string());
     }
@@ -220,7 +368,7 @@ fn verify_runtime_directory_with_digest(
         ));
     }
 
-    let server_name = llama_server_filename();
+    let server_name = spec.executable();
     let mut found_server = false;
     let mut expected_files = HashSet::with_capacity(manifest.files.len());
     for entry in &manifest.files {
@@ -245,7 +393,7 @@ fn verify_runtime_directory_with_digest(
         }
         if entry.name == server_name {
             if !entry.executable {
-                return Err("Managed llama-server is not marked executable".to_string());
+                return Err(format!("Managed {server_name} is not marked executable"));
             }
             found_server = true;
         }
@@ -284,28 +432,29 @@ fn verify_runtime_directory_with_digest(
     Ok(directory.join(server_name))
 }
 
-fn verify_runtime_directory(directory: &Path) -> Result<PathBuf, String> {
-    verify_runtime_directory_with_digest(directory, embedded_trusted_manifest_sha256()?)
+fn verify_runtime_directory(
+    spec: &ManagedRuntimeSpec,
+    directory: &Path,
+) -> Result<PathBuf, String> {
+    verify_runtime_directory_with_digest(spec, directory, spec.trusted_manifest_digest()?)
 }
 
-fn runtime_candidates(base: &Path) -> [PathBuf; 3] {
+fn runtime_candidates(spec: &ManagedRuntimeSpec, base: &Path) -> [PathBuf; 3] {
+    let staged = format!("{}-{}", spec.id, spec.version);
     [
-        base.join("managed-runtime")
-            .join(format!("llama-{MANAGED_LLAMA_VERSION}")),
-        base.join("resources")
-            .join("managed-runtime")
-            .join(format!("llama-{MANAGED_LLAMA_VERSION}")),
+        base.join("managed-runtime").join(&staged),
+        base.join("resources").join("managed-runtime").join(&staged),
         base.join("Resources")
             .join("resources")
             .join("managed-runtime")
-            .join(format!("llama-{MANAGED_LLAMA_VERSION}")),
+            .join(&staged),
     ]
 }
 
-fn bundled_runtime_near_current_exe() -> Option<PathBuf> {
+fn bundled_runtime_near_current_exe(spec: &ManagedRuntimeSpec) -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?;
     for ancestor in executable.ancestors().take(7) {
-        for candidate in runtime_candidates(ancestor) {
+        for candidate in runtime_candidates(spec, ancestor) {
             if candidate.join(MANIFEST_FILE).is_file() {
                 return Some(candidate);
             }
@@ -314,18 +463,25 @@ fn bundled_runtime_near_current_exe() -> Option<PathBuf> {
     None
 }
 
-pub fn bundled_runtime_in(resource_dir: &Path) -> Option<PathBuf> {
-    runtime_candidates(resource_dir)
+pub fn bundled_runtime_in_for(
+    spec: &ManagedRuntimeSpec,
+    resource_dir: &Path,
+) -> Option<PathBuf> {
+    runtime_candidates(spec, resource_dir)
         .into_iter()
         .find(|candidate| candidate.join(MANIFEST_FILE).is_file())
-        .or_else(bundled_runtime_near_current_exe)
+        .or_else(|| bundled_runtime_near_current_exe(spec))
 }
 
-fn explicit_runtime_override() -> Option<PathBuf> {
-    let value = std::env::var_os("LITTLE_MONKEY_LLAMA_RUNTIME")?;
+pub fn bundled_runtime_in(resource_dir: &Path) -> Option<PathBuf> {
+    bundled_runtime_in_for(&LLAMA, resource_dir)
+}
+
+fn explicit_runtime_override(spec: &ManagedRuntimeSpec) -> Option<PathBuf> {
+    let value = std::env::var_os(spec.override_env)?;
     let path = PathBuf::from(value);
     if path.is_dir() {
-        Some(path.join(llama_server_filename()))
+        Some(path.join(spec.executable()))
     } else {
         Some(path)
     }
@@ -333,37 +489,87 @@ fn explicit_runtime_override() -> Option<PathBuf> {
 
 /// Finds an already materialized/bundled app-owned runtime. The explicit
 /// environment override exists for development and CI fixtures only.
-pub fn find_managed_llama_server(app_data_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Some(override_path) = explicit_runtime_override() {
+pub fn find_managed_server(
+    spec: &ManagedRuntimeSpec,
+    app_data_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(override_path) = explicit_runtime_override(spec) {
         if override_path.is_file() {
             return Some(override_path);
         }
     }
     if let Some(root) = app_data_dir {
-        let installed = managed_runtime_dir(root);
-        if let Ok(server) = verify_runtime_directory(&installed) {
+        let installed = managed_runtime_dir_for(spec, root);
+        if let Ok(server) = verify_runtime_directory(spec, &installed) {
             return Some(server);
         }
     }
-    let bundled = bundled_runtime_near_current_exe()?;
-    verify_runtime_directory(&bundled).ok()
+    let bundled = bundled_runtime_near_current_exe(spec)?;
+    verify_runtime_directory(spec, &bundled).ok()
+}
+
+/// Whether a runtime's binary is simply *there*, without verifying the tree.
+///
+/// [`find_managed_server`] hashes every file the manifest lists — 113 MB for
+/// stable-diffusion.cpp — which is the right price before launching a process
+/// and far too much for a status probe the UI runs on every panel refresh.
+///
+/// Nothing is ever launched on the strength of this answer. It exists only to
+/// tell a panel whether to offer a feature; every path that actually starts a
+/// process still goes through [`find_managed_server`] and pays for the full
+/// verification there.
+pub fn managed_server_present(spec: &ManagedRuntimeSpec, app_data_dir: Option<&Path>) -> bool {
+    if explicit_runtime_override(spec).is_some_and(|path| path.is_file()) {
+        return true;
+    }
+    let installed = app_data_dir.is_some_and(|root| {
+        managed_runtime_dir_for(spec, root)
+            .join(spec.executable())
+            .is_file()
+    });
+    installed
+        || bundled_runtime_near_current_exe(spec)
+            .is_some_and(|directory| directory.join(spec.executable()).is_file())
+}
+
+pub fn find_managed_llama_server(app_data_dir: Option<&Path>) -> Option<PathBuf> {
+    find_managed_server(&LLAMA, app_data_dir)
+}
+
+pub fn find_managed_sd_server(app_data_dir: Option<&Path>) -> Option<PathBuf> {
+    find_managed_server(&STABLE_DIFFUSION, app_data_dir)
 }
 
 /// Verifies the bundled runtime and publishes a private copy under app data.
 /// Returns `Ok(None)` for developer/source builds without staged resources;
 /// release builds always have a bundle and therefore return `Some`.
-pub fn materialize_bundled_runtime(
+pub fn materialize_bundled_runtime_for(
+    spec: &ManagedRuntimeSpec,
     resource_dir: Option<&Path>,
     app_data_dir: &Path,
 ) -> Result<Option<PathBuf>, String> {
     let source = resource_dir
-        .and_then(bundled_runtime_in)
-        .or_else(bundled_runtime_near_current_exe);
+        .and_then(|directory| bundled_runtime_in_for(spec, directory))
+        .or_else(|| bundled_runtime_near_current_exe(spec));
     let Some(source) = source else {
         return Ok(None);
     };
-    let trusted_manifest_sha256 = embedded_trusted_manifest_sha256()?;
-    materialize_runtime_from_source(&source, app_data_dir, trusted_manifest_sha256).map(Some)
+    let trusted_manifest_sha256 = spec.trusted_manifest_digest()?;
+    materialize_runtime_from_source(spec, &source, app_data_dir, trusted_manifest_sha256).map(Some)
+}
+
+pub fn materialize_bundled_runtime(
+    resource_dir: Option<&Path>,
+    app_data_dir: &Path,
+) -> Result<Option<PathBuf>, String> {
+    materialize_bundled_runtime_for(&LLAMA, resource_dir, app_data_dir)
+}
+
+pub fn materialize_bundled_sd_runtime(
+    resource_dir: Option<&Path>,
+    app_data_dir: &Path,
+) -> Result<Option<PathBuf>, String> {
+    materialize_bundled_runtime_for(&STABLE_DIFFUSION, resource_dir, app_data_dir)
 }
 
 fn remove_invalid_runtime_destination(destination: &Path) -> Result<(), String> {
@@ -391,13 +597,15 @@ fn remove_invalid_runtime_destination(destination: &Path) -> Result<(), String> 
 }
 
 fn materialize_runtime_from_source(
+    spec: &ManagedRuntimeSpec,
     source: &Path,
     app_data_dir: &Path,
     trusted_manifest_sha256: &str,
 ) -> Result<PathBuf, String> {
-    verify_runtime_directory_with_digest(source, trusted_manifest_sha256)?;
-    let destination = managed_runtime_dir(app_data_dir);
-    if let Ok(server) = verify_runtime_directory_with_digest(&destination, trusted_manifest_sha256)
+    verify_runtime_directory_with_digest(spec, source, trusted_manifest_sha256)?;
+    let destination = managed_runtime_dir_for(spec, app_data_dir);
+    if let Ok(server) =
+        verify_runtime_directory_with_digest(spec, &destination, trusted_manifest_sha256)
     {
         return Ok(server);
     }
@@ -411,17 +619,18 @@ fn materialize_runtime_from_source(
             parent.display()
         )
     })?;
-    let install_lock_path = parent.join(format!(".{MANAGED_LLAMA_VERSION}.install.lock"));
+    let install_lock_path = parent.join(format!(".{}.install.lock", spec.version));
     let _install_lock = acquire_cross_process_lock(&install_lock_path)?;
 
     // Another process may have published the valid runtime while this one
     // waited. Recheck under the lock before allocating another staging tree.
-    if let Ok(server) = verify_runtime_directory_with_digest(&destination, trusted_manifest_sha256)
+    if let Ok(server) =
+        verify_runtime_directory_with_digest(spec, &destination, trusted_manifest_sha256)
     {
         return Ok(server);
     }
 
-    let staging = parent.join(format!(".{}-{}.tmp", MANAGED_LLAMA_VERSION, Uuid::new_v4()));
+    let staging = parent.join(format!(".{}-{}.tmp", spec.version, Uuid::new_v4()));
     fs::create_dir(&staging).map_err(|error| {
         format!(
             "Failed to create managed runtime staging directory {}: {error}",
@@ -461,7 +670,7 @@ fn materialize_runtime_from_source(
                 staging.display()
             )
         })?;
-        verify_runtime_directory_with_digest(&staging, trusted_manifest_sha256)?;
+        verify_runtime_directory_with_digest(spec, &staging, trusted_manifest_sha256)?;
 
         // Staging is already authenticated. The version lock makes removal
         // of an invalid tree plus atomic directory publication single-writer,
@@ -473,7 +682,7 @@ fn materialize_runtime_from_source(
                 destination.display()
             )
         })?;
-        verify_runtime_directory_with_digest(&destination, trusted_manifest_sha256)
+        verify_runtime_directory_with_digest(spec, &destination, trusted_manifest_sha256)
     })();
 
     if publish.is_err() && staging.exists() {
@@ -486,23 +695,47 @@ fn materialize_runtime_from_source(
 mod tests {
     use super::*;
 
-    fn runtime_fixture(label: &str) -> (PathBuf, String) {
+    /// The status probe must not pay for verification. Hashing the whole tree
+    /// on every Studio refresh made switching tabs take seconds, because the
+    /// stable-diffusion.cpp tree is 113 MB and the check ran per call.
+    ///
+    /// The two answers are deliberately different: presence says only that a
+    /// binary is where it should be, and nothing is ever launched on that
+    /// answer alone.
+    #[test]
+    fn presence_is_cheap_and_is_not_verification() {
+        let root = std::env::temp_dir().join(format!("lm-present-{}", Uuid::new_v4().simple()));
+        let installed = managed_runtime_dir_for(&STABLE_DIFFUSION, &root);
+        fs::create_dir_all(&installed).unwrap();
+
+        fs::write(installed.join(STABLE_DIFFUSION.executable()), b"not really a binary").unwrap();
+        assert!(managed_server_present(&STABLE_DIFFUSION, Some(&root)));
+        // Same directory, and verification refuses it: there is no manifest
+        // and the bytes are not a runtime. That gap is the whole point —
+        // presence answers the picker, verification answers the spawn.
+        assert!(verify_runtime_directory(&STABLE_DIFFUSION, &installed).is_err());
+
+        // The absent case is deliberately not asserted through the top-level
+        // lookups: a developer checkout has a real staged tree beside the test
+        // binary, which both functions are entitled to find.
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn runtime_fixture(spec: &ManagedRuntimeSpec, label: &str) -> (PathBuf, String) {
         let directory = std::env::temp_dir().join(format!(
             "little-monkey-managed-runtime-{label}-{}",
             Uuid::new_v4().simple()
         ));
         fs::create_dir_all(&directory).unwrap();
-        let server_name = llama_server_filename();
+        let server_name = spec.executable();
         let server_bytes = b"verified-test-runtime";
         fs::write(directory.join(server_name), server_bytes).unwrap();
         let manifest = serde_json::json!({
             "schemaVersion": 1,
-            "runtime": "llama.cpp",
-            "version": MANAGED_LLAMA_VERSION,
-            "target": expected_runtime_target().unwrap(),
-            "sourceUrl": format!(
-                "https://github.com/ggml-org/llama.cpp/releases/download/{MANAGED_LLAMA_VERSION}/fixture"
-            ),
+            "runtime": spec.manifest_runtime,
+            "version": spec.version,
+            "target": expected_runtime_target(spec).unwrap(),
+            "sourceUrl": format!("{}download/{}/fixture", spec.source_url_prefix, spec.version),
             "archiveSha256": "a".repeat(64),
             "files": [{
                 "name": server_name,
@@ -520,7 +753,8 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn concurrent_materialization_serializes_invalid_runtime_repair() {
-        let (source, trusted_manifest_sha256) = runtime_fixture("concurrent-repair-source");
+        let (source, trusted_manifest_sha256) =
+            runtime_fixture(&LLAMA, "concurrent-repair-source");
         let app_data = std::env::temp_dir().join(format!(
             "little-monkey-managed-runtime-concurrent-app-{}",
             Uuid::new_v4().simple()
@@ -538,7 +772,12 @@ mod tests {
             let barrier = barrier.clone();
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
-                materialize_runtime_from_source(&source, &app_data, &trusted_manifest_sha256)
+                materialize_runtime_from_source(
+                    &LLAMA,
+                    &source,
+                    &app_data,
+                    &trusted_manifest_sha256,
+                )
             }));
         }
         barrier.wait();
@@ -548,9 +787,12 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(installed[0], installed[1]);
-        assert!(
-            verify_runtime_directory_with_digest(&destination, &trusted_manifest_sha256).is_ok()
-        );
+        assert!(verify_runtime_directory_with_digest(
+            &LLAMA,
+            &destination,
+            &trusted_manifest_sha256
+        )
+        .is_ok());
         let runtime_parent = destination.parent().unwrap();
         for entry in fs::read_dir(runtime_parent).unwrap() {
             let name = entry.unwrap().file_name().to_string_lossy().into_owned();
@@ -570,48 +812,113 @@ mod tests {
         assert!(!is_safe_flat_name(""));
     }
 
+    /// Speech rides the llama tree rather than a runtime of its own, so the
+    /// staged manifest must actually carry `llama-tts` beside the server.
     #[test]
-    fn managed_runtime_directory_is_versioned_under_app_data() {
-        let root = Path::new("/tmp/little-monkey-test-data");
+    fn the_llama_tree_carries_the_speech_binary() {
+        let (directory, digest) = runtime_fixture(&LLAMA, "tts-sibling");
+        let server =
+            verify_runtime_directory_with_digest(&LLAMA, &directory, &digest).unwrap();
         assert_eq!(
-            managed_runtime_dir(root),
-            root.join("runtimes")
-                .join("llama")
-                .join(MANAGED_LLAMA_VERSION)
+            server.with_file_name(llama_tts_filename()).file_name(),
+            Some(std::ffi::OsStr::new(llama_tts_filename()))
         );
+        assert_ne!(llama_tts_filename(), llama_server_filename());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
     fn current_release_platform_has_an_exact_runtime_target() {
-        assert!(expected_runtime_target().is_some());
+        assert!(expected_runtime_target(&LLAMA).is_some());
+    }
+
+    /// stable-diffusion.cpp publishes fewer prebuilt targets than llama.cpp.
+    /// A host outside that set must report "unsupported" rather than silently
+    /// accepting a tree built for a different triple.
+    #[test]
+    fn stable_diffusion_targets_are_a_subset_of_llama_targets() {
+        for target in STABLE_DIFFUSION.supported_targets {
+            assert!(LLAMA.supported_targets.contains(target), "{target}");
+        }
+        assert!(runtime_supported_here(&LLAMA));
+        assert_eq!(
+            runtime_supported_here(&STABLE_DIFFUSION),
+            STABLE_DIFFUSION
+                .supported_targets
+                .contains(&host_target().unwrap())
+        );
+    }
+
+    /// The two runtimes must never share a directory, a staged resource name,
+    /// or an install lock — publishing one cannot disturb the other.
+    #[test]
+    fn each_runtime_publishes_to_its_own_versioned_directory() {
+        let root = Path::new("/tmp/little-monkey-test-data");
+        assert_eq!(
+            managed_runtime_dir_for(&LLAMA, root),
+            root.join("runtimes").join("llama").join(MANAGED_LLAMA_VERSION)
+        );
+        assert_eq!(
+            managed_runtime_dir_for(&STABLE_DIFFUSION, root),
+            root.join("runtimes").join("sd").join(MANAGED_SD_VERSION)
+        );
+        assert_ne!(
+            managed_runtime_dir_for(&LLAMA, root),
+            managed_runtime_dir_for(&STABLE_DIFFUSION, root)
+        );
+        assert_ne!(LLAMA.override_env, STABLE_DIFFUSION.override_env);
+        assert_ne!(LLAMA.executable(), STABLE_DIFFUSION.executable());
     }
 
     #[test]
     fn runtime_candidates_cover_tauri_resource_layouts() {
         let base = Path::new("/app/Contents");
-        let candidates = runtime_candidates(base);
+        let candidates = runtime_candidates(&LLAMA, base);
         assert!(candidates[0].ends_with("managed-runtime/llama-b9637"));
         assert!(candidates[1].ends_with("resources/managed-runtime/llama-b9637"));
         assert!(candidates[2].ends_with("Resources/resources/managed-runtime/llama-b9637"));
+        let sd = runtime_candidates(&STABLE_DIFFUSION, base);
+        assert!(sd[0].ends_with(format!("managed-runtime/sd-{MANAGED_SD_VERSION}")));
     }
 
     #[test]
     fn verification_rejects_unmanifested_runtime_files() {
-        let (directory, trusted_manifest_sha256) = runtime_fixture("unexpected-file");
-        assert!(verify_runtime_directory_with_digest(&directory, &trusted_manifest_sha256).is_ok());
+        let (directory, trusted_manifest_sha256) = runtime_fixture(&LLAMA, "unexpected-file");
+        assert!(
+            verify_runtime_directory_with_digest(&LLAMA, &directory, &trusted_manifest_sha256)
+                .is_ok()
+        );
 
         fs::write(directory.join("unexpected-backend.dll"), b"untrusted").unwrap();
         assert!(
-            verify_runtime_directory_with_digest(&directory, &trusted_manifest_sha256)
+            verify_runtime_directory_with_digest(&LLAMA, &directory, &trusted_manifest_sha256)
                 .unwrap_err()
                 .contains("unexpected entry")
         );
         let _ = fs::remove_dir_all(directory);
     }
 
+    /// A tree staged for one runtime must not verify as the other, even when
+    /// its own manifest digest is presented — otherwise a swapped resource
+    /// directory could launch `sd-server` where `llama-server` was expected.
+    #[test]
+    fn a_runtime_tree_does_not_verify_under_another_runtimes_spec() {
+        if !runtime_supported_here(&STABLE_DIFFUSION) {
+            return;
+        }
+        let (directory, digest) = runtime_fixture(&STABLE_DIFFUSION, "cross-runtime");
+        assert!(verify_runtime_directory_with_digest(&STABLE_DIFFUSION, &directory, &digest).is_ok());
+        assert!(
+            verify_runtime_directory_with_digest(&LLAMA, &directory, &digest)
+                .unwrap_err()
+                .contains("Unsupported managed runtime manifest")
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
     #[test]
     fn verification_rejects_replacing_runtime_and_manifest_together() {
-        let (directory, trusted_manifest_sha256) = runtime_fixture("replaced-tree");
+        let (directory, trusted_manifest_sha256) = runtime_fixture(&LLAMA, "replaced-tree");
         let server_name = llama_server_filename();
         let replacement_bytes = b"attacker-replaced-runtime";
         fs::write(directory.join(server_name), replacement_bytes).unwrap();
@@ -619,7 +926,7 @@ mod tests {
             "schemaVersion": 1,
             "runtime": "llama.cpp",
             "version": MANAGED_LLAMA_VERSION,
-            "target": expected_runtime_target().unwrap(),
+            "target": expected_runtime_target(&LLAMA).unwrap(),
             "sourceUrl": format!(
                 "https://github.com/ggml-org/llama.cpp/releases/download/{MANAGED_LLAMA_VERSION}/replacement"
             ),
@@ -638,7 +945,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            verify_runtime_directory_with_digest(&directory, &trusted_manifest_sha256)
+            verify_runtime_directory_with_digest(&LLAMA, &directory, &trusted_manifest_sha256)
                 .unwrap_err()
                 .contains("manifest checksum mismatch")
         );
