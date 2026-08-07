@@ -1041,15 +1041,111 @@ enforcement claim that had no test now has one.**
   succeeding. The answer, for the record: Seatbelt does deny it, loopback
   included.
 
-**Remaining — and it is platform work, not reporting work.** Platform-enforced
-confinement on all three. Linux: Landlock filesystem rules plus a seccomp-BPF
-syscall filter, with user namespaces where available. Windows: a restricted token
-with a job object, and AppContainer where the payload allows it. Each platform
-needs the *same* integration test as macOS — a command that tries to read and
-write the real workspace, with and without network, and fails — plus the network
-contrast test above. None of those primitives exists anywhere in the crate today
-and no dependency supplies one, so this is genuinely unbuilt rather than
-half-built.
+**Shipped — the Linux leg, and it is kernel-enforced rather than reported.**
+`sandbox_linux.rs`. Landlock filesystem rules and a seccomp filter are installed in
+`pre_exec`, so they are inherited across the exec and cannot be dropped by the
+payload — the same seam `os_limits` already uses for `setrlimit`, composed with it
+rather than replacing it. The ruleset grants read+write beneath the sandbox root and
+read+execute on `LINUX_SYSTEM_READ_ROOTS`; `macos_readable_roots` became
+`readable_roots(system_roots, …)` so both platforms now share **one** implementation
+of the PATH-entry, toolchain, never-whole-home and never-the-real-workspace filters,
+which is the part that keeps the two policies from drifting.
+
+`/proc` is granted nothing, deliberately: it would hand the child
+`/proc/<pid>/environ` for every same-uid process including the app's own, which is
+precisely what `env_clear()` exists to prevent.
+
+ABI v1 rights are a hard requirement, so a kernel with no usable Landlock reports
+`ProcessOnly` rather than pretending; everything above v1 degrades best-effort,
+which is narrower but still real. One functional cost is known and not papered
+over: on 5.13–5.18 there is no `Refer`, so the kernel denies cross-directory rename
+while a domain is in force, and a build that renames into a sibling directory inside
+the sandbox fails there. `sandbox_enforcement()` stays a runtime probe for the
+reason stated above, and Linux never answers `Unavailable` — there is no binary to
+be missing and the mechanism degrades instead of failing, so forcing symmetry with
+macOS would have been a worse answer than asymmetry.
+
+seccomp is scoped narrowly and installed only when network is denied: `socket(2)`
+for `AF_INET`/`AF_INET6`/`AF_PACKET`, plus `io_uring_setup(2)`, because
+`IORING_OP_SOCKET` creates an inet socket without ever entering `socket(2)` and is
+the documented way around a filter of this shape. Denying socket *creation* rather
+than `connect` leaves one choke point with nothing to reach around, and denies
+loopback, which is what parity with Seatbelt's `(deny network*)` requires. The
+reasoning for keeping it this narrow is that Landlock understands paths and so
+confines the filesystem better than a syscall filter can; everything a broader
+filter would add is a build command that stops working. Known gap: `AF_UNIX` stays
+allowed where Seatbelt denies it, because denying it breaks Python
+`multiprocessing`, syslog and NSS.
+
+**Verified on a real kernel, which is worth separating from "it compiles".** The
+two macOS live tests were factored into shared helpers so both platforms enter the
+same assertions rather than two lookalikes, contrast test included. On
+`ubuntu-22.04` all four Linux tests run and pass: the real workspace is denied for
+read *and* write, the positive half passes (so `LINUX_SYSTEM_READ_ROOTS` is
+genuinely sufficient for glibc to load `sh`), and the network contrast holds with
+its allow arm actually connecting.
+
+That last claim needed a fix before it meant anything. **The tests skip when the
+mechanism is absent, and an earlier version of this section's own reasoning — that
+printing the reason keeps "green because it asserted" distinct from "green because
+it asserted nothing" — was wrong**, because `cargo test` captures a *passing*
+test's output and the print never reaches the log anyone reads. A runner without
+Landlock produced exactly the same green as one that enforced it. Under `CI` the
+absence of the mechanism is now a failure, so green means the assertions ran; the
+skip survives only for a developer whose kernel lacks Landlock, which is not a
+regression in this code.
+
+**Remaining — Windows, and the acceptance above was worded backwards.** Assessing it
+before writing any of it changed the answer, so the acceptance is amended rather
+than merely deferred:
+
+- **A job object contributes nothing to this item.** It gives resource caps,
+  kill-on-close and UI restrictions, and *no* filesystem restriction at all — it
+  never participates in an access check. Its one security-relevant knob,
+  `JOB_OBJECT_UILIMIT_HANDLES`, closes the `SendMessage` hole that
+  `CreateRestrictedToken`'s own documentation warns about, which is why the original
+  pairing was right about needing both and wrong about which one isolates. The job
+  object belongs to K4, and `Isolation` stays `ProcessOnly` with it.
+- **A restricted token's denial depends on the user's directory ACLs.** It works
+  only with a restricting-SID list that excludes the user's SID, and even then an
+  ACE for `Users`/`Everyone` — common on a hand-made `C:\dev` — satisfies the second
+  access check and the workspace stays reachable. So it cannot be stated as a
+  guarantee. Worse, the version most likely to get written (`DISABLE_MAX_PRIVILEGE`,
+  no `SidsToRestrict`) confines *nothing* while passing a smoke test, which would
+  let this app report `OsSandboxed` falsely — the exact overstatement this file
+  exists to prevent. It is a hardening layer, not the mechanism.
+- **AppContainer/LPAC is the mechanism**, because a lowbox token makes the
+  filesystem deny-by-default regardless of the workspace's DACL, and turns network
+  into a capability that maps directly onto `allow_network`. That is the real
+  analogue of Seatbelt's deny-plus-allowlist.
+
+The cost is the reason it is not in this change. It needs
+`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` through a process attribute list, and
+`spawn_with_attributes` is **nightly-only** (rust-lang/rust#114854) while CI builds
+on stable; `tokio`'s `spawn_with` is additionally behind `tokio_unstable`. `std`
+exposes no token parameter at any stability level, so `CreateProcessAsUserW` is
+unreachable by construction. Doing it means replacing the twelve-line tokio spawn
+with hand-rolled FFI that re-implements the UTF-16 environment block, three pipe
+pairs with *concurrent* stdout/stderr draining (serial reads deadlock at the 64 KiB
+buffer), `kill_on_drop`, and the timeout path — several hundred lines of unsafe on a
+security boundary, for a target this repo's dev machines cannot typecheck. It also
+needs runtime ACL edits so the confined child can write its own `HOME`/`TMPDIR`, or
+the *positive* half of the parity test fails.
+
+Two further findings for whoever picks it up: the network contrast test does **not**
+port as written, because AppContainer blocks loopback by default even with
+`internetClient` (it needs a `CheckNetIsolation` exemption); and on a hosted runner
+the calling account is an administrator, so CI is the *privileged* case — a green
+Windows run would not prove the mechanism works for a standard user. The cheap first
+step is a CI-only probe in the existing `verify-*.yml` pattern rather than an edit to
+`sandbox.rs`.
+
+Also unbuilt on Linux: user namespaces. `unshare(CLONE_NEWNET)` needs
+`CLONE_NEWUSER` first for an unprivileged process, which changes uid semantics and is
+disabled outright in many container and CI environments, so seccomp on socket
+creation was taken instead. Landlock plus that filter covers what the acceptance
+asks of the Linux leg; namespaces would add a stronger network boundary and a mount
+view, and the latter is K10's business rather than this item's.
 
 Also open, and deliberately **not** treated as a quick win after checking it: the
 agent's own shell tool has no `env_clear()` on any platform, so a tool call
@@ -1067,10 +1163,12 @@ disposable probe, not the user's real workspace. What tool calls should inherit 
 a policy decision that belongs with K5's egress work, not a hardening tweak to
 smuggle in here.
 
-**Blocks:** the claim itself. An OS whose isolation is advisory on two of
-three platforms is a framework. Also K21 concretely — its conformance suite must
-cover the isolation guarantees, which cannot be asserted uniformly while two
-platforms have none.
+**Blocks:** still the claim, but for one platform rather than two. Isolation is now
+kernel-enforced on macOS and Linux and advisory on Windows, so the honest sentence
+changed from "advisory on two of three" to "advisory on Windows" — a smaller gap,
+and not a closed one. Also K21 concretely: its conformance suite must cover the
+isolation guarantees, and while they can now be asserted on two platforms with the
+same test body, Windows still cannot join it.
 
 ## K4. Enforced per-process resource limits *(userspace built; platform legs deferred)*
 
@@ -3118,14 +3216,23 @@ and shares fairly on CPU milliseconds it measured itself (K6–K8). Resource
 arbitration is real: admission consults live hardware and the offload plan, holds
 what does not fit, and rejects at enqueue what can never fit.
 
-**The one that does not survive it is isolation (K3), and it is the honest blocker
-on the name.** There is no landlock, no seccomp, and no job-object code in the
-tree; macOS Seatbelt is the only platform confinement and it is opt-in with a
-single non-test caller, and the agent shell tool is unsandboxed on every platform.
-"Enforced by the platform, not requested politely by the program" is the definition
-this file opens with, and it is the clause still unmet. Phase 3 — copy-on-write run
-namespace, tamper-evident log chaining, freeze/restore, transactional effects — is
-also largely ahead.
+**Isolation (K3) is the clause that still decides the name, and it is now half
+met.** Landlock and seccomp confinement ship on Linux and are exercised against a
+real kernel in CI, so "enforced by the platform, not requested politely by the
+program" — the definition this file opens with — is true on macOS and Linux. It is
+not true on Windows, where the only mechanism that could make it true is
+AppContainer and the cost of reaching it is set out under K3.
 
-So the name does not change yet, and the reason to state plainly is K3 rather than
-the scheduler.
+Two things temper that even on the platforms where it holds, and both are worth
+stating plainly rather than leaving for a reader to find. The sandbox is still
+**opt-in**, with one non-test caller. And **the agent's own shell tool is not routed
+through it on any platform** — it spawns `sh -c` / `cmd /C` with the workspace as
+cwd. That is not an oversight to be fixed by pointing the shell tool at
+`execute_in_sandbox`, because the sandbox denies the real workspace by design and
+the agent's job is to edit it; what tool calls should be allowed to reach is a
+policy question, and it belongs with K5.
+
+So the name does not change yet. The reason is narrower than it was — Windows
+isolation, the sandbox being opt-in, and Phase 3 (copy-on-write namespace,
+tamper-evident log chaining, freeze/restore, transactional effects) still being
+largely ahead — but it is still a reason.

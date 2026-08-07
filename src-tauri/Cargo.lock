@@ -2779,6 +2779,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "landlock"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2887,6 +2898,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "keyring",
+ "landlock",
  "libc",
  "notify",
  "pdf-extract",
@@ -2902,6 +2914,7 @@ dependencies = [
  "rustyline",
  "schemars 1.2.1",
  "scraper",
+ "seccompiler",
  "serde",
  "serde-saphyr",
  "serde_json",
@@ -4565,6 +4578,15 @@ dependencies = [
  "precomputed-hash",
  "selectors 0.38.0",
  "tendril",
+]
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
