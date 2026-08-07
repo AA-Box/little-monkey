@@ -5,7 +5,8 @@
 //! reasoning as `checkpoints_cli.rs`. No create/delete/rename/add-source
 //! here: per the RAG design doc's CLI-parity note ("a Stacks subcommand
 //! (list/reindex...)"), stack management stays a Settings-panel action; the
-//! CLI only ever lists and reindexes stacks someone already created there.
+//! CLI only ever lists, reindexes and v1-imports stacks someone already created
+//! there.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -91,6 +92,33 @@ pub async fn reindex(name: &str) -> Result<(), String> {
         updated.chunk_count,
         updated.sources.len()
     );
+    Ok(())
+}
+
+/// `monkey-cli stacks import-v1 <name>` — publishes an already-indexed stack's
+/// v1 index as its first v2 generation, reusing the stored embeddings instead of
+/// computing new ones. Calls `knowledge_service::import_v1_generation_impl`
+/// directly, the same `AppHandle`-free entry point the desktop command wraps, so
+/// there is nothing to reimplement here: no embeddings server, no progress
+/// callback, no network.
+pub fn import_v1(name: &str) -> Result<(), String> {
+    let app_data = little_monkey_lib::app_paths::data_dir()
+        .ok_or("Could not resolve the app data directory")?;
+    let registry = stacks::list_impl(&app_data.join("stacks"))?;
+    let stack = find_by_name(&registry, name)
+        .ok_or_else(|| format!("No knowledge stack named '{}'", name.trim()))?;
+
+    let report =
+        little_monkey_lib::knowledge_service::import_v1_generation_impl(&app_data, &stack.id)?;
+    println!(
+        "Imported '{}' into Knowledge 2.0: {} chunks across {} object(s), {}-dimensional, reusing \
+         every existing embedding.",
+        stack.name, report.chunk_count, report.object_count, report.dimension,
+    );
+    println!("Active generation: {}", report.generation_id);
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
     Ok(())
 }
 

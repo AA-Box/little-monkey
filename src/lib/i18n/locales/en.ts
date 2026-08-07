@@ -1700,6 +1700,13 @@ export const en: Record<string, string> = {
   "KnowledgeV2Panel.notionRootIdLabel": "Root page or database id",
   "KnowledgeV2Panel.slackChannelIdsLabel": "Channel ids (comma-separated)",
   "KnowledgeV2Panel.jiraProjectKeyLabel": "Project key",
+  "KnowledgeV2Panel.v1ImportTitle": "Bring your existing index into Knowledge 2.0",
+  "KnowledgeV2Panel.v1ImportBody":
+    "This stack was indexed by the older pipeline and has no Knowledge 2.0 generation yet, so it misses hybrid search, citations and incremental refresh. Importing reuses the embeddings it already has: nothing is embedded again, no embeddings model has to be running, and it finishes in seconds. Your existing index is left untouched.",
+  "KnowledgeV2Panel.v1ImportButton": "Import existing index",
+  "KnowledgeV2Panel.v1ImportBusy": "Importing…",
+  "KnowledgeV2Panel.v1ImportDone":
+    "Imported {{chunks}} chunks across {{objects}} objects, reusing every existing embedding.",
   "KnowledgeV2Panel.connectorNonGoalsNote": "SharePoint and Google Drive are not offered here — both require a registered OAuth app, which is out of scope for this connector catalog. GitLab is a possible future addition, not yet built.",
   "ScheduledTasksPanel.description": "Saved recipes — YAML tasks with a prompt, model target, and permission policy — runnable here or headlessly via `monkey task run`.",
   "ScheduledTasksPanel.newRecipe": "New recipe",

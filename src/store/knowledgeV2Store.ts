@@ -121,6 +121,17 @@ export interface KnowledgeRefreshReport {
   duration_ms: number;
 }
 
+/** Mirrors the Rust `KnowledgeV1ImportReport` (camelCase-serialized). */
+export interface KnowledgeV1ImportReport {
+  stackId: string;
+  generationId: string;
+  objectCount: number;
+  chunkCount: number;
+  skippedRows: number;
+  dimension: number;
+  warnings: string[];
+}
+
 export interface KnowledgeBackgroundRefreshConfig {
   enabled: boolean;
   intervalMinutes: number;
@@ -270,6 +281,7 @@ interface KnowledgeV2Store {
   sources: KnowledgeSourceV2[];
   progress: Record<string, KnowledgeRefreshProgress>;
   reports: Record<string, KnowledgeRefreshReport>;
+  v1Imports: Record<string, KnowledgeV1ImportReport>;
   errors: Record<string, string>;
   loading: boolean;
   backgroundConfig: KnowledgeBackgroundRefreshConfig | null;
@@ -289,6 +301,7 @@ interface KnowledgeV2Store {
   ) => Promise<KnowledgeSourceV2>;
   removeSource: (sourceId: string) => Promise<void>;
   refreshStack: (stackId: string) => Promise<KnowledgeRefreshReport>;
+  importFromV1: (stackId: string) => Promise<KnowledgeV1ImportReport>;
   cancelRefresh: (stackId: string) => Promise<boolean>;
   updateChunking: (stackId: string, chunkChars: number, chunkOverlap: number) => Promise<KnowledgeStack>;
   refreshBackgroundConfig: () => Promise<KnowledgeBackgroundRefreshConfig>;
@@ -323,6 +336,7 @@ export const useKnowledgeV2Store = create<KnowledgeV2Store>((set, get) => ({
   sources: [],
   progress: {},
   reports: {},
+  v1Imports: {},
   errors: {},
   loading: false,
   backgroundConfig: null,
@@ -378,6 +392,27 @@ export const useKnowledgeV2Store = create<KnowledgeV2Store>((set, get) => ({
     try {
       const report = await invoke<KnowledgeRefreshReport>("knowledge_v2_refresh", { stackId });
       set((state) => ({ reports: { ...state.reports, [stackId]: report } }));
+      await Promise.all([get().refreshSources(), useStackStore.getState().refresh()]);
+      return report;
+    } catch (error) {
+      const message = errorText(error);
+      set((state) => ({ errors: { ...state.errors, [stackId]: message } }));
+      throw error;
+    }
+  },
+
+  // Same shape as `refreshStack`: errors land in `errors[stackId]` for the
+  // panel's existing error slot, and both stores are re-read afterwards because
+  // the import seeds v2 sources and updates the stack's legacy readiness badge.
+  importFromV1: async (stackId) => {
+    set((state) => {
+      const errors = { ...state.errors };
+      delete errors[stackId];
+      return { errors };
+    });
+    try {
+      const report = await invoke<KnowledgeV1ImportReport>("knowledge_v2_import_from_v1", { stackId });
+      set((state) => ({ v1Imports: { ...state.v1Imports, [stackId]: report } }));
       await Promise.all([get().refreshSources(), useStackStore.getState().refresh()]);
       return report;
     } catch (error) {

@@ -441,6 +441,13 @@ fn stack_index_is_healthy(v1_files_present: bool, active_v2_generation: bool) ->
     v1_files_present || active_v2_generation
 }
 
+/// Id prefix for the "still on the v1 index" finding, carrying the stack id
+/// after it. It nests under `knowledge_index.` so the subsystem stays readable
+/// in a support bundle, which means [`diagnostics_apply_fix`] must match it
+/// *before* the bare `knowledge_index.` case — otherwise that case strips only
+/// the shorter prefix and passes `v1_import.<id>` in as a stack id.
+const V1_IMPORT_FINDING_PREFIX: &str = "knowledge_index.v1_import.";
+
 fn audit_knowledge_index(app_data: &Path, findings: &mut Vec<DiagnosticFinding>) {
     let base = app_data.join("stacks");
     let stacks = match crate::stacks::list_impl(&base) {
@@ -478,6 +485,7 @@ fn audit_knowledge_index(app_data: &Path, findings: &mut Vec<DiagnosticFinding>)
     };
 
     let mut corrupt = Vec::new();
+    let mut unimported = Vec::new();
     let mut healthy = 0usize;
     for stack in &stacks {
         if stack.indexed_at.is_none() {
@@ -485,11 +493,38 @@ fn audit_knowledge_index(app_data: &Path, findings: &mut Vec<DiagnosticFinding>)
         }
         let dir = base.join(&stack.id);
         let v1_ok = dir.join("chunks.jsonl").is_file() && dir.join("vectors.bin").is_file();
-        if stack_index_is_healthy(v1_ok, has_active_v2_generation(&stack.id)) {
-            healthy += 1;
-        } else {
+        let v2 = has_active_v2_generation(&stack.id);
+        if !stack_index_is_healthy(v1_ok, v2) {
             corrupt.push(stack);
+            continue;
         }
+        // Healthy, but served by v1 only. Counted separately below because
+        // "how many stacks are still in this state?" is the question that
+        // decides when the v1 read path can be deleted, and until now a support
+        // bundle could only be guessed at for the answer. Still counted healthy:
+        // its chunk and vector files really are intact.
+        healthy += 1;
+        if !v2 {
+            unimported.push(stack);
+        }
+    }
+    for stack in unimported {
+        findings.push(finding(
+            &format!("{V1_IMPORT_FINDING_PREFIX}{}", stack.id),
+            "knowledge_index",
+            "Knowledge stack is still served by the v1 index",
+            &format!(
+                "'{}' has a v1 index but no Knowledge 2.0 generation, so it misses hybrid search, \
+                 citations and incremental refresh. Importing reuses the embeddings it already \
+                 has — nothing is embedded again and no embeddings model needs to be running.",
+                stack.name
+            ),
+            DiagnosticStatus::Info,
+            true,
+            Some(
+                "Apply the safe fix to import the existing index, or use Import from v1 index in Settings > Knowledge.",
+            ),
+        ));
     }
     if corrupt.is_empty() {
         findings.push(finding(
@@ -837,6 +872,32 @@ pub async fn diagnostics_apply_fix(
         ));
     }
 
+    // Ordered before the bare `knowledge_index.` case below — see
+    // `V1_IMPORT_FINDING_PREFIX`.
+    //
+    // Import rather than reindex, for the stacks where it applies: a reindex
+    // re-embeds every chunk, which costs the user a running embeddings server
+    // and a long wait to arrive back at vectors they already have on disk. The
+    // import reuses them verbatim. The reverse substitution is not available —
+    // the corrupt case below is by definition a stack whose v1 `chunks.jsonl` or
+    // `vectors.bin` is gone, so there is nothing to import and reindexing is the
+    // only repair.
+    if let Some(stack_id) = finding_id.strip_prefix(V1_IMPORT_FINDING_PREFIX) {
+        let report = crate::knowledge_service::knowledge_v2_import_from_v1(
+            app.clone(),
+            stack_id.to_string(),
+        )?;
+        return Ok(fixed_finding(
+            &finding_id,
+            "knowledge_index",
+            "Imported the v1 index into Knowledge 2.0",
+            &format!(
+                "Reused {} existing embedding(s) across {} object(s) — nothing was embedded again.",
+                report.chunk_count, report.object_count
+            ),
+        ));
+    }
+
     if let Some(stack_id) = finding_id.strip_prefix("knowledge_index.") {
         crate::stacks::stacks_reindex(app.clone(), state.clone(), stack_id.to_string()).await?;
         return Ok(fixed_finding(
@@ -1137,6 +1198,87 @@ mod tests {
         let finding = find(&report, &format!("knowledge_index.{stack_id}"));
         assert_eq!(finding.status, DiagnosticStatus::Critical);
         assert!(finding.fixable);
+    }
+
+    /// The population count behind D2: a stack with an intact v1 index and no v2
+    /// generation is healthy but un-migrated, and a support bundle has to be able
+    /// to say how many of those are left before the v1 read path can be deleted.
+    #[test]
+    fn a_v1_only_stack_is_reported_as_importable_not_corrupt() {
+        let temp = TestDirectory::new("knowledge-v1-only");
+        let stacks_dir = temp.0.join("stacks");
+        let stack_id = "22222222-2222-2222-2222-222222222222";
+        fs::create_dir_all(stacks_dir.join(stack_id)).unwrap();
+        fs::write(
+            stacks_dir.join("index.json"),
+            serde_json::to_vec_pretty(&serde_json::json!([{
+                "id": stack_id,
+                "name": "Docs",
+                "sources": [],
+                "embedding": {
+                    "backend": "ollama",
+                    "model_id_or_tag": "nomic-embed-text",
+                    "dim": 768,
+                    "query_prefix": "",
+                    "doc_prefix": ""
+                },
+                "chunk_chars": 1600,
+                "chunk_overlap": 200,
+                "indexed_at": 1700000000000u64,
+                "chunk_count": 3
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        // A complete v1 index, and no `knowledge-v2/indexes` at all.
+        fs::write(stacks_dir.join(stack_id).join("chunks.jsonl"), b"").unwrap();
+        fs::write(stacks_dir.join(stack_id).join("vectors.bin"), b"").unwrap();
+
+        let report = run_diagnostics(&request(&temp.0)).unwrap();
+        let finding = find(&report, &format!("{V1_IMPORT_FINDING_PREFIX}{stack_id}"));
+        assert_eq!(finding.status, DiagnosticStatus::Info);
+        assert!(finding.fixable, "the import is the safe fix");
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.id == format!("knowledge_index.{stack_id}")),
+            "an intact v1 index is not corrupt"
+        );
+        assert_eq!(
+            find(&report, "knowledge_index.healthy").status,
+            DiagnosticStatus::Pass,
+            "and it still counts as an intact index"
+        );
+    }
+
+    /// `diagnostics_apply_fix` matches finding ids by prefix, and
+    /// `knowledge_index.` is a prefix of [`V1_IMPORT_FINDING_PREFIX`]. If the two
+    /// branches are ever reordered, the import finding falls through to the
+    /// reindex branch with `v1_import.<uuid>` as its stack id — a reindex of a
+    /// stack that does not exist, in place of the free import. Nothing but order
+    /// prevents that, so it is asserted here rather than left to a comment.
+    #[test]
+    fn the_v1_import_finding_id_is_matched_before_the_reindex_case() {
+        assert!(
+            V1_IMPORT_FINDING_PREFIX.starts_with("knowledge_index."),
+            "the ordering hazard this guards is that one prefix contains the other"
+        );
+        let source = include_str!("diagnostics.rs");
+        let fix = source
+            .split_once("pub async fn diagnostics_apply_fix")
+            .expect("the safe-fix dispatcher exists")
+            .1;
+        let import = fix
+            .find("strip_prefix(V1_IMPORT_FINDING_PREFIX)")
+            .expect("the import branch dispatches on the constant");
+        let reindex = fix
+            .find("strip_prefix(\"knowledge_index.\")")
+            .expect("the reindex branch dispatches on the bare prefix");
+        assert!(
+            import < reindex,
+            "the v1-import branch must come first, or the reindex branch swallows its findings"
+        );
     }
 
     #[test]
