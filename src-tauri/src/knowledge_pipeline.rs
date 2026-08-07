@@ -3112,6 +3112,38 @@ pub struct HybridIndex {
     embedding_spec: EmbeddingSpec,
 }
 
+/// Test-only tally of [`HybridIndex::open`] calls per index path. `open`
+/// revalidates every stored chunk (see [`digest_stored_index`]), so a caller
+/// that opens the same index twice to serve one query doubles the cost of that
+/// query — which is exactly what `open_active_index` used to do on top of
+/// [`GenerationStore::active`]. Keyed by path rather than a single global
+/// counter so a test can assert on its own temporary index while the rest of
+/// the suite opens theirs in parallel.
+#[cfg(test)]
+static INDEX_OPENS: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
+
+#[cfg(not(test))]
+fn record_index_open(_path: &Path) {}
+
+#[cfg(test)]
+fn record_index_open(path: &Path) {
+    *INDEX_OPENS
+        .lock()
+        .expect("index-open tally")
+        .get_or_insert_with(HashMap::new)
+        .entry(path.to_path_buf())
+        .or_insert(0) += 1;
+}
+
+#[cfg(test)]
+fn index_opens(path: &Path) -> usize {
+    let opens = INDEX_OPENS.lock().expect("index-open tally");
+    opens
+        .as_ref()
+        .and_then(|counts| counts.get(path).copied())
+        .unwrap_or(0)
+}
+
 impl HybridIndex {
     pub fn create(
         path: &Path,
@@ -3239,6 +3271,7 @@ impl HybridIndex {
     }
 
     pub fn open(path: &Path) -> PipelineResult<Self> {
+        record_index_open(path);
         let metadata = fs::symlink_metadata(path)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(PipelineError::InvalidIndex(
@@ -3842,11 +3875,28 @@ fn verify_fts_mirror(connection: &Connection) -> PipelineResult<()> {
             "FTS mirror count differs from the chunk table".to_string(),
         ));
     }
+    // Set difference, not a join. `chunks_fts` is an FTS5 virtual table with no
+    // index on `chunk_id`, so `chunks LEFT JOIN chunks_fts ON chunk_id` — the
+    // shape this check used to have — rescans the whole FTS table once per chunk
+    // row: 31s to open an 11k-chunk index, dwarfing everything else `open` does
+    // (the per-chunk digest recompute over the same rows is ~120ms). `EXCEPT`
+    // sorts each side once instead, and with the count equality above it carries
+    // exactly the same guarantee: every stored chunk's searchable text and
+    // heading appear in the mirror, and the mirror holds nothing else.
+    //
+    // That equivalence leans on `chunks.chunk_id` being a PRIMARY KEY, so state it
+    // rather than leave it implicit. `EXCEPT` deduplicates, so on its own it only
+    // proves `distinct(chunks) ⊆ distinct(mirror)`. Uniqueness on the chunks side
+    // makes that set as large as the row count, and an extra mirror row would then
+    // push the mirror's row count above it — which the count check above already
+    // refused. Drop the primary key and this check silently weakens to "the mirror
+    // contains at least the distinct chunk rows", so the two belong together.
     let mismatches = connection.query_row(
-        "SELECT COUNT(*)
-         FROM chunks AS c
-         LEFT JOIN chunks_fts AS f ON f.chunk_id = c.chunk_id
-         WHERE f.chunk_id IS NULL OR f.text != c.text OR f.heading != c.heading",
+        "SELECT COUNT(*) FROM (
+             SELECT chunk_id, text, heading FROM chunks
+             EXCEPT
+             SELECT chunk_id, text, heading FROM chunks_fts
+         )",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -4328,6 +4378,58 @@ impl GenerationStore {
     }
 
     pub fn active(&self, stack_id: &str) -> PipelineResult<Option<ActiveGeneration>> {
+        Ok(self
+            .active_with_index(stack_id)?
+            .map(|(generation, _)| generation))
+    }
+
+    /// The verified active generation **and** the [`HybridIndex`] resolving it
+    /// already opened. Callers that need both (a refresh reading the previous
+    /// generation's chunks, a prune rewriting it) must use this rather than
+    /// `active()` followed by `open_active_index()`: `HybridIndex::open`
+    /// revalidates every stored chunk, so the second call re-pays an
+    /// O(all chunks) cost for a file that cannot have changed in between —
+    /// generations are immutable.
+    pub fn active_with_index(
+        &self,
+        stack_id: &str,
+    ) -> PipelineResult<Option<(ActiveGeneration, HybridIndex)>> {
+        Ok(self
+            .resolve_active(stack_id, true)?
+            .map(|(generation, index)| {
+                (
+                    generation,
+                    index.expect(
+                        "a verified active generation carries the index it was verified with",
+                    ),
+                )
+            }))
+    }
+
+    /// The active generation's manifest **without** opening its index — every
+    /// cheap check `active` makes (active-state parse, manifest hash, manifest
+    /// validation, stack/generation identity) minus the one expensive one
+    /// (`HybridIndex::open`, which revalidates every stored chunk). For callers
+    /// that only read manifest fields and never touch chunks; a read-only
+    /// staleness badge fanned out across every stack must not pay a full index
+    /// revalidation per stack to answer a hint.
+    ///
+    /// The cost is precision, not safety: a generation whose index file is
+    /// missing or corrupt is still reported here, where `active` would skip it
+    /// and fall back to an older active-state entry. Nothing is *served* from
+    /// this — the query path goes through `open_active_index` and still fails
+    /// hard on a corrupt index.
+    pub fn active_manifest(&self, stack_id: &str) -> PipelineResult<Option<ActiveGeneration>> {
+        Ok(self
+            .resolve_active(stack_id, false)?
+            .map(|(generation, _)| generation))
+    }
+
+    fn resolve_active(
+        &self,
+        stack_id: &str,
+        verify_index: bool,
+    ) -> PipelineResult<Option<(ActiveGeneration, Option<HybridIndex>)>> {
         validate_stable_id("stack_id", stack_id)?;
         let directory = self.active_stack_dir(stack_id);
         if !directory.exists() {
@@ -4394,25 +4496,38 @@ impl GenerationStore {
             {
                 continue;
             }
-            let Ok(index) = HybridIndex::open(&generation_dir.join(INDEX_FILE)) else {
-                continue;
+            // Two digest checks, neither redundant with the other. `open`
+            // recomputes the index's content digest and compares it to the
+            // digest stored *inside the same file* — that catches corruption or
+            // tampering of the index itself. The comparison after it checks that
+            // claim against the manifest, which is what catches an index file
+            // that is internally consistent but belongs to another (or a
+            // stale) generation than the active pointer names.
+            let index = if verify_index {
+                let Ok(index) = HybridIndex::open(&generation_dir.join(INDEX_FILE)) else {
+                    continue;
+                };
+                if index.index_digest() != manifest.index_digest {
+                    continue;
+                }
+                Some(index)
+            } else {
+                None
             };
-            if index.index_digest() != manifest.index_digest {
-                continue;
-            }
-            return Ok(Some(ActiveGeneration {
-                sequence: state.sequence,
-                manifest,
-                directory: generation_dir,
-            }));
+            return Ok(Some((
+                ActiveGeneration {
+                    sequence: state.sequence,
+                    manifest,
+                    directory: generation_dir,
+                },
+                index,
+            )));
         }
         Ok(None)
     }
 
     pub fn open_active_index(&self, stack_id: &str) -> PipelineResult<Option<HybridIndex>> {
-        self.active(stack_id)?
-            .map(|generation| HybridIndex::open(&generation.directory.join(INDEX_FILE)))
-            .transpose()
+        Ok(self.active_with_index(stack_id)?.map(|(_, index)| index))
     }
 
     fn active_stack_dir(&self, stack_id: &str) -> PathBuf {
@@ -5850,6 +5965,90 @@ mod tests {
         assert_eq!(active.manifest.generation_id, first_id);
         assert_eq!(active.sequence, 1);
         assert!(store.root().join(GENERATIONS_DIR).join(second_id).is_dir());
+    }
+
+    /// Serving a query must revalidate the active index once. `open_active_index`
+    /// used to call `active` (which opens the index to cross-check its digest
+    /// against the manifest) and then open the very same file again, so every
+    /// search paid `digest_stored_index`'s per-chunk revalidation twice.
+    #[test]
+    fn serving_the_active_index_opens_it_once_per_call() {
+        let directory = TestDirectory::new("generation-open-count");
+        let store = GenerationStore::new(directory.path()).expect("store");
+        let generation_id = Uuid::new_v4().to_string();
+        let chunk = chunks_for("generation-open-count", "the only generation").remove(0);
+        let build = generation_build(generation_id.clone(), None, chunk, vec![1.0, 0.0]);
+        let staged = store
+            .stage(&build, &test_limits(), &CancellationToken::new())
+            .expect("stage");
+        store
+            .activate(staged, &CancellationToken::new())
+            .expect("activate");
+        let index_path = store
+            .root()
+            .join(GENERATIONS_DIR)
+            .join(&generation_id)
+            .join(INDEX_FILE);
+
+        let before = index_opens(&index_path);
+        let index = store
+            .open_active_index("stack:test")
+            .expect("open active index")
+            .expect("active index");
+        assert_eq!(index.path(), index_path);
+        assert_eq!(index_opens(&index_path) - before, 1);
+
+        let before = index_opens(&index_path);
+        let (active, index) = store
+            .active_with_index("stack:test")
+            .expect("load active")
+            .expect("active generation");
+        assert_eq!(active.manifest.generation_id, generation_id);
+        assert_eq!(index.index_digest(), active.manifest.index_digest);
+        assert_eq!(index_opens(&index_path) - before, 1);
+    }
+
+    /// The lexical half of every hybrid query is served from `chunks_fts`, and
+    /// the content digest covers only the `chunks` table — so the mirror check is
+    /// the sole thing standing between an edited FTS row and a search that
+    /// silently returns text no chunk contains. Pinned here because that check
+    /// was rewritten (`LEFT JOIN` to `EXCEPT`) for speed.
+    #[test]
+    fn a_tampered_fts_mirror_is_rejected() {
+        let directory = TestDirectory::new("fts-mirror");
+        let path = directory.path().join("index.sqlite3");
+        let chunk = chunks_for("fts-mirror", "mirrored chunk text").remove(0);
+        HybridIndex::create(
+            &path,
+            &Uuid::new_v4().to_string(),
+            std::slice::from_ref(&chunk),
+            &[vec![1.0, 0.0]],
+            &embedding_spec(),
+            &CancellationToken::new(),
+        )
+        .expect("create");
+        HybridIndex::open(&path).expect("the untampered index opens");
+
+        let connection = Connection::open(&path).expect("open writable");
+        connection
+            .execute("UPDATE chunks_fts SET text = 'tampered'", [])
+            .expect("tamper mirror");
+        drop(connection);
+        assert!(matches!(
+            HybridIndex::open(&path),
+            Err(PipelineError::InvalidIndex(_))
+        ));
+
+        // And a mirror row that is simply gone (counts disagree), not edited.
+        let connection = Connection::open(&path).expect("open writable");
+        connection
+            .execute("DELETE FROM chunks_fts", [])
+            .expect("empty mirror");
+        drop(connection);
+        assert!(matches!(
+            HybridIndex::open(&path),
+            Err(PipelineError::InvalidIndex(_))
+        ));
     }
 
     #[test]
