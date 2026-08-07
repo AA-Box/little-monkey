@@ -32,18 +32,35 @@ inspect which policy chose a given turn's target and why, and reorder or
 disable policies without editing code. A policy can never widen a permission
 or bypass the Privacy Firewall.
 
-## 2. Real benchmarking
-
-**Today:** the Quantization workbench performs genuine conversions and
-records reproducible reports, and the Runtime Hub shows honest hardware
-detection. The "benchmark" surface, however, measures nothing — edge device
-profiles are static prose, not measurements.
+## 2. Real benchmarking *(built)*
 
 **Acceptance:** a benchmark run produces measured tokens/sec, time-to-first
 token, and peak memory for a specific model + runtime + quantization on
 *this* machine, with variance across repeated runs reported and the hardware
 snapshot attached. No number is displayed that was not measured on the
 machine displaying it.
+
+**Shipped — Runtime Hub → Benchmark.** Every duration comes from a monotonic
+`Instant` around a real streamed generation on this machine; token counts come
+from the runtime's own completion usage; peak memory comes from sampling the
+runtime process. Variance is the sample standard deviation across repeats, and it
+is *absent* rather than `0.0` for a single repeat. The first repeat is discarded as
+warm-up so that loading the weights is not reported as prefill.
+
+The last clause is enforced in the type system rather than by convention: an
+unmeasurable field carries the reason it is unmeasurable and has no numeric
+branch to render, so a gap cannot be printed as a zero. There is deliberately no
+chart — a zero-height bar cannot say "unknown" rather than "zero".
+
+**One honest gap:** no runtime here reports a quantization *scheme* for a loaded
+model (a GGUF's `general.quantization_version` is a format version, not `Q4_K_M`),
+so a run identifies its model and runtime and says plainly that it cannot identify
+the quantization. See `docs/agent-os-roadmap.md` K6 for the full account, including
+why the abandoned TypeScript prototype was audited and not salvaged.
+
+**Remaining:** `runtimeEdgeProfiles.ts` still returns hardcoded prose profiles
+whose own text defers to this benchmark; replacing that prose with measurements is
+a separate change.
 
 ## 3. Prompt and workflow version control
 

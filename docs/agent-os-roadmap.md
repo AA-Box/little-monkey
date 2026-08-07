@@ -2774,7 +2774,7 @@ fitting. The one thing that would have gone unnoticed without measuring first is
 recorded under K6 — a CPU reading that was wrong by 42× on Apple Silicon and
 exactly right on Intel.
 
-## K6. Measured resource accounting *(ledger built; benchmark surface remaining)*
+## K6. Measured resource accounting *(built)*
 
 **Today:** the Telemetry tab captures real per-load and per-request traces —
 load timing, memory/VRAM headroom, offload placement, sampler stats, token
@@ -2852,9 +2852,80 @@ that prints the backend's reason. Totals report how many rows could not
 contribute. No chart — a zero-height bar cannot say "unknown" rather than "idle",
 which is the exact lie the item exists to prevent.
 
-**Remaining — (a), the benchmark surface.** Untouched. Edge device profiles are
-still static prose and cost still comes from typed rates. The ledger now gives it
-somewhere honest to write measurements to, which is the part that blocked it.
+**Shipped — (a), the benchmark surface. `benchmark.rs` measures a real streamed
+generation, and the constraint that shaped every decision is ROADMAP #2's own
+sentence: "no number is displayed that was not measured on the machine displaying
+it."**
+
+- **Time-to-first-token did not exist anywhere in the tree**, and could not have,
+  because the only in-process generation path the hub exposed for this
+  (`M3InferenceEngine::complete`) rejects `stream: true`. It is measured now by a
+  third canonical-sink decorator alongside `ProtocolEncodingSink` and
+  `MlxCanonicalSink` — forward, observe, retain nothing — stamping one `Instant`
+  on the **first non-empty `TextDelta`**. Not `ResponseStart`, which a runtime may
+  emit before doing any prefill work, and not `TextStart`, which announces a
+  content block rather than content.
+- **The existing `tokensPerSecond` is a different quantity wearing the same name.**
+  `runtime_telemetry.rs` computes `output_tokens / total_wall_time`, prefill
+  included, so it is an end-to-end rate rather than a decode rate. The benchmark
+  reports decode throughput over the window that opens at the first token, and its
+  numerator is `output_tokens - 1`: the first token's cost is already reported as
+  time-to-first-token, and charging it to the decode window counts it twice. At a
+  128-token budget that is a ~0.8% overstatement — the size of error that survives
+  review forever.
+- **The traces' clock could not carry a benchmark.** Durations came from the
+  frontend's `Date.now()` across the IPC boundary, so they included IPC and JSON
+  cost and could go *backwards* under an NTP adjustment, which `saturating_sub`
+  then rendered as `0`. Everything here is `Instant`, which is monotonic.
+- **Peak memory needed a distinction, not a reading.** `process_usage::sample`
+  reports the process *lifetime* high-water mark, which is right for a process the
+  ledger owns end to end and wrong here: a model server resident for an hour
+  already carries a peak somebody else's request set. The mark is read before and
+  after, and `run_peak_bytes` is populated **only when it rose** — the one case
+  where this run is what set it. Otherwise the lifetime mark is reported as an
+  upper bound with that stated, because collapsing the two would attribute an
+  earlier request's memory to the benchmark.
+- **Variance is the sample standard deviation, and it is `None` for one repeat
+  rather than `0.0`** — one observation has no spread, and zero reads as
+  "perfectly repeatable". The first repeat is discarded as warm-up, since a cold
+  request pays to load the weights and charging that to time-to-first-token
+  reports load time as prefill.
+- **Two refusals rather than two weak numbers.** A request under 32 output tokens
+  or under 2 repeats is rejected, not clamped — clamping would return a report
+  whose `maxOutputTokens` disagreed with what was asked. And a model the runtime
+  inventory marks `is_cloud` is refused outright: timing it measures a network
+  round trip to hardware the user does not own, which is precisely what the
+  acceptance clause rules out.
+
+**An honest gap that is worth naming rather than papering over.** The acceptance
+asks for a **model + runtime + quantization** triple, and this tree can identify
+two-thirds of it. No runtime here reports a quantization *scheme* for a loaded
+model — the inventory carries only `is_cloud`, and a GGUF's own
+`general.quantization_version` is a **format version ("2"), not a scheme
+("Q4_K_M")**, which is exactly the misreading a caller would make of it. So
+`quantization` is `None` with that reason attached, rather than sniffed out of a
+filename.
+
+**Prior art was audited and deliberately not salvaged.** An abandoned branch
+(`codex/model-benchmark-advisor`, 1977 lines, never merged) had built this surface
+in TypeScript against Ollama's HTTP API. It measures one of the four required
+numbers, and the reasons it cannot be repaired in place are structural rather than
+stylistic: every request sets `stream: false`, so TTFT is unobservable by
+construction; nothing samples any process, so its "memory analysis" compares the
+model's *on-disk file size* to RAM; each task runs exactly once, so variance is not
+merely missing but impossible without changing its result types; and being
+Ollama-only it cannot express the runtime axis at all. It also displayed cloud
+models' tokens/sec unlabelled, and rendered a failed task's fabricated
+`tokensPerSecond: 0` as "0.0 tok/s", indistinguishable from a genuine measurement
+of a very slow model. Two of its files carry comments claiming a sibling test
+"proves — mechanically, not just by convention" a property; neither test file was
+ever written.
+
+**Remaining.** Cost still comes from typed rates, which is ROADMAP #4's item rather
+than this one. `runtimeEdgeProfiles.ts` still returns eight hardcoded prose
+profiles, and its own text defers to "the local benchmark" seven times — those
+deferrals were false until now and are merely *satisfiable* today; replacing the
+prose with measurements is its own change.
 
 **Blocks:** nothing now. K7 and K8 both shipped on top of it, and K8's fair-share
 reads `cpu_time_ms` out of this ledger rather than deriving a number of its own.

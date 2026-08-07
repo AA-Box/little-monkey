@@ -19,6 +19,10 @@ pub mod artifact_store;
 // activation and rollback. The manager is Tauri-free so desktop, CLI, and a
 // future user-owned runner share one ownership and integrity policy.
 pub mod asset_manager;
+// Measured benchmarking (ROADMAP #2): a timing sink over the hub's canonical
+// stream, so time-to-first-token, decode throughput and peak memory are read
+// off a real generation on this machine rather than a device-class table.
+pub mod benchmark;
 // Native in-app browser pane: real tabbed child webviews (Claude-Desktop-
 // style) overlaid on the main webview via the `unstable` multiwebview API.
 pub mod browser_pane;
@@ -1283,6 +1287,7 @@ pub fn run() {
             sandbox::sandbox_discard,
             m3_commands::m3_hardware_snapshot,
             m3_commands::m3_hardware_profile,
+            m3_commands::m3_benchmark_run,
             m3_commands::m3_hardware_compatibility_report,
             m3_commands::m3_storage_status,
             m3_commands::m3_installed_models,
