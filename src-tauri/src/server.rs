@@ -2805,6 +2805,10 @@ where
             },
         )
         .await;
+        // The M3 routes return here rather than falling through to
+        // `handle_request`, so they need their own call — same rule, same
+        // filter, one funnel each.
+        record_http_request(&deps, &method, &path, response.status());
         return Ok((response, None));
     }
 
@@ -2843,6 +2847,10 @@ where
         if let Some(result) =
             handle_extended_request(app, &deps, &method, &path, &headers, &body).await
         {
+            // The desktop-only routes also return early. `LocalAppRun` is the
+            // one HTTP route that *is* permission-gated, so leaving it out would
+            // mean the stream missed the request most worth having.
+            record_http_request(&deps, &method, &path, result.0.status());
             return Ok(result);
         }
     }
