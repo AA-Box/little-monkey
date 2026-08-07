@@ -197,6 +197,9 @@ export interface GenerationRequest {
   /** The second, higher-resolution pass. Null disables it. */
   hires: HiresSettings | null;
   seed: number;
+  /** How many images to sample from this one prompt. Image tasks only — a
+   *  clip and an utterance are one artifact per run. */
+  batchCount: number;
   videoFrames: number;
   fps: number;
   /** Speech only: a reference clip whose voice the utterance is spoken in. */
@@ -326,8 +329,10 @@ export const studioClient = {
     invoke<RemoteBackend[]>("generation_add_backend", { backend }),
   removeBackend: (backendId: string) =>
     invoke<RemoteBackend[]>("generation_remove_backend", { backendId }),
+  /** Resolves to every artifact the run produced: one for a clip or an
+   *  utterance, `batchCount` of them for a batch of images. */
   run: (request: GenerationRequest) =>
-    invoke<GenerationEntry>("generation_run", { request }),
+    invoke<GenerationEntry[]>("generation_run", { request }),
   cancel: (jobId: string) => invoke<boolean>("generation_cancel", { jobId }),
   gallery: () => invoke<GenerationEntry[]>("generation_gallery"),
   deleteEntry: (entryId: string) =>
@@ -437,6 +442,11 @@ export const ALL_TASKS: GenerationTask[] = [
   "image_to_video",
   "text_to_speech",
 ];
+
+/** Images one run may ask for. Mirrors the backend's own ceiling — the engine
+ *  samples a batch serially, so a bigger number is a longer run, not a wider
+ *  one, and the request is rejected rather than clamped above this. */
+export const MAX_BATCH_COUNT = 8;
 
 /** Samplers the engine accepts, in the order it reports them. */
 export const SAMPLERS = [
