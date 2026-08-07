@@ -1,7 +1,7 @@
 //! Phase 8 item 11 (OpenAI/Ollama API compatibility harness): real
 //! integration tests that spin up the actual `m3_http_server` loopback
-//! listener (the same `start_server_core`/`M3HttpServerState` used in
-//! production) in front of a real `M3RuntimeHub`, and make real HTTP
+//! listener (through the explicitly test-only compatibility harness) in
+//! front of a real `M3RuntimeHub`, and make real HTTP
 //! requests against every advertised route with a real `reqwest::Client` —
 //! following the `m3_http_server.rs`-embedded test's and
 //! `m3_runtime_hub_contract.rs`'s convention of mocking only at the runtime
@@ -21,12 +21,16 @@
 use little_monkey_lib::compatibility_hub::{
     ApiBackend, ApiScope, LanServerPolicy, LanStateProtector, PairingRequest,
 };
-use little_monkey_lib::m3_http_server::{start_server_core, stop_server_core, M3HttpServerState};
+use little_monkey_lib::m3_http_server::{start_compatibility_harness, CompatibilityHarnessServer};
 use little_monkey_lib::m3_runtime_hub::*;
 use little_monkey_lib::runtime_adapter::{
     EndpointOrigin, EndpointPolicy, HardwareSnapshot, KeepAlive, ModelCapabilities,
     PlatformCapabilities, RuntimeDescriptor, RuntimeInventory, RuntimeKind, RuntimeLifecycleState,
     RuntimeLogTail, RuntimeModel, RuntimeStatus, SettingValue,
+};
+use little_monkey_lib::server::{
+    run_cli_server_with_m3_hub_and_endpoints, save_config_impl, ApiServerConfig, Backend,
+    CliRuntimeEndpoints, Scope, TokenEntry,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -35,6 +39,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Notify;
 
 struct TestDirectory(PathBuf);
 
@@ -109,6 +115,14 @@ struct MockRuntimeDriver {
     backend: ApiBackend,
     model_id: String,
     supports_embed: bool,
+    stream_control: Option<Arc<StreamControl>>,
+}
+
+#[derive(Default)]
+struct StreamControl {
+    started: Notify,
+    release: Notify,
+    cancellations: AtomicU64,
 }
 
 impl MockRuntimeDriver {
@@ -119,6 +133,7 @@ impl MockRuntimeDriver {
             backend: ApiBackend::Ollama,
             model_id: "llama3".to_string(),
             supports_embed: true,
+            stream_control: None,
         }
     }
 
@@ -129,6 +144,18 @@ impl MockRuntimeDriver {
             backend: ApiBackend::ManagedLocal,
             model_id: "qwen-local".to_string(),
             supports_embed: false,
+            stream_control: None,
+        }
+    }
+
+    fn controlled_llama_cpp(control: Arc<StreamControl>) -> Self {
+        Self {
+            runtime_id: "harness-llama".to_string(),
+            kind: M3RuntimeKind::LlamaCpp,
+            backend: ApiBackend::ManagedLocal,
+            model_id: "qwen-local".to_string(),
+            supports_embed: false,
+            stream_control: Some(control),
         }
     }
 
@@ -176,7 +203,10 @@ impl M3RuntimeDriver for MockRuntimeDriver {
         Ok(())
     }
 
-    fn status<'a>(&'a self, _context: &'a M3OperationContext) -> M3HubFuture<'a, M3RuntimeStatusView> {
+    fn status<'a>(
+        &'a self,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, M3RuntimeStatusView> {
         Box::pin(async move {
             Ok(M3RuntimeStatusView::Adapter {
                 status: RuntimeStatus {
@@ -192,7 +222,10 @@ impl M3RuntimeDriver for MockRuntimeDriver {
         })
     }
 
-    fn inventory<'a>(&'a self, _context: &'a M3OperationContext) -> M3HubFuture<'a, RuntimeInventory> {
+    fn inventory<'a>(
+        &'a self,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, RuntimeInventory> {
         Box::pin(async move {
             Ok(RuntimeInventory {
                 schema_version: little_monkey_lib::runtime_adapter::RUNTIME_ADAPTER_SCHEMA_VERSION,
@@ -237,7 +270,11 @@ impl M3RuntimeDriver for MockRuntimeDriver {
         Box::pin(async move { Ok(()) })
     }
 
-    fn logs<'a>(&'a self, _max_bytes: usize, _context: &'a M3OperationContext) -> M3HubFuture<'a, RuntimeLogTail> {
+    fn logs<'a>(
+        &'a self,
+        _max_bytes: usize,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, RuntimeLogTail> {
         Box::pin(async move {
             Ok(RuntimeLogTail {
                 text: String::new(),
@@ -246,7 +283,10 @@ impl M3RuntimeDriver for MockRuntimeDriver {
         })
     }
 
-    fn metrics<'a>(&'a self, _context: &'a M3OperationContext) -> M3HubFuture<'a, M3RuntimeMetricsView> {
+    fn metrics<'a>(
+        &'a self,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, M3RuntimeMetricsView> {
         Box::pin(async move {
             Ok(M3RuntimeMetricsView::Adapter {
                 status: RuntimeStatus {
@@ -268,7 +308,9 @@ impl M3RuntimeDriver for MockRuntimeDriver {
         _context: &'a M3OperationContext,
     ) -> M3HubFuture<'a, little_monkey_lib::compatibility_hub::CanonicalInferenceResponse> {
         Box::pin(async move {
-            use little_monkey_lib::compatibility_hub::{CanonicalContent, CanonicalInferenceResponse, CanonicalUsage};
+            use little_monkey_lib::compatibility_hub::{
+                CanonicalContent, CanonicalInferenceResponse, CanonicalUsage,
+            };
             let mut content = vec![CanonicalContent::Text {
                 text: "functional response".to_string(),
             }];
@@ -302,6 +344,10 @@ impl M3RuntimeDriver for MockRuntimeDriver {
         _context: &'a M3OperationContext,
     ) -> M3HubFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(control) = &self.stream_control {
+                control.started.notify_one();
+                control.release.notified().await;
+            }
             use little_monkey_lib::compatibility_hub::{CanonicalStreamEvent, CanonicalUsage};
             let response_id = format!("response-{}", request.request_id);
             sink.emit(CanonicalStreamEvent::ResponseStart {
@@ -331,8 +377,19 @@ impl M3RuntimeDriver for MockRuntimeDriver {
         })
     }
 
-    fn cancel<'a>(&'a self, _request_id: &'a str, _context: &'a M3OperationContext) -> M3HubFuture<'a, bool> {
-        Box::pin(async move { Ok(false) })
+    fn cancel<'a>(
+        &'a self,
+        _request_id: &'a str,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, bool> {
+        Box::pin(async move {
+            let Some(control) = &self.stream_control else {
+                return Ok(false);
+            };
+            control.cancellations.fetch_add(1, Ordering::SeqCst);
+            control.release.notify_one();
+            Ok(true)
+        })
     }
 
     fn embed<'a>(
@@ -352,7 +409,9 @@ impl M3RuntimeDriver for MockRuntimeDriver {
                     self.runtime_id, request.model
                 )));
             }
-            use little_monkey_lib::compatibility_hub::{CanonicalEmbeddingDatum, CanonicalEmbeddingResponse, CanonicalUsage};
+            use little_monkey_lib::compatibility_hub::{
+                CanonicalEmbeddingDatum, CanonicalEmbeddingResponse, CanonicalUsage,
+            };
             let data = request
                 .input
                 .iter()
@@ -377,6 +436,19 @@ impl M3RuntimeDriver for MockRuntimeDriver {
 }
 
 fn test_hub(root: &TestDirectory) -> Arc<M3RuntimeHub> {
+    test_hub_with_runtimes(
+        root,
+        vec![
+            Arc::new(MockRuntimeDriver::ollama()),
+            Arc::new(MockRuntimeDriver::llama_cpp()),
+        ],
+    )
+}
+
+fn test_hub_with_runtimes(
+    root: &TestDirectory,
+    runtimes: Vec<Arc<dyn M3RuntimeDriver>>,
+) -> Arc<M3RuntimeHub> {
     let download: Arc<dyn M3DownloadTransport> =
         Arc::new(ReqwestM3DownloadTransport::new().expect("download transport"));
     Arc::new(
@@ -392,10 +464,7 @@ fn test_hub(root: &TestDirectory) -> Arc<M3RuntimeHub> {
                 hardware: Arc::new(TestHardware),
                 download,
                 catalogs: Vec::new(),
-                runtimes: vec![
-                    Arc::new(MockRuntimeDriver::ollama()),
-                    Arc::new(MockRuntimeDriver::llama_cpp()),
-                ],
+                runtimes,
                 runtime_reconciler: None,
                 lan_factory: Some(Arc::new(DefaultM3LanAccessFactory::new(
                     Arc::new(little_monkey_lib::compatibility_hub::OsLanEntropy),
@@ -421,18 +490,17 @@ async fn free_loopback_port() -> Option<u16> {
 /// Starts the real M3 HTTP server (loopback, unauthenticated — a
 /// pre-existing, deliberate policy for `127.0.0.1` when
 /// `require_authentication` is false) in front of `hub` and returns
-/// `(state, base_url)`. The caller must `stop_server_core(&state)` when
-/// done.
-async fn start_test_server(hub: Arc<M3RuntimeHub>) -> Option<(M3HttpServerState, String)> {
+/// `(state, base_url)`. The caller must stop the harness when done.
+async fn start_test_server(hub: Arc<M3RuntimeHub>) -> Option<(CompatibilityHarnessServer, String)> {
     let Some(port) = free_loopback_port().await else {
         return None;
     };
     let mut policy = LanServerPolicy::default();
     policy.port = port;
     policy.require_authentication = false;
-    hub.configure_lan(policy).expect("configure loopback policy");
-    let state = M3HttpServerState::default();
-    let started = start_server_core(&state, hub)
+    hub.configure_lan(policy)
+        .expect("configure loopback policy");
+    let (state, started) = start_compatibility_harness(hub)
         .await
         .expect("start M3 HTTP server");
     assert_eq!(started.status, "running");
@@ -446,6 +514,185 @@ fn http_client() -> reqwest::Client {
         .expect("loopback client")
 }
 
+/// Wall-clock milliseconds, matching the clock the HTTP layer authorizes
+/// against (`m3_http_server`'s credential preflight and quota debit both use
+/// real time, not a hub-injected clock).
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// `now_ms` only orders the pairing challenge against its own completion, so a
+/// small synthetic value is fine there. **Token expiry is not**: it is checked
+/// against the wall clock, so `now_ms + 100_000` on a synthetic `now_ms` mints a
+/// token that expired in 1970 and every request with it answers `403 token is
+/// expired`.
+fn pair_harness_token(hub: &M3RuntimeHub, label: &str, now_ms: u64) -> String {
+    let challenge = hub
+        .begin_pairing(
+            PairingRequest {
+                client_label: label.to_string(),
+                scopes: BTreeSet::from([ApiScope::ChatCompletions]),
+                backends: BTreeSet::from([ApiBackend::ManagedLocal]),
+                allowed_models: BTreeSet::from(["qwen-local".to_string()]),
+                token_expires_at_ms: Some(wall_clock_ms() + 600_000),
+            },
+            now_ms,
+            "127.0.0.1",
+        )
+        .expect("begin harness token pairing");
+    hub.complete_pairing(
+        &challenge.challenge_id,
+        &challenge.pairing_code,
+        now_ms + 1,
+        "127.0.0.1",
+    )
+    .expect("complete harness token pairing")
+    .token
+}
+
+#[tokio::test]
+async fn streaming_is_registered_before_http_200_and_cancel_is_owner_bound() {
+    let root = TestDirectory::new("stream-registration-cancel");
+    let control = Arc::new(StreamControl::default());
+    let hub = test_hub_with_runtimes(
+        &root,
+        vec![Arc::new(MockRuntimeDriver::controlled_llama_cpp(
+            control.clone(),
+        ))],
+    );
+    let Some(port) = free_loopback_port().await else {
+        return;
+    };
+    let mut policy = LanServerPolicy::default();
+    policy.port = port;
+    policy.require_authentication = true;
+    policy.rate_limit.max_requests = 100;
+    policy.rate_limit.max_input_bytes = 16 * 1024 * 1024;
+    hub.configure_lan(policy)
+        .expect("configure authenticated stream harness");
+    let owner_token = pair_harness_token(&hub, "stream-owner", 40_000);
+    let other_token = pair_harness_token(&hub, "same-capability-other-owner", 40_010);
+    let (state, started) = start_compatibility_harness(hub)
+        .await
+        .expect("start authenticated stream harness");
+    assert_eq!(started.status, "running");
+    let base = format!("http://127.0.0.1:{port}");
+    let client = http_client();
+    let stream_body = json!({
+        "model":"qwen-local",
+        "messages":[{"role":"user","content":"hold stream"}],
+        "stream":true
+    });
+    let cancel_body = |request_id: &str| {
+        json!({
+            "protocol":"open_ai_chat_completions",
+            "runtimeId":"harness-llama",
+            "requestId":request_id,
+            "modelId":"qwen-local"
+        })
+    };
+
+    let first = tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(&owner_token)
+            .header("x-request-id", "http-owned-stream")
+            .json(&stream_body)
+            .send(),
+    )
+    .await
+    .expect("stream headers wait only for registration")
+    .expect("owned stream request");
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        first
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let foreign = client
+        .post(format!("{base}/v1/requests/cancel"))
+        .bearer_auth(&other_token)
+        .json(&cancel_body("http-owned-stream"))
+        .send()
+        .await
+        .expect("foreign owner cancel request");
+    let foreign_status = foreign.status();
+    let foreign_body = foreign.text().await.expect("foreign cancel body");
+    let missing = client
+        .post(format!("{base}/v1/requests/cancel"))
+        .bearer_auth(&other_token)
+        .json(&cancel_body("http-missing-stream"))
+        .send()
+        .await
+        .expect("missing cancel request");
+    let missing_status = missing.status();
+    let missing_body = missing.text().await.expect("missing cancel body");
+    assert_eq!(foreign_status, reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(missing_status, foreign_status);
+    assert_eq!(missing_body, foreign_body);
+    assert_eq!(control.cancellations.load(Ordering::SeqCst), 0);
+
+    let exact = client
+        .post(format!("{base}/v1/requests/cancel"))
+        .bearer_auth(&owner_token)
+        .json(&cancel_body("http-owned-stream"))
+        .send()
+        .await
+        .expect("exact owner cancel request");
+    assert_eq!(exact.status(), reqwest::StatusCode::OK);
+    assert_eq!(control.cancellations.load(Ordering::SeqCst), 1);
+    let first_body = first.text().await.expect("cancelled stream body");
+    assert!(first_body.contains("[DONE]"));
+
+    let active_duplicate = client
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(&owner_token)
+        .header("x-request-id", "http-duplicate-stream")
+        .json(&stream_body)
+        .send()
+        .await
+        .expect("first duplicate-id stream request");
+    assert_eq!(active_duplicate.status(), reqwest::StatusCode::OK);
+    let duplicate = client
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(&owner_token)
+        .header("x-request-id", "http-duplicate-stream")
+        .json(&stream_body)
+        .send()
+        .await
+        .expect("second duplicate-id stream request");
+    assert_eq!(duplicate.status(), reqwest::StatusCode::CONFLICT);
+    assert_ne!(
+        duplicate
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let release_duplicate = client
+        .post(format!("{base}/v1/requests/cancel"))
+        .bearer_auth(&owner_token)
+        .json(&cancel_body("http-duplicate-stream"))
+        .send()
+        .await
+        .expect("release duplicate-id owner stream");
+    assert_eq!(release_duplicate.status(), reqwest::StatusCode::OK);
+    let _ = active_duplicate
+        .text()
+        .await
+        .expect("released duplicate stream body");
+    assert_eq!(control.cancellations.load(Ordering::SeqCst), 2);
+    state.stop().await;
+}
+
 #[tokio::test]
 async fn v1_models_and_api_tags_list_the_scoped_runtimes_models() {
     let root = TestDirectory::new("models-tags");
@@ -454,6 +701,28 @@ async fn v1_models_and_api_tags_list_the_scoped_runtimes_models() {
         return;
     };
     let client = http_client();
+
+    let union = client
+        .get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .expect("union v1/models request");
+    assert_eq!(union.status(), reqwest::StatusCode::OK);
+    let union_payload: Value = union.json().await.expect("union v1/models JSON");
+    let union_ids = union_payload["data"]
+        .as_array()
+        .expect("union data array")
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("union model id"))
+        .collect::<Vec<_>>();
+    assert!(
+        union_ids.contains(&"llama3"),
+        "expected Ollama model in {union_ids:?}"
+    );
+    assert!(
+        union_ids.contains(&"qwen-local"),
+        "expected managed model in {union_ids:?}"
+    );
 
     let models = client
         .get(format!("{base}/v1/models"))
@@ -486,7 +755,22 @@ async fn v1_models_and_api_tags_list_the_scoped_runtimes_models() {
     assert_eq!(models[0]["model"], "qwen-local");
     assert!(models[0]["modified_at"].as_str().unwrap().contains('T'));
 
-    stop_server_core(&state).await.expect("stop server");
+    let unknown = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({"model":"not-advertised","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .expect("unknown exact model request");
+    let unknown_status = unknown.status();
+    let unknown_body = unknown.text().await.expect("unknown model body");
+    assert_eq!(
+        unknown_status,
+        reqwest::StatusCode::NOT_FOUND,
+        "unexpected unknown-model response: {unknown_body}"
+    );
+    assert!(unknown_body.contains("not-advertised"));
+
+    state.stop().await;
 }
 
 #[tokio::test]
@@ -513,7 +797,10 @@ async fn chat_completions_non_streaming_streaming_tool_calls_and_json_schema() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let payload: Value = response.json().await.expect("chat completions JSON");
     assert_eq!(payload["object"], "chat.completion");
-    assert_eq!(payload["choices"][0]["message"]["content"], "functional response");
+    assert_eq!(
+        payload["choices"][0]["message"]["content"],
+        "functional response"
+    );
 
     // Tool calls: request carries a tool, mock echoes a tool_calls choice.
     let response = client
@@ -566,7 +853,10 @@ async fn chat_completions_non_streaming_streaming_tool_calls_and_json_schema() {
         .expect("streaming chat request");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(
-        response.headers().get("content-type").and_then(|value| value.to_str().ok()),
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
         Some("text/event-stream")
     );
     let body = response.text().await.expect("SSE body");
@@ -574,7 +864,7 @@ async fn chat_completions_non_streaming_streaming_tool_calls_and_json_schema() {
     assert!(body.contains("\"content\":\"streamed\""));
     assert!(body.contains("[DONE]"));
 
-    stop_server_core(&state).await.expect("stop server");
+    state.stop().await;
 }
 
 #[tokio::test]
@@ -619,11 +909,12 @@ async fn responses_and_messages_protocols_translate_end_to_end() {
     assert_eq!(payload["type"], "message");
     assert_eq!(payload["content"][0]["text"], "functional response");
 
-    stop_server_core(&state).await.expect("stop server");
+    state.stop().await;
 }
 
 #[tokio::test]
-async fn embeddings_succeeds_for_a_real_embeddings_capable_runtime_and_is_honestly_unsupported_otherwise() {
+async fn embeddings_succeeds_for_a_real_embeddings_capable_runtime_and_is_honestly_unsupported_otherwise(
+) {
     let root = TestDirectory::new("embeddings");
     let hub = test_hub(&root);
     let Some((state, base)) = start_test_server(hub).await else {
@@ -676,7 +967,7 @@ async fn embeddings_succeeds_for_a_real_embeddings_capable_runtime_and_is_honest
         .expect("base64 embeddings request");
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
 
-    stop_server_core(&state).await.expect("stop server");
+    state.stop().await;
 }
 
 #[tokio::test]
@@ -702,14 +993,20 @@ async fn ollama_native_chat_returns_ollama_shaped_response_with_tool_calls() {
         .expect("ollama chat request");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(
-        response.headers().get("content-type").and_then(|value| value.to_str().ok()),
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
         Some("application/json")
     );
     let payload: Value = response.json().await.expect("ollama chat JSON");
     assert_eq!(payload["model"], "llama3");
     assert_eq!(payload["done"], true);
     assert_eq!(payload["message"]["role"], "assistant");
-    assert_eq!(payload["message"]["tool_calls"][0]["function"]["name"], "weather");
+    assert_eq!(
+        payload["message"]["tool_calls"][0]["function"]["name"],
+        "weather"
+    );
     assert!(payload["total_duration"].as_u64().is_some());
     assert_eq!(payload["prompt_eval_count"], 8);
 
@@ -728,7 +1025,10 @@ async fn ollama_native_chat_returns_ollama_shaped_response_with_tool_calls() {
         .expect("streaming-flagged ollama chat request");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(
-        response.headers().get("content-type").and_then(|value| value.to_str().ok()),
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
         Some("application/x-ndjson")
     );
     let body = response.text().await.expect("ndjson body");
@@ -749,7 +1049,7 @@ async fn ollama_native_chat_returns_ollama_shaped_response_with_tool_calls() {
         .expect("image ollama chat request");
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
 
-    stop_server_core(&state).await.expect("stop server");
+    state.stop().await;
 }
 
 #[tokio::test]
@@ -762,7 +1062,8 @@ async fn external_callers_are_gated_by_the_same_pairing_scopes_as_pre_existing_r
     let mut policy = LanServerPolicy::default();
     policy.port = port;
     policy.require_authentication = true;
-    hub.configure_lan(policy).expect("configure authenticated policy");
+    hub.configure_lan(policy)
+        .expect("configure authenticated policy");
 
     let chat_only = hub
         .begin_pairing(
@@ -778,7 +1079,12 @@ async fn external_callers_are_gated_by_the_same_pairing_scopes_as_pre_existing_r
         )
         .expect("begin pairing");
     let chat_only_token = hub
-        .complete_pairing(&chat_only.challenge_id, &chat_only.pairing_code, 1_000, "127.0.0.1")
+        .complete_pairing(
+            &chat_only.challenge_id,
+            &chat_only.pairing_code,
+            1_000,
+            "127.0.0.1",
+        )
         .expect("complete pairing");
 
     let embeddings_scoped = hub
@@ -803,8 +1109,9 @@ async fn external_callers_are_gated_by_the_same_pairing_scopes_as_pre_existing_r
         )
         .expect("complete pairing");
 
-    let state = M3HttpServerState::default();
-    let started = start_server_core(&state, hub).await.expect("start M3 HTTP server");
+    let (state, started) = start_compatibility_harness(hub)
+        .await
+        .expect("start M3 HTTP server");
     assert_eq!(started.status, "running");
     let base = format!("http://127.0.0.1:{port}");
     let client = http_client();
@@ -854,5 +1161,418 @@ async fn external_callers_are_gated_by_the_same_pairing_scopes_as_pre_existing_r
         .expect("scoped embeddings request");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
-    stop_server_core(&state).await.expect("stop server");
+    state.stop().await;
+}
+
+#[tokio::test]
+async fn legacy_routes_dispatch_resolved_m3_targets_directly_for_chat_and_embeddings() {
+    let root = TestDirectory::new("legacy-direct-m3");
+    let hub = test_hub(&root);
+    let Some(port) = free_loopback_port().await else {
+        return;
+    };
+    let plaintext = "lmk-legacy-direct-m3";
+    let mut hasher = Sha256::new();
+    hasher.update(plaintext.as_bytes());
+    let mut config = ApiServerConfig::default();
+    config.port = port;
+    config.require_token = true;
+    config.expose_ollama = true;
+    config.tokens = vec![TokenEntry {
+        id: "legacy-direct-m3".to_string(),
+        label: "legacy direct M3".to_string(),
+        sha256: format!("{:x}", hasher.finalize()),
+        scopes: vec![Scope::Chat, Scope::Embeddings],
+        backends: vec![Backend::Local, Backend::Ollama],
+        created_at: 1,
+        last_used_at: None,
+        expires_at: None,
+        bound_local_app_id: None,
+    }];
+    let config_path = root.0.join("api_server.json");
+    save_config_impl(&config_path, &config).expect("save legacy direct-M3 config");
+    let server = tokio::spawn(run_cli_server_with_m3_hub_and_endpoints(
+        port,
+        config_path,
+        hub,
+        CliRuntimeEndpoints {
+            llama_port: 1,
+            ollama_base_url: "http://127.0.0.1:1".to_string(),
+        },
+        Vec::new,
+    ));
+    let client = http_client();
+    let base = format!("http://127.0.0.1:{port}");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if client
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("legacy unified listener readiness");
+
+    let chat = client
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(plaintext)
+        .json(&json!({
+            "model": "qwen-local",
+            "messages": [{"role":"user","content":"hello"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("legacy-to-M3 chat request");
+    let chat_status = chat.status();
+    let chat_body: Value = chat.json().await.expect("legacy-to-M3 chat JSON");
+    assert_eq!(chat_status, reqwest::StatusCode::OK, "{chat_body}");
+    assert_eq!(
+        chat_body["choices"][0]["message"]["content"],
+        "functional response"
+    );
+
+    let embeddings = client
+        .post(format!("{base}/v1/embeddings"))
+        .bearer_auth(plaintext)
+        .json(&json!({"model":"llama3","input":"hello"}))
+        .send()
+        .await
+        .expect("legacy-to-M3 embeddings request");
+    let embeddings_status = embeddings.status();
+    let embeddings_body: Value = embeddings
+        .json()
+        .await
+        .expect("legacy-to-M3 embeddings JSON");
+    assert_eq!(
+        embeddings_status,
+        reqwest::StatusCode::OK,
+        "{embeddings_body}"
+    );
+    assert_eq!(embeddings_body["data"][0]["embedding"], json!([5.0, 0.0]));
+
+    server.abort();
+    let _ = server.await;
+}
+
+/// The crossover that "one HTTP server" actually means, on a live socket.
+///
+/// Each token family was already covered in isolation: the legacy digest-list
+/// path by `tests/legacy_route_compatibility.rs`, the pairing-store path by the
+/// tests above. What was untested was the *dual accept* itself — one primary
+/// loopback endpoint, one server generation, both families presented to it, each
+/// routed to its own owner with its own bytes and its own quota ledger. The only
+/// other test that sends a `lmk-lan-` token to the primary socket
+/// (`server.rs`'s `saturated_dedup_socket_uses_the_selected_routes_own_busy_envelope`)
+/// never checks that string against the pairing store at all; it exercises
+/// classification plus a 503 envelope.
+///
+/// The prefix ordering is what makes the crossover subtle: `lmk-lan-` *starts
+/// with* `lmk-`, so a classifier that tested the legacy prefix first would hand
+/// every paired token to the legacy digest list, where it would 401 as an unknown
+/// key. `classify_bearer_family` checks `lmk-lan-` first for exactly this reason,
+/// and this test is what proves the ordering holds through a real socket rather
+/// than only in the unit test next to it.
+#[tokio::test]
+async fn one_primary_socket_accepts_both_token_families_and_routes_each_to_its_owner() {
+    let root = TestDirectory::new("dual-accept");
+    let hub = test_hub(&root);
+    let Some(port) = free_loopback_port().await else {
+        return;
+    };
+
+    // `max_requests: 1` is the whole point of the rate-limit half: it exhausts
+    // the *pairing* ledger after one request while leaving the legacy limiter
+    // (a separate, in-memory, 60-request budget in `http_policy.rs`) untouched.
+    let mut policy = LanServerPolicy::default();
+    policy.port = port;
+    policy.require_authentication = true;
+    policy.rate_limit.max_requests = 1;
+    hub.configure_lan(policy)
+        .expect("configure the primary socket's pairing policy");
+
+    let pairing_scopes = BTreeSet::from([ApiScope::ModelDiscover, ApiScope::ChatCompletions]);
+    let pairing_backends = BTreeSet::from([ApiBackend::ManagedLocal, ApiBackend::Ollama]);
+    let paired = hub
+        .begin_pairing(
+            PairingRequest {
+                client_label: "dual-accept paired client".to_string(),
+                scopes: pairing_scopes.clone(),
+                backends: pairing_backends.clone(),
+                allowed_models: BTreeSet::new(),
+                token_expires_at_ms: None,
+            },
+            wall_clock_ms(),
+            "127.0.0.1",
+        )
+        .expect("begin pairing");
+    let paired_token = hub
+        .complete_pairing(
+            &paired.challenge_id,
+            &paired.pairing_code,
+            wall_clock_ms(),
+            "127.0.0.1",
+        )
+        .expect("complete pairing")
+        .token;
+    assert!(
+        paired_token.starts_with("lmk-lan-") && paired_token.len() == "lmk-lan-".len() + 64,
+        "a real pairing token is `lmk-lan-` + 64 hex: {paired_token}"
+    );
+
+    // Expired at request time, but still in the future when it was minted, so
+    // pairing itself accepts it.
+    let expiring = hub
+        .begin_pairing(
+            PairingRequest {
+                client_label: "dual-accept expired client".to_string(),
+                scopes: pairing_scopes,
+                backends: pairing_backends,
+                allowed_models: BTreeSet::new(),
+                token_expires_at_ms: Some(wall_clock_ms() - 1_000),
+            },
+            wall_clock_ms() - 5_000,
+            "127.0.0.1",
+        )
+        .expect("begin pairing for an already-elapsed expiry");
+    let expired_paired_token = hub
+        .complete_pairing(
+            &expiring.challenge_id,
+            &expiring.pairing_code,
+            wall_clock_ms() - 4_000,
+            "127.0.0.1",
+        )
+        .expect("complete pairing for an already-elapsed expiry")
+        .token;
+
+    // Real `lmk-` + 32 hex plaintexts, stored the way the desktop stores them:
+    // only the digest survives in `api_server.json`.
+    let legacy_token = "lmk-0123456789abcdef0123456789abcdef";
+    let expired_legacy_token = "lmk-fedcba9876543210fedcba9876543210";
+    let unknown_legacy_token = "lmk-99999999999999999999999999999999";
+    let unknown_paired_token = format!("lmk-lan-{}", "a".repeat(64));
+    let legacy_entry = |id: &str, plaintext: &str, expires_at: Option<u64>| {
+        let mut hasher = Sha256::new();
+        hasher.update(plaintext.as_bytes());
+        TokenEntry {
+            id: id.to_string(),
+            label: id.to_string(),
+            sha256: format!("{:x}", hasher.finalize()),
+            scopes: vec![Scope::Models, Scope::Chat, Scope::Embeddings],
+            backends: vec![Backend::Local, Backend::Ollama],
+            created_at: 1,
+            last_used_at: None,
+            expires_at,
+            bound_local_app_id: None,
+        }
+    };
+
+    let mut config = ApiServerConfig::default();
+    config.port = port;
+    config.require_token = true;
+    // Left off deliberately: with an unreachable Ollama endpoint an enabled
+    // Ollama source would turn `GET /v1/models` into an upstream probe, and this
+    // test is about which owner answers, not about upstream reachability.
+    config.expose_ollama = false;
+    config.tokens = vec![
+        legacy_entry("dual-accept-legacy", legacy_token, None),
+        legacy_entry("dual-accept-legacy-expired", expired_legacy_token, Some(1)),
+    ];
+    let config_path = root.0.join("api_server.json");
+    save_config_impl(&config_path, &config).expect("save dual-accept config");
+
+    let server = tokio::spawn(run_cli_server_with_m3_hub_and_endpoints(
+        port,
+        config_path,
+        hub,
+        CliRuntimeEndpoints {
+            llama_port: 1,
+            ollama_base_url: "http://127.0.0.1:1".to_string(),
+        },
+        Vec::new,
+    ));
+    let client = http_client();
+    let base = format!("http://127.0.0.1:{port}");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if client
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("unified primary endpoint readiness");
+
+    let models = |token: &str| {
+        client
+            .get(format!("{base}/v1/models"))
+            .bearer_auth(token)
+            .send()
+    };
+
+    // 1. The legacy family reaches the legacy owner: wildcard CORS, and rows
+    //    without M3's extended `source_id`/`runtime_id`/`backend` fields.
+    let legacy = models(legacy_token).await.expect("legacy models request");
+    assert_eq!(legacy.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        legacy
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("*"),
+        "the legacy owner stamps wildcard CORS on every response"
+    );
+    let legacy_body: Value = legacy.json().await.expect("legacy models JSON");
+    let legacy_rows = legacy_body["data"]
+        .as_array()
+        .expect("legacy models data array");
+    assert!(!legacy_rows.is_empty(), "{legacy_body}");
+    for row in legacy_rows {
+        assert!(
+            row.get("source_id").is_none(),
+            "the legacy listing is the unextended shape: {row}"
+        );
+    }
+
+    // 2. The pairing family reaches the M3 owner on the *same socket in the same
+    //    generation*: extended rows, and no wildcard CORS.
+    let paired_response = models(&paired_token).await.expect("paired models request");
+    assert_eq!(paired_response.status(), reqwest::StatusCode::OK);
+    assert_ne!(
+        paired_response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("*"),
+        "the M3 owner is deny-by-default on CORS and must never emit the wildcard"
+    );
+    let paired_body: Value = paired_response.json().await.expect("paired models JSON");
+    let paired_rows = paired_body["data"]
+        .as_array()
+        .expect("paired models data array");
+    assert!(!paired_rows.is_empty(), "{paired_body}");
+    for row in paired_rows {
+        assert!(
+            row.get("source_id").is_some() && row.get("runtime_id").is_some(),
+            "the M3 listing is the extended shape: {row}"
+        );
+    }
+
+    // 3. Separate ledgers. The pairing token's durable quota is now spent
+    //    (`max_requests: 1`), so its next request is refused — while the legacy
+    //    token, whose budget lives in a different limiter entirely, keeps working
+    //    on the same socket. A single shared ledger would fail one of these two.
+    let exhausted = models(&paired_token)
+        .await
+        .expect("second paired models request");
+    assert_eq!(
+        exhausted.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the pairing store's own limiter must debit the paired token"
+    );
+    let exhausted_body: Value = exhausted.json().await.expect("paired 429 JSON");
+    assert_eq!(exhausted_body["error"]["code"], "rate_limited");
+    let legacy_after = models(legacy_token)
+        .await
+        .expect("legacy request after the paired quota is spent");
+    assert_eq!(
+        legacy_after.status(),
+        reqwest::StatusCode::OK,
+        "exhausting the pairing quota must not refuse legacy traffic"
+    );
+
+    // 4. An invalid token of either family is refused, and within the legacy
+    //    family "expired" and "never existed" are byte-identical — no existence
+    //    oracle. (`server.rs::authenticate_credential` reaches its generic error
+    //    by `break`, not by an early return, for exactly this reason.)
+    let unknown = models(unknown_legacy_token)
+        .await
+        .expect("unknown legacy token request");
+    let unknown_status = unknown.status();
+    let unknown_cors = unknown
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let unknown_bytes = unknown.bytes().await.expect("unknown legacy 401 body");
+    let expired = models(expired_legacy_token)
+        .await
+        .expect("expired legacy token request");
+    let expired_status = expired.status();
+    let expired_cors = expired
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let expired_bytes = expired.bytes().await.expect("expired legacy 401 body");
+    assert_eq!(unknown_status, reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(expired_status, unknown_status);
+    assert_eq!(expired_bytes, unknown_bytes);
+    assert_eq!(expired_cors, unknown_cors);
+
+    // The pairing family refuses an unknown token with its own 401 envelope.
+    let unknown_paired = models(&unknown_paired_token)
+        .await
+        .expect("unknown paired token request");
+    assert_eq!(unknown_paired.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let unknown_paired_body: Value = unknown_paired.json().await.expect("paired 401 JSON");
+    assert_eq!(unknown_paired_body["error"]["code"], "unauthorized");
+    assert_eq!(
+        unknown_paired_body["error"]["type"],
+        "little_monkey_m3_error"
+    );
+
+    // And the pairing family closes the same oracle the legacy family does: an
+    // expired paired token is byte-identical to an unknown one, rather than the
+    // `403 "token is expired"` it used to answer, which told a caller the token
+    // it holds was once real. The decision is `compatibility_hub.rs`'s
+    // `credential_validity_denial`, shared by `preflight_credential` and
+    // `authorize_validated`; scope denials on a *live* token keep their own 403
+    // (the caller already proved possession), which is why this collapse is
+    // limited to credential validity.
+    let expired_paired = models(&expired_paired_token)
+        .await
+        .expect("expired paired token request");
+    let expired_paired_status = expired_paired.status();
+    let expired_paired_cors = expired_paired
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let expired_paired_bytes = expired_paired
+        .bytes()
+        .await
+        .expect("expired paired 401 body");
+    let unknown_paired_again = models(&unknown_paired_token)
+        .await
+        .expect("unknown paired token request, for byte comparison");
+    let unknown_paired_status = unknown_paired_again.status();
+    let unknown_paired_cors = unknown_paired_again
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let unknown_paired_bytes = unknown_paired_again
+        .bytes()
+        .await
+        .expect("unknown paired 401 body");
+    assert_eq!(expired_paired_status, reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(expired_paired_status, unknown_paired_status);
+    assert_eq!(expired_paired_bytes, unknown_paired_bytes);
+    assert_eq!(expired_paired_cors, unknown_paired_cors);
+
+    server.abort();
+    let _ = server.await;
 }

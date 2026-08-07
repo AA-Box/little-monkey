@@ -339,8 +339,7 @@ async fn verified_call_within_scope(
         request = request.json(body);
     }
 
-    let response = request
-        .send()
+    let response = crate::egress::send(request)
         .await
         .map_err(|e| format!("Verification request failed: {e}"))?;
     if response.status().is_redirection() {

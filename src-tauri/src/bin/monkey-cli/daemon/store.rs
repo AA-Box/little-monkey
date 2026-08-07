@@ -251,6 +251,13 @@ pub struct DaemonJob {
     pub worktree_json: Option<String>,
     pub parent_run_id: Option<String>,
     pub last_error: Option<String>,
+    /// Why admission last passed this job over, or `None` when it never has.
+    ///
+    /// Separate from `last_error` on purpose: that column is sticky
+    /// (`transition` writes it with `COALESCE`), so a hold left in it would
+    /// still be there when the job later succeeded and would be read back as
+    /// that success's exit reason.
+    pub hold_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -284,8 +291,9 @@ impl DaemonStore {
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| error.to_string())?;
         connection
-            .execute_batch(DAEMON_SCHEMA)
-            .map_err(|error| format!("Failed to migrate daemon state: {error}"))?;
+            .execute_batch(DAEMON_PRAGMAS)
+            .map_err(|error| format!("Failed to configure daemon state: {error}"))?;
+        apply_daemon_migrations(&connection)?;
         restrict_file(&paths.state_db)?;
         Ok(Self { connection })
     }
@@ -294,8 +302,9 @@ impl DaemonStore {
     pub fn open_in_memory() -> Result<Self, String> {
         let connection = Connection::open_in_memory().map_err(|error| error.to_string())?;
         connection
-            .execute_batch(DAEMON_SCHEMA)
+            .execute_batch(DAEMON_PRAGMAS)
             .map_err(|error| error.to_string())?;
+        apply_daemon_migrations(&connection)?;
         Ok(Self { connection })
     }
 
@@ -405,7 +414,7 @@ impl DaemonStore {
                         max_attempts, created_at_ms, updated_at_ms, started_at_ms,
                         finished_at_ms, process_id, max_runtime_ms, max_memory_bytes,
                         max_log_bytes, pause_requested, cancel_requested,
-                        repository_policy_json, worktree_json, parent_run_id, last_error
+                        repository_policy_json, worktree_json, parent_run_id, last_error, hold_reason
                  FROM daemon_jobs WHERE job_id=?1 OR run_id=?1",
                 [id],
                 read_job,
@@ -422,7 +431,7 @@ impl DaemonStore {
                         max_attempts, created_at_ms, updated_at_ms, started_at_ms,
                         finished_at_ms, process_id, max_runtime_ms, max_memory_bytes,
                         max_log_bytes, pause_requested, cancel_requested,
-                        repository_policy_json, worktree_json, parent_run_id, last_error
+                        repository_policy_json, worktree_json, parent_run_id, last_error, hold_reason
                  FROM daemon_jobs
                  WHERE state='queued' AND pause_requested=0 AND cancel_requested=0
                  ORDER BY priority DESC, created_at_ms ASC, job_id ASC LIMIT ?1",
@@ -443,7 +452,7 @@ impl DaemonStore {
                         max_attempts, created_at_ms, updated_at_ms, started_at_ms,
                         finished_at_ms, process_id, max_runtime_ms, max_memory_bytes,
                         max_log_bytes, pause_requested, cancel_requested,
-                        repository_policy_json, worktree_json, parent_run_id, last_error
+                        repository_policy_json, worktree_json, parent_run_id, last_error, hold_reason
                  FROM daemon_jobs WHERE state IN
                  ('running','waiting_approval','paused','cancelling')
                  ORDER BY created_at_ms ASC, job_id ASC",
@@ -464,7 +473,7 @@ impl DaemonStore {
                         max_attempts, created_at_ms, updated_at_ms, started_at_ms,
                         finished_at_ms, process_id, max_runtime_ms, max_memory_bytes,
                         max_log_bytes, pause_requested, cancel_requested,
-                        repository_policy_json, worktree_json, parent_run_id, last_error
+                        repository_policy_json, worktree_json, parent_run_id, last_error, hold_reason
                  FROM daemon_jobs WHERE state NOT IN
                  ('succeeded','failed','cancelled','needs_reconciliation')
                  ORDER BY created_at_ms ASC, job_id ASC",
@@ -554,6 +563,177 @@ impl DaemonStore {
         Ok(())
     }
 
+    /// Claim memory for an admitted job, durably (K7).
+    ///
+    /// Also clears `hold_reason`: whatever admission was waiting for, it is not
+    /// waiting for it any more.
+    pub fn record_reservation(
+        &mut self,
+        job_id: &str,
+        model_key: &str,
+        ram_bytes: u64,
+        vram_bytes: u64,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "UPDATE daemon_jobs
+                 SET reservation_model_key=?2, reservation_ram_bytes=?3,
+                     reservation_vram_bytes=?4, hold_reason=NULL
+                 WHERE job_id=?1",
+                params![job_id, model_key, to_i64(ram_bytes)?, to_i64(vram_bytes)?],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Give the claim back. Idempotent, because more than one exit path reaches
+    /// it for the same job.
+    pub fn release_reservation(&mut self, job_id: &str) -> Result<(), String> {
+        self.connection
+            .execute(
+                "UPDATE daemon_jobs
+                 SET reservation_model_key=NULL, reservation_ram_bytes=NULL,
+                     reservation_vram_bytes=NULL
+                 WHERE job_id=?1",
+                [job_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// One row per *resident model*, not per job: `(model_key, ram, vram)`.
+    ///
+    /// The `GROUP BY` is the whole point. Two queued turns against one local
+    /// model make it resident once, so they must be charged once — and the
+    /// release rule falls out of the same grouping rather than needing its own
+    /// bookkeeping: the model's row disappears when the last job holding that
+    /// key leaves an active state, not when the first one does.
+    ///
+    /// `MAX` rather than any single row's value because two holders of one model
+    /// were admitted against different hardware snapshots and may have recorded
+    /// marginally different claims; the larger is the conservative one.
+    pub fn committed_reservations(&self) -> Result<Vec<(String, u64, u64)>, String> {
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "SELECT reservation_model_key,
+                        MAX(COALESCE(reservation_ram_bytes, 0)),
+                        MAX(COALESCE(reservation_vram_bytes, 0))
+                 FROM daemon_jobs
+                 WHERE reservation_model_key IS NOT NULL
+                   AND state IN {DAEMON_ACTIVE_STATES}
+                 GROUP BY reservation_model_key"
+            ))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    from_i64(row.get(1)?)?,
+                    from_i64(row.get(2)?)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Drop reservations left behind by a daemon that died holding them.
+    ///
+    /// `committed_reservations` already ignores a row whose job is no longer
+    /// active, so this is not what makes the accounting correct — it is what
+    /// keeps the columns honest for anything else that reads them, and it is the
+    /// only thing that would notice a row whose job reached a terminal state by
+    /// some path that never released it. Returns how many were swept.
+    pub fn sweep_stale_reservations(&mut self) -> Result<usize, String> {
+        self.connection
+            .execute(
+                &format!(
+                    "UPDATE daemon_jobs
+                     SET reservation_model_key=NULL, reservation_ram_bytes=NULL,
+                         reservation_vram_bytes=NULL
+                     WHERE reservation_model_key IS NOT NULL
+                       AND state NOT IN {DAEMON_ACTIVE_STATES}"
+                ),
+                [],
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    /// `(job_id, model_key, ram, vram)` for every job currently holding a claim.
+    ///
+    /// Per job rather than per resident model, which is the opposite of
+    /// [`Self::committed_reservations`] and deliberately so: the committed total
+    /// asks "how much is held", and preemption asks "who is holding it", which
+    /// needs the holders spelled out. It is also how the engine learns that a
+    /// model has more than one holder — and therefore that suspending any one of
+    /// them frees nothing.
+    pub fn job_reservations(&self) -> Result<Vec<(String, String, u64, u64)>, String> {
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "SELECT job_id, reservation_model_key,
+                        COALESCE(reservation_ram_bytes, 0),
+                        COALESCE(reservation_vram_bytes, 0)
+                 FROM daemon_jobs
+                 WHERE reservation_model_key IS NOT NULL
+                   AND state IN {DAEMON_ACTIVE_STATES}"
+            ))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    from_i64(row.get(2)?)?,
+                    from_i64(row.get(3)?)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Jobs waiting to start: the backlog the backpressure signal compares
+    /// `held_count` against, and the only counter that can tell "the queue is
+    /// deep" from "everything in it is stuck".
+    pub fn queued_count(&self) -> Result<u32, String> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM daemon_jobs WHERE state IN ('preparing','queued')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    /// How many queued jobs admission is currently refusing for resources.
+    ///
+    /// The backpressure signal's "the machine is full, not the queue" case, and
+    /// the only counter that can tell those two apart.
+    pub fn held_count(&self) -> Result<u32, String> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM daemon_jobs
+                 WHERE state='queued' AND hold_reason IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    /// Record why admission passed a queued job over, so "held for memory" is
+    /// distinguishable from "not looked at yet" without inventing a job state.
+    pub fn record_hold(&mut self, job_id: &str, reason: Option<&str>) -> Result<(), String> {
+        self.connection
+            .execute(
+                "UPDATE daemon_jobs SET hold_reason=?2 WHERE job_id=?1",
+                params![job_id, reason],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub fn request_pause(
         &mut self,
         id: &str,
@@ -604,7 +784,7 @@ impl DaemonStore {
                         max_attempts, created_at_ms, updated_at_ms, started_at_ms,
                         finished_at_ms, process_id, max_runtime_ms, max_memory_bytes,
                         max_log_bytes, pause_requested, cancel_requested,
-                        repository_policy_json, worktree_json, parent_run_id, last_error
+                        repository_policy_json, worktree_json, parent_run_id, last_error, hold_reason
                  FROM daemon_jobs WHERE state='preparing' AND updated_at_ms < ?1",
             )
             .map_err(|error| error.to_string())?;
@@ -627,7 +807,7 @@ impl DaemonStore {
                             max_attempts, created_at_ms, updated_at_ms, started_at_ms,
                             finished_at_ms, process_id, max_runtime_ms, max_memory_bytes,
                             max_log_bytes, pause_requested, cancel_requested,
-                            repository_policy_json, worktree_json, parent_run_id, last_error
+                            repository_policy_json, worktree_json, parent_run_id, last_error, hold_reason
                      FROM daemon_jobs WHERE state IN
                      ('succeeded','failed','cancelled','needs_reconciliation')
                      AND finished_at_ms IS NOT NULL AND finished_at_ms < ?1
@@ -657,7 +837,7 @@ impl DaemonStore {
                         max_attempts, created_at_ms, updated_at_ms, started_at_ms,
                         finished_at_ms, process_id, max_runtime_ms, max_memory_bytes,
                         max_log_bytes, pause_requested, cancel_requested,
-                        repository_policy_json, worktree_json, parent_run_id, last_error
+                        repository_policy_json, worktree_json, parent_run_id, last_error, hold_reason
                  FROM daemon_jobs WHERE state IN
                  ('succeeded','failed','cancelled','needs_reconciliation')
                  AND finished_at_ms IS NOT NULL AND finished_at_ms < ?1
@@ -849,6 +1029,127 @@ impl DaemonStore {
     }
 }
 
+/// Outcome tokens for [`SchedulerDecision::outcome`]. Spelled once here because
+/// the migration's `CHECK` constraint spells them too.
+pub const DECISION_ADMITTED: &str = "admitted";
+pub const DECISION_HELD: &str = "held";
+pub const DECISION_PREEMPTED: &str = "preempted";
+pub const DECISION_RESUMED: &str = "resumed";
+pub const DECISION_REJECTED: &str = "rejected";
+
+/// How many decisions are retained. Older ones are deleted on insert.
+///
+/// A decision log has to be bounded or it becomes the largest table in the
+/// database: at four ticks a second with anything queued, an unbounded log grows
+/// by tens of thousands of rows an hour. 512 is a few minutes of a busy queue,
+/// which is the window in which anyone actually asks "why did that run go
+/// first".
+pub const MAX_SCHEDULER_DECISIONS: i64 = 512;
+
+/// One arbitration decision, after the fact.
+///
+/// The point of the row is the last three fields. "Job A was admitted" is not
+/// inspectable; "job A was admitted over B and C because available RAM read
+/// 9.2 GiB at 15:04:02" is. `measurement` names *which* number decided it and
+/// `measured_at_ms` is that number's own observation time, not the time this row
+/// was written — a re-derived guess with a fresh timestamp is exactly the thing
+/// this column exists to rule out.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulerDecision {
+    pub decided_at_ms: u64,
+    pub job_id: String,
+    pub outcome: String,
+    /// The class the run's frozen kind declares.
+    pub process_class: String,
+    /// That class after aging promotion, which is what the ranking actually used.
+    pub effective_class: String,
+    pub workspace: Option<String>,
+    /// What this job was chosen over, most-nearly-chosen first. Bounded when
+    /// written — a decision row must not grow with the queue.
+    pub passed_over: Vec<String>,
+    pub detail: String,
+    pub measurement: String,
+    pub measured_value: Option<u64>,
+    pub measured_at_ms: Option<u64>,
+}
+
+impl DaemonStore {
+    /// Append a decision and drop anything past [`MAX_SCHEDULER_DECISIONS`].
+    pub fn record_decision(&mut self, decision: &SchedulerDecision) -> Result<(), String> {
+        let passed_over =
+            serde_json::to_string(&decision.passed_over).map_err(|error| error.to_string())?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO daemon_scheduler_decisions (
+                    decided_at_ms, job_id, outcome, process_class, effective_class,
+                    workspace, passed_over_json, detail, measurement, measured_value,
+                    measured_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    to_i64(decision.decided_at_ms)?,
+                    decision.job_id,
+                    decision.outcome,
+                    decision.process_class,
+                    decision.effective_class,
+                    decision.workspace,
+                    passed_over,
+                    decision.detail,
+                    decision.measurement,
+                    decision.measured_value.map(to_i64).transpose()?,
+                    decision.measured_at_ms.map(to_i64).transpose()?,
+                ],
+            )
+            .map_err(|error| format!("Failed to record scheduling decision: {error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM daemon_scheduler_decisions WHERE decision_id <=
+                 (SELECT MAX(decision_id) FROM daemon_scheduler_decisions) - ?1",
+                [MAX_SCHEDULER_DECISIONS],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    /// The newest decisions first.
+    pub fn recent_decisions(&self, limit: u32) -> Result<Vec<SchedulerDecision>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT decided_at_ms, job_id, outcome, process_class, effective_class,
+                        workspace, passed_over_json, detail, measurement, measured_value,
+                        measured_at_ms
+                 FROM daemon_scheduler_decisions
+                 ORDER BY decision_id DESC LIMIT ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([i64::from(limit.clamp(1, 512))], |row| {
+                Ok(SchedulerDecision {
+                    decided_at_ms: from_i64(row.get(0)?)?,
+                    job_id: row.get(1)?,
+                    outcome: row.get(2)?,
+                    process_class: row.get(3)?,
+                    effective_class: row.get(4)?,
+                    workspace: row.get(5)?,
+                    passed_over: serde_json::from_str(&row.get::<_, String>(6)?)
+                        .unwrap_or_default(),
+                    detail: row.get(7)?,
+                    measurement: row.get(8)?,
+                    measured_value: row.get::<_, Option<i64>>(9)?.map(from_i64).transpose()?,
+                    measured_at_ms: row.get::<_, Option<i64>>(10)?.map(from_i64).transpose()?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingDelivery {
     pub trigger_id: String,
@@ -897,6 +1198,7 @@ fn read_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DaemonJob> {
         worktree_json: row.get(18)?,
         parent_run_id: row.get(19)?,
         last_error: row.get(20)?,
+        hold_reason: row.get(21)?,
     })
 }
 
@@ -925,10 +1227,15 @@ pub fn map_run_status(status: RunStatus) -> JobState {
     }
 }
 
-const DAEMON_SCHEMA: &str = r#"
+const DAEMON_PRAGMAS: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
+"#;
 
+const DAEMON_V1: i64 = 1;
+const DAEMON_V1_CHECKSUM: &str = "daemon-jobs-v1";
+
+const DAEMON_V1_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS daemon_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -978,9 +1285,240 @@ CREATE TABLE IF NOT EXISTS daemon_delivery_payloads (
 ) STRICT;
 "#;
 
+const DAEMON_V2: i64 = 2;
+const DAEMON_V2_CHECKSUM: &str = "daemon-jobs-v2-reservations";
+
+/// Resource-aware admission (K7) needs two facts to outlive the daemon process:
+/// what an admitted job holds, and why a queued one is still queued.
+///
+/// `reservation_model_key` is the identity of the *resident model*, not of the
+/// job, which is what makes the committed total a `GROUP BY` rather than a `SUM`
+/// — see `committed_reservations`.
+///
+/// Added by `ALTER` rather than by rebuilding the table, which costs the ability
+/// to express "all three reservation columns are set together" as a SQL `CHECK`
+/// (SQLite cannot add a constraint to an existing table). No loss worth
+/// rebuilding a live queue for: `record_reservation` is the only writer and sets
+/// all three in one statement.
+const DAEMON_V2_SQL: &str = r#"
+ALTER TABLE daemon_jobs ADD COLUMN reservation_model_key TEXT;
+ALTER TABLE daemon_jobs ADD COLUMN reservation_ram_bytes INTEGER;
+ALTER TABLE daemon_jobs ADD COLUMN reservation_vram_bytes INTEGER;
+ALTER TABLE daemon_jobs ADD COLUMN hold_reason TEXT;
+"#;
+
+const DAEMON_V3: i64 = 3;
+const DAEMON_V3_CHECKSUM: &str = "daemon-jobs-v3-scheduler-decisions";
+
+/// The scheduler's decision log (K8): which job was chosen, what it was chosen
+/// over, and which measurement decided it.
+///
+/// Its own table rather than more columns on `daemon_jobs`, because a job has
+/// many decisions over its life — held on nine ticks, preempted, resumed,
+/// admitted — and a column can only hold the last one. `hold_reason` is the
+/// degenerate single-slot version of this and stays where it is: the ready-queue
+/// gate reads it in SQL, and it answers "why is this job still queued right now",
+/// which is a live question rather than a historical one.
+///
+/// `decision_id` is an `INTEGER PRIMARY KEY` and therefore the rowid, which is
+/// what makes the retention delete in `record_decision` a single indexed range
+/// scan rather than an ordered scan of the whole table.
+const DAEMON_V3_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS daemon_scheduler_decisions (
+    decision_id INTEGER PRIMARY KEY,
+    decided_at_ms INTEGER NOT NULL CHECK (decided_at_ms > 0),
+    job_id TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'admitted','held','preempted','resumed','rejected'
+    )),
+    process_class TEXT NOT NULL CHECK (process_class IN (
+        'interactive','batch','background','maintenance'
+    )),
+    effective_class TEXT NOT NULL CHECK (effective_class IN (
+        'interactive','batch','background','maintenance'
+    )),
+    workspace TEXT,
+    passed_over_json TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    measurement TEXT NOT NULL,
+    measured_value INTEGER,
+    measured_at_ms INTEGER
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS daemon_scheduler_decisions_job_idx
+    ON daemon_scheduler_decisions(job_id, decision_id DESC);
+"#;
+
+/// Every migration in order, so applying them is a loop rather than a stanza per
+/// version. Mirrors the shape `denial_sink` and the run ledger already use, and
+/// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
+/// `daemon-v1.sqlite3` was one `CREATE TABLE IF NOT EXISTS` with no version key,
+/// so neither a new state nor a new column could be added at all.
+///
+/// V1 is the pre-existing schema. Recording it is safe on a database that
+/// already has those tables because every statement in it is
+/// `CREATE ... IF NOT EXISTS`, so the first run against an old file writes the
+/// version row and changes nothing else.
+const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
+    (DAEMON_V1, DAEMON_V1_CHECKSUM, DAEMON_V1_SQL),
+    (DAEMON_V2, DAEMON_V2_CHECKSUM, DAEMON_V2_SQL),
+    (DAEMON_V3, DAEMON_V3_CHECKSUM, DAEMON_V3_SQL),
+];
+
+/// Latest version this build understands. The forward-only guard compares
+/// against this rather than a specific version, so adding V4 needs no edit
+/// there.
+const DAEMON_LATEST: i64 = DAEMON_V3;
+
+/// Active states, spelled once. A reservation is held for exactly as long as the
+/// job is in one of them, which is what releases it on any exit path — clean,
+/// crashed, or reconciled — without each of those paths having to remember to.
+const DAEMON_ACTIVE_STATES: &str = "('running','waiting_approval','paused','cancelling')";
+
+fn apply_daemon_migrations(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS daemon_migrations (
+                version INTEGER PRIMARY KEY,
+                checksum TEXT NOT NULL,
+                applied_at_ms INTEGER NOT NULL
+             ) STRICT;",
+        )
+        .map_err(|error| format!("Failed to open daemon migrations: {error}"))?;
+
+    if let Some(version) = connection
+        .query_row("SELECT MAX(version) FROM daemon_migrations", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })
+        .map_err(|error| error.to_string())?
+    {
+        // Forward-only. A rolled-back build meeting a newer queue refuses to
+        // open it rather than reading columns it does not know are there.
+        if version > DAEMON_LATEST {
+            return Err(format!(
+                "Daemon state was written by a newer build (schema v{version}); upgrade monkey or remove the daemon state file"
+            ));
+        }
+    }
+
+    for &(version, checksum, sql) in DAEMON_MIGRATIONS {
+        if let Some(recorded) = connection
+            .query_row(
+                "SELECT checksum FROM daemon_migrations WHERE version = ?1",
+                [version],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        {
+            // Already applied. Still checked rather than skipped: a schema
+            // edited in place instead of added as a new version is the mistake
+            // worth failing on, and only the recorded checksum can see it.
+            if recorded != checksum {
+                return Err(format!(
+                    "Daemon schema v{version} was edited in place; add a new version instead"
+                ));
+            }
+            continue;
+        }
+        connection
+            .execute_batch(sql)
+            .map_err(|error| format!("Failed to migrate daemon state to v{version}: {error}"))?;
+        connection
+            .execute(
+                "INSERT INTO daemon_migrations (version, checksum, applied_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![version, checksum, 1_i64],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A queue written by a build that predates the migration table must upgrade
+    /// in place and keep its rows. This is the case the daemon store had no way
+    /// to handle at all before K7.
+    #[test]
+    fn a_pre_migration_database_upgrades_in_place_and_keeps_its_jobs() {
+        let connection = Connection::open_in_memory().unwrap();
+        // Exactly what an older build left behind: V1's tables and no version key.
+        connection.execute_batch(DAEMON_V1_SQL).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO daemon_jobs (
+                    job_id, recipe_snapshot, state, priority, attempt, max_attempts,
+                    created_at_ms, updated_at_ms, max_runtime_ms, max_log_bytes
+                 ) VALUES ('old', '/old.json', 'running', 0, 1, 1, 1, 1, 60000, 1024);",
+            )
+            .unwrap();
+
+        apply_daemon_migrations(&connection).unwrap();
+
+        let store = DaemonStore { connection };
+        let job = store.get_job("old").unwrap().unwrap();
+        assert_eq!(job.state, JobState::Running, "the row survives the upgrade");
+        assert_eq!(job.hold_reason, None, "the new column reads as unset");
+        assert!(store.committed_reservations().unwrap().is_empty());
+    }
+
+    /// Re-running the loop is a no-op, and a checksum that no longer matches its
+    /// recorded version is the mistake worth failing on.
+    #[test]
+    fn migrations_are_idempotent_and_refuse_a_schema_edited_in_place() {
+        let connection = Connection::open_in_memory().unwrap();
+        apply_daemon_migrations(&connection).unwrap();
+        apply_daemon_migrations(&connection).unwrap();
+
+        connection
+            .execute(
+                "UPDATE daemon_migrations SET checksum='tampered' WHERE version=?1",
+                [DAEMON_V2],
+            )
+            .unwrap();
+        let error = apply_daemon_migrations(&connection).unwrap_err();
+        assert!(
+            error.contains("edited in place"),
+            "expected an in-place-edit refusal, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_reservation_is_charged_once_per_resident_model_and_swept_when_idle() {
+        let mut store = DaemonStore::open_in_memory().unwrap();
+        for id in ["one", "two"] {
+            store.insert_preparing(&new_job(id, 1), 8).unwrap();
+            store.mark_queued(id, &format!("run-{id}"), 1).unwrap();
+            store
+                .transition(id, JobState::Running, 2, Some(7), None)
+                .unwrap();
+            store
+                .record_reservation(id, "shared-model", 1_024, 512)
+                .unwrap();
+        }
+        assert_eq!(
+            store.committed_reservations().unwrap(),
+            vec![("shared-model".to_string(), 1_024, 512)],
+            "two jobs, one resident model, one charge"
+        );
+
+        // The first holder leaving does not free the model.
+        store.release_reservation("one").unwrap();
+        store
+            .transition("one", JobState::Succeeded, 3, None, None)
+            .unwrap();
+        assert_eq!(store.committed_reservations().unwrap().len(), 1);
+
+        // A terminal job that somehow kept its columns is swept.
+        store
+            .transition("two", JobState::Failed, 4, None, Some("crash"))
+            .unwrap();
+        assert_eq!(store.sweep_stale_reservations().unwrap(), 1);
+        assert!(store.committed_reservations().unwrap().is_empty());
+    }
 
     fn new_job(id: &str, now: u64) -> NewDaemonJob {
         NewDaemonJob {
@@ -1086,6 +1624,47 @@ mod tests {
             store.managed_run_ids(2).unwrap(),
             ["run-old".to_string(), "run-new".to_string()]
         );
+    }
+
+    /// The log has to stay bounded, and it has to keep the *newest* rows —
+    /// dropping the newest would leave a log that answers questions nobody has.
+    #[test]
+    fn the_decision_log_is_bounded_and_retains_the_newest() {
+        let mut store = DaemonStore::open_in_memory().unwrap();
+        let total = u64::try_from(MAX_SCHEDULER_DECISIONS).unwrap() + 40;
+        for index in 1..=total {
+            store
+                .record_decision(&SchedulerDecision {
+                    decided_at_ms: index,
+                    job_id: format!("job-{index}"),
+                    outcome: DECISION_ADMITTED.to_string(),
+                    process_class: "batch".to_string(),
+                    effective_class: "batch".to_string(),
+                    workspace: Some("/work".to_string()),
+                    passed_over: vec!["job-other".to_string()],
+                    detail: "fixture".to_string(),
+                    measurement: "available_ram_bytes".to_string(),
+                    measured_value: Some(1_024),
+                    measured_at_ms: Some(index),
+                })
+                .unwrap();
+        }
+        let retained = store.recent_decisions(512).unwrap();
+        assert_eq!(
+            i64::try_from(retained.len()).unwrap(),
+            MAX_SCHEDULER_DECISIONS
+        );
+        assert_eq!(retained[0].job_id, format!("job-{total}"), "newest first");
+        assert_eq!(retained[0].passed_over, ["job-other"]);
+        assert_eq!(retained[0].measured_at_ms, Some(total));
+
+        // The wire spelling `--json` prints, which the desktop mirror
+        // (`DesktopSchedulerDecision` in the library's `daemon_commands.rs`)
+        // decodes: camelCase throughout, and no `decision_id` — the column exists
+        // but `recent_decisions` deliberately does not select it.
+        let wire = serde_json::to_value(&retained[0]).unwrap();
+        assert!(wire.get("passedOver").is_some() && wire.get("measuredAtMs").is_some());
+        assert!(wire.get("measured_at_ms").is_none() && wire.get("decisionId").is_none());
     }
 
     #[test]

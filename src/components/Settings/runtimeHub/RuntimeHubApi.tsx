@@ -3,8 +3,7 @@ import { Braces, Copy, Play, Square } from "lucide-react";
 import { Button, StatusPill } from "../../ui";
 import type {
   CompatibilityProtocol,
-  M3ApiCaller,
-  M3ApiDispatchRequest,
+  M3DiagnosticDispatchRequest,
 } from "../../../lib/runtimeHubClient";
 import { createM3OperationId } from "../../../lib/runtimeHubClient";
 import { useRuntimeHubStore } from "../../../store/runtimeHubStore";
@@ -69,9 +68,6 @@ export function RuntimeHubApi() {
   const [runtimeId, setRuntimeId] = useState(initialRuntime);
   const [modelId, setModelId] = useState(initialModel);
   const [requestId, setRequestId] = useState(() => createM3OperationId("diagnostic"));
-  const [callerType, setCallerType] = useState<"internal" | "external">("internal");
-  const [bearerToken, setBearerToken] = useState("");
-  const [remoteAddress, setRemoteAddress] = useState("127.0.0.1");
   const [body, setBody] = useState(() => defaultBody("open_ai_chat_completions", initialModel));
   const [localError, setLocalError] = useState<string | null>(null);
   const [cancelled, setCancelled] = useState<boolean | null>(null);
@@ -106,20 +102,10 @@ export function RuntimeHubApi() {
     }
   }
 
-  function caller(): M3ApiCaller {
-    return callerType === "internal"
-      ? { type: "internal" }
-      : { type: "external", bearer_token: bearerToken, remote_address: remoteAddress };
-  }
-
-  function request(): M3ApiDispatchRequest | null {
+  function request(): M3DiagnosticDispatchRequest | null {
     setLocalError(null);
     if (!runtimeId || !modelId || !requestId.trim()) {
       setLocalError("Runtime, model, and request id are required.");
-      return null;
-    }
-    if (callerType === "external" && (!bearerToken.trim() || !remoteAddress.trim())) {
-      setLocalError("External diagnostics require a paired bearer token and exact remote address.");
       return null;
     }
     try {
@@ -137,8 +123,6 @@ export function RuntimeHubApi() {
       runtimeId,
       requestId: requestId.trim(),
       body: Array.from(new TextEncoder().encode(body)),
-      caller: caller(),
-      nowMs: Date.now(),
     };
   }
 
@@ -158,8 +142,6 @@ export function RuntimeHubApi() {
       runtimeId,
       requestId: next.requestId,
       modelId,
-      caller: next.caller,
-      nowMs: Date.now(),
     }).then(setCancelled).catch(() => {});
   }
 
@@ -178,7 +160,7 @@ export function RuntimeHubApi() {
     <div role="tabpanel" id="runtime-hub-panel-api" aria-labelledby="runtime-hub-tab-api" className="flex flex-col gap-5">
       <SectionHeading
         title="Compatibility diagnostics"
-        description="Send a real non-streaming request through the same strict OpenAI or Anthropic translation layer used by the HTTP server. Unsupported fields fail explicitly."
+        description="Send a desktop-only, non-streaming request through the same strict OpenAI or Anthropic translation layer used by the HTTP server. The native backend supplies caller identity and time; test paired LAN credentials through the HTTP endpoint."
       />
 
       <form onSubmit={submit} className="flex flex-col gap-4 rounded-lg border border-border bg-background p-4">
@@ -203,22 +185,6 @@ export function RuntimeHubApi() {
           <Field label="Request id" hint="Use this same id to cancel an in-flight generation.">
             <input value={requestId} onChange={(event) => setRequestId(event.target.value)} className={`${CONTROL_CLASS} font-mono`} />
           </Field>
-          <Field label="Caller">
-            <select value={callerType} onChange={(event) => setCallerType(event.target.value as "internal" | "external")} className={CONTROL_CLASS}>
-              <option value="internal">Internal desktop caller</option>
-              <option value="external">External paired LAN caller</option>
-            </select>
-          </Field>
-          {callerType === "external" && (
-            <>
-              <Field label="Bearer token" hint="Validated for exact scope, backend, model, rate limit, and remote address.">
-                <input type="password" value={bearerToken} onChange={(event) => setBearerToken(event.target.value)} className={`${CONTROL_CLASS} font-mono`} autoComplete="off" />
-              </Field>
-              <Field label="Remote address">
-                <input value={remoteAddress} onChange={(event) => setRemoteAddress(event.target.value)} className={`${CONTROL_CLASS} font-mono`} />
-              </Field>
-            </>
-          )}
         </div>
 
         <Field label="JSON request body" hint="Streaming is intentionally exercised through the HTTP SSE route, not this IPC diagnostic.">
@@ -256,4 +222,3 @@ export function RuntimeHubApi() {
     </div>
   );
 }
-

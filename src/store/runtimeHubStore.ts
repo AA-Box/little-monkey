@@ -12,9 +12,9 @@ import {
   type HardwareProfile,
   type HardwareSnapshot,
   type LanServerPolicy,
-  type M3ApiDispatchRequest,
+  type M3DiagnosticDispatchRequest,
   type M3ApiDispatchResponse,
-  type M3CancelInferenceRequest,
+  type M3DiagnosticCancelRequest,
   type M3CatalogSourceConfig,
   type M3CatalogMatch,
   type M3CleanupReport,
@@ -187,8 +187,8 @@ interface RuntimeHubStoreState {
   loadModel: (request: M3LoadModelRequest) => Promise<void>;
   unloadModel: (request: M3UnloadModelRequest) => Promise<void>;
   setRuntimeConfig: (runtimeId: string, values: Record<string, SettingValue>) => Promise<void>;
-  dispatchApi: (request: M3ApiDispatchRequest) => Promise<void>;
-  cancelInference: (request: M3CancelInferenceRequest) => Promise<boolean>;
+  dispatchApi: (request: M3DiagnosticDispatchRequest) => Promise<void>;
+  cancelInference: (request: M3DiagnosticCancelRequest) => Promise<boolean>;
   refreshCompatibilityMatrix: () => Promise<void>;
   refreshLan: () => Promise<void>;
   validateLanPolicy: (policy: LanServerPolicy) => Promise<void>;
@@ -1010,8 +1010,10 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         await runtimeHubClient.lanValidatePolicy(policy);
         const lanPolicy = await runtimeHubClient.lanConfigure(policy);
         set({ lanPolicy });
-        const httpServerStatus = await runtimeHubClient.httpServerStart();
-        set({ lanPolicy, httpServerStatus });
+        // `m3_lan_configure` is a backend transaction: policy persistence,
+        // listener reconciliation, and rollback on bind failure complete
+        // before it returns. A second start call would reopen the race that
+        // transaction exists to remove.
         await get().refreshLan();
       } catch (error) {
         try {
@@ -1031,10 +1033,13 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       const key = "lan-disable";
       begin(key);
       try {
-        const httpServerStatus = await runtimeHubClient.httpServerStop();
-        set({ httpServerStatus });
+        // Disable + listener reconciliation is likewise one backend
+        // transaction. Publish the durable policy result immediately, then
+        // refresh the status projection from the unified server.
         await runtimeHubClient.lanDisable("DISABLE LAN API");
-        set({ lanPolicy: null, lanTokens: [], pairingChallenge: null, pairedToken: null, httpServerStatus });
+        set({ lanPolicy: null, lanTokens: [], pairingChallenge: null, pairedToken: null });
+        const httpServerStatus = await runtimeHubClient.httpServerStatus();
+        set({ httpServerStatus });
       } catch (error) {
         fail(key, error);
         throw error;

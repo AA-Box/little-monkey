@@ -678,9 +678,7 @@ pub(crate) async fn download_to_file(
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
-    let response = client
-        .get(&url)
-        .send()
+    let response = crate::egress::send(client.get(&url))
         .await
         .map_err(|e| format!("Failed to reach Hugging Face at {url}: {e}"))?;
 

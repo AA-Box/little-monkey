@@ -38,6 +38,13 @@ const LORAS_FILE: &str = "studio-loras.json";
 /// the model registry because a model entry must be a whole model, and these
 /// are shared between them.
 const PARTS_FILE: &str = "studio-parts.json";
+/// Remote generation endpoints — a ComfyUI the user runs, or a hosted
+/// OpenAI-compatible image API. Separate from the model registry because a
+/// backend has no weight files: nothing to download, verify, or launch.
+const BACKENDS_FILE: &str = "studio-backends.json";
+/// A ceiling on the backend list. Nobody has fifty ComfyUI servers; this only
+/// stops a scripted caller from growing the file without bound.
+const MAX_BACKENDS: usize = 32;
 /// Keeps a corrupt or hand-edited gallery from being read without bound.
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 /// A long clip on a constrained machine can legitimately sample for a long
@@ -507,6 +514,49 @@ pub fn generation_remove_part(
     Ok(parts)
 }
 
+#[tauri::command]
+pub fn generation_backends(app: AppHandle) -> Result<Vec<generation::RemoteBackend>, String> {
+    read_state(&app, BACKENDS_FILE)
+}
+
+/// Registers a remote backend, keyed on its id so re-adding one edits it.
+///
+/// Nothing is contacted here. A backend that is switched off, still starting,
+/// or on a laptop that is currently elsewhere is a normal thing to have saved,
+/// so reachability is proven by the first generation rather than made a
+/// precondition of writing the entry down.
+#[tauri::command]
+pub fn generation_add_backend(
+    app: AppHandle,
+    backend: generation::RemoteBackend,
+) -> Result<Vec<generation::RemoteBackend>, String> {
+    generation::validate_remote_backend(&backend)?;
+    let mut backends: Vec<generation::RemoteBackend> = read_state(&app, BACKENDS_FILE)?;
+    if backends.len() >= MAX_BACKENDS && !backends.iter().any(|entry| entry.id == backend.id) {
+        return Err(format!("At most {MAX_BACKENDS} backends can be registered"));
+    }
+    match backends.iter_mut().find(|entry| entry.id == backend.id) {
+        Some(existing) => *existing = backend,
+        None => backends.push(backend),
+    }
+    backends.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    write_state(&app, BACKENDS_FILE, &backends)?;
+    Ok(backends)
+}
+
+/// Forgets a backend. Whatever it pointed at keeps running; the app only ever
+/// held its address.
+#[tauri::command]
+pub fn generation_remove_backend(
+    app: AppHandle,
+    backend_id: String,
+) -> Result<Vec<generation::RemoteBackend>, String> {
+    let mut backends: Vec<generation::RemoteBackend> = read_state(&app, BACKENDS_FILE)?;
+    backends.retain(|entry| entry.id != backend_id);
+    write_state(&app, BACKENDS_FILE, &backends)?;
+    Ok(backends)
+}
+
 /// Forgets a LoRA. The file itself is the user's and stays where it is.
 #[tauri::command]
 pub fn generation_remove_lora(
@@ -632,26 +682,37 @@ pub async fn generation_run(
     state: tauri::State<'_, AppState>,
     request: GenerationRequest,
 ) -> Result<GenerationEntry, String> {
-    let spec = find_registered(&app, &request.model_id)?;
-    let request = generation::validate_request(&spec, &request)?;
-    // A swapped VAE or text encoder changes what the engine loads, so it is
-    // resolved before anything launches. The engine keys reuse on its launch
-    // arguments, so switching one mid-session relaunches on its own.
-    let spec = generation::apply_component_overrides(
-        &spec,
-        &read_state::<Vec<generation::PartAsset>>(&app, PARTS_FILE)?,
-        &request.component_overrides,
-    )?;
-
-    let media = if request.task.is_speech() {
-        let _ = app.emit(
-            "studio://progress",
-            GenerationProgressEvent::new("speech", "running"),
-        );
-        run_speech(&app, &spec, &request).await?
-    } else {
-        run_diffusion(&app, &state, &spec, &request).await?
-    };
+    // A remote backend has no library entry to look up, no components to
+    // override and no engine to launch, so it forks before all three rather
+    // than threading an "is it local" flag through them.
+    let (model_id, request, media) =
+        if let Some((backend_id, model)) = generation::parse_remote_model_id(&request.model_id) {
+            let backend = find_backend(&app, backend_id)?;
+            let validated = generation::validate_remote_request(&backend, &request)?;
+            let media = run_remote(&app, &state, &backend, model, &validated).await?;
+            (request.model_id.clone(), validated, media)
+        } else {
+            let spec = find_registered(&app, &request.model_id)?;
+            let validated = generation::validate_request(&spec, &request)?;
+            // A swapped VAE or text encoder changes what the engine loads, so it
+            // is resolved before anything launches. The engine keys reuse on its
+            // launch arguments, so switching one mid-session relaunches on its own.
+            let spec = generation::apply_component_overrides(
+                &spec,
+                &read_state::<Vec<generation::PartAsset>>(&app, PARTS_FILE)?,
+                &validated.component_overrides,
+            )?;
+            let media = if validated.task.is_speech() {
+                let _ = app.emit(
+                    "studio://progress",
+                    GenerationProgressEvent::new("speech", "running"),
+                );
+                run_speech(&app, &spec, &validated).await?
+            } else {
+                run_diffusion(&app, &state, &spec, &validated).await?
+            };
+            (spec.id.clone(), validated, media)
+        };
 
     let blob = artifacts(&app)?
         .put(&media.bytes)
@@ -659,7 +720,7 @@ pub async fn generation_run(
     let entry = GenerationEntry {
         entry_id: format!("studio-{}", Uuid::new_v4()),
         artifact_id: blob.id,
-        model_id: spec.id.clone(),
+        model_id,
         task: request.task,
         prompt: request.prompt.clone(),
         negative_prompt: request.negative_prompt.clone(),
@@ -690,6 +751,62 @@ pub async fn generation_run(
         GenerationProgressEvent::new(&entry.entry_id, "completed"),
     );
     Ok(entry)
+}
+
+fn find_backend(app: &AppHandle, backend_id: &str) -> Result<generation::RemoteBackend, String> {
+    read_state::<Vec<generation::RemoteBackend>>(app, BACKENDS_FILE)?
+        .into_iter()
+        .find(|entry| entry.id == backend_id)
+        .ok_or_else(|| format!("No backend named '{backend_id}' is registered"))
+}
+
+/// In-flight remote jobs, so [`generation_cancel`] can reach one.
+///
+/// Local runs are cancelled through the engine's own job API, which needs no
+/// bookkeeping here. A remote run has no such handle — cancelling it means
+/// dropping the HTTP wait (and telling ComfyUI to interrupt), which only the
+/// token that run is holding can do.
+fn remote_jobs() -> &'static std::sync::Mutex<std::collections::HashMap<String, CancellationToken>>
+{
+    static JOBS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, CancellationToken>>> =
+        OnceLock::new();
+    JOBS.get_or_init(Default::default)
+}
+
+/// The remote half of [`generation_run`].
+///
+/// There is no queue to report and no sampling counter to scrape — a remote
+/// backend exposes neither — so the UI gets "running" once and then the result.
+async fn run_remote(
+    app: &AppHandle,
+    state: &tauri::State<'_, AppState>,
+    backend: &generation::RemoteBackend,
+    model: &str,
+    request: &GenerationRequest,
+) -> Result<generation::GeneratedMedia, String> {
+    // The managed engine holds a model in VRAM for reuse. A remote run about to
+    // compete with it for the same GPU — the common case, since ComfyUI usually
+    // runs on this machine — should not have to. It reloads on the next local
+    // run, which costs one warm-up rather than an out-of-memory failure.
+    let _ = state.generation_engine.stop();
+
+    let job_id = format!("remote-{}", Uuid::new_v4());
+    let cancellation = CancellationToken::new();
+    if let Ok(mut jobs) = remote_jobs().lock() {
+        jobs.insert(job_id.clone(), cancellation.clone());
+    }
+    let _ = app.emit(
+        "studio://progress",
+        GenerationProgressEvent::new(&job_id, "running"),
+    );
+
+    let result =
+        crate::generation_remote::run(backend, model, request, &job_id, &cancellation).await;
+
+    if let Ok(mut jobs) = remote_jobs().lock() {
+        jobs.remove(&job_id);
+    }
+    result
 }
 
 /// The `sd-server` half of [`generation_run`]: ensure the engine is serving
@@ -753,6 +870,14 @@ pub async fn generation_cancel(
 ) -> Result<bool, String> {
     if job_id.is_empty() || job_id.len() > 128 {
         return Err("Invalid job id".to_string());
+    }
+    // A remote job is cancelled by dropping its own wait, not by calling an
+    // engine that is not running it.
+    if let Ok(jobs) = remote_jobs().lock() {
+        if let Some(token) = jobs.get(&job_id) {
+            token.cancel();
+            return Ok(true);
+        }
     }
     // The engine is launched on a fresh port each time, so its address comes
     // from the running instance rather than a constant.

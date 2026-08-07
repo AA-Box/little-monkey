@@ -600,6 +600,30 @@ pub(crate) fn cli_capabilities() -> ModelCapabilitiesSnapshot {
     }
 }
 
+/// Local RAM the model hub says this model id holds once resident, frozen into
+/// the run spec so the daemon's admission control has a number to work with.
+///
+/// Before this, every CLI submission emitted `None` here and the daemon's memory
+/// bound short-circuited to "fits" for every job it ever saw: admission was
+/// wired up and inert on the only path that reaches it from `monkey daemon
+/// queue`.
+///
+/// `None` is deliberately not `Some(0)`. The protocol rejects a zero estimate
+/// precisely because zero means "this run holds no local weights", which is true
+/// of a provider call and false of a model nobody measured. Passing the unknown
+/// case through as `None` keeps those two apart all the way to
+/// `admission::Reservation`, which admits an unmeasured model but refuses to
+/// count it as having fitted — see that type for why the distinction is
+/// load-bearing.
+fn frozen_local_ram_estimate(model_id: &str) -> Option<u64> {
+    use little_monkey_lib::m3_runtime_hub::M3ModelFootprint;
+    let app_data = crate::app_data_dir()?;
+    match little_monkey_lib::m3_runtime_hub::installed_model_footprint(&app_data, model_id) {
+        M3ModelFootprint::Known { memory, .. } => Some(memory.ram_bytes).filter(|bytes| *bytes > 0),
+        M3ModelFootprint::Unknown => None,
+    }
+}
+
 fn snapshot_target(target: &recipes::RecipeTarget) -> Result<ModelTargetSnapshot, String> {
     let capabilities = cli_capabilities();
     if let Some(provider) = &target.provider {
@@ -634,7 +658,7 @@ fn snapshot_target(target: &recipes::RecipeTarget) -> Result<ModelTargetSnapshot
             model: model.clone(),
             is_cloud: model.to_ascii_lowercase().contains("cloud"),
             capabilities,
-            estimated_memory_bytes: None,
+            estimated_memory_bytes: frozen_local_ram_estimate(model),
         });
     }
     if let Some(endpoint) = &target.local_url {

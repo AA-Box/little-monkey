@@ -11,8 +11,9 @@ import { errorMessage } from "../../lib/errors";
  * template), authenticated by a token scoped to run only that one recipe —
  * see `local_apps.rs`'s module doc for the full security model. This panel
  * never sees a token's plaintext (it's embedded directly into the generated
- * page by the Rust side, the same "never re-shown" convention
- * `ApiServerPanel`'s create-token flow already follows).
+ * page by the Rust side). That backend-owned compatibility path deliberately
+ * remains while the ordinary legacy-token mint UI is retired in favour of
+ * Runtime Hub pairing.
  */
 export function LocalAppsPanel() {
   const { t } = useT();

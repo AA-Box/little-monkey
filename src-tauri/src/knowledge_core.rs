@@ -536,13 +536,14 @@ fn l2_normalize(v: &mut [f32]) {
 
 async fn embed_via_llama(model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://127.0.0.1:{}/v1/embeddings", crate::llama::EMBED_PORT))
-        .json(&serde_json::json!({ "model": model, "input": texts }))
-        .timeout(std::time::Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|e| {
+    let resp = crate::egress::send(
+        client
+            .post(format!("http://127.0.0.1:{}/v1/embeddings", crate::llama::EMBED_PORT))
+            .json(&serde_json::json!({ "model": model, "input": texts }))
+            .timeout(std::time::Duration::from_secs(60)),
+    )
+    .await
+    .map_err(|e| {
             format!(
                 "Failed to reach the embedding server: {e} — start it first from the desktop app's Settings > \
                  Knowledge tab, or (from a terminal) `monkey stacks embed-server start --model-path <path>`."

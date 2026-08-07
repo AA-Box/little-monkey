@@ -19,12 +19,24 @@
 //! [`EgressRule`] is the third piece, and the one the other two were missing: a
 //! *name* for the rule that refused a request, so a refusal is a value and not
 //! only a sentence. See its doc comment for what could not be done without it.
+//!
+//! [`send`] and [`metered`] are the fourth, and the only part of this module that
+//! *measures* rather than decides: how many bytes a request actually moved, and
+//! which process row they belong to. See [`send`] for the byte unit — it is not
+//! the obvious one — and `Counted` for why counting a streamed body does not turn
+//! it into a buffered one.
 
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use hyper::body::{Body as HttpBody, Buf, Frame, SizeHint};
 use reqwest::Url;
+
+use crate::run_scope::{self, Unattributed};
 
 /// Declares [`EgressRule`] together with its code and summary tables.
 ///
@@ -739,6 +751,279 @@ pub(crate) fn origin_label(url: &Url) -> String {
     }
 }
 
+/// Bytes counted for work with no process row to charge, one tally per reason.
+///
+/// # Why these exist rather than a `return`
+///
+/// The ledger's whole claim is that a number in it was measured and a `NULL` in it
+/// says why it was not. Bytes that crossed the wire under no attribution are
+/// neither: dropping them on the floor would make the process rows *look*
+/// complete while the totals quietly disagreed with the network, and charging them
+/// to whichever process happened to be nearby would be worse. So they are counted
+/// here, under the reason they could not be attributed, where a support bundle can
+/// read them and where the tests below can prove nothing was silently lost.
+///
+/// Process-lifetime tallies and deliberately not ledger rows: there is no row to
+/// write them to, which is the whole point. `Relaxed` for the same reason
+/// [`run_scope::ProcessScope::charge_egress`] uses it — each tally has to be right,
+/// not ordered against anything else.
+///
+/// Sized from [`Unattributed::ALL`] plus the two cases that enum does not cover, so
+/// a reason added there gets a tally here without anyone remembering to widen this.
+static UNATTRIBUTED_EGRESS: [AtomicU64; UNATTRIBUTED_BUCKETS] =
+    [const { AtomicU64::new(0) }; UNATTRIBUTED_BUCKETS];
+
+const UNATTRIBUTED_BUCKETS: usize = Unattributed::ALL.len() + 2;
+
+/// A run was in scope but no process row was, so the ledger has nothing to charge.
+/// Distinct from every [`Unattributed`] reason, all of which explain the absence of
+/// a *run*.
+const RUN_WITHOUT_PROCESS: usize = Unattributed::ALL.len();
+
+/// No scope at all: a call site nobody has instrumented yet. Kept apart from
+/// `RUN_WITHOUT_PROCESS` for the reason `run_scope` keeps `None` apart from
+/// `Unattributed` — "we lost it" and "there is deliberately nothing" cannot be
+/// read out of one number.
+const NO_SCOPE: usize = Unattributed::ALL.len() + 1;
+
+/// The stable label of each tally, in [`UNATTRIBUTED_EGRESS`] order.
+fn unattributed_label(bucket: usize) -> &'static str {
+    match bucket {
+        RUN_WITHOUT_PROCESS => "egress.run-without-process",
+        NO_SCOPE => "egress.no-scope",
+        index => Unattributed::ALL[index].code(),
+    }
+}
+
+/// Every unattributable tally with its label, for a support bundle or a test.
+#[must_use]
+pub fn unattributed_egress_bytes() -> Vec<(&'static str, u64)> {
+    (0..UNATTRIBUTED_BUCKETS)
+        .map(|bucket| {
+            (
+                unattributed_label(bucket),
+                UNATTRIBUTED_EGRESS[bucket].load(Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
+/// Where a counted byte goes.
+///
+/// Resolved **once per request**, not once per frame, and that is a correctness
+/// property as much as a cost one. Reading the task-local per frame would charge a
+/// body that is consumed after the scope has been left — a response handed to a
+/// detached task, which this tree does routinely — to nobody, or worse to whatever
+/// scope that task happens to be in. Binding the destination when the request is
+/// made means the bytes follow the request that asked for them.
+#[derive(Clone)]
+enum Charge {
+    /// A process row exists and these are its bytes.
+    Process(run_scope::ProcessScope),
+    /// One of the [`UNATTRIBUTED_EGRESS`] tallies.
+    Unattributed(usize),
+}
+
+impl Charge {
+    /// Reads the ambient scope and picks the destination.
+    fn resolve() -> Self {
+        if let Some(process) = run_scope::current_process() {
+            return Charge::Process(process);
+        }
+        Charge::Unattributed(match run_scope::current() {
+            None => NO_SCOPE,
+            Some(scope) => match scope.unattributed() {
+                // `position` cannot miss: `ALL` is complete by construction (see
+                // `run_scope`'s own test). `NO_SCOPE` is the fallback purely so
+                // this is not an `unwrap` on a hot path.
+                Some(reason) => Unattributed::ALL
+                    .iter()
+                    .position(|candidate| *candidate == reason)
+                    .unwrap_or(NO_SCOPE),
+                None => RUN_WITHOUT_PROCESS,
+            },
+        })
+    }
+
+    fn add(&self, bytes: u64) {
+        match self {
+            Charge::Process(process) => process.charge_egress(bytes),
+            Charge::Unattributed(bucket) => {
+                UNATTRIBUTED_EGRESS[*bucket].fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// A body that counts what passes through it and passes it straight on.
+///
+/// # Why this is not a buffering wrapper
+///
+/// It would be a great deal easier to read the body to the end, count the length
+/// and hand back the bytes — and it would break the two things this app most needs
+/// a body for. An SSE stream never ends, so buffering it is a hang, not a delay;
+/// and a model download is gigabytes, so buffering it is an OOM. So this is a
+/// frame-by-frame passthrough: [`Self::poll_frame`] adds nothing to the pipeline
+/// except an addition, retains no data, and forwards `size_hint` and
+/// `is_end_stream` unchanged so nothing downstream can tell it is there. A test
+/// below asserts the first frame arrives long before the last one is sent, which
+/// is a test only a non-buffering implementation can pass.
+///
+/// # Why the count is of frames *delivered*
+///
+/// A caller may abandon a response — every byte cap in this tree does exactly that
+/// once its ceiling is reached — and the bytes it never polled were never handed
+/// over by the transport either. Counting per delivered frame therefore counts what
+/// crossed the socket into this process, rather than the `Content-Length` the peer
+/// promised or the subset the caller chose to keep.
+struct Counted<B> {
+    inner: B,
+    charge: Charge,
+}
+
+impl<B> HttpBody for Counted<B>
+where
+    B: HttpBody + Unpin,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // Both fields are `Unpin`, so the inner body can be re-pinned in place and
+        // this needs no projection macro (and no new dependency for one).
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(context);
+        if let Poll::Ready(Some(Ok(frame))) = &polled {
+            // Trailers carry no data and are not counted — see [`send`] on what
+            // the unit excludes.
+            if let Some(data) = frame.data_ref() {
+                this.charge.add(data.remaining() as u64);
+            }
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Sends a request and counts the bytes it moves, both ways.
+///
+/// # The unit, which is not the obvious one
+///
+/// Every number this module produces is **HTTP entity-body bytes, as they crossed
+/// the socket, undecoded**. Precisely:
+///
+/// - *Counted*: the request body written out and the response body read in, in the
+///   content coding the peer actually used.
+/// - *Not counted*: request and response headers, chunked-transfer or HTTP/2 frame
+///   overhead, TLS records, and TCP/IP. reqwest exposes none of those — its
+///   connector's `Conn` is a sealed type, so there is no supported way to wrap the
+///   socket itself — and a number that included some of them but not others would
+///   be worse than one whose exclusions are written down.
+///
+/// "Undecoded" needs saying out loud because it is a property of this crate's
+/// build rather than of the code here: `Cargo.toml` enables none of reqwest's
+/// `gzip`/`brotli`/`zstd`/`deflate` features, so reqwest never decompresses a
+/// response and the frames counted below are the compressed-on-the-wire bytes. If
+/// one of those features is ever enabled, this count silently becomes *decoded*
+/// bytes — larger than what the network carried — so enabling one means revisiting
+/// this comment and the tests that pin the unit.
+///
+/// # Attribution
+///
+/// The destination is resolved here, under the caller's scope, so a
+/// response whose body is read later — in a detached task, after the scope has
+/// ended — still charges the process that asked for it. A request made with no
+/// process in scope is counted under why it had none, never dropped and never
+/// charged to a process that did not make it.
+///
+/// # What a caller gives up
+///
+/// Nothing at the call site: `client.get(url).send().await` becomes
+/// `egress::send(client.get(url)).await` and the `Response` that comes back is an
+/// ordinary one, with its url, status, headers and extensions intact.
+///
+/// ponytail: an in-memory body replayed across a redirect is counted once, not
+/// once per hop. Counting the replay would mean wrapping a reusable body, which
+/// makes it unreusable (`reqwest::Body::try_clone` returns `None` for a streaming
+/// body) and would break the same-origin redirect this module deliberately
+/// follows. Upgrade path is counting in the redirect policy, which sees each hop.
+pub async fn send(request: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
+    let charge = Charge::resolve();
+    let (client, built) = request.build_split();
+    let mut built = built?;
+    if let Some(body) = built.body_mut().take() {
+        // An in-memory body is counted by its length and left alone, so it stays
+        // replayable across a redirect; only a streaming body is wrapped, which
+        // costs it nothing because a streaming body was never replayable.
+        let in_memory = body.as_bytes().map(|bytes| bytes.len() as u64);
+        *built.body_mut() = Some(match in_memory {
+            Some(length) => {
+                charge.add(length);
+                body
+            }
+            None => reqwest::Body::wrap(Counted {
+                inner: body,
+                charge: charge.clone(),
+            }),
+        });
+    }
+    let response = client.execute(built).await?;
+    Ok(metered_by(response, charge))
+}
+
+/// Counts a response's body without having sent the request through [`send`].
+///
+/// For a caller that already has a `Response` in hand. Same unit and same
+/// attribution rules; the request body is the caller's own to account for.
+#[must_use]
+pub fn metered(response: reqwest::Response) -> reqwest::Response {
+    metered_by(response, Charge::resolve())
+}
+
+/// Rebuilds `response` around a [`Counted`] body.
+///
+/// The round trip through `http::Response` is the only way in: `reqwest::Response`
+/// exposes no `body_mut`, so the body cannot be replaced in place. Url, status,
+/// version, headers and extensions are all carried across — the url explicitly,
+/// because reqwest keeps it beside the response rather than in it and the
+/// conversion drops it.
+fn metered_by(response: reqwest::Response, charge: Charge) -> reqwest::Response {
+    use reqwest::ResponseBuilderExt;
+
+    let url = response.url().clone();
+    let (parts, body) = hyper::http::Response::<reqwest::Body>::from(response).into_parts();
+    let mut builder = hyper::http::Response::builder()
+        .status(parts.status)
+        .version(parts.version);
+    if let Some(headers) = builder.headers_mut() {
+        *headers = parts.headers;
+    }
+    if let Some(extensions) = builder.extensions_mut() {
+        extensions.extend(parts.extensions);
+    }
+    let rebuilt = builder
+        .url(url)
+        .body(reqwest::Body::wrap(Counted {
+            inner: body,
+            charge,
+        }))
+        // `http::response::Builder` only fails on a status, header or version it
+        // could not accept, and every one of those came out of a response reqwest
+        // had already parsed — there is nothing here for it to reject.
+        .expect("a response reqwest parsed can be rebuilt from its own parts");
+    reqwest::Response::from(rebuilt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1309,6 +1594,7 @@ mod tests {
 
     mod wiring {
         use super::*;
+        use crate::run_scope::RunScope;
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1599,6 +1885,363 @@ mod tests {
             assert_eq!(host.accepted(), 2, "one connection per hop");
         }
 
+        /// The count, against a peer that says exactly how many bytes it wrote.
+        ///
+        /// A body big enough to arrive in several frames, on purpose: a wrapper
+        /// that counted only the first frame, or only the last, passes a one-frame
+        /// test and undercounts every real transfer. The frame count is asserted
+        /// for the same reason — if the transport ever coalesced this into one
+        /// frame the test would stop testing what it claims to.
+        #[tokio::test]
+        async fn counted_bytes_on_a_streamed_response_are_the_bytes_the_peer_sent() {
+            use futures_util::StreamExt;
+
+            const SENT: usize = 40_000;
+            let host = FakeHost::start(vec![Answer::Trickle {
+                chunks: SENT,
+                gap: Duration::ZERO,
+            }]);
+            let client = hardened().build().expect("client builds");
+            let process = run_scope::ProcessScope::new("p-turn-count");
+
+            let (frames, received) = run_scope::scoped_with_process(
+                RunScope::run("run:count"),
+                process.clone(),
+                async {
+                    let response = send(client.get(&host.origin))
+                        .await
+                        .expect("the peer answers");
+                    let mut stream = response.bytes_stream();
+                    let (mut frames, mut received) = (0usize, 0usize);
+                    while let Some(chunk) = stream.next().await {
+                        frames += 1;
+                        received += chunk.expect("a frame arrives").len();
+                    }
+                    (frames, received)
+                },
+            )
+            .await;
+
+            assert_eq!(received, SENT, "the peer's whole body must arrive");
+            assert!(
+                frames > 1,
+                "a {SENT}-byte trickle arrived in {frames} frame(s); this test only \
+                 means something if the body is delivered in several"
+            );
+            assert_eq!(
+                process.take_egress(),
+                SENT as u64,
+                "the count must be the bytes the peer actually wrote"
+            );
+        }
+
+        /// A cap that abandons a response still counts what crossed the wire.
+        ///
+        /// The claim is not "the whole `Content-Length`" — the peer never got to
+        /// send the rest — it is "everything that was handed over", which is what
+        /// the caller's own tally proves.
+        #[tokio::test]
+        async fn an_abandoned_response_still_counts_what_crossed_the_wire() {
+            use futures_util::StreamExt;
+
+            let host = FakeHost::start(vec![Answer::Trickle {
+                chunks: 20_000,
+                gap: Duration::ZERO,
+            }]);
+            let client = hardened().build().expect("client builds");
+            let process = run_scope::ProcessScope::new("p-turn-capped");
+
+            let received = run_scope::scoped_with_process(
+                RunScope::run("run:capped"),
+                process.clone(),
+                async {
+                    let response = send(client.get(&host.origin))
+                        .await
+                        .expect("the peer answers");
+                    let mut stream = response.bytes_stream();
+                    // One frame, then walk away — exactly what
+                    // `knowledge_service.rs` and `mcp_app_core.rs` do at their
+                    // ceilings.
+                    let first = stream
+                        .next()
+                        .await
+                        .expect("at least one frame")
+                        .expect("a frame arrives")
+                        .len();
+                    drop(stream);
+                    first
+                },
+            )
+            .await;
+
+            assert!(
+                received > 0,
+                "the test needs the peer to have sent something"
+            );
+            assert_eq!(
+                process.take_egress(),
+                received as u64,
+                "an abandoned body must be counted for what it delivered, neither \
+                 zero nor the length the peer promised"
+            );
+        }
+
+        /// Bytes with no process to charge are recorded under why they had none.
+        ///
+        /// Three distinct answers, and keeping them apart is the point: an
+        /// uninstrumented call site, deliberately unattributed work, and a run
+        /// whose process row nobody resolved are three different findings, and one
+        /// shared bucket would make all three unreadable.
+        #[tokio::test]
+        async fn a_request_with_no_process_in_scope_is_counted_under_why_it_had_none() {
+            fn tally(label: &str) -> u64 {
+                unattributed_egress_bytes()
+                    .into_iter()
+                    .find(|(name, _)| *name == label)
+                    .map(|(_, bytes)| bytes)
+                    .expect("every label has a tally")
+            }
+            async fn fetch(origin: &str) {
+                let client = hardened().build().expect("client builds");
+                let body = send(client.get(origin))
+                    .await
+                    .expect("the peer answers")
+                    .text()
+                    .await
+                    .expect("body reads");
+                assert_eq!(body, "hello");
+            }
+
+            // No scope at all: nobody has instrumented this site.
+            let host = FakeHost::start(vec![ok_body("hello")]);
+            let before = tally("egress.no-scope");
+            fetch(&host.origin).await;
+            assert_eq!(
+                tally("egress.no-scope") - before,
+                5,
+                "an uninstrumented request must still be counted somewhere"
+            );
+
+            // Deliberately no run, with the reason kept.
+            let host = FakeHost::start(vec![ok_body("hello")]);
+            let before = tally(Unattributed::Scheduled.code());
+            run_scope::scoped(
+                RunScope::Unattributed(Unattributed::Scheduled),
+                fetch(&host.origin),
+            )
+            .await;
+            assert_eq!(
+                tally(Unattributed::Scheduled.code()) - before,
+                5,
+                "unattributed work keeps its own reason as its tally"
+            );
+
+            // A run, but no process row: legitimate, and not the same finding.
+            let host = FakeHost::start(vec![ok_body("hello")]);
+            let before = tally("egress.run-without-process");
+            run_scope::scoped(RunScope::run("run:no-process"), fetch(&host.origin)).await;
+            assert_eq!(
+                tally("egress.run-without-process") - before,
+                5,
+                "a run with no process row must not be charged to another process"
+            );
+        }
+
+        /// The streaming property, as a test that a buffering implementation fails.
+        ///
+        /// The peer writes its head at once and then one byte per `gap`, so the
+        /// first frame is available five gaps before the last one is. A wrapper
+        /// that read the body to the end to count it would deliver nothing until
+        /// the whole transfer finished, and the first assertion below is what
+        /// notices.
+        #[tokio::test]
+        async fn counting_a_body_does_not_buffer_it() {
+            use futures_util::StreamExt;
+
+            let gap = Duration::from_millis(100);
+            let chunks = 5usize;
+            let host = FakeHost::start(vec![Answer::Trickle { chunks, gap }]);
+            let client = hardened().build().expect("client builds");
+            let process = run_scope::ProcessScope::new("p-turn-stream");
+
+            let (first_frame_at, whole_body_at) = run_scope::scoped_with_process(
+                RunScope::run("run:stream"),
+                process.clone(),
+                async {
+                    let response = send(client.get(&host.origin))
+                        .await
+                        .expect("the peer answers");
+                    let started = Instant::now();
+                    let mut stream = response.bytes_stream();
+                    let _first = stream
+                        .next()
+                        .await
+                        .expect("a first frame")
+                        .expect("a frame arrives");
+                    let first_frame_at = started.elapsed();
+                    while let Some(chunk) = stream.next().await {
+                        chunk.expect("a frame arrives");
+                    }
+                    (first_frame_at, started.elapsed())
+                },
+            )
+            .await;
+
+            assert!(
+                first_frame_at < gap * (chunks as u32 - 1),
+                "the first frame took {first_frame_at:?}, which is long enough that \
+                 the body was collected before being handed over"
+            );
+            assert!(
+                whole_body_at >= gap * (chunks as u32 - 1),
+                "the transfer finished in {whole_body_at:?}, too fast for the peer \
+                 to have trickled {chunks} bytes {gap:?} apart — the timing this \
+                 test rests on is not what it thinks"
+            );
+            assert_eq!(process.take_egress(), chunks as u64);
+        }
+
+        /// The other direction: a request body is counted as it goes out, and the
+        /// two halves add up in one tally.
+        #[tokio::test]
+        async fn a_request_body_is_counted_on_its_way_out() {
+            let host = FakeHost::start(vec![ok_body("ok")]);
+            let client = hardened().build().expect("client builds");
+            let process = run_scope::ProcessScope::new("p-turn-upload");
+            let payload = "x".repeat(1_000);
+
+            run_scope::scoped_with_process(RunScope::run("run:upload"), process.clone(), async {
+                let body = send(client.post(&host.origin).body(payload.clone()))
+                    .await
+                    .expect("the peer answers")
+                    .text()
+                    .await
+                    .expect("body reads");
+                assert_eq!(body, "ok");
+            })
+            .await;
+
+            assert_eq!(
+                process.take_egress(),
+                payload.len() as u64 + 2,
+                "the request body out plus the response body in"
+            );
+        }
+
+        /// Counting rebuilds the response, so everything a caller reads off one has
+        /// to survive the trip. The url is the one that does not come for free —
+        /// reqwest keeps it beside the response rather than in it.
+        #[tokio::test]
+        async fn a_metered_response_keeps_its_url_status_and_headers() {
+            let host = FakeHost::start(vec![Answer::Raw(
+                "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nX-Trace: abc\r\n\
+                 Content-Length: 2\r\nConnection: close\r\n\r\nhi"
+                    .to_string(),
+            )]);
+            let client = hardened().build().expect("client builds");
+            let process = run_scope::ProcessScope::new("p-turn-shape");
+
+            run_scope::scoped_with_process(RunScope::run("run:shape"), process.clone(), async {
+                let response = send(client.get(format!("{}/path?q=1", host.origin)))
+                    .await
+                    .expect("the peer answers");
+                assert_eq!(response.status().as_u16(), 201);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("x-trace")
+                        .map(|value| value.as_bytes()),
+                    Some(b"abc".as_ref())
+                );
+                assert_eq!(
+                    response.url().as_str(),
+                    format!("{}/path?q=1", host.origin),
+                    "the url must survive being rebuilt around a counting body"
+                );
+                assert_eq!(response.text().await.expect("body reads"), "hi");
+            })
+            .await;
+
+            assert_eq!(process.take_egress(), 2);
+        }
+
+        /// The whole path, ending in the column: bytes counted off a socket reach
+        /// `agent_processes.bytes_egressed` through the additive writer, and a row
+        /// nobody reported egress for keeps its `NULL`.
+        #[tokio::test]
+        async fn counted_bytes_reach_the_ledger_row_through_add_egress_bytes() {
+            use crate::process_table::{
+                AdmitProcess, ProcessKind, ProcessTable, ProcessUsageFilter,
+            };
+            use crate::run_ledger::RunLedger;
+
+            fn stored_egress(table: &ProcessTable<'_>, process_id: &str) -> Option<u64> {
+                table
+                    .usage_rows(&ProcessUsageFilter {
+                        process_id: Some(process_id.to_string()),
+                        ..ProcessUsageFilter::default()
+                    })
+                    .expect("the ledger row reads")
+                    .pop()
+                    .expect("the row exists")
+                    .usage
+                    .measured()
+                    .bytes_egressed
+            }
+
+            let ledger = RunLedger::open_in_memory().expect("an in-memory ledger opens");
+            let table = ProcessTable::new(ledger.connection());
+            let record = table
+                .admit(
+                    &AdmitProcess::new(ProcessKind::BackgroundShell, "bg-egress".to_string()),
+                    1_000,
+                )
+                .expect("a row is admitted");
+            let untouched = table
+                .admit(
+                    &AdmitProcess::new(ProcessKind::BackgroundShell, "bg-quiet".to_string()),
+                    1_000,
+                )
+                .expect("a second row is admitted");
+
+            let host = FakeHost::start(vec![ok_body("hello")]);
+            let client = hardened().build().expect("client builds");
+            let process = run_scope::ProcessScope::new(record.process_id.clone());
+
+            run_scope::scoped_with_process(RunScope::run("run:ledger"), process.clone(), async {
+                send(client.get(&host.origin))
+                    .await
+                    .expect("the peer answers")
+                    .text()
+                    .await
+                    .expect("body reads");
+            })
+            .await;
+
+            // What the scope owner does on its own schedule: drain and add. Twice,
+            // to prove the drain does not re-report the same bytes.
+            for _ in 0..2 {
+                let counted = process.take_egress();
+                if counted > 0 {
+                    table
+                        .add_egress_bytes(&record.process_id, counted, 2_000)
+                        .expect("the row takes the bytes");
+                }
+            }
+
+            assert_eq!(
+                stored_egress(&table, &record.process_id),
+                Some(5),
+                "the body's five bytes must land in the column exactly once"
+            );
+            assert_eq!(
+                stored_egress(&table, &untouched.process_id),
+                None,
+                "a process nobody reported egress for keeps its NULL rather than \
+                 being credited with a measured zero"
+            );
+        }
+
         /// The hop cap. `Policy::custom` does not inherit reqwest's loop cap, and
         /// since same-origin hops *are* followed, a self-redirect would otherwise
         /// run until the read timeout — ten minutes, in production.
@@ -1682,18 +2325,6 @@ mod tests {
             ("knowledge_core.rs", 1),
             // Bundled `llama-server` health/completion probes.
             ("llama.rs", 2),
-            // `ollama.rs` used to sit here with 2. Both were converted rather
-            // than justified: loopback-only earns a site an exemption from the
-            // *redirect* and credential rules, but not from having any deadline
-            // at all, and these two were `#[tauri::command]`s that would hang
-            // the UI forever against a daemon that went quiet. Every Ollama
-            // call now goes through `ollama_client`.
-            // The two API-server instances' `local_client`. Each was one client
-            // serving both loopback inference and cloud providers; the cloud half
-            // now starts from `hardened()` and these two are loopback-only by
-            // construction, which is what earns them a place in this list rather
-            // than the "owned by a different change" note they used to carry.
-            ("server.rs", 2),
         ];
 
         /// Everything after the first `#[cfg(test)]` is test code, and a test is

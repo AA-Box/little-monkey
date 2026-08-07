@@ -36,6 +36,13 @@ use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::process_usage::{
+    ProcessUsageSample, FIELD_BYTES_EGRESSED, FIELD_BYTES_READ, FIELD_BYTES_WRITTEN,
+    FIELD_CPU_TIME_MS, FIELD_GPU_DEVICE_MS, FIELD_GPU_RESIDENT_BYTES, FIELD_PEAK_RSS_BYTES,
+    FIELD_TOKENS_IN, FIELD_TOKENS_OUT, FIELD_WALL_TIME_MS,
+};
+use crate::runtime_telemetry::TraceFieldNote;
+
 /// Which execution surface a process belongs to.
 ///
 /// The `as_str` values are the stored SQL enum and must match
@@ -553,6 +560,144 @@ impl ProcessLimits {
     }
 }
 
+/// What a process actually consumed, as opposed to what it was allowed to.
+///
+/// The reading counterpart to [`ProcessLimits`]' declarations, and the reason
+/// this table needed migration V8: nothing here recorded a measurement before,
+/// so "what did that turn cost" had no answer.
+///
+/// **`None` means not measured. It never means zero.** A ledger that reports 0
+/// bytes egressed for a process nobody measured is worse than one that reports
+/// nothing, because the zero is indistinguishable from a real measurement of no
+/// egress — and a cost attribution built on inferred zeros is wrong in the
+/// direction that looks fine. Which is why this type cannot be constructed with
+/// a gap that has no stated reason: see [`ProcessUsage::new`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasuredUsage {
+    /// User + system CPU, milliseconds. Sampled from the OS while the process
+    /// lived — see [`crate::process_usage`].
+    pub cpu_time_ms: Option<u64>,
+    pub peak_rss_bytes: Option<u64>,
+    pub bytes_read: Option<u64>,
+    pub bytes_written: Option<u64>,
+    /// Network bytes attributed to this process. No platform reports this per
+    /// process, so it is only ever populated by whoever accounts for egress.
+    pub bytes_egressed: Option<u64>,
+    /// From the run's `UsageRecorded`/`Completed` events. Structurally
+    /// unavailable for a kind whose `run_id` is NULL — a subagent and the `m4`
+    /// workflow kinds have no ledger run to read.
+    pub tokens_in: Option<u64>,
+    pub tokens_out: Option<u64>,
+    /// Always `None` today. Nothing in this tree measures per-process GPU
+    /// residency or device time; the columns exist so a runtime that starts
+    /// reporting them needs no schema change, and until one does the reason is
+    /// recorded rather than a zero invented.
+    pub gpu_resident_bytes: Option<u64>,
+    pub gpu_device_ms: Option<u64>,
+}
+
+impl MeasuredUsage {
+    /// Every field paired with the wire name a note must use to explain it.
+    ///
+    /// This list *is* the invariant's definition: a column added to V8's set
+    /// without an entry here would be free to go NULL with nothing recorded
+    /// about why, which is the single failure mode the resource ledger exists to
+    /// prevent.
+    fn fields(&self) -> [(&'static str, Option<u64>); 9] {
+        [
+            (FIELD_CPU_TIME_MS, self.cpu_time_ms),
+            (FIELD_PEAK_RSS_BYTES, self.peak_rss_bytes),
+            (FIELD_BYTES_READ, self.bytes_read),
+            (FIELD_BYTES_WRITTEN, self.bytes_written),
+            (FIELD_BYTES_EGRESSED, self.bytes_egressed),
+            (FIELD_TOKENS_IN, self.tokens_in),
+            (FIELD_TOKENS_OUT, self.tokens_out),
+            (FIELD_GPU_RESIDENT_BYTES, self.gpu_resident_bytes),
+            (FIELD_GPU_DEVICE_MS, self.gpu_device_ms),
+        ]
+    }
+}
+
+/// A [`MeasuredUsage`] that has been checked: every gap carries its reason.
+///
+/// Constructible only through [`Self::new`], which is the whole point — the
+/// fields are private so there is no way to hand the write path a row with an
+/// unexplained NULL in it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessUsage {
+    #[serde(flatten)]
+    measured: MeasuredUsage,
+    /// Why each unmeasured field is unmeasured, in the same `{field, reason}`
+    /// vocabulary `runtime_telemetry.rs` uses for runtime traces. Deliberately
+    /// not a second vocabulary: a support bundle that reads one shape is worth
+    /// more than one that reads two.
+    unavailable: Vec<TraceFieldNote>,
+}
+
+impl ProcessUsage {
+    /// Fails when any field is `None` and nothing in `unavailable` names it.
+    ///
+    /// A hard error rather than a warning or a silently-added placeholder note,
+    /// because the alternative is the ledger quietly acquiring gaps nobody can
+    /// account for — and a gap nobody can account for is the thing a reader will
+    /// eventually read as a zero.
+    ///
+    /// The inverse — a note naming a field that *was* measured — is not refused.
+    /// It is stale bookkeeping rather than a claim about a number, and refusing
+    /// it would turn a harmless leftover into a blocked terminal write.
+    pub fn new(
+        measured: MeasuredUsage,
+        unavailable: Vec<TraceFieldNote>,
+    ) -> ProcessTableResult<Self> {
+        for (field, value) in measured.fields() {
+            if value.is_none() && !unavailable.iter().any(|note| note.field == field) {
+                return Err(ProcessTableError::UsageGapWithoutReason { field });
+            }
+        }
+        Ok(ProcessUsage {
+            measured,
+            unavailable,
+        })
+    }
+
+    pub fn measured(&self) -> MeasuredUsage {
+        self.measured
+    }
+
+    pub fn unavailable(&self) -> &[TraceFieldNote] {
+        &self.unavailable
+    }
+
+    /// Why `field` was not measured, if it was not.
+    pub fn reason_for(&self, field: &str) -> Option<&str> {
+        self.unavailable
+            .iter()
+            .find(|note| note.field == field)
+            .map(|note| note.reason.as_str())
+    }
+}
+
+/// Reasons the close-out records, as consts so the same gap is always explained
+/// the same way whichever path closed the row.
+const NO_RUN_REASON: &str =
+    "this process kind has no ledger run, so there is no token accounting to read";
+const NO_RUN_USAGE_REASON: &str = "the run recorded no readable usage event before it closed";
+const GPU_NOT_REPORTED_REASON: &str =
+    "no runtime in this build reports per-process GPU residency or device time";
+const NOT_SAMPLED_REASON: &str = "nothing sampled this process's resource use while it ran";
+const REAPED_REASON: &str =
+    "this process was reaped after its host went away, so nothing sampled it";
+const NO_EGRESS_ACCOUNTING_REASON: &str =
+    "no egress was attributed to this process; nothing fed the ledger a byte count";
+const NOT_CLOSED_OUT_REASON: &str =
+    "this process has not exited, so its resource ledger row is not closed out";
+const PREDATES_LEDGER_REASON: &str =
+    "this process exited before the resource ledger existed, so nothing was recorded";
+const WALL_TIME_NOT_FINAL_REASON: &str =
+    "this process has not exited, so its wall time is not final";
+
 /// The exit detail carried by an `exited` row.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -843,7 +988,9 @@ impl RestartPolicy {
     pub fn permits_retry(self, attempt: u32) -> bool {
         match self {
             RestartPolicy::Never => false,
-            RestartPolicy::OnFailure { max_attempts, .. } => attempt.saturating_add(1) < max_attempts,
+            RestartPolicy::OnFailure { max_attempts, .. } => {
+                attempt.saturating_add(1) < max_attempts
+            }
         }
     }
 
@@ -1100,6 +1247,12 @@ pub enum ProcessTableError {
         field: &'static str,
         reason: String,
     },
+    /// A resource ledger field was left unmeasured with nothing recorded about
+    /// why — the one thing the ledger must never contain, because a reader will
+    /// eventually treat an unexplained gap as a zero.
+    UsageGapWithoutReason {
+        field: &'static str,
+    },
 }
 
 impl fmt::Display for ProcessTableError {
@@ -1166,6 +1319,11 @@ impl fmt::Display for ProcessTableError {
             ProcessTableError::InvalidField { field, reason } => {
                 write!(f, "invalid {field}: {reason}")
             }
+            ProcessTableError::UsageGapWithoutReason { field } => write!(
+                f,
+                "usage field \"{field}\" is unmeasured with no reason recorded; \
+                 an unmeasured field must say why, never default to zero"
+            ),
         }
     }
 }
@@ -1187,11 +1345,7 @@ pub type ProcessTableResult<T> = Result<T, ProcessTableError>;
 /// them, the subagent store key, was a provider-supplied `ToolCall.id` that
 /// could collide with `call_0`).
 pub fn new_process_id(kind: ProcessKind) -> String {
-    format!(
-        "p-{}-{}",
-        kind.tag(),
-        uuid::Uuid::new_v4().simple()
-    )
+    format!("p-{}-{}", kind.tag(), uuid::Uuid::new_v4().simple())
 }
 
 /// Companion store over the shared ledger connection.
@@ -1280,6 +1434,15 @@ impl<'a> ProcessTable<'a> {
 
     /// Move a process to `next`. Refuses an illegal transition rather than
     /// applying it, and requires exit detail exactly when moving to `Exited`.
+    ///
+    /// **Reaching `Exited` also closes out the resource ledger row.** This is the
+    /// only `UPDATE` in the codebase that writes `state`, so it is the only place
+    /// a close-out can be guaranteed rather than hoped for: the reapers
+    /// ([`Self::reap_missing`], [`Self::reap_dead_hosts`]) and [`Self::reconcile`]
+    /// all route through here, which is how a process nobody was watching still
+    /// gets a row with honest reasons instead of no row at all. State and usage go
+    /// out in one statement so `agent_processes_close_out_states_its_gaps` can
+    /// enforce it in SQL too.
     pub fn transition(
         &self,
         process_id: &str,
@@ -1326,6 +1489,29 @@ impl<'a> ProcessTable<'a> {
             current.exited_at_ms
         };
 
+        // Only a terminal move closes the ledger; every other transition binds
+        // NULLs below, and the `COALESCE`s keep whatever was accumulated while
+        // the process ran.
+        let usage = match next {
+            ProcessState::Exited => Some(self.close_out_usage(&current, exit.as_ref())?),
+            _ => None,
+        };
+        let unavailable_json = usage
+            .as_ref()
+            .map(|usage| {
+                serde_json::to_string(usage.unavailable()).map_err(|error| {
+                    ProcessTableError::InvalidField {
+                        field: "usage_unavailable_json",
+                        reason: error.to_string(),
+                    }
+                })
+            })
+            .transpose()?;
+        let measured = usage
+            .as_ref()
+            .map(ProcessUsage::measured)
+            .unwrap_or_default();
+
         self.connection.execute(
             "UPDATE agent_processes
                 SET state = ?2,
@@ -1335,7 +1521,17 @@ impl<'a> ProcessTable<'a> {
                     exit_reason = ?6,
                     updated_at_ms = ?7,
                     started_at_ms = ?8,
-                    exited_at_ms = ?9
+                    exited_at_ms = ?9,
+                    cpu_time_ms = COALESCE(?10, cpu_time_ms),
+                    peak_rss_bytes = COALESCE(?11, peak_rss_bytes),
+                    bytes_read = COALESCE(?12, bytes_read),
+                    bytes_written = COALESCE(?13, bytes_written),
+                    bytes_egressed = COALESCE(?14, bytes_egressed),
+                    tokens_in = COALESCE(?15, tokens_in),
+                    tokens_out = COALESCE(?16, tokens_out),
+                    gpu_resident_bytes = COALESCE(?17, gpu_resident_bytes),
+                    gpu_device_ms = COALESCE(?18, gpu_device_ms),
+                    usage_unavailable_json = COALESCE(?19, usage_unavailable_json)
               WHERE process_id = ?1",
             params![
                 process_id,
@@ -1347,6 +1543,16 @@ impl<'a> ProcessTable<'a> {
                 now_ms,
                 started_at_ms,
                 exited_at_ms,
+                to_sql_u64(measured.cpu_time_ms),
+                to_sql_u64(measured.peak_rss_bytes),
+                to_sql_u64(measured.bytes_read),
+                to_sql_u64(measured.bytes_written),
+                to_sql_u64(measured.bytes_egressed),
+                to_sql_u64(measured.tokens_in),
+                to_sql_u64(measured.tokens_out),
+                to_sql_u64(measured.gpu_resident_bytes),
+                to_sql_u64(measured.gpu_device_ms),
+                unavailable_json,
             ],
         )?;
 
@@ -1354,6 +1560,206 @@ impl<'a> ProcessTable<'a> {
             .ok_or_else(|| ProcessTableError::NotFound {
                 process_id: process_id.to_string(),
             })
+    }
+
+    /// The ledger row for a process about to become `exited`.
+    ///
+    /// Assembled from three sources, none of which is allowed to guess:
+    /// whatever [`Self::accumulate_usage`] managed to sample while the process
+    /// lived, the run's own token accounting where the process has a run, and an
+    /// explicit reason for everything else. A reaped row gets the reaper's reason
+    /// rather than zeros — which is the case that matters most, because a process
+    /// whose host crashed is exactly the one nobody sampled.
+    fn close_out_usage(
+        &self,
+        record: &ProcessRecord,
+        exit: Option<&ProcessExit>,
+    ) -> ProcessTableResult<ProcessUsage> {
+        let mut measured = self.stored_usage(&record.process_id)?;
+        let mut unavailable: Vec<TraceFieldNote> = Vec::new();
+        let mut note = |field: &str, reason: &str| {
+            unavailable.push(TraceFieldNote {
+                field: field.to_string(),
+                reason: reason.to_string(),
+            });
+        };
+
+        if measured.tokens_in.is_none() && measured.tokens_out.is_none() {
+            match record.run_id.as_deref() {
+                // The snapshot is cumulative and the newest one wins, matching
+                // every other consumer of these events (`durable_run.rs`,
+                // `runCapsule.ts`).
+                Some(run_id) => match self.latest_run_usage(run_id) {
+                    Some(usage) => {
+                        measured.tokens_in = Some(usage.input_tokens);
+                        measured.tokens_out = Some(usage.output_tokens);
+                    }
+                    None => {
+                        note(FIELD_TOKENS_IN, NO_RUN_USAGE_REASON);
+                        note(FIELD_TOKENS_OUT, NO_RUN_USAGE_REASON);
+                    }
+                },
+                // Structural, not incidental: `agent_processes.run_id` is NULL
+                // for `subagent` and the `m4` workflow kinds, so there is no
+                // event stream to read. A zero here would claim those kinds spend
+                // no tokens, which is the opposite of true.
+                None => {
+                    note(FIELD_TOKENS_IN, NO_RUN_REASON);
+                    note(FIELD_TOKENS_OUT, NO_RUN_REASON);
+                }
+            }
+        }
+
+        note(FIELD_GPU_RESIDENT_BYTES, GPU_NOT_REPORTED_REASON);
+        note(FIELD_GPU_DEVICE_MS, GPU_NOT_REPORTED_REASON);
+
+        // A reaped process was never sampled *and nothing could have sampled it*,
+        // which is a different fact from "sampling was available and nobody did
+        // it". Both are honest; only one is actionable.
+        let sampling_reason = match exit.map(|exit| exit.status) {
+            Some(ExitStatus::Lost) => REAPED_REASON,
+            _ => NOT_SAMPLED_REASON,
+        };
+        for (field, value) in [
+            (FIELD_CPU_TIME_MS, measured.cpu_time_ms),
+            (FIELD_PEAK_RSS_BYTES, measured.peak_rss_bytes),
+            (FIELD_BYTES_READ, measured.bytes_read),
+            (FIELD_BYTES_WRITTEN, measured.bytes_written),
+        ] {
+            if value.is_none() {
+                note(field, sampling_reason);
+            }
+        }
+        if measured.bytes_egressed.is_none() {
+            note(FIELD_BYTES_EGRESSED, NO_EGRESS_ACCOUNTING_REASON);
+        }
+
+        ProcessUsage::new(measured, unavailable)
+    }
+
+    /// The newest cumulative usage snapshot on a run, or `None`.
+    ///
+    /// Reads the event stream because `UsageSnapshot` is stored inside
+    /// `run_events.envelope_json` and is not queryable by SQL.
+    ///
+    /// **Every failure is `None`, deliberately.** This runs inside a terminal
+    /// write, and a missing run, an unreadable blob or a SQLite hiccup must not be
+    /// able to prevent a process being recorded as exited — a row stuck `running`
+    /// forever is a worse outcome than a token count nobody could read, and the
+    /// caller records the latter as an explicit unavailability either way.
+    fn latest_run_usage(&self, run_id: &str) -> Option<crate::run_protocol::UsageSnapshot> {
+        use crate::run_protocol::{RunEvent, RunEventEnvelope};
+
+        let bytes: Vec<u8> = self
+            .connection
+            .query_row(
+                "SELECT envelope_json FROM run_events
+                  WHERE run_id = ?1 AND event_type IN ('usage_recorded', 'completed')
+                  ORDER BY sequence DESC LIMIT 1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()??;
+        let envelope: RunEventEnvelope = serde_json::from_slice(&bytes).ok()?;
+        match envelope.event {
+            RunEvent::UsageRecorded { usage } | RunEvent::Completed { usage, .. } => Some(usage),
+            _ => None,
+        }
+    }
+
+    fn stored_usage(&self, process_id: &str) -> ProcessTableResult<MeasuredUsage> {
+        Ok(self
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT {SELECT_USAGE_COLUMNS} FROM agent_processes WHERE process_id = ?1"
+                ),
+                params![process_id],
+                |row| map_measured_usage(row, 0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Fold one live sample into the row, keeping the highest reading per field.
+    ///
+    /// The accumulate half of the ledger's write path, and it has to exist
+    /// separately from close-out for a physical reason: peak resident size is
+    /// unreadable once a pid is gone, so the peak has to be captured while the
+    /// process is alive. A caller polls into a
+    /// [`crate::process_usage::ProcessUsageAccumulator`] and flushes through here
+    /// as often as it likes.
+    ///
+    /// The maximum is taken in SQL rather than read-modify-written in Rust, so two
+    /// samplers — the desktop and a `monkey` process watching the same row —
+    /// cannot lose each other's reading to a lost update. A `NULL` in the sample
+    /// leaves the stored value alone; it never overwrites a measurement with
+    /// "unknown".
+    ///
+    /// `sample.bytes_egressed` is folded by maximum too, because an accumulator's
+    /// egress figure is a running total. A caller holding an *increment* instead
+    /// wants [`Self::add_egress_bytes`] — use one or the other for a given
+    /// process, not both, or the two conventions double-count.
+    pub fn accumulate_usage(
+        &self,
+        process_id: &str,
+        sample: &ProcessUsageSample,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        let updated = self.connection.execute(
+            "UPDATE agent_processes
+                SET cpu_time_ms = COALESCE(MAX(cpu_time_ms, ?2), cpu_time_ms, ?2),
+                    peak_rss_bytes = COALESCE(MAX(peak_rss_bytes, ?3), peak_rss_bytes, ?3),
+                    bytes_read = COALESCE(MAX(bytes_read, ?4), bytes_read, ?4),
+                    bytes_written = COALESCE(MAX(bytes_written, ?5), bytes_written, ?5),
+                    bytes_egressed = COALESCE(MAX(bytes_egressed, ?6), bytes_egressed, ?6),
+                    updated_at_ms = ?7
+              WHERE process_id = ?1",
+            params![
+                process_id,
+                to_sql_u64(sample.cpu_time_ms),
+                to_sql_u64(sample.peak_rss_bytes),
+                to_sql_u64(sample.bytes_read),
+                to_sql_u64(sample.bytes_written),
+                to_sql_u64(sample.bytes_egressed),
+                now_ms,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Add network bytes attributed to this process.
+    ///
+    /// Additive, unlike [`Self::accumulate_usage`]'s maxima, because egress
+    /// arrives as increments from whoever counted them rather than as a running
+    /// total. The first call is what turns the column from "not measured" into a
+    /// measurement — a process nobody reports egress for keeps its NULL and its
+    /// stated reason, rather than being credited with zero bytes.
+    pub fn add_egress_bytes(
+        &self,
+        process_id: &str,
+        bytes: u64,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        let updated = self.connection.execute(
+            "UPDATE agent_processes
+                SET bytes_egressed = COALESCE(bytes_egressed, 0) + ?2,
+                    updated_at_ms = ?3
+              WHERE process_id = ?1",
+            params![process_id, bytes as i64, now_ms],
+        )?;
+        if updated == 0 {
+            return Err(ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Ask a process for a signal, durably.
@@ -1473,10 +1879,7 @@ impl<'a> ProcessTable<'a> {
     /// This mirrors the convention the daemon already uses
     /// (`pause_requested && state != Paused`), and needs no extra column. A
     /// `stop_requested` row self-clears by leaving the live set when it exits.
-    pub fn pending_signals(
-        &self,
-        kinds: &[ProcessKind],
-    ) -> ProcessTableResult<Vec<ProcessRecord>> {
+    pub fn pending_signals(&self, kinds: &[ProcessKind]) -> ProcessTableResult<Vec<ProcessRecord>> {
         let mut sql = format!(
             "{SELECT_COLUMNS} WHERE state <> 'exited' AND (\
                  stop_requested = 1 \
@@ -1529,12 +1932,7 @@ impl<'a> ProcessTable<'a> {
     /// Link a ledger run after the fact. Some surfaces mint their process
     /// before the run row exists (the ledger enforces foreign keys, so the
     /// link cannot be written first).
-    pub fn link_run(
-        &self,
-        process_id: &str,
-        run_id: &str,
-        now_ms: i64,
-    ) -> ProcessTableResult<()> {
+    pub fn link_run(&self, process_id: &str, run_id: &str, now_ms: i64) -> ProcessTableResult<()> {
         let updated = self.connection.execute(
             "UPDATE agent_processes SET run_id = ?2, updated_at_ms = ?3 WHERE process_id = ?1",
             params![process_id, run_id, now_ms],
@@ -1879,6 +2277,187 @@ impl<'a> ProcessTable<'a> {
         }
         Ok(reaped)
     }
+
+    /// Resource ledger rows, newest first, always bounded.
+    ///
+    /// Reads back what [`Self::transition`] closed out, plus the wall time
+    /// derived from the row's own timestamps. A row that has not been closed out
+    /// still comes back — with its gaps explained as "not closed out yet" rather
+    /// than omitted, so a caller can tell "no measurement" from "no row".
+    pub fn usage_rows(
+        &self,
+        filter: &ProcessUsageFilter,
+    ) -> ProcessTableResult<Vec<ProcessUsageRow>> {
+        let mut sql = format!(
+            "SELECT process_id, kind, external_id, run_id, workspace, state, exit_status, \
+             created_at_ms, started_at_ms, exited_at_ms, {SELECT_USAGE_COLUMNS}, \
+             usage_unavailable_json FROM agent_processes"
+        );
+        let mut clauses: Vec<&str> = Vec::new();
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(process_id) = filter.process_id.as_deref() {
+            clauses.push("process_id = ?");
+            values.push(Box::new(process_id.to_string()));
+        }
+        if let Some(run_id) = filter.run_id.as_deref() {
+            clauses.push("run_id = ?");
+            values.push(Box::new(run_id.to_string()));
+        }
+        if let Some(workspace) = filter.workspace.as_deref() {
+            clauses.push("workspace = ?");
+            values.push(Box::new(workspace.to_string()));
+        }
+        if filter.closed_only {
+            clauses.push("state = 'exited'");
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY created_at_ms DESC, process_id DESC LIMIT ?");
+        values.push(Box::new(i64::from(
+            filter
+                .limit
+                .unwrap_or(DEFAULT_LIST_LIMIT)
+                .clamp(1, MAX_LIST_LIMIT),
+        )));
+
+        let mut statement = self.connection.prepare(&sql)?;
+        let bindings: Vec<&dyn rusqlite::ToSql> =
+            values.iter().map(|value| value.as_ref()).collect();
+        let rows = statement.query_map(bindings.as_slice(), map_usage_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row??);
+        }
+        Ok(out)
+    }
+
+    /// The same rows folded into one total per field.
+    ///
+    /// Folded in Rust over [`Self::usage_rows`] rather than by a second SQL
+    /// aggregate, for one reason worth stating: `SUM` over a column with NULLs
+    /// silently reports the total of the rows that happened to have a value, and
+    /// a resource ledger whose whole premise is "never infer" cannot ship a
+    /// headline number that quietly drops the processes nobody measured. Each
+    /// [`ProcessUsageTotal`] therefore carries how many rows contributed and how
+    /// many could not.
+    pub fn usage_totals(
+        &self,
+        filter: &ProcessUsageFilter,
+    ) -> ProcessTableResult<ProcessUsageAggregate> {
+        let rows = self.usage_rows(filter)?;
+        let mut aggregate = ProcessUsageAggregate {
+            rows: u32::try_from(rows.len()).unwrap_or(u32::MAX),
+            ..ProcessUsageAggregate::default()
+        };
+        for row in &rows {
+            let measured = row.usage.measured();
+            for (total, value) in [
+                (&mut aggregate.wall_time_ms, row.wall_time_ms),
+                (&mut aggregate.cpu_time_ms, measured.cpu_time_ms),
+                (&mut aggregate.bytes_read, measured.bytes_read),
+                (&mut aggregate.bytes_written, measured.bytes_written),
+                (&mut aggregate.bytes_egressed, measured.bytes_egressed),
+                (&mut aggregate.tokens_in, measured.tokens_in),
+                (&mut aggregate.tokens_out, measured.tokens_out),
+                (&mut aggregate.gpu_device_ms, measured.gpu_device_ms),
+            ] {
+                fold_total(total, value, Fold::Sum);
+            }
+            for (total, value) in [
+                (&mut aggregate.peak_rss_bytes, measured.peak_rss_bytes),
+                (
+                    &mut aggregate.gpu_resident_bytes,
+                    measured.gpu_resident_bytes,
+                ),
+            ] {
+                fold_total(total, value, Fold::Max);
+            }
+        }
+        Ok(aggregate)
+    }
+}
+
+/// What [`ProcessTable::usage_rows`] selects over. Every field is optional; an
+/// empty filter means every process, still bounded by [`DEFAULT_LIST_LIMIT`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessUsageFilter {
+    pub process_id: Option<String>,
+    pub run_id: Option<String>,
+    pub workspace: Option<String>,
+    /// Only rows that have exited, and therefore have a closed-out ledger row.
+    pub closed_only: bool,
+    pub limit: Option<u32>,
+}
+
+/// One process's resource ledger row.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessUsageRow {
+    pub process_id: String,
+    pub kind: ProcessKind,
+    pub external_id: String,
+    pub run_id: Option<String>,
+    pub workspace: Option<String>,
+    pub state: ProcessState,
+    pub exit_status: Option<ExitStatus>,
+    /// Derived from the row's timestamps, never stored — see `MIGRATION_V8_SQL`.
+    /// `None` until the process exits, with the reason recorded in
+    /// `usage.unavailable` like any other gap.
+    pub wall_time_ms: Option<u64>,
+    pub usage: ProcessUsage,
+}
+
+/// One field's total across a set of ledger rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessUsageTotal {
+    /// `None` when no row in the set measured this field. The total of nothing is
+    /// unknown, not zero — the same rule the rows themselves follow.
+    pub value: Option<u64>,
+    pub measured_rows: u32,
+    pub unavailable_rows: u32,
+}
+
+/// Totals by run or workspace, as [`ProcessTable::usage_totals`] folds them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessUsageAggregate {
+    pub rows: u32,
+    pub wall_time_ms: ProcessUsageTotal,
+    pub cpu_time_ms: ProcessUsageTotal,
+    pub bytes_read: ProcessUsageTotal,
+    pub bytes_written: ProcessUsageTotal,
+    pub bytes_egressed: ProcessUsageTotal,
+    pub tokens_in: ProcessUsageTotal,
+    pub tokens_out: ProcessUsageTotal,
+    pub gpu_device_ms: ProcessUsageTotal,
+    /// Maxima, not sums. Adding two processes' peak footprints invents a number
+    /// no moment in time ever saw — the machine only ever held one of them at a
+    /// time unless the two overlapped, which this table does not know.
+    pub peak_rss_bytes: ProcessUsageTotal,
+    pub gpu_resident_bytes: ProcessUsageTotal,
+}
+
+enum Fold {
+    Sum,
+    Max,
+}
+
+fn fold_total(total: &mut ProcessUsageTotal, value: Option<u64>, fold: Fold) {
+    match value {
+        Some(value) => {
+            total.measured_rows = total.measured_rows.saturating_add(1);
+            total.value = Some(match (total.value, fold) {
+                (Some(held), Fold::Sum) => held.saturating_add(value),
+                (Some(held), Fold::Max) => held.max(value),
+                (None, _) => value,
+            });
+        }
+        None => total.unavailable_rows = total.unavailable_rows.saturating_add(1),
+    }
 }
 
 /// The pid to record as this work's host, for a projection in `state`.
@@ -1975,7 +2554,8 @@ impl ProcessProjector for LedgerProcessProjector {
             .map_err(|_| "process projector lock was poisoned".to_string())?;
         if slot.is_none() {
             *slot = Some(
-                crate::run_ledger::RunLedger::open(&self.path).map_err(|error| error.to_string())?,
+                crate::run_ledger::RunLedger::open(&self.path)
+                    .map_err(|error| error.to_string())?,
             );
         }
         let ledger = slot.as_ref().expect("ledger initialized above");
@@ -1992,6 +2572,110 @@ const SELECT_COLUMNS: &str = "SELECT process_id, parent_process_id, kind, extern
      max_child_processes, exit_status, exit_code, exit_signal, exit_reason, created_at_ms, \
      updated_at_ms, started_at_ms, exited_at_ms, stop_requested, suspend_requested, \
      signal_reason, signal_requested_at_ms, kill_requested FROM agent_processes";
+
+/// The nine V8 measurement columns, in [`MeasuredUsage::fields`]' order so the
+/// column list and the invariant's field list cannot drift apart.
+const SELECT_USAGE_COLUMNS: &str = "cpu_time_ms, peak_rss_bytes, bytes_read, bytes_written, \
+     bytes_egressed, tokens_in, tokens_out, gpu_resident_bytes, gpu_device_ms";
+
+/// SQLite has no unsigned integer type, so a count wider than `i64::MAX` cannot
+/// be stored. Clamping rather than failing: a byte count that large is a bug
+/// somewhere upstream, and refusing the terminal write over it would strand the
+/// row instead of recording a number that is merely saturated.
+fn to_sql_u64(value: Option<u64>) -> Option<i64> {
+    value.map(|value| i64::try_from(value).unwrap_or(i64::MAX))
+}
+
+fn map_measured_usage(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<MeasuredUsage> {
+    let field = |index: usize| row.get::<_, Option<i64>>(offset + index);
+    Ok(MeasuredUsage {
+        cpu_time_ms: field(0)?.map(|value| value.max(0) as u64),
+        peak_rss_bytes: field(1)?.map(|value| value.max(0) as u64),
+        bytes_read: field(2)?.map(|value| value.max(0) as u64),
+        bytes_written: field(3)?.map(|value| value.max(0) as u64),
+        bytes_egressed: field(4)?.map(|value| value.max(0) as u64),
+        tokens_in: field(5)?.map(|value| value.max(0) as u64),
+        tokens_out: field(6)?.map(|value| value.max(0) as u64),
+        gpu_resident_bytes: field(7)?.map(|value| value.max(0) as u64),
+        gpu_device_ms: field(8)?.map(|value| value.max(0) as u64),
+    })
+}
+
+/// Row → ledger row, deriving wall time and back-filling a reason for any gap the
+/// stored note list does not cover.
+///
+/// The back-fill is what keeps a read of a row that predates V8, or one that has
+/// not closed out yet, from failing [`ProcessUsage::new`]'s check: those rows have
+/// real gaps and no stored reasons, and a read must describe them rather than
+/// refuse them.
+fn map_usage_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<ProcessUsageRow>> {
+    let kind = match ProcessKind::parse(&row.get::<_, String>(1)?) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let state = match ProcessState::parse(&row.get::<_, String>(5)?) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let exit_status = match row.get::<_, Option<String>>(6)? {
+        Some(raw) => match ExitStatus::parse(&raw) {
+            Ok(value) => Some(value),
+            Err(error) => return Ok(Err(error)),
+        },
+        None => None,
+    };
+
+    let created_at_ms: i64 = row.get(7)?;
+    let started_at_ms: Option<i64> = row.get(8)?;
+    let exited_at_ms: Option<i64> = row.get(9)?;
+    let measured = map_measured_usage(row, 10)?;
+    let mut unavailable: Vec<TraceFieldNote> = row
+        .get::<_, Option<String>>(19)?
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+
+    // Wall time is the span from when the work actually started, falling back to
+    // admission for a process that exited without ever running.
+    let wall_time_ms = exited_at_ms.map(|exited| {
+        u64::try_from(exited.saturating_sub(started_at_ms.unwrap_or(created_at_ms))).unwrap_or(0)
+    });
+    if wall_time_ms.is_none() {
+        unavailable.push(TraceFieldNote {
+            field: FIELD_WALL_TIME_MS.to_string(),
+            reason: WALL_TIME_NOT_FINAL_REASON.to_string(),
+        });
+    }
+
+    let back_fill = if state.is_terminal() {
+        PREDATES_LEDGER_REASON
+    } else {
+        NOT_CLOSED_OUT_REASON
+    };
+    for (field, value) in measured.fields() {
+        if value.is_none() && !unavailable.iter().any(|note| note.field == field) {
+            unavailable.push(TraceFieldNote {
+                field: field.to_string(),
+                reason: back_fill.to_string(),
+            });
+        }
+    }
+
+    let usage = match ProcessUsage::new(measured, unavailable) {
+        Ok(usage) => usage,
+        Err(error) => return Ok(Err(error)),
+    };
+    Ok(Ok(ProcessUsageRow {
+        process_id: row.get(0)?,
+        kind,
+        external_id: row.get(2)?,
+        run_id: row.get(3)?,
+        workspace: row.get(4)?,
+        state,
+        exit_status,
+        wall_time_ms,
+        usage,
+    }))
+}
 
 /// Row → record. Returns a nested `Result` because a stored enum that fails to
 /// parse is a data error, not a SQLite error, and must not be reported as one.
@@ -2067,6 +2751,477 @@ mod tests {
         table
             .admit(&AdmitProcess::new(kind, external), T0)
             .expect("admit succeeds")
+    }
+
+    /// A `runs` row plus one `usage_recorded` event, written straight to SQL.
+    ///
+    /// Deliberately not `RunLedger::submit_run`: this needs a run to exist so the
+    /// `agent_processes.run_id` foreign key resolves and so
+    /// `ProcessTable::latest_run_usage` has an event stream to read, and a full
+    /// `RunSpec` would be forty lines of irrelevant detail. The envelope itself is
+    /// built through serde so its stored shape is the real one.
+    fn seed_run_with_usage(
+        ledger: &RunLedger,
+        run_id: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) {
+        use crate::run_protocol::{
+            ClientIdentity, ClientKind, RunEvent, RunEventEnvelope, UsageSnapshot,
+            RUN_PROTOCOL_SCHEMA_VERSION,
+        };
+
+        ledger
+            .connection()
+            .execute(
+                "INSERT INTO runs (run_id, idempotency_key, spec_json, created_at_ms,
+                                   updated_at_ms, status, last_sequence, max_event_count)
+                 VALUES (?1, ?1, x'7b7d', ?2, ?2, 'running', 0, 1000)",
+                params![run_id, T0],
+            )
+            .expect("a run row is seeded");
+
+        let envelope = RunEventEnvelope {
+            schema_version: RUN_PROTOCOL_SCHEMA_VERSION,
+            event_id: format!("event-{run_id}-1"),
+            run_id: run_id.to_string(),
+            sequence: 1,
+            occurred_at_ms: T0 as u64,
+            actor_id: None,
+            emitter: ClientIdentity {
+                client_id: "client-usage-test".to_string(),
+                instance_id: "instance-usage-test".to_string(),
+                kind: ClientKind::Test,
+                version: "1".to_string(),
+            },
+            event: RunEvent::UsageRecorded {
+                usage: UsageSnapshot {
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens: 0,
+                    model_calls: 1,
+                    tool_calls: 0,
+                    cost_micros: None,
+                },
+            },
+        };
+        ledger
+            .connection()
+            .execute(
+                "INSERT INTO run_events (event_id, run_id, sequence, occurred_at_ms, actor_id,
+                                        emitter_json, event_type, envelope_json, derived_status,
+                                        is_terminal)
+                 VALUES (?1, ?2, 1, ?3, NULL, x'7b7d', 'usage_recorded', ?4, NULL, 0)",
+                params![
+                    envelope.event_id,
+                    run_id,
+                    T0,
+                    serde_json::to_vec(&envelope).expect("the envelope serialises"),
+                ],
+            )
+            .expect("a usage event is seeded");
+    }
+
+    fn usage_of(table: &ProcessTable<'_>, process_id: &str) -> ProcessUsageRow {
+        table
+            .usage_rows(&ProcessUsageFilter {
+                process_id: Some(process_id.to_string()),
+                ..ProcessUsageFilter::default()
+            })
+            .expect("the ledger reads back")
+            .pop()
+            .expect("a row exists for an admitted process")
+    }
+
+    /// The invariant the whole resource ledger exists for. Without this check a
+    /// gap reaches storage with nothing recorded about it, and the next reader
+    /// treats the NULL as a zero.
+    #[test]
+    fn a_usage_row_with_an_unexplained_gap_cannot_be_constructed() {
+        let error = ProcessUsage::new(MeasuredUsage::default(), Vec::new())
+            .expect_err("nine unexplained gaps must be refused");
+        assert!(
+            matches!(error, ProcessTableError::UsageGapWithoutReason { .. }),
+            "got {error:?}"
+        );
+
+        // One field short of complete is still refused, and the error names the
+        // field that is missing its reason.
+        let mut notes: Vec<TraceFieldNote> = MeasuredUsage::default()
+            .fields()
+            .iter()
+            .filter(|(field, _)| *field != FIELD_BYTES_WRITTEN)
+            .map(|(field, _)| TraceFieldNote {
+                field: (*field).to_string(),
+                reason: "not measured in this test".to_string(),
+            })
+            .collect();
+        assert!(matches!(
+            ProcessUsage::new(MeasuredUsage::default(), notes.clone()),
+            Err(ProcessTableError::UsageGapWithoutReason {
+                field: FIELD_BYTES_WRITTEN
+            })
+        ));
+
+        // The counter-test: with every gap explained it constructs. Without this,
+        // a constructor that refused everything would pass the assertions above.
+        notes.push(TraceFieldNote {
+            field: FIELD_BYTES_WRITTEN.to_string(),
+            reason: "not measured in this test".to_string(),
+        });
+        let usage =
+            ProcessUsage::new(MeasuredUsage::default(), notes).expect("every gap is accounted for");
+        assert_eq!(
+            usage.reason_for(FIELD_BYTES_WRITTEN),
+            Some("not measured in this test")
+        );
+
+        // A measured field needs no note, and none is invented for it.
+        let usage = ProcessUsage::new(
+            MeasuredUsage {
+                cpu_time_ms: Some(7),
+                ..MeasuredUsage::default()
+            },
+            MeasuredUsage::default()
+                .fields()
+                .iter()
+                .filter(|(field, _)| *field != FIELD_CPU_TIME_MS)
+                .map(|(field, _)| TraceFieldNote {
+                    field: (*field).to_string(),
+                    reason: "not measured in this test".to_string(),
+                })
+                .collect(),
+        )
+        .expect("a measured field needs no reason");
+        assert_eq!(usage.measured().cpu_time_ms, Some(7));
+        assert_eq!(usage.reason_for(FIELD_CPU_TIME_MS), None);
+    }
+
+    /// The wire shape a listing surface reads. Worth pinning for the same reason
+    /// the signal-intent shape is: `#[serde(flatten)]` puts the nine measurement
+    /// fields at the top level of `usage`, and a rename or an accidental nesting
+    /// would compile fine while every number silently read as `undefined`.
+    #[test]
+    fn a_usage_row_serialises_with_its_measurements_flat_and_its_reasons_beside_them() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::SideTask, "task-usage-wire");
+        table
+            .accumulate_usage(
+                &record.process_id,
+                &ProcessUsageSample {
+                    cpu_time_ms: Some(42),
+                    ..ProcessUsageSample::default()
+                },
+                T0 + 1,
+            )
+            .expect("a sample folds in");
+
+        let json =
+            serde_json::to_value(usage_of(&table, &record.process_id)).expect("the row serialises");
+
+        assert_eq!(json["processId"], record.process_id);
+        assert_eq!(json["kind"], "side_task");
+        assert_eq!(json["state"], "admitted");
+        assert_eq!(json["wallTimeMs"], serde_json::Value::Null);
+        // Flat, not nested under a `measured` key.
+        assert_eq!(json["usage"]["cpuTimeMs"], 42);
+        assert_eq!(json["usage"]["peakRssBytes"], serde_json::Value::Null);
+        // A NULL always travels with the reason that explains it.
+        let reasons = json["usage"]["unavailable"]
+            .as_array()
+            .expect("unavailable is an array");
+        assert!(reasons
+            .iter()
+            .any(|note| note["field"] == FIELD_PEAK_RSS_BYTES && note["reason"].is_string()));
+        assert!(
+            !reasons
+                .iter()
+                .any(|note| note["field"] == FIELD_CPU_TIME_MS),
+            "a measured field must not appear in the reason list"
+        );
+    }
+
+    /// A reaped process is the case that matters most: nobody was watching it, so
+    /// there is nothing to measure — and a ledger that answered "0 bytes, 0ms" for
+    /// it would be lying about the one process it knows least about.
+    #[test]
+    fn a_reaped_process_still_closes_with_a_reason_for_every_field_and_no_zeros() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::WorkflowRun, "wf-crashed-host");
+        table
+            .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+            .expect("the run starts");
+        table
+            .set_native_pid(&record.process_id, Some(999_999), T0 + 1)
+            .expect("the host records its pid");
+
+        let reaped = table
+            .reap_dead_hosts(
+                &ProcessFilter::default(),
+                &|_| false,
+                "the process hosting this run exited without closing it",
+                T0 + 5,
+            )
+            .expect("the reaper runs");
+        assert_eq!(reaped.len(), 1, "the row whose host is gone is closed");
+
+        let row = usage_of(&table, &record.process_id);
+        assert_eq!(row.exit_status, Some(ExitStatus::Lost));
+        assert_eq!(
+            row.wall_time_ms,
+            Some(4),
+            "wall time is derived, not stored"
+        );
+
+        let measured = row.usage.measured();
+        for (field, value) in measured.fields() {
+            assert_eq!(value, None, "{field} was never measured for a reaped row");
+            assert!(
+                row.usage.reason_for(field).is_some(),
+                "{field} is NULL and must therefore state why"
+            );
+        }
+        assert_eq!(
+            row.usage.reason_for(FIELD_CPU_TIME_MS),
+            Some(REAPED_REASON),
+            "a reaped row must say nothing could have sampled it, not merely that nothing did"
+        );
+        assert_eq!(
+            row.usage.reason_for(FIELD_GPU_DEVICE_MS),
+            Some(GPU_NOT_REPORTED_REASON)
+        );
+    }
+
+    /// The SQL half of the same guarantee: a writer that bypassed
+    /// `close_out_usage` cannot land an `exited` row with no reason list. Mirrors
+    /// how V5's transition rules are enforced in both Rust and SQL.
+    #[test]
+    fn sql_refuses_an_exited_row_that_states_nothing_about_its_gaps() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::ChatTurn, "turn-direct-sql");
+
+        let error = ledger
+            .connection()
+            .execute(
+                "UPDATE agent_processes SET state = 'exited', exit_status = 'succeeded'
+                  WHERE process_id = ?1",
+                params![record.process_id],
+            )
+            .expect_err("the trigger must abort a close-out with no reason list");
+        assert!(
+            error
+                .to_string()
+                .contains("must state its unmeasured fields"),
+            "got {error}"
+        );
+    }
+
+    /// Peak resident size is unreadable once a pid is gone, so the value that
+    /// reaches the ledger has to be the highest one sampled while the process
+    /// lived — and close-out must keep it rather than overwrite it with a reason.
+    #[test]
+    fn a_sampled_peak_survives_close_out_and_only_the_unsampled_fields_get_reasons() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::BackgroundShell, "sh-sampled");
+        table
+            .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+            .expect("the shell starts");
+
+        for (cpu, rss) in [(10, 4_000), (25, 9_000), (30, 5_000)] {
+            table
+                .accumulate_usage(
+                    &record.process_id,
+                    &ProcessUsageSample {
+                        cpu_time_ms: Some(cpu),
+                        peak_rss_bytes: Some(rss),
+                        ..ProcessUsageSample::default()
+                    },
+                    T0 + 2,
+                )
+                .expect("a sample folds in");
+        }
+        table
+            .add_egress_bytes(&record.process_id, 1_024, T0 + 3)
+            .expect("egress is attributed");
+        table
+            .add_egress_bytes(&record.process_id, 512, T0 + 3)
+            .expect("egress accumulates");
+
+        let closed = table
+            .transition(
+                &record.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::succeeded()),
+                T0 + 9,
+            )
+            .expect("the shell exits");
+        assert_eq!(closed.state, ProcessState::Exited);
+
+        let row = usage_of(&table, &record.process_id);
+        let measured = row.usage.measured();
+        assert_eq!(measured.cpu_time_ms, Some(30));
+        assert_eq!(
+            measured.peak_rss_bytes,
+            Some(9_000),
+            "the peak must survive a later, smaller sample"
+        );
+        assert_eq!(measured.bytes_egressed, Some(1_536));
+        assert_eq!(row.wall_time_ms, Some(8));
+        // A measured field carries no "not measured" note...
+        assert_eq!(row.usage.reason_for(FIELD_PEAK_RSS_BYTES), None);
+        assert_eq!(row.usage.reason_for(FIELD_BYTES_EGRESSED), None);
+        // ...and one nothing sampled still does.
+        assert_eq!(measured.bytes_read, None);
+        assert_eq!(
+            row.usage.reason_for(FIELD_BYTES_READ),
+            Some(NOT_SAMPLED_REASON)
+        );
+    }
+
+    /// Tokens come from the run's own event stream, because `UsageSnapshot` lives
+    /// inside `run_events.envelope_json` and is not queryable by SQL.
+    #[test]
+    fn tokens_are_read_from_the_runs_usage_events_when_the_process_has_a_run() {
+        let ledger = ledger();
+        seed_run_with_usage(&ledger, "run-tokens", 1_200, 340);
+        let table = ProcessTable::new(ledger.connection());
+        let record = table
+            .admit(
+                &AdmitProcess::new(ProcessKind::DaemonJob, "job-tokens").with_run("run-tokens"),
+                T0,
+            )
+            .expect("a job with a run is admitted");
+        table
+            .transition(
+                &record.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::succeeded()),
+                T0 + 1,
+            )
+            .expect("the job finishes");
+
+        let row = usage_of(&table, &record.process_id);
+        assert_eq!(row.usage.measured().tokens_in, Some(1_200));
+        assert_eq!(row.usage.measured().tokens_out, Some(340));
+        assert_eq!(row.usage.reason_for(FIELD_TOKENS_IN), None);
+    }
+
+    /// `agent_processes.run_id` is NULL for `subagent` and the `m4` workflow
+    /// kinds, so their token counts are *structurally* unavailable. Reporting zero
+    /// would claim a subagent spends no tokens, which is the opposite of true.
+    #[test]
+    fn a_process_with_no_run_marks_its_tokens_structurally_unavailable() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::Subagent, "sub-no-run");
+        table
+            .transition(
+                &record.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::succeeded()),
+                T0 + 1,
+            )
+            .expect("the subagent finishes");
+
+        let row = usage_of(&table, &record.process_id);
+        assert_eq!(row.usage.measured().tokens_in, None);
+        assert_eq!(row.usage.measured().tokens_out, None);
+        assert_eq!(row.usage.reason_for(FIELD_TOKENS_IN), Some(NO_RUN_REASON));
+        assert_eq!(row.usage.reason_for(FIELD_TOKENS_OUT), Some(NO_RUN_REASON));
+    }
+
+    /// A live row has no closed-out ledger yet, and a read must say so rather
+    /// than fail the invariant check or omit the process entirely.
+    #[test]
+    fn a_live_row_reads_back_with_its_gaps_explained_as_not_closed_out() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::ChatTurn, "turn-still-running");
+
+        let row = usage_of(&table, &record.process_id);
+        assert_eq!(row.state, ProcessState::Admitted);
+        assert_eq!(row.wall_time_ms, None);
+        assert_eq!(
+            row.usage.reason_for(FIELD_WALL_TIME_MS),
+            Some(WALL_TIME_NOT_FINAL_REASON)
+        );
+        assert_eq!(
+            row.usage.reason_for(FIELD_CPU_TIME_MS),
+            Some(NOT_CLOSED_OUT_REASON)
+        );
+    }
+
+    /// An aggregate over rows where some fields were never measured must report
+    /// the shortfall. A bare `SUM` reports the total of whatever happened to have
+    /// a value and looks like the total of everything.
+    #[test]
+    fn totals_report_how_many_rows_could_not_be_measured_rather_than_summing_nulls_as_zero() {
+        let ledger = ledger();
+        seed_run_with_usage(&ledger, "run-agg", 100, 20);
+        let table = ProcessTable::new(ledger.connection());
+
+        // Two processes on one run: one sampled, one not.
+        for (external, sample) in [
+            ("job-agg-sampled", Some((40_u64, 8_000_u64))),
+            ("job-agg-unsampled", None),
+        ] {
+            let record = table
+                .admit(
+                    &AdmitProcess::new(ProcessKind::DaemonJob, external).with_run("run-agg"),
+                    T0,
+                )
+                .expect("admitted");
+            if let Some((cpu, rss)) = sample {
+                table
+                    .accumulate_usage(
+                        &record.process_id,
+                        &ProcessUsageSample {
+                            cpu_time_ms: Some(cpu),
+                            peak_rss_bytes: Some(rss),
+                            ..ProcessUsageSample::default()
+                        },
+                        T0 + 1,
+                    )
+                    .expect("a sample folds in");
+            }
+            table
+                .transition(
+                    &record.process_id,
+                    ProcessState::Exited,
+                    Some(ProcessExit::succeeded()),
+                    T0 + 3,
+                )
+                .expect("finished");
+        }
+
+        let totals = table
+            .usage_totals(&ProcessUsageFilter {
+                run_id: Some("run-agg".to_string()),
+                ..ProcessUsageFilter::default()
+            })
+            .expect("totals fold");
+
+        assert_eq!(totals.rows, 2);
+        assert_eq!(totals.cpu_time_ms.value, Some(40));
+        assert_eq!(totals.cpu_time_ms.measured_rows, 1);
+        assert_eq!(
+            totals.cpu_time_ms.unavailable_rows, 1,
+            "the unsampled process must be visible as a gap, not folded in as a zero"
+        );
+        // Both processes read the same run, so tokens are measured for both.
+        assert_eq!(totals.tokens_in.value, Some(200));
+        assert_eq!(totals.tokens_in.unavailable_rows, 0);
+        // Peaks are maxima: summing two footprints would invent a number no
+        // moment ever saw.
+        assert_eq!(totals.peak_rss_bytes.value, Some(8_000));
+        // Nothing measures GPU residency, so the total is unknown rather than 0.
+        assert_eq!(totals.gpu_resident_bytes.value, None);
+        assert_eq!(totals.gpu_resident_bytes.unavailable_rows, 2);
+        assert_eq!(totals.wall_time_ms.value, Some(6));
     }
 
     /// The wire shape `processSignalDelivery.ts` reads to decide what to deliver.
@@ -2412,7 +3567,8 @@ mod tests {
 
         match error {
             ProcessTableError::DuplicateExternalId {
-                existing_process_id, ..
+                existing_process_id,
+                ..
             } => assert_eq!(existing_process_id, first.process_id),
             other => panic!("wrong error: {other}"),
         }
@@ -2589,7 +3745,10 @@ mod tests {
             "UPDATE agent_processes SET exit_status = 'succeeded' WHERE process_id = ?1",
             params![record.process_id],
         );
-        assert!(raw.is_err(), "an exit status on a running row must be refused");
+        assert!(
+            raw.is_err(),
+            "an exit status on a running row must be refused"
+        );
     }
 
     #[test]
@@ -2600,12 +3759,14 @@ mod tests {
 
         let child = table
             .admit(
-                &AdmitProcess::new(ProcessKind::Subagent, "sub-1")
-                    .with_parent(&parent.process_id),
+                &AdmitProcess::new(ProcessKind::Subagent, "sub-1").with_parent(&parent.process_id),
                 T0 + 1,
             )
             .unwrap();
-        assert_eq!(child.parent_process_id.as_deref(), Some(parent.process_id.as_str()));
+        assert_eq!(
+            child.parent_process_id.as_deref(),
+            Some(parent.process_id.as_str())
+        );
 
         assert!(matches!(
             table.admit(
@@ -2619,7 +3780,10 @@ mod tests {
             "UPDATE agent_processes SET parent_process_id = process_id WHERE process_id = ?1",
             params![child.process_id],
         );
-        assert!(self_parent.is_err(), "a process must not become its own parent");
+        assert!(
+            self_parent.is_err(),
+            "a process must not become its own parent"
+        );
     }
 
     #[test]
@@ -2721,7 +3885,11 @@ mod tests {
                 ..ProcessFilter::default()
             })
             .unwrap();
-        assert_eq!(in_one.len(), 1, "the table can answer what runs in a folder");
+        assert_eq!(
+            in_one.len(),
+            1,
+            "the table can answer what runs in a folder"
+        );
         assert_eq!(in_one[0].external_id, "turn-a");
 
         // A caller cannot ask for an unbounded scan, and cannot ask for zero.
@@ -3069,7 +4237,12 @@ mod tests {
             .transition(&turn.process_id, ProcessState::Running, None, T0 + 1)
             .unwrap();
         table
-            .signal(&turn.process_id, ProcessSignal::Suspend, Some("user"), T0 + 2)
+            .signal(
+                &turn.process_id,
+                ProcessSignal::Suspend,
+                Some("user"),
+                T0 + 2,
+            )
             .unwrap();
         table
             .transition(&turn.process_id, ProcessState::Suspended, None, T0 + 3)
@@ -3087,7 +4260,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(reaped.len(), 1, "a suspended row is still live work to reap");
+        assert_eq!(
+            reaped.len(),
+            1,
+            "a suspended row is still live work to reap"
+        );
         let closed = table.get(&turn.process_id).unwrap().unwrap();
         assert_eq!(closed.state, ProcessState::Exited);
         assert_eq!(
@@ -3398,7 +4575,11 @@ mod tests {
 
         let (record, _) = table
             .reconcile(
-                &ProcessProjection::new(ProcessKind::DaemonJob, "job-late-pid", ProcessState::Admitted),
+                &ProcessProjection::new(
+                    ProcessKind::DaemonJob,
+                    "job-late-pid",
+                    ProcessState::Admitted,
+                ),
                 T0,
             )
             .unwrap();
@@ -3561,7 +4742,10 @@ mod tests {
             .unwrap();
         assert!(signalled.signal_intent.stop_requested);
         assert!(!signalled.signal_intent.suspend_requested);
-        assert_eq!(signalled.signal_reason.as_deref(), Some("user pressed stop"));
+        assert_eq!(
+            signalled.signal_reason.as_deref(),
+            Some("user pressed stop")
+        );
         assert_eq!(signalled.signal_requested_at_ms, Some(T0 + 1));
 
         // Read back through a fresh view — the whole point is that it is on disk,
@@ -3615,7 +4799,10 @@ mod tests {
             .expect_err("a workflow node cannot be suspended independently");
         match error {
             ProcessTableError::SignalRefused {
-                kind, signal, reason, ..
+                kind,
+                signal,
+                reason,
+                ..
             } => {
                 assert_eq!(kind, ProcessKind::WorkflowNode);
                 assert_eq!(signal, ProcessSignal::Suspend);
@@ -3669,7 +4856,12 @@ mod tests {
                 .unwrap();
         }
         table
-            .signal(&asked.process_id, ProcessSignal::Stop, Some("shutdown"), T0 + 2)
+            .signal(
+                &asked.process_id,
+                ProcessSignal::Stop,
+                Some("shutdown"),
+                T0 + 2,
+            )
             .unwrap();
         table
             .signal(&other_kind.process_id, ProcessSignal::Suspend, None, T0 + 2)
@@ -3680,7 +4872,11 @@ mod tests {
         assert_eq!(daemon_pending[0].process_id, asked.process_id);
 
         let all_pending = table.pending_signals(&[]).unwrap();
-        assert_eq!(all_pending.len(), 2, "an empty kind filter means every kind");
+        assert_eq!(
+            all_pending.len(),
+            2,
+            "an empty kind filter means every kind"
+        );
 
         // An exited process is never pending, however it was signalled.
         table
@@ -3692,7 +4888,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            table.pending_signals(&[ProcessKind::DaemonJob]).unwrap().len(),
+            table
+                .pending_signals(&[ProcessKind::DaemonJob])
+                .unwrap()
+                .len(),
             0
         );
     }
@@ -3736,10 +4935,20 @@ mod tests {
         let record = admit(&table, ProcessKind::DaemonJob, "job-escalated");
 
         table
-            .signal(&record.process_id, ProcessSignal::Kill, Some("hung"), T0 + 1)
+            .signal(
+                &record.process_id,
+                ProcessSignal::Kill,
+                Some("hung"),
+                T0 + 1,
+            )
             .unwrap();
         let after_stop = table
-            .signal(&record.process_id, ProcessSignal::Stop, Some("polite"), T0 + 2)
+            .signal(
+                &record.process_id,
+                ProcessSignal::Stop,
+                Some("polite"),
+                T0 + 2,
+            )
             .unwrap();
         assert!(
             after_stop.signal_intent.kill_requested,
@@ -3831,7 +5040,10 @@ mod tests {
         assert!(policy.permits_retry(0));
         assert!(policy.permits_retry(1));
         assert!(!policy.permits_retry(2), "the ceiling is a ceiling");
-        assert!(!policy.permits_retry(u32::MAX), "no overflow past the bound");
+        assert!(
+            !policy.permits_retry(u32::MAX),
+            "no overflow past the bound"
+        );
 
         assert_eq!(policy.backoff_ms(0), 1_000);
         assert_eq!(policy.backoff_ms(1), 2_000);
@@ -3864,7 +5076,12 @@ mod tests {
         // One of them was mid-pause when the app died, which must not change
         // the answer.
         table
-            .transition(&admitted[0].process_id, ProcessState::Suspended, None, T0 + 2)
+            .transition(
+                &admitted[0].process_id,
+                ProcessState::Suspended,
+                None,
+                T0 + 2,
+            )
             .unwrap();
 
         // The crash: nothing this instance owned is accounted for, because its
@@ -3973,7 +5190,10 @@ mod tests {
     }
 
     fn temp_ledger_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("lm-signal-source-test-{label}-{}", uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!(
+            "lm-signal-source-test-{label}-{}",
+            uuid::Uuid::new_v4()
+        ))
     }
 
     #[test]

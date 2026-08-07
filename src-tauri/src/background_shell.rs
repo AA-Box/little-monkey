@@ -40,6 +40,22 @@ const MAX_EVENT_CHUNK_BYTES: usize = 32 * 1024;
 /// blocking `wait`) keeps the child mutex free so `background_shell_kill` can
 /// take it at any moment — same reasoning as `terminal.rs`'s exit watcher.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How many exit-watcher ticks pass between writes of a live command's sampled
+/// usage to its ledger row — ten, so one write per second.
+///
+/// Two different rates, on purpose, because the two costs are not the same:
+///
+/// - **Sampling** rides every [`EXIT_POLL_INTERVAL`] tick, because it is one
+///   syscall and because peak resident size is unreadable once the pid is gone
+///   (see `process_usage`). Sampling on the same tick that notices the exit is
+///   what bounds how stale the final CPU reading can be — at most one tick — and
+///   it needs no thread of its own.
+/// - **Writing** is a SQLite `UPDATE`, and once a second is already generous for
+///   a ledger. The daemon's watchdog polls at 250ms because it has to *react*
+///   inside a budget; this only has to *record*, and the row's peak fields are
+///   kernel-maintained high-water marks, so a slower write loses nothing but
+///   freshness for a command that is still running.
+const USAGE_FLUSH_TICKS: u32 = 10;
 /// Hard cap on concurrently running background commands, so a looping model
 /// can't spawn processes without bound.
 const MAX_RUNNING: usize = 16;
@@ -275,6 +291,53 @@ fn project_process(app: &tauri::AppHandle, view: &BackgroundShellView, native_pi
     }
 }
 
+/// Folds one sampled reading into a background shell's resource ledger row.
+///
+/// Split out from the thread that calls it so it can be driven against an
+/// in-memory ledger in a test. A row that is not there is **not** an error and
+/// records nothing: the exit watcher starts a moment before the spawn's own
+/// `emit_status` projects the row, and a missing row later would mean the command
+/// was cleared — neither is a reason to invent one.
+///
+/// Only [`ProcessTable::accumulate_usage`] is used here, never
+/// `add_egress_bytes`, and the sample this hands over always carries
+/// `bytes_egressed: None` because nothing in `process_usage::sample` measures
+/// egress. That is what keeps the two conventions from meeting on one row: the
+/// egress column is only ever written additively, by whoever counted the bytes,
+/// and the maximum-folding writer leaves it alone.
+fn record_usage(
+    table: &crate::process_table::ProcessTable<'_>,
+    external_id: &str,
+    sample: &crate::process_usage::ProcessUsageSample,
+    now_ms: i64,
+) -> Result<bool, crate::process_table::ProcessTableError> {
+    use crate::process_table::ProcessKind;
+
+    let Some(record) = table.find_by_external_id(ProcessKind::BackgroundShell, external_id)? else {
+        return Ok(false);
+    };
+    table.accumulate_usage(&record.process_id, sample, now_ms)?;
+    Ok(true)
+}
+
+/// Writes what has been sampled so far. Fail-soft like every other bookkeeping
+/// call here — a command must not die because its ledger row could not be updated.
+fn flush_usage(
+    app: &tauri::AppHandle,
+    external_id: &str,
+    usage: &crate::process_usage::ProcessUsageAccumulator,
+) {
+    let Ok(now) = crate::run_commands::unix_time_ms() else {
+        return;
+    };
+    let state = app.state::<crate::AppState>();
+    if let Err(error) = crate::process_commands::with_process_table(app, state.inner(), |table| {
+        record_usage(table, external_id, usage.sample(), now as i64).map(|_| ())
+    }) {
+        eprintln!("background shell: could not record usage for {external_id}: {error}");
+    }
+}
+
 /// Delivers a real OS suspend/resume to a background shell's child,
 /// immediately — there is no safe point to wait for; the process either can
 /// be paused right now or it can't, unlike the cooperative kinds that check a
@@ -385,44 +448,91 @@ fn split_event_chunks(chunk: &str) -> Vec<String> {
     pieces
 }
 
+/// Watches for the child's exit, and samples its resources on the way.
+///
+/// The sampling lives here rather than in a thread of its own because this loop
+/// already has the two things it needs — the pid and a tick — and because the
+/// reading that matters most is the last one before the exit this loop is the
+/// first to notice. See [`USAGE_FLUSH_TICKS`] for why sampling and writing run at
+/// different rates, and `process_usage` for why sampling has to happen at all
+/// (peak resident size cannot be read from a pid that is gone).
 fn spawn_exit_watcher(app: tauri::AppHandle, process: Arc<BackgroundProcess>) {
-    std::thread::spawn(move || loop {
-        let waited = {
-            let Ok(mut child) = process.child.lock() else { break };
-            child.try_wait()
-        };
-        match waited {
-            Ok(None) => std::thread::sleep(EXIT_POLL_INTERVAL),
-            Ok(Some(status)) => {
-                if let Ok(mut view) = process.view.lock() {
-                    // `kill` already moved the view to `Killed` and stamped
-                    // `finished_at_ms`; don't overwrite that with the signal
-                    // exit this watcher observes a moment later.
-                    if view.status == BackgroundShellStatus::Running {
-                        view.status = if status.success() {
-                            BackgroundShellStatus::Exited
-                        } else {
-                            BackgroundShellStatus::Error
-                        };
-                        view.exit_code = status.code();
-                        view.finished_at_ms = now_ms().ok();
-                    }
-                    emit_status(&app, view.clone(), None);
-                }
-                break;
+    std::thread::spawn(move || {
+        let external_id = process.view().map(|view| view.id).unwrap_or_default();
+        // Captured once: `Child::id` keeps answering after the child exits, but
+        // the lock is cheaper to take once than every tick.
+        let pid = process
+            .child
+            .lock()
+            .ok()
+            .and_then(|child| i64::try_from(child.id()).ok());
+        let mut usage = crate::process_usage::ProcessUsageAccumulator::new();
+        let mut ticks: u32 = 0;
+
+        loop {
+            // Before `try_wait`, so the reading is of a process still alive. On the
+            // tick that observes the exit this sample fails and folds nothing, which
+            // leaves the accumulator holding the previous tick's live reading — at
+            // most one `EXIT_POLL_INTERVAL` old.
+            if let Some(pid) = pid {
+                usage.observe_pid(pid);
             }
-            Err(error) => {
-                if let Ok(mut view) = process.view.lock() {
-                    if view.status == BackgroundShellStatus::Running {
-                        view.status = BackgroundShellStatus::Error;
-                        let mut truncated = view.output_truncated;
-                        append_bounded(&mut view.output, &format!("\n[{error}]\n"), &mut truncated);
-                        view.output_truncated = truncated;
-                        view.finished_at_ms = now_ms().ok();
+            let waited = {
+                let Ok(mut child) = process.child.lock() else { break };
+                child.try_wait()
+            };
+            match waited {
+                Ok(None) => {
+                    ticks = ticks.wrapping_add(1);
+                    if ticks % USAGE_FLUSH_TICKS == 0 {
+                        flush_usage(&app, &external_id, &usage);
                     }
-                    emit_status(&app, view.clone(), None);
+                    std::thread::sleep(EXIT_POLL_INTERVAL)
                 }
-                break;
+                Ok(Some(status)) => {
+                    // Written *before* `emit_status`, and the order is load-bearing:
+                    // that call projects the terminal state, and `ProcessTable`'s
+                    // terminal transition closes the ledger row out — it records which
+                    // fields are unavailable and why. A measurement arriving after
+                    // close-out would leave a value sitting next to a note saying it
+                    // was never measured.
+                    flush_usage(&app, &external_id, &usage);
+                    if let Ok(mut view) = process.view.lock() {
+                        // `kill` already moved the view to `Killed` and stamped
+                        // `finished_at_ms`; don't overwrite that with the signal
+                        // exit this watcher observes a moment later.
+                        if view.status == BackgroundShellStatus::Running {
+                            view.status = if status.success() {
+                                BackgroundShellStatus::Exited
+                            } else {
+                                BackgroundShellStatus::Error
+                            };
+                            view.exit_code = status.code();
+                            view.finished_at_ms = now_ms().ok();
+                        }
+                        emit_status(&app, view.clone(), None);
+                    }
+                    break;
+                }
+                Err(error) => {
+                    // Same ordering rule as the exit branch above.
+                    flush_usage(&app, &external_id, &usage);
+                    if let Ok(mut view) = process.view.lock() {
+                        if view.status == BackgroundShellStatus::Running {
+                            view.status = BackgroundShellStatus::Error;
+                            let mut truncated = view.output_truncated;
+                            append_bounded(
+                                &mut view.output,
+                                &format!("\n[{error}]\n"),
+                                &mut truncated,
+                            );
+                            view.output_truncated = truncated;
+                            view.finished_at_ms = now_ms().ok();
+                        }
+                        emit_status(&app, view.clone(), None);
+                    }
+                    break;
+                }
             }
         }
     });
@@ -676,6 +786,59 @@ mod tests {
         let pieces = split_event_chunks(&chunk);
         assert!(pieces.len() > 1);
         assert_eq!(pieces.concat(), chunk);
+    }
+
+    /// The sampling seam, against an in-memory ledger: a real pid's CPU time
+    /// reaches the row, a row that is not there is not invented, and — the one
+    /// that guards the double-count rule — sampling never writes the egress
+    /// column, which belongs to the additive writer alone.
+    #[test]
+    fn sampling_reaches_the_ledger_row_without_touching_the_egress_column() {
+        use crate::process_table::{AdmitProcess, ProcessKind, ProcessTable, ProcessUsageFilter};
+        use crate::process_usage::ProcessUsageAccumulator;
+        use crate::run_ledger::RunLedger;
+
+        let ledger = RunLedger::open_in_memory().expect("an in-memory ledger opens");
+        let table = ProcessTable::new(ledger.connection());
+        let mut usage = ProcessUsageAccumulator::new();
+        // This test process is the only pid a test can be certain about.
+        usage.observe_pid(std::process::id() as i64);
+
+        assert!(
+            !record_usage(&table, "bg-never-projected", usage.sample(), 1_000)
+                .expect("a missing row is not an error"),
+            "a shell with no row yet must not have one invented for it"
+        );
+
+        let record = table
+            .admit(
+                &AdmitProcess::new(ProcessKind::BackgroundShell, "bg-sampled".to_string()),
+                1_000,
+            )
+            .expect("a row is admitted");
+        assert!(
+            record_usage(&table, "bg-sampled", usage.sample(), 1_001).expect("the row takes it")
+        );
+
+        let row = table
+            .usage_rows(&ProcessUsageFilter {
+                process_id: Some(record.process_id.clone()),
+                ..ProcessUsageFilter::default()
+            })
+            .expect("the ledger row reads")
+            .pop()
+            .expect("the row exists");
+        assert!(
+            row.usage.measured().cpu_time_ms.is_some(),
+            "a live sample must reach the row; got {:?}",
+            row.usage.unavailable()
+        );
+        assert_eq!(
+            row.usage.measured().bytes_egressed,
+            None,
+            "the sampler must leave the egress column to `add_egress_bytes`, or the \
+             two conventions double-count"
+        );
     }
 
     #[cfg(unix)]
