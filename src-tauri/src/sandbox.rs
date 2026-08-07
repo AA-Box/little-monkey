@@ -307,9 +307,16 @@ pub fn sandbox_enforcement() -> SandboxEnforcement {
     // here for the reason it is wrong on Linux: there is no separate binary to be
     // missing, and a machine that cannot create a job object degrades to
     // `ProcessOnly` rather than failing.
+    // Two mechanisms, so three answers. An AppContainer is the filesystem
+    // boundary and earns `OsEnforced` alongside Seatbelt and Landlock; a machine
+    // that can only give us a job object gets `ProcessContained`; one that can
+    // give neither gets `ProcessOnly`. Probed rather than assumed from the target
+    // triple, because group policy can refuse either one.
     #[cfg(target_os = "windows")]
     {
-        if crate::sandbox_windows::job_objects_are_enforceable() {
+        if crate::sandbox_windows::app_containers_are_enforceable() {
+            SandboxEnforcement::OsEnforced
+        } else if crate::sandbox_windows::job_objects_are_enforceable() {
             SandboxEnforcement::ProcessContained
         } else {
             SandboxEnforcement::ProcessOnly
@@ -929,16 +936,66 @@ pub async fn execute_in_sandbox(
         )
     };
 
-    // `ProcessContained` rather than `ProcessOnly`: the job object below is
-    // created before the spawn and its assignment is fatal, so a run that reaches
-    // the end of this function was contained. Not `OsSandboxed` — the containment
-    // is the process tree and its resources, never the filesystem.
+    // Windows leaves the shared `Command` path entirely: an AppContainer's
+    // capabilities can only be handed to `CreateProcessW` through a
+    // `STARTUPINFOEX` attribute list, which `Command` cannot build. So the whole
+    // spawn, wait and timeout live in `sandbox_windows::run_confined`, and this
+    // returns from here rather than falling through to code that would spawn a
+    // second, unconfined child.
     #[cfg(target_os = "windows")]
-    let (program, args, isolation) = (
-        "cmd".to_string(),
-        vec!["/C".to_string(), shell_command.to_string()],
-        Isolation::ProcessContained,
-    );
+    {
+        let job = crate::sandbox_windows::create_job()?;
+        // The container is the filesystem boundary; the job is the process-tree
+        // one. A machine that cannot give us the container still gets the job,
+        // and says so, rather than failing the run or overstating it.
+        // A fresh name per run, so two concurrent sandboxed runs never share a
+        // container and one finishing never deletes the other's profile.
+        let container =
+            crate::sandbox_windows::create_app_container(&uuid::Uuid::new_v4().simple().to_string());
+        let container = match container {
+            Ok(container) => {
+                // The single grant that makes the sandbox copy reachable. Fatal:
+                // without it the child is inside a container that cannot read its
+                // own working directory, which is a broken run, not a confined
+                // one.
+                container.grant_tree_access(&sandbox_root)?;
+                Some(container)
+            }
+            Err(error) => {
+                // Degrade rather than fail, matching the Linux path on a kernel
+                // without Landlock: the job still holds the process tree, and
+                // `ProcessContained` is the honest name for that.
+                eprintln!(
+                    "sandbox: no AppContainer for this run, continuing without a \
+                     filesystem boundary: {error}"
+                );
+                None
+            }
+        };
+        let isolation = match container.is_some() {
+            true => Isolation::OsSandboxed,
+            false => Isolation::ProcessContained,
+        };
+        let output = crate::sandbox_windows::run_confined(
+            container.as_ref(),
+            &job,
+            shell_command,
+            &workspace_dir,
+            &env,
+            allow_network,
+            timeout,
+        )
+        .await?;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        return Ok(SandboxExecOutcome {
+            isolation,
+            exit_code: output.exit_code,
+            timed_out: output.timed_out,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            duration_ms,
+        });
+    }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let (program, args, isolation) = (
@@ -947,105 +1004,99 @@ pub async fn execute_in_sandbox(
         Isolation::ProcessOnly,
     );
 
-    let mut command = tokio::process::Command::new(&program);
-    command
-        .args(&args)
-        .current_dir(&workspace_dir)
-        .env_clear()
-        .envs(env.iter().cloned())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // Its own process group, so the timeout below ends the whole tree. Without it
-    // `kill_on_drop` reaps only `sandbox-exec` (or the bare `sh` on the platforms
-    // with no Seatbelt), and a sandboxed command that spawns a build leaves that
-    // build running — with write access to the sandbox copy of the workspace and
-    // no remaining supervisor.
-    #[cfg(unix)]
-    command.process_group(0);
-    // Kernel-held bounds, which matter most here: on the platforms with no
-    // Seatbelt this is `Isolation::ProcessOnly`, so `os_limits` is the only
-    // enforcement the OS applies to the child at all. Inherited across the
-    // `sandbox-exec` exec, so it reaches the sandboxed program itself.
-    crate::os_limits::apply(crate::os_limits::ChildLimits::baseline(), &mut command);
-    // Linux's boundary is installed the same way, and *after* `os_limits` on
-    // purpose: `pre_exec` closures run in registration order, so the `setrlimit`
-    // bounds are already in place before anything starts denying syscalls.
-    // Reported from `confine`'s own answer rather than from the target triple —
-    // a kernel without Landlock keeps the `ProcessOnly` the branch above chose.
-    #[cfg(target_os = "linux")]
-    let isolation = {
-        let path_env = env
-            .iter()
-            .find(|(key, _)| key == "PATH")
-            .map(|(_, value)| OsStr::new(value));
-        let readable_roots = readable_roots(
-            LINUX_SYSTEM_READ_ROOTS,
-            path_env,
-            real_home.as_deref(),
-            &real_workspace_root,
-        );
-        match crate::sandbox_linux::confine(
-            &mut command,
-            &sandbox_root,
-            &readable_roots,
-            allow_network,
-        )? {
-            true => Isolation::OsSandboxed,
-            false => isolation,
-        }
-    };
+    // Every platform but Windows spawns through `tokio::process` from here.
+    // Windows returned above from its own `CreateProcessW` path, and this is
+    // `cfg`-gated rather than left unreachable so that `program`, `args` and
+    // `isolation` — none of which the Windows arm defines — are not even named
+    // there.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut command = tokio::process::Command::new(&program);
+        command
+            .args(&args)
+            .current_dir(&workspace_dir)
+            .env_clear()
+            .envs(env.iter().cloned())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        // Its own process group, so the timeout below ends the whole tree. Without it
+        // `kill_on_drop` reaps only `sandbox-exec` (or the bare `sh` on the platforms
+        // with no Seatbelt), and a sandboxed command that spawns a build leaves that
+        // build running — with write access to the sandbox copy of the workspace and
+        // no remaining supervisor.
+        #[cfg(unix)]
+        command.process_group(0);
+        // Kernel-held bounds, which matter most here: on the platforms with no
+        // Seatbelt this is `Isolation::ProcessOnly`, so `os_limits` is the only
+        // enforcement the OS applies to the child at all. Inherited across the
+        // `sandbox-exec` exec, so it reaches the sandboxed program itself.
+        crate::os_limits::apply(crate::os_limits::ChildLimits::baseline(), &mut command);
+        // Linux's boundary is installed the same way, and *after* `os_limits` on
+        // purpose: `pre_exec` closures run in registration order, so the `setrlimit`
+        // bounds are already in place before anything starts denying syscalls.
+        // Reported from `confine`'s own answer rather than from the target triple —
+        // a kernel without Landlock keeps the `ProcessOnly` the branch above chose.
+        #[cfg(target_os = "linux")]
+        let isolation = {
+            let path_env = env
+                .iter()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| OsStr::new(value));
+            let readable_roots = readable_roots(
+                LINUX_SYSTEM_READ_ROOTS,
+                path_env,
+                real_home.as_deref(),
+                &real_workspace_root,
+            );
+            match crate::sandbox_linux::confine(
+                &mut command,
+                &sandbox_root,
+                &readable_roots,
+                allow_network,
+            )? {
+                true => Isolation::OsSandboxed,
+                false => isolation,
+            }
+        };
 
-    // Created before the spawn so a machine that cannot configure a job fails the
-    // run instead of producing an unconfined child — the same choice `os_limits`
-    // and `sandbox_linux` make. Bound for the whole scope below: the job's
-    // kill-on-close flag makes this handle's lifetime the containment's lifetime,
-    // so an early drop would kill the child mid-run.
-    #[cfg(target_os = "windows")]
-    let job = crate::sandbox_windows::create_job()?;
+        // Windows never reaches here — it returned above, from its own
+        // `CreateProcessW` path.
+        let child = command.spawn()?;
 
-    let child = command.spawn()?;
-
-    // Assigned immediately after the spawn, because `Command` cannot attach a job
-    // at creation. `sandbox_windows`' module docs cover the window this leaves and
-    // why `cmd.exe /C` cannot escape through it. A failed assignment is a failed
-    // run: the child is dropped by `?` (and `kill_on_drop` reaps it) rather than
-    // continuing as an unconfined process the caller was told was contained.
-    #[cfg(target_os = "windows")]
-    job.assign(&child)?;
-
-    // Captured before `wait_with_output` consumes the child; with
-    // `process_group(0)` the child's own pid is also its group id.
-    let child_pgid = child.id();
-    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    if result.is_err() {
-        if let Some(pgid) = child_pgid {
-            if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
-                eprintln!("sandbox: could not terminate process group {pgid}: {error}");
+        // Captured before `wait_with_output` consumes the child; with
+        // `process_group(0)` the child's own pid is also its group id.
+        let child_pgid = child.id();
+        let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if result.is_err() {
+            if let Some(pgid) = child_pgid {
+                if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
+                    eprintln!("sandbox: could not terminate process group {pgid}: {error}");
+                }
             }
         }
-    }
 
-    match result {
-        Ok(Ok(output)) => Ok(SandboxExecOutcome {
-            isolation,
-            exit_code: output.status.code(),
-            timed_out: false,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            duration_ms,
-        }),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Ok(SandboxExecOutcome {
-            isolation,
-            exit_code: None,
-            timed_out: true,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            duration_ms,
-        }),
+        match result {
+            Ok(Ok(output)) => Ok(SandboxExecOutcome {
+                isolation,
+                exit_code: output.status.code(),
+                timed_out: false,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                duration_ms,
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Ok(SandboxExecOutcome {
+                isolation,
+                exit_code: None,
+                timed_out: true,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                duration_ms,
+            }),
+        }
     }
 }
 
@@ -2254,17 +2305,21 @@ mod tests {
         {
             // Same shape again: tracks what this machine can hold rather than the
             // target triple, and never `Unavailable`, because a machine that
-            // cannot create a job object degrades instead of failing the run.
-            let expected = if crate::sandbox_windows::job_objects_are_enforceable() {
+            // cannot create a container or a job degrades instead of failing.
+            let expected = if crate::sandbox_windows::app_containers_are_enforceable() {
+                SandboxEnforcement::OsEnforced
+            } else if crate::sandbox_windows::job_objects_are_enforceable() {
                 SandboxEnforcement::ProcessContained
             } else {
                 SandboxEnforcement::ProcessOnly
             };
             assert_eq!(enforcement, expected);
             assert_ne!(enforcement, SandboxEnforcement::Unavailable);
-            // The claim that must never drift: containment is not a filesystem
-            // boundary, and Windows has no filesystem boundary to report.
-            assert_ne!(enforcement, SandboxEnforcement::OsEnforced);
+            // `OsEnforced` here is a claim about a filesystem boundary, so it may
+            // only be reported when a container is actually creatable.
+            if enforcement == SandboxEnforcement::OsEnforced {
+                assert!(crate::sandbox_windows::app_containers_are_enforceable());
+            }
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
