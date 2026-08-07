@@ -333,16 +333,16 @@ migration over users' existing embedded vectors**:
   sites, not ~9** (16 `knowledge_service.rs`, 11 `portability_commands.rs`, 1
   `diagnostics.rs`, ~17 `monkey-cli`). Harmless for the move itself, since they all
   resolve through the re-export — but that is the size of the repointing below.
-- Port the one v1-only capability v2 genuinely lacks: **source staleness**
-  (`is_stale_impl`, an mtime-only probe that reads no file contents, which is why the panel
-  can fan it out across every stack on mount). v2 has no read-only staleness probe at any
-  granularity — its change detection lives inside `refresh_at` and only has its inputs
-  after the sources have been fetched and hashed, which for a remote connector means
-  network I/O. So the honest port has a free tier (pipeline fingerprint changed), a cheap
-  tier for local connectors (the same mtime walk), and **"unknown" for remote connectors** —
-  any design that answers synchronously for those either does network I/O in a badge render
-  or lies. The second capability this line used to name, a query hot cache, should not be
-  ported at all; see the correction below.
+- ~~Port the one v1-only capability v2 genuinely lacks: **source staleness**.~~ **Done** —
+  `v2_staleness_impl`, built exactly as this line specified: a free tier (pipeline
+  fingerprint changed), a cheap tier for local connectors (the same mtime walk v1 does,
+  against the generation's creation time), and **`Unknown` for remote connectors**, because
+  any design that answers synchronously for those either does network I/O inside a badge
+  render or makes something up. `Unknown` must render as unknown and never as fresh.
+
+  It sat unwired in the UI for a release, which is its own lesson and is recorded in the
+  panel-collapse entry below. The second capability this line used to name, a query hot
+  cache, should not be ported at all; see the correction below.
 - ~~**Synthesize a v2 generation from each v1 index without re-embedding.**~~ **Done**,
   and the entry understated the hard part. Every factual claim in it held — the vectors
   are reusable as-is, and all thirteen `validate_chunk`/`validate_generation_contents`
@@ -388,11 +388,40 @@ migration over users' existing embedded vectors**:
   `audit_knowledge_index` now emits `knowledge_index.v1_import.<stack_id>` for each
   un-imported stack, so a support bundle answers "how many users still hold a v1 index?"
   with a number. That number is the precondition for deleting anything.
-- Port the remaining work: repoint the call sites off the re-export, route every read
-  through v2, delete the v1 index, and collapse the two panels. `stacks.rs` registers
-  **11 Tauri commands** (an earlier revision of this line said 12, while the section's own
-  opening said 11 — the opening was right), so v1 is still live and this item is still
-  *partially built*.
+- ~~Repoint the call sites off the re-export, and route every read through v2.~~ **Done.**
+  The final count is **57 references**, of which 47 were repointed at `knowledge_core` and
+  ten genuinely need v1: `ChunkMeta` ×7 — the *importer's* input type, so deleting it as
+  cruft would delete the migration path — plus `reindex_impl`, `query_impl` and
+  `stacks_reindex`. An earlier revision of this line estimated 53/42/11 before the work;
+  57/47/10 is what the repointing actually found, and both the re-export's comment and
+  `knowledge_core.rs`'s module doc asserted the opposite of the `ChunkMeta` fact and were
+  corrected.
+
+  Routing found a real divergence rather than a tidy-up: **the CLI could not read v2 at
+  all.** `monkey stacks search` and the CLI agent's `search_docs` answered from v1 while
+  the GUI preferred v2 — same query, same stack, different answers — and `agent.rs`
+  carried a comment asserting the two produce identically shaped results. All three callers
+  now share `query_stacks_v2_first`, so that parity is structural rather than a comment.
+- ~~Collapse the two panels' duplicated stack selection.~~ **Done**, and it found another
+  command implemented, tested, registered and never called: `knowledge_v2_is_stale`. Its
+  doc comment says it reads the manifest through `active_manifest` rather than `active`
+  *because the panel fans it out across every indexed stack on mount* — and the panel never
+  did. Two consequences, both user-visible: **a native v2 stack could never report as
+  stale at all**, and the badge that did render was v1's, describing the freshness of an
+  index that stack is no longer answered from. Wiring it also gives each row a "which index
+  answers this?" badge for free, because `NotIndexed` *is* the predicate the read path
+  branches on. Same class of finding as the unregistered import above, which is now twice
+  in this item — the guard test catches unregistered commands, not unused ones.
+
+  The selection itself is now single: the expanded stack row *is* the stack the Knowledge
+  2.0 section configures, derived from one piece of state rather than synchronised by an
+  effect. Before, the two halves could sit on different stacks, so a stack's v1 sources and
+  some other stack's v2 sources were on screen together with nothing saying so.
+- **Remaining, and gated on a release rather than a merge:** deleting v1 — its commands,
+  its panel controls, its `KnowledgePanel.*` strings, and last of all its bytes on disk.
+  `stacks.rs` registers **11 Tauri commands** (an earlier revision of this line said 12,
+  while the section's own opening said 11 — the opening was right), so v1 is still live and
+  this item is still *partially built*.
 
   **Deletion cannot be one change, and the reason is the import above rather than the
   refactor.** The repointing is largely mechanical — 53 code references to the re-export,
@@ -2774,7 +2803,7 @@ fitting. The one thing that would have gone unnoticed without measuring first is
 recorded under K6 — a CPU reading that was wrong by 42× on Apple Silicon and
 exactly right on Intel.
 
-## K6. Measured resource accounting *(ledger built; benchmark surface remaining)*
+## K6. Measured resource accounting *(built)*
 
 **Today:** the Telemetry tab captures real per-load and per-request traces —
 load timing, memory/VRAM headroom, offload placement, sampler stats, token
@@ -2852,9 +2881,80 @@ that prints the backend's reason. Totals report how many rows could not
 contribute. No chart — a zero-height bar cannot say "unknown" rather than "idle",
 which is the exact lie the item exists to prevent.
 
-**Remaining — (a), the benchmark surface.** Untouched. Edge device profiles are
-still static prose and cost still comes from typed rates. The ledger now gives it
-somewhere honest to write measurements to, which is the part that blocked it.
+**Shipped — (a), the benchmark surface. `benchmark.rs` measures a real streamed
+generation, and the constraint that shaped every decision is ROADMAP #2's own
+sentence: "no number is displayed that was not measured on the machine displaying
+it."**
+
+- **Time-to-first-token did not exist anywhere in the tree**, and could not have,
+  because the only in-process generation path the hub exposed for this
+  (`M3InferenceEngine::complete`) rejects `stream: true`. It is measured now by a
+  third canonical-sink decorator alongside `ProtocolEncodingSink` and
+  `MlxCanonicalSink` — forward, observe, retain nothing — stamping one `Instant`
+  on the **first non-empty `TextDelta`**. Not `ResponseStart`, which a runtime may
+  emit before doing any prefill work, and not `TextStart`, which announces a
+  content block rather than content.
+- **The existing `tokensPerSecond` is a different quantity wearing the same name.**
+  `runtime_telemetry.rs` computes `output_tokens / total_wall_time`, prefill
+  included, so it is an end-to-end rate rather than a decode rate. The benchmark
+  reports decode throughput over the window that opens at the first token, and its
+  numerator is `output_tokens - 1`: the first token's cost is already reported as
+  time-to-first-token, and charging it to the decode window counts it twice. At a
+  128-token budget that is a ~0.8% overstatement — the size of error that survives
+  review forever.
+- **The traces' clock could not carry a benchmark.** Durations came from the
+  frontend's `Date.now()` across the IPC boundary, so they included IPC and JSON
+  cost and could go *backwards* under an NTP adjustment, which `saturating_sub`
+  then rendered as `0`. Everything here is `Instant`, which is monotonic.
+- **Peak memory needed a distinction, not a reading.** `process_usage::sample`
+  reports the process *lifetime* high-water mark, which is right for a process the
+  ledger owns end to end and wrong here: a model server resident for an hour
+  already carries a peak somebody else's request set. The mark is read before and
+  after, and `run_peak_bytes` is populated **only when it rose** — the one case
+  where this run is what set it. Otherwise the lifetime mark is reported as an
+  upper bound with that stated, because collapsing the two would attribute an
+  earlier request's memory to the benchmark.
+- **Variance is the sample standard deviation, and it is `None` for one repeat
+  rather than `0.0`** — one observation has no spread, and zero reads as
+  "perfectly repeatable". The first repeat is discarded as warm-up, since a cold
+  request pays to load the weights and charging that to time-to-first-token
+  reports load time as prefill.
+- **Two refusals rather than two weak numbers.** A request under 32 output tokens
+  or under 2 repeats is rejected, not clamped — clamping would return a report
+  whose `maxOutputTokens` disagreed with what was asked. And a model the runtime
+  inventory marks `is_cloud` is refused outright: timing it measures a network
+  round trip to hardware the user does not own, which is precisely what the
+  acceptance clause rules out.
+
+**An honest gap that is worth naming rather than papering over.** The acceptance
+asks for a **model + runtime + quantization** triple, and this tree can identify
+two-thirds of it. No runtime here reports a quantization *scheme* for a loaded
+model — the inventory carries only `is_cloud`, and a GGUF's own
+`general.quantization_version` is a **format version ("2"), not a scheme
+("Q4_K_M")**, which is exactly the misreading a caller would make of it. So
+`quantization` is `None` with that reason attached, rather than sniffed out of a
+filename.
+
+**Prior art was audited and deliberately not salvaged.** An abandoned branch
+(`codex/model-benchmark-advisor`, 1977 lines, never merged) had built this surface
+in TypeScript against Ollama's HTTP API. It measures one of the four required
+numbers, and the reasons it cannot be repaired in place are structural rather than
+stylistic: every request sets `stream: false`, so TTFT is unobservable by
+construction; nothing samples any process, so its "memory analysis" compares the
+model's *on-disk file size* to RAM; each task runs exactly once, so variance is not
+merely missing but impossible without changing its result types; and being
+Ollama-only it cannot express the runtime axis at all. It also displayed cloud
+models' tokens/sec unlabelled, and rendered a failed task's fabricated
+`tokensPerSecond: 0` as "0.0 tok/s", indistinguishable from a genuine measurement
+of a very slow model. Two of its files carry comments claiming a sibling test
+"proves — mechanically, not just by convention" a property; neither test file was
+ever written.
+
+**Remaining.** Cost still comes from typed rates, which is ROADMAP #4's item rather
+than this one. `runtimeEdgeProfiles.ts` still returns eight hardcoded prose
+profiles, and its own text defers to "the local benchmark" seven times — those
+deferrals were false until now and are merely *satisfiable* today; replacing the
+prose with measurements is its own change.
 
 **Blocks:** nothing now. K7 and K8 both shipped on top of it, and K8's fair-share
 reads `cpu_time_ms` out of this ledger rather than deriving a number of its own.

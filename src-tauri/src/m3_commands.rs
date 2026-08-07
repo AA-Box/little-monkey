@@ -9,10 +9,12 @@ use crate::agent_launcher::{
     self, AgentConfigDriftReport, AgentTool, DriftCheckInput, GenerateAgentConfigRequest,
     GeneratedAgentConfig,
 };
+use crate::benchmark::{self, BenchmarkReport, BenchmarkRequest, PeakMemory};
 use crate::chat_template_lab::{run_chat_template_lab, ChatTemplateLabReport, TemplateFamily};
 use crate::compatibility_hub::{
-    LanServerPolicy, PairedToken, PairingChallengeView, PairingRequest, ScopedTokenView,
-    SecurityAuditEvent,
+    CanonicalContent, CanonicalInferenceRequest, CanonicalMessage, CanonicalRole,
+    CompatibilityProtocol, LanServerPolicy, PairedToken, PairingChallengeView, PairingRequest,
+    ScopedTokenView, SecurityAuditEvent, COMPATIBILITY_SCHEMA_VERSION,
 };
 use crate::context_cache::{
     self, ContextCacheView, ContextFailureClassification, ContextFailureInput, ContextRuntimeKind,
@@ -42,7 +44,7 @@ use crate::runtime_adapter::{
 };
 use crate::runtime_telemetry::{
     RecordLoadTraceRequest, RecordRequestTraceRequest, RuntimeTelemetryState, RuntimeTraceRecord,
-    SupportBundle,
+    SupportBundle, TraceFieldNote,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -263,6 +265,173 @@ pub fn m3_hardware_profile(
     state: tauri::State<'_, M3CommandState>,
 ) -> Result<HardwareProfile, String> {
     state.hub.hardware_profile().map_err(command_error)
+}
+
+/// A benchmark report plus the machine it was measured on.
+///
+/// The snapshot is attached here rather than inside `BenchmarkReport` because
+/// `benchmark.rs` has no way to probe hardware and must not acquire one — it can
+/// measure a generation and nothing else. Keeping them separate is also what
+/// lets a stored report be invalidated when the hardware changes.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct M3BenchmarkResponse {
+    pub report: BenchmarkReport,
+    pub hardware: HardwareSnapshot,
+}
+
+/// ROADMAP #2. Times `repeats` real streamed generations of `model` on
+/// `runtime_id` and reports what this machine measured.
+///
+/// The whole surface exists to satisfy one sentence — "no number is displayed
+/// that was not measured on the machine displaying it" — so it refuses rather
+/// than reports in the two cases where it could not honour that: a request too
+/// small to measure (rejected by [`BenchmarkRequest::validated`]) and a model
+/// that does not run here at all (below).
+#[tauri::command]
+pub async fn m3_benchmark_run(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    request: BenchmarkRequest,
+) -> Result<M3BenchmarkResponse, String> {
+    let request = request.validated()?;
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = benchmark_with_context(&state, &request, &context).await;
+    finish(&state, &operation_id, result).await
+}
+
+/// The I/O half of the benchmark, kept out of `benchmark.rs` for the same reason
+/// `admission.rs` is pure and `engine.rs` is not: everything with a decision in
+/// it should be testable without a hub.
+async fn benchmark_with_context(
+    state: &M3CommandState,
+    request: &BenchmarkRequest,
+    context: &M3OperationContext,
+) -> Result<M3BenchmarkResponse, M3HubError> {
+    let hardware = state.hub.hardware_snapshot()?;
+    refuse_a_model_this_machine_does_not_run(state, request, context).await?;
+
+    let pid = state
+        .hub
+        .benchmark_runtime_pid(&request.runtime_id, context)
+        .await?;
+    let mut memory_notes = Vec::new();
+    let before = read_peak_mark(pid, &mut memory_notes);
+
+    let canonical = canonical_benchmark_request(request);
+    let mut samples = Vec::with_capacity(request.repeats as usize);
+    for repeat in 0..request.repeats {
+        let mut canonical = canonical.clone();
+        // A distinct id per repeat: the hub tracks an in-flight inference by
+        // request id, and reusing one would make the second repeat a duplicate.
+        canonical.request_id = format!("{}-{repeat}", canonical.request_id);
+        samples.push(
+            state
+                .hub
+                .benchmark_stream_once(&request.runtime_id, &canonical, context)
+                .await?,
+        );
+    }
+
+    let after = read_peak_mark(pid, &mut memory_notes);
+    let mut peak_memory = PeakMemory::measure(pid, before, after);
+    peak_memory.unavailable.extend(memory_notes);
+
+    let mut report = benchmark::summarize(
+        request,
+        // Genuinely unavailable rather than skipped: no runtime here reports a
+        // quantization scheme for a loaded model, and a GGUF's own
+        // `general.quantization_version` is a format version ("2"), not the
+        // scheme ("Q4_K_M") a reader would take it for. Naming the model's file
+        // is not the same as knowing how it was quantized.
+        None,
+        benchmark::WARMUP_REPEATS,
+        samples,
+        peak_memory,
+    );
+    report.unavailable.push(TraceFieldNote {
+        field: "quantization".to_string(),
+        reason: "neither this runtime's inventory nor the model's GGUF header reports a \
+                 quantization scheme, so the benchmarked triple is identified by model and \
+                 runtime only"
+            .to_string(),
+    });
+
+    Ok(M3BenchmarkResponse { report, hardware })
+}
+
+/// Refuses a model whose numbers would have been produced somewhere else.
+///
+/// The runtime inventory marks a hosted model `is_cloud`, and timing one
+/// measures a network round trip to a GPU this user does not own — the exact
+/// thing ROADMAP #2's "on the machine displaying it" clause rules out. A model
+/// the inventory does not list at all is also refused, since the alternative is
+/// a per-repeat "model not found" reported as a failed measurement.
+async fn refuse_a_model_this_machine_does_not_run(
+    state: &M3CommandState,
+    request: &BenchmarkRequest,
+    context: &M3OperationContext,
+) -> Result<(), M3HubError> {
+    let inventory = state
+        .hub
+        .runtime_inventory(&request.runtime_id, context)
+        .await?;
+    let Some(model) = inventory
+        .models
+        .iter()
+        .find(|model| model.model_id == request.model)
+    else {
+        return Err(M3HubError::NotFound(format!(
+            "runtime {} does not list model {}",
+            request.runtime_id, request.model
+        )));
+    };
+    if model.metadata.get("is_cloud").map(String::as_str) == Some("true") {
+        return Err(M3HubError::Unsupported(format!(
+            "{} runs in the cloud, so timing it would measure a network round trip and somebody \
+             else's hardware rather than this machine",
+            request.model
+        )));
+    }
+    Ok(())
+}
+
+/// Reads the runtime process's high-water mark, collecting the platform's own
+/// reason when it has none to give.
+fn read_peak_mark(pid: Option<i64>, notes: &mut Vec<TraceFieldNote>) -> Option<u64> {
+    let pid = pid?;
+    let (bytes, note) = PeakMemory::sample_mark(pid);
+    if let Some(note) = note {
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+    bytes
+}
+
+/// Builds the canonical request directly, with no protocol translation: a
+/// benchmark is not an API caller, and `temperature: 0` keeps repeats comparable
+/// rather than measuring a different sampling path each time.
+fn canonical_benchmark_request(request: &BenchmarkRequest) -> CanonicalInferenceRequest {
+    CanonicalInferenceRequest {
+        schema_version: COMPATIBILITY_SCHEMA_VERSION,
+        protocol: CompatibilityProtocol::OpenAiChatCompletions,
+        request_id: format!("benchmark-{}", trusted_now_ms()),
+        model: request.model.clone(),
+        messages: vec![CanonicalMessage {
+            role: CanonicalRole::User,
+            content: vec![CanonicalContent::Text {
+                text: request.prompt_text().to_string(),
+            }],
+        }],
+        tools: Vec::new(),
+        max_output_tokens: request.max_output_tokens,
+        temperature: Some(0.0),
+        stream: true,
+        response_schema: None,
+        metadata: serde_json::Value::Null,
+    }
 }
 
 /// Hardware Compatibility Matrix / "Driver Doctor" report. The frontend
