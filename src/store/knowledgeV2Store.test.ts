@@ -14,6 +14,7 @@ import {
   type KnowledgeConnector,
   type KnowledgeSourceV2,
 } from "./knowledgeV2Store";
+import { useStackStore, type KnowledgeStack } from "./stackStore";
 
 const source: KnowledgeSourceV2 = {
   id: "source-1",
@@ -197,6 +198,34 @@ describe("knowledgeV2Store", () => {
 
     it.each(cases)("reports connectorUsesAccountReference($usesAccountReference) for $label", ({ connector, usesAccountReference }) => {
       expect(connectorUsesAccountReference(connector.kind)).toBe(usesAccountReference);
+    });
+
+    it("leaves a stack whose staleness probe failed absent rather than calling it fresh", async () => {
+      const stack = (id: string): KnowledgeStack => ({
+        id,
+        name: id,
+        sources: [],
+        embedding: { backend: "llama", model_id_or_tag: "m", dim: 4, query_prefix: "", doc_prefix: "" },
+        chunk_chars: 800,
+        chunk_overlap: 100,
+        indexed_at: 1,
+        chunk_count: 1,
+      });
+      useStackStore.setState({ stacks: [stack("served"), stack("broken"), stack("v1-only")] });
+      invokeMock.mockImplementation((_command: string, args: { stackId: string }) => {
+        if (args.stackId === "broken") return Promise.reject(new Error("corrupt generation"));
+        return Promise.resolve(args.stackId === "served" ? "staleSources" : "notIndexed");
+      });
+
+      await useKnowledgeV2Store.getState().refreshV2Staleness();
+
+      // The panel reads "served by v2" as `!== "notIndexed"`, so a probe that
+      // threw must not land as any answer at all — reporting it fresh would claim
+      // v2 serves the stack *and* that its index is current, on no evidence.
+      expect(useKnowledgeV2Store.getState().v2Staleness).toEqual({
+        served: "staleSources",
+        "v1-only": "notIndexed",
+      });
     });
 
     it("updates a source that references a connector account without ever sending a secret", async () => {
