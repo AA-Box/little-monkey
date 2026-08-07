@@ -1342,7 +1342,10 @@ pub async fn mcp_call_tool(
         serde_json::to_string_pretty(&arguments).unwrap_or_else(|_| arguments.to_string());
     let detail = format!("{} → {}\n{}", entry.label, tool_name, pretty_args);
 
-    permissions::request_permission(
+    // The id of the decision that permitted this call, carried down to the
+    // subsystem event below so "what authorized this MCP call" is one join
+    // rather than a guess from timestamps.
+    let permission_request_id = permissions::request_permission(
         &app,
         state.inner(),
         &format!("mcp:{}:{}", server_id, tool_name),
@@ -1352,7 +1355,21 @@ pub async fn mcp_call_tool(
         None,
         None,
     )
-    .await?;
+    .await
+    .inspect_err(|_| {
+        // A refusal is an event too, and the one most worth having. Recorded
+        // here because the early return below is the only path that never
+        // reaches the append at the end.
+        record_mcp_event(
+            &app,
+            state.inner(),
+            &server_id,
+            &tool_name,
+            turn_id.as_deref(),
+            None,
+            crate::run_ledger::SubsystemOutcome::Denied,
+        );
+    })?;
 
     let timeout = Duration::from_secs(entry.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
 
@@ -1410,7 +1427,67 @@ pub async fn mcp_call_tool(
         emit_status(&app, &server_id, "error", Some(message.to_string()), None);
     }
 
+    record_mcp_event(
+        &app,
+        state.inner(),
+        &server_id,
+        &tool_name,
+        turn_id.as_deref(),
+        Some(&permission_request_id),
+        if outcome.is_ok() {
+            crate::run_ledger::SubsystemOutcome::Succeeded
+        } else {
+            crate::run_ledger::SubsystemOutcome::Failed
+        },
+    );
+
     outcome.map_err(ToolCallAttemptError::into_message)
+}
+
+/// Record one MCP tool call in the unified subsystem event stream (roadmap K12).
+///
+/// Written once, when the call has an outcome — the *authorization* is already
+/// in `permission_decisions`, written before the call ran, so a second "started"
+/// row would restate what that row proves. A call that never finishes therefore
+/// leaves an open permission and no event, which reads correctly as "authorized,
+/// never completed".
+///
+/// A write failure is logged, never propagated: failing an MCP call that already
+/// succeeded because its audit row could not be appended would turn a
+/// bookkeeping problem into a user-visible one. The permission decision — the
+/// security-relevant half — is written on the `permissions.rs` path, which does
+/// fail closed.
+fn record_mcp_event<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    server_id: &str,
+    tool_name: &str,
+    turn_id: Option<&str>,
+    permission_request_id: Option<&str>,
+    outcome: crate::run_ledger::SubsystemOutcome,
+) {
+    let recorded = (|| -> Result<(), String> {
+        let (run_id, attribution) = permissions::permission_attribution(app, state, turn_id)?;
+        let event = crate::run_ledger::SubsystemEvent {
+            event_id: format!("subsystem-{}", uuid::Uuid::new_v4().simple()),
+            subsystem: crate::run_ledger::Subsystem::Mcp,
+            action: format!("{server_id}:{tool_name}"),
+            occurred_at_ms: crate::run_commands::unix_time_ms()?,
+            run_id,
+            attribution,
+            process_id: crate::run_scope::current_process()
+                .map(|process| process.process_id().to_string()),
+            permission_request_id: permission_request_id.map(str::to_string),
+            outcome,
+            detail_json: None,
+        };
+        crate::run_commands::with_ledger(app, state, |ledger| {
+            ledger.append_subsystem_event(&event).map(|_| ())
+        })
+    })();
+    if let Err(error) = recorded {
+        eprintln!("MCP call completed but was not recorded in the event stream: {error}");
+    }
 }
 
 #[cfg(test)]
