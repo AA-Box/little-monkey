@@ -8,20 +8,28 @@
 
 use crate::compatibility_hub::{
     compatibility_conformance_manifest, encode_embeddings_response, encode_ollama_chat_response,
-    encode_response, encode_stream_event, request_offers_tool, translate_embeddings_request,
+    encode_response, encode_stream_event, translate_embeddings_request,
     translate_ollama_chat_request, ApiBackend, ApiScope, AuthorizationRequest,
     AuthorizedBackendCandidates, AuthorizedStagedRequest, AuthorizedToken,
-    BackendCandidateAuthorizationRequest, CanonicalContent, CanonicalEmbeddingRequest,
-    CanonicalEmbeddingResponse, CanonicalInferenceRequest, CanonicalInferenceResponse,
-    CanonicalMessage, CanonicalRole, CanonicalStreamEvent, CanonicalUsage,
+    BackendCandidateAuthorizationRequest, CanonicalEmbeddingRequest, CanonicalEmbeddingResponse,
+    CanonicalInferenceRequest, CanonicalInferenceResponse, CanonicalStreamEvent,
     CompatibilityConformanceManifest, CompatibilityError, CompatibilityProtocol,
     CredentialPreflightRequest, LanAccessController, LanEntropySource, LanServerPolicy,
     LanStateProtector, PairedToken, PairingChallengeView, PairingRequest, ProtocolStreamFrame,
     ScopedTokenView, SecurityAuditEvent, StagedAuthorizationRequest,
 };
+// MLX is Metal-only, so `crate::mlx_runtime` exists only in the macOS build and
+// every hub item that names one of its types is gated to match.
+#[cfg(target_os = "macos")]
 use crate::mlx_runtime::{
     MlxGenerationRequest, MlxGenerationSummary, MlxMessage, MlxOperationContext, MlxProcessMetrics,
     MlxRuntimeAdapter, MlxRuntimeStatus, MlxStreamEvent, MlxStreamSink, MlxToolDefinition,
+};
+// Reached only by the MLX driver and `canonical_message_to_mlx` outside of
+// tests, which reuse them for the non-MLX collector fixtures.
+#[cfg(any(target_os = "macos", test))]
+use crate::compatibility_hub::{
+    request_offers_tool, CanonicalContent, CanonicalMessage, CanonicalRole, CanonicalUsage,
 };
 use crate::runtime_adapter::{
     validate_setting_values, AcceleratorKind, AdvancedSettingCapability, HardwareProfile,
@@ -33,7 +41,9 @@ use reqwest::header::{
     HeaderValue, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, RANGE,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
+#[cfg(any(target_os = "macos", test))]
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1649,6 +1659,7 @@ pub enum M3RuntimeStatusView {
         status: RuntimeStatus,
         running_models: Vec<RunningModel>,
     },
+    #[cfg(target_os = "macos")]
     Mlx {
         status: MlxRuntimeStatus,
     },
@@ -1661,6 +1672,7 @@ pub enum M3RuntimeMetricsView {
         status: RuntimeStatus,
         running_models: Vec<RunningModel>,
     },
+    #[cfg(target_os = "macos")]
     Mlx {
         metrics: Option<MlxProcessMetrics>,
         status: MlxRuntimeStatus,
@@ -2050,12 +2062,14 @@ impl M3RuntimeDriver for RuntimeAdapterM3Driver {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub struct MlxM3Driver {
     runtime_id: String,
     adapter: Arc<MlxRuntimeAdapter>,
     clock: Arc<dyn M3Clock>,
 }
 
+#[cfg(target_os = "macos")]
 impl MlxM3Driver {
     pub fn new(
         runtime_id: impl Into<String>,
@@ -2109,6 +2123,7 @@ impl MlxM3Driver {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl M3RuntimeDriver for MlxM3Driver {
     fn descriptor(&self) -> M3RuntimeDescriptor {
         M3RuntimeDescriptor {
@@ -3996,6 +4011,7 @@ impl M3RuntimeHub {
                 M3RuntimeStatusView::Adapter { running_models, .. } => running_models
                     .iter()
                     .any(|running| running.model_id == model_id),
+                #[cfg(target_os = "macos")]
                 M3RuntimeStatusView::Mlx { status } => {
                     matches!(status, MlxRuntimeStatus::Running { handle, .. } if handle.model_id == model_id)
                 }
@@ -4689,6 +4705,7 @@ impl M3RuntimeHub {
             M3RuntimeStatusView::Adapter { status, .. } => {
                 status.process.as_ref().and_then(|handle| handle.os_pid)
             }
+            #[cfg(target_os = "macos")]
             M3RuntimeStatusView::Mlx { status } => match status {
                 MlxRuntimeStatus::Running { handle, .. } => handle.os_pid,
                 _ => None,
@@ -4732,6 +4749,7 @@ impl M3CanonicalStreamSink for ProtocolEncodingSink<'_> {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct MlxCanonicalSink<'a> {
     downstream: &'a mut dyn M3CanonicalStreamSink,
     response_id: String,
@@ -4743,6 +4761,7 @@ struct MlxCanonicalSink<'a> {
     completed: bool,
 }
 
+#[cfg(target_os = "macos")]
 impl<'a> MlxCanonicalSink<'a> {
     fn new(downstream: &'a mut dyn M3CanonicalStreamSink, response_id: String) -> Self {
         Self {
@@ -4792,6 +4811,7 @@ impl<'a> MlxCanonicalSink<'a> {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl MlxStreamSink for MlxCanonicalSink<'_> {
     fn emit(&mut self, event: MlxStreamEvent) -> Result<(), String> {
         match event {
@@ -4884,6 +4904,7 @@ impl MlxStreamSink for MlxCanonicalSink<'_> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Default)]
 struct CanonicalCollector {
     response_id: Option<String>,
@@ -4896,6 +4917,7 @@ struct CanonicalCollector {
     error: Option<String>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct CanonicalToolAccumulator {
     call_id: String,
     name: String,
@@ -4903,6 +4925,7 @@ struct CanonicalToolAccumulator {
     ended: bool,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl M3CanonicalStreamSink for CanonicalCollector {
     fn emit(&mut self, event: CanonicalStreamEvent) -> Result<(), String> {
         match event {
@@ -4996,6 +5019,7 @@ impl M3CanonicalStreamSink for CanonicalCollector {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl CanonicalCollector {
     fn into_response(
         self,
@@ -5076,6 +5100,7 @@ impl CanonicalCollector {
 /// directly (not mocked) to validate the MLX driver's tool-call round-trip
 /// alongside the OpenAI-compatible Ollama/llama.cpp path, and its own vision
 /// fixture (ROADMAP item 12's prior art) exercises the same function.
+#[cfg(target_os = "macos")]
 pub(crate) fn canonical_message_to_mlx(message: &CanonicalMessage) -> M3HubResult<MlxMessage> {
     let role = match message.role {
         CanonicalRole::System => "system",
@@ -6275,6 +6300,7 @@ fn canonical_json<T: Serialize + ?Sized>(value: &T) -> M3HubResult<Vec<u8>> {
     Ok(serde_json::to_vec(&value)?)
 }
 
+#[cfg(target_os = "macos")]
 fn canonical_json_string<T: Serialize + ?Sized>(value: &T) -> M3HubResult<String> {
     String::from_utf8(canonical_json(value)?)
         .map_err(|error| invalid("json", format!("canonical JSON is not UTF-8: {error}")))
@@ -6334,10 +6360,12 @@ fn runtime_error(error: crate::runtime_adapter::RuntimeAdapterError) -> M3HubErr
     M3HubError::Runtime(error.to_string())
 }
 
+#[cfg(target_os = "macos")]
 fn mlx_error(error: crate::mlx_runtime::MlxError) -> M3HubError {
     M3HubError::Runtime(error.to_string())
 }
 
+#[cfg(target_os = "macos")]
 fn stream_sink_error(message: String) -> M3HubError {
     M3HubError::Runtime(format!("stream sink: {message}"))
 }
@@ -6398,6 +6426,22 @@ const MAX_COMPONENT_VERSIONS_KEPT: usize = 3;
 const MAX_INSTALLED_COMPONENTS: usize = 512;
 const MAX_COMPONENT_SOURCES: usize = 64;
 const MAX_COMPATIBILITY_NOTE_BYTES: usize = 4 * 1024;
+
+/// Whether this build can do anything with a component of that kind.
+///
+/// A component feed is platform-agnostic — it lists every kind the project
+/// publishes. Offering one this binary has no code for would be a download
+/// button whose install step cannot exist: the MLX unpack-and-verify command is
+/// compiled into the macOS build only, so a Windows or Linux user clicking
+/// Install on `mlx_runtime` would fetch an archive and then hit a missing
+/// command. Filtered at `list_registry`, the one place every listing path goes
+/// through, rather than in each caller.
+pub(crate) fn component_kind_runs_here(kind: M3ComponentKind) -> bool {
+    match kind {
+        M3ComponentKind::MlxRuntime => cfg!(target_os = "macos"),
+        _ => true,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -6783,6 +6827,9 @@ impl M3ComponentHub {
             }
             for entry in listed {
                 entry.validate()?;
+                if !component_kind_runs_here(entry.kind) {
+                    continue;
+                }
                 if entry.source_id != source.source_id() {
                     return Err(invalid(
                         "component.sourceId",
@@ -7905,6 +7952,7 @@ mod tests {
     /// process would emit, one JSON object per line) run through
     /// `MlxCanonicalSink` and land in a `CanonicalCollector`, mirroring what
     /// `MlxRuntimeAdapter::stream`/`complete` do in production.
+    #[cfg(target_os = "macos")]
     fn run_mlx_pipeline(
         request: &CanonicalInferenceRequest,
         events: Vec<MlxStreamEvent>,
@@ -7919,6 +7967,7 @@ mod tests {
         collector.into_response(request, 0)
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn mlx_pipeline_reconstructs_brace_in_string_arguments() {
         let request = request_with_tools(&["search"]);
@@ -7956,6 +8005,7 @@ mod tests {
         assert_eq!(response.finish_reason, "tool_use");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn mlx_pipeline_rejects_duplicate_tool_call_id() {
         let request = request_with_tools(&["search"]);
@@ -7978,6 +8028,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn mlx_pipeline_rejects_arguments_before_start() {
         let request = request_with_tools(&["search"]);
@@ -7991,6 +8042,7 @@ mod tests {
         assert!(matches!(result, Err(M3HubError::Runtime(_))));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn mlx_pipeline_rejects_end_for_unknown_tool_call() {
         let request = request_with_tools(&["search"]);
@@ -8006,6 +8058,7 @@ mod tests {
     /// The MLX sidecar process crashing or its stream being cut mid-call
     /// (started, never ended) must not silently complete as if nothing
     /// happened.
+    #[cfg(target_os = "macos")]
     #[test]
     fn mlx_pipeline_rejects_completed_with_unfinished_tool_call() {
         let request = request_with_tools(&["search"]);
@@ -8032,6 +8085,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn mlx_pipeline_rejects_tool_call_naming_an_unoffered_tool() {
         let request = request_with_tools(&["weather"]);
@@ -8412,5 +8466,35 @@ mod tests {
             with_draft.draft_model_candidates[0].model_id,
             draft.model_id
         );
+    }
+
+    /// The component feed is platform-agnostic, so this is what keeps a build
+    /// from offering an install whose second half it does not carry. Asserted
+    /// against the real `cfg!` rather than a fixture so it fails on whichever
+    /// platform drifts: on macOS `mlx_runtime` must stay offered, and on Windows
+    /// and Linux it must not, since `m3_mlx_install_component` is compiled only
+    /// into the macOS build.
+    #[test]
+    fn only_macos_is_offered_an_mlx_runtime_component() {
+        assert_eq!(
+            component_kind_runs_here(M3ComponentKind::MlxRuntime),
+            cfg!(target_os = "macos"),
+            "an MLX component may only be offered where the MLX installer exists"
+        );
+        for kind in [
+            M3ComponentKind::LlamaCppServer,
+            M3ComponentKind::Tokenizer,
+            M3ComponentKind::Converter,
+            M3ComponentKind::ProjectorRuntime,
+            M3ComponentKind::MetalSupport,
+            M3ComponentKind::CudaSupport,
+            M3ComponentKind::RocmSupport,
+            M3ComponentKind::VulkanSupport,
+        ] {
+            assert!(
+                component_kind_runs_here(kind),
+                "{kind:?} is not platform-gated and must stay offered everywhere"
+            );
+        }
     }
 }
