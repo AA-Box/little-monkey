@@ -179,6 +179,13 @@ rustls = "0.23.41"
 flate2 = "1.1.9"
 quick-xml = "0.41.0"
 crc32fast = "1.5.0"
+# tar 0.4.46 is already locked and compiled through tauri-plugin-updater, which
+# unpacks macOS update archives with it. Making it direct lets mlx_runtime.rs
+# unpack the MLX service package the component hub downloads, without adding a
+# crate to the graph. Entries are read as data only: the extractor takes bytes
+# and a validated relative path from each header and applies its own modes, so
+# no permission, symlink, or device entry in an archive is ever honored.
+tar = "0.4.46"
 # stacks.rs (RAG design doc, slice 4): pure-Rust PDF text extraction for
 # Knowledge Stacks sources. `optional = true` + the `pdf-extraction` feature
 # below (default-on) so PDF support is a build-time toggle, not a hard
