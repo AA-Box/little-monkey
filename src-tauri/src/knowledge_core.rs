@@ -27,9 +27,17 @@
 //! What is deliberately NOT here: everything that is an artefact of v1's
 //! *index format* rather than of the registry — `chunks.jsonl`/`vectors.bin`
 //! I/O, the character-boundary chunker, brute-force dot-product ranking, the
-//! incremental-reindex planner, the staleness check, the `LoadedStack` cache.
-//! Those stay in `stacks.rs` and die with it. v2 has its own equivalents in
+//! incremental-reindex planner, the `LoadedStack` cache. Those stay in
+//! `stacks.rs` and die with it. v2 has its own equivalents in
 //! `knowledge_pipeline.rs` and never called v1's.
+//!
+//! The one later addition is the local-source staleness walk at the bottom of
+//! this file ([`source_has_newer_mtime`]). It arrived here rather than staying
+//! in `stacks.rs` because v2 grew a staleness probe of its own
+//! (`knowledge_service::v2_staleness_impl`) and "has a local file changed since
+//! we indexed?" is a question about the *registry's* sources, not about either
+//! index format — two implementations of it would have drifted on exactly the
+//! extension/size exclusions that keep the badge from lying.
 //!
 //! This module is Tauri-*light*, not Tauri-free: [`stacks_base_dir`] resolves
 //! the app-data path from an `AppHandle` exactly as it did in `stacks.rs`, and
@@ -630,6 +638,118 @@ pub async fn embed_batch(
     }
 
     Ok(out)
+}
+
+// ---------------------------------------------------------------------
+// Local-source staleness probe
+// ---------------------------------------------------------------------
+
+/// Files larger than this are skipped during indexing (silently, like a
+/// binary file) — a single huge log/data file shouldn't dominate a stack's
+/// chunk budget or indexing time.
+pub(crate) const MAX_FILE_BYTES: u64 = 5_000_000;
+
+/// Extension allowlist for indexable files — text formats plus common code
+/// files. Matched case-insensitively.
+const ALLOWED_EXTENSIONS: &[&str] = &[
+    "md", "markdown", "txt", "rst", "json", "yaml", "yml", "toml", "csv", "html", "htm", "rs",
+    "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "cc", "h", "hpp", "cs", "rb", "php",
+    "swift", "kt", "sh", "sql",
+];
+
+/// True for an extension v1's `read_indexable_file` would ever actually read
+/// (`.pdf` when the `pdf-extraction` feature is compiled in, or anything in
+/// [`ALLOWED_EXTENSIONS`]) — factored out so [`source_has_newer_mtime`] can
+/// apply the exact same extension gate without duplicating (and risking
+/// drifting from) `read_indexable_file`'s own check.
+pub(crate) fn is_indexable_extension(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext = ext.to_lowercase();
+
+    #[cfg(feature = "pdf-extraction")]
+    if ext == "pdf" {
+        return true;
+    }
+
+    ALLOWED_EXTENSIONS.contains(&ext.as_str())
+}
+
+pub(crate) fn mtime_ms(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
+/// True if `path` itself (a file source) or any file reachable under it (a
+/// folder source, walked the same way `collect_source_files` does) has an
+/// mtime after `indexed_at_ms`.
+///
+/// Shared by both index generations: v1's `stacks::is_stale_impl` (per stack,
+/// against `KnowledgeStack::indexed_at`) and v2's
+/// `knowledge_service::v2_staleness_impl` (per local connector, against the
+/// active generation's `created_unix_ms`). It is `stat`-only on purpose —
+/// both callers fan it out across every indexed stack on panel mount, so it
+/// must never read file contents or touch the network.
+pub(crate) fn source_has_newer_mtime(path: &Path, indexed_at_ms: u64) -> bool {
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return true,
+    };
+
+    if !metadata.is_dir() {
+        return mtime_ms(&metadata)
+            .map(|mtime| mtime > indexed_at_ms)
+            .unwrap_or(true);
+    }
+
+    let walker = walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() > 0 && entry.file_type().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    return !crate::tools::MENTION_SKIP_DIRS.contains(&name);
+                }
+            }
+            true
+        });
+    for entry in walker {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        // Match `collect_source_files`/`read_indexable_file`'s own
+        // extension-allowlist and size-cap gates — a touched file that
+        // indexing would never actually look at (wrong extension, an
+        // oversized log file, etc.) must not flip the stale badge, or
+        // reindexing would be "recommended" for a change that produces zero
+        // new/changed chunks. Skipped here on metadata alone (no content
+        // read), so this stays a cheap `stat`-only check like the rest of
+        // this function; the binary-content-sniff/UTF-8-validity gates
+        // `read_indexable_file` also applies aren't replicated since those
+        // require reading the file, which this check deliberately doesn't do.
+        if !is_indexable_extension(entry.path()) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.len() == 0 || metadata.len() > MAX_FILE_BYTES {
+            continue;
+        }
+        if mtime_ms(&metadata)
+            .map(|mtime| mtime > indexed_at_ms)
+            .unwrap_or(true)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
