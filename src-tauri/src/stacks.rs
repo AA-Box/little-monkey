@@ -75,8 +75,8 @@ pub use crate::knowledge_core::{
     StackQueryResult, StackSource,
 };
 use crate::knowledge_core::{
-    load_registry, now_ms, save_registry, spec_matches, stacks_base_dir, validate_id,
-    EMBED_BATCH_SIZE,
+    is_indexable_extension, load_registry, now_ms, save_registry, source_has_newer_mtime,
+    spec_matches, stacks_base_dir, validate_id, EMBED_BATCH_SIZE, MAX_FILE_BYTES,
 };
 
 /// Hard cap on chunks a single stack may produce. Brute-force dot-product
@@ -85,19 +85,6 @@ use crate::knowledge_core::{
 /// `vectors.bin` size with no feedback until it's too late — failing fast
 /// with a clear message is better than a multi-hour silent index.
 const MAX_CHUNKS_PER_STACK: usize = 50_000;
-
-/// Files larger than this are skipped during indexing (silently, like a
-/// binary file) — a single huge log/data file shouldn't dominate a stack's
-/// chunk budget or indexing time.
-const MAX_FILE_BYTES: u64 = 5_000_000;
-
-/// Extension allowlist for indexable files — text formats plus common code
-/// files. Matched case-insensitively.
-const ALLOWED_EXTENSIONS: &[&str] = &[
-    "md", "markdown", "txt", "rst", "json", "yaml", "yml", "toml", "csv", "html", "htm", "rs",
-    "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "cc", "h", "hpp", "cs", "rb", "php",
-    "swift", "kt", "sh", "sql",
-];
 
 /// Default number of results `stacks_query` returns when the caller doesn't
 /// specify `k`.
@@ -422,25 +409,6 @@ fn read_indexable_pdf(path: &Path) -> Option<(String, String)> {
         return None;
     }
     Some((path.to_string_lossy().to_string(), text))
-}
-
-/// True for an extension `read_indexable_file` would ever actually read
-/// (`.pdf` when the `pdf-extraction` feature is compiled in, or anything in
-/// [`ALLOWED_EXTENSIONS`]) — factored out so [`source_has_newer_mtime`] can
-/// apply the exact same extension gate without duplicating (and risking
-/// drifting from) `read_indexable_file`'s own check.
-fn is_indexable_extension(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
-    let ext = ext.to_lowercase();
-
-    #[cfg(feature = "pdf-extraction")]
-    if ext == "pdf" {
-        return true;
-    }
-
-    ALLOWED_EXTENSIONS.contains(&ext.as_str())
 }
 
 /// Reads `path` as an indexable file, or returns `None` if it should be
@@ -1372,6 +1340,12 @@ fn merge_stack_results(
 
 // ---------------------------------------------------------------------
 // Staleness check
+//
+// The mtime walk itself now lives in `knowledge_core` (imported above), shared
+// with the Knowledge 2.0 probe (`knowledge_service::v2_staleness_impl`) so both
+// generations answer "did a local source change?" with one implementation
+// during the overlap. What stays here is v1's own framing of the question: per
+// stack, against `KnowledgeStack::indexed_at`.
 // ---------------------------------------------------------------------
 
 /// True if any of `stack`'s source files has a filesystem mtime newer than
@@ -1387,75 +1361,6 @@ fn is_stale_impl(stack: &KnowledgeStack) -> bool {
         .sources
         .iter()
         .any(|source| source_has_newer_mtime(Path::new(&source.path), indexed_at))
-}
-
-fn mtime_ms(metadata: &std::fs::Metadata) -> Option<u64> {
-    metadata
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_millis() as u64)
-}
-
-/// True if `path` itself (a file source) or any file reachable under it (a
-/// folder source, walked the same way `collect_source_files` does) has an
-/// mtime after `indexed_at_ms`.
-fn source_has_newer_mtime(path: &Path, indexed_at_ms: u64) -> bool {
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return true,
-    };
-
-    if !metadata.is_dir() {
-        return mtime_ms(&metadata)
-            .map(|mtime| mtime > indexed_at_ms)
-            .unwrap_or(true);
-    }
-
-    let walker = WalkDir::new(path)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            if entry.depth() > 0 && entry.file_type().is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    return !crate::tools::MENTION_SKIP_DIRS.contains(&name);
-                }
-            }
-            true
-        });
-    for entry in walker {
-        let Ok(entry) = entry else { continue };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        // Match `collect_source_files`/`read_indexable_file`'s own
-        // extension-allowlist and size-cap gates — a touched file that
-        // indexing would never actually look at (wrong extension, an
-        // oversized log file, etc.) must not flip the stale badge, or
-        // reindexing would be "recommended" for a change that produces zero
-        // new/changed chunks. Skipped here on metadata alone (no content
-        // read), so this stays a cheap `stat`-only check like the rest of
-        // this function; the binary-content-sniff/UTF-8-validity gates
-        // `read_indexable_file` also applies aren't replicated since those
-        // require reading the file, which this check deliberately doesn't do.
-        if !is_indexable_extension(entry.path()) {
-            continue;
-        }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if metadata.len() == 0 || metadata.len() > MAX_FILE_BYTES {
-            continue;
-        }
-        if mtime_ms(&metadata)
-            .map(|mtime| mtime > indexed_at_ms)
-            .unwrap_or(true)
-        {
-            return true;
-        }
-    }
-    false
 }
 
 // ---------------------------------------------------------------------
