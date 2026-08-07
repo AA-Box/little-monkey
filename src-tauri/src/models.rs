@@ -58,8 +58,10 @@ pub struct ModelInfo {
 }
 
 /// The curated registry: a small, hand-picked set of instruct models known
-/// to work well with llama.cpp's OpenAI-compatible tool calling.
-fn curated_models() -> Vec<ModelInfo> {
+/// to work well with llama.cpp's OpenAI-compatible tool calling. `pub` so
+/// monkey-cli's launcher can offer the same "Recommended" list the desktop
+/// app's model tab shows, rather than keeping a second copy of it.
+pub fn curated_models() -> Vec<ModelInfo> {
     vec![
         ModelInfo {
             id: "qwen2.5-7b".to_string(),

@@ -190,7 +190,10 @@ pub mod connectors;
 // draft-only reply/comment/status-update generation. Every write goes through
 // `permissions::request_permission`, same as every other mutating tool.
 pub mod model_sources;
-mod models;
+// `pub` for `curated_models()` alone — monkey-cli's launcher offers the same
+// curated recommendations the desktop model tab does. Everything else in here
+// is Tauri commands the CLI can't call anyway.
+pub mod models;
 pub mod ollama;
 mod process_lock;
 pub mod providers;
