@@ -2538,6 +2538,100 @@ allowlist would need a context-propagation layer this app does not have. That la
 now **D3**, its own item, because K6's per-process resource ledger turns out to need
 the same thing — two dependents make it a prerequisite rather than a footnote here.
 
+*Superseded by the entry below.* D3 shipped that layer — `run_scope.rs` is a real
+`tokio::task_local!` and `egress::send` is a real choke point — so the premise of this
+correction ("a run id can only reach an egress site as an explicit parameter") no
+longer holds. What stays true is every *other* observation in it, and each is now a
+documented limit of the allowlist rather than a reason not to build one:
+`browser_worker.rs` still makes its own subresource decisions outside `send`, `mcp.rs`
+still shares one transport across runs, and run-less egress is still permitted rather
+than refused.
+
+**Shipped — the run's own host/port/protocol allowlist, frozen at submission and
+enforced where every request converges.** `PermissionPolicySnapshot` carries an
+`Option<EgressAllowlist>`; `egress::send` reads the ambient run from `run_scope`,
+loads that run's frozen list and refuses a host, port or protocol it does not name.
+
+- **Absent, empty and present are three states, and that distinction is the whole
+  safety property.** *Absent* is what every run row already on disk says, and it means
+  today's behaviour — `allow_network` alone governs. Reading those rows as deny-all
+  would have refused every existing and in-flight run. *Present and empty* is a
+  declaration that permits nothing, so a submitter has a way to say "this run sends
+  nothing" that is not spelled the same way as saying nothing. *Present and populated*
+  is deny-by-default within it, on all three dimensions conjunctively. Making a
+  declaration mandatory is a later release's job — the staged shape D1 used for token
+  families — because the alternative is rewriting frozen specs, and they are frozen for
+  a reason.
+- **`serde(default)` is only half of the compatibility property; `skip_serializing_if`
+  is the other half.** `run_ledger` compares the serialized spec byte-for-byte to
+  decide whether a resubmission is the same run, so emitting `"egress_allowlist":null`
+  would have turned every idempotent resubmit of an existing run into a conflict. The
+  test that pins this is a **verbatim JSON string**, not a `json!` fixture: a fixture
+  built from this build's own idea of the shape would keep passing after a change that
+  broke every stored row.
+- **A wildcard host entry matches at a label boundary or not at all.**
+  `*.example.com` covers `api.example.com`, does not cover `example.com` (the apex is
+  named in its own right), and does not cover `evil-example.com` — the classic
+  `ends_with` bypass, which `http_route_registry`'s `ExactOrDescendant` already had the
+  shape for.
+- **Fail-closed and fail-open are split deliberately, and the split is per absence.**
+  No run in scope, or a run whose spec declares nothing, behaves exactly as before —
+  scheduled knowledge refresh, connector verification and model downloads legitimately
+  have no run, and refusing them would be the clause disabling features rather than
+  protecting anything. A run whose frozen policy **cannot be read** is refused: the
+  spec lives in the same ledger the run appends its events to, so a run that cannot
+  read its own spec cannot record anything either, and refusing its egress is a symptom
+  of that failure rather than a new one. A run id the ledger has never heard of is
+  *permitted*, because `browser_worker` and `m4_runtime` both scope work under ids that
+  are not ledger runs.
+- **No ledger read on the hot path.** The frozen spec is immutable — written once, no
+  update path — so it is cached per run behind the same process-wide-install pattern
+  `denial_sink` uses, bounded at 256 runs and cleared wholesale at the bound. Dropping
+  a cache entry costs one re-read and cannot widen a policy. Loopback is checked
+  *before* the read, so a local-inference run never reads a row to be told what it may
+  do on its own machine.
+- **The refusal is a `reqwest::Error` carrying the denial, and that took a trick worth
+  writing down.** `reqwest::Error` has no public constructor, so a refusal reaches the
+  caller the one way reqwest will carry someone else's error: a throwaway request
+  through a `dns_resolver` that refuses, aimed at a reserved `.invalid` name with
+  `.no_proxy()` set. Nothing leaves the process, and the rule survives to the far side
+  as itself rather than as a sentence — same property the redirect policy's refusals
+  already had.
+- **The check runs on the redirect hop too**, and not out of symmetry: `hardened`'s
+  policy deliberately follows an `http` → `https` upgrade on the same authority, and
+  that changes the effective port from 80 to 443, so a hop can otherwise reach a
+  protocol and a port the original request never asked for.
+
+**Shipped — DNS answers are pinned for the run's lifetime.** `hardened()` now installs
+a resolver that resolves an allowed name once per run and returns the same addresses
+afterwards, so the address the connection uses is the address the check passed.
+
+- **Check-equals-connect, not check-then-cache.** The pin *is* the answer reqwest
+  connects to, not a value compared against a later lookup, so there is no second
+  resolution left for a rebinding attacker to race. Proven by a test that makes two
+  real connections through a resolver which answers with a live fixture once and with
+  `240.0.0.1` every time after: the second request reaches the fixture, the fixture
+  accepted two connections, and the counter-test with no run in scope shows the same
+  rebind being followed. Sabotage-verified in both directions — deleting the pin lookup
+  fails with `tcp connect error, 240.0.0.1`.
+- **A pin binds an address, not an endpoint.** reqwest replaces a resolved address's
+  port with the URL's own (its `Resolve` doc says so), which is also why the rebinding
+  test has to move the *address* rather than the port.
+- **The cost is real and is the point.** A long run against a rotating CDN keeps the
+  address it first saw; if that address is withdrawn mid-run the run's requests fail
+  rather than following the rotation, and the fix is a new run, since nothing outlives
+  one. Two further honest limits: a **pooled** connection is not re-resolved at all, so
+  a request reusing another run's connection travels to that run's pin (both runs had
+  to allow the same host, and the address was a pinned answer for it either way); and
+  the pin table is bounded at 512 and cleared wholesale, so a dropped pin reopens the
+  window for that name until it is re-pinned.
+- **Four new rule codes and no migration.** `egress.run-host-not-allowlisted`,
+  `egress.run-port-not-allowlisted`, `egress.run-protocol-not-allowlisted` and
+  `egress.run-policy-unavailable` are new *data* in `denial_sink`'s existing
+  `rule_code` column, not a new fact about a denial — the ladder is for the latter,
+  which is what V2's `unattributed_reason` was. A column per rule family would buy
+  nothing and cost the one-way-door problem that file exists to avoid.
+
 **Shipped — every blocked attempt is written down with the rule that blocked it.**
 `denial_sink.rs` is an append-only store in its **own database file**
 (`egress-denials-v1.sqlite3`), written at the raise site by all four guards.

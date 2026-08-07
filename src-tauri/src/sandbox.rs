@@ -1067,6 +1067,7 @@ fn build_sandbox_run_spec(
             tool_rules: Vec::new(),
             allow_network: request.allow_network,
             allow_external_mutations: false,
+            egress_allowlist: None,
         },
         budgets: RunBudgets {
             wall_time_ms: request.timeout().as_millis() as u64,

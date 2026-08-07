@@ -41,6 +41,17 @@
 //! daemon store is already a second database with its own schema, so neither the
 //! extra file nor the convention is new.
 //!
+//! # Why a new refusal kind needs no migration
+//!
+//! Worth stating, because the instinct on being handed four new rules — K5's per-run
+//! allowlist added `egress.run-host-not-allowlisted` and three siblings — is to reach
+//! for the ladder at [`SINK_MIGRATIONS`]. It is the wrong instinct here. `rule_code`
+//! is `TEXT` and the rule *codes* are the vocabulary, so a new rule is new data in an
+//! existing column, not a new shape. The ladder is for a new **fact** about a
+//! denial, which is what V2 added (`unattributed_reason` — a thing the row could not
+//! previously express at all). A column per rule family, or a table per guard, would
+//! buy nothing and cost the one-way-door problem this file exists to avoid.
+//!
 //! # Why recording is fail-soft
 //!
 //! A denial is written down *after* the refusal has already happened. If this
@@ -326,7 +337,9 @@ fn slot() -> &'static Mutex<Option<DenialSink>> {
     SINK.get_or_init(|| Mutex::new(None))
 }
 
-/// Serializes the tests that install a sink, wherever in the crate they live.
+/// Serializes the tests that install a sink — or `egress`'s per-run policy source,
+/// which is a process-wide slot with the same hazard — wherever in the crate they
+/// live.
 ///
 /// Necessary because [`install`] replaces a **process-wide** slot: two tests
 /// running concurrently, each installing its own file-backed sink and then reading
@@ -804,6 +817,44 @@ mod tests {
             .find(|row| row.detail.as_deref() == Some("explicit-wins"))
             .expect("row recorded");
         assert_eq!(row.run_id.as_deref(), Some("run:explicit"));
+    }
+
+    /// K5's fourth clause for its newest guard: a per-run allowlist refusal is a
+    /// row, with the rule that blocked it and the run it belonged to.
+    ///
+    /// Driven through `egress::check_run_allowlist` rather than by handing [`record`]
+    /// a row, because the claim is about the *guard* reaching the sink — the rule code
+    /// and the run id are both things nothing on that path is handed explicitly.
+    #[test]
+    fn a_per_run_allowlist_refusal_is_recorded_with_its_rule_and_its_run() {
+        let _guard = test_lock();
+        install(DenialSink::open_in_memory().expect("sink opens"));
+        crate::egress::install_run_policy_source(|_| {
+            crate::egress::RunEgressPolicy::Declared(std::sync::Arc::new(
+                crate::run_protocol::EgressAllowlist::default(),
+            ))
+        });
+
+        let url = url::Url::parse("https://api.example.com/v1").expect("parses");
+        let denial = run_scope::scoped_sync(RunScope::run("run:sink"), || {
+            crate::egress::check_run_allowlist(&url).expect_err("deny-all refuses this")
+        });
+        assert_eq!(denial.rule(), EgressRule::RunHostNotAllowlisted);
+
+        let rows = slot()
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|sink| sink.recent(8).expect("reads")))
+            .expect("a sink is installed");
+        let row = rows
+            .iter()
+            .find(|row| row.rule_code == "egress.run-host-not-allowlisted")
+            .expect("the refusal was written down");
+        assert_eq!(row.guard, "egress.run-allowlist");
+        assert_eq!(row.run_id.as_deref(), Some("run:sink"));
+        assert_eq!(row.unattributed_reason, None);
+
+        crate::egress::clear_run_policy_source();
     }
 
     /// Recording with nothing installed must be a no-op and not a panic: every
