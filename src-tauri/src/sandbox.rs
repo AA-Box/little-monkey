@@ -2157,7 +2157,11 @@ mod tests {
     #[tokio::test]
     async fn seccomp_denies_a_real_connection_when_network_is_not_allowed() {
         if !Path::new("/bin/bash").is_file() {
-            eprintln!("skipping Linux network test: /bin/bash is unavailable");
+            skip_locally_but_fail_in_ci(
+                "bash",
+                "/bin/bash is unavailable, and its `/dev/tcp` is what opens the \
+                 socket this filter has to deny",
+            );
             return;
         }
         assert_loopback_is_reachable_only_when_network_is_allowed("seccomp", |port| {
@@ -2337,7 +2341,11 @@ mod tests {
     #[tokio::test]
     async fn sandbox_exec_cannot_read_or_write_real_workspace_with_or_without_network() {
         if !Path::new(SANDBOX_EXEC).is_file() {
-            eprintln!("skipping Seatbelt integration test: sandbox-exec is unavailable");
+            skip_locally_but_fail_in_ci(
+                "Seatbelt",
+                "sandbox-exec is unavailable, and it is the only thing enforcing \
+                 confinement on this platform",
+            );
             return;
         }
         assert_real_workspace_stays_out_of_reach("seatbelt").await;
@@ -2345,19 +2353,40 @@ mod tests {
 
     /// The Linux arm of the same test.
     ///
-    /// Skips rather than fails when the kernel cannot enforce Landlock — a CI
-    /// runner on a kernel built without it, or a container whose own policy
-    /// blocks the syscall, is not a regression in this code. The skip prints why,
-    /// so a green run that never asserted anything cannot pass for a green run
-    /// that did.
+    /// Skips rather than fails when the kernel cannot enforce Landlock — a
+    /// developer on a kernel built without it, or a container whose own policy
+    /// blocks the syscall, is not a regression in this code. On CI it fails
+    /// instead, via `skip_locally_but_fail_in_ci`: green has to mean the
+    /// assertions ran, and a captured `println!` cannot carry that difference.
+    /// Skip locally, fail in CI — because a skip and a pass are the same colour.
+    ///
+    /// An earlier version of the two tests below claimed that printing the reason
+    /// was enough to keep "green because it asserted" distinct from "green because
+    /// it asserted nothing". That was wrong: `cargo test` captures a *passing*
+    /// test's stdout and stderr, so the print never reaches the log that anyone
+    /// reads. The distinction matters more here than anywhere else in this file,
+    /// since the thing that would quietly stop being tested is a security
+    /// boundary — so on CI the absence of the mechanism is a failure. A runner
+    /// image that stops shipping Landlock must turn this red rather than silently
+    /// stop enforcing it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn skip_locally_but_fail_in_ci(mechanism: &str, reason: &str) {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{mechanism} is unavailable on this CI runner, so the isolation it \
+             enforces went untested: {reason}"
+        );
+        eprintln!("skipping {mechanism} integration test: {reason}");
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn landlock_cannot_read_or_write_real_workspace_with_or_without_network() {
         if !crate::sandbox_linux::landlock_is_enforceable() {
-            eprintln!(
-                "skipping Landlock integration test: this kernel cannot enforce the \
-                 Landlock ABI v1 baseline (not built in, disabled at boot, or the \
-                 syscall is blocked by an outer sandbox)"
+            skip_locally_but_fail_in_ci(
+                "Landlock",
+                "this kernel cannot enforce the Landlock ABI v1 baseline (not built \
+                 in, disabled at boot, or the syscall is blocked by an outer sandbox)",
             );
             return;
         }
