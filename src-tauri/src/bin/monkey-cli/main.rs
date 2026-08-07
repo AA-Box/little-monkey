@@ -956,6 +956,35 @@ fn compose_system_prompt(state: &AppState, user_system: Option<&str>) -> Option<
 /// directory" before it finds its footing. Not gated on `--no-rules`: that
 /// flag means "skip MONKEY.md rules and remembered facts", not "hide which
 /// folder you're in".
+/// A workspace root as it should be *said* to a model, which on Windows is not
+/// how it is stored.
+///
+/// `workspace::all_roots` canonicalizes, deliberately — every path comparison in
+/// the crate depends on one exact form. But `std::fs::canonicalize` on Windows
+/// returns a *verbatim* path (`\\?\C:\...`), and that form is correct to compare
+/// and wrong to hand to a model: this string is presented as "the working
+/// directory for run_shell", so the model will paste it into a shell command, and
+/// plenty of Windows tooling — `cmd.exe` builtins among them — mishandles a `\\?\`
+/// prefix. `\\?\UNC\server\share` denormalizes back to `\\server\share` for the
+/// same reason.
+///
+/// Display only. The canonical `PathBuf` every other caller of `all_roots` holds
+/// (`rules.rs` finding MONKEY.md, `tools.rs` resolving tool paths) is untouched,
+/// because those want the exact form and would break without it.
+fn root_for_prompt(path: &Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    text
+}
+
 fn workspace_section(state: &AppState) -> String {
     let Ok(roots) = workspace::all_roots(state) else {
         return "No workspace folder is open. File and shell tools will fail until one is — say so instead of retrying.".to_string();
@@ -965,12 +994,12 @@ fn workspace_section(state: &AppState) -> String {
         if *is_primary {
             lines.push(format!(
                 "The primary workspace folder is \"{}\". It is the working directory for run_shell and the root every tool path resolves against — never cd elsewhere to look for the project.",
-                path.display()
+                root_for_prompt(path)
             ));
         } else {
             lines.push(format!(
                 "Additional attached folder \"{label}\" ({}); address its paths by prefixing them with the label.",
-                path.display()
+                root_for_prompt(path)
             ));
         }
     }
@@ -1634,13 +1663,35 @@ mod tests {
         // Present even with --no-rules: that flag hides MONKEY.md/facts, not
         // which folder the agent is standing in.
         let no_rules = Cli::try_parse_from(["monkey", "--no-rules", "llama3.2", "hi"]).unwrap();
+        // Against the canonicalized root, the way the sibling tests below already
+        // do it: `all_roots` canonicalizes, so comparing with the raw `TempDir`
+        // path only ever passed by luck. On Windows it stopped passing outright,
+        // because canonicalization there also adds a `\\?\` prefix.
+        let expected = root_for_prompt(&ws.path.canonicalize().unwrap());
         for cli in [&cli, &no_rules] {
             let prompt = effective_system(cli, &state, None).expect("workspace section");
-            assert!(
-                prompt.contains(&ws.path.to_string_lossy().to_string()),
-                "{prompt}"
-            );
+            assert!(prompt.contains(&expected), "{prompt}");
         }
+    }
+
+    /// A verbatim prefix must never reach the prompt, because the model is told
+    /// this path is where `run_shell` runs and will paste it into a command.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_workspace_root_is_named_without_its_verbatim_prefix() {
+        assert_eq!(
+            root_for_prompt(Path::new(r"\\?\C:\Users\dev\project")),
+            r"C:\Users\dev\project"
+        );
+        assert_eq!(
+            root_for_prompt(Path::new(r"\\?\UNC\server\share\project")),
+            r"\\server\share\project"
+        );
+        // An already-plain path is left exactly as it is.
+        assert_eq!(
+            root_for_prompt(Path::new(r"C:\Users\dev\project")),
+            r"C:\Users\dev\project"
+        );
     }
 
     #[test]
