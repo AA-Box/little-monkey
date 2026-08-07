@@ -2,7 +2,8 @@ use std::path::Path;
 
 use clap::Subcommand;
 use little_monkey_lib::native_skills::{NativeSkillManager, SkillSource};
-use little_monkey_lib::run_ledger::{ChainVerification, RunLedger};
+use little_monkey_lib::run_ledger::{ChainVerification, RunLedger, StoredPermissionDecision};
+use little_monkey_lib::run_protocol::PermissionDecision;
 use little_monkey_lib::security_doctor::{
     run_security_audit, FindingStatus, NativeSkillSnapshot, SecurityAuditRequest,
     SecurityRuntimeSnapshot,
@@ -32,6 +33,18 @@ pub enum SecurityCmd {
         /// The run to verify.
         run_id: String,
         /// Print the versioned machine-readable verdict.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Produce the permission decision that authorized a tool call.
+    ///
+    /// The K12 acceptance says a tool call whose authorizing decision cannot be
+    /// produced from the log is a bug, so finding nothing exits non-zero. That
+    /// is the difference between "it was allowed" and "nothing gated it".
+    PermissionTrail {
+        /// The tool call id to trace.
+        tool_call_id: String,
+        /// Print the versioned machine-readable trail.
         #[arg(long)]
         json: bool,
     },
@@ -91,17 +104,30 @@ pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> R
             }
             Ok(())
         }
-        SecurityCmd::VerifyRunChain { run_id, json } => {
-            let path = data_dir.join("profile-v1.sqlite3");
-            if !path.exists() {
-                // Read-only question: refuse rather than create a ledger as a
-                // side effect, the same way `processes_cli` does.
+        SecurityCmd::PermissionTrail { tool_call_id, json } => {
+            let ledger = open_existing_ledger(data_dir)?;
+            let trail = ledger
+                .permission_decisions_for_tool_call(tool_call_id)
+                .map_err(|error| error.to_string())?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&trail).map_err(|error| error.to_string())?
+                );
+            } else {
+                print_permission_trail(tool_call_id, &trail);
+            }
+            // "Nothing gated this call" is the bug K12's acceptance names, so it
+            // is a failure rather than an empty report.
+            if trail.is_empty() {
                 return Err(format!(
-                    "No Little Monkey ledger at {} yet — start the app or a daemon run first",
-                    path.display()
+                    "no permission decision was ever recorded for tool call {tool_call_id}"
                 ));
             }
-            let ledger = RunLedger::open(&path).map_err(|error| error.to_string())?;
+            Ok(())
+        }
+        SecurityCmd::VerifyRunChain { run_id, json } => {
+            let ledger = open_existing_ledger(data_dir)?;
             let verdict = ledger
                 .verify_run_chain(run_id)
                 .map_err(|error| error.to_string())?;
@@ -121,6 +147,67 @@ pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> R
                     Err(format!("run {run_id}'s event chain is broken"))
                 }
             }
+        }
+    }
+}
+
+/// Open the ledger for a read-only question, refusing rather than creating one
+/// as a side effect — the same way `processes_cli` does.
+fn open_existing_ledger(data_dir: &Path) -> Result<RunLedger, String> {
+    let path = data_dir.join("profile-v1.sqlite3");
+    if !path.exists() {
+        return Err(format!(
+            "No Little Monkey ledger at {} yet — start the app or a daemon run first",
+            path.display()
+        ));
+    }
+    RunLedger::open(&path).map_err(|error| error.to_string())
+}
+
+fn print_permission_trail(tool_call_id: &str, trail: &[StoredPermissionDecision]) {
+    println!(
+        "Permission trail for tool call {tool_call_id}: {} decision(s)",
+        trail.len()
+    );
+    for entry in trail {
+        let request = &entry.request;
+        println!(
+            "[{}] {} — {}",
+            match entry.decision {
+                Some(PermissionDecision::AllowOnce) => "ALLOW",
+                Some(PermissionDecision::AllowForRun) => "ALLOW-RUN",
+                Some(PermissionDecision::Deny) => "DENY",
+                Some(PermissionDecision::Expired) => "EXPIRED",
+                None => "OPEN",
+            },
+            request.tool_name,
+            request.request_id
+        );
+        println!(
+            "  attributed to: {}{}",
+            request.attribution.code(),
+            request
+                .run_id
+                .as_deref()
+                .map(|run_id| format!(" ({run_id})"))
+                .unwrap_or_default()
+        );
+        if let Some(process_id) = &request.process_id {
+            println!("  process: {process_id}");
+        }
+        println!(
+            "  mode: {}, risk: {}",
+            request.mode,
+            match (&request.risk_level, request.risk_floored) {
+                (Some(level), true) => format!("{level:?} (deterministic floor)"),
+                (Some(level), false) => format!("{level:?} (advisory)"),
+                (None, _) => "unclassified".to_string(),
+            }
+        );
+        println!("  operation: {}", request.operation_sha256);
+        match (&entry.decision, &entry.decided_by) {
+            (Some(_), Some(decided_by)) => println!("  decided by: {decided_by}"),
+            _ => println!("  still open — nothing has answered it yet"),
         }
     }
 }
@@ -245,6 +332,32 @@ mod tests {
         assert!(
             Harness::try_parse_from(["monkey", "verify-run-chain"]).is_err(),
             "the run id is required — verifying 'whichever run' is not a question"
+        );
+    }
+
+    #[test]
+    fn permission_trail_takes_a_tool_call_id_and_a_json_flag() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            command: SecurityCmd,
+        }
+
+        let parsed = Harness::try_parse_from(["monkey", "permission-trail", "tool-9", "--json"])
+            .expect("permission-trail should parse");
+        match parsed.command {
+            SecurityCmd::PermissionTrail { tool_call_id, json } => {
+                assert_eq!(tool_call_id, "tool-9");
+                assert!(json);
+            }
+            other => panic!("expected PermissionTrail, got {other:?}"),
+        }
+
+        assert!(
+            Harness::try_parse_from(["monkey", "permission-trail"]).is_err(),
+            "the tool call id is required — 'whichever call' is not a question"
         );
     }
 
