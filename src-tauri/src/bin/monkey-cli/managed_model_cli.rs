@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use little_monkey_lib::egress;
 use little_monkey_lib::model_sources::{
     self, InstalledModelReference, ModelDownloadProgress, ModelReferenceSource,
 };
@@ -306,11 +307,8 @@ async fn wait_until_healthy(
             }
         }
 
-        if let Ok(response) = client
-            .get(&health_url)
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await
+        if let Ok(response) =
+            egress::send(client.get(&health_url).timeout(Duration::from_secs(2))).await
         {
             if response.status().is_success()
                 && server_reports_alias(client, port, expected_alias).await
@@ -339,15 +337,12 @@ async fn wait_until_healthy(
 
 async fn server_reports_alias(client: &reqwest::Client, port: u16, expected_alias: &str) -> bool {
     let models_url = format!("http://{}:{port}/v1/models", Ipv4Addr::LOCALHOST);
-    let mut response = match client
-        .get(models_url)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-    {
-        Ok(response) if response.status().is_success() => response,
-        _ => return false,
-    };
+    // Chunked below rather than buffered, and metering does not change that.
+    let mut response =
+        match egress::send(client.get(models_url).timeout(Duration::from_secs(2))).await {
+            Ok(response) if response.status().is_success() => response,
+            _ => return false,
+        };
     if response
         .content_length()
         .is_some_and(|length| length > MAX_MODELS_RESPONSE_BYTES as u64)

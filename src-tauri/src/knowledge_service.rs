@@ -3199,8 +3199,7 @@ async fn fetch_connector_bytes(
     for (key, value) in headers {
         request = request.header(*key, value.as_str());
     }
-    let response = request
-        .send()
+    let response = crate::egress::send(request)
         .await
         .map_err(|error| format!("Connector request failed: {error}"))?;
     if response.status().is_redirection() {
@@ -4604,8 +4603,7 @@ async fn fetch_http(
         if let Some((username, password)) = auth {
             request = request.basic_auth(username, Some(password));
         }
-        let response = request
-            .send()
+        let response = crate::egress::send(request)
             .await
             .map_err(|error| format!("Source request failed: {error}"))?;
         if response.status().is_redirection() {

@@ -673,8 +673,7 @@ async fn generate_chat_completion_text(
     let request = crate::providers::build_chat_request(
         &client, &base_url, provider_id, &api_key, model, &messages, &[], effort,
     );
-    let response = request
-        .send()
+    let response = crate::egress::send(request)
         .await
         .map_err(|e| format!("Failed to reach {base_url}: {e}"))?;
     if !response.status().is_success() {

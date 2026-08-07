@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use little_monkey_lib::egress;
 use reqwest::{Certificate, Method, Response};
 use serde_json::Value;
 
@@ -37,20 +38,20 @@ pub async fn accept_invitation(
         "{}/v1/remote/pairings/accept",
         invitation.runner_url.trim_end_matches('/')
     );
-    let response = client
-        .post(endpoint)
-        .json(&PairAcceptRequest {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            pairing_id: invitation.pairing_id.clone(),
-            pairing_token: invitation.pairing_token.clone(),
-            device_name: device_name.to_string(),
-            // The CLI controller never down-selects: omitting the subset
-            // requests the invitation's complete capability grant.
-            requested_capabilities: None,
-        })
-        .send()
-        .await
-        .map_err(|error| format!("Pairing request failed: {error}"))?;
+    // Metered like every other outbound request. The TLS pin below still works:
+    // the meter rebuilds the response from its own parts, extensions included, so
+    // `reqwest::tls::TlsInfo` survives.
+    let response = egress::send(client.post(endpoint).json(&PairAcceptRequest {
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+        pairing_id: invitation.pairing_id.clone(),
+        pairing_token: invitation.pairing_token.clone(),
+        device_name: device_name.to_string(),
+        // The CLI controller never down-selects: omitting the subset
+        // requests the invitation's complete capability grant.
+        requested_capabilities: None,
+    }))
+    .await
+    .map_err(|error| format!("Pairing request failed: {error}"))?;
     verify_response_pin(&response, &invitation.server_certificate_sha256)?;
     let status = response.status();
     let bytes = response
@@ -173,25 +174,28 @@ pub async fn call(
     );
     let mut last_error = None;
     for attempt in 0..3u32 {
-        let response = client
-            .request(method.clone(), &endpoint)
-            .header("x-little-monkey-device", &auth.device_id)
-            .header(
-                "x-little-monkey-key-generation",
-                auth.secret_generation.to_string(),
-            )
-            .header("x-little-monkey-sequence", auth.sequence.to_string())
-            .header(
-                "x-little-monkey-timestamp-ms",
-                auth.timestamp_ms.to_string(),
-            )
-            .header("x-little-monkey-nonce", &auth.nonce)
-            .header("x-little-monkey-command", &auth.command_id)
-            .header("x-little-monkey-signature", &auth.signature)
-            .header("content-type", "application/json")
-            .body(body.clone())
-            .send()
-            .await;
+        let response = egress::send(
+            client
+                .request(method.clone(), &endpoint)
+                .header("x-little-monkey-device", &auth.device_id)
+                .header(
+                    "x-little-monkey-key-generation",
+                    auth.secret_generation.to_string(),
+                )
+                .header("x-little-monkey-sequence", auth.sequence.to_string())
+                .header(
+                    "x-little-monkey-timestamp-ms",
+                    auth.timestamp_ms.to_string(),
+                )
+                .header("x-little-monkey-nonce", &auth.nonce)
+                .header("x-little-monkey-command", &auth.command_id)
+                .header("x-little-monkey-signature", &auth.signature)
+                .header("content-type", "application/json")
+                // Cloned per attempt because a retry re-sends it, which the meter
+                // charges again — the bytes really do leave the machine twice.
+                .body(body.clone()),
+        )
+        .await;
         match response {
             Ok(response) => {
                 verify_response_pin(&response, &profile.server_certificate_sha256)?;

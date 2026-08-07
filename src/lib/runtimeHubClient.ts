@@ -804,17 +804,11 @@ export interface M3UnloadModelRequest {
   forceExactOwner: boolean;
 }
 
-export type M3ApiCaller =
-  | { type: "internal" }
-  | { type: "external"; bearer_token: string; remote_address: string };
-
-export interface M3ApiDispatchRequest {
+export interface M3DiagnosticDispatchRequest {
   protocol: CompatibilityProtocol;
   runtimeId: string;
   requestId: string;
   body: number[];
-  caller: M3ApiCaller;
-  nowMs: number;
 }
 
 export interface M3ApiDispatchResponse {
@@ -822,13 +816,11 @@ export interface M3ApiDispatchResponse {
   body: unknown;
 }
 
-export interface M3CancelInferenceRequest {
+export interface M3DiagnosticCancelRequest {
   protocol: CompatibilityProtocol;
   runtimeId: string;
   requestId: string;
   modelId: string;
-  caller: M3ApiCaller;
-  nowMs: number;
 }
 
 export type TlsPolicy =
@@ -1158,9 +1150,9 @@ export const runtimeHubClient = {
     invoke<Record<string, SettingValue>>("m3_runtime_set_config", { request }),
   runtimeConfig: (runtimeId: string) =>
     invoke<Record<string, SettingValue> | null>("m3_runtime_config", { runtimeId }),
-  apiDispatch: (args: OperationArgs & { request: M3ApiDispatchRequest }) =>
+  apiDispatch: (args: OperationArgs & { request: M3DiagnosticDispatchRequest }) =>
     invoke<M3ApiDispatchResponse>("m3_api_dispatch", args),
-  apiCancelInference: (args: OperationArgs & { request: M3CancelInferenceRequest }) =>
+  apiCancelInference: (args: OperationArgs & { request: M3DiagnosticCancelRequest }) =>
     invoke<boolean>("m3_api_cancel_inference", args),
   compatibilityMatrix: () => invoke<M3CompatibilityMatrixReport>("m3_compatibility_matrix"),
   lanValidatePolicy: (policy: LanServerPolicy) => invoke<void>("m3_lan_validate_policy", { policy }),

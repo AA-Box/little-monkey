@@ -9,13 +9,15 @@
 use crate::compatibility_hub::{
     compatibility_conformance_manifest, encode_embeddings_response, encode_ollama_chat_response,
     encode_response, encode_stream_event, request_offers_tool, translate_embeddings_request,
-    translate_ollama_chat_request, ApiBackend, ApiScope, AuthorizationRequest, AuthorizedToken,
-    CanonicalContent, CanonicalEmbeddingRequest, CanonicalEmbeddingResponse,
-    CanonicalInferenceRequest, CanonicalInferenceResponse, CanonicalMessage, CanonicalRole,
-    CanonicalStreamEvent, CanonicalUsage, CompatibilityConformanceManifest, CompatibilityError,
-    CompatibilityProtocol, LanAccessController, LanEntropySource, LanServerPolicy,
+    translate_ollama_chat_request, ApiBackend, ApiScope, AuthorizationRequest,
+    AuthorizedBackendCandidates, AuthorizedStagedRequest, AuthorizedToken,
+    BackendCandidateAuthorizationRequest, CanonicalContent, CanonicalEmbeddingRequest,
+    CanonicalEmbeddingResponse, CanonicalInferenceRequest, CanonicalInferenceResponse,
+    CanonicalMessage, CanonicalRole, CanonicalStreamEvent, CanonicalUsage,
+    CompatibilityConformanceManifest, CompatibilityError, CompatibilityProtocol,
+    CredentialPreflightRequest, LanAccessController, LanEntropySource, LanServerPolicy,
     LanStateProtector, PairedToken, PairingChallengeView, PairingRequest, ProtocolStreamFrame,
-    ScopedTokenView, SecurityAuditEvent,
+    ScopedTokenView, SecurityAuditEvent, StagedAuthorizationRequest,
 };
 use crate::mlx_runtime::{
     MlxGenerationRequest, MlxGenerationSummary, MlxMessage, MlxOperationContext, MlxProcessMetrics,
@@ -23,8 +25,8 @@ use crate::mlx_runtime::{
 };
 use crate::runtime_adapter::{
     validate_setting_values, AcceleratorKind, AdvancedSettingCapability, HardwareProfile,
-    HardwareSnapshot, KeepAlive, ModelLoadRequest, ModelUnloadRequest, RunningModel, RuntimeAdapter,
-    RuntimeCapabilities, RuntimeInventory, RuntimeLogRequest, RuntimeLogTail,
+    HardwareSnapshot, KeepAlive, ModelLoadRequest, ModelUnloadRequest, RunningModel,
+    RuntimeAdapter, RuntimeCapabilities, RuntimeInventory, RuntimeLogRequest, RuntimeLogTail,
     RuntimeOperationContext, RuntimeOperationLimits, RuntimeStatus, SettingValue, UnloadPolicy,
 };
 use reqwest::header::{
@@ -746,9 +748,7 @@ impl M3CatalogSource for HttpM3CatalogSource {
                 .append_pair("q", query)
                 .append_pair("limit", &limit.to_string());
             let response = run_bounded(context, "catalog search", async {
-                self.client
-                    .get(url)
-                    .send()
+                crate::egress::send(self.client.get(url))
                     .await
                     .map_err(|error| M3HubError::Transport(error.to_string()))
             })
@@ -840,9 +840,7 @@ impl M3DownloadTransport for ReqwestM3DownloadTransport {
             validate_download_url(url)?;
             context.preflight("probe model download")?;
             let response = run_bounded(context, "probe model download", async {
-                self.client
-                    .head(url)
-                    .send()
+                crate::egress::send(self.client.head(url))
                     .await
                     .map_err(|error| M3HubError::Transport(error.to_string()))
             })
@@ -896,8 +894,7 @@ impl M3DownloadTransport for ReqwestM3DownloadTransport {
                 request = request.header(IF_RANGE, etag);
             }
             let mut response = run_bounded(context, "download model range", async {
-                request
-                    .send()
+                crate::egress::send(request)
                     .await
                     .map_err(|error| M3HubError::Transport(error.to_string()))
             })
@@ -1102,6 +1099,82 @@ pub fn runtime_supports_image_transport(kind: M3RuntimeKind) -> bool {
 /// multiplier is layered on top of it.
 pub fn estimated_projector_memory_bytes(projector: &M3ProjectorRef) -> u64 {
     projector.size_bytes
+}
+
+/// Where the model hub lives under the Tauri app-data directory.
+///
+/// Duplicated from `m3_production::M3_DIRECTORY` rather than shared with it,
+/// because that module is Tauri-only wiring and this one has to be reachable
+/// from the CLI, which links the library without it.
+pub const M3_HUB_DIRECTORY: &str = "m3";
+
+/// What a model id will hold once it is resident, or an explicit admission that
+/// nothing installed on this machine knows.
+///
+/// [`Self::Unknown`] exists so a caller cannot mistake "we never measured this
+/// model" for "this model costs nothing". Those are the same `u64` and opposite
+/// facts: the second may legitimately satisfy a memory bound, the first must
+/// never be allowed to look like it did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum M3ModelFootprint {
+    Known {
+        /// Exact on-disk size of the active version's artifact.
+        weights_bytes: u64,
+        /// The catalog's declared fully-on-CPU and fully-offloaded footprints.
+        memory: crate::runtime_adapter::MemoryRequirement,
+        required_accelerator: Option<crate::runtime_adapter::AcceleratorKind>,
+        /// Present only when the active version declares a projector.
+        projector_memory_bytes: Option<u64>,
+    },
+    Unknown,
+}
+
+/// `model_id` → footprint, read from the hub's own durable installed inventory.
+///
+/// A free function rather than an [`M3RuntimeHub`] method because the two
+/// callers that need it most — the CLI's run submission path and the daemon's
+/// admission loop — have an app-data directory and no hub. Building one wants a
+/// clock, a hardware probe, a download transport, a catalog list and a runtime
+/// inventory, none of which are needed to answer "how big is this model".
+///
+/// Every failure is [`M3ModelFootprint::Unknown`]: an absent hub root,
+/// unreadable state, and a model this machine has never installed are the same
+/// answer to the caller, and none of them is worth failing a submission over.
+pub fn installed_model_footprint(app_data_dir: &Path, model_id: &str) -> M3ModelFootprint {
+    let root = app_data_dir.join(M3_HUB_DIRECTORY);
+    let Ok(state) = load_hub_state(&root.join("state"), &root.join("models")) else {
+        return M3ModelFootprint::Unknown;
+    };
+    for stored in &state.models {
+        let Some(version) = stored
+            .versions
+            .iter()
+            .find(|version| version.version_key == stored.active_version_key)
+        else {
+            continue;
+        };
+        if version.model.model_id != model_id {
+            continue;
+        }
+        return M3ModelFootprint::Known {
+            weights_bytes: version.model.size_bytes,
+            memory: crate::runtime_adapter::MemoryRequirement {
+                ram_bytes: version.model.estimated_ram_bytes,
+                vram_bytes: version.model.estimated_vram_bytes,
+            },
+            required_accelerator: version
+                .model
+                .required_accelerator
+                .as_deref()
+                .and_then(|value| parse_accelerator(value).ok()),
+            projector_memory_bytes: version
+                .model
+                .projector
+                .as_ref()
+                .map(estimated_projector_memory_bytes),
+        };
+    }
+    M3ModelFootprint::Unknown
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1429,7 +1502,8 @@ pub struct M3SettingCapabilitiesView {
 /// acceleration (see each gate's reason string for the user-facing detail).
 fn gpu_backend_available(report: &M3HardwareCompatibilityReport) -> bool {
     report.accelerators.iter().any(|accelerator| {
-        accelerator.kind != AcceleratorKind::Cpu && accelerator.status == M3AcceleratorStatus::Available
+        accelerator.kind != AcceleratorKind::Cpu
+            && accelerator.status == M3AcceleratorStatus::Available
     })
 }
 
@@ -1475,7 +1549,8 @@ fn compatible_draft_models<'a>(
     if target.runtime != M3RuntimeKind::LlamaCpp {
         return Vec::new();
     }
-    let target_family = ModelFamily::detect(&target.model_id, &target.display_name, &target.variant_id);
+    let target_family =
+        ModelFamily::detect(&target.model_id, &target.display_name, &target.variant_id);
     if target_family == ModelFamily::Generic {
         return Vec::new();
     }
@@ -1485,8 +1560,11 @@ fn compatible_draft_models<'a>(
             candidate.asset_id != target.asset_id
                 && candidate.runtime == M3RuntimeKind::LlamaCpp
                 && candidate.estimated_ram_bytes < target.estimated_ram_bytes
-                && ModelFamily::detect(&candidate.model_id, &candidate.display_name, &candidate.variant_id)
-                    == target_family
+                && ModelFamily::detect(
+                    &candidate.model_id,
+                    &candidate.display_name,
+                    &candidate.variant_id,
+                ) == target_family
         })
         .collect()
 }
@@ -2326,6 +2404,89 @@ pub struct M3RuntimeHubDependencies {
     pub lan_factory: Option<Arc<dyn M3LanAccessFactory>>,
 }
 
+/// Authenticated owner of an in-flight inference. This type is deliberately
+/// crate-private and has no Serde implementation: public/Tauri request
+/// envelopes cannot assert an already-authorized paired-token identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum M3RequestPrincipal {
+    Internal,
+    PairedToken(String),
+}
+
+struct M3ApiAuthorization {
+    candidates: Option<AuthorizedBackendCandidates>,
+    principal: M3RequestPrincipal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct M3InFlightInferenceBinding {
+    pub(crate) runtime_id: String,
+    pub(crate) model_id: String,
+    pub(crate) scope: ApiScope,
+    principal: M3RequestPrincipal,
+    registration_id: Uuid,
+}
+
+struct M3InFlightInferenceEntry {
+    binding: M3InFlightInferenceBinding,
+    cancel_in_progress: bool,
+    dispatch_finished: bool,
+}
+
+struct M3InFlightInferenceGuard<'a> {
+    request_id: String,
+    registration_id: Uuid,
+    registry: &'a Mutex<BTreeMap<String, M3InFlightInferenceEntry>>,
+}
+
+impl Drop for M3InFlightInferenceGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = self.registry.lock() {
+            let remove = match in_flight.get_mut(&self.request_id) {
+                Some(entry) if entry.binding.registration_id == self.registration_id => {
+                    if entry.cancel_in_progress {
+                        entry.dispatch_finished = true;
+                        false
+                    } else {
+                        true
+                    }
+                }
+                _ => false,
+            };
+            if remove {
+                in_flight.remove(&self.request_id);
+            }
+        }
+    }
+}
+
+struct M3InFlightCancellationGuard<'a> {
+    request_id: String,
+    registration_id: Uuid,
+    registry: &'a Mutex<BTreeMap<String, M3InFlightInferenceEntry>>,
+}
+
+impl Drop for M3InFlightCancellationGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = self.registry.lock() {
+            let remove = match in_flight.get_mut(&self.request_id) {
+                Some(entry) if entry.binding.registration_id == self.registration_id => {
+                    if entry.dispatch_finished {
+                        true
+                    } else {
+                        entry.cancel_in_progress = false;
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if remove {
+                in_flight.remove(&self.request_id);
+            }
+        }
+    }
+}
+
 pub struct M3RuntimeHub {
     config: M3HubConfig,
     root: PathBuf,
@@ -2341,6 +2502,7 @@ pub struct M3RuntimeHub {
     runtime_reconciler: Option<Arc<dyn M3RuntimeReconciler>>,
     lan_factory: Option<Arc<dyn M3LanAccessFactory>>,
     lan: RwLock<Option<Arc<LanAccessController>>>,
+    in_flight_inference: Mutex<BTreeMap<String, M3InFlightInferenceEntry>>,
     state_lock: Mutex<()>,
     mutation_lock: tokio::sync::Mutex<()>,
 }
@@ -2391,6 +2553,7 @@ impl M3RuntimeHub {
             runtime_reconciler: dependencies.runtime_reconciler,
             lan_factory: dependencies.lan_factory,
             lan: RwLock::new(lan),
+            in_flight_inference: Mutex::new(BTreeMap::new()),
             state_lock: Mutex::new(()),
             mutation_lock: tokio::sync::Mutex::new(()),
         })
@@ -3549,10 +3712,8 @@ impl M3RuntimeHub {
         &self,
         values: &BTreeMap<String, SettingValue>,
     ) -> M3HubResult<()> {
-        let flash_wants_on =
-            matches!(values.get("flash_attention"), Some(SettingValue::Choice { value }) if value == "on");
-        let mixed_wants_non_f16 =
-            matches!(values.get("mixed_precision"), Some(SettingValue::Choice { value }) if value != "f16");
+        let flash_wants_on = matches!(values.get("flash_attention"), Some(SettingValue::Choice { value }) if value == "on");
+        let mixed_wants_non_f16 = matches!(values.get("mixed_precision"), Some(SettingValue::Choice { value }) if value != "f16");
         if !flash_wants_on && !mixed_wants_non_f16 {
             return Ok(());
         }
@@ -3724,6 +3885,24 @@ impl M3RuntimeHub {
             .map_err(M3HubError::from)
     }
 
+    /// Validates only the paired credential at a transport edge. This is
+    /// deliberately read-only and quota-free; the exact buffered byte count
+    /// is charged once by `authorize_external_staged_request` below.
+    pub fn preflight_external_credential(
+        &self,
+        bearer_token: &str,
+        remote_address: &str,
+        now_ms: u64,
+    ) -> M3HubResult<()> {
+        self.lan_controller()?
+            .preflight_credential(&CredentialPreflightRequest {
+                bearer_token: bearer_token.to_string(),
+                remote_address: remote_address.to_string(),
+                now_ms,
+            })
+            .map_err(M3HubError::from)
+    }
+
     /// Applies the same scoped-token, backend, model, mutation, rate-limit,
     /// and destructive-confirmation policy used by compatibility inference to
     /// an HTTP listener's model/runtime lifecycle routes.
@@ -3740,6 +3919,46 @@ impl M3RuntimeHub {
                 input_bytes: request.input_bytes,
                 remote_address: request.remote_address.clone(),
                 destructive_confirmation: request.destructive_confirmation.clone(),
+                now_ms: request.now_ms,
+            })
+            .map_err(M3HubError::from)
+    }
+
+    /// Performs the full external gate before model/runtime discovery.  The
+    /// returned backend set is both an authorization receipt and the hard
+    /// boundary for subsequent catalog resolution; the caller must not call
+    /// `authorize_external_operation` again for the same request.
+    pub fn authorize_external_backend_candidates(
+        &self,
+        request: &M3ExternalBackendCandidateAuthorization,
+    ) -> M3HubResult<AuthorizedBackendCandidates> {
+        self.lan_controller()?
+            .authorize_backend_candidates(&BackendCandidateAuthorizationRequest {
+                bearer_token: request.bearer_token.clone(),
+                scope: request.scope,
+                model_id: request.model_id.clone(),
+                input_bytes: request.input_bytes,
+                remote_address: request.remote_address.clone(),
+                destructive_confirmation: request.destructive_confirmation.clone(),
+                deferred_destructive_resource_id: request.deferred_destructive_resource_id.clone(),
+                now_ms: request.now_ms,
+            })
+            .map_err(M3HubError::from)
+    }
+
+    /// Performs the single quota-bearing gate before an HTTP request envelope
+    /// is parsed. The returned candidate receipt must be narrowed after parse;
+    /// no downstream operation may authorize or debit this request again.
+    pub fn authorize_external_staged_request(
+        &self,
+        request: &M3ExternalStagedAuthorization,
+    ) -> M3HubResult<AuthorizedStagedRequest> {
+        self.lan_controller()?
+            .authorize_staged_request(&StagedAuthorizationRequest {
+                bearer_token: request.bearer_token.clone(),
+                scope: request.scope,
+                input_bytes: request.input_bytes,
+                remote_address: request.remote_address.clone(),
                 now_ms: request.now_ms,
             })
             .map_err(M3HubError::from)
@@ -3830,18 +4049,31 @@ impl M3RuntimeHub {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum M3ApiCaller {
     Internal,
     External {
+        #[serde(skip_serializing)]
         bearer_token: String,
         remote_address: String,
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+impl fmt::Debug for M3ApiCaller {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Internal => formatter.write_str("Internal"),
+            Self::External { remote_address, .. } => formatter
+                .debug_struct("External")
+                .field("bearer_token", &"[REDACTED]")
+                .field("remote_address", remote_address)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct M3ExternalOperationAuthorization {
     pub bearer_token: String,
     pub scope: ApiScope,
@@ -3850,6 +4082,27 @@ pub struct M3ExternalOperationAuthorization {
     pub input_bytes: u64,
     pub remote_address: String,
     pub destructive_confirmation: Option<String>,
+    pub now_ms: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct M3ExternalBackendCandidateAuthorization {
+    pub bearer_token: String,
+    pub scope: ApiScope,
+    pub model_id: Option<String>,
+    pub input_bytes: u64,
+    pub remote_address: String,
+    pub destructive_confirmation: Option<String>,
+    pub deferred_destructive_resource_id: Option<String>,
+    pub now_ms: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct M3ExternalStagedAuthorization {
+    pub bearer_token: String,
+    pub scope: Option<ApiScope>,
+    pub input_bytes: u64,
+    pub remote_address: String,
     pub now_ms: u64,
 }
 
@@ -3922,9 +4175,108 @@ pub struct M3OllamaChatDispatchResponse {
 }
 
 impl M3RuntimeHub {
+    /// Returns the authoritative metadata for an active inference request.
+    /// Transport callers may use this only after their credential/quota gate
+    /// has succeeded; cancellation authorization must be narrowed against
+    /// this stored binding rather than untrusted fields in the cancel body.
+    pub(crate) fn in_flight_inference_binding(
+        &self,
+        request_id: &str,
+    ) -> M3HubResult<M3InFlightInferenceBinding> {
+        validate_identifier(request_id, "requestId")?;
+        lock(&self.in_flight_inference)?
+            .get(request_id)
+            .map(|entry| entry.binding.clone())
+            .ok_or_else(|| M3HubError::NotFound("in-flight request".to_string()))
+    }
+
+    fn register_in_flight_inference(
+        &self,
+        request_id: &str,
+        runtime_id: &str,
+        model_id: &str,
+        scope: ApiScope,
+        principal: &M3RequestPrincipal,
+    ) -> M3HubResult<M3InFlightInferenceGuard<'_>> {
+        validate_identifier(request_id, "requestId")?;
+        validate_identifier(runtime_id, "runtimeId")?;
+        validate_identifier(model_id, "modelId")?;
+        let mut in_flight = lock(&self.in_flight_inference)?;
+        if in_flight.contains_key(request_id) {
+            return Err(M3HubError::Conflict(format!(
+                "requestId {request_id} is already in flight"
+            )));
+        }
+        let registration_id = Uuid::new_v4();
+        in_flight.insert(
+            request_id.to_string(),
+            M3InFlightInferenceEntry {
+                binding: M3InFlightInferenceBinding {
+                    runtime_id: runtime_id.to_string(),
+                    model_id: model_id.to_string(),
+                    scope,
+                    principal: principal.clone(),
+                    registration_id,
+                },
+                cancel_in_progress: false,
+                dispatch_finished: false,
+            },
+        );
+        drop(in_flight);
+        Ok(M3InFlightInferenceGuard {
+            request_id: request_id.to_string(),
+            registration_id,
+            registry: &self.in_flight_inference,
+        })
+    }
+
+    fn begin_in_flight_cancellation(
+        &self,
+        request_id: &str,
+        registration_id: Uuid,
+    ) -> M3HubResult<M3InFlightCancellationGuard<'_>> {
+        let mut in_flight = lock(&self.in_flight_inference)?;
+        let entry = in_flight
+            .get_mut(request_id)
+            .filter(|entry| entry.binding.registration_id == registration_id)
+            .ok_or_else(|| M3HubError::NotFound("in-flight request".to_string()))?;
+        if entry.cancel_in_progress {
+            return Err(M3HubError::Conflict(format!(
+                "cancellation for requestId {request_id} is already in progress"
+            )));
+        }
+        entry.cancel_in_progress = true;
+        drop(in_flight);
+        Ok(M3InFlightCancellationGuard {
+            request_id: request_id.to_string(),
+            registration_id,
+            registry: &self.in_flight_inference,
+        })
+    }
+
     pub async fn dispatch_api(
         &self,
         request: &M3ApiDispatchRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3ApiDispatchResponse> {
+        self.dispatch_api_with_principal(request, None, context)
+            .await
+    }
+
+    pub(crate) async fn dispatch_pre_authorized_api(
+        &self,
+        request: &M3ApiDispatchRequest,
+        principal: M3RequestPrincipal,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3ApiDispatchResponse> {
+        self.dispatch_api_with_principal(request, Some(principal), context)
+            .await
+    }
+
+    async fn dispatch_api_with_principal(
+        &self,
+        request: &M3ApiDispatchRequest,
+        trusted_principal: Option<M3RequestPrincipal>,
         context: &M3OperationContext,
     ) -> M3HubResult<M3ApiDispatchResponse> {
         context.preflight("dispatch compatibility request")?;
@@ -3938,14 +4290,23 @@ impl M3RuntimeHub {
                 "streaming requests must use dispatch_api_stream".to_string(),
             ));
         }
-        let runtime = self.runtime(&request.runtime_id)?;
-        self.authorize_api(
+        let authorization = self.authorize_api_candidates(
             &request.caller,
             protocol_scope(request.protocol),
-            &runtime.descriptor(),
             &canonical.model,
             request.body.len() as u64,
             request.now_ms,
+            trusted_principal.as_ref(),
+        )?;
+        let runtime = self
+            .runtime_after_authorization(&request.runtime_id, authorization.candidates.as_ref())?;
+        let runtime_id = runtime.descriptor().runtime_id;
+        let _in_flight = self.register_in_flight_inference(
+            &request.request_id,
+            &runtime_id,
+            &canonical.model,
+            protocol_scope(request.protocol),
+            &authorization.principal,
         )?;
         let response = runtime.complete(&canonical, context).await?;
         if response.model != canonical.model {
@@ -3965,26 +4326,87 @@ impl M3RuntimeHub {
         sink: &mut dyn M3ProtocolFrameSink,
         context: &M3OperationContext,
     ) -> M3HubResult<()> {
-        context.preflight("dispatch compatibility stream")?;
-        let canonical = crate::compatibility_hub::translate_request(
-            request.protocol,
-            &request.request_id,
-            &request.body,
-        )?;
-        if !canonical.stream {
-            return Err(M3HubError::Conflict(
-                "non-streaming requests must use dispatch_api".to_string(),
-            ));
+        self.dispatch_api_stream_with_principal(request, sink, None, None, context)
+            .await
+    }
+
+    pub(crate) async fn dispatch_pre_authorized_api_stream(
+        &self,
+        request: &M3ApiDispatchRequest,
+        sink: &mut dyn M3ProtocolFrameSink,
+        principal: M3RequestPrincipal,
+        ready: tokio::sync::oneshot::Sender<M3HubResult<()>>,
+        context: &M3OperationContext,
+    ) -> M3HubResult<()> {
+        self.dispatch_api_stream_with_principal(
+            request,
+            sink,
+            Some(principal),
+            Some(ready),
+            context,
+        )
+        .await
+    }
+
+    async fn dispatch_api_stream_with_principal(
+        &self,
+        request: &M3ApiDispatchRequest,
+        sink: &mut dyn M3ProtocolFrameSink,
+        trusted_principal: Option<M3RequestPrincipal>,
+        mut ready: Option<tokio::sync::oneshot::Sender<M3HubResult<()>>>,
+        context: &M3OperationContext,
+    ) -> M3HubResult<()> {
+        let prepared: M3HubResult<_> = (|| {
+            context.preflight("dispatch compatibility stream")?;
+            let canonical = crate::compatibility_hub::translate_request(
+                request.protocol,
+                &request.request_id,
+                &request.body,
+            )?;
+            if !canonical.stream {
+                return Err(M3HubError::Conflict(
+                    "non-streaming requests must use dispatch_api".to_string(),
+                ));
+            }
+            let authorization = self.authorize_api_candidates(
+                &request.caller,
+                protocol_scope(request.protocol),
+                &canonical.model,
+                request.body.len() as u64,
+                request.now_ms,
+                trusted_principal.as_ref(),
+            )?;
+            let runtime = self.runtime_after_authorization(
+                &request.runtime_id,
+                authorization.candidates.as_ref(),
+            )?;
+            let runtime_id = runtime.descriptor().runtime_id;
+            let in_flight = self.register_in_flight_inference(
+                &request.request_id,
+                &runtime_id,
+                &canonical.model,
+                protocol_scope(request.protocol),
+                &authorization.principal,
+            )?;
+            Ok((canonical, runtime, in_flight))
+        })();
+        let (canonical, runtime, _in_flight) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Err(error));
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
+        // The HTTP layer waits for this signal before it commits SSE 200
+        // headers. Therefore an immediate cancel always observes the binding,
+        // and a duplicate active requestId is an HTTP conflict rather than a
+        // late error frame inside an already-successful stream.
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(Ok(()));
         }
-        let runtime = self.runtime(&request.runtime_id)?;
-        self.authorize_api(
-            &request.caller,
-            protocol_scope(request.protocol),
-            &runtime.descriptor(),
-            &canonical.model,
-            request.body.len() as u64,
-            request.now_ms,
-        )?;
         let mut encoding = ProtocolEncodingSink {
             protocol: request.protocol,
             downstream: sink,
@@ -4004,15 +4426,16 @@ impl M3RuntimeHub {
     ) -> M3HubResult<M3ApiDispatchResponse> {
         context.preflight("dispatch embeddings request")?;
         let canonical = translate_embeddings_request(&request.request_id, &request.body)?;
-        let runtime = self.runtime(&request.runtime_id)?;
-        self.authorize_api(
+        let authorization = self.authorize_api_candidates(
             &request.caller,
             ApiScope::Embeddings,
-            &runtime.descriptor(),
             &canonical.model,
             request.body.len() as u64,
             request.now_ms,
+            None,
         )?;
+        let runtime = self
+            .runtime_after_authorization(&request.runtime_id, authorization.candidates.as_ref())?;
         let response = runtime.embed(&canonical, context).await?;
         if response.model != canonical.model {
             return Err(M3HubError::Runtime(
@@ -4037,17 +4460,46 @@ impl M3RuntimeHub {
         request: &M3OllamaChatDispatchRequest,
         context: &M3OperationContext,
     ) -> M3HubResult<M3OllamaChatDispatchResponse> {
+        self.dispatch_ollama_chat_with_principal(request, None, context)
+            .await
+    }
+
+    pub(crate) async fn dispatch_pre_authorized_ollama_chat(
+        &self,
+        request: &M3OllamaChatDispatchRequest,
+        principal: M3RequestPrincipal,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3OllamaChatDispatchResponse> {
+        self.dispatch_ollama_chat_with_principal(request, Some(principal), context)
+            .await
+    }
+
+    async fn dispatch_ollama_chat_with_principal(
+        &self,
+        request: &M3OllamaChatDispatchRequest,
+        trusted_principal: Option<M3RequestPrincipal>,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3OllamaChatDispatchResponse> {
         context.preflight("dispatch ollama-native chat request")?;
         let (canonical, stream_requested) =
             translate_ollama_chat_request(&request.request_id, &request.body)?;
-        let runtime = self.runtime(&request.runtime_id)?;
-        self.authorize_api(
+        let authorization = self.authorize_api_candidates(
             &request.caller,
             ApiScope::ChatCompletions,
-            &runtime.descriptor(),
             &canonical.model,
             request.body.len() as u64,
             request.now_ms,
+            trusted_principal.as_ref(),
+        )?;
+        let runtime = self
+            .runtime_after_authorization(&request.runtime_id, authorization.candidates.as_ref())?;
+        let runtime_id = runtime.descriptor().runtime_id;
+        let _in_flight = self.register_in_flight_inference(
+            &request.request_id,
+            &runtime_id,
+            &canonical.model,
+            ApiScope::ChatCompletions,
+            &authorization.principal,
         )?;
         let started_at = std::time::Instant::now();
         let response = runtime.complete(&canonical, context).await?;
@@ -4068,48 +4520,147 @@ impl M3RuntimeHub {
         request: &M3CancelInferenceRequest,
         context: &M3OperationContext,
     ) -> M3HubResult<bool> {
+        self.cancel_inference_with_principal(request, None, None, context)
+            .await
+    }
+
+    pub(crate) async fn cancel_pre_authorized_inference(
+        &self,
+        request: &M3CancelInferenceRequest,
+        binding: M3InFlightInferenceBinding,
+        principal: M3RequestPrincipal,
+        context: &M3OperationContext,
+    ) -> M3HubResult<bool> {
+        self.cancel_inference_with_principal(request, Some(binding), Some(principal), context)
+            .await
+    }
+
+    async fn cancel_inference_with_principal(
+        &self,
+        request: &M3CancelInferenceRequest,
+        trusted_binding: Option<M3InFlightInferenceBinding>,
+        trusted_principal: Option<M3RequestPrincipal>,
+        context: &M3OperationContext,
+    ) -> M3HubResult<bool> {
         validate_identifier(&request.request_id, "requestId")?;
         validate_identifier(&request.model_id, "modelId")?;
-        let runtime = self.runtime(&request.runtime_id)?;
-        self.authorize_api(
+        if trusted_principal.is_none() {
+            if let M3ApiCaller::External {
+                bearer_token,
+                remote_address,
+            } = &request.caller
+            {
+                // Keep invalid credentials from probing the in-flight registry.
+                // This preflight is read-only and quota-free; authorization below
+                // performs the request's single quota-bearing transaction.
+                self.preflight_external_credential(bearer_token, remote_address, request.now_ms)?;
+            }
+        }
+        let binding = match trusted_binding {
+            Some(binding) => binding,
+            None => self.in_flight_inference_binding(&request.request_id)?,
+        };
+        let authorization = match self.authorize_api_candidates(
             &request.caller,
-            protocol_scope(request.protocol),
-            &runtime.descriptor(),
-            &request.model_id,
+            binding.scope,
+            &binding.model_id,
             0,
             request.now_ms,
-        )?;
+            trusted_principal.as_ref(),
+        ) {
+            Ok(authorization) => authorization,
+            Err(M3HubError::Forbidden(_) | M3HubError::NotFound(_)) => {
+                return Err(M3HubError::NotFound("in-flight request".to_string()))
+            }
+            Err(error) => return Err(error),
+        };
+        let runtime = match self
+            .runtime_after_authorization(&binding.runtime_id, authorization.candidates.as_ref())
+        {
+            Ok(runtime) => runtime,
+            Err(M3HubError::Forbidden(_) | M3HubError::NotFound(_)) => {
+                return Err(M3HubError::NotFound("in-flight request".to_string()))
+            }
+            Err(error) => return Err(error),
+        };
+        if request.runtime_id != binding.runtime_id
+            || request.model_id != binding.model_id
+            || protocol_scope(request.protocol) != binding.scope
+            || authorization.principal != binding.principal
+        {
+            return Err(M3HubError::NotFound("in-flight request".to_string()));
+        }
+        let _cancellation =
+            self.begin_in_flight_cancellation(&request.request_id, binding.registration_id)?;
         runtime.cancel(&request.request_id, context).await
     }
 
-    fn authorize_api(
+    fn authorize_api_candidates(
         &self,
         caller: &M3ApiCaller,
         scope: ApiScope,
-        runtime: &M3RuntimeDescriptor,
         model_id: &str,
         input_bytes: u64,
         now_ms: u64,
-    ) -> M3HubResult<()> {
+        trusted_principal: Option<&M3RequestPrincipal>,
+    ) -> M3HubResult<M3ApiAuthorization> {
+        if let Some(principal) = trusted_principal {
+            if !matches!(caller, M3ApiCaller::Internal) {
+                return Err(M3HubError::State(
+                    "pre-authorized dispatch must use an internal request envelope".to_string(),
+                ));
+            }
+            return Ok(M3ApiAuthorization {
+                candidates: None,
+                principal: principal.clone(),
+            });
+        }
         match caller {
-            M3ApiCaller::Internal => Ok(()),
+            M3ApiCaller::Internal => Ok(M3ApiAuthorization {
+                candidates: None,
+                principal: M3RequestPrincipal::Internal,
+            }),
             M3ApiCaller::External {
                 bearer_token,
                 remote_address,
             } => {
-                self.lan_controller()?.authorize(&AuthorizationRequest {
-                    bearer_token: bearer_token.clone(),
-                    scope,
-                    backend: runtime.api_backend,
-                    model_id: Some(model_id.to_string()),
-                    input_bytes,
-                    remote_address: remote_address.clone(),
-                    destructive_confirmation: None,
-                    now_ms,
-                })?;
-                Ok(())
+                let receipt = self.lan_controller()?.authorize_backend_candidates(
+                    &BackendCandidateAuthorizationRequest {
+                        bearer_token: bearer_token.clone(),
+                        scope,
+                        model_id: Some(model_id.to_string()),
+                        input_bytes,
+                        remote_address: remote_address.clone(),
+                        destructive_confirmation: None,
+                        deferred_destructive_resource_id: None,
+                        now_ms,
+                    },
+                )?;
+                let principal = M3RequestPrincipal::PairedToken(receipt.token_id.clone());
+                Ok(M3ApiAuthorization {
+                    candidates: Some(receipt),
+                    principal,
+                })
             }
         }
+    }
+
+    fn runtime_after_authorization(
+        &self,
+        runtime_id: &str,
+        authorization: Option<&AuthorizedBackendCandidates>,
+    ) -> M3HubResult<Arc<dyn M3RuntimeDriver>> {
+        // Authentication, scope/model checks, and quota debit have already
+        // happened for external callers before this first runtime lookup.
+        let runtime = self.runtime(runtime_id)?;
+        if authorization
+            .is_some_and(|receipt| !receipt.backends.contains(&runtime.descriptor().api_backend))
+        {
+            // Do not disclose whether the named runtime exists to a token that
+            // cannot use its backend.
+            return Err(M3HubError::NotFound("authorized runtime".to_string()));
+        }
+        Ok(runtime)
     }
 }
 
@@ -6141,9 +6692,11 @@ impl M3ComponentHub {
     pub fn storage_status(&self) -> M3HubResult<M3StorageStatus> {
         let blob_bytes = directory_size(&self.blobs_root)?;
         let pending_download_bytes = directory_size(&self.downloads_root)?;
-        let used_bytes = blob_bytes.checked_add(pending_download_bytes).ok_or_else(|| {
-            M3HubError::State("managed component storage byte count overflow".to_string())
-        })?;
+        let used_bytes = blob_bytes
+            .checked_add(pending_download_bytes)
+            .ok_or_else(|| {
+                M3HubError::State("managed component storage byte count overflow".to_string())
+            })?;
         let available_for_models_bytes = self
             .config
             .storage_quota_bytes
@@ -6168,12 +6721,8 @@ impl M3ComponentHub {
         let mut entries = Vec::new();
         let mut dedupe = BTreeSet::new();
         for source in &sources {
-            let listed = run_bounded(
-                context,
-                "component source list",
-                source.list(context),
-            )
-            .await?;
+            let listed =
+                run_bounded(context, "component source list", source.list(context)).await?;
             if listed.len() > MAX_CATALOG_ENTRIES {
                 return Err(invalid(
                     "component.entries",
@@ -6461,15 +7010,18 @@ impl M3ComponentHub {
             .ok_or_else(|| M3HubError::State("installed component vanished".to_string()))?;
         let asset_key_for_prune = state.components[component_index].asset_key.clone();
         let prune_root = self.blobs_root.join(&asset_key_for_prune);
-        let pruned =
-            prune_excess_component_versions(&mut state.components[component_index], &self.blobs_root)?;
-        let candidate = match stored_component_view(&state.components[component_index], &self.blobs_root) {
-            Ok(view) => view,
-            Err(error) => {
-                restore_isolated_versions(&pruned, &prune_root);
-                return Err(error);
-            }
-        };
+        let pruned = prune_excess_component_versions(
+            &mut state.components[component_index],
+            &self.blobs_root,
+        )?;
+        let candidate =
+            match stored_component_view(&state.components[component_index], &self.blobs_root) {
+                Ok(view) => view,
+                Err(error) => {
+                    restore_isolated_versions(&pruned, &prune_root);
+                    return Err(error);
+                }
+            };
         let saved = {
             let _guard = lock(&self.state_lock)?;
             save_next_component_state(&self.state_root, &mut state, self.clock.now_ms()?)
@@ -6664,10 +7216,7 @@ fn save_next_component_state(
     Ok(())
 }
 
-fn validate_component_hub_state(
-    state: &M3ComponentHubState,
-    blobs_root: &Path,
-) -> M3HubResult<()> {
+fn validate_component_hub_state(state: &M3ComponentHubState, blobs_root: &Path) -> M3HubResult<()> {
     validate_component_hub_state_structure(state)?;
     for stored in &state.components {
         for version in &stored.versions {
@@ -6855,7 +7404,10 @@ fn verify_component_directory(
             .metadata()
             .map_err(|source| io_at("inspect component version entry", &entry.path(), source))?;
         if !entry_metadata.is_file()
-            || !matches!(name.as_str(), COMPONENT_PAYLOAD_FILE | COMPONENT_MANIFEST_FILE)
+            || !matches!(
+                name.as_str(),
+                COMPONENT_PAYLOAD_FILE | COMPONENT_MANIFEST_FILE
+            )
         {
             return Err(M3HubError::State(
                 "component version contains an unexpected entry".to_string(),
@@ -6917,6 +7469,90 @@ fn validate_component_sources(sources: &[Arc<dyn M3ComponentSource>]) -> M3HubRe
 mod tests {
     use super::*;
     use crate::compatibility_hub::CanonicalToolDefinition;
+
+    struct RegistryTestHardware;
+
+    impl M3HardwareProbe for RegistryTestHardware {
+        fn snapshot(&self) -> M3HubResult<HardwareSnapshot> {
+            Ok(HardwareSnapshot {
+                captured_at_ms: 1,
+                total_ram_bytes: 8 * 1024 * 1024 * 1024,
+                available_ram_bytes: 6 * 1024 * 1024 * 1024,
+                logical_cpu_count: 4,
+                platform: crate::runtime_adapter::PlatformCapabilities::current(Vec::new()),
+            })
+        }
+    }
+
+    #[test]
+    fn stale_cancel_binding_cannot_target_a_reused_request_id() {
+        let root = std::env::temp_dir().join(format!(
+            "m3-cancel-aba-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create ABA test root");
+        let hub = M3RuntimeHub::new(
+            &root,
+            M3HubConfig::default(),
+            M3RuntimeHubDependencies {
+                clock: Arc::new(SystemM3Clock),
+                hardware: Arc::new(RegistryTestHardware),
+                download: Arc::new(
+                    ReqwestM3DownloadTransport::new().expect("ABA test download transport"),
+                ),
+                catalogs: Vec::new(),
+                runtimes: Vec::new(),
+                runtime_reconciler: None,
+                lan_factory: None,
+            },
+        )
+        .expect("ABA test hub");
+        let first = hub
+            .register_in_flight_inference(
+                "reused-request",
+                "managed-runtime",
+                "local-model",
+                ApiScope::ChatCompletions,
+                &M3RequestPrincipal::PairedToken("token-a".to_string()),
+            )
+            .expect("register first request generation");
+        let stale = hub
+            .in_flight_inference_binding("reused-request")
+            .expect("capture first binding");
+        drop(first);
+        let _second = hub
+            .register_in_flight_inference(
+                "reused-request",
+                "managed-runtime",
+                "local-model",
+                ApiScope::ChatCompletions,
+                &M3RequestPrincipal::PairedToken("token-a".to_string()),
+            )
+            .expect("reuse requestId after first dispatch finished");
+
+        assert!(matches!(
+            hub.begin_in_flight_cancellation("reused-request", stale.registration_id),
+            Err(M3HubError::NotFound(_))
+        ));
+        assert!(hub.in_flight_inference_binding("reused-request").is_ok());
+        drop(_second);
+        drop(hub);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn api_caller_debug_and_serialization_redact_plaintext_bearers() {
+        let caller = M3ApiCaller::External {
+            bearer_token: "lmk-lan-super-secret".to_string(),
+            remote_address: "127.0.0.1".to_string(),
+        };
+        let debug = format!("{caller:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("super-secret"));
+        let serialized = serde_json::to_string(&caller).expect("serialize caller");
+        assert!(!serialized.contains("super-secret"));
+    }
 
     // ------------------------------------------------------------------
     // Phase 8 item 10: tool-call and structured-output parser hardening.
@@ -7002,10 +7638,7 @@ mod tests {
             .match_indices('}')
             .next()
             .expect("embedded close brace");
-        let (escape_at, _) = text
-            .match_indices("\\\"")
-            .next()
-            .expect("escaped quote");
+        let (escape_at, _) = text.match_indices("\\\"").next().expect("escaped quote");
         let mut cuts = vec![embedded_open + 1, embedded_close, escape_at + 1];
         cuts.sort_unstable();
         cuts.dedup();
@@ -7245,14 +7878,12 @@ mod tests {
             call_id: "call_1".to_string(),
             name: "search".to_string(),
         }];
-        events.extend(
-            fragments
-                .into_iter()
-                .map(|fragment| MlxStreamEvent::ToolCallArgumentsDelta {
-                    call_id: "call_1".to_string(),
-                    json: fragment,
-                }),
-        );
+        events.extend(fragments.into_iter().map(|fragment| {
+            MlxStreamEvent::ToolCallArgumentsDelta {
+                call_id: "call_1".to_string(),
+                json: fragment,
+            }
+        }));
         events.push(MlxStreamEvent::ToolCallEnd {
             call_id: "call_1".to_string(),
         });
@@ -7599,7 +8230,11 @@ mod tests {
             M3RuntimeKind::LlamaCpp,
             1_000_000_000,
         );
-        assert!(compatible_draft_models(&generic_target, &[generic_target.clone(), generic_smaller]).is_empty());
+        assert!(compatible_draft_models(
+            &generic_target,
+            &[generic_target.clone(), generic_smaller]
+        )
+        .is_empty());
 
         // A non-llama.cpp target never gets a draft at all, regardless of
         // family/size — speculative decoding is only wired for llama.cpp.
@@ -7610,7 +8245,10 @@ mod tests {
             M3RuntimeKind::Ollama,
             8_000_000_000,
         );
-        assert!(compatible_draft_models(&ollama_target, &installed_smaller_llama_cpp_fixture()).is_empty());
+        assert!(
+            compatible_draft_models(&ollama_target, &installed_smaller_llama_cpp_fixture())
+                .is_empty()
+        );
     }
 
     /// A single smaller, same-family, llama.cpp-runtime model — used only to
@@ -7629,7 +8267,8 @@ mod tests {
     #[test]
     fn gate_advanced_settings_flips_flash_attention_and_mixed_precision_with_the_hardware_report() {
         let capabilities = llama_capabilities_fixture();
-        let cpu_result = gate_advanced_settings(&capabilities, &cpu_only_compatibility_report(), None, &[]);
+        let cpu_result =
+            gate_advanced_settings(&capabilities, &cpu_only_compatibility_report(), None, &[]);
         let flash_attention = cpu_result
             .settings
             .iter()
@@ -7644,7 +8283,8 @@ mod tests {
             .expect("mixed_precision present");
         assert!(!mixed_precision.supported);
 
-        let gpu_result = gate_advanced_settings(&capabilities, &cuda_compatibility_report(), None, &[]);
+        let gpu_result =
+            gate_advanced_settings(&capabilities, &cuda_compatibility_report(), None, &[]);
         let flash_attention = gpu_result
             .settings
             .iter()
@@ -7685,7 +8325,8 @@ mod tests {
             M3RuntimeKind::LlamaCpp,
             8_000_000_000,
         );
-        let no_draft_installed = gate_advanced_settings(&capabilities, &report, Some(&target), &[target.clone()]);
+        let no_draft_installed =
+            gate_advanced_settings(&capabilities, &report, Some(&target), &[target.clone()]);
         let draft_setting = no_draft_installed
             .settings
             .iter()
@@ -7715,6 +8356,9 @@ mod tests {
         assert!(draft_setting.supported);
         assert!(draft_setting.unsupported_reason.is_none());
         assert_eq!(with_draft.draft_model_candidates.len(), 1);
-        assert_eq!(with_draft.draft_model_candidates[0].model_id, draft.model_id);
+        assert_eq!(
+            with_draft.draft_model_candidates[0].model_id,
+            draft.model_id
+        );
     }
 }

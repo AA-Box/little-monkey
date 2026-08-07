@@ -321,23 +321,23 @@ impl ReqwestGithubPullsTransport {
 impl GithubPullsTransport for ReqwestGithubPullsTransport {
     fn get<'a>(&'a self, url: &'a str) -> PrWatcherFuture<'a, GithubHttpResponse> {
         Box::pin(async move {
-            let response = self
-                .client
-                .get(url)
-                // GitHub's REST API hard-rejects a request with no
-                // `User-Agent` (HTTP 403); the exact string doesn't matter
-                // to GitHub beyond being present, but a real product
-                // identifier keeps this app's traffic identifiable in
-                // GitHub's own logs if it's ever worth following up on.
-                .header(
-                    reqwest::header::USER_AGENT,
-                    "little-monkey-runtime-pr-watcher",
-                )
-                .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .send()
-                .await
-                .map_err(|error| PrWatcherError::Network(error.to_string()))?;
+            let response = crate::egress::send(
+                self.client
+                    .get(url)
+                    // GitHub's REST API hard-rejects a request with no
+                    // `User-Agent` (HTTP 403); the exact string doesn't matter
+                    // to GitHub beyond being present, but a real product
+                    // identifier keeps this app's traffic identifiable in
+                    // GitHub's own logs if it's ever worth following up on.
+                    .header(
+                        reqwest::header::USER_AGENT,
+                        "little-monkey-runtime-pr-watcher",
+                    )
+                    .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28"),
+            )
+            .await
+            .map_err(|error| PrWatcherError::Network(error.to_string()))?;
             let status = response.status().as_u16();
             let bytes = response
                 .bytes()

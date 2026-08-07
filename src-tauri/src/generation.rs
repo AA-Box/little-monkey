@@ -1432,10 +1432,17 @@ impl GenerationEngineState {
                 self.stop()?;
                 return Err(failure);
             }
-            if let Ok(response) = client
-                .get(&capabilities)
-                .timeout(Duration::from_secs(2))
-                .send()
+            // Wait out the whole deadline on one probe rather than abandoning a
+            // short one every half second. `sd-server` answers `/capabilities`
+            // from its worker pool, and a big model warms up for a minute or
+            // more before the first answer comes back — every probe we give up
+            // on leaves its handler thread blocked, so a 2s timeout drains the
+            // pool in seconds and the engine can never answer at all. A dead
+            // child drops the connection, so this still fails fast.
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_secs(1));
+            if let Ok(response) = crate::egress::send(client.get(&capabilities).timeout(remaining))
                 .await
             {
                 // A foreign service could answer on this port while our child
@@ -1498,12 +1505,13 @@ pub async fn submit_job(
     spec: &GenerationModelSpec,
     request: &GenerationRequest,
 ) -> Result<String, String> {
-    let response = client
-        .post(format!("{base_url}{}", request.task.endpoint()))
-        .json(&request_body(spec, request))
-        .send()
-        .await
-        .map_err(|error| format!("Submit generation job: {error}"))?;
+    let response = crate::egress::send(
+        client
+            .post(format!("{base_url}{}", request.task.endpoint()))
+            .json(&request_body(spec, request)),
+    )
+    .await
+    .map_err(|error| format!("Submit generation job: {error}"))?;
     let status = response.status();
     let body: Value = response
         .json()
@@ -1526,9 +1534,7 @@ pub async fn poll_job(
     base_url: &str,
     job_id: &str,
 ) -> Result<JobProgress, String> {
-    let response = client
-        .get(format!("{base_url}/sdcpp/v1/jobs/{job_id}"))
-        .send()
+    let response = crate::egress::send(client.get(format!("{base_url}/sdcpp/v1/jobs/{job_id}")))
         .await
         .map_err(|error| format!("Poll generation job: {error}"))?;
     if !response.status().is_success() {
@@ -1545,12 +1551,271 @@ pub async fn poll_job(
 }
 
 pub async fn cancel_job(client: &reqwest::Client, base_url: &str, job_id: &str) -> bool {
-    client
-        .post(format!("{base_url}/sdcpp/v1/jobs/{job_id}/cancel"))
-        .send()
+    crate::egress::send(client.post(format!("{base_url}/sdcpp/v1/jobs/{job_id}/cancel")))
         .await
         .map(|response| response.status().is_success())
         .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Remote backends
+// ---------------------------------------------------------------------------
+//
+// The managed `sd-server` above runs weight files the app itself downloaded and
+// verified, which is why every model there is a set of component slots. Two
+// other engines generate images without any of that machinery, and neither can
+// be bundled: ComfyUI is a Python process the user installs and GPL-3.0, and a
+// hosted OpenAI-compatible endpoint has no local weights at all. Both are
+// reached over HTTP at arm's length — nothing is linked and nothing is shipped,
+// so this app's MIT license is unaffected.
+//
+// A remote backend is deliberately *not* a [`GenerationModelSpec`]: it has no
+// components to validate, nothing to download, and no launch line. It is a
+// destination plus the model names that destination serves.
+
+/// How a remote backend is spoken to. The two protocols share nothing beyond
+/// "POST a prompt, get an image back".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteBackendKind {
+    /// A ComfyUI server. Generation is a workflow graph the user supplies;
+    /// the app substitutes prompt and canvas into it and never authors nodes.
+    ComfyUi,
+    /// `POST /images/generations` with the key already in the OS keychain.
+    OpenAiCompatible,
+}
+
+/// The `model_id` prefix that routes a run away from the managed engine.
+///
+/// Remote entries share the model picker with library models, so they share the
+/// id space too. A prefix keeps one field doing one job — a request either
+/// names a library model or names a backend and one of its models — instead of
+/// adding a mode flag that every other field then has to be read against.
+pub const REMOTE_MODEL_PREFIX: &str = "remote:";
+
+/// Builds the picker id for one model on one backend.
+pub fn remote_model_id(backend_id: &str, model: &str) -> String {
+    format!("{REMOTE_MODEL_PREFIX}{backend_id}:{model}")
+}
+
+/// Splits a [`remote_model_id`] back into its parts.
+///
+/// The model name is the remainder after the *first* separator, not up to the
+/// last one: hosted model names contain colons (`black-forest-labs/flux:1.1`),
+/// and splitting from the right would silently address a different model.
+pub fn parse_remote_model_id(model_id: &str) -> Option<(&str, &str)> {
+    let rest = model_id.strip_prefix(REMOTE_MODEL_PREFIX)?;
+    let (backend_id, model) = rest.split_once(':')?;
+    if backend_id.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some((backend_id, model))
+}
+
+/// One user-registered remote generation endpoint.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteBackend {
+    pub id: String,
+    pub label: String,
+    pub kind: RemoteBackendKind,
+    /// Base URL of the ComfyUI server, or of the OpenAI-compatible API. Empty
+    /// on an OpenAI-compatible backend falls back to the provider's own base.
+    pub base_url: String,
+    /// Which saved provider key to authenticate with. OpenAI-compatible only.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// The ComfyUI API-format workflow, with `{{prompt}}`-style placeholders.
+    #[serde(default)]
+    pub workflow_template: Option<Value>,
+    /// Whether this endpoint accepts an init image on `/images/edits`.
+    #[serde(default)]
+    pub supports_editing: bool,
+    /// Model names to offer in the picker. A ComfyUI workflow names its own
+    /// checkpoint, so one placeholder entry is enough there.
+    pub models: Vec<String>,
+}
+
+impl RemoteBackend {
+    /// The tasks this backend can be asked for.
+    ///
+    /// Video and speech are absent on purpose: a ComfyUI graph *can* produce
+    /// video, but which node does and how to read it back is workflow-specific
+    /// and cannot be inferred from a template the app did not author.
+    pub fn tasks(&self) -> Vec<GenerationTask> {
+        match self.kind {
+            RemoteBackendKind::ComfyUi => vec![GenerationTask::TextToImage],
+            RemoteBackendKind::OpenAiCompatible if self.supports_editing => {
+                vec![GenerationTask::TextToImage, GenerationTask::ImageToImage]
+            }
+            RemoteBackendKind::OpenAiCompatible => vec![GenerationTask::TextToImage],
+        }
+    }
+}
+
+pub fn validate_remote_backend(backend: &RemoteBackend) -> Result<(), String> {
+    if backend.id.trim().is_empty() || backend.id.len() > 64 {
+        return Err("A backend needs an id of at most 64 characters".to_string());
+    }
+    // The id is half of a `remote:<id>:<model>` picker id, so a colon in it
+    // would make that id parse back to a different backend than it names.
+    if backend
+        .id
+        .contains(|c: char| c == ':' || c == '/' || c.is_whitespace())
+    {
+        return Err("A backend id may not contain colons, slashes or spaces".to_string());
+    }
+    if backend.label.trim().is_empty() || backend.label.len() > 120 {
+        return Err("A backend needs a label of at most 120 characters".to_string());
+    }
+    if backend.models.is_empty() {
+        return Err("List at least one model this backend serves".to_string());
+    }
+    if backend.models.len() > 64 {
+        return Err("At most 64 models can be listed for one backend".to_string());
+    }
+    for model in &backend.models {
+        if model.trim().is_empty() || model.len() > 200 {
+            return Err("Each model name must be 1 to 200 characters".to_string());
+        }
+    }
+    match backend.kind {
+        RemoteBackendKind::ComfyUi => {
+            if backend.workflow_template.is_none() {
+                return Err("A ComfyUI backend needs an API-format workflow".to_string());
+            }
+            if backend.base_url.trim().is_empty() {
+                return Err("A ComfyUI backend needs a base URL".to_string());
+            }
+        }
+        RemoteBackendKind::OpenAiCompatible => {
+            if backend
+                .provider_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+            {
+                return Err(
+                    "An OpenAI-compatible backend needs the provider whose key it uses".to_string(),
+                );
+            }
+        }
+    }
+    if !backend.base_url.trim().is_empty() {
+        let url = backend.base_url.trim();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err("A backend base URL must start with http:// or https://".to_string());
+        }
+        if url.len() > 400 {
+            return Err("Backend base URL is too long".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// The remote counterpart of [`validate_request`].
+///
+/// It cannot reuse that function: every bound there is read off a
+/// [`GenerationModelSpec`] — supported tasks, default sampler, frame grid — and
+/// a remote backend has none of those. What is shared is the part that protects
+/// the *caller* rather than the engine, so those bounds are repeated here
+/// rather than relaxed.
+pub fn validate_remote_request(
+    backend: &RemoteBackend,
+    request: &GenerationRequest,
+) -> Result<GenerationRequest, String> {
+    if !backend.tasks().contains(&request.task) {
+        return Err(format!("{} does not support this task", backend.label));
+    }
+    if request.prompt.trim().is_empty() {
+        return Err("A prompt is required".to_string());
+    }
+    if request.prompt.len() > MAX_PROMPT_BYTES || request.negative_prompt.len() > MAX_PROMPT_BYTES {
+        return Err("Prompt exceeds its size limit".to_string());
+    }
+    if request.steps == 0 || request.steps > MAX_STEPS {
+        return Err(format!("Steps must be between 1 and {MAX_STEPS}"));
+    }
+    if !request.cfg_scale.is_finite() || !(0.0..=100.0).contains(&request.cfg_scale) {
+        return Err("Guidance scale is out of range".to_string());
+    }
+    if request.width > MAX_DIMENSION || request.height > MAX_DIMENSION {
+        return Err(format!("Canvas may not exceed {MAX_DIMENSION} px"));
+    }
+    match (request.task.needs_init_image(), &request.init_image_base64) {
+        (true, None) => return Err("This task requires a source image".to_string()),
+        (_, Some(encoded)) if encoded.len() > MAX_INIT_IMAGE_BYTES => {
+            return Err("Source image exceeds its size limit".to_string())
+        }
+        _ => {}
+    }
+
+    let mut normalized = request.clone();
+    normalized.width = normalize_dimension(request.width);
+    normalized.height = normalize_dimension(request.height);
+    normalized.fps = 1;
+    normalized.video_frames = 1;
+    // Nothing below reaches a remote engine: LoRAs are local files, component
+    // overrides name local weight slots, and hires is an `sd-server` pass. They
+    // are dropped rather than rejected so switching the picker from a library
+    // model to a backend does not invalidate the controls already set.
+    normalized.loras.clear();
+    normalized.component_overrides.clear();
+    normalized.hires = None;
+    Ok(normalized)
+}
+
+/// Substitutes generation parameters into a ComfyUI workflow template.
+///
+/// Every string leaf is scanned, so a placeholder works wherever the user put
+/// it — the app has no idea which node in *their* graph is the sampler.
+///
+/// A leaf that is *only* a placeholder is replaced by a typed value, not by
+/// text: ComfyUI validates `steps` and `width` as numbers and rejects the graph
+/// outright if they arrive quoted. A placeholder embedded in a longer string
+/// (`"masterpiece, {{prompt}}"`) can only be text, so it is spliced instead.
+pub fn replace_workflow_placeholders(value: &mut Value, request: &GenerationRequest, model: &str) {
+    match value {
+        Value::String(text) => {
+            *value = match text.as_str() {
+                "{{prompt}}" => Value::String(request.prompt.clone()),
+                "{{negative_prompt}}" => Value::String(request.negative_prompt.clone()),
+                "{{model}}" => Value::String(model.to_string()),
+                "{{width}}" => Value::from(request.width),
+                "{{height}}" => Value::from(request.height),
+                "{{steps}}" => Value::from(request.steps),
+                "{{cfg_scale}}" => Value::from(request.cfg_scale),
+                "{{seed}}" => Value::from(request.seed),
+                _ => {
+                    if !text.contains("{{") {
+                        return;
+                    }
+                    Value::String(
+                        text.replace("{{prompt}}", &request.prompt)
+                            .replace("{{negative_prompt}}", &request.negative_prompt)
+                            .replace("{{model}}", model)
+                            .replace("{{width}}", &request.width.to_string())
+                            .replace("{{height}}", &request.height.to_string())
+                            .replace("{{steps}}", &request.steps.to_string())
+                            .replace("{{cfg_scale}}", &request.cfg_scale.to_string())
+                            .replace("{{seed}}", &request.seed.to_string()),
+                    )
+                }
+            };
+        }
+        Value::Array(items) => {
+            for item in items {
+                replace_workflow_placeholders(item, request, model);
+            }
+        }
+        Value::Object(entries) => {
+            for entry in entries.values_mut() {
+                replace_workflow_placeholders(entry, request, model);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

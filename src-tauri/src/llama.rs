@@ -226,19 +226,25 @@ fn find_llama_server_binary_for_app(app: &AppHandle) -> Result<String, String> {
         .app_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     let resource_dir = app.path().resource_dir().ok();
-    match crate::managed_runtime::materialize_bundled_runtime(
+    // A bundle that fails verification must not be the end of the search: an
+    // already-published app-data tree, the `LITTLE_MONKEY_LLAMA_RUNTIME`
+    // override and a system llama.cpp are all still valid answers, and a single
+    // bad bundle used to mask every one of them (leaving no workaround at all).
+    let bundle_error = match crate::managed_runtime::materialize_bundled_runtime(
         resource_dir.as_deref(),
         &app_data_dir,
     ) {
         Ok(Some(path)) => return Ok(path.to_string_lossy().into_owned()),
-        Ok(None) => {}
-        Err(error) => {
-            return Err(format!(
-                "Little Monkey's bundled llama.cpp runtime failed verification: {error}"
-            ))
-        }
-    }
-    find_llama_server_binary()
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+    find_llama_server_binary().map_err(|fallback_error| match bundle_error {
+        Some(bundle_error) => format!(
+            "Little Monkey's bundled llama.cpp runtime failed verification: {bundle_error}. \
+             {fallback_error}"
+        ),
+        None => fallback_error,
+    })
 }
 
 /// Emit a status event (`llama://status` or `embed://status`) to all windows
@@ -284,11 +290,10 @@ pub async fn server_reports_alias(
     expected_alias: &str,
 ) -> bool {
     let models_url = format!("http://127.0.0.1:{port}/v1/models");
-    let mut response = match client
-        .get(models_url)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
+    let mut response = match crate::egress::send(
+        client.get(models_url).timeout(Duration::from_secs(2)),
+    )
+    .await
     {
         Ok(response) if response.status().is_success() => response,
         _ => return false,
@@ -422,11 +427,10 @@ async fn spawn_and_wait_healthy(
             break;
         }
 
-        if let Ok(resp) = client
-            .get(&health_url)
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await
+        if let Ok(resp) = crate::egress::send(
+            client.get(&health_url).timeout(Duration::from_secs(2)),
+        )
+        .await
         {
             if resp.status().is_success()
                 && server_reports_alias(&client, port, expected_alias).await
@@ -607,12 +611,13 @@ pub async fn embed_server_start(
     .await?;
 
     let client = reqwest::Client::new();
-    let verify = client
-        .post(format!("http://127.0.0.1:{EMBED_PORT}/v1/embeddings"))
-        .json(&json!({ "model": startup_alias, "input": ["ready check"] }))
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await;
+    let verify = crate::egress::send(
+        client
+            .post(format!("http://127.0.0.1:{EMBED_PORT}/v1/embeddings"))
+            .json(&json!({ "model": startup_alias, "input": ["ready check"] }))
+            .timeout(Duration::from_secs(10)),
+    )
+    .await;
 
     let verified = matches!(verify, Ok(resp) if resp.status().is_success());
     if !verified {

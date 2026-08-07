@@ -2019,7 +2019,7 @@ async fn put_webdav(
         Some(etag) => request.header(IF_MATCH, etag),
         None => request.header(IF_NONE_MATCH, "*"),
     };
-    let response = request.send().await.map_err(command_error)?;
+    let response = crate::egress::send(request).await.map_err(command_error)?;
     if response.status().is_redirection() {
         return Err(
             "WebDAV redirects are disabled to keep credentials on the configured origin"
@@ -2209,12 +2209,11 @@ async fn probe_remote_snapshot(
     password: &str,
     remote_path: &str,
 ) -> Result<RemoteSnapshotProbe, String> {
-    let response = client
-        .get(remote_url(config, remote_path)?)
-        .basic_auth(&config.username, Some(password))
-        .send()
-        .await
-        .map_err(command_error)?;
+    let response = crate::egress::send(
+        client.get(remote_url(config, remote_path)?).basic_auth(&config.username, Some(password)),
+    )
+    .await
+    .map_err(command_error)?;
     if response.status().is_redirection() {
         return Err("WebDAV redirects are disabled to protect credentials".to_string());
     }
@@ -2612,15 +2611,16 @@ pub async fn portable_webdav_run_due(
 pub async fn portable_webdav_test(app: tauri::AppHandle) -> Result<(), String> {
     let config = validate_stored_config(load_webdav_config(&app)?)?;
     let password = load_webdav_password(&config)?;
-    let response = webdav_client()?
-        .request(
-            reqwest::Method::OPTIONS,
-            Url::parse(&config.base_url).map_err(command_error)?,
-        )
-        .basic_auth(&config.username, Some(password))
-        .send()
-        .await
-        .map_err(command_error)?;
+    let response = crate::egress::send(
+        webdav_client()?
+            .request(
+                reqwest::Method::OPTIONS,
+                Url::parse(&config.base_url).map_err(command_error)?,
+            )
+            .basic_auth(&config.username, Some(password)),
+    )
+    .await
+    .map_err(command_error)?;
     if response.status().is_redirection() {
         return Err("WebDAV redirects are disabled to protect credentials".to_string());
     }
@@ -2668,7 +2668,7 @@ pub async fn portable_webdav_download_snapshot(
     if let Some(etag) = config.known_etag.as_deref() {
         request = request.header(IF_NONE_MATCH, etag);
     }
-    let response = request.send().await.map_err(command_error)?;
+    let response = crate::egress::send(request).await.map_err(command_error)?;
     if response.status().is_redirection() {
         return Err("WebDAV redirects are disabled to protect credentials".to_string());
     }

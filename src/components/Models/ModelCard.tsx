@@ -21,6 +21,9 @@ export interface ModelCardProps {
   llamaStatus: LlamaStatus;
   /** Present while `model.file` is being downloaded. */
   downloadProgress?: DownloadProgress;
+  /** Backend reason the last start failed. Shown verbatim in place of the
+   * generic message, which on its own is undiagnosable. */
+  startError?: string | null;
   onInstall: () => void;
   onCancelDownload: () => void;
   onDelete: () => void;
@@ -40,6 +43,7 @@ export function ModelCard({
   isActive,
   llamaStatus,
   downloadProgress,
+  startError,
   onInstall,
   onCancelDownload,
   onDelete,
@@ -81,9 +85,11 @@ export function ModelCard({
           {formatSizeGb(model.size_gb)}
         </p>
         {isErrored && (
-          <p className="mt-1 flex items-center gap-1 text-xs text-danger">
-            <AlertTriangle size={12} className="shrink-0" />
-            {t("ModelCard.startFailedMessage")}
+          <p className="mt-1 flex items-start gap-1 text-xs text-danger">
+            <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+            <span className="break-words">
+              {startError || t("ModelCard.startFailedMessage")}
+            </span>
           </p>
         )}
       </div>

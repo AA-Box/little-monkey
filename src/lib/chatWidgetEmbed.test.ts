@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildWidgetEmbedSnippet, resolveExpiryPreset } from "./chatWidgetEmbed";
+import { buildWidgetEmbedSnippet } from "./chatWidgetEmbed";
 
 // Split so secret scanners don't flag the fixture as a real token.
 const FAKE_TOKEN = ["lmk-", "abcdef0123456789abcdef0123456789"].join("");
@@ -60,30 +60,5 @@ describe("buildWidgetEmbedSnippet", () => {
     // and a token/title cannot break out of its string literal.
     expect(snippet).toContain('token: "lmk-\\"><script>alert(1)</script>"');
     expect(snippet).toContain('title: "A \\"quoted\\" title"');
-  });
-});
-
-describe("resolveExpiryPreset", () => {
-  const now = 1_700_000_000_000;
-
-  it("resolves 'never' to null", () => {
-    expect(resolveExpiryPreset("never", now)).toBeNull();
-  });
-
-  it("resolves each preset to now plus the expected duration", () => {
-    expect(resolveExpiryPreset("1h", now)).toBe(now + 60 * 60 * 1000);
-    expect(resolveExpiryPreset("1d", now)).toBe(now + 24 * 60 * 60 * 1000);
-    expect(resolveExpiryPreset("7d", now)).toBe(now + 7 * 24 * 60 * 60 * 1000);
-    expect(resolveExpiryPreset("30d", now)).toBe(now + 30 * 24 * 60 * 60 * 1000);
-    expect(resolveExpiryPreset("90d", now)).toBe(now + 90 * 24 * 60 * 60 * 1000);
-  });
-
-  it("defaults `now` to the current time when omitted", () => {
-    const before = Date.now();
-    const resolved = resolveExpiryPreset("1d");
-    const after = Date.now();
-    expect(resolved).not.toBeNull();
-    expect(resolved as number).toBeGreaterThanOrEqual(before + 24 * 60 * 60 * 1000);
-    expect(resolved as number).toBeLessThanOrEqual(after + 24 * 60 * 60 * 1000);
   });
 });

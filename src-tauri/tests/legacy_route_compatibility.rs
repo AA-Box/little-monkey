@@ -30,15 +30,10 @@
 //! probe, skip-on-`PermissionDenied` sandbox guard, real `reqwest` client,
 //! teardown at the end of the test).
 //!
-//! One consequence of going through `run_cli_server` is worth stating
-//! plainly: two of legacy's upstreams live at **hardcoded** loopback ports
-//! in that loop — llama-server at `llama::CHAT_PORT` (8090) and Ollama at
-//! `ollama::OLLAMA_BASE_URL` (11434; `handle_models` reaches Ollama through
-//! that constant, not through `ServerDeps::ollama_base_url`). The two pins
-//! that need an upstream therefore need those exact ports, and skip
-//! themselves — loudly, on stderr — when something else already holds one
-//! (a developer machine running the real llama-server or Ollama). See
-//! `fixed_port_upstreams`.
+//! The production wrapper still uses llama-server/Ollama's conventional
+//! loopback endpoints. This harness drives the same common server with
+//! explicitly injected ephemeral endpoints, so a developer's real Ollama
+//! daemon can neither make a pin skip nor become accidental test input.
 //!
 //! WHAT IS NOT PINNED HERE, and why: the third `owned_by` family,
 //! `"{provider_id}"` from a configured cloud provider, is unreachable from a
@@ -48,14 +43,20 @@
 //! would mean writing to the developer's real OS keychain. That gap is
 //! recorded rather than faked.
 
+use little_monkey_lib::m3_runtime_hub::{
+    M3DownloadTransport, M3HardwareProbe, M3HubConfig, M3HubResult, M3RuntimeHub,
+    M3RuntimeHubDependencies, ReqwestM3DownloadTransport, SystemM3Clock,
+};
+use little_monkey_lib::runtime_adapter::{HardwareSnapshot, PlatformCapabilities};
 use little_monkey_lib::server::{
-    run_cli_server, save_config_impl, ApiServerConfig, Backend, Scope, TokenEntry,
+    run_cli_server_with_m3_hub_and_endpoints, save_config_impl, ApiServerConfig, Backend,
+    CliRuntimeEndpoints, Scope, TokenEntry,
 };
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::Arc;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------
@@ -89,8 +90,8 @@ const NOT_FOUND_BODY: &[u8] =
 /// Pins three things at once: the envelope's own alphabetical key order
 /// (`data` before `object`, again not source order), each entry's three keys
 /// and their order, and the `owned_by` literal `"local"` that clients filter
-/// on. The id is whatever `probe_llama_server` read from the upstream — in
-/// the GUI loop the same slot is filled from the model file's stem — so the
+/// on. The id is whatever the post-auth lazy catalog read from the upstream —
+/// in the GUI loop the same slot is filled from the model file's stem — so the
 /// pinned part is the shape and the `owned_by` value, not the name.
 const MODELS_LOCAL_ONLY_BODY: &[u8] =
     br#"{"data":[{"id":"pinned-local-model","object":"model","owned_by":"local"}],"object":"list"}"#;
@@ -122,12 +123,37 @@ const UPSTREAM_SSE_BYTES: &[u8] = b": keep-alive\n\ndata:{\"choices\":[{\"delta\
 /// canonical `text/event-stream`.
 const UPSTREAM_SSE_CONTENT_TYPE: &str = "text/event-stream; charset=utf-8";
 
-/// llama-server's hardcoded port in `run_cli_server` (`llama::CHAT_PORT`,
-/// which is `pub(crate)` and so not nameable from here).
-const LEGACY_LLAMA_PORT: u16 = 8090;
+/// What the embeddings upstream puts on the wire, written to be *wrong* in
+/// several ways a handler that deserialized and re-serialized would silently
+/// correct:
+///
+///   * `object` before `data`, and `index` before `embedding` — source order,
+///     not the alphabetical order this crate's `serde_json` `Map` (a
+///     `BTreeMap`, no `preserve_order`) would re-emit,
+///   * a vendor key legacy has never heard of (`x_upstream_note`), which a
+///     typed round-trip through an OpenAI-shaped struct would drop,
+///   * `1.0` rather than `1`, which `serde_json` re-serializes as `1.0` but a
+///     typed `f32`/`f64` round-trip through some encoders renders differently.
+///
+/// Legacy never parses this at all: `handle_embeddings` hands the upstream's
+/// `bytes()` straight to the response body. m3's embeddings handler builds its
+/// own canonical envelope and cannot reproduce any of the above, so this const
+/// is what a "cleanup" that pointed `/v1/embeddings` at the m3 handler breaks.
+const UPSTREAM_EMBEDDINGS_BODY: &[u8] = br#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[1.0,-0.5]}],"model":"pinned-ollama-tag:latest","x_upstream_note":"relayed verbatim"}"#;
 
-/// Ollama's hardcoded port (`ollama::OLLAMA_BASE_URL`).
-const LEGACY_OLLAMA_PORT: u16 = 11434;
+/// The embeddings upstream's own `Content-Type`, deliberately *not* JSON.
+/// Unlike the streaming chat path (which echoes the upstream header verbatim),
+/// `handle_embeddings` always stamps `application/json` on the way out — so
+/// this value must never appear on the client's response.
+const UPSTREAM_EMBEDDINGS_CONTENT_TYPE: &str = "application/x-upstream-quirk";
+
+/// The legacy scope refusal for `/v1/embeddings`, spelled out because it is
+/// one of the strings that differs between the two implementations: legacy
+/// names the route in backticks and uses `code: "insufficient_scope"`, while
+/// m3 answers `{"error":{"code":"forbidden",...}}` with "token does not grant
+/// the requested scope". A client branching on either string sees a different
+/// one depending on which handler owns the route.
+const EMBEDDINGS_SCOPE_ERROR_MESSAGE: &str = "This token isn't scoped for `embeddings`.";
 
 /// Bounds the wait for `run_cli_server`'s listener, and every request. A
 /// hang would otherwise be indistinguishable from a slow machine: legacy's
@@ -189,33 +215,97 @@ fn token_digest(plaintext: &str) -> String {
         .collect()
 }
 
+struct TestHardware;
+
+impl M3HardwareProbe for TestHardware {
+    fn snapshot(&self) -> M3HubResult<HardwareSnapshot> {
+        Ok(HardwareSnapshot {
+            captured_at_ms: 1_000,
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,
+            available_ram_bytes: 12 * 1024 * 1024 * 1024,
+            logical_cpu_count: 8,
+            platform: PlatformCapabilities::from_host("linux", "x86_64", Vec::new()),
+        })
+    }
+}
+
+fn test_m3_hub(root: &std::path::Path) -> Arc<M3RuntimeHub> {
+    let download: Arc<dyn M3DownloadTransport> =
+        Arc::new(ReqwestM3DownloadTransport::new().expect("test download transport"));
+    Arc::new(
+        M3RuntimeHub::new(
+            root,
+            M3HubConfig {
+                storage_quota_bytes: 8 * 1024 * 1024 * 1024,
+                storage_reserve_bytes: 1024 * 1024 * 1024,
+                ..M3HubConfig::default()
+            },
+            M3RuntimeHubDependencies {
+                clock: Arc::new(SystemM3Clock),
+                hardware: Arc::new(TestHardware),
+                download,
+                catalogs: Vec::new(),
+                runtimes: Vec::new(),
+                runtime_reconciler: None,
+                lan_factory: None,
+            },
+        )
+        .expect("legacy compatibility test M3 hub"),
+    )
+}
+
 /// One running legacy server, plus the `api_server.json` it re-reads on
 /// **every** request. That re-read is what lets a single test flip
 /// `require_token`/`expose_ollama` mid-flight (see `build_deps`' "never
 /// stale" note) instead of paying for a second server.
 struct LegacyServer {
     base: String,
+    data_dir: PathBuf,
     config_path: PathBuf,
     accept_loop: tokio::task::JoinHandle<Result<(), String>>,
 }
 
 impl LegacyServer {
     async fn start(label: &str, config: ApiServerConfig) -> Option<Self> {
+        Self::start_with_endpoints(label, config, unreachable_runtime_endpoints()).await
+    }
+
+    async fn start_with_endpoints(
+        label: &str,
+        config: ApiServerConfig,
+        endpoints: CliRuntimeEndpoints,
+    ) -> Option<Self> {
         let port = free_loopback_port().await?;
-        let config_path = std::env::temp_dir().join(format!(
-            "legacy-route-compat-{label}-{}-{}.json",
+        let data_dir = std::env::temp_dir().join(format!(
+            "legacy-route-compat-{label}-{}-{}",
             std::process::id(),
             next_test_id()
         ));
+        std::fs::create_dir(&data_dir).expect("create the private fixture app-data directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("make the fixture app-data directory private");
+        }
+        let config_path = data_dir.join("api_server.json");
         save_config_impl(&config_path, &config).expect("write the legacy server's config");
+        let m3_hub = test_m3_hub(&data_dir.join("m3-test-hub"));
 
         // No custom cloud providers: the built-in presets are catalogued
         // regardless, and none of them can be *routed* to without a keychain
         // key, so the provider branch stays inert either way.
-        let accept_loop = tokio::spawn(run_cli_server(port, config_path.clone(), Vec::new));
+        let accept_loop = tokio::spawn(run_cli_server_with_m3_hub_and_endpoints(
+            port,
+            config_path.clone(),
+            m3_hub,
+            endpoints,
+            Vec::new,
+        ));
 
-        let server = LegacyServer {
+        let mut server = LegacyServer {
             base: format!("http://127.0.0.1:{port}"),
+            data_dir,
             config_path,
             accept_loop,
         };
@@ -226,6 +316,10 @@ impl LegacyServer {
         for _ in 0..100 {
             if client.get(server.url("/health")).send().await.is_ok() {
                 return Some(server);
+            }
+            if server.accept_loop.is_finished() {
+                let outcome = (&mut server.accept_loop).await;
+                panic!("the legacy server exited before readiness: {outcome:?}");
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -241,10 +335,24 @@ impl LegacyServer {
     }
 }
 
+fn unreachable_runtime_endpoints() -> CliRuntimeEndpoints {
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve an unused test runtime port");
+    let port = listener
+        .local_addr()
+        .expect("unused runtime address")
+        .port();
+    drop(listener);
+    CliRuntimeEndpoints {
+        llama_port: port,
+        ollama_base_url: format!("http://127.0.0.1:{port}"),
+    }
+}
+
 impl Drop for LegacyServer {
     fn drop(&mut self) {
         self.accept_loop.abort();
-        let _ = std::fs::remove_file(&self.config_path);
+        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -258,10 +366,10 @@ impl Drop for LegacyServer {
 /// the whole test binary because it owns a fixed port that more than one test
 /// probes, and the process exiting is what releases it.
 fn spawn_fake_upstream(
-    port: u16,
     respond: impl Fn(&str) -> Vec<u8> + Send + 'static,
-) -> Result<(), std::io::Error> {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
+) -> Result<u16, std::io::Error> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
     std::thread::spawn(move || {
         while let Ok((mut stream, _)) = listener.accept() {
             let mut buffer = [0u8; 8192];
@@ -271,7 +379,19 @@ fn spawn_fake_upstream(
             let _ = stream.flush();
         }
     });
-    Ok(())
+    Ok(port)
+}
+
+fn spawn_counted_fake_upstream(
+    respond: impl Fn(&str) -> Vec<u8> + Send + 'static,
+) -> Result<(u16, Arc<AtomicU64>), std::io::Error> {
+    let requests = Arc::new(AtomicU64::new(0));
+    let observed = requests.clone();
+    let port = spawn_fake_upstream(move |head| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        respond(head)
+    })?;
+    Ok((port, requests))
 }
 
 fn raw_http_response(content_type: &str, body: &[u8]) -> Vec<u8> {
@@ -284,53 +404,40 @@ fn raw_http_response(content_type: &str, body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Binds both hardcoded-port fakes, once for the whole test binary, and
-/// reports whether they are ours.
-///
-/// `false` means something else already holds 8090 or 11434 — on a developer
-/// machine, most likely the real llama-server or the real Ollama. The pins
-/// that need an upstream then skip rather than assert against a live daemon
-/// whose model list nobody controls.
-fn fixed_port_upstreams() -> bool {
-    static READY: OnceLock<bool> = OnceLock::new();
-    *READY.get_or_init(|| {
-        // llama-server: `probe_llama_server` calls `/health` and then
-        // `/v1/models`, and takes `data[0].id` as the ready model's id.
-        let llama = spawn_fake_upstream(LEGACY_LLAMA_PORT, |head| {
-            if head.starts_with("GET /v1/models") {
-                raw_http_response(
-                    "application/json",
-                    br#"{"object":"list","data":[{"id":"pinned-local-model","object":"model"}]}"#,
-                )
-            } else {
-                raw_http_response("application/json", br#"{"status":"ok"}"#)
-            }
-        });
-        // Ollama: `/api/tags` for the model listing, `/v1/chat/completions`
-        // for the SSE relay. Every non-empty model id that isn't the ready
-        // llama stem routes here (`route_model`).
-        let ollama = spawn_fake_upstream(LEGACY_OLLAMA_PORT, |head| {
-            if head.starts_with("GET /api/tags") {
-                raw_http_response(
-                    "application/json",
-                    br#"{"models":[{"name":"pinned-ollama-tag:latest"}]}"#,
-                )
-            } else {
-                raw_http_response(UPSTREAM_SSE_CONTENT_TYPE, UPSTREAM_SSE_BYTES)
-            }
-        });
-        match (llama, ollama) {
-            (Ok(()), Ok(())) => true,
-            _ => {
-                eprintln!(
-                    "skipping the upstream-backed legacy pins: 127.0.0.1:{LEGACY_LLAMA_PORT} or \
-                     :{LEGACY_OLLAMA_PORT} is already in use (a real llama-server or Ollama?), and \
-                     `run_cli_server` reaches those upstreams at hardcoded ports"
-                );
-                false
-            }
+/// Starts isolated ephemeral llama-server and Ollama stand-ins and returns the
+/// endpoints injected into the AppHandle-free CLI core. Nothing is skipped:
+/// failure to create either loopback fake is a harness failure.
+fn fake_runtime_endpoints() -> CliRuntimeEndpoints {
+    // llama-server: the post-auth source reads `/v1/models` and takes each
+    // `data[].id` as a servable model identity.
+    let llama_port = spawn_fake_upstream(|head| {
+        if head.starts_with("GET /v1/models") {
+            raw_http_response(
+                "application/json",
+                br#"{"object":"list","data":[{"id":"pinned-local-model","object":"model"}]}"#,
+            )
+        } else {
+            raw_http_response("application/json", br#"{"status":"ok"}"#)
         }
     })
+    .expect("bind the ephemeral llama-server stand-in");
+    // Ollama: `/api/tags` for model listing and `/v1/chat/completions` for
+    // the raw SSE relay.
+    let ollama_port = spawn_fake_upstream(|head| {
+        if head.starts_with("GET /api/tags") {
+            raw_http_response(
+                "application/json",
+                br#"{"models":[{"name":"pinned-ollama-tag:latest"}]}"#,
+            )
+        } else {
+            raw_http_response(UPSTREAM_SSE_CONTENT_TYPE, UPSTREAM_SSE_BYTES)
+        }
+    })
+    .expect("bind the ephemeral Ollama stand-in");
+    CliRuntimeEndpoints {
+        llama_port,
+        ollama_base_url: format!("http://127.0.0.1:{ollama_port}"),
+    }
 }
 
 /// Asserts on bytes, and prints both sides as text when they differ — the
@@ -633,6 +740,38 @@ async fn each_legacy_failure_keeps_its_own_code_and_message_bytes() {
         .as_bytes(),
     );
 
+    // Unknown and explicitly denied-looking paths still pass through the
+    // legacy authentication gate. The typed registry must prevent dispatch,
+    // but it must not turn either path into a pre-auth route-existence oracle.
+    let response = client
+        .get(server.url("/v1/tools"))
+        .send()
+        .await
+        .expect("GET a denied-looking path with no configured tokens");
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_bytes(
+        "denied-looking legacy path authenticates before 404",
+        &response.bytes().await.expect("denied-looking 401 body"),
+        &no_tokens_body,
+    );
+
+    // Host-only desktop routes are deliberately unavailable to the
+    // AppHandle-free CLI, but historically they were ordinary unknown paths
+    // there and therefore still authenticated before the 404.
+    let response = client
+        .post(server.url("/v1/knowledge/query"))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("POST a GUI-only route through the CLI listener");
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_bytes(
+        "GUI-only legacy path authenticates in the CLI",
+        &response.bytes().await.expect("GUI-only 401 body"),
+        &no_tokens_body,
+    );
+
     // A token exists but this caller's bearer doesn't match it. Same `code`,
     // different message — and the difference is the point: collapsing the two
     // into one generic 401 would leave an operator unable to tell "I never
@@ -673,6 +812,51 @@ async fn each_legacy_failure_keeps_its_own_code_and_message_bytes() {
     assert_ne!(
         no_tokens_body, wrong_token_body,
         "the two 401 reasons must stay distinguishable"
+    );
+
+    // A wrong method on a known legacy route follows the same ordering: an
+    // invalid bearer gets the ordinary 401, not a pre-auth 405 that reveals
+    // the route. With a valid bearer below, the same request reaches the
+    // historical 404 fallthrough.
+    let response = client
+        .get(server.url("/v1/chat/completions"))
+        .bearer_auth("lmk-not-the-right-token")
+        .send()
+        .await
+        .expect("GET a legacy POST route with a wrong bearer");
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_bytes(
+        "legacy wrong-method request authenticates first",
+        &response.bytes().await.expect("wrong-method 401 body"),
+        &wrong_token_body,
+    );
+
+    let response = client
+        .get(server.url("/v1/chat/completions"))
+        .bearer_auth(scoped_token)
+        .send()
+        .await
+        .expect("GET a legacy POST route with a valid bearer");
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_bytes(
+        "legacy authenticated wrong method falls through",
+        &response.bytes().await.expect("wrong-method 404 body"),
+        NOT_FOUND_BODY,
+    );
+
+    let response = client
+        .post(server.url("/v1/knowledge/query"))
+        .bearer_auth(scoped_token)
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("POST an unavailable GUI-only route with a valid bearer");
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_bytes(
+        "GUI-only legacy path falls through after authentication",
+        &response.bytes().await.expect("GUI-only 404 body"),
+        NOT_FOUND_BODY,
     );
 
     // Authenticated, but out of scope: `403`, and a distinct `code` clients
@@ -755,6 +939,24 @@ async fn options_on_a_v1_route_is_a_204_preflight_that_needs_no_token() {
         "a 204 preflight carries no body"
     );
 
+    // The wildcard is literal. A path that would be denied for an execution
+    // method remains a harmless legacy preflight: it cannot dispatch a tool,
+    // but browser clients still receive the byte-compatible 204 contract.
+    let response = client
+        .request(reqwest::Method::OPTIONS, server.url("/v1/tools"))
+        .send()
+        .await
+        .expect("OPTIONS /v1/tools");
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("*")
+    );
+    assert!(response.bytes().await.expect("preflight body").is_empty());
+
     // Counter-test 1: authentication really is on under this config, so the
     // 204 above is a route-specific bypass and not "this server accepts
     // everything".
@@ -794,10 +996,9 @@ async fn options_on_a_v1_route_is_a_204_preflight_that_needs_no_token() {
 
 #[tokio::test]
 async fn the_models_listing_labels_owned_by_local_then_ollama_with_byte_exact_entries() {
-    if !fixed_port_upstreams() {
-        return;
-    }
-    let Some(server) = LegacyServer::start("models", base_config()).await else {
+    let endpoints = fake_runtime_endpoints();
+    let Some(server) = LegacyServer::start_with_endpoints("models", base_config(), endpoints).await
+    else {
         return;
     };
     let client = http_client();
@@ -847,20 +1048,98 @@ async fn the_models_listing_labels_owned_by_local_then_ollama_with_byte_exact_en
     );
 }
 
+#[tokio::test]
+async fn model_sources_are_unobserved_before_auth_and_unknown_ids_are_not_guessed_as_ollama() {
+    let (llama_port, llama_requests) = spawn_counted_fake_upstream(|_| {
+        raw_http_response(
+            "application/json",
+            br#"{"object":"list","data":[{"id":"pinned-local-model","object":"model"}]}"#,
+        )
+    })
+    .expect("bind counted llama stand-in");
+    let (ollama_port, ollama_requests) = spawn_counted_fake_upstream(|_| {
+        raw_http_response(
+            "application/json",
+            br#"{"models":[{"name":"pinned-ollama-tag:latest"}]}"#,
+        )
+    })
+    .expect("bind counted Ollama stand-in");
+    let token = "lmk-catalog-ordering-pin";
+    let config = ApiServerConfig {
+        require_token: true,
+        expose_ollama: true,
+        tokens: vec![TokenEntry {
+            id: "catalog-ordering".to_string(),
+            label: "catalog ordering".to_string(),
+            sha256: token_digest(token),
+            scopes: vec![Scope::Models, Scope::Chat],
+            backends: vec![Backend::Local, Backend::Ollama],
+            ..TokenEntry::default()
+        }],
+        ..base_config()
+    };
+    let endpoints = CliRuntimeEndpoints {
+        llama_port,
+        ollama_base_url: format!("http://127.0.0.1:{ollama_port}"),
+    };
+    let Some(server) =
+        LegacyServer::start_with_endpoints("catalog-ordering", config, endpoints).await
+    else {
+        return;
+    };
+    let client = http_client();
+
+    let denied = client
+        .get(server.url("/v1/models"))
+        .bearer_auth("lmk-invalid")
+        .send()
+        .await
+        .expect("invalid bearer request");
+    assert_eq!(denied.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(llama_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(ollama_requests.load(Ordering::SeqCst), 0);
+
+    let listed = client
+        .get(server.url("/v1/models"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("authorized union listing");
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+    assert_bytes(
+        "authorized union listing",
+        &listed.bytes().await.expect("union body"),
+        MODELS_LOCAL_AND_OLLAMA_BODY,
+    );
+    assert_eq!(llama_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(ollama_requests.load(Ordering::SeqCst), 1);
+
+    let unknown = client
+        .post(server.url("/v1/chat/completions"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"model":"not-advertised","messages":[]}))
+        .send()
+        .await
+        .expect("unknown exact model request");
+    assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+    let body = unknown.text().await.expect("unknown model body");
+    assert!(body.contains("not-advertised"));
+    assert!(body.contains("legacy-managed-llama"));
+    assert!(body.contains("legacy-ollama"));
+}
+
 // ---------------------------------------------------------------------
 // 5. Raw SSE passthrough
 // ---------------------------------------------------------------------
 
 #[tokio::test]
 async fn streamed_upstream_sse_bytes_reach_the_client_unmodified() {
-    if !fixed_port_upstreams() {
-        return;
-    }
+    let endpoints = fake_runtime_endpoints();
     let config = ApiServerConfig {
         expose_ollama: true,
         ..base_config()
     };
-    let Some(server) = LegacyServer::start("sse", config).await else {
+    let Some(server) = LegacyServer::start_with_endpoints("sse", config, endpoints).await else {
         return;
     };
     let client = http_client();
@@ -888,21 +1167,12 @@ async fn streamed_upstream_sse_bytes_reach_the_client_unmodified() {
         Some("*"),
         "the streaming path is wrapped by `with_cors` too"
     );
-    // Pins a real cross-cutting property, but not the one an earlier version of this
-    // claimed. It said a Content-Length here would prove legacy had buffered the
-    // completion. It would not: `serve_with_admission` ends every response body in
-    // `hold_permit_until_body_ends`, whose `StreamBody` does not override
-    // `Body::size_hint`, so hyper sees `None` and chunks *every* legacy response —
-    // streamed or buffered. What this does pin is that the admission wrapper stays in
-    // the response path, which a merge that re-wrapped bodies would change.
-    //
-    // The streaming-vs-buffered distinction is deliberately *not* pinned here. It is
-    // not observable in headers on this server, and the only alternative is a timing
-    // assertion, which is a flake waiting to happen. The byte compare below is what
-    // proves passthrough, and that is the property the roadmap actually names.
+    // The admission body delegates `Body::size_hint`, so the streaming body remains
+    // unknown-length while a buffered response below keeps its exact length. That
+    // makes the two production branches observable without a timing assertion.
     assert!(
         response.headers().get("content-length").is_none(),
-        "every legacy body is chunked, because the admission wrapper erases its size hint"
+        "the streamed branch must stay unknown-length"
     );
 
     let body = response.bytes().await.expect("SSE body");
@@ -948,19 +1218,231 @@ async fn streamed_upstream_sse_bytes_reach_the_client_unmodified() {
         .await
         .expect("POST a non-streaming chat completion");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
-    // Symmetric with the streamed branch above, and the assertion an earlier version of
-    // this test got backwards: it expected `Content-Length: <len>` here on the theory
-    // that a buffered response knows its own length. It does not reach the client that
-    // way — `hold_permit_until_body_ends` wraps this body too — so that assertion
-    // failed with `left: None, right: Some("106")`, and only in CI, because both fake
-    // upstream ports have to bind for this test to run at all.
-    assert!(
-        response.headers().get("content-length").is_none(),
-        "the buffered branch is chunked for the same reason the streamed one is"
+    let expected_content_length = UPSTREAM_SSE_BYTES.len().to_string();
+    assert_eq!(
+        response
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_content_length.as_str()),
+        "the buffered branch must preserve its exact body length"
     );
     assert_bytes(
         "buffered body",
         &response.bytes().await.expect("buffered body"),
         UPSTREAM_SSE_BYTES,
+    );
+}
+
+// ---------------------------------------------------------------------
+// 7. `/v1/embeddings` — the fourth shared route
+// ---------------------------------------------------------------------
+
+/// The one shared route (`shared_route_owner`'s four) that had no byte pin at
+/// all. Its legacy and m3 implementations diverge in every dimension this file
+/// exists to guard — wildcard CORS versus deny-by-default, a verbatim upstream
+/// relay versus a re-serialized canonical envelope, and a different scope-error
+/// code *and* message — yet the only tests touching it were generic CORS and
+/// envelope tests on *other* routes. A cleanup that collapsed `/v1/embeddings`
+/// onto the m3 handler would have turned every browser client of it into an
+/// opaque CORS failure with nothing going red.
+///
+/// Reached through Ollama rather than llama-server on purpose: the
+/// `AppHandle`-free CLI core hardcodes `llama_embeddings_enabled: false` (it
+/// cannot see the GUI's in-memory `--embeddings` flag), so the llama branch is
+/// a `501` here and the Ollama branch is the only one that reaches an upstream.
+#[tokio::test]
+async fn the_embeddings_route_relays_upstream_bytes_with_wildcard_cors_and_its_own_scope_error() {
+    // llama-server's inventory still has to answer, because the merged catalog
+    // is read before the model id is matched; only the Ollama half is what this
+    // request routes to.
+    let llama_port = spawn_fake_upstream(|head| {
+        if head.starts_with("GET /v1/models") {
+            raw_http_response(
+                "application/json",
+                br#"{"object":"list","data":[{"id":"pinned-local-model","object":"model"}]}"#,
+            )
+        } else {
+            raw_http_response("application/json", br#"{"status":"ok"}"#)
+        }
+    })
+    .expect("bind the ephemeral llama-server stand-in");
+    let ollama_port = spawn_fake_upstream(|head| {
+        if head.starts_with("GET /api/tags") {
+            raw_http_response(
+                "application/json",
+                br#"{"models":[{"name":"pinned-ollama-tag:latest"}]}"#,
+            )
+        } else {
+            raw_http_response(UPSTREAM_EMBEDDINGS_CONTENT_TYPE, UPSTREAM_EMBEDDINGS_BODY)
+        }
+    })
+    .expect("bind the ephemeral embeddings upstream stand-in");
+    let endpoints = CliRuntimeEndpoints {
+        llama_port,
+        ollama_base_url: format!("http://127.0.0.1:{ollama_port}"),
+    };
+    let config = ApiServerConfig {
+        expose_ollama: true,
+        ..base_config()
+    };
+    let Some(server) = LegacyServer::start_with_endpoints("embeddings", config, endpoints).await
+    else {
+        return;
+    };
+    let client = http_client();
+    let embeddings_body = r#"{"model":"pinned-ollama-tag:latest","input":"hello"}"#;
+
+    // 1. Success: the upstream's bytes, unmodified, under a *fixed*
+    //    `application/json` (not the upstream's own content-type), with the
+    //    wildcard CORS origin.
+    let response = client
+        .post(server.url("/v1/embeddings"))
+        .header("content-type", "application/json")
+        .body(embeddings_body)
+        .send()
+        .await
+        .expect("POST /v1/embeddings");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        cors_origin(&response).as_deref(),
+        Some("*"),
+        "a successful embeddings response must carry the wildcard CORS origin — m3's default is \
+         deny-all, so a merge that adopts it silently breaks every browser client of this route"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "embeddings stamps a fixed content-type rather than echoing the upstream's, unlike the \
+         streaming chat path"
+    );
+    let expected_length = UPSTREAM_EMBEDDINGS_BODY.len().to_string();
+    assert_eq!(
+        response
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_length.as_str()),
+        "embeddings are never streamed — the body is buffered and keeps its exact length"
+    );
+    let body = response.bytes().await.expect("embeddings body");
+    assert_bytes("POST /v1/embeddings", &body, UPSTREAM_EMBEDDINGS_BODY);
+    // Spelled out separately from the byte compare, because each of these is a
+    // quirk a re-serializing implementation would individually "fix" and a
+    // named assertion says which one broke.
+    assert!(
+        body.starts_with(br#"{"object":"list","data":"#),
+        "source key order must survive; alphabetical order means the body was re-serialized"
+    );
+    assert!(
+        contains_bytes(&body, br#""x_upstream_note":"relayed verbatim""#),
+        "an unknown upstream key must survive; a typed round-trip would drop it"
+    );
+    assert!(
+        contains_bytes(&body, b"[1.0,-0.5]"),
+        "the upstream's own float rendering must survive"
+    );
+
+    // 2. Failure, same route, same wildcard. The scope refusal is legacy's own
+    //    `insufficient_scope` envelope, byte for byte — a different code *and*
+    //    a different message from m3's `forbidden` / "token does not grant the
+    //    requested scope", so a client branching on either sees which handler
+    //    owns the route.
+    let scoped_token = "lmk-embeddings-pin-token";
+    server.set_config(ApiServerConfig {
+        require_token: true,
+        expose_ollama: true,
+        tokens: vec![TokenEntry {
+            id: "embeddings-pin".to_string(),
+            label: "embeddings route pins".to_string(),
+            sha256: token_digest(scoped_token),
+            // Deliberately *not* `Embeddings`.
+            scopes: vec![Scope::Models],
+            backends: vec![Backend::Local, Backend::Ollama],
+            ..TokenEntry::default()
+        }],
+        ..base_config()
+    });
+    let response = client
+        .post(server.url("/v1/embeddings"))
+        .bearer_auth(scoped_token)
+        .header("content-type", "application/json")
+        .body(embeddings_body)
+        .send()
+        .await
+        .expect("POST /v1/embeddings with an under-scoped token");
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(
+        cors_origin(&response).as_deref(),
+        Some("*"),
+        "the header is not conditional on success — a browser needs it on the 403 most of all, or \
+         the fetch rejects with an opaque network error instead of surfacing the status"
+    );
+    let denied = response.bytes().await.expect("embeddings 403 body");
+    assert_bytes(
+        "under-scoped embeddings token",
+        &denied,
+        error_envelope("insufficient_scope", EMBEDDINGS_SCOPE_ERROR_MESSAGE).as_bytes(),
+    );
+
+    // Structural belt-and-braces on the envelope, same as the 404 pin: no
+    // fourth key inside `error`, nothing beside it at the top level. An
+    // implementation that *added* `param` or `request_id` would still satisfy a
+    // `contains` check and still break a client with a closed struct.
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&denied).expect("the embeddings 403 body is JSON");
+    let top = parsed.as_object().expect("a JSON object");
+    assert_eq!(
+        top.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["error"],
+        "`error` is the only top-level key"
+    );
+    let inner = top["error"].as_object().expect("error is an object");
+    assert_eq!(
+        inner.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["code", "message", "type"],
+        "exactly three keys, in this order"
+    );
+
+    // 3. And the pre-resolution failure, which is where the scope check's
+    //    ordering shows: a missing `model` is legacy's `404 model_not_found`
+    //    with OpenAI's own wording, still wildcard-CORS'd.
+    server.set_config(ApiServerConfig {
+        expose_ollama: true,
+        ..base_config()
+    });
+    let response = client
+        .post(server.url("/v1/embeddings"))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("POST /v1/embeddings with no model");
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(cors_origin(&response).as_deref(), Some("*"));
+    assert_bytes(
+        "embeddings with no model",
+        &response.bytes().await.expect("embeddings 404 body"),
+        error_envelope("model_not_found", "you must provide a model parameter").as_bytes(),
+    );
+
+    // Counter-test for the block: the same server still answers the success
+    // case, so the failures above are route-specific refusals and not "this
+    // fixture stopped working".
+    let response = client
+        .post(server.url("/v1/embeddings"))
+        .header("content-type", "application/json")
+        .body(embeddings_body)
+        .send()
+        .await
+        .expect("POST /v1/embeddings again after the failure cases");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_bytes(
+        "POST /v1/embeddings (repeat)",
+        &response.bytes().await.expect("embeddings body"),
+        UPSTREAM_EMBEDDINGS_BODY,
     );
 }

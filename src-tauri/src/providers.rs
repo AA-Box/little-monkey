@@ -191,6 +191,21 @@ pub fn resolve_base_url(id: &str, custom: &[CustomProviderEntry]) -> Result<Stri
         .ok_or_else(|| format!("Unknown provider '{id}'"))
 }
 
+/// The custom provider list read straight off disk, for callers with no
+/// `AppHandle` to resolve the app data dir through.
+///
+/// A missing or unreadable `providers.json` is an empty list rather than an
+/// error: the presets are still resolvable without it, and a caller that then
+/// fails to find its provider says so with a better message than "no file".
+pub fn configured_custom_providers() -> Vec<CustomProviderEntry> {
+    crate::app_paths::data_dir()
+        .and_then(|dir| std::fs::read_to_string(dir.join("providers.json")).ok())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value.get("custom").cloned())
+        .and_then(|value| serde_json::from_value::<Vec<CustomProviderEntry>>(value).ok())
+        .unwrap_or_default()
+}
+
 fn find_base_url(app: &AppHandle, id: &str) -> Result<String, String> {
     let custom = read_custom_providers(app)?;
     resolve_base_url(id, &custom)
@@ -377,8 +392,7 @@ pub async fn fetch_models(
         api_key,
     );
 
-    let response = request
-        .send()
+    let response = crate::egress::send(request)
         .await
         .map_err(|e| format!("Failed to reach {base_url}: {e}"))?;
 
@@ -662,7 +676,13 @@ pub async fn providers_stream_chat(
         Some(run_id) => RunScope::run(run_id),
         None => RunScope::Unattributed(Unattributed::UserAction),
     };
-    let result = crate::run_scope::scoped(
+    // `scoped_with_egress` rather than `scoped`: it attaches the run's process row
+    // when there is one, so the bytes this stream moves reach
+    // `agent_processes.bytes_egressed` instead of an unattributed tally. See its
+    // doc for what that column counts and how often it is written.
+    let result = crate::run_commands::scoped_with_egress(
+        &app,
+        state.inner(),
         scope,
         run_stream_chat(
             &app,
@@ -821,7 +841,7 @@ async fn run_stream_chat(
             );
             return Ok(());
         }
-        result = request.send() => {
+        result = crate::egress::send(request) => {
             result.map_err(|e| format!("Failed to reach {base_url}: {e}"))?
         }
     };

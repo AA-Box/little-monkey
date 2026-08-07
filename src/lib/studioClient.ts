@@ -208,6 +208,89 @@ export interface GenerationRequest {
   componentOverrides: ComponentOverride[];
 }
 
+/** How a remote backend is spoken to. */
+export type RemoteBackendKind = "comfy_ui" | "open_ai_compatible";
+
+/** One registered remote generation endpoint: a ComfyUI the user runs, or a
+ *  hosted OpenAI-compatible image API. Neither ships with the app — both are
+ *  reached over HTTP, which is what keeps ComfyUI's GPL-3.0 at arm's length. */
+export interface RemoteBackend {
+  id: string;
+  label: string;
+  kind: RemoteBackendKind;
+  /** Empty on an OpenAI-compatible backend falls back to the provider's base. */
+  baseUrl: string;
+  /** Which saved provider key authenticates. OpenAI-compatible only. */
+  providerId: string | null;
+  /** API-format workflow with `{{prompt}}`-style placeholders. ComfyUI only. */
+  workflowTemplate: unknown | null;
+  /** Whether this endpoint accepts an init image on `/images/edits`. */
+  supportsEditing: boolean;
+  /** The model names to offer in the picker. */
+  models: string[];
+}
+
+/** The `modelId` prefix that routes a run to a backend instead of the managed
+ *  engine. Backend and library models share one picker, so they share one id
+ *  space. */
+export const REMOTE_MODEL_PREFIX = "remote:";
+
+export function remoteModelId(backendId: string, model: string): string {
+  return `${REMOTE_MODEL_PREFIX}${backendId}:${model}`;
+}
+
+export function isRemoteModelId(modelId: string | null): boolean {
+  return modelId !== null && modelId.startsWith(REMOTE_MODEL_PREFIX);
+}
+
+/** Presents each backend's models as library entries so the picker, the task
+ *  filter and the run path need no notion of a backend at all.
+ *
+ *  The fields a backend genuinely has no answer for are not guessed: it weighs
+ *  nothing locally, needs no download and carries no license to accept, so
+ *  those read as installed, zero-byte and accepted rather than as a model stuck
+ *  half-configured. */
+export function backendModels(backends: RemoteBackend[]): GenerationModel[] {
+  return backends.flatMap((backend) =>
+    backend.models.map((model) => ({
+      id: remoteModelId(backend.id, model),
+      name: model,
+      family: backend.label,
+      tasks:
+        backend.kind === "open_ai_compatible" && backend.supportsEditing
+          ? (["text_to_image", "image_to_image"] as GenerationTask[])
+          : (["text_to_image"] as GenerationTask[]),
+      components: [],
+      defaults: {
+        width: 1024,
+        height: 1024,
+        steps: 25,
+        cfgScale: 7,
+        sampleMethod: "",
+        flowShift: null,
+        fps: 1,
+        videoFrames: 1,
+        // Never read: a backend offers no video task for it to constrain.
+        frameGrid: "down_to4n_plus1" as FrameGrid,
+      },
+      minRamBytes: 0,
+      license: {
+        id: "",
+        name: "",
+        url: "",
+        excludedTerritories: [],
+        acceptanceRequired: false,
+      },
+      extraLaunchArgs: [],
+      installed: true,
+      totalBytes: 0,
+      missingBytes: 0,
+      licenseAccepted: true,
+      fitsInMemory: true,
+    })),
+  );
+}
+
 export interface GenerationProgressPayload {
   jobId: string;
   phase: string;
@@ -238,6 +321,11 @@ export const studioClient = {
   loras: () => invoke<LoraAsset[]>("generation_loras"),
   addLora: (asset: LoraAsset) => invoke<LoraAsset[]>("generation_add_lora", { asset }),
   removeLora: (path: string) => invoke<LoraAsset[]>("generation_remove_lora", { path }),
+  backends: () => invoke<RemoteBackend[]>("generation_backends"),
+  addBackend: (backend: RemoteBackend) =>
+    invoke<RemoteBackend[]>("generation_add_backend", { backend }),
+  removeBackend: (backendId: string) =>
+    invoke<RemoteBackend[]>("generation_remove_backend", { backendId }),
   run: (request: GenerationRequest) =>
     invoke<GenerationEntry>("generation_run", { request }),
   cancel: (jobId: string) => invoke<boolean>("generation_cancel", { jobId }),

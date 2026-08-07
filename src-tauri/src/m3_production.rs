@@ -1322,7 +1322,7 @@ impl OpenAiCompatibleM3InferenceEngine {
             tokio::select! {
                 _ = context.cancellation.cancelled() => Err(M3HubError::Cancelled { operation: "local inference request".to_string() }),
                 _ = cancellation.cancelled() => Err(M3HubError::Cancelled { operation: "local inference request".to_string() }),
-                response = self.client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").body(encoded).send() => {
+                response = crate::egress::send(self.client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").body(encoded)) => {
                     response.map_err(|error| M3HubError::Transport(error.to_string()))
                 }
             }
@@ -1419,7 +1419,7 @@ impl OpenAiCompatibleM3InferenceEngine {
             tokio::select! {
                 _ = context.cancellation.cancelled() => Err(M3HubError::Cancelled { operation: "local embeddings request".to_string() }),
                 _ = cancellation.cancelled() => Err(M3HubError::Cancelled { operation: "local embeddings request".to_string() }),
-                response = self.client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").body(encoded).send() => {
+                response = crate::egress::send(self.client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").body(encoded)) => {
                     response.map_err(|error| M3HubError::Transport(error.to_string()))
                 }
             }
@@ -3051,7 +3051,7 @@ impl MlxServiceController for ProductionMlxServiceController {
                 let response = tokio::select! {
                     _ = context.cancellation.cancelled() => return Err(MlxError::Cancelled { operation: "stream".to_string() }),
                     _ = cancellation.cancelled() => return Err(MlxError::Cancelled { operation: "stream".to_string() }),
-                    response = self.client.post(format!("http://127.0.0.1:{}/v1/generate", handle.port)).json(request).send() => {
+                    response = crate::egress::send(self.client.post(format!("http://127.0.0.1:{}/v1/generate", handle.port)).json(request)) => {
                         response.map_err(|error| Self::controller_error("start MLX stream", error))?
                     }
                 };

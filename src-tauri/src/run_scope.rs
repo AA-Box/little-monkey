@@ -11,6 +11,17 @@
 //! says it outright — "there are zero `task_local!` declarations in this crate to
 //! carry one implicitly" — and that is the sentence this module exists to retire.
 //!
+//! # A run id was not enough on its own
+//!
+//! The ledger half of that pair charges bytes to a **process**, not to a run: a
+//! run has many process rows and `agent_processes` is what carries the resource
+//! columns. So the ambient value is a run id *and* an optional
+//! [`ProcessScope`] — see that type for why the byte counter travels with the
+//! identity rather than living in a global map keyed by it. The two halves are
+//! independent on purpose: a run with no process id is a legitimate state, and
+//! the honest record for work in it is "unattributed" rather than a nearby
+//! process that did not do it.
+//!
 //! # Why a task-local and not a thread-local
 //!
 //! This is the decisive technical point, not a style preference. Tokio moves a task
@@ -51,6 +62,8 @@
 
 use std::fmt;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Why a piece of work legitimately belongs to no run.
 ///
@@ -162,11 +175,94 @@ impl RunScope {
     }
 }
 
+/// The process-table row the ambient work belongs to, plus the drop-box its
+/// egress is charged into.
+///
+/// # Why the counter lives in the scope
+///
+/// The resource ledger needs bytes per **process**, and the only place that knows
+/// which process an outbound request belongs to is the scope it was made under.
+/// Two other shapes were considered and rejected:
+///
+/// - A global `Mutex<HashMap<process_id, u64>>` charged per request. That buys
+///   attribution with a lock on the hot path of every HTTP body frame, which is
+///   the one thing per-byte accounting must not cost.
+/// - A process id alone, with the counting done elsewhere. There is no
+///   "elsewhere" that does not end up being the map above.
+///
+/// So the counter is an `Arc<AtomicU64>` handed out with the identity: charging is
+/// one relaxed `fetch_add` with no lock and no allocation, and whoever entered the
+/// scope holds the other handle and drains it into
+/// `ProcessTable::add_egress_bytes` on its own schedule. Nothing global, nothing to
+/// clean up if the task that was charging dies.
+///
+/// `Clone` is cheap and shares the counter — two clones are two views of one
+/// tally, which is what lets the scope owner drain what the scoped work charged.
+#[derive(Debug, Clone)]
+pub struct ProcessScope {
+    process_id: Arc<str>,
+    egress_bytes: Arc<AtomicU64>,
+}
+
+impl ProcessScope {
+    /// A scope for a row that already exists in `agent_processes`.
+    ///
+    /// The id is the table's own `process_id`, not an external id — this is what
+    /// `add_egress_bytes` takes, and resolving an external id to it is the
+    /// caller's job because only the caller knows the kind.
+    #[must_use]
+    pub fn new(process_id: impl Into<String>) -> Self {
+        ProcessScope {
+            process_id: Arc::from(process_id.into()),
+            egress_bytes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[must_use]
+    pub fn process_id(&self) -> &str {
+        &self.process_id
+    }
+
+    /// Charges `bytes` to this process. Lock-free and safe to call from any task
+    /// or thread holding a clone.
+    ///
+    /// `Relaxed` is sufficient: the only reader is [`Self::take_egress`], which
+    /// needs the total to be correct rather than ordered against anything else,
+    /// and `fetch_add` is atomic regardless of ordering.
+    pub fn charge_egress(&self, bytes: u64) {
+        self.egress_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Takes everything charged since the last call, leaving zero behind.
+    ///
+    /// A drain rather than a read because the ledger's `add_egress_bytes` is
+    /// additive: reading without resetting and adding the result would count
+    /// every earlier byte again on every flush.
+    #[must_use]
+    pub fn take_egress(&self) -> u64 {
+        self.egress_bytes.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// What the task-local actually holds.
+///
+/// A struct rather than a third [`RunScope`] arm so that `RunScope::Run(id)` —
+/// constructed at call sites this module does not own — keeps compiling and
+/// keeps meaning what it meant. A run with no process id is a legitimate state:
+/// it means the work belongs to a run whose process row nobody has resolved
+/// here, which the egress accounting records as unattributed rather than
+/// guessing at.
+#[derive(Debug, Clone)]
+struct Ambient {
+    scope: RunScope,
+    process: Option<ProcessScope>,
+}
+
 tokio::task_local! {
     /// The ambient scope. Absent — not defaulted — outside every [`scoped`] call,
     /// which is what lets [`current`] distinguish "not instrumented" from
     /// "deliberately no run".
-    static SCOPE: RunScope;
+    static SCOPE: Ambient;
 }
 
 /// Runs `future` with `scope` as the ambient scope for everything it awaits.
@@ -180,7 +276,35 @@ pub async fn scoped<F>(scope: RunScope, future: F) -> F::Output
 where
     F: Future,
 {
-    SCOPE.scope(scope, future).await
+    SCOPE
+        .scope(
+            Ambient {
+                scope,
+                process: None,
+            },
+            future,
+        )
+        .await
+}
+
+/// [`scoped`], with the process-table row the work belongs to.
+///
+/// The caller keeps its own clone of `process` and drains it into
+/// `ProcessTable::add_egress_bytes` — see [`ProcessScope`] for why the counter
+/// travels with the identity instead of living in a global map.
+pub async fn scoped_with_process<F>(scope: RunScope, process: ProcessScope, future: F) -> F::Output
+where
+    F: Future,
+{
+    SCOPE
+        .scope(
+            Ambient {
+                scope,
+                process: Some(process),
+            },
+            future,
+        )
+        .await
 }
 
 /// [`scoped`] for code that is not a future.
@@ -203,7 +327,13 @@ pub fn scoped_sync<F, R>(scope: RunScope, body: F) -> R
 where
     F: FnOnce() -> R,
 {
-    SCOPE.sync_scope(scope, body)
+    SCOPE.sync_scope(
+        Ambient {
+            scope,
+            process: None,
+        },
+        body,
+    )
 }
 
 /// The ambient scope, or `None` at a site no [`scoped`] call encloses.
@@ -213,7 +343,20 @@ where
 /// the two would make the resulting record unreadable.
 #[must_use]
 pub fn current() -> Option<RunScope> {
-    SCOPE.try_with(Clone::clone).ok()
+    SCOPE.try_with(|ambient| ambient.scope.clone()).ok()
+}
+
+/// The process the ambient work belongs to, if the scope was entered with one.
+///
+/// `None` covers both "no scope at all" and "a scope with no process id"; a
+/// caller that has to tell those apart asks [`current`] as well. Nothing here
+/// invents an identity for either case.
+#[must_use]
+pub fn current_process() -> Option<ProcessScope> {
+    SCOPE
+        .try_with(|ambient| ambient.process.clone())
+        .ok()
+        .flatten()
 }
 
 /// The ambient run id, if the current scope has one.
@@ -297,37 +440,112 @@ mod tests {
     /// with no awaits and then hands one run another's id the moment there is real
     /// work between the set and the read. `yield_now` forces at least one such
     /// hand-off per task.
+    ///
+    /// Extended to carry a process id alongside the run id, because the ledger's
+    /// per-process egress attribution rests on exactly the same property: a
+    /// process id that survives the run id's awaits but not its own would charge
+    /// one process's bytes to another.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_scopes_never_observe_each_other() {
         let mut tasks = Vec::new();
-        for index in 0..32 {
+        for index in 0..32u64 {
             let expected = format!("run:{index}");
-            tasks.push(tokio::spawn(scoped(RunScope::run(expected.clone()), {
-                async move {
-                    // Three hand-off opportunities around the read, so a leak has
-                    // every chance to show up rather than being scheduled away.
-                    tokio::task::yield_now().await;
-                    let first = current_run_id();
-                    tokio::task::yield_now().await;
-                    let second = current_run_id();
-                    tokio::task::yield_now().await;
-                    (expected, first, second)
-                }
-            })));
+            let expected_process = format!("p-turn-{index}");
+            tasks.push(tokio::spawn(scoped_with_process(
+                RunScope::run(expected.clone()),
+                ProcessScope::new(expected_process.clone()),
+                {
+                    async move {
+                        // Three hand-off opportunities around the read, so a leak has
+                        // every chance to show up rather than being scheduled away.
+                        tokio::task::yield_now().await;
+                        let first = current_run_id();
+                        let first_process = current_process();
+                        tokio::task::yield_now().await;
+                        let second = current_run_id();
+                        tokio::task::yield_now().await;
+                        // Charged from inside the scope, read back by the owner
+                        // below: the whole point of the counter travelling with
+                        // the identity.
+                        if let Some(process) = current_process() {
+                            process.charge_egress(index + 1);
+                        }
+                        (
+                            expected,
+                            first,
+                            second,
+                            expected_process,
+                            first_process,
+                            current_process(),
+                        )
+                    }
+                },
+            )));
         }
 
         let mut observed = BTreeSet::new();
         for task in tasks {
-            let (expected, first, second) = task.await.expect("scoped task joins");
+            let (expected, first, second, expected_process, first_process, last_process) =
+                task.await.expect("scoped task joins");
             assert_eq!(
                 first.as_deref(),
                 Some(expected.as_str()),
                 "a task must read back its own scope across an await"
             );
             assert_eq!(second, first, "and read the same one twice");
+            assert_eq!(
+                first_process.as_ref().map(ProcessScope::process_id),
+                Some(expected_process.as_str()),
+                "a task must read back its own process id across an await"
+            );
+            assert_eq!(
+                last_process.as_ref().map(ProcessScope::process_id),
+                Some(expected_process.as_str()),
+                "and the same one after two more hand-offs"
+            );
+            assert_eq!(
+                last_process.expect("a process is in scope").take_egress(),
+                observed.len() as u64 + 1,
+                "each task's bytes must land in its own tally"
+            );
             observed.insert(expected);
         }
         assert_eq!(observed.len(), 32, "every task must have been checked");
+    }
+
+    /// A run with no process id is a state, not a failure: the run id is still
+    /// there and the process side reports nothing rather than something invented.
+    #[tokio::test]
+    async fn a_scope_may_carry_a_run_without_a_process() {
+        let (run, process) = scoped(RunScope::run("run:alpha"), async {
+            (current_run_id(), current_process())
+        })
+        .await;
+        assert_eq!(run.as_deref(), Some("run:alpha"));
+        assert!(
+            process.is_none(),
+            "no process row was named, so none may be reported"
+        );
+        // And outside every scope, neither half exists.
+        assert!(current_process().is_none());
+    }
+
+    /// The counter is shared by clones and drains to zero, which is what makes it
+    /// safe to feed the ledger's additive `add_egress_bytes`.
+    #[test]
+    fn a_process_scope_tally_is_shared_by_clones_and_drains_once() {
+        let owner = ProcessScope::new("p-turn-1");
+        let charged = owner.clone();
+        charged.charge_egress(1_024);
+        charged.charge_egress(512);
+
+        assert_eq!(owner.take_egress(), 1_536, "a clone charges the same tally");
+        assert_eq!(
+            owner.take_egress(),
+            0,
+            "a drained tally must not report the same bytes twice"
+        );
+        assert_eq!(charged.take_egress(), 0, "and the drain is shared too");
     }
 
     /// `tokio::spawn` does not inherit the scope, and this pins it rather than

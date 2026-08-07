@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 
 import { Button, IconButton, Listbox, StatusPill, Tabs } from "../ui";
+import { AddBackendForm } from "./AddBackendForm";
 import { AddModelForm } from "./AddModelForm";
 import { LoraStack } from "./LoraStack";
 import { ModelFiles } from "./ModelFiles";
@@ -49,6 +50,9 @@ import {
   type ComponentOverride,
   type ComponentSlot,
   type PartAsset,
+  backendModels,
+  isRemoteModelId,
+  type RemoteBackend,
 } from "../../lib/studioClient";
 
 /** The canvas and sampling controls for one run. Seeded from the model but
@@ -204,6 +208,8 @@ export function StudioPanel() {
   const [mode, setMode] = useState<StudioMode>("image");
   const [status, setStatus] = useState<GenerationEngineStatus | null>(null);
   const [models, setModels] = useState<GenerationModel[]>([]);
+  const [backends, setBackends] = useState<RemoteBackend[]>([]);
+  const [addingBackend, setAddingBackend] = useState(false);
   const [gallery, setGallery] = useState<GenerationEntry[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [task, setTask] = useState<GenerationTask>("text_to_image");
@@ -263,6 +269,11 @@ export function StudioPanel() {
     () => visible.find((model) => model.id === selectedId) ?? null,
     [visible, selectedId],
   );
+  // LoRAs, slot swaps and the hires pass are all `sd-server` features applied
+  // to weight files the app holds. A remote backend runs somebody else's
+  // process against weights this app never sees, so those controls are hidden
+  // rather than shown and then silently dropped on the way out.
+  const remote = isRemoteModelId(selected?.id ?? null);
   // This tab's results, newest first: the newest fills the canvas, the rest is
   // the strip under it.
   const shownGallery = useMemo(
@@ -287,14 +298,21 @@ export function StudioPanel() {
 
   const refresh = useCallback(async () => {
     try {
-      const [engine, list, entries, assets, loose] = await Promise.all([
+      const [engine, library, entries, assets, loose, remotes] = await Promise.all([
         studioClient.engineStatus(),
         studioClient.models(),
         studioClient.gallery(),
         studioClient.loras(),
         studioClient.parts(),
+        studioClient.backends(),
       ]);
+      // A backend's models join the library list rather than sitting beside it:
+      // the picker, the task filter and the run path then need no notion of a
+      // backend at all, and the one place that does — which controls make sense
+      // for the selection — asks the id.
+      const list = [...library, ...backendModels(remotes)];
       setStatus(engine);
+      setBackends(remotes);
       setModels(list);
       setGallery([...entries].reverse());
       setLoraLibrary(assets);
@@ -702,18 +720,22 @@ export function StudioPanel() {
                     </span>
                   </span>
                   <span className="flex shrink-0 items-center gap-2">
-                    <IconButton
-                      size="sm"
-                      aria-label={t("Studio.forget")}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void studioClient.removeModel(model.id).then(refresh).catch((reason) =>
-                          setError(errorText(reason)),
-                        );
-                      }}
-                    >
-                      <Trash2 size={12} />
-                    </IconButton>
+                    {/* A backend's models are not library entries and are not
+                        forgotten one at a time — the backend below owns them. */}
+                    {!isRemoteModelId(model.id) && (
+                      <IconButton
+                        size="sm"
+                        aria-label={t("Studio.forget")}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void studioClient.removeModel(model.id).then(refresh).catch((reason) =>
+                            setError(errorText(reason)),
+                          );
+                        }}
+                      >
+                        <Trash2 size={12} />
+                      </IconButton>
+                    )}
                     {model.installed ? (
                       <StatusPill tone="success">{t("Studio.installed")}</StatusPill>
                     ) : (
@@ -725,8 +747,9 @@ export function StudioPanel() {
                 </button>
 
                 {/* Adding and swapping files happens here and only here. The
-                    generation tabs pick from what this produces. */}
-                <details className="mt-2">
+                    generation tabs pick from what this produces. A backend's
+                    models have no files here to swap. */}
+                <details className="mt-2" hidden={isRemoteModelId(model.id)}>
                   <summary className="cursor-pointer text-[11px] text-muted">
                     {t("Studio.parts")}
                     <span className="ml-1.5 text-faint">
@@ -830,6 +853,72 @@ export function StudioPanel() {
               </div>
             );
           })}
+        </div>
+
+        {/* Remote backends. Nothing here is bundled: a ComfyUI is a server the
+            user installed and runs, and a hosted endpoint is somebody else's.
+            Both are reached over HTTP, which is what fills the gaps the managed
+            engine cannot — architectures it has no support for, and machines
+            with no GPU at all. */}
+        <div className="mt-6">
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="text-xs font-medium text-muted">{t("Studio.backends")}</h2>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => setAddingBackend((open) => !open)}
+            >
+              {addingBackend ? t("Studio.add.cancel") : t("Studio.backendAdd")}
+            </Button>
+          </div>
+          {addingBackend && (
+            <div className="mb-2">
+              <AddBackendForm
+                onSaved={() => {
+                  setAddingBackend(false);
+                  void refresh();
+                }}
+              />
+            </div>
+          )}
+          {backends.length === 0 && !addingBackend && (
+            <p className="text-xs text-faint">{t("Studio.backendsEmpty")}</p>
+          )}
+          <div className="grid gap-2">
+            {backends.map((backend) => (
+              <div
+                key={backend.id}
+                className="flex items-start justify-between gap-3 rounded border border-border p-3"
+              >
+                <span className="min-w-0">
+                  <span className="block text-xs font-medium">{backend.label}</span>
+                  <span className="mt-0.5 block truncate text-[11px] text-faint">
+                    {t(
+                      backend.kind === "comfy_ui"
+                        ? "Studio.backend.kindComfy"
+                        : "Studio.backend.kindOpenAi",
+                    )}
+                    {backend.baseUrl ? ` · ${backend.baseUrl}` : ""}
+                    {` · ${t("Studio.backendModelCount", {
+                      count: String(backend.models.length),
+                    })}`}
+                  </span>
+                </span>
+                <IconButton
+                  size="sm"
+                  aria-label={t("Studio.forget")}
+                  onClick={() =>
+                    void studioClient
+                      .removeBackend(backend.id)
+                      .then(refresh)
+                      .catch((reason) => setError(errorText(reason)))
+                  }
+                >
+                  <Trash2 size={12} />
+                </IconButton>
+              </div>
+            ))}
+          </div>
         </div>
 
         {/* The loose files: CLIPs, text encoders, VAEs. A model entry has to
@@ -1203,7 +1292,7 @@ export function StudioPanel() {
                 </span>
               </label>
 
-              <details className="grid gap-2">
+              <details className="grid gap-2" hidden={remote}>
                 <summary className="cursor-pointer text-[11px] text-muted">
                   {t("Studio.advanced")}
                 </summary>
@@ -1330,7 +1419,7 @@ export function StudioPanel() {
             </details>
           )}
 
-          {!isSpeechTask(task) && (
+          {!isSpeechTask(task) && !remote && (
             <details className="rounded border border-border p-3">
               <summary className="cursor-pointer text-xs font-medium">
                 {t("Studio.lora.title")}
@@ -1353,7 +1442,7 @@ export function StudioPanel() {
               setting — so this offers the alternatives the library holds and
               nothing else. Hidden entirely when there are none, because a
               column of fixed dropdowns is just noise. */}
-          {choosable.length > 0 && (
+          {choosable.length > 0 && !remote && (
             <details open className="rounded border border-border p-3">
               <summary className="cursor-pointer text-xs font-medium">
                 {t("Studio.parts")}

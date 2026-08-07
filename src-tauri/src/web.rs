@@ -961,9 +961,7 @@ async fn fetch_within_scope(
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    let response = client
-        .get(parsed.clone())
-        .send()
+    let response = crate::egress::send(client.get(parsed.clone()))
         .await
         .map_err(|e| format!("Failed to fetch '{}': {}", url, e))?;
 
@@ -1235,10 +1233,7 @@ fn parse_ddg_results(html: &str, count: usize) -> Vec<SearchResult> {
 async fn ddg_search(query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
     let client = search_client()?;
 
-    let response = client
-        .post(DUCKDUCKGO_HTML_ENDPOINT)
-        .form(&[("q", query)])
-        .send()
+    let response = crate::egress::send(client.post(DUCKDUCKGO_HTML_ENDPOINT).form(&[("q", query)]))
         .await
         .map_err(|e| format!("Failed to search DuckDuckGo for '{}': {}", query, e))?;
 
@@ -1325,14 +1320,15 @@ async fn brave_search_at(
 ) -> Result<Vec<SearchResult>, String> {
     let client = search_client()?;
 
-    let response = client
-        .get(endpoint)
-        .header("X-Subscription-Token", api_key)
-        .header("Accept", "application/json")
-        .query(&[("q", query), ("count", &count.to_string())])
-        .send()
-        .await
-        .map_err(|e| format!("Failed to search Brave for '{}': {}", query, e))?;
+    let response = crate::egress::send(
+        client
+            .get(endpoint)
+            .header("X-Subscription-Token", api_key)
+            .header("Accept", "application/json")
+            .query(&[("q", query), ("count", &count.to_string())]),
+    )
+    .await
+    .map_err(|e| format!("Failed to search Brave for '{}': {}", query, e))?;
 
     let status = response.status();
     let body = read_body_capped(response, MAX_SEARCH_BODY_BYTES)
@@ -1421,10 +1417,7 @@ async fn searxng_search(
     let client = search_client()?;
 
     let url = format!("{}/search", base_url.trim_end_matches('/'));
-    let response = client
-        .get(&url)
-        .query(&[("q", query), ("format", "json")])
-        .send()
+    let response = crate::egress::send(client.get(&url).query(&[("q", query), ("format", "json")]))
         .await
         .map_err(|e| format!("Failed to search SearXNG at '{}': {}", base_url, e))?;
 
