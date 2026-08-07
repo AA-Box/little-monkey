@@ -74,6 +74,11 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 rustyline = "17"
+# monkey-cli's `launcher.rs` only — raw mode plus key events for the bare
+# `monkey` menu/model picker. rustyline (the REPL's line editor) has no
+# single-key API, and a full TUI framework would be a lot of crate for two
+# scrolling lists.
+crossterm = "0.29"
 # mcp_oauth.rs: implementing rmcp's `transport::auth::CredentialStore`/
 # `StateStore` traits (both `#[async_trait]`-defined) requires applying the
 # same macro to the `impl` block. Already an indirect dependency via rmcp
