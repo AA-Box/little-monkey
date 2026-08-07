@@ -200,7 +200,7 @@ function buildAssistantMarkdownComponents(
               <button
                 type="button"
                 onClick={() => useArtifactStore.getState().open(sessionId, ref)}
-                className="flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-xs text-white/50 transition-colors hover:bg-white/10 hover:text-white"
+                className="flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-xs text-muted transition-colors hover:bg-foreground/10 hover:text-foreground"
               >
                 <Eye size={12} />
                 {t("MessageBubble.previewButton")}
