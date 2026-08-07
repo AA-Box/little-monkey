@@ -4661,6 +4661,67 @@ mod tests {
         }
     }
 
+    /// The upgrade path, not just the fresh-install one. A database written by a
+    /// build that predates V11 must gain the table on open, and gain it *only*
+    /// once — which is the branch `migration_is_safe_to_rerun_…` cannot reach,
+    /// since that test never sees a database missing a version.
+    #[test]
+    fn a_database_written_before_v11_gains_the_permission_table_on_open() {
+        let database = TempDb::new("permission-upgrade");
+        {
+            let ledger = RunLedger::open(&database.path).unwrap();
+            ledger
+                .record_permission_request(&permission_request(
+                    "req-old",
+                    PermissionAttribution::Unknown,
+                ))
+                .unwrap();
+        }
+
+        // Wind the database back to what V10 left behind. Dropping the table is
+        // the only way to get there from here — the build that wrote it is gone.
+        {
+            let connection = Connection::open(&database.path).unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE permission_decisions;
+                     DELETE FROM schema_migrations WHERE version = 11;
+                     PRAGMA user_version = 10;",
+                )
+                .unwrap();
+        }
+
+        let ledger = RunLedger::open(&database.path).unwrap();
+        assert_eq!(
+            ledger.applied_migrations().unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            "opening a V10 database must apply V11 and nothing else"
+        );
+        assert_eq!(
+            ledger
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            11
+        );
+        // The table is back and empty: the upgrade adds the surface, it does not
+        // invent rows for permissions nobody recorded at the time.
+        assert!(ledger
+            .load_permission_decision("req-old")
+            .unwrap()
+            .is_none());
+        ledger
+            .record_permission_request(&permission_request(
+                "req-new",
+                PermissionAttribution::Unknown,
+            ))
+            .unwrap();
+        assert!(ledger
+            .load_permission_decision("req-new")
+            .unwrap()
+            .is_some());
+    }
+
     /// The bug K12's acceptance names: before this table, a gated tool call
     /// outside a ledger-registered run — deleting a model from Settings, a local
     /// app definition run over HTTP, a triage reply posted to Slack — produced no
