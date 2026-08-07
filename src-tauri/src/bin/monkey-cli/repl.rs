@@ -90,6 +90,76 @@ impl Reader {
     }
 }
 
+/// The session header an interactive REPL opens with: what's answering,
+/// where it can write, and what the permission gate is set to — the three
+/// facts that decide what the next `>>>` will actually do. Box-drawn and
+/// sized to its own longest line, so it needs no terminal-width math.
+fn print_banner(
+    target: &Target,
+    state: &AppState,
+    mode: PermissionMode,
+    mcp_servers: usize,
+) {
+    let model = match target {
+        Target::Local { model, .. } => model.clone().unwrap_or_else(|| "default".to_string()),
+        Target::Provider { model, .. } => model.clone(),
+    };
+    let root = little_monkey_lib::workspace::primary_root_canon(state).ok();
+    let folder = root
+        .as_ref()
+        .map(|path| match (dirs::home_dir(), path.strip_prefix(dirs::home_dir().unwrap_or_default())) {
+            (Some(_), Ok(relative)) => format!("~/{}", relative.display()),
+            _ => path.display().to_string(),
+        })
+        .unwrap_or_else(|| "no folder open".to_string());
+    let branch = root.as_ref().and_then(|path| git_branch(path));
+
+    let mut rows = vec![
+        format!("Model    {model}"),
+        match branch {
+            Some(branch) => format!("Folder   {folder} ({branch})"),
+            None => format!("Folder   {folder}"),
+        },
+        format!(
+            "Mode     {}{}",
+            mode.label(),
+            match mcp_servers {
+                0 => String::new(),
+                1 => " · 1 MCP server".to_string(),
+                many => format!(" · {many} MCP servers"),
+            }
+        ),
+        String::new(),
+        "/? for help · \"\"\" for multiline · /bye to exit".to_string(),
+    ];
+    let title = format!(" Little Monkey {} ", env!("CARGO_PKG_VERSION"));
+    let width = rows
+        .iter()
+        .map(|row| row.chars().count())
+        .chain(std::iter::once(title.chars().count()))
+        .max()
+        .unwrap_or(0);
+    for row in &mut rows {
+        let pad = width - row.chars().count();
+        row.push_str(&" ".repeat(pad));
+    }
+    let dashes = "─".repeat((width + 2).saturating_sub(title.chars().count()));
+    println!("╭{title}{dashes}╮");
+    for row in rows {
+        println!("│ {row} │");
+    }
+    println!("╰{}╯", "─".repeat(width + 2));
+    println!();
+}
+
+/// The checked-out branch, read straight from `.git/HEAD` — one file read
+/// against shelling out to git for a single line of banner text. A detached
+/// HEAD (or no repo) simply contributes nothing.
+fn git_branch(root: &std::path::Path) -> Option<String> {
+    let head = std::fs::read_to_string(root.join(".git").join("HEAD")).ok()?;
+    Some(head.trim().strip_prefix("ref: refs/heads/")?.to_string())
+}
+
 /// Runs the interactive session against an already-resolved target until
 /// `/bye`, `exit`, `quit`, or EOF. `options.system` coming in is just
 /// rules/facts + `--system` text — WITHOUT any `--persona` folded in (see
@@ -110,7 +180,7 @@ pub async fn run(
 ) {
     let mut reader = Reader::new();
     if reader.interactive() {
-        println!("Type /? for help. \"\"\" begins multiline.\n");
+        print_banner(&target, state, mode, mcp_entries.len());
     }
 
     let mut perms = TerminalPermissions::new(mode);
