@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use tauri::Emitter;
 use tokio::sync::oneshot;
 
+use crate::run_ledger::PermissionAttribution;
 use crate::run_protocol::{PermissionDecision, RiskLevel, RunEvent};
 use crate::AppState;
 
@@ -253,7 +254,44 @@ pub struct PendingPermission {
     /// claims. A floored operation is never remembered; see
     /// [`NO_SESSION_REMEMBER`], which covers the same ground per-tool.
     risk_floored: bool,
-    sender: oneshot::Sender<bool>,
+    sender: oneshot::Sender<ResolvedPermission>,
+}
+
+/// How a pending prompt ended, and who ended it.
+///
+/// This used to be a bare `bool`, which meant every responder had to record the
+/// decision itself — and three of them (`deny_pending`, the Stop button's path
+/// through [`respond_if_pending`], and the expiry check) recorded nothing at
+/// all. Carrying the decision instead lets the *awaiting* task write it down,
+/// and the awaiting task is the one place every outcome funnels through.
+type ResolvedPermission = (PermissionDecision, &'static str);
+
+/// A local human answered the prompt.
+const DECIDED_BY_PROMPT: &str = "user:desktop-prompt";
+/// The mode or a remembered grant decided without asking anyone.
+const DECIDED_BY_POLICY: &str = "engine:permission-policy";
+/// Nothing answered within [`PERMISSION_TIMEOUT`].
+const DECIDED_BY_TIMEOUT: &str = "engine:permission-timeout";
+/// No window was listening, so nobody could have been asked.
+const DECIDED_BY_NO_WINDOW: &str = "engine:no-window";
+/// Stop, a workspace switch, or a cancelled turn withdrew the prompt.
+const DECIDED_BY_CANCELLED: &str = "engine:cancelled";
+
+/// Whether a decision lets the operation proceed.
+fn decision_allows(decision: PermissionDecision) -> bool {
+    matches!(
+        decision,
+        PermissionDecision::AllowOnce | PermissionDecision::AllowForRun
+    )
+}
+
+/// The decision a responder's `(allow, remember)` pair means.
+fn decision_for(allow: bool, remember: bool) -> PermissionDecision {
+    match (allow, remember) {
+        (true, true) => PermissionDecision::AllowForRun,
+        (true, false) => PermissionDecision::AllowOnce,
+        (false, _) => PermissionDecision::Deny,
+    }
 }
 
 #[derive(Clone)]
@@ -594,6 +632,56 @@ fn durable_run_exists<R: tauri::Runtime>(
     crate::run_commands::with_ledger(app, state, |ledger| Ok(ledger.load_run(run_id)?.is_some()))
 }
 
+/// What this permission belongs to, and the run id to file it under.
+///
+/// `turn` is what the caller passed; the ambient [`crate::run_scope`] is
+/// consulted only when the caller passed nothing, which is the case for the
+/// four sites that hard-code `None` — deleting a model from Settings, running a
+/// local app definition over HTTP, and the two triage post paths.
+///
+/// The ambient scope is deliberately **not** allowed to override an explicit
+/// `turn`, and is not used to widen which run events get written: an event
+/// written against a run the caller never named would leave `permission_respond`
+/// unable to find its own approval row later.
+fn permission_attribution<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    turn: Option<&str>,
+) -> Result<(Option<String>, PermissionAttribution), String> {
+    let run_id = turn
+        .map(str::to_string)
+        .or_else(crate::run_scope::current_run_id);
+    let Some(run_id) = run_id else {
+        return Ok((
+            None,
+            match crate::run_scope::current().and_then(|scope| scope.unattributed()) {
+                Some(reason) => PermissionAttribution::Unattributed(reason),
+                None => PermissionAttribution::Unknown,
+            },
+        ));
+    };
+    let attribution = if durable_run_exists(app, state, Some(&run_id))? {
+        PermissionAttribution::LedgerRun
+    } else {
+        PermissionAttribution::UnregisteredRun
+    };
+    Ok((Some(run_id), attribution))
+}
+
+/// Write the decision down. Called on every terminal path, run or no run.
+fn record_decision<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    request_id: &str,
+    decision: PermissionDecision,
+    decided_by: &str,
+) -> Result<(), String> {
+    let decided_at_ms = crate::run_commands::unix_time_ms()?;
+    crate::run_commands::with_ledger(app, state, |ledger| {
+        ledger.record_permission_decision(request_id, decision, decided_by, decided_at_ms)
+    })
+}
+
 struct PermissionAudit<'a> {
     run_id: &'a str,
     request_id: &'a str,
@@ -710,37 +798,67 @@ pub async fn request_permission<R: tauri::Runtime>(
         risk: risk.as_ref(),
     };
 
+    // Recorded before the gate is consulted and regardless of whether a run
+    // holds it, so no path can reach an answer without the question being on
+    // record first. This is the K12 acceptance's "a tool call whose authorizing
+    // decision cannot be produced from the log is a bug", and it used to be one:
+    // everything below was gated on `durable`.
+    let mode = effective_mode(state, turn);
+    let (attributed_run_id, attribution) = permission_attribution(app, state, turn)?;
+    let request_record = crate::run_ledger::PermissionRequestRecord {
+        request_id: request_id.clone(),
+        run_id: attributed_run_id,
+        attribution,
+        process_id: crate::run_scope::current_process()
+            .map(|process| process.process_id().to_string()),
+        tool_name: tool.to_string(),
+        tool_call_id: normalized_tool_call_id.clone(),
+        operation_sha256: operation_sha256.clone(),
+        mode: mode.clone(),
+        risk_level: protocol_risk(risk.as_ref()),
+        risk_floored: risk.as_ref().is_some_and(|assessment| assessment.floored),
+        requested_at_ms: now,
+        expires_at_ms,
+    };
+    crate::run_commands::with_ledger(app, state, |ledger| {
+        ledger.record_permission_request(&request_record)
+    })?;
+
     // The decision itself lives in `evaluate_gate` so `permission_dry_run`
     // answers from the same table; only the audit/prompt side effects stay
     // here.
-    match evaluate_gate(state, &effective_mode(state, turn), tool, turn, risk.as_ref()) {
-        GateOutcome::ShortCircuit(decision) => {
+    match evaluate_gate(state, &mode, tool, turn, risk.as_ref()) {
+        GateOutcome::ShortCircuit(outcome) => {
+            let decision = if outcome.is_ok() {
+                PermissionDecision::AllowOnce
+            } else {
+                PermissionDecision::Deny
+            };
             if durable {
                 append_permission_requested(app, state, &audit, false)?;
-                append_automatic_decision(
-                    app,
-                    state,
-                    &audit,
-                    if decision.is_ok() {
-                        PermissionDecision::AllowOnce
-                    } else {
-                        PermissionDecision::Deny
-                    },
-                )?;
+                append_automatic_decision(app, state, &audit, decision)?;
             }
-            return decision;
+            record_decision(app, state, &request_id, decision, DECIDED_BY_POLICY)?;
+            return outcome;
         }
         GateOutcome::Remembered => {
             if durable {
                 append_permission_requested(app, state, &audit, false)?;
                 append_automatic_decision(app, state, &audit, PermissionDecision::AllowForRun)?;
             }
+            record_decision(
+                app,
+                state,
+                &request_id,
+                PermissionDecision::AllowForRun,
+                DECIDED_BY_POLICY,
+            )?;
             return Ok(());
         }
         GateOutcome::Prompt => {}
     }
 
-    let (tx, rx) = oneshot::channel::<bool>();
+    let (tx, rx) = oneshot::channel::<ResolvedPermission>();
 
     state.permissions.pending.lock().unwrap().insert(
         request_id.clone(),
@@ -788,12 +906,29 @@ pub async fn request_permission<R: tauri::Runtime>(
         if durable {
             append_automatic_decision(app, state, &audit, PermissionDecision::Deny)?;
         }
+        record_decision(
+            app,
+            state,
+            &request_id,
+            PermissionDecision::Deny,
+            DECIDED_BY_NO_WINDOW,
+        )?;
         return Err("Permission denied".to_string());
     }
 
     match tokio::time::timeout(PERMISSION_TIMEOUT, rx).await {
-        Ok(Ok(true)) => Ok(()),
-        Ok(Ok(false)) => Err("Permission denied".to_string()),
+        Ok(Ok((decision, decided_by))) => {
+            // `permission_respond` already appended the run event for a durable
+            // run — it is the side that knows the human's identity — but every
+            // other responder (`deny_pending`, a cancelled turn) appends
+            // nothing, so the decision is written here for all of them.
+            record_decision(app, state, &request_id, decision, decided_by)?;
+            if decision_allows(decision) {
+                Ok(())
+            } else {
+                Err("Permission denied".to_string())
+            }
+        }
         // Timed out, or the sender was dropped without a response.
         Ok(Err(_)) | Err(_) => {
             state
@@ -805,6 +940,13 @@ pub async fn request_permission<R: tauri::Runtime>(
             if durable {
                 append_automatic_decision(app, state, &audit, PermissionDecision::Expired)?;
             }
+            record_decision(
+                app,
+                state,
+                &request_id,
+                PermissionDecision::Expired,
+                DECIDED_BY_TIMEOUT,
+            )?;
             Err("Permission denied".to_string())
         }
     }
@@ -1094,6 +1236,15 @@ pub fn permission_respond(
             expires_at_ms: pending.expires_at_ms,
         }
     };
+    // Computed before the durable branch, not inside it: an expired prompt is
+    // expired whether or not a run holds it, and deciding that only for durable
+    // runs meant a stale prompt could still be answered elsewhere.
+    let expired = crate::run_commands::unix_time_ms()? >= pending.expires_at_ms;
+    let decision = if expired {
+        PermissionDecision::Expired
+    } else {
+        decision_for(allow, remember)
+    };
     if durable_run_exists(&app, state.inner(), pending.turn.as_deref())? {
         let run_id = pending
             .turn
@@ -1116,7 +1267,6 @@ pub fn permission_respond(
                 "Pending permission does not match its immutable ledger approval".to_string(),
             );
         }
-        let expired = crate::run_commands::unix_time_ms()? >= pending.expires_at_ms;
         crate::run_commands::append_host_event(
             &app,
             &window,
@@ -1126,31 +1276,18 @@ pub fn permission_respond(
             RunEvent::PermissionDecided {
                 request_id: id.clone(),
                 operation_sha256: pending.operation_sha256.clone(),
-                decision: if expired {
-                    PermissionDecision::Expired
-                } else if allow {
-                    if remember {
-                        PermissionDecision::AllowForRun
-                    } else {
-                        PermissionDecision::AllowOnce
-                    }
-                } else {
-                    PermissionDecision::Deny
-                },
+                decision,
                 decided_by: crate::run_commands::desktop_identity(&app, &window),
             },
         )?;
-        if expired {
-            return respond_impl(state.inner(), id, false, false);
-        }
     }
-    respond_impl(state.inner(), id, allow, remember)
+    respond_impl(state.inner(), id, decision)
 }
 
 /// Core logic behind [`permission_respond`], factored out so it can be
 /// exercised directly in tests without standing up a full Tauri app/window.
-fn respond_impl(state: &AppState, id: String, allow: bool, remember: bool) -> Result<(), String> {
-    if respond_if_pending(state, &id, allow, remember)? {
+fn respond_impl(state: &AppState, id: String, decision: PermissionDecision) -> Result<(), String> {
+    if resolve_pending(state, &id, decision, DECIDED_BY_PROMPT)? {
         Ok(())
     } else {
         Err(format!("No pending permission request with id {id}"))
@@ -1163,9 +1300,26 @@ pub(crate) fn respond_if_pending(
     allow: bool,
     remember: bool,
 ) -> Result<bool, String> {
+    resolve_pending(state, id, decision_for(allow, remember), DECIDED_BY_PROMPT)
+}
+
+/// Resolve a pending prompt with an explicit decision.
+///
+/// The decision travels to the awaiting task rather than a bare `allow` flag so
+/// that task can record it — see [`ResolvedPermission`]. `decided_by` names the
+/// responder, which is the difference between "the user denied this" and "Stop
+/// withdrew it".
+fn resolve_pending(
+    state: &AppState,
+    id: &str,
+    decision: PermissionDecision,
+    decided_by: &'static str,
+) -> Result<bool, String> {
     let Some(pending) = state.permissions.pending.lock().unwrap().remove(id) else {
         return Ok(false);
     };
+    let allow = decision_allows(decision);
+    let remember = matches!(decision, PermissionDecision::AllowForRun);
 
     // A floored operation is never remembered, for the same reason `run_shell`
     // never is: one approval must not stand in for every later write to a
@@ -1197,7 +1351,7 @@ pub(crate) fn respond_if_pending(
 
     // If the receiving end was already dropped (e.g. the request timed out
     // just before the user clicked), there's nothing left to notify.
-    let _ = pending.sender.send(allow);
+    let _ = pending.sender.send((decision, decided_by));
 
     Ok(true)
 }
@@ -1217,7 +1371,7 @@ pub fn deny_pending(state: &AppState, turn: Option<&str>) {
         .filter(|(_, pending)| turn.is_none() || pending.turn.as_deref() == turn)
         .map(|(id, _)| id.clone())
         .collect();
-    let pending: Vec<oneshot::Sender<bool>> = matching
+    let pending: Vec<oneshot::Sender<ResolvedPermission>> = matching
         .iter()
         .filter_map(|id| guard.remove(id))
         .map(|pending| pending.sender)
@@ -1225,7 +1379,9 @@ pub fn deny_pending(state: &AppState, turn: Option<&str>) {
     drop(guard);
 
     for sender in pending {
-        let _ = sender.send(false);
+        // Withdrawn, not refused by a person — the awaiting task records the
+        // difference, so a Stop press does not read back as a user denial.
+        let _ = sender.send((PermissionDecision::Deny, DECIDED_BY_CANCELLED));
     }
 }
 
@@ -1275,7 +1431,11 @@ mod tests {
 
     /// Directly inserts a pending request the way [`request_permission`]
     /// would, without needing a running app/window to emit an event through.
-    fn insert_pending(state: &AppState, id: &str, tool: &str) -> oneshot::Receiver<bool> {
+    fn insert_pending(
+        state: &AppState,
+        id: &str,
+        tool: &str,
+    ) -> oneshot::Receiver<ResolvedPermission> {
         insert_pending_for_turn(state, id, tool, None)
     }
 
@@ -1284,7 +1444,7 @@ mod tests {
         id: &str,
         tool: &str,
         turn: Option<&str>,
-    ) -> oneshot::Receiver<bool> {
+    ) -> oneshot::Receiver<ResolvedPermission> {
         insert_pending_with_floor(state, id, tool, turn, false)
     }
 
@@ -1294,8 +1454,8 @@ mod tests {
         tool: &str,
         turn: Option<&str>,
         risk_floored: bool,
-    ) -> oneshot::Receiver<bool> {
-        let (tx, rx) = oneshot::channel::<bool>();
+    ) -> oneshot::Receiver<ResolvedPermission> {
+        let (tx, rx) = oneshot::channel::<ResolvedPermission>();
         state.permissions.pending.lock().unwrap().insert(
             id.to_string(),
             PendingPermission {
@@ -1311,6 +1471,46 @@ mod tests {
         rx
     }
 
+    /// Stop withdrawing a prompt and a person refusing it are both "denied", and
+    /// the recorded trail must not conflate them — that is the whole reason the
+    /// resolution channel carries a responder rather than a bare `bool`.
+    #[test]
+    fn a_withdrawn_prompt_is_not_recorded_as_a_human_denial() {
+        let state = AppState::default();
+        let mut withdrawn = insert_pending(&state, "req-stop", "run_shell");
+        deny_pending(&state, None);
+        assert_eq!(
+            withdrawn.try_recv(),
+            Ok((PermissionDecision::Deny, DECIDED_BY_CANCELLED))
+        );
+
+        let mut refused = insert_pending(&state, "req-user", "run_shell");
+        respond_impl(&state, "req-user".to_string(), PermissionDecision::Deny).unwrap();
+        assert_eq!(
+            refused.try_recv(),
+            Ok((PermissionDecision::Deny, DECIDED_BY_PROMPT))
+        );
+    }
+
+    /// `respond_if_pending` keeps its `(allow, remember)` shape for its existing
+    /// callers, so the mapping onto a decision is the thing that can drift.
+    #[test]
+    fn allow_and_remember_map_onto_the_decision_they_mean() {
+        assert_eq!(decision_for(true, true), PermissionDecision::AllowForRun);
+        assert_eq!(decision_for(true, false), PermissionDecision::AllowOnce);
+        assert_eq!(decision_for(false, true), PermissionDecision::Deny);
+        assert_eq!(decision_for(false, false), PermissionDecision::Deny);
+        for decision in [
+            PermissionDecision::AllowOnce,
+            PermissionDecision::AllowForRun,
+        ] {
+            assert!(decision_allows(decision));
+        }
+        for decision in [PermissionDecision::Deny, PermissionDecision::Expired] {
+            assert!(!decision_allows(decision));
+        }
+    }
+
     #[test]
     fn deny_pending_scoped_to_a_turn_leaves_other_turns_prompts_alone() {
         let state = AppState::default();
@@ -1320,7 +1520,10 @@ mod tests {
         deny_pending(&state, Some("turn-a"));
 
         // Turn A's prompt was denied…
-        assert_eq!(rx_a.try_recv(), Ok(false));
+        assert_eq!(
+            rx_a.try_recv().map(|(decision, _)| decision),
+            Ok(PermissionDecision::Deny)
+        );
         // …turn B's is still pending, unanswered.
         assert!(rx_b.try_recv().is_err());
         assert!(state
@@ -1339,8 +1542,14 @@ mod tests {
 
         deny_pending(&state, None);
 
-        assert_eq!(rx_a.try_recv(), Ok(false));
-        assert_eq!(rx_b.try_recv(), Ok(false));
+        assert_eq!(
+            rx_a.try_recv().map(|(decision, _)| decision),
+            Ok(PermissionDecision::Deny)
+        );
+        assert_eq!(
+            rx_b.try_recv().map(|(decision, _)| decision),
+            Ok(PermissionDecision::Deny)
+        );
         assert!(state.permissions.pending.lock().unwrap().is_empty());
     }
 
@@ -1354,7 +1563,7 @@ mod tests {
         let state = AppState::default();
         let _rx = insert_pending(&state, "req-1", "write_file");
 
-        respond_impl(&state, "req-1".to_string(), true, true).unwrap();
+        respond_impl(&state, "req-1".to_string(), PermissionDecision::AllowForRun).unwrap();
 
         let allowed = state.permissions.session_allow.lock().unwrap();
         assert!(allowed.contains("write_file"));
@@ -1366,7 +1575,7 @@ mod tests {
         let state = AppState::default();
         let _rx = insert_pending(&state, "req-1", "run_shell");
 
-        respond_impl(&state, "req-1".to_string(), true, true).unwrap();
+        respond_impl(&state, "req-1".to_string(), PermissionDecision::AllowForRun).unwrap();
 
         assert!(!state
             .permissions
@@ -1379,7 +1588,12 @@ mod tests {
     #[test]
     fn respond_errors_for_unknown_id() {
         let state = AppState::default();
-        let err = respond_impl(&state, "does-not-exist".to_string(), true, true).unwrap_err();
+        let err = respond_impl(
+            &state,
+            "does-not-exist".to_string(),
+            PermissionDecision::AllowForRun,
+        )
+        .unwrap_err();
         assert!(err.contains("No pending permission request"));
     }
 
@@ -1388,9 +1602,12 @@ mod tests {
         let state = AppState::default();
         let rx = insert_pending(&state, "req-1", "edit_file");
 
-        respond_impl(&state, "req-1".to_string(), false, false).unwrap();
+        respond_impl(&state, "req-1".to_string(), PermissionDecision::Deny).unwrap();
 
-        assert_eq!(rx.blocking_recv(), Ok(false));
+        assert_eq!(
+            rx.blocking_recv().map(|(decision, _)| decision),
+            Ok(PermissionDecision::Deny)
+        );
     }
 
     #[test]
@@ -1398,7 +1615,12 @@ mod tests {
         let state = AppState::default();
         let _rx = insert_pending_for_turn(&state, "req-run", "write_file", Some("run-a"));
 
-        respond_impl(&state, "req-run".to_string(), true, true).unwrap();
+        respond_impl(
+            &state,
+            "req-run".to_string(),
+            PermissionDecision::AllowForRun,
+        )
+        .unwrap();
 
         let grants = state.permissions.run_allow.lock().unwrap();
         assert!(grants.contains(&("run-a".to_string(), "write_file".to_string())));
@@ -1477,7 +1699,10 @@ mod tests {
 
         assert!(state.permissions.session_allow.lock().unwrap().is_empty());
         assert!(state.permissions.pending.lock().unwrap().is_empty());
-        assert_eq!(rx.blocking_recv(), Ok(false));
+        assert_eq!(
+            rx.blocking_recv().map(|(decision, _)| decision),
+            Ok(PermissionDecision::Deny)
+        );
     }
 
     #[test]
@@ -2073,7 +2298,10 @@ mod tests {
 
     impl CorpusFixture {
         fn path(&self) -> Option<&str> {
-            self.triggered_action.args.get("path").and_then(|v| v.as_str())
+            self.triggered_action
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
         }
     }
 
@@ -2275,7 +2503,10 @@ mod tests {
         let root = TempRoot::new("floored_accept");
         let state = state_with_root(&root.path);
 
-        for fixture in corpus().into_iter().filter(|f| f.id.starts_with("floored-")) {
+        for fixture in corpus()
+            .into_iter()
+            .filter(|f| f.id.starts_with("floored-"))
+        {
             for mode in ["acceptEdits", "auto"] {
                 let outcome = dry_run_fixture(&state, &fixture, mode);
                 assert!(
@@ -2316,7 +2547,10 @@ mod tests {
             .unwrap()
             .insert("edit_file".to_string());
 
-        for fixture in corpus().into_iter().filter(|f| f.id.starts_with("floored-")) {
+        for fixture in corpus()
+            .into_iter()
+            .filter(|f| f.id.starts_with("floored-"))
+        {
             assert_eq!(
                 fixture.triggered_action.tool, "edit_file",
                 "{} must use the granted tool or this proves nothing",
@@ -2425,7 +2659,10 @@ mod tests {
                 other => panic!("{} was not approved under bypass: {other:?}", fixture.id),
             }
         }
-        assert!(approved > 0, "bypass approved nothing — the dry run is inert");
+        assert!(
+            approved > 0,
+            "bypass approved nothing — the dry run is inert"
+        );
     }
 
     #[test]
