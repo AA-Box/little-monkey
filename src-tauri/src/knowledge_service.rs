@@ -34,6 +34,7 @@ use crate::knowledge_adapters::{
     media_type_for_path, source_object_from_bytes, HtmlPdfExtractor, OfficeOpenXmlExtractor,
     TesseractOcrProvider,
 };
+use crate::knowledge_core::{EmbeddingBackend, KnowledgeStack};
 use crate::knowledge_pipeline::{
     run_ocr, ChunkingSpec, DocumentChunker, DocumentFormat, DocumentSecurityDeclaration,
     EmbeddingSpec as PipelineEmbeddingSpec, ExtractedDocument, ExtractionPolicy, ExtractorRegistry,
@@ -43,7 +44,6 @@ use crate::knowledge_pipeline::{
     SensitiveDataMode, SensitiveDataScanner, SourceObject, UrlSourcePolicy,
     EMBEDDING_CONTRACT_VERSION, EXTRACTOR_CONTRACT_VERSION,
 };
-use crate::stacks::{EmbeddingBackend, KnowledgeStack};
 
 const CATALOG_VERSION: u32 = 1;
 const MAX_RETRY_HISTORY: usize = 20;
@@ -578,11 +578,7 @@ pub struct KnowledgeInspectorResponse {
 }
 
 fn data_root(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
-    data_root_at(&app_data)
+    data_root_at(&crate::knowledge_core::app_data_dir(app)?)
 }
 
 fn data_root_at(app_data: &Path) -> Result<PathBuf, String> {
@@ -1416,7 +1412,7 @@ fn remove_source_generation(
     store
         .activate(staged, &cancel)
         .map_err(|error| error.to_string())?;
-    crate::stacks::mark_v2_indexed_impl(
+    crate::knowledge_core::mark_v2_indexed_impl(
         &app_data.join("stacks"),
         stack_id,
         now_ms(),
@@ -1893,7 +1889,7 @@ async fn refresh_inner_at(
 ) -> Result<KnowledgeRefreshReport, String> {
     let root = data_root_at(app_data)?;
     let stacks_root = app_data.join("stacks");
-    let stack = crate::stacks::list_impl(&stacks_root)?
+    let stack = crate::knowledge_core::list_impl(&stacks_root)?
         .into_iter()
         .find(|stack| stack.id == stack_id)
         .ok_or_else(|| "Knowledge stack not found".to_string())?;
@@ -2149,7 +2145,7 @@ async fn refresh_inner_at(
             .iter()
             .map(|chunk| chunk.text.clone())
             .collect::<Vec<_>>();
-        let vectors = crate::stacks::embed_batch(&stack.embedding, &texts, false).await?;
+        let vectors = crate::knowledge_core::embed_batch(&stack.embedding, &texts, false).await?;
         if cancel.is_cancelled() {
             return Err(PipelineError::Cancelled.to_string());
         }
@@ -2192,9 +2188,12 @@ async fn refresh_inner_at(
     generation_store
         .activate(staged, cancel)
         .map_err(|error| error.to_string())?;
-    if let Err(error) =
-        crate::stacks::mark_v2_indexed_impl(&stacks_root, stack_id, now_ms(), build.chunks.len())
-    {
+    if let Err(error) = crate::knowledge_core::mark_v2_indexed_impl(
+        &stacks_root,
+        stack_id,
+        now_ms(),
+        build.chunks.len(),
+    ) {
         warnings.push(format!(
             "The v2 index is active, but its legacy readiness badge could not be updated: {error}"
         ));
@@ -2384,7 +2383,7 @@ pub fn v2_staleness_impl(app_data: &Path, stack_id: &str) -> Result<KnowledgeV2S
     };
 
     // Tier 1: free, no I/O beyond the small config files.
-    let stack = crate::stacks::list_impl(&app_data.join("stacks"))?
+    let stack = crate::knowledge_core::list_impl(&app_data.join("stacks"))?
         .into_iter()
         .find(|stack| stack.id == stack_id)
         .ok_or_else(|| "Knowledge stack not found".to_string())?;
@@ -2679,7 +2678,7 @@ pub fn import_v1_generation_impl(
 ) -> Result<KnowledgeV1ImportReport, String> {
     validate_id("stack id", stack_id)?;
     let stacks_root = app_data.join("stacks");
-    let stack = crate::stacks::list_impl(&stacks_root)?
+    let stack = crate::knowledge_core::list_impl(&stacks_root)?
         .into_iter()
         .find(|stack| stack.id == stack_id)
         .ok_or_else(|| "Knowledge stack not found".to_string())?;
@@ -2746,10 +2745,10 @@ pub fn import_v1_generation_impl(
         // with no connector equivalent must fail this build, rather than be
         // dropped from an import that then reports itself complete.
         let connector = match stack_source.kind {
-            crate::stacks::SourceKind::Folder => ConnectorConfig::LocalFolder {
+            crate::knowledge_core::SourceKind::Folder => ConnectorConfig::LocalFolder {
                 path: stack_source.path.clone(),
             },
-            crate::stacks::SourceKind::File => ConnectorConfig::LocalFile {
+            crate::knowledge_core::SourceKind::File => ConnectorConfig::LocalFile {
                 path: stack_source.path.clone(),
             },
         };
@@ -3022,7 +3021,7 @@ pub fn import_v1_generation_impl(
         ));
     }
     if let Err(error) =
-        crate::stacks::mark_v2_indexed_impl(&stacks_root, stack_id, now_ms(), chunk_count)
+        crate::knowledge_core::mark_v2_indexed_impl(&stacks_root, stack_id, now_ms(), chunk_count)
     {
         warnings.push(format!(
             "The imported generation is active, but its legacy readiness badge could not be \
@@ -5139,9 +5138,15 @@ impl Reranker for LocalOverlapReranker {
 /// existing `search_docs` agent tool so an attached stack can migrate to the
 /// hybrid index without changing its public tool schema.
 pub fn has_active_generation(app: &AppHandle, stack_id: &str) -> Result<bool, String> {
+    has_active_generation_at(&crate::knowledge_core::app_data_dir(app)?, stack_id)
+}
+
+/// `AppHandle`-free [`has_active_generation`]. `monkey-cli stacks reindex` uses
+/// it to pick which index it is actually refreshing — see `stacks_cli::reindex`.
+pub fn has_active_generation_at(app_data: &Path, stack_id: &str) -> Result<bool, String> {
     validate_id("stack id", stack_id)?;
-    let store =
-        GenerationStore::new(data_root(app)?.join("indexes")).map_err(|error| error.to_string())?;
+    let store = GenerationStore::new(data_root_at(app_data)?.join("indexes"))
+        .map_err(|error| error.to_string())?;
     store
         .active(stack_id)
         .map(|generation| generation.is_some())
@@ -5164,16 +5169,37 @@ pub async fn query_for_agent(
     query: &str,
     k: usize,
     cancel: &CancellationToken,
-) -> Result<Option<Vec<crate::stacks::StackQueryResult>>, String> {
-    let store =
-        GenerationStore::new(data_root(app)?.join("indexes")).map_err(|error| error.to_string())?;
+) -> Result<Option<Vec<crate::knowledge_core::StackQueryResult>>, String> {
+    query_for_agent_at(
+        &crate::knowledge_core::app_data_dir(app)?,
+        stack,
+        query,
+        k,
+        cancel,
+    )
+    .await
+}
+
+/// `AppHandle`-free [`query_for_agent`]. `monkey-cli` has no `AppHandle`, and
+/// without this entry point its `search_docs` tool answered from the v1 index
+/// only while the desktop app preferred v2 for the same stack — the two agents
+/// disagreeing about the same query against the same machine.
+pub async fn query_for_agent_at(
+    app_data: &Path,
+    stack: &KnowledgeStack,
+    query: &str,
+    k: usize,
+    cancel: &CancellationToken,
+) -> Result<Option<Vec<crate::knowledge_core::StackQueryResult>>, String> {
+    let store = GenerationStore::new(data_root_at(app_data)?.join("indexes"))
+        .map_err(|error| error.to_string())?;
     let Some(index) = store
         .open_active_index(&stack.id)
         .map_err(|error| error.to_string())?
     else {
         return Ok(None);
     };
-    let vector = crate::stacks::embed_batch(&stack.embedding, &[query.to_string()], true)
+    let vector = crate::knowledge_core::embed_batch(&stack.embedding, &[query.to_string()], true)
         .await?
         .into_iter()
         .next()
@@ -5210,7 +5236,7 @@ pub async fn query_for_agent(
                     Some(notice) => format!("{notice}\n{}", hit.chunk.text),
                     None => hit.chunk.text.clone(),
                 };
-                crate::stacks::StackQueryResult {
+                crate::knowledge_core::StackQueryResult {
                     stack_id: stack.id.clone(),
                     stack_name: stack.name.clone(),
                     source_path: hit.chunk.citation.canonical_uri.clone(),
@@ -5246,7 +5272,7 @@ pub fn knowledge_v2_update_chunking(
         .app_data_dir()
         .map_err(|error| error.to_string())?
         .join("stacks");
-    crate::stacks::update_chunking_impl(&stacks_root, &stack_id, chunk_chars, chunk_overlap)
+    crate::knowledge_core::update_chunking_impl(&stacks_root, &stack_id, chunk_chars, chunk_overlap)
 }
 
 fn low_confidence_notice(chunk: &KnowledgeChunk) -> Option<String> {
@@ -5298,7 +5324,7 @@ pub async fn knowledge_v2_query(
         .app_data_dir()
         .map_err(|error| error.to_string())?
         .join("stacks");
-    let stack = crate::stacks::list_impl(&stacks_root)?
+    let stack = crate::knowledge_core::list_impl(&stacks_root)?
         .into_iter()
         .find(|stack| stack.id == request.stack_id)
         .ok_or_else(|| "Knowledge stack not found".to_string())?;
@@ -5308,11 +5334,12 @@ pub async fn knowledge_v2_query(
         .open_active_index(&request.stack_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Knowledge 2.0 stack has not been indexed".to_string())?;
-    let vector = crate::stacks::embed_batch(&stack.embedding, &[normalized_query.clone()], true)
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "Embedding provider returned no query vector".to_string())?;
+    let vector =
+        crate::knowledge_core::embed_batch(&stack.embedding, &[normalized_query.clone()], true)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Embedding provider returned no query vector".to_string())?;
     if cancel.is_cancelled() {
         return Err("Knowledge query cancelled".to_string());
     }
@@ -5846,10 +5873,10 @@ mod tests {
         // `refresh_inner_at` reads the stack back out of the same one.
         let stacks_root = app_data.join("stacks");
         fs::create_dir_all(&stacks_root).unwrap();
-        let stack = crate::stacks::create_impl(
+        let stack = crate::knowledge_core::create_impl(
             &stacks_root,
             "Scheduled scope fixture".to_string(),
-            crate::stacks::EmbeddingSpec {
+            crate::knowledge_core::EmbeddingSpec {
                 backend: EmbeddingBackend::Llama,
                 model_id_or_tag: "fixture-embed".to_string(),
                 dim: 8,
@@ -5984,10 +6011,10 @@ mod tests {
         // `refresh_inner_at` reads the stack back out of the same one.
         let stacks_root = app_data.join("stacks");
         fs::create_dir_all(&stacks_root).unwrap();
-        let stack = crate::stacks::create_impl(
+        let stack = crate::knowledge_core::create_impl(
             &stacks_root,
             format!("{label} fixture"),
-            crate::stacks::EmbeddingSpec {
+            crate::knowledge_core::EmbeddingSpec {
                 backend: EmbeddingBackend::Llama,
                 model_id_or_tag: "fixture-embed".to_string(),
                 dim: 8,
@@ -7136,7 +7163,7 @@ mod tests {
         // computed for the live configuration. Computed here through the same
         // function refresh uses, so a change to that recipe cannot quietly
         // start agreeing with the sentinel.
-        let stack = crate::stacks::list_impl(&app_data.join("stacks"))
+        let stack = crate::knowledge_core::list_impl(&app_data.join("stacks"))
             .unwrap()
             .into_iter()
             .find(|stack| stack.id == stack_id)
@@ -7596,6 +7623,30 @@ mod tests {
         fs::remove_dir_all(app_data).unwrap();
     }
 
+    /// The predicate `monkey-cli stacks reindex` and `stacks_query`'s v1 fallback
+    /// both branch on. False for a v1-only stack is not an incidental detail: it
+    /// is what stops the CLI from running a v2 refresh that would fail with "Add
+    /// and enable at least one Knowledge 2.0 source", and what keeps the read
+    /// path serving an un-imported stack from v1.
+    #[test]
+    fn has_active_generation_at_is_false_until_the_v1_index_is_imported() {
+        let app_data = temporary_root("v2-active-generation-probe");
+        let stack_id = "stack-active-probe";
+        let rows = vec![v1_row("/docs/alpha.md", 0, "alpha chunk text")];
+        write_v1_stack_4d(&app_data, stack_id, &rows, &[vec![0.5, 0.5, 0.5, 0.5]]);
+
+        assert!(
+            !has_active_generation_at(&app_data, stack_id).unwrap(),
+            "a stack with only a v1 index has no v2 generation to refresh or query"
+        );
+        import_v1_generation_impl(&app_data, stack_id).unwrap();
+        assert!(
+            has_active_generation_at(&app_data, stack_id).unwrap(),
+            "the import is what flips both callers over to v2"
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
     /// Reuse-or-refuse, both halves, against a catalog that already holds a
     /// source for the path this stack lists. Enabled: reused, so the path is not
     /// indexed twice under two ids. Disabled: refused, because reusing its id
@@ -7850,7 +7901,7 @@ mod tests {
         let store = GenerationStore::new(root.join("indexes")).unwrap();
         let (active, index) = store.active_with_index(stack_id).unwrap().unwrap();
         let (chunks, vectors): (Vec<_>, Vec<_>) = index.entries().unwrap().into_iter().unzip();
-        let stack = crate::stacks::list_impl(&app_data.join("stacks"))
+        let stack = crate::knowledge_core::list_impl(&app_data.join("stacks"))
             .unwrap()
             .into_iter()
             .find(|stack| stack.id == stack_id)
@@ -8031,7 +8082,8 @@ mod tests {
         published_stack_with_folder(&app_data, stack_id);
         // v2 only: a chunking change nothing on disk reflects. Free to detect and
         // definitive — the next refresh re-extracts and re-embeds everything.
-        crate::stacks::update_chunking_impl(&app_data.join("stacks"), stack_id, 900, 100).unwrap();
+        crate::knowledge_core::update_chunking_impl(&app_data.join("stacks"), stack_id, 900, 100)
+            .unwrap();
         assert_eq!(
             v2_staleness_impl(&app_data, stack_id).unwrap(),
             KnowledgeV2Staleness::StalePipeline
