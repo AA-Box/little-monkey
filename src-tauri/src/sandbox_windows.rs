@@ -125,7 +125,8 @@ use windows_sys::Win32::Security::{
     SID_AND_ATTRIBUTES, SUB_CONTAINERS_AND_OBJECTS_INHERIT, WELL_KNOWN_SID_TYPE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ALL_ACCESS, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_ALL_ACCESS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicUIRestrictions,
@@ -296,7 +297,7 @@ impl JobConfinement {
         // call, passed to a syscall that only reads it.
         let assigned = unsafe { AssignProcessToJobObject(self.handle, process) };
         match assigned {
-            0 => Err(io::Error::last_os_error()),
+            0 => Err(os_error("AssignProcessToJobObject")),
             _ => Ok(()),
         }
     }
@@ -314,6 +315,24 @@ impl JobConfinement {
             let _ = TerminateJobObject(self.handle, 1);
         }
     }
+}
+
+/// The last OS error, labelled with the call that produced it.
+///
+/// Every failure in [`spawn_confined`] is one of six syscalls returning a bare
+/// `BOOL`, and `io::Error::last_os_error()` alone cannot say which. A Windows-only
+/// path that can only be debugged from a CI log has to name its own failures, or
+/// diagnosing one costs a full CI round trip per guess — which is exactly what
+/// `ERROR_ENVVAR_NOT_FOUND` out of an unlabelled `CreateProcessW` cost.
+fn os_error(call: &str) -> io::Error {
+    let error = io::Error::last_os_error();
+    io::Error::new(
+        error.kind(),
+        format!(
+            "{call} failed: {error} (os error {:?})",
+            error.raw_os_error()
+        ),
+    )
 }
 
 /// A NUL-terminated UTF-16 buffer, which is what every `PCWSTR` here wants.
@@ -542,11 +561,11 @@ fn piped() -> io::Result<(OwnedHandle, OwnedHandle)> {
     // Safe: both out-parameters are valid slots and the attributes outlive the
     // call.
     if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(os_error("CreatePipe"));
     }
     // The parent keeps the read end and must not leak it into the child.
     if unsafe { SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0) } == 0 {
-        let error = io::Error::last_os_error();
+        let error = os_error("SetHandleInformation");
         unsafe {
             let _ = CloseHandle(read);
             let _ = CloseHandle(write);
@@ -576,7 +595,7 @@ fn null_device() -> io::Result<OwnedHandle> {
     let handle = unsafe {
         CreateFileW(
             name.as_ptr(),
-            FILE_ALL_ACCESS,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             &attributes,
             OPEN_EXISTING,
@@ -585,7 +604,7 @@ fn null_device() -> io::Result<OwnedHandle> {
         )
     };
     if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-        return Err(io::Error::last_os_error());
+        return Err(os_error("CreateFileW(NUL)"));
     }
     // Safe: freshly opened and owned here.
     Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
@@ -690,7 +709,7 @@ fn spawn_confined(
             let list = attribute_buffer.as_mut_ptr().cast::<c_void>();
             // Safe: the buffer is exactly the size the call above asked for.
             if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
-                return Err(io::Error::last_os_error());
+                return Err(os_error("InitializeProcThreadAttributeList"));
             }
             // Safe: `security` outlives the spawn below, and the size matches its
             // type.
@@ -706,7 +725,7 @@ fn spawn_confined(
                 )
             };
             if updated == 0 {
-                let error = io::Error::last_os_error();
+                let error = os_error("UpdateProcThreadAttribute");
                 unsafe { DeleteProcThreadAttributeList(list) };
                 return Err(error);
             }
@@ -776,7 +795,7 @@ fn spawn_confined(
         unsafe { DeleteProcThreadAttributeList(attribute_list) };
     }
     if spawned == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(os_error("CreateProcessW"));
     }
     // Safe: both handles come from a successful `CreateProcessW` and are owned
     // here from this point.
