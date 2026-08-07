@@ -211,6 +211,15 @@ pub enum Isolation {
     /// restricted cwd/env: a generated macOS Seatbelt profile (`sandbox-exec`),
     /// or a Landlock ruleset on Linux.
     OsSandboxed,
+    /// The kernel bounded the process *tree* but not its filesystem: a Windows
+    /// job object confined the run's process count, committed memory and
+    /// window-station reach, and killed the whole tree on exit.
+    ///
+    /// Deliberately not [`Isolation::OsSandboxed`], because the real workspace is
+    /// still reachable by absolute path. Windows has no filesystem boundary this
+    /// app can reach without owning its own `CreateProcess` — see
+    /// `crate::sandbox_windows`.
+    ProcessContained,
     /// Only the restricted cwd + allowlisted env applied — either no OS-level
     /// sandbox exists for this platform, or this kernel could not enforce one.
     ProcessOnly,
@@ -247,6 +256,15 @@ pub enum SandboxEnforcement {
     /// A kernel-enforced boundary applies: macOS Seatbelt via `sandbox-exec`, or
     /// Landlock on Linux.
     OsEnforced,
+    /// A Windows job object will bound the run's process tree, committed memory
+    /// and window-station reach, and kill the tree when the run ends — but no
+    /// filesystem or network boundary applies, so the real workspace stays
+    /// reachable by absolute path.
+    ///
+    /// Between [`SandboxEnforcement::OsEnforced`] and
+    /// [`SandboxEnforcement::ProcessOnly`] on purpose, and closer to the latter
+    /// for any decision about running untrusted code.
+    ProcessContained,
     /// Restricted cwd and allowlisted environment only. No kernel boundary.
     ProcessOnly,
     /// This platform has an enforcement mechanism and it is not usable here, so a
@@ -284,11 +302,20 @@ pub fn sandbox_enforcement() -> SandboxEnforcement {
             SandboxEnforcement::ProcessOnly
         }
     }
-    // Windows has no enforcement path in this app at all — no job object,
-    // restricted token or AppContainer anywhere in the crate — so there is
-    // nothing to probe for. `Unavailable` would imply a mechanism that failed;
-    // `ProcessOnly` is the accurate answer.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    // Windows has containment but no filesystem boundary, so it answers with the
+    // middle state rather than either extreme. `Unavailable` would still be wrong
+    // here for the reason it is wrong on Linux: there is no separate binary to be
+    // missing, and a machine that cannot create a job object degrades to
+    // `ProcessOnly` rather than failing.
+    #[cfg(target_os = "windows")]
+    {
+        if crate::sandbox_windows::job_objects_are_enforceable() {
+            SandboxEnforcement::ProcessContained
+        } else {
+            SandboxEnforcement::ProcessOnly
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         SandboxEnforcement::ProcessOnly
     }
@@ -902,11 +929,15 @@ pub async fn execute_in_sandbox(
         )
     };
 
+    // `ProcessContained` rather than `ProcessOnly`: the job object below is
+    // created before the spawn and its assignment is fatal, so a run that reaches
+    // the end of this function was contained. Not `OsSandboxed` — the containment
+    // is the process tree and its resources, never the filesystem.
     #[cfg(target_os = "windows")]
     let (program, args, isolation) = (
         "cmd".to_string(),
         vec!["/C".to_string(), shell_command.to_string()],
-        Isolation::ProcessOnly,
+        Isolation::ProcessContained,
     );
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -966,7 +997,24 @@ pub async fn execute_in_sandbox(
         }
     };
 
+    // Created before the spawn so a machine that cannot configure a job fails the
+    // run instead of producing an unconfined child — the same choice `os_limits`
+    // and `sandbox_linux` make. Bound for the whole scope below: the job's
+    // kill-on-close flag makes this handle's lifetime the containment's lifetime,
+    // so an early drop would kill the child mid-run.
+    #[cfg(target_os = "windows")]
+    let job = crate::sandbox_windows::create_job()?;
+
     let child = command.spawn()?;
+
+    // Assigned immediately after the spawn, because `Command` cannot attach a job
+    // at creation. `sandbox_windows`' module docs cover the window this leaves and
+    // why `cmd.exe /C` cannot escape through it. A failed assignment is a failed
+    // run: the child is dropped by `?` (and `kill_on_drop` reaps it) rather than
+    // continuing as an unconfined process the caller was told was contained.
+    #[cfg(target_os = "windows")]
+    job.assign(&child)?;
+
     // Captured before `wait_with_output` consumes the child; with
     // `process_group(0)` the child's own pid is also its group id.
     let child_pgid = child.id();
@@ -2202,11 +2250,26 @@ mod tests {
             assert_eq!(enforcement, expected);
             assert_ne!(enforcement, SandboxEnforcement::Unavailable);
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            // Same shape again: tracks what this machine can hold rather than the
+            // target triple, and never `Unavailable`, because a machine that
+            // cannot create a job object degrades instead of failing the run.
+            let expected = if crate::sandbox_windows::job_objects_are_enforceable() {
+                SandboxEnforcement::ProcessContained
+            } else {
+                SandboxEnforcement::ProcessOnly
+            };
+            assert_eq!(enforcement, expected);
+            assert_ne!(enforcement, SandboxEnforcement::Unavailable);
+            // The claim that must never drift: containment is not a filesystem
+            // boundary, and Windows has no filesystem boundary to report.
+            assert_ne!(enforcement, SandboxEnforcement::OsEnforced);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             // Not `Unavailable`: that would imply a mechanism this app has and
-            // could not use, and there is no job object or restricted token
-            // anywhere in the crate.
+            // could not use, and this platform has none.
             assert_eq!(enforcement, SandboxEnforcement::ProcessOnly);
         }
     }

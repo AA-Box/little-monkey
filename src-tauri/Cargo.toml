@@ -263,7 +263,12 @@ winreg = "0.56"
 # `os_signal::process_is_alive` (OpenProcess/WaitForSingleObject — the unix
 # side of that answer is `kill(pid, 0)`, which needs no feature). 0.61 verified
 # current on crates.io at implementation time.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+# `Win32_System_JobObjects` is `sandbox_windows.rs`: the job object that bounds a
+# sandboxed run's process tree, its committed memory and its window-station
+# reach. `Win32_Security` comes with it and is not optional — `CreateJobObjectW`
+# names `SECURITY_ATTRIBUTES` in its signature, and that module is itself
+# feature-gated, so without it the job-object module does not resolve.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [features]
 default = ["pdf-extraction"]
