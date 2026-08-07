@@ -44,6 +44,11 @@ const MAX_AUDIT_EVENTS: usize = 10_000;
 const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PAIRING_ATTEMPTS: u8 = 5;
 const TOKEN_PREFIX: &str = "lmk-lan-";
+/// The one answer every authentication failure gives before the caller has
+/// proven possession of a live credential. Shared by construction so an
+/// unknown digest, a revoked token, and a lapsed token cannot drift apart —
+/// see `credential_validity_denial`.
+const GENERIC_CREDENTIAL_DENIAL: &str = "invalid bearer token";
 const STATE_FILE_PREFIX: &str = "security-state-";
 const STATE_FILE_SUFFIX: &str = ".json";
 
@@ -702,7 +707,10 @@ fn parse_data_url_image(url: &str, path: &str) -> CompatibilityResult<CanonicalC
         ));
     };
     let Some((metadata, data_base64)) = rest.split_once(',') else {
-        return Err(invalid(path, "data URL is missing a comma-separated payload"));
+        return Err(invalid(
+            path,
+            "data URL is missing a comma-separated payload",
+        ));
     };
     let Some(mime_type) = metadata.strip_suffix(";base64") else {
         return Err(invalid(path, "data URL must declare \";base64\" encoding"));
@@ -742,7 +750,11 @@ fn parse_openai_message(value: &Value, path: &str) -> CompatibilityResult<Canoni
                         "text" => {
                             reject_unknown(block, &["type", "text"], &block_path)?;
                             content.push(CanonicalContent::Text {
-                                text: required_string(block, "text", &format!("{block_path}.text"))?,
+                                text: required_string(
+                                    block,
+                                    "text",
+                                    &format!("{block_path}.text"),
+                                )?,
                             });
                         }
                         "image_url" => {
@@ -756,9 +768,15 @@ fn parse_openai_message(value: &Value, path: &str) -> CompatibilityResult<Canoni
                                 "image_url must be an object",
                             )?;
                             reject_unknown(image_object, &["url", "detail"], &image_url_path)?;
-                            let url =
-                                required_string(image_object, "url", &format!("{image_url_path}.url"))?;
-                            content.push(parse_data_url_image(&url, &format!("{image_url_path}.url"))?);
+                            let url = required_string(
+                                image_object,
+                                "url",
+                                &format!("{image_url_path}.url"),
+                            )?;
+                            content.push(parse_data_url_image(
+                                &url,
+                                &format!("{image_url_path}.url"),
+                            )?);
                         }
                         _ => {
                             return Err(unsupported(
@@ -1295,7 +1313,13 @@ pub fn translate_ollama_chat_request(
     reject_unknown(
         object,
         &[
-            "model", "messages", "tools", "format", "options", "keep_alive", "stream",
+            "model",
+            "messages",
+            "tools",
+            "format",
+            "options",
+            "keep_alive",
+            "stream",
         ],
         "$",
     )?;
@@ -1337,11 +1361,22 @@ pub fn translate_ollama_chat_request(
     Ok((request, stream_requested))
 }
 
-fn parse_ollama_message(value: &Value, path: &str, index: usize) -> CompatibilityResult<CanonicalMessage> {
+fn parse_ollama_message(
+    value: &Value,
+    path: &str,
+    index: usize,
+) -> CompatibilityResult<CanonicalMessage> {
     let object = require_object(value, path, "message must be an object")?;
     reject_unknown(
         object,
-        &["role", "content", "images", "tool_calls", "tool_call_id", "tool_name"],
+        &[
+            "role",
+            "content",
+            "images",
+            "tool_calls",
+            "tool_call_id",
+            "tool_name",
+        ],
         path,
     )?;
     if object.contains_key("images") {
@@ -1362,9 +1397,7 @@ fn parse_ollama_message(value: &Value, path: &str, index: usize) -> Compatibilit
     match object.get("content") {
         Some(Value::String(text)) => {
             if !text.is_empty() || canonical_role != CanonicalRole::Assistant {
-                content.push(CanonicalContent::Text {
-                    text: text.clone(),
-                });
+                content.push(CanonicalContent::Text { text: text.clone() });
             }
         }
         Some(Value::Null) | None => {}
@@ -1413,7 +1446,10 @@ fn parse_ollama_message(value: &Value, path: &str, index: usize) -> Compatibilit
                 &format!("{call_path}.function"),
             )?;
             let name = required_string(function, "name", &format!("{call_path}.function.name"))?;
-            let input = function.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let input = function
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             if !input.is_object() {
                 return Err(invalid(
                     format!("{call_path}.function.arguments"),
@@ -1679,7 +1715,9 @@ pub fn encode_ollama_chat_response(
     }))
 }
 
-fn ollama_response_content(content: &[CanonicalContent]) -> CompatibilityResult<(String, Vec<Value>)> {
+fn ollama_response_content(
+    content: &[CanonicalContent],
+) -> CompatibilityResult<(String, Vec<Value>)> {
     let mut text = Vec::new();
     let mut tool_calls = Vec::new();
     for block in content {
@@ -1975,6 +2013,12 @@ pub fn protocol_error_response(
         | CompatibilityError::Conflict(message) => {
             (400, "invalid_request_error", message.clone(), None)
         }
+        CompatibilityError::Json(error) => (
+            400,
+            "invalid_request_error",
+            format!("Invalid JSON request: {error}"),
+            None,
+        ),
         CompatibilityError::Limit { .. } => (413, "request_too_large", error.to_string(), None),
         _ => (
             500,
@@ -2420,6 +2464,106 @@ pub struct AuthorizedToken {
     pub backend: ApiBackend,
 }
 
+/// A fully authenticated operation whose concrete backend has not been
+/// resolved yet.  The allowed set is the token/policy intersection, computed
+/// before any model inventory or runtime adapter is touched.  HTTP callers use
+/// this receipt to constrain resolution and must not debit the token a second
+/// time after selecting one of these backends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedBackendCandidates {
+    pub(crate) token_id: String,
+    pub(crate) client_label: String,
+    pub(crate) scope: ApiScope,
+    pub(crate) backends: BTreeSet<ApiBackend>,
+    /// Empty means every model is allowed. When non-empty, a resolver that
+    /// deferred the model check must filter discovery results and validate
+    /// the resolved model against this exact set before dispatch.
+    pub(crate) allowed_models: BTreeSet<String>,
+    /// Opaque resource id whose exact destructive confirmation was checked
+    /// before deferred model resolution. The resolver must look up this same
+    /// id and then narrow it through `allowed_models` and `backends`.
+    pub(crate) confirmed_resource_id: Option<String>,
+}
+
+/// Authorization input for a request whose model id and operation are known
+/// from its envelope, but whose backend is deliberately still unresolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackendCandidateAuthorizationRequest {
+    pub bearer_token: String,
+    pub scope: ApiScope,
+    pub model_id: Option<String>,
+    pub input_bytes: u64,
+    pub remote_address: String,
+    pub destructive_confirmation: Option<String>,
+    pub deferred_destructive_resource_id: Option<String>,
+    pub now_ms: u64,
+}
+
+/// Read-only credential check used at an HTTP transport edge before polling
+/// a potentially large or stalled request body. This never consumes request
+/// or byte quota; the post-buffer staged authorization remains authoritative
+/// and revalidates the token to close revocation/expiry races.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialPreflightRequest {
+    pub bearer_token: String,
+    pub remote_address: String,
+    pub now_ms: u64,
+}
+
+/// Quota-bearing authorization for a route whose scope and exact input byte
+/// count are known, but whose model/backend/destructive target still lives in
+/// the unparsed request envelope. Callers must narrow the returned receipt
+/// after parsing without authorizing or debiting a second time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedAuthorizationRequest {
+    pub bearer_token: String,
+    /// `None` is reserved for envelopes (currently cancellation) whose
+    /// protocol determines the required inference scope only after parsing.
+    pub scope: Option<ApiScope>,
+    pub input_bytes: u64,
+    pub remote_address: String,
+    pub now_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedStagedRequest {
+    pub(crate) token_id: String,
+    pub(crate) backends: BTreeSet<ApiBackend>,
+    pub(crate) allowed_models: BTreeSet<String>,
+    pub(crate) allowed_scopes: BTreeSet<ApiScope>,
+}
+
+/// Internal shape shared by exact-backend and pre-resolution authorization.
+/// Keeping one state transaction for both paths prevents scope, expiry,
+/// mutation, quota, and audit semantics from drifting as either API evolves.
+struct ValidatedAuthorization<'a> {
+    bearer_token: &'a str,
+    scope: Option<ApiScope>,
+    model_id: Option<&'a String>,
+    input_bytes: u64,
+    remote_address: &'a str,
+    destructive_confirmation: Option<&'a str>,
+    deferred_destructive_resource_id: Option<&'a String>,
+    now_ms: u64,
+    target: AuthorizationTarget,
+}
+
+#[derive(Clone, Copy)]
+enum AuthorizationTarget {
+    Exact(ApiBackend),
+    BackendCandidates,
+    StagedEnvelope,
+}
+
+struct AuthorizationGrant {
+    token_id: String,
+    client_label: String,
+    backends: BTreeSet<ApiBackend>,
+    allowed_models: BTreeSet<String>,
+    confirmed_resource_id: Option<String>,
+    allowed_scopes: BTreeSet<ApiScope>,
+}
+
 pub struct LanAccessController {
     state_root: PathBuf,
     policy: LanServerPolicy,
@@ -2429,6 +2573,34 @@ pub struct LanAccessController {
 }
 
 impl LanAccessController {
+    pub fn preflight_credential(
+        &self,
+        request: &CredentialPreflightRequest,
+    ) -> CompatibilityResult<()> {
+        validate_credential_preflight_request(request)?;
+        let _guard = lock(&self.operation_lock)?;
+        let state = self.load_state()?;
+        let digest = sha256_hex(request.bearer_token.as_bytes());
+        let Some(record) = state
+            .tokens
+            .iter()
+            .find(|record| constant_time_eq(record.token_sha256.as_bytes(), digest.as_bytes()))
+        else {
+            return Err(CompatibilityError::Unauthorized(
+                GENERIC_CREDENTIAL_DENIAL.to_string(),
+            ));
+        };
+        // Revoked and expired answer exactly as an unmatched digest does; see
+        // `credential_validity_denial` for the boundary rule. This edge is
+        // quota-free by contract, so there is nothing to debit either way.
+        if credential_validity_denial(record, request.now_ms).is_some() {
+            return Err(CompatibilityError::Unauthorized(
+                GENERIC_CREDENTIAL_DENIAL.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn new(
         state_root: impl AsRef<Path>,
         policy: LanServerPolicy,
@@ -2616,6 +2788,84 @@ impl LanAccessController {
         request: &AuthorizationRequest,
     ) -> CompatibilityResult<AuthorizedToken> {
         validate_authorization_request(request)?;
+        let grant = self.authorize_validated(ValidatedAuthorization {
+            bearer_token: &request.bearer_token,
+            scope: Some(request.scope),
+            model_id: request.model_id.as_ref(),
+            input_bytes: request.input_bytes,
+            remote_address: &request.remote_address,
+            destructive_confirmation: request.destructive_confirmation.as_deref(),
+            deferred_destructive_resource_id: None,
+            now_ms: request.now_ms,
+            target: AuthorizationTarget::Exact(request.backend),
+        })?;
+        Ok(AuthorizedToken {
+            token_id: grant.token_id,
+            client_label: grant.client_label,
+            scope: request.scope,
+            backend: request.backend,
+        })
+    }
+
+    /// Authenticates, checks scope/model/mutation policy, and consumes the
+    /// request/byte quota before returning the only backends resolution may
+    /// inspect. This closes the model-inventory oracle that exists when a
+    /// server resolves a model first and authorizes the selected backend
+    /// afterward.
+    pub fn authorize_backend_candidates(
+        &self,
+        request: &BackendCandidateAuthorizationRequest,
+    ) -> CompatibilityResult<AuthorizedBackendCandidates> {
+        validate_candidate_authorization_request(request)?;
+        let grant = self.authorize_validated(ValidatedAuthorization {
+            bearer_token: &request.bearer_token,
+            scope: Some(request.scope),
+            model_id: request.model_id.as_ref(),
+            input_bytes: request.input_bytes,
+            remote_address: &request.remote_address,
+            destructive_confirmation: request.destructive_confirmation.as_deref(),
+            deferred_destructive_resource_id: request.deferred_destructive_resource_id.as_ref(),
+            now_ms: request.now_ms,
+            target: AuthorizationTarget::BackendCandidates,
+        })?;
+        Ok(AuthorizedBackendCandidates {
+            token_id: grant.token_id,
+            client_label: grant.client_label,
+            scope: request.scope,
+            backends: grant.backends,
+            allowed_models: grant.allowed_models,
+            confirmed_resource_id: grant.confirmed_resource_id,
+        })
+    }
+
+    pub fn authorize_staged_request(
+        &self,
+        request: &StagedAuthorizationRequest,
+    ) -> CompatibilityResult<AuthorizedStagedRequest> {
+        validate_staged_authorization_request(request)?;
+        let grant = self.authorize_validated(ValidatedAuthorization {
+            bearer_token: &request.bearer_token,
+            scope: request.scope,
+            model_id: None,
+            input_bytes: request.input_bytes,
+            remote_address: &request.remote_address,
+            destructive_confirmation: None,
+            deferred_destructive_resource_id: None,
+            now_ms: request.now_ms,
+            target: AuthorizationTarget::StagedEnvelope,
+        })?;
+        Ok(AuthorizedStagedRequest {
+            token_id: grant.token_id,
+            backends: grant.backends,
+            allowed_models: grant.allowed_models,
+            allowed_scopes: grant.allowed_scopes,
+        })
+    }
+
+    fn authorize_validated(
+        &self,
+        request: ValidatedAuthorization<'_>,
+    ) -> CompatibilityResult<AuthorizationGrant> {
         let _guard = lock(&self.operation_lock)?;
         let mut state = self.load_state()?;
         let digest = sha256_hex(request.bearer_token.as_bytes());
@@ -2631,19 +2881,24 @@ impl LanAccessController {
                     SecurityAuditKind::TokenDenied,
                     None,
                     None,
-                    Some(request.scope),
-                    Some(request.remote_address.clone()),
+                    request.scope,
+                    Some(request.remote_address.to_string()),
                     "denied",
                     "unknown bearer token",
                 )?,
             );
             self.save_next_state(&mut state)?;
             return Err(CompatibilityError::Unauthorized(
-                "invalid bearer token".to_string(),
+                GENERIC_CREDENTIAL_DENIAL.to_string(),
             ));
         };
-        let denial = token_denial_reason(&state.tokens[index], request, &self.policy);
-        if let Some(reason) = denial {
+
+        // Credential validity first, and answered generically: a revoked or
+        // lapsed token must be indistinguishable from the unknown-token branch
+        // above, including in quota (neither reaches the debit below) and in
+        // work done (both audit once and persist once). See
+        // `credential_validity_denial`.
+        if let Some(reason) = credential_validity_denial(&state.tokens[index], request.now_ms) {
             let token_id = state.tokens[index].token_id.clone();
             append_audit(
                 &mut state,
@@ -2652,8 +2907,42 @@ impl LanAccessController {
                     SecurityAuditKind::TokenDenied,
                     Some(token_id),
                     None,
-                    Some(request.scope),
-                    Some(request.remote_address.clone()),
+                    request.scope,
+                    Some(request.remote_address.to_string()),
+                    "denied",
+                    reason,
+                )?,
+            );
+            self.save_next_state(&mut state)?;
+            return Err(CompatibilityError::Unauthorized(
+                GENERIC_CREDENTIAL_DENIAL.to_string(),
+            ));
+        }
+
+        if let Some(reason) = token_common_denial_reason(
+            &state.tokens[index],
+            request.scope,
+            request.model_id,
+            request.destructive_confirmation,
+            request.now_ms,
+            &self.policy,
+            matches!(
+                request.target,
+                AuthorizationTarget::BackendCandidates | AuthorizationTarget::StagedEnvelope
+            ),
+            request.deferred_destructive_resource_id,
+            matches!(request.target, AuthorizationTarget::StagedEnvelope),
+        ) {
+            let token_id = state.tokens[index].token_id.clone();
+            append_audit(
+                &mut state,
+                self.audit_event(
+                    request.now_ms,
+                    SecurityAuditKind::TokenDenied,
+                    Some(token_id),
+                    None,
+                    request.scope,
+                    Some(request.remote_address.to_string()),
                     "denied",
                     &reason,
                 )?,
@@ -2661,6 +2950,63 @@ impl LanAccessController {
             self.save_next_state(&mut state)?;
             return Err(CompatibilityError::Forbidden(reason));
         }
+
+        let mut backends = match request.target {
+            AuthorizationTarget::Exact(backend)
+                if state.tokens[index].backends.contains(&backend)
+                    && self.policy.allowed_backends.contains(&backend) =>
+            {
+                BTreeSet::from([backend])
+            }
+            AuthorizationTarget::Exact(_) => BTreeSet::new(),
+            AuthorizationTarget::BackendCandidates | AuthorizationTarget::StagedEnvelope => state
+                .tokens[index]
+                .backends
+                .intersection(&self.policy.allowed_backends)
+                .copied()
+                .collect::<BTreeSet<_>>(),
+        };
+        if !self.policy.is_loopback() || !self.policy.allow_cloud_providers_over_lan {
+            backends.remove(&ApiBackend::CloudProvider);
+        }
+        if backends.is_empty() {
+            let reason = match request.target {
+                AuthorizationTarget::Exact(ApiBackend::CloudProvider)
+                    if state.tokens[index]
+                        .backends
+                        .contains(&ApiBackend::CloudProvider)
+                        && self
+                            .policy
+                            .allowed_backends
+                            .contains(&ApiBackend::CloudProvider) =>
+                {
+                    "cloud-provider routing is disabled for this listener"
+                }
+                AuthorizationTarget::Exact(_) => {
+                    "token or server policy forbids the requested backend"
+                }
+                AuthorizationTarget::BackendCandidates | AuthorizationTarget::StagedEnvelope => {
+                    "token and server policy have no backend in common"
+                }
+            };
+            let token_id = state.tokens[index].token_id.clone();
+            append_audit(
+                &mut state,
+                self.audit_event(
+                    request.now_ms,
+                    SecurityAuditKind::TokenDenied,
+                    Some(token_id),
+                    None,
+                    request.scope,
+                    Some(request.remote_address.to_string()),
+                    "denied",
+                    reason,
+                )?,
+            );
+            self.save_next_state(&mut state)?;
+            return Err(CompatibilityError::Forbidden(reason.to_string()));
+        }
+
         let rate_limit = &self.policy.rate_limit;
         let record = &mut state.tokens[index];
         if request.now_ms.saturating_sub(record.window_started_at_ms) >= rate_limit.window_ms {
@@ -2684,8 +3030,8 @@ impl LanAccessController {
                     SecurityAuditKind::TokenRateLimited,
                     Some(token_id),
                     None,
-                    Some(request.scope),
-                    Some(request.remote_address.clone()),
+                    request.scope,
+                    Some(request.remote_address.to_string()),
                     "denied",
                     "per-token request or byte quota exceeded",
                 )?,
@@ -2698,6 +3044,12 @@ impl LanAccessController {
         record.last_used_at_ms = Some(request.now_ms);
         let token_id = record.token_id.clone();
         let client_label = record.client_label.clone();
+        let allowed_scopes = record.scopes.clone();
+        let allowed_models = request
+            .model_id
+            .map(|model| BTreeSet::from([model.clone()]))
+            .unwrap_or_else(|| record.allowed_models.clone());
+        let confirmed_resource_id = request.deferred_destructive_resource_id.cloned();
         append_audit(
             &mut state,
             self.audit_event(
@@ -2705,18 +3057,30 @@ impl LanAccessController {
                 SecurityAuditKind::TokenAuthorized,
                 Some(token_id.clone()),
                 None,
-                Some(request.scope),
-                Some(request.remote_address.clone()),
+                request.scope,
+                Some(request.remote_address.to_string()),
                 "allowed",
-                "scope, backend, model, mutation, and rate checks passed",
+                match request.target {
+                    AuthorizationTarget::Exact(_) => {
+                        "scope, backend, model, mutation, and rate checks passed"
+                    }
+                    AuthorizationTarget::BackendCandidates => {
+                        "scope, model, mutation, rate, and candidate-backend checks passed"
+                    }
+                    AuthorizationTarget::StagedEnvelope => {
+                        "scope, mutation policy, rate, and candidate-backend checks passed before envelope parsing"
+                    }
+                },
             )?,
         );
         self.save_next_state(&mut state)?;
-        Ok(AuthorizedToken {
+        Ok(AuthorizationGrant {
             token_id,
             client_label,
-            scope: request.scope,
-            backend: request.backend,
+            backends,
+            allowed_models,
+            confirmed_resource_id,
+            allowed_scopes,
         })
     }
 
@@ -2982,52 +3346,116 @@ impl LanAccessController {
     }
 }
 
-fn token_denial_reason(
-    record: &ScopedTokenRecord,
-    request: &AuthorizationRequest,
-    policy: &LanServerPolicy,
-) -> Option<String> {
+/// Whether a token whose digest matched is a live credential at all, as
+/// opposed to a live credential that merely is not authorized for what was
+/// asked. `Some(reason)` means it is not; the reason is for the audit log only.
+///
+/// # The authentication-failure boundary
+///
+/// This is the single place the pairing family draws the line that makes an
+/// authentication failure non-informative, and the rule is:
+///
+/// > **Before** the caller has proven possession of a live credential, every
+/// > failure must be indistinguishable. **After** it has, the real reason is
+/// > safe and useful.
+///
+/// Revocation and expiry sit on the *before* side. A token that was revoked,
+/// or whose expiry has elapsed, is exactly as unusable as one that was never
+/// issued — so telling those apart tells an unauthenticated caller only one
+/// thing: that the secret it presented was once real. That is an existence
+/// oracle, and it leaks whether a given string was ever minted here. Every
+/// caller of this function must therefore map `Some(_)` onto the same
+/// `CompatibilityError::Unauthorized(GENERIC_CREDENTIAL_DENIAL)` that an
+/// unmatched digest produces, byte for byte, and must do so *without* debiting
+/// quota or taking a distinguishable amount of work: an unknown token cannot
+/// be debited and cannot be rate limited, so a debit or a `429` reachable only
+/// by a token that exists would re-open the same oracle through the ledger
+/// instead of through the status code. The audit log keeps the precise reason
+/// because it is local, already privileged, and the operator's only view of
+/// why a paired client stopped working.
+///
+/// Everything checked *after* this — scope, allowed models, backend
+/// intersection, LAN mutation policy, destructive confirmation, and the
+/// per-token rate limit — is on the *after* side and deliberately keeps its
+/// specific `Forbidden` / `RateLimited` answer. Those are not oracles: the
+/// caller has already demonstrated it holds a live token, so a precise reason
+/// tells it only about the grant it already possesses. Collapsing them into
+/// `401` would destroy diagnosability (and every scope-denial `403` the
+/// compatibility harness pins) for no security gain.
+///
+/// The legacy digest-list family holds the identical rule by different means:
+/// `server.rs`'s `authenticate_credential` reaches its generic `401` on an
+/// expired match by `break`, not by an early return with a distinct message.
+fn credential_validity_denial(record: &ScopedTokenRecord, now_ms: u64) -> Option<&'static str> {
     if record.revoked_at_ms.is_some() {
-        return Some("token is revoked".to_string());
+        return Some("token is revoked");
     }
     if record
         .expires_at_ms
-        .is_some_and(|expires| request.now_ms >= expires)
+        .is_some_and(|expires| now_ms >= expires)
     {
-        return Some("token is expired".to_string());
+        return Some("token is expired");
     }
-    if !record.scopes.contains(&request.scope) {
+    None
+}
+
+/// Post-possession denials only. Credential validity is decided before this by
+/// `credential_validity_denial`; see its doc comment for why the two sets must
+/// not share an answer.
+fn token_common_denial_reason(
+    record: &ScopedTokenRecord,
+    scope: Option<ApiScope>,
+    model_id: Option<&String>,
+    destructive_confirmation: Option<&str>,
+    now_ms: u64,
+    policy: &LanServerPolicy,
+    allow_deferred_model: bool,
+    deferred_destructive_resource_id: Option<&String>,
+    defer_destructive_confirmation: bool,
+) -> Option<String> {
+    debug_assert!(
+        credential_validity_denial(record, now_ms).is_none(),
+        "credential validity must be decided before scope/model/policy denials"
+    );
+    if scope.is_some_and(|scope| !record.scopes.contains(&scope)) {
         return Some("token does not grant the requested scope".to_string());
     }
-    if !record.backends.contains(&request.backend)
-        || !policy.allowed_backends.contains(&request.backend)
-    {
-        return Some("token or server policy forbids the requested backend".to_string());
-    }
-    if request.backend == ApiBackend::CloudProvider
-        && (!policy.is_loopback() || !policy.allow_cloud_providers_over_lan)
-    {
-        return Some("cloud-provider routing is disabled for this listener".to_string());
-    }
-    if !record.allowed_models.is_empty()
-        && request
-            .model_id
-            .as_ref()
-            .is_none_or(|model| !record.allowed_models.contains(model))
-    {
-        return Some("token is not scoped to the requested model".to_string());
+    if !record.allowed_models.is_empty() {
+        match model_id {
+            Some(model) if !record.allowed_models.contains(model) => {
+                return Some("token is not scoped to the requested model".to_string())
+            }
+            None if !allow_deferred_model => {
+                return Some("token is not scoped to an unspecified model".to_string())
+            }
+            _ => {}
+        }
     }
     if !policy.is_loopback()
-        && request.scope.is_mutation()
-        && !policy.allowed_lan_mutations.contains(&request.scope)
+        && scope.is_some_and(|scope| {
+            scope.is_mutation() && !policy.allowed_lan_mutations.contains(&scope)
+        })
     {
         return Some("LAN policy does not name this lifecycle mutation".to_string());
     }
-    if request.scope.is_destructive() {
-        let Some(model) = request.model_id.as_deref() else {
-            return Some("destructive model operation requires an exact model id".to_string());
+    if scope.is_some_and(ApiScope::is_destructive) && !defer_destructive_confirmation {
+        let target = match model_id.map(String::as_str) {
+            Some(model) => model,
+            None if allow_deferred_model => {
+                let Some(resource_id) = deferred_destructive_resource_id.map(String::as_str) else {
+                    return Some(
+                        "deferred destructive authorization requires an exact resource id"
+                            .to_string(),
+                    );
+                };
+                resource_id
+            }
+            None => {
+                return Some("destructive model operation requires an exact model id".to_string())
+            }
         };
-        if request.destructive_confirmation.as_deref() != Some(&format!("DELETE {model}")) {
+        let expected_confirmation = format!("DELETE {target}");
+        if destructive_confirmation != Some(expected_confirmation.as_str()) {
             return Some("model deletion requires exact destructive confirmation".to_string());
         }
     }
@@ -3056,6 +3484,93 @@ fn validate_authorization_request(request: &AuthorizationRequest) -> Compatibili
     }
     if let Some(model) = &request.model_id {
         validate_id(model, "authorization.modelId")?;
+    }
+    Ok(())
+}
+
+fn validate_credential_preflight_request(
+    request: &CredentialPreflightRequest,
+) -> CompatibilityResult<()> {
+    validate_timestamp(request.now_ms, "credentialPreflight.nowMs")?;
+    validate_remote_address(&request.remote_address)?;
+    validate_bearer_token_shape(&request.bearer_token)
+}
+
+fn validate_staged_authorization_request(
+    request: &StagedAuthorizationRequest,
+) -> CompatibilityResult<()> {
+    validate_timestamp(request.now_ms, "stagedAuthorization.nowMs")?;
+    validate_remote_address(&request.remote_address)?;
+    validate_bearer_token_shape(&request.bearer_token)?;
+    if request.input_bytes > MAX_BODY_BYTES as u64 {
+        return Err(limit(
+            "staged authorization input bytes",
+            request.input_bytes,
+            MAX_BODY_BYTES as u64,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bearer_token_shape(bearer_token: &str) -> CompatibilityResult<()> {
+    if !bearer_token.starts_with(TOKEN_PREFIX)
+        || bearer_token.len() != TOKEN_PREFIX.len() + 64
+        || !bearer_token[TOKEN_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        Err(CompatibilityError::Unauthorized(
+            "invalid bearer token shape".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_candidate_authorization_request(
+    request: &BackendCandidateAuthorizationRequest,
+) -> CompatibilityResult<()> {
+    validate_timestamp(request.now_ms, "authorization.nowMs")?;
+    validate_remote_address(&request.remote_address)?;
+    if !request.bearer_token.starts_with(TOKEN_PREFIX)
+        || request.bearer_token.len() != TOKEN_PREFIX.len() + 64
+        || !request.bearer_token[TOKEN_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(CompatibilityError::Unauthorized(
+            "invalid bearer token shape".to_string(),
+        ));
+    }
+    if request.input_bytes > MAX_BODY_BYTES as u64 {
+        return Err(limit(
+            "authorization input bytes",
+            request.input_bytes,
+            MAX_BODY_BYTES as u64,
+        ));
+    }
+    if let Some(model) = &request.model_id {
+        validate_id(model, "authorization.modelId")?;
+    } else if !matches!(
+        request.scope,
+        ApiScope::ModelDiscover
+            | ApiScope::ModelLoad
+            | ApiScope::ModelStatus
+            | ApiScope::ModelDelete
+    ) {
+        return Err(invalid(
+            "authorization.modelId",
+            "may be deferred only for discovery or asset/runtime resolution",
+        ));
+    }
+    if let Some(resource_id) = &request.deferred_destructive_resource_id {
+        validate_id(resource_id, "authorization.deferredDestructiveResourceId")?;
+        if !request.scope.is_destructive() || request.model_id.is_some() {
+            return Err(invalid(
+                "authorization.deferredDestructiveResourceId",
+                "is allowed only for a destructive operation with deferred model resolution",
+            ));
+        }
     }
     Ok(())
 }
@@ -3979,7 +4494,10 @@ mod tests {
         assert_eq!(manifest.endpoints.len(), 3);
         assert!(!manifest.workspace_tool_routes_exposed);
         assert!(manifest.endpoints.iter().all(|endpoint| {
-            endpoint.streaming && endpoint.tools && !endpoint.audio && endpoint.unsupported_fields_rejected
+            endpoint.streaming
+                && endpoint.tools
+                && !endpoint.audio
+                && endpoint.unsupported_fields_rejected
         }));
         // Only OpenAI Chat Completions composes/parses image content blocks
         // today (base64 data URIs only); Responses and Anthropic Messages
@@ -4132,7 +4650,10 @@ mod tests {
             &serde_json::to_vec(&batch).expect("body"),
         )
         .expect("translate batch embeddings");
-        assert_eq!(request.input, vec!["hello".to_string(), "world".to_string()]);
+        assert_eq!(
+            request.input,
+            vec!["hello".to_string(), "world".to_string()]
+        );
 
         let response = CanonicalEmbeddingResponse {
             model: "nomic-embed-text".to_string(),
@@ -4161,7 +4682,10 @@ mod tests {
 
         let base64 = json!({"model":"nomic-embed-text","input":"x","encoding_format":"base64"});
         assert!(matches!(
-            translate_embeddings_request("request-embed-3", &serde_json::to_vec(&base64).expect("body")),
+            translate_embeddings_request(
+                "request-embed-3",
+                &serde_json::to_vec(&base64).expect("body")
+            ),
             Err(CompatibilityError::Unsupported { .. })
         ));
 
@@ -4240,11 +4764,15 @@ mod tests {
             },
             created_at_seconds: 1_700_000_000,
         };
-        let encoded = encode_ollama_chat_response(&response, 42_000_000).expect("encode ollama chat");
+        let encoded =
+            encode_ollama_chat_response(&response, 42_000_000).expect("encode ollama chat");
         assert_eq!(encoded["model"], "llama3");
         assert_eq!(encoded["done"], true);
         assert_eq!(encoded["message"]["content"], "It is sunny.");
-        assert_eq!(encoded["message"]["tool_calls"][0]["function"]["name"], "weather");
+        assert_eq!(
+            encoded["message"]["tool_calls"][0]["function"]["name"],
+            "weather"
+        );
         assert_eq!(encoded["total_duration"], 42_000_000_u64);
         assert_eq!(encoded["prompt_eval_count"], 10);
         assert_eq!(encoded["eval_count"], 5);
@@ -4254,7 +4782,10 @@ mod tests {
             "messages":[{"role":"user","content":"describe","images":["base64data"]}]
         });
         assert!(matches!(
-            translate_ollama_chat_request("request-ollama-image", &serde_json::to_vec(&images).expect("body")),
+            translate_ollama_chat_request(
+                "request-ollama-image",
+                &serde_json::to_vec(&images).expect("body")
+            ),
             Err(CompatibilityError::Unsupported { .. })
         ));
 
@@ -4551,9 +5082,11 @@ mod tests {
             .revoke_token(&paired.record.token_id, 2_400, "192.168.1.50")
             .expect("revoke");
         assert_eq!(revoked.revoked_at_ms, Some(2_400));
+        // Generic, not `Forbidden("token is revoked")`: a revoked token must be
+        // indistinguishable from one that never existed.
         assert!(matches!(
             reopened.authorize(&authorization(2_500)),
-            Err(CompatibilityError::Forbidden(_))
+            Err(CompatibilityError::Unauthorized(message)) if message == GENERIC_CREDENTIAL_DENIAL
         ));
         let audit = reopened.audit_events().expect("audit");
         assert!(audit
@@ -4565,6 +5098,281 @@ mod tests {
         assert!(audit
             .iter()
             .any(|event| event.kind == SecurityAuditKind::TokenRevoked));
+    }
+
+    #[test]
+    fn candidate_authorization_precedes_resolution_and_returns_policy_intersection() {
+        let directory = TestDirectory::new("candidate-auth");
+        let policy = lan_policy();
+        let controller = make_controller(&directory.0, policy, 18);
+        let challenge = controller
+            .begin_pairing(pairing_request(), 1_000, "192.168.1.20")
+            .expect("begin pairing");
+        let paired = controller
+            .complete_pairing(
+                &challenge.challenge_id,
+                &challenge.pairing_code,
+                1_100,
+                "192.168.1.20",
+            )
+            .expect("complete pairing");
+        let request = |token: String, now_ms| BackendCandidateAuthorizationRequest {
+            bearer_token: token,
+            scope: ApiScope::ChatCompletions,
+            model_id: Some("local-model".to_string()),
+            input_bytes: 100,
+            remote_address: "192.168.1.20".to_string(),
+            destructive_confirmation: None,
+            deferred_destructive_resource_id: None,
+            now_ms,
+        };
+
+        assert!(matches!(
+            controller
+                .authorize_backend_candidates(&request("lmk-lan-not-a-token".to_string(), 1_150,)),
+            Err(CompatibilityError::Unauthorized(_))
+        ));
+        let authorized = controller
+            .authorize_backend_candidates(&request(paired.token.clone(), 1_200))
+            .expect("candidate authorization");
+        assert_eq!(
+            authorized.backends,
+            BTreeSet::from([ApiBackend::ManagedLocal, ApiBackend::Mlx])
+        );
+        assert!(!authorized.backends.contains(&ApiBackend::CloudProvider));
+
+        let mut wrong_model = request(paired.token, 1_300);
+        wrong_model.model_id = Some("private-model".to_string());
+        assert!(matches!(
+            controller.authorize_backend_candidates(&wrong_model),
+            Err(CompatibilityError::Forbidden(_))
+        ));
+    }
+
+    /// The existence oracle this closes: an unknown, a revoked, and an expired
+    /// paired token must be one answer, on every entry point, and must stay
+    /// that answer no matter how many times they are retried — a `429` that
+    /// only a token that exists can provoke is the same oracle wearing the
+    /// rate limiter's clothes. The boundary rule lives on
+    /// `credential_validity_denial`; this pins both of its sides.
+    #[test]
+    fn unknown_revoked_and_expired_tokens_are_one_generic_denial_on_every_entry_point() {
+        let directory = TestDirectory::new("credential-oracle");
+        let controller = make_controller(&directory.0, lan_policy(), 91);
+        let challenge = controller
+            .begin_pairing(pairing_request(), 1_000, "192.168.1.20")
+            .expect("begin pairing");
+        let paired = controller
+            .complete_pairing(
+                &challenge.challenge_id,
+                &challenge.pairing_code,
+                1_100,
+                "192.168.1.20",
+            )
+            .expect("complete pairing");
+        let unknown = format!("{TOKEN_PREFIX}{}", "a".repeat(64));
+        // `pairing_request` mints with `token_expires_at_ms: Some(100_000)`.
+        let after_expiry = 200_000;
+
+        // Every entry point, for a token that never existed and for one whose
+        // expiry has elapsed, at a moment when the live token still works.
+        let denials = |token: &str, now_ms: u64| {
+            vec![
+                controller.preflight_credential(&CredentialPreflightRequest {
+                    bearer_token: token.to_string(),
+                    remote_address: "192.168.1.20".to_string(),
+                    now_ms,
+                }),
+                controller
+                    .authorize(&AuthorizationRequest {
+                        bearer_token: token.to_string(),
+                        scope: ApiScope::ChatCompletions,
+                        backend: ApiBackend::ManagedLocal,
+                        model_id: Some("local-model".to_string()),
+                        input_bytes: 10,
+                        remote_address: "192.168.1.20".to_string(),
+                        destructive_confirmation: None,
+                        now_ms,
+                    })
+                    .map(|_| ()),
+                controller
+                    .authorize_backend_candidates(&BackendCandidateAuthorizationRequest {
+                        bearer_token: token.to_string(),
+                        scope: ApiScope::ChatCompletions,
+                        model_id: Some("local-model".to_string()),
+                        input_bytes: 10,
+                        remote_address: "192.168.1.20".to_string(),
+                        destructive_confirmation: None,
+                        deferred_destructive_resource_id: None,
+                        now_ms,
+                    })
+                    .map(|_| ()),
+                controller
+                    .authorize_staged_request(&StagedAuthorizationRequest {
+                        bearer_token: token.to_string(),
+                        scope: None,
+                        input_bytes: 10,
+                        remote_address: "192.168.1.20".to_string(),
+                        now_ms,
+                    })
+                    .map(|_| ()),
+            ]
+        };
+
+        for (label, token, now_ms) in [
+            ("unknown", unknown.as_str(), 1_200),
+            ("expired", paired.token.as_str(), after_expiry),
+            ("unknown after expiry", unknown.as_str(), after_expiry),
+        ] {
+            for outcome in denials(token, now_ms) {
+                assert!(
+                    matches!(&outcome, Err(CompatibilityError::Unauthorized(message))
+                        if message == GENERIC_CREDENTIAL_DENIAL),
+                    "{label} token must answer the generic 401: {outcome:?}"
+                );
+            }
+        }
+
+        // A live token is still authorized, so the generic answer above is not
+        // simply "everything is refused".
+        controller
+            .authorize(&AuthorizationRequest {
+                bearer_token: paired.token.clone(),
+                scope: ApiScope::ChatCompletions,
+                backend: ApiBackend::ManagedLocal,
+                model_id: Some("local-model".to_string()),
+                input_bytes: 10,
+                remote_address: "192.168.1.20".to_string(),
+                destructive_confirmation: None,
+                now_ms: 2_000,
+            })
+            .expect("a live token is still authorized");
+
+        // Past the boundary the real reason is kept: a live token asking for a
+        // scope it does not hold is a 403, not a 401.
+        assert!(matches!(
+            controller.authorize(&AuthorizationRequest {
+                bearer_token: paired.token.clone(),
+                scope: ApiScope::Embeddings,
+                backend: ApiBackend::ManagedLocal,
+                model_id: Some("local-model".to_string()),
+                input_bytes: 10,
+                remote_address: "192.168.1.20".to_string(),
+                destructive_confirmation: None,
+                now_ms: 2_001,
+            }),
+            Err(CompatibilityError::Forbidden(message))
+                if message == "token does not grant the requested scope"
+        ));
+
+        // No leak through the ledger either. `max_requests` is 2 per window, so
+        // a debiting pre-possession failure would turn into a 429 by the third
+        // try and hand the caller its oracle back. Both families of failure
+        // must stay on the generic 401 indefinitely.
+        for attempt in 0..6 {
+            for (label, token) in [("expired", paired.token.as_str()), ("unknown", &unknown)] {
+                let outcome = controller.authorize(&AuthorizationRequest {
+                    bearer_token: token.to_string(),
+                    scope: ApiScope::ChatCompletions,
+                    backend: ApiBackend::ManagedLocal,
+                    model_id: Some("local-model".to_string()),
+                    input_bytes: 10,
+                    remote_address: "192.168.1.20".to_string(),
+                    destructive_confirmation: None,
+                    now_ms: after_expiry + attempt,
+                });
+                assert!(
+                    matches!(&outcome, Err(CompatibilityError::Unauthorized(message))
+                        if message == GENERIC_CREDENTIAL_DENIAL),
+                    "{label} token must never be debited into a 429: {outcome:?}"
+                );
+            }
+        }
+
+        // Revocation joins the same generic answer, and revoking does not make
+        // the token usable on any entry point.
+        let live = controller
+            .begin_pairing(pairing_request(), 3_000, "192.168.1.20")
+            .expect("begin pairing for revocation");
+        let live = controller
+            .complete_pairing(
+                &live.challenge_id,
+                &live.pairing_code,
+                3_100,
+                "192.168.1.20",
+            )
+            .expect("complete pairing for revocation");
+        controller
+            .revoke_token(&live.record.token_id, 3_200, "192.168.1.20")
+            .expect("revoke");
+        for outcome in denials(&live.token, 3_300) {
+            assert!(
+                matches!(&outcome, Err(CompatibilityError::Unauthorized(message))
+                    if message == GENERIC_CREDENTIAL_DENIAL),
+                "a revoked token must answer the generic 401: {outcome:?}"
+            );
+        }
+
+        // The audit log keeps the precise reasons the responses withhold.
+        let audit = controller.audit_events().expect("audit");
+        assert!(audit
+            .iter()
+            .any(|event| event.kind == SecurityAuditKind::TokenDenied
+                && event.detail == "token is expired"));
+        assert!(audit
+            .iter()
+            .any(|event| event.kind == SecurityAuditKind::TokenDenied
+                && event.detail == "token is revoked"));
+        assert!(audit
+            .iter()
+            .any(|event| event.kind == SecurityAuditKind::TokenDenied
+                && event.detail == "unknown bearer token"));
+    }
+
+    #[test]
+    fn exact_and_candidate_paths_share_one_atomic_quota_and_policy_gate() {
+        let directory = TestDirectory::new("shared-auth-gate");
+        let controller = make_controller(&directory.0, lan_policy(), 24);
+        let challenge = controller
+            .begin_pairing(pairing_request(), 1_000, "192.168.1.20")
+            .expect("begin pairing");
+        let paired = controller
+            .complete_pairing(
+                &challenge.challenge_id,
+                &challenge.pairing_code,
+                1_100,
+                "192.168.1.20",
+            )
+            .expect("complete pairing");
+        let exact = |now_ms| AuthorizationRequest {
+            bearer_token: paired.token.clone(),
+            scope: ApiScope::ChatCompletions,
+            backend: ApiBackend::ManagedLocal,
+            model_id: Some("local-model".to_string()),
+            input_bytes: 100,
+            remote_address: "192.168.1.20".to_string(),
+            destructive_confirmation: None,
+            now_ms,
+        };
+        let candidate = |now_ms| BackendCandidateAuthorizationRequest {
+            bearer_token: paired.token.clone(),
+            scope: ApiScope::ChatCompletions,
+            model_id: Some("local-model".to_string()),
+            input_bytes: 100,
+            remote_address: "192.168.1.20".to_string(),
+            destructive_confirmation: None,
+            deferred_destructive_resource_id: None,
+            now_ms,
+        };
+
+        controller.authorize(&exact(1_200)).expect("exact debit");
+        controller
+            .authorize_backend_candidates(&candidate(1_300))
+            .expect("candidate debit");
+        assert!(matches!(
+            controller.authorize(&exact(1_400)),
+            Err(CompatibilityError::RateLimited { .. })
+        ));
     }
 
     #[test]

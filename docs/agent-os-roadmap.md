@@ -157,8 +157,45 @@ message bytes, `owned_by` values, raw SSE passthrough, and `OPTIONS /v1/*` → 2
   `port == DEFAULT_HTTP_PORT` to name the other listener, so a listener holding
   its own copy could be moved off 1234 and silently make that diagnosis wrong.
 
-**Remaining — and why it is not one more coding session.** Three parts of this
-merge are blocked on decisions or on a release cycle, not on effort:
+**Since the section below was written, three of its four blockers shipped and the
+merge itself landed.** `unified_http_server.rs` is now the lifecycle authority and
+`server.rs` is its transport — the production bind is `bind_candidate`, the accept
+task is `run_unified_endpoint`, and every entry point (autostart, exit hook, the two
+`api_server_*` commands, `m3_http_server_start`, LAN policy configure/disable) funnels
+through one reconciler. `m3_http_server.rs`'s own listener is now explicitly
+**test-only**. Route authority is the typed `http_route_registry.rs`: one ordered
+table, a five-variant matcher, first-match-wins, plus a negative `DENIED_SURFACES`
+tier — so **the host-route prefix tier landed without weakening the invariant**, and
+the guard the doc named is now a real test under that name. It is a table-level guard
+rather than a behavioural one, deliberately: the defect it must catch is a *newly
+added* route, which no test over today's routes can see.
+
+Dual-accept is live on one socket and tested end-to-end (both families, each routed
+to its owner, each debited against its own limiter). `read_capped_body` was two
+independent implementations and is now one in `http_policy.rs`, with the wire
+rendering — which genuinely differed — expressed as a typed rejection each router
+renders itself, rather than silently picking one. `now_ms`, `full_body` and
+`json_response` merged; **`error_response` deliberately did not** (different `type`
+discriminator, different field order), and neither did the four shared handlers, for
+the reason the byte-compatibility bullet below gives. That reason is now written at
+the fork point so the next reader does not "clean it up" and turn every browser
+client into a 403.
+
+One security finding came out of writing the dual-accept test, and it was the
+mirror image of a fix the legacy path already had: **an expired paired token
+answered 403 "token is expired" while an unknown one answered 401** — an existence
+oracle telling a caller whether a secret was ever issued. The legacy path had
+deliberately routed expiry into the same generic 401 years earlier. The fix could
+not be "collapse Forbidden into Unauthorized", which would have destroyed every
+legitimate scope-denial 403; the rule is **before the caller has proven possession
+of a live credential every failure must be indistinguishable — including in quota
+consumed, since a 429 reachable only by a token that exists is the same oracle in a
+different costume — and after it has, real reasons are safe and useful.** Unknown,
+expired, revoked and unpaired-peer now answer byte-identically; scope, model,
+backend and confirmation denials keep their 403s.
+
+**Remaining — and why it is not one more coding session.** What is left is a
+calendar dependency, not effort:
 
 - **Token unification cannot be a cutover.** Legacy tokens are `lmk-` + 32 hex;
   the pairing store's are `lmk-lan-` + 64 hex and shape-checked, so it rejects a
@@ -168,7 +205,7 @@ merge are blocked on decisions or on a release cycle, not on effort:
   both (pairing store first, legacy digest list as fallback, rate limiter on
   both), deprecate the legacy mint flow in the UI, then delete the legacy branch
   *a release later*. That last step is a calendar dependency.
-- **Model-id resolution is mutually exclusive** — *decided, implementation reverted.*
+- **Model-id resolution is mutually exclusive** — *decided, reverted once, now shipped.*
   `server.rs` treats any unknown non-empty model id as an Ollama tag; m3 404s unless the
   model is installed or an explicit runtime header is present.
 
@@ -206,21 +243,46 @@ merge are blocked on decisions or on a release cycle, not on effort:
   security-state writes behind a global mutex; and the same oracle still exists at
   `discover_models` and three lifecycle paths, so this is a shared-helper fix rather than
   a per-call-site one.
+
+  **The second attempt shipped it**, as `http_model_catalog.rs` (the pure engine),
+  `http_model_service.rs` (the façade) and `http_model_sources.rs` (the adapters:
+  m3 runtimes, legacy llama, OpenAI-compatible, Ollama, cloud providers). Listing and
+  resolution both run over the union, deduped by `(model_id, runtime_id)` and sorted
+  deterministically, with `x-little-monkey-runtime-id` as the explicit override and a
+  404 only when nothing has the id.
+
+  **The trap that killed the first attempt is now structural rather than remembered.**
+  Authorization strictly precedes resolution on both paths, and the gate is enforced
+  twice on purpose: `HttpModelService::resolve` runs `preflight_gate` before it will so
+  much as *construct* a source, and `UnifiedModelCatalog::resolve` repeats
+  `effective_backends` before `collect_effective` makes the first network touch. So an
+  unauthenticated caller cannot cause an outbound `/api/tags` probe, cannot enumerate
+  runtime ids from an error body, and cannot use 404-vs-401 as a per-model existence
+  oracle — a disabled runtime override is `Forbidden` without probing the others, and a
+  known-but-disallowed provider prefix is `Forbidden` rather than a synthesized 404. The
+  end-to-end test asserts an invalid bearer produces zero llama requests *and* zero
+  ollama requests, which is the only form of that assertion that would have caught the
+  original defect.
 - **Byte-level compatibility is load-bearing.** `Access-Control-Allow-Origin: *`
   on every legacy response versus m3's deny-all default; `/health` returning
   exactly `{"status":"ok"}`; the OpenAI error envelope real SDKs branch on;
   `owned_by` values clients filter on; raw SSE passthrough versus m3's re-framed
   frames; `OPTIONS` on `/v1/*` returning 204. A naive merge turns every
-  browser-based client into a 403. This needs the byte-level harness for the
-  legacy routes that does not exist yet — the one thing that would make the rest
-  of the merge safe to attempt.
+  browser-based client into a 403. **The harness exists now** and it is what made
+  the merge safe to attempt — it caught every byte question above, and the four
+  shared routes were left deliberately unmerged because of what it pins. One gap
+  it had is closed: `/v1/embeddings` appeared nowhere in it, so its fork was
+  protected only by generic assertions on other routes. It is now byte-pinned like
+  the other three, against a fixture written to be wrong in three ways a
+  re-serializer would silently fix.
 
 Also still open: `monkey-cli api-serve` is deliberately `AppHandle`-free while
-the merged server needs an `M3RuntimeHub` that today only exists under Tauri;
-and the five host routes (`/v1/knowledge/query`, `/v1/local-apps/{id}/run`,
-`/v1/artifacts/{id}`, `/v1/workflows/runs/{id}`, `/local-apps/{id}`) need m3's
-exact-match allowlist to grow a prefix tier without weakening the invariant
-`route_allowlist_never_exposes_agent_or_workspace_tools` asserts.
+the merged server needs an `M3RuntimeHub` that today only exists under Tauri.
+The five host routes (`/v1/knowledge/query`, `/v1/local-apps/{id}/run`,
+`/v1/artifacts/{id}`, `/v1/workflows/runs/{id}`, `/local-apps/{id}`) are done —
+they are in the typed registry, loopback-scoped, with the prefix tier landed and
+the invariant `route_allowlist_never_exposes_agent_or_workspace_tools` now an
+actual test rather than a name in this file.
 
 **Blocks:** K7 still.
 
@@ -2458,7 +2520,13 @@ egress travels with it.
 Measure first, then arbitrate. Building the scheduler before K6 produces a
 scheduler that optimizes numbers nobody measured.
 
-## K6. Measured resource accounting
+That ordering was followed and it paid: K8's fair-share reads `cpu_time_ms` out of
+K6's ledger, and K7's admission refuses to report an unmeasured footprint as
+fitting. The one thing that would have gone unnoticed without measuring first is
+recorded under K6 — a CPU reading that was wrong by 42× on Apple Silicon and
+exactly right on Intel.
+
+## K6. Measured resource accounting *(ledger built; benchmark surface remaining)*
 
 **Today:** the Telemetry tab captures real per-load and per-request traces —
 load timing, memory/VRAM headroom, offload placement, sampler stats, token
@@ -2474,11 +2542,78 @@ with wall time, CPU time, peak RSS, GPU-resident bytes and device-seconds
 where the runtime reports them, bytes read/written, bytes egressed, and tokens
 in/out — each field either measured or marked `unavailable`, never inferred.
 
-**Blocks:** K7, K8. Also the honesty of every claim Phase 2 makes.
+**Shipped — (b), the ledger. The load-bearing clause is "never inferred", and it
+is enforced in three places rather than asserted once.** `process_usage.rs` samples
+a live pid: `proc_pid_rusage` with `RUSAGE_INFO_V4` on macOS, `/proc/<pid>/{stat,
+status,io}` on Linux, `GetProcessTimes` on Windows. Migration V8 adds nine nullable
+columns to `agent_processes` plus `usage_unavailable_json`, where **NULL means
+unavailable and every NULL carries the reason it is NULL**. `ProcessUsage::new`
+refuses to construct a value whose `None` field has no note; a SQL trigger,
+`agent_processes_close_out_states_its_gaps`, aborts any transition to `exited`
+whose reasons column is NULL, so the invariant survives a direct-SQL writer that
+never goes through Rust. Close-out is derived inside `ProcessTable::transition` —
+the one UPDATE every terminal path already funnels through — so its signature is
+unchanged and no caller, reaper, or test had to learn the ledger exists.
+
+**The interesting correction is one only measuring could have found.**
+`ri_user_time` and `ri_system_time` are **mach absolute time units, not
+nanoseconds**. Dividing by 1,000,000 under-reported CPU by ~42× on Apple Silicon
+— and would have been exactly *correct* on Intel, where the timebase is 1/1. That
+is the shape of error that survives review forever: plausible, documented-looking,
+and right on the machine the reviewer happens to own. A `mach_timebase_info`
+conversion fixed it; a 1168ms busy loop now reads 1156ms against 1157ms wall, and
+a regression test bounds the reading below by wall/4 and above by wall × cores, so
+it cannot flake in a parallel test binary.
+
+**Bytes egressed was the one field with no measurement code anywhere in the tree,
+and it needed new plumbing rather than a new reader.** `egress::Counted<B>` is a
+frame-by-frame `http_body::Body` passthrough — it forwards the frame, adds
+`data.remaining()`, retains nothing, and forwards `size_hint`/`is_end_stream` so
+nothing downstream can tell it is there. That property is load-bearing: buffering
+to count would break SSE and blow memory on a multi-GB model pull, so a test
+proves the first frame arrives before the last one is produced. **Unit: HTTP
+entity-body bytes as they crossed the socket, undecoded** — a property of this
+crate's build (none of reqwest's decompression features are enabled), documented
+at `egress::send` including the warning that enabling one silently changes the
+number's meaning. Adopted at 79 call sites. The connector was tried first and
+cannot work: `connector_layer` must return reqwest's `Conn`, a private type that
+cannot be constructed or unwrapped.
+
+Attribution needed a **process** identity where `run_scope.rs` only had a run id.
+`ProcessScope` now rides the same `tokio::task_local!` — the D3 primitive, kept for
+the D3 reason — and `run_commands::scoped_with_egress` drains it into
+`add_egress_bytes` every 5s and at teardown, so a long run's bytes are neither
+invisible until it ends nor lost if it is killed. A run with no row, or several
+rows claiming one run, falls back to a named unattributed tally rather than
+guessing; bytes are never dropped and never charged to a bystander.
+
+**What is honestly unavailable, and stays that way.** GPU-resident bytes and
+device-seconds: nothing in this tree measures per-process GPU residency, so both
+columns record that reason and invent no number. Peak RSS and disk I/O on Windows:
+the windows-sys feature modules this crate enables do not cover them. Tokens for
+`subagent`, `side_task` and the m4 workflow kinds: `agent_processes.run_id` is NULL
+for those kinds *by design*, so a token count sourced from the run's event stream
+is structurally unavailable — an honest gap, not a bug to paper over. The `mcp.rs`
+rmcp transport owns its own client inside spawned workers and never surfaces a
+`RequestBuilder`, so it is the one place a count is genuinely *missing* rather than
+merely unattributed.
+
+`ResourceLedgerPanel` surfaces it, and the render path is a tagged union: an
+unmeasured field has no `.text` to read, so the only compilable branch is the one
+that prints the backend's reason. Totals report how many rows could not
+contribute. No chart — a zero-height bar cannot say "unknown" rather than "idle",
+which is the exact lie the item exists to prevent.
+
+**Remaining — (a), the benchmark surface.** Untouched. Edge device profiles are
+still static prose and cost still comes from typed rates. The ledger now gives it
+somewhere honest to write measurements to, which is the part that blocked it.
+
+**Blocks:** nothing now. K7 and K8 both shipped on top of it, and K8's fair-share
+reads `cpu_time_ms` out of this ledger rather than deriving a number of its own.
 
 *Maps to: ROADMAP #2.*
 
-## K7. Resource-aware admission control
+## K7. Resource-aware admission control *(built)*
 
 **Today:** the daemon admits work by a fixed integer concurrency
 (`DEFAULT_CONCURRENCY: u32 = 4`, clamped 1–32) ordered by
@@ -2494,10 +2629,54 @@ alongside what is already resident. Reservations are released on exit,
 including on crash. A process that can never fit on this machine is rejected
 at enqueue with the specific shortfall, not started and killed later.
 
-**Blocks:** K8 — a scheduler is admission plus arbitration; this is the half
-that can ship first and independently.
+**Shipped — `daemon/admission.rs` (pure) with the I/O in `engine.rs`.** `fit`
+returns `Fits` / `Hold{resource, shortfall}` / `Never{resource, shortfall}`, both
+refusals naming which resource fell short and by how much, and both propagating
+into the log line and the ledger rejection reason. `installed_model_footprint(app_data_dir,
+model_id) -> M3ModelFootprint::{Known, Unknown}` is the public model-id→footprint
+function that did not previously exist anywhere — `evaluate_hardware_fit` was
+private and took a catalog record rather than an id.
 
-## K8. A real scheduler
+**Four things the first cut got wrong, each worth recording:**
+
+- **It was inert on the CLI path.** `snapshot_target` hardcoded
+  `estimated_memory_bytes: None`, so `reservation_bytes` was 0 and every job from
+  `monkey daemon queue <recipe>` short-circuited to `Fits` — the feature was live,
+  tested, and did nothing for one of its two producers. The CLI path now freezes a
+  real footprint. **An unknown footprint is a third case, `Unmeasured`, not zero**:
+  such a job is started (refusing every unmeasured model would refuse every
+  pre-estimate spec) but reserves nothing and is *never reported as fitting*, so the
+  tick's bound is recorded as taken on faith rather than laundered into a measurement.
+- **It was RAM-only.** The fit now plans with `LocalOffloadPlanner::plan` and splits
+  the model's two estimates along the planned placement. The subtlety is that it
+  plans against an **idle** machine on purpose: the planner's job is to make anything
+  fit by spilling, so planning against current load answers "fits" at every load
+  level and the accelerator leg could never hold. Metal and CPU take no VRAM leg at
+  all — unified memory charged twice would cap every Mac at half its capacity.
+- **Two jobs on one model each paid full price.** Reservations are keyed by
+  `ModelTargetSnapshot::target_id()` and totalled with a SQL `GROUP BY`, so N turns
+  against one local model — the common case — are charged once, and the
+  release-on-last-holder rule falls out of the grouping instead of needing its own
+  bookkeeping.
+- **Reservations lived in a `HashMap` that died with the daemon process.** Harmless
+  by accident while nothing else read them, load-bearing the moment anything did.
+  They are now durable in `daemon_jobs`, released in `finish_active` *and*
+  `reconcile_interrupted` (the crash funnel: dead child, lapsed lease, restarted
+  daemon), and swept in `recover`. This required giving the daemon db the migration
+  framework `engine.rs` had already flagged as debt, mirroring `denial_sink.rs`'s
+  `(version, checksum, sql)` ladder.
+
+A held job reports **why** in a dedicated `hold_reason` column rather than a new
+`JobState` variant — `process_state_for` already maps `Queued → ProcessState::Admitted`,
+so the unified process table reported the roadmap's `admitted` correctly all along,
+and a state name cannot answer the question an operator actually has ("why, and by
+how much"). Not `last_error`: `transition` writes that with `COALESCE`, so a hold
+parked there would still be present when the job later succeeded and would read back
+as that success's exit reason.
+
+**Blocks:** nothing now.
+
+## K8. A real scheduler *(built)*
 
 **Today:** priority-ordered FIFO with a fixed worker count. No preemption, no
 fair-share, no starvation guarantee, no distinction between an interactive
@@ -2514,8 +2693,107 @@ delay is stated and testable; and a backpressure signal every producer
 decision is inspectable after the fact: which process was chosen, what it was
 chosen over, and which measurement decided it.
 
-**Blocks:** the claim. This is the single largest gap between "agent runtime"
-and "agent OS".
+**Shipped — `daemon/scheduler.rs`, pure, with the I/O in `engine.rs`.** Arbitration
+is six ordered keys: effective class (interactive → batch → background →
+maintenance, promoted one level per aging interval spent queued), then aging steps
+descending, then fair-share deficit, then declared priority, then queue age, then
+job id so the order is total and two ticks never disagree. The engine walks that
+order and admits what fits, *holding* rather than stopping at what does not — so
+the ranking decides who gets first refusal, never who is allowed to be considered.
+
+Class comes from the run's frozen `RunKind`, **not from `priority`** — otherwise
+`--priority 9` becomes a self-service interactive badge. A desktop turn is
+interactive because `task.rs` already writes `RunKind::Interactive`; a
+`monkey daemon run <recipe>` is `Workflow`, i.e. batch. Priority cannot promote a
+class; a negative priority may demote one.
+
+**Starvation bound, stated and tested:**
+`T_head = (CLASS_COUNT − 1) × AGING_INTERVAL_MS` = 3 minutes, and
+`delay_until_dispatch ≤ T_head + max(max_runtime_ms of the running jobs)`. Rank key
+two is what makes it a bound rather than a hope: after three promotions a
+maintenance job is at the head and **no later arrival can overtake it**. The
+dispatch term is deliberately not tightened — a free slot is still needed, and that
+wait is bounded only by the watchdog's own ceiling. What the bound guarantees is
+that the wait stops depending on what arrives after the job did. The test asserts
+*not* first at `T_head − 1`, first at `T_head` against 32 interactive arrivals, and
+still first after ten more intervals of fresh ones.
+
+**Fair-share reads K6's measurements rather than deriving its own** —
+`usage_totals(workspace).cpu_time_ms` over the workspace's 64 most recent
+processes, compared in 30s buckets so a 1ms difference does not reorder. That is
+why K6 came first: one workspace running a single six-hour job is not equal to one
+running 720 short turns, and only a measured number can tell them apart. **Two
+approximations, named rather than hidden:** it is CPU-only, so a job blocked on a
+remote provider is charged almost nothing while holding a slot, and a
+GPU-saturating job is charged only for the CPU feeding it (`gpu_device_ms` exists
+in the ledger but no runtime here reports it — the upgrade is purely additive); and
+it shares across workspaces only, not profiles, because `RunSpec` carries no
+profile field to read.
+
+**Preemption suspends, never kills**, via K2's durable latch — writing
+`ProcessSignal::Suspend` rather than setting `pause_requested`, because
+`apply_signal_intent` is level-triggered table→daemon and a bare flag would be
+cleared on the very next tick. The reservation is released on suspend and
+reacquired on resume, and **the interesting case is that reacquisition can fail**: a
+resumed job whose memory is no longer available goes back to held with a reason and
+delivers zero signals to its child, rather than thrashing. Only a strictly lower
+class is ever a victim (equal classes would livelock), only the sole holder of a
+resident model (suspending one of two holders frees nothing), and only one victim
+per tick. Honest ceiling, recorded in the code: `SIGSTOP` returns no pages to the
+OS and a local model's weights live in a model server outside the process group, so
+releasing the claim is an **accounting** decision that trades possible swap for
+interactive latency. Actually reclaiming those bytes needs a runtime-hub unload the
+engine has no seam for; the accounting is already correct for it.
+
+**Decisions are inspectable, and cite a real reading.**
+`daemon_scheduler_decisions`, bounded to 512 rows, records the outcome, the class,
+what it was passed over, and the measurement that decided it — where
+`measured_at_ms` is **the cited reading's own observation time, not the write
+time**, which is the whole substance of the clause. Which measurement gets cited
+depends on the outcome, and for an admission it is the ranking key that actually
+put the job first, computed by `deciding_key` walking `rank`'s keys in the same
+order so the explanation cannot drift from the decision. Held decisions are written
+only when the reason changes — admission re-evaluates four times a second, and a
+row per evaluation would churn the whole log every two minutes. Surfaced by
+`monkey daemon decisions` and by `ResourceLedgerPanel`.
+
+**A starvation bug the first cut left behind is fixed:** the candidate window was
+only as wide as the free slot count, so a small job queued behind `concurrency`
+larger *held* jobs was never even considered until one left. It is now the queue
+bound, affordable because a `JobFacts` cache reads each run's immutable spec once
+rather than once per tick.
+
+**Backpressure** is a typed signal on `daemon status --json` —
+`state: accepting|slow|closed`, a stable `reason` token, a human `detail` nothing
+branches on, and an advisory `retry_after_ms`. `closed` is enforced at the single
+`enqueue` chokepoint *before* a worktree or snapshot is created, so every producer
+that routes through the CLI gets a hard error rather than a silently overfull
+queue. `slow` is advisory and honored asymmetrically on purpose: **an interactive
+producer proceeds** — a person waiting on a turn has nothing to defer to, so
+deferring is a refusal they did not ask for — **and a batch producer defers**. A
+missing signal is treated as accepting; a safety signal that goes absent must not
+brick the app. The desktop's deserializer was silently dropping the field until a
+test fed it verbatim CLI JSON: the nested block needs a split
+`rename_all(serialize = "camelCase", deserialize = "snake_case")`, and the naive
+camelCase every sibling struct uses loses exactly the fields whose absence still
+lets `state` work.
+
+The two HTTP listeners honor nothing, **with evidence rather than by omission**:
+`m3_http_server.rs` contains no reference to the daemon at all, and every
+`server.rs` route is inference proxy, model lifecycle, cancellation, or read-only
+state — `POST /v1/local-apps/{id}/run` emits an event and returns 202 without
+touching the queue. Gating inference would mean spawning a status subprocess on the
+hot path of every chat completion to refuse work that never enters the queue being
+measured. A test trips if an enqueueing route is ever added. Note also that
+scheduler backpressure and the per-listener `RequestAdmission` bound are different
+things and stay distinguishable: `503`/`server_busy` means requests in flight,
+`429` + `Retry-After` means the work queue behind them.
+
+**Remaining:** no cascade preemption (one victim per tick), and `ready_jobs` still
+takes slot availability into account for dispatch even though the candidate window
+no longer does.
+
+**Blocks:** nothing now.
 
 ## K9. Dispatch policy (model routing)
 
@@ -2831,3 +3109,23 @@ claim is already strong and already true. "Agent OS" invites a reader to look
 for a process table, enforced isolation on their platform, and a scheduler
 that measured something — and the README's whole voice is that a reader who
 looks will find what was promised.
+
+**Three of those four now survive that reader.** There is a process table with a
+parent/child tree, nine kinds, a validated transition table and three reapers (K1,
+K2). There is a scheduler that arbitrates by documented classes, preempts by
+suspend-and-resume, states a starvation bound as a formula with a test behind it,
+and shares fairly on CPU milliseconds it measured itself (K6–K8). Resource
+arbitration is real: admission consults live hardware and the offload plan, holds
+what does not fit, and rejects at enqueue what can never fit.
+
+**The one that does not survive it is isolation (K3), and it is the honest blocker
+on the name.** There is no landlock, no seccomp, and no job-object code in the
+tree; macOS Seatbelt is the only platform confinement and it is opt-in with a
+single non-test caller, and the agent shell tool is unsandboxed on every platform.
+"Enforced by the platform, not requested politely by the program" is the definition
+this file opens with, and it is the clause still unmet. Phase 3 — copy-on-write run
+namespace, tamper-evident log chaining, freeze/restore, transactional effects — is
+also largely ahead.
+
+So the name does not change yet, and the reason to state plainly is K3 rather than
+the scheduler.

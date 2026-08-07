@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use futures_util::StreamExt;
+use little_monkey_lib::egress;
 use little_monkey_lib::providers::Utf8ChunkAccumulator;
 
 use crate::ollama_api::{self, ChatEvent, ChatMetrics, NativeChatReq};
@@ -299,8 +300,9 @@ pub async fn stream_turn_observed(
         }
     };
 
-    let response = request
-        .send()
+    // The SSE body stays a stream: `bytes_stream` below consumes it frame by
+    // frame and the meter is a passthrough.
+    let response = egress::send(request)
         .await
         .map_err(|e| format!("Request failed: {e}"))?;
     if !response.status().is_success() {

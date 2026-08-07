@@ -117,9 +117,7 @@ pub fn process_descendants(
     state: tauri::State<'_, AppState>,
     process_id: String,
 ) -> Result<Vec<ProcessRecord>, String> {
-    with_process_table(&app, state.inner(), |table| {
-        table.descendants(&process_id)
-    })
+    with_process_table(&app, state.inner(), |table| table.descendants(&process_id))
 }
 
 /// Live count per kind.
@@ -529,8 +527,9 @@ pub fn process_deliver_os_signal(
         return Ok(None);
     };
 
-    let delivered = crate::background_shell::deliver_os_signal(&app, state.inner(), &record, signal)
-        .unwrap_or(record);
+    let delivered =
+        crate::background_shell::deliver_os_signal(&app, state.inner(), &record, signal)
+            .unwrap_or(record);
     notify(&app, &delivered);
     Ok(Some(delivered))
 }
@@ -615,6 +614,63 @@ pub fn process_pending_signals(
         parsed.push(ProcessKind::parse(&raw).map_err(to_message)?);
     }
     with_process_table(&app, state.inner(), |table| table.pending_signals(&parsed))
+}
+
+/// Filter arguments for [`process_usage_ledger`].
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessUsageArgs {
+    #[serde(default)]
+    pub process_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub closed_only: Option<bool>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// The resource ledger for a selection of processes: the rows and their totals.
+///
+/// Both in one response because they are only meaningful together — a total whose
+/// `unavailableRows` is nonzero is answering a narrower question than it looks
+/// like, and the rows are how a caller sees which processes were left out and
+/// why.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessUsageLedger {
+    pub rows: Vec<crate::process_table::ProcessUsageRow>,
+    pub totals: crate::process_table::ProcessUsageAggregate,
+}
+
+/// What each process actually consumed, per process and in aggregate.
+///
+/// The read side of K6(b). Every field is either a measurement or `null` with a
+/// reason in `usage.unavailable` — nothing here is inferred, and in particular
+/// nothing unmeasured is reported as zero, so a surface showing these numbers can
+/// say "not measured, because …" instead of implying a process cost nothing.
+#[tauri::command]
+pub fn process_usage_ledger(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    args: Option<ProcessUsageArgs>,
+) -> Result<ProcessUsageLedger, String> {
+    let args = args.unwrap_or_default();
+    let filter = crate::process_table::ProcessUsageFilter {
+        process_id: args.process_id,
+        run_id: args.run_id,
+        workspace: args.workspace,
+        closed_only: args.closed_only.unwrap_or(false),
+        limit: args.limit,
+    };
+    with_process_table(&app, state.inner(), |table| {
+        Ok(ProcessUsageLedger {
+            rows: table.usage_rows(&filter)?,
+            totals: table.usage_totals(&filter)?,
+        })
+    })
 }
 
 /// Applies a projection through the shared reconcile, for native adopters that

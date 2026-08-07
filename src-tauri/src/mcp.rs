@@ -416,6 +416,15 @@ pub struct McpConnection {
 /// reason, which is `run_scope`'s honest third state rather than a blank standing
 /// in for one.
 ///
+/// The same two spawns are why the transport's bytes are not *measured* either.
+/// [`crate::egress::send`] counts a request it is handed as a `RequestBuilder`, and
+/// rmcp's transport never surfaces one — it owns its `reqwest::Client` and issues
+/// every request inside the worker task. So those bytes are absent from
+/// `bytes_egressed` and from [`crate::egress::unattributed_egress_bytes`] alike,
+/// which is the one place in this tree where a count is missing rather than merely
+/// unattributed. The OAuth round-trip below *is* metered, because that one is an
+/// ordinary call this file makes itself.
+///
 /// That is not a gap left open for want of trying. The only seam that could carry
 /// a scope into the worker task is a `StreamableHttpClient` wrapper entering it
 /// per request, and implementing that trait means naming `sse_stream::Sse` and

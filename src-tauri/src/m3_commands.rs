@@ -20,14 +20,15 @@ use crate::context_cache::{
 };
 use crate::m3_production::M3CatalogSourceConfig;
 use crate::m3_runtime_hub::{
-    M3ActivateComponentVersionRequest, M3ActivateModelVersionRequest, M3ApiDispatchRequest,
-    M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch, M3CleanupReport,
-    M3CompatibilityMatrixReport, M3ComponentCatalogEntry, M3ComponentHub, M3ComponentUpdateCheck,
-    M3DeleteModelRequest, M3DownloadRequest, M3HardwareCompatibilityReport, M3HubError,
-    M3InstallComponentRequest, M3InstalledComponentView, M3InstalledModelView, M3LoadModelRequest,
-    M3OperationContext, M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub,
-    M3RuntimeKind, M3RuntimeMetricsView, M3RuntimeStatusView, M3SetRuntimeConfigRequest,
-    M3SettingCapabilitiesView, M3StorageStatus, M3UnloadModelRequest, M3VerifyProjectorRequest,
+    M3ActivateComponentVersionRequest, M3ActivateModelVersionRequest, M3ApiCaller,
+    M3ApiDispatchRequest, M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch,
+    M3CleanupReport, M3CompatibilityMatrixReport, M3ComponentCatalogEntry, M3ComponentHub,
+    M3ComponentUpdateCheck, M3DeleteModelRequest, M3DownloadRequest, M3HardwareCompatibilityReport,
+    M3HubError, M3InstallComponentRequest, M3InstalledComponentView, M3InstalledModelView,
+    M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest, M3RuntimeCapabilityView,
+    M3RuntimeHub, M3RuntimeKind, M3RuntimeMetricsView, M3RuntimeStatusView,
+    M3SetRuntimeConfigRequest, M3SettingCapabilitiesView, M3StorageStatus, M3UnloadModelRequest,
+    M3VerifyProjectorRequest,
 };
 use crate::quantization::{
     BackendDescriptor, ConversionReport, ConversionRequest, DeclaredLicense, GgufQuantType,
@@ -35,14 +36,14 @@ use crate::quantization::{
 };
 use crate::runtime_adapter::{
     HardwareProfile, HardwareSnapshot, LocalOffloadPlanner, LocalRuntimeScheduler, OffloadPlan,
-    OffloadPlanInput, ReqwestHttpTransport, RuntimeInventory, RuntimeLifecycleState, RuntimeLogTail,
-    SchedulingInput, SchedulingPlan,
+    OffloadPlanInput, ReqwestHttpTransport, RuntimeInventory, RuntimeLifecycleState,
+    RuntimeLogTail, SchedulingInput, SchedulingPlan,
 };
 use crate::runtime_telemetry::{
     RecordLoadTraceRequest, RecordRequestTraceRequest, RuntimeTelemetryState, RuntimeTraceRecord,
     SupportBundle,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -57,12 +58,64 @@ const SUPPORT_BUNDLE_MAX_LOG_BYTES_PER_RUNTIME: usize = 64 * 1024;
 /// How many recent traces a support bundle embeds.
 const SUPPORT_BUNDLE_MAX_TRACES: usize = 200;
 
-fn telemetry_now_ms() -> u64 {
+fn trusted_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+/// WebView-safe envelope for the non-streaming Runtime Hub diagnostic.
+///
+/// This is intentionally distinct from [`M3ApiDispatchRequest`], the trusted
+/// hub/HTTP envelope. IPC callers may provide request data, but they cannot
+/// assert an authenticated principal, authorization receipt, or clock value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3DiagnosticDispatchRequest {
+    pub protocol: crate::compatibility_hub::CompatibilityProtocol,
+    pub runtime_id: String,
+    pub request_id: String,
+    pub body: Vec<u8>,
+}
+
+impl M3DiagnosticDispatchRequest {
+    fn into_hub_request(self, now_ms: u64) -> M3ApiDispatchRequest {
+        M3ApiDispatchRequest {
+            protocol: self.protocol,
+            runtime_id: self.runtime_id,
+            request_id: self.request_id,
+            body: self.body,
+            caller: M3ApiCaller::Internal,
+            now_ms,
+        }
+    }
+}
+
+/// WebView-safe cancellation envelope paired with
+/// [`M3DiagnosticDispatchRequest`]. The command supplies the trusted internal
+/// caller and current time after deserialization.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3DiagnosticCancelRequest {
+    pub protocol: crate::compatibility_hub::CompatibilityProtocol,
+    pub runtime_id: String,
+    pub request_id: String,
+    pub model_id: String,
+}
+
+impl M3DiagnosticCancelRequest {
+    fn into_hub_request(self, now_ms: u64) -> M3CancelInferenceRequest {
+        M3CancelInferenceRequest {
+            protocol: self.protocol,
+            runtime_id: self.runtime_id,
+            request_id: self.request_id,
+            model_id: self.model_id,
+            caller: M3ApiCaller::Internal,
+            now_ms,
+        }
+    }
 }
 
 pub trait M3OwnedProcessShutdown: Send + Sync {
@@ -303,8 +356,12 @@ pub fn m3_resolve_setting_capabilities(
 /// any model's declared `template` string, including `null`/unrecognized
 /// ones (which fall back to the `Generic` family).
 #[tauri::command]
-pub fn m3_chat_template_lab_report(template: Option<String>) -> Result<ChatTemplateLabReport, String> {
-    Ok(run_chat_template_lab(TemplateFamily::detect(template.as_deref())))
+pub fn m3_chat_template_lab_report(
+    template: Option<String>,
+) -> Result<ChatTemplateLabReport, String> {
+    Ok(run_chat_template_lab(TemplateFamily::detect(
+        template.as_deref(),
+    )))
 }
 
 /// Simulates fit and computes a per-load offload plan (context size, batch
@@ -565,7 +622,10 @@ async fn context_cache_state_impl(
         if let Ok(M3RuntimeStatusView::Adapter { status, .. }) =
             state.hub.runtime_status(runtime_id, context).await
         {
-            let reachable = matches!(status.state, RuntimeLifecycleState::Ready | RuntimeLifecycleState::Starting);
+            let reachable = matches!(
+                status.state,
+                RuntimeLifecycleState::Ready | RuntimeLifecycleState::Starting
+            );
             if reachable {
                 if let Ok(transport) = ReqwestHttpTransport::new() {
                     let cancellation = CancellationToken::new();
@@ -583,15 +643,26 @@ async fn context_cache_state_impl(
     }
 
     let reported_context_tokens = live.as_ref().and_then(|live| live.reported_context_tokens);
-    let context_tokens_in_use = live
-        .as_ref()
-        .and_then(|live| live.slots.iter().filter_map(|slot| slot.tokens_in_use).max());
+    let context_tokens_in_use = live.as_ref().and_then(|live| {
+        live.slots
+            .iter()
+            .filter_map(|slot| slot.tokens_in_use)
+            .max()
+    });
     let context_shift_detected = live.as_ref().and_then(|live| {
         if live.slots.is_empty() {
             None
-        } else if live.slots.iter().any(|slot| slot.context_shifted == Some(true)) {
+        } else if live
+            .slots
+            .iter()
+            .any(|slot| slot.context_shifted == Some(true))
+        {
             Some(true)
-        } else if live.slots.iter().all(|slot| slot.context_shifted == Some(false)) {
+        } else if live
+            .slots
+            .iter()
+            .all(|slot| slot.context_shifted == Some(false))
+        {
             Some(false)
         } else {
             None
@@ -607,7 +678,10 @@ async fn context_cache_state_impl(
         configured,
         reported_context_tokens,
         context_tokens_in_use,
-        context_headroom_tokens: context_cache::context_headroom(effective_context_tokens, context_tokens_in_use),
+        context_headroom_tokens: context_cache::context_headroom(
+            effective_context_tokens,
+            context_tokens_in_use,
+        ),
         context_shift_detected,
         total_slots,
         notes,
@@ -676,9 +750,10 @@ pub async fn m3_api_dispatch(
     state: tauri::State<'_, M3CommandState>,
     operation_id: String,
     timeout_ms: Option<u64>,
-    request: M3ApiDispatchRequest,
+    request: M3DiagnosticDispatchRequest,
 ) -> Result<M3ApiDispatchResponse, String> {
     let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let request = request.into_hub_request(trusted_now_ms());
     let result = state.hub.dispatch_api(&request, &context).await;
     finish(&state, &operation_id, result).await
 }
@@ -688,9 +763,10 @@ pub async fn m3_api_cancel_inference(
     state: tauri::State<'_, M3CommandState>,
     operation_id: String,
     timeout_ms: Option<u64>,
-    request: M3CancelInferenceRequest,
+    request: M3DiagnosticCancelRequest,
 ) -> Result<bool, String> {
     let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let request = request.into_hub_request(trusted_now_ms());
     let result = state.hub.cancel_inference(&request, &context).await;
     finish(&state, &operation_id, result).await
 }
@@ -713,19 +789,16 @@ pub fn m3_lan_validate_policy(policy: LanServerPolicy) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn m3_lan_configure(
-    state: tauri::State<'_, M3CommandState>,
+pub async fn m3_lan_configure(
+    app: tauri::AppHandle,
     policy: LanServerPolicy,
 ) -> Result<LanServerPolicy, String> {
-    state.hub.configure_lan(policy).map_err(command_error)
+    crate::server::configure_m3_policy_and_reconcile(&app, policy).await
 }
 
 #[tauri::command]
-pub fn m3_lan_disable(
-    state: tauri::State<'_, M3CommandState>,
-    confirmation: String,
-) -> Result<bool, String> {
-    state.hub.disable_lan(&confirmation).map_err(command_error)
+pub async fn m3_lan_disable(app: tauri::AppHandle, confirmation: String) -> Result<bool, String> {
+    crate::server::disable_m3_policy_and_reconcile(&app, &confirmation).await
 }
 
 #[tauri::command]
@@ -900,7 +973,9 @@ pub async fn quantization_convert_installed_model(
         .versions
         .into_iter()
         .find(|version| version.version_key == target_version_key)
-        .ok_or_else(|| format!("no installed version '{target_version_key}' for asset '{asset_id}'"))?;
+        .ok_or_else(|| {
+            format!("no installed version '{target_version_key}' for asset '{asset_id}'")
+        })?;
 
     let workbench = state.workbench.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -982,7 +1057,10 @@ pub async fn m3_component_install(
     request: M3InstallComponentRequest,
 ) -> Result<M3InstalledComponentView, String> {
     let context = state.begin_operation(&operation_id, timeout_ms)?;
-    let result = state.component_hub.install_component(&request, &context).await;
+    let result = state
+        .component_hub
+        .install_component(&request, &context)
+        .await;
     finish(&state, &operation_id, result).await
 }
 
@@ -1074,7 +1152,11 @@ async fn assemble_support_bundle(
         let runtime_id = runtime.descriptor.runtime_id.clone();
         if let Ok(tail) = state
             .hub
-            .runtime_logs(&runtime_id, SUPPORT_BUNDLE_MAX_LOG_BYTES_PER_RUNTIME, context)
+            .runtime_logs(
+                &runtime_id,
+                SUPPORT_BUNDLE_MAX_LOG_BYTES_PER_RUNTIME,
+                context,
+            )
             .await
         {
             raw_logs.push((runtime_id, tail.text, tail.truncated));
@@ -1091,7 +1173,7 @@ async fn assemble_support_bundle(
         compatibility,
         traces,
         raw_logs,
-        telemetry_now_ms(),
+        trusted_now_ms(),
     ))
 }
 
@@ -1202,4 +1284,67 @@ pub fn agent_launcher_check_drift(
             .unwrap_or(false),
     };
     agent_launcher::detect_drift(&input).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn dispatch_json() -> Value {
+        json!({
+            "protocol": "open_ai_chat_completions",
+            "runtimeId": "ollama",
+            "requestId": "diagnostic-1",
+            "body": [123, 125]
+        })
+    }
+
+    fn cancel_json() -> Value {
+        json!({
+            "protocol": "open_ai_chat_completions",
+            "runtimeId": "ollama",
+            "requestId": "diagnostic-1",
+            "modelId": "qwen"
+        })
+    }
+
+    #[test]
+    fn diagnostic_dispatch_ipc_shape_supplies_trusted_hub_fields() {
+        let request: M3DiagnosticDispatchRequest =
+            serde_json::from_value(dispatch_json()).expect("valid diagnostic IPC request");
+        assert_eq!(serde_json::to_value(&request).unwrap(), dispatch_json());
+
+        let hub_request = request.into_hub_request(42);
+        assert_eq!(hub_request.caller, M3ApiCaller::Internal);
+        assert_eq!(hub_request.now_ms, 42);
+    }
+
+    #[test]
+    fn diagnostic_cancel_ipc_shape_supplies_trusted_hub_fields() {
+        let request: M3DiagnosticCancelRequest =
+            serde_json::from_value(cancel_json()).expect("valid diagnostic IPC cancel request");
+        assert_eq!(serde_json::to_value(&request).unwrap(), cancel_json());
+
+        let hub_request = request.into_hub_request(43);
+        assert_eq!(hub_request.caller, M3ApiCaller::Internal);
+        assert_eq!(hub_request.now_ms, 43);
+    }
+
+    #[test]
+    fn diagnostic_ipc_shapes_reject_client_asserted_trust_fields() {
+        for forbidden in [
+            ("caller", json!({ "type": "internal" })),
+            ("nowMs", json!(0)),
+            ("authorizationReceipt", json!({ "id": "forged" })),
+        ] {
+            let mut dispatch = dispatch_json();
+            dispatch[forbidden.0] = forbidden.1.clone();
+            assert!(serde_json::from_value::<M3DiagnosticDispatchRequest>(dispatch).is_err());
+
+            let mut cancel = cancel_json();
+            cancel[forbidden.0] = forbidden.1;
+            assert!(serde_json::from_value::<M3DiagnosticCancelRequest>(cancel).is_err());
+        }
+    }
 }

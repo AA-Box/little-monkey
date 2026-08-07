@@ -268,6 +268,157 @@ fn enforce_run_network_permission(
     Err(denial.to_string())
 }
 
+/// How often a still-running scope's counted egress is written to its row.
+///
+/// Drained on a timer *and* once more when the scope ends, and both halves are
+/// load-bearing. Without the timer a long inference stream shows zero bytes for
+/// its entire life and then jumps at the end, and a run that is killed — which is
+/// the whole point of `agent_processes`' signal latch — would take every byte it
+/// moved with it. Without the final drain the bytes since the last tick are lost
+/// for exactly the runs that are shortest. Five seconds because the write is one
+/// `UPDATE` on a row this process already has open, so the cost is negligible
+/// beside a stream that runs for minutes, and the ledger stays close enough to
+/// live for the Processes view to be worth watching.
+const EGRESS_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Runs `future` under `scope`, with egress counted against the run's process row.
+///
+/// # What `agent_processes.bytes_egressed` means
+///
+/// **Every HTTP entity body byte the scoped work moved, in either direction,
+/// loopback included.** This is the one place that decision is made, so it is
+/// written down here rather than at the ~60 call sites that feed it.
+///
+/// Counting a request to this machine's own `llama-server`, Ollama or `sd-server`
+/// is deliberate and it is worth saying why, because the field's name argues the
+/// other way. The column sits beside `cpu_time_ms` and `peak_memory_bytes` on a
+/// row that answers "what did this process consume": a 4 GB model pulled over a
+/// loopback socket is real consumption, and a number that silently omitted it
+/// would make the biggest transfers in the app the invisible ones. The *privacy*
+/// question — did anything leave this machine — is a different question, and it is
+/// already answered elsewhere and better: by the egress guards, by
+/// [`crate::egress::is_loopback_target`], and by `denial_sink`'s record of what was
+/// refused. Splitting this column in two would need a second column to be honest
+/// about it (an implicit split is worse than either), and nothing yet asks for one.
+///
+/// # Attribution, and what happens when there is none
+///
+/// A run's bytes belong to its process row, so the row is resolved here — once, up
+/// front — and the counter travels with it (see [`crate::run_scope::ProcessScope`]).
+/// A scope with no run, or a run with no process row, enters without one: those
+/// bytes land in [`crate::egress::unattributed_egress_bytes`] under the reason they
+/// could not be attributed rather than being charged to a nearby row.
+pub(crate) async fn scoped_with_egress<F, R>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    scope: crate::run_scope::RunScope,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+    R: tauri::Runtime,
+{
+    scoped_with_egress_every(app, state, EGRESS_DRAIN_INTERVAL, scope, future).await
+}
+
+/// [`scoped_with_egress`] with the cadence injected, so a test can watch a drain
+/// happen mid-stream instead of waiting out the production five seconds. Same
+/// reason `egress::hardened_with_timeouts` exists beside `hardened`.
+async fn scoped_with_egress_every<F, R>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    interval: std::time::Duration,
+    scope: crate::run_scope::RunScope,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+    R: tauri::Runtime,
+{
+    let Some(process) = scope
+        .run_id()
+        .and_then(|run_id| process_scope_for_run(app, state, run_id))
+    else {
+        return crate::run_scope::scoped(scope, future).await;
+    };
+
+    let scoped = crate::run_scope::scoped_with_process(scope, process.clone(), future);
+    tokio::pin!(scoped);
+    // First tick a full interval out, not immediately: `interval`'s first tick
+    // completes at once, which would only ever drain an empty counter.
+    let mut drains = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    loop {
+        tokio::select! {
+            output = &mut scoped => {
+                drain_egress(app, state, &process);
+                return output;
+            }
+            _ = drains.tick() => drain_egress(app, state, &process),
+        }
+    }
+}
+
+/// The process row `run_id`'s egress belongs to, when exactly one row claims it.
+///
+/// `None` for none and `None` for several, and the second case is the one worth
+/// stating: a run with two live rows gives no way to say which of them made a
+/// request, and guessing would put one process's bytes on another's row —
+/// precisely the failure `run_scope`'s task-local exists to prevent. The honest
+/// record for that is the unattributed tally, which is what returning `None`
+/// selects.
+fn process_scope_for_run<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    run_id: &str,
+) -> Option<crate::run_scope::ProcessScope> {
+    let rows = crate::process_commands::with_process_table(app, state, |table| {
+        table.usage_rows(&crate::process_table::ProcessUsageFilter {
+            run_id: Some(run_id.to_string()),
+            ..crate::process_table::ProcessUsageFilter::default()
+        })
+    })
+    .ok()?;
+    match rows.as_slice() {
+        [row] => Some(crate::run_scope::ProcessScope::new(row.process_id.clone())),
+        _ => None,
+    }
+}
+
+/// Moves everything counted so far onto the row, additively.
+///
+/// Fail-soft like every other bookkeeping call at this boundary — a stream must not
+/// die because its ledger row could not be updated — but the bytes are handed back
+/// to the counter if the write fails, so a transient error delays them to the next
+/// drain instead of destroying them.
+///
+/// Runs in the scoped task itself, so it can only interleave at one of `future`'s
+/// await points. That means `future` must not hold [`with_ledger`]'s guard across
+/// an await — a `std::sync::Mutex` is not reentrant, so the drain would deadlock
+/// against it rather than block. No caller does, and none should.
+fn drain_egress<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    process: &crate::run_scope::ProcessScope,
+) {
+    let bytes = process.take_egress();
+    if bytes == 0 {
+        return;
+    }
+    let Ok(now) = unix_time_ms() else {
+        process.charge_egress(bytes);
+        return;
+    };
+    if let Err(error) = crate::process_commands::with_process_table(app, state, |table| {
+        table.add_egress_bytes(process.process_id(), bytes, now as i64)
+    }) {
+        process.charge_egress(bytes);
+        eprintln!(
+            "run egress: could not record {bytes} bytes for {}: {error}",
+            process.process_id()
+        );
+    }
+}
+
 fn emit_changed<R: tauri::Runtime>(app: &tauri::AppHandle<R>, outcome: &AppendEventOutcome) {
     let _ = app.emit(
         RUNS_CHANGED_EVENT,
@@ -682,5 +833,224 @@ mod tests {
         let denial = enforce_run_network_permission("not a url", "run-corrupt", false)
             .expect_err("a malformed frozen endpoint must not be treated as local");
         assert!(denial.contains(crate::egress::EgressRule::UrlMalformed.code()));
+    }
+
+    /// The egress accounting seam, end to end and against a real socket.
+    mod egress {
+        use super::*;
+        use crate::process_table::{
+            AdmitProcess, ProcessKind, ProcessUsageFilter, ProcessUsageRow,
+        };
+        use crate::run_ledger::RunLedger;
+        use crate::run_scope::RunScope;
+        use futures_util::StreamExt;
+        use std::io::{Read, Write};
+        use std::time::Duration;
+
+        /// A loopback peer that writes its head at once and then one body byte per
+        /// `gap`. Trickling on purpose: a drain that lands bytes on the row while
+        /// this peer is still writing is a drain that saw a *frame*, which only a
+        /// non-buffering body can deliver.
+        fn trickling_peer(chunks: usize, gap: Duration) -> String {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+            let origin = format!("http://{}", listener.local_addr().expect("has an address"));
+            std::thread::spawn(move || {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut head = [0u8; 2048];
+                let _ = stream.read(&mut head);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                     Content-Length: {chunks}\r\nConnection: close\r\n\r\n"
+                );
+                if stream.write_all(header.as_bytes()).is_ok() {
+                    for _ in 0..chunks {
+                        std::thread::sleep(gap);
+                        if stream.write_all(b"x").is_err() || stream.flush().is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            origin
+        }
+
+        /// A mock app whose ledger is in memory, so nothing here resolves a real
+        /// app-data directory on disk.
+        fn ledgered_app() -> (tauri::AppHandle<tauri::test::MockRuntime>, AppState) {
+            let state = AppState::default();
+            *state.run_ledger.lock().unwrap() =
+                Some(RunLedger::open_in_memory().expect("an in-memory ledger opens"));
+            (tauri::test::mock_app().handle().clone(), state)
+        }
+
+        /// A `runs` row and a process row that claims it.
+        ///
+        /// The bare SQL insert follows `process_table`'s own fixture: what this
+        /// needs is only that `agent_processes.run_id`'s foreign key resolves, and
+        /// a full `RunSpec` would be forty lines of irrelevant detail.
+        fn admit(
+            app: &tauri::AppHandle<tauri::test::MockRuntime>,
+            state: &AppState,
+            external_id: &str,
+            run_id: &str,
+        ) -> String {
+            with_ledger(app, state, |ledger| {
+                ledger
+                    .connection()
+                    .execute(
+                        "INSERT INTO runs (run_id, idempotency_key, spec_json, created_at_ms,
+                                           updated_at_ms, status, last_sequence, max_event_count)
+                         VALUES (?1, ?1, x'7b7d', 1000, 1000, 'running', 0, 1000)",
+                        rusqlite::params![run_id],
+                    )
+                    .expect("a run row is seeded");
+                Ok(())
+            })
+            .expect("the ledger opens");
+            crate::process_commands::with_process_table(app, state, |table| {
+                table.admit(
+                    &AdmitProcess::new(ProcessKind::CrewMember, external_id.to_string())
+                        .with_run(run_id.to_string()),
+                    1_000,
+                )
+            })
+            .expect("a row is admitted")
+            .process_id
+        }
+
+        fn stored_egress(
+            app: &tauri::AppHandle<tauri::test::MockRuntime>,
+            state: &AppState,
+            process_id: &str,
+        ) -> Option<u64> {
+            crate::process_commands::with_process_table(app, state, |table| {
+                table.usage_rows(&ProcessUsageFilter {
+                    process_id: Some(process_id.to_string()),
+                    ..ProcessUsageFilter::default()
+                })
+            })
+            .expect("the ledger row reads")
+            .pop()
+            .map(|row: ProcessUsageRow| row.usage.measured().bytes_egressed)
+            .expect("the row exists")
+        }
+
+        /// The whole point of the exercise: a real run's bytes reach
+        /// `agent_processes.bytes_egressed`, and they get there **while the body is
+        /// still arriving** rather than only when the run ends.
+        ///
+        /// Three claims in one test because they share a fixture and each is
+        /// worthless alone. The mid-stream read proves the timer drain exists (a
+        /// teardown-only drain reads `None` there) *and* that the counting body is
+        /// still a passthrough (a buffering one hands over nothing until the last
+        /// byte, so there would be nothing to drain). The final read proves the
+        /// teardown drain does not lose the tail, and that the two drains add
+        /// rather than overwrite — which is what `add_egress_bytes` is for.
+        #[tokio::test]
+        async fn a_runs_bytes_reach_its_process_row_while_the_stream_is_still_running() {
+            let (app, state) = ledgered_app();
+            let process_id = admit(&app, &state, "crew-egress", "run:egress");
+            let chunks = 8usize;
+            let gap = Duration::from_millis(60);
+            let origin = trickling_peer(chunks, gap);
+            let client = crate::egress::hardened().build().expect("client builds");
+
+            let mid = scoped_with_egress_every(
+                &app,
+                &state,
+                Duration::from_millis(20),
+                RunScope::run("run:egress"),
+                async {
+                    let response = crate::egress::send(client.get(&origin))
+                        .await
+                        .expect("the peer answers");
+                    let mut stream = response.bytes_stream();
+                    for _ in 0..2 {
+                        stream
+                            .next()
+                            .await
+                            .expect("a frame arrives")
+                            .expect("the frame is not an error");
+                    }
+                    // One drain interval, well inside the peer's remaining gaps.
+                    tokio::time::sleep(gap).await;
+                    let mid = stored_egress(&app, &state, &process_id);
+                    while let Some(frame) = stream.next().await {
+                        frame.expect("the rest of the body arrives");
+                    }
+                    mid
+                },
+            )
+            .await;
+
+            let mid = mid.expect(
+                "no bytes had reached the row while the body was still trickling: either \
+                 the scheduled drain is gone, or the body is being buffered before the \
+                 caller sees a frame",
+            );
+            assert!(
+                mid < chunks as u64,
+                "the row already held the whole body ({mid} bytes) at the halfway read, \
+                 so this test is not measuring a mid-stream drain"
+            );
+            assert_eq!(
+                stored_egress(&app, &state, &process_id),
+                Some(chunks as u64),
+                "the teardown drain must add the tail rather than replace what the \
+                 scheduled drains already wrote"
+            );
+        }
+
+        /// A run whose process row nobody resolved is *unattributed*, not somebody
+        /// else's. The bystander row keeps its `NULL` — a measured zero would be a
+        /// claim nobody made — and the bytes are still counted, under why they had
+        /// no row.
+        #[tokio::test]
+        async fn a_run_with_no_row_of_its_own_charges_no_other_row() {
+            fn tally() -> u64 {
+                crate::egress::unattributed_egress_bytes()
+                    .into_iter()
+                    .find(|(label, _)| *label == "egress.run-without-process")
+                    .map(|(_, bytes)| bytes)
+                    .expect("the tally exists")
+            }
+
+            let (app, state) = ledgered_app();
+            let bystander = admit(&app, &state, "crew-bystander", "run:bystander");
+            let origin = trickling_peer(4, Duration::from_millis(1));
+            let client = crate::egress::hardened().build().expect("client builds");
+
+            let before = tally();
+            scoped_with_egress_every(
+                &app,
+                &state,
+                Duration::from_millis(20),
+                RunScope::run("run:has-no-row"),
+                async {
+                    crate::egress::send(client.get(&origin))
+                        .await
+                        .expect("the peer answers")
+                        .text()
+                        .await
+                        .expect("body reads");
+                },
+            )
+            .await;
+
+            assert_eq!(
+                stored_egress(&app, &state, &bystander),
+                None,
+                "another run's bytes must never land on this row"
+            );
+            // `>=` and not `==`: the tally is process-wide and other tests in this
+            // binary share it.
+            assert!(
+                tally() >= before + 4,
+                "the bytes must still be counted somewhere, not dropped"
+            );
+        }
     }
 }

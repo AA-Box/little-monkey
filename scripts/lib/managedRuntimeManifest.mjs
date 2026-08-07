@@ -21,6 +21,12 @@
 // stay in step with `ManagedRuntimeSpec` in src-tauri/src/managed_runtime.rs and
 // with the staged directory names in src-tauri/build.rs.
 
+import { createHash } from "node:crypto";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+export const MANIFEST_FILE = "runtime-manifest.json";
+
 export const MANAGED_LLAMA_VERSION = "b9637";
 export const MANAGED_TTS_VERSION = "b10278";
 export const MANAGED_SD_VERSION = "master-812-ea7f0c8";
@@ -161,6 +167,31 @@ export function managedRuntime(id) {
 /** The staged Tauri resource directory name for a runtime. */
 export function stagedRuntimeDirectory(runtime) {
   return `${runtime.id}-${runtime.version}`;
+}
+
+/**
+ * Recomputes a staged manifest's per-file digests and sizes from what is on
+ * disk right now, preserving every other field (the Rust side parses this with
+ * `deny_unknown_fields`).
+ *
+ * Codesigning rewrites every Mach-O in the tree *after* staging hashed it, so
+ * without this the shipped manifest describes the unsigned upstream binaries
+ * and `managed_runtime.rs` rejects the whole tree — which is exactly how 1.2.0
+ * shipped a llama-server that never starts.
+ */
+export function restampRuntimeManifest(directory) {
+  const path = join(directory, MANIFEST_FILE);
+  const manifest = JSON.parse(readFileSync(path, "utf8"));
+  manifest.files = manifest.files.map((file) => {
+    const staged = join(directory, file.name);
+    return {
+      ...file,
+      sha256: createHash("sha256").update(readFileSync(staged)).digest("hex"),
+      sizeBytes: statSync(staged).size,
+    };
+  });
+  writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
+  return manifest;
 }
 
 /** The launchable binary's file name inside a runtime tree, per target. */

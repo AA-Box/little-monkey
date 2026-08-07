@@ -133,6 +133,30 @@ export async function admitProcess(args: AdmitProcessArgs): Promise<string | nul
   }
 }
 
+/**
+ * Point an already-admitted process at its ledger run.
+ *
+ * Separate from {@link AdmitProcessArgs.runId} because `agent_processes.run_id`
+ * is a foreign key into `runs`: a surface whose process row is minted *before*
+ * its run row exists cannot carry the link at admission time. The link is what
+ * lets the per-process resource ledger attribute a run's measured usage — CPU
+ * time, peak RSS, disk I/O, egress bytes — to this row instead of an
+ * unattributed bucket.
+ *
+ * Call it at most **once** per process. The ledger charges a run only when
+ * exactly one row claims it, and re-pointing a row at a second run does not
+ * merely move the charge: it leaves the first run claimed by nobody, which the
+ * ledger treats exactly like several rows claiming it — unattributed.
+ */
+export async function linkProcessRun(processId: string, runId: string): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    await invoke("process_link_run", { processId, runId });
+  } catch (error) {
+    warn(`link ${processId} to run ${runId}`, error);
+  }
+}
+
 async function transition(
   processId: string,
   state: ProcessState,

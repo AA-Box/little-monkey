@@ -39,6 +39,8 @@ const MIGRATION_V6: i64 = 6;
 const MIGRATION_V6_CHECKSUM: &str = "process-signal-intent-v6-2026-08-02";
 const MIGRATION_V7: i64 = 7;
 const MIGRATION_V7_CHECKSUM: &str = "process-kill-intent-v7-2026-08-03";
+const MIGRATION_V8: i64 = 8;
+const MIGRATION_V8_CHECKSUM: &str = "process-resource-ledger-v8-2026-08-06";
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -529,9 +531,8 @@ impl RunLedger {
             "UPDATE runs SET archived_at_ms = ?2 WHERE run_id = ?1",
             params![run_id, to_sql_i64(archived_at_ms, "archived_at_ms")?],
         )?;
-        let archived = load_run_from(&transaction, run_id)?.ok_or_else(|| {
-            LedgerError::Corrupt(format!("archived run '{run_id}' disappeared"))
-        })?;
+        let archived = load_run_from(&transaction, run_id)?
+            .ok_or_else(|| LedgerError::Corrupt(format!("archived run '{run_id}' disappeared")))?;
         transaction.commit()?;
         Ok(archived)
     }
@@ -783,7 +784,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
             row.get::<_, Option<i64>>(0)
         })?
     {
-        if version > MIGRATION_V7 {
+        if version > MIGRATION_V8 {
             return Err(LedgerError::MigrationConflict { version });
         }
     }
@@ -796,6 +797,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         (MIGRATION_V5, MIGRATION_V5_CHECKSUM),
         (MIGRATION_V6, MIGRATION_V6_CHECKSUM),
         (MIGRATION_V7, MIGRATION_V7_CHECKSUM),
+        (MIGRATION_V8, MIGRATION_V8_CHECKSUM),
     ] {
         if let Some(checksum) = connection
             .query_row(
@@ -995,7 +997,24 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
-    transaction.execute_batch("PRAGMA user_version = 7;")?;
+    let has_v8 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V8],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v8 {
+        transaction.execute_batch(MIGRATION_V8_SQL)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![MIGRATION_V8, MIGRATION_V8_CHECKSUM, now_ms_i64()?],
+        )?;
+    }
+
+    transaction.execute_batch("PRAGMA user_version = 8;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -1563,6 +1582,64 @@ CREATE INDEX runs_archived_idx ON runs(archived_at_ms) WHERE archived_at_ms IS N
 /// untouched, no existing query changes meaning, and the
 /// `agent_processes_pending_signal_idx` partial index still covers a killed row
 /// without being rebuilt, because such a row always has `stop_requested = 1`.
+/// The per-process resource ledger (K6(b)).
+///
+/// Nine measurement columns beside the four `max_*` ceilings already here, and
+/// the distinction between the two groups is the point: a `max_*` is a
+/// *declaration* a caller made at admission, while these are *readings*. Nothing
+/// in this table recorded a reading before, so "what did that run actually cost"
+/// had no answer at all.
+///
+/// **Every column is nullable and NULL means "not measured", never zero.** A
+/// resource ledger that reports 0 bytes egressed for a process nobody measured is
+/// worse than one that reports nothing, because the zero is indistinguishable
+/// from a real measurement of no egress. `usage_unavailable_json` carries the
+/// per-field reasons — a `Vec<TraceFieldNote>`, the same
+/// `{field, reason}` vocabulary `runtime_telemetry.rs` already uses for exactly
+/// this problem — so a NULL always comes with a stated cause rather than a
+/// shrug.
+///
+/// There is deliberately **no wall-time column**: `started_at_ms` and
+/// `exited_at_ms` are already here and their difference is the wall time. A
+/// stored copy would be a second source of truth for a fact this table already
+/// holds, and the two would eventually disagree.
+///
+/// The trigger is the same kind of duplication as V5's and V7's, and guards the
+/// invariant this migration exists for: a row cannot reach `exited` without its
+/// reason list being written. `ProcessTable::transition` writes state and usage
+/// in one statement precisely so this can be enforced in SQL rather than trusted
+/// to every future writer. Rows that were already `exited` before this migration
+/// keep their NULL — the trigger fires on the transition, not on history, so
+/// nothing has to be back-filled with a number nobody measured.
+const MIGRATION_V8_SQL: &str = r#"
+ALTER TABLE agent_processes ADD COLUMN cpu_time_ms INTEGER
+    CHECK (cpu_time_ms IS NULL OR cpu_time_ms >= 0);
+ALTER TABLE agent_processes ADD COLUMN peak_rss_bytes INTEGER
+    CHECK (peak_rss_bytes IS NULL OR peak_rss_bytes >= 0);
+ALTER TABLE agent_processes ADD COLUMN bytes_read INTEGER
+    CHECK (bytes_read IS NULL OR bytes_read >= 0);
+ALTER TABLE agent_processes ADD COLUMN bytes_written INTEGER
+    CHECK (bytes_written IS NULL OR bytes_written >= 0);
+ALTER TABLE agent_processes ADD COLUMN bytes_egressed INTEGER
+    CHECK (bytes_egressed IS NULL OR bytes_egressed >= 0);
+ALTER TABLE agent_processes ADD COLUMN tokens_in INTEGER
+    CHECK (tokens_in IS NULL OR tokens_in >= 0);
+ALTER TABLE agent_processes ADD COLUMN tokens_out INTEGER
+    CHECK (tokens_out IS NULL OR tokens_out >= 0);
+ALTER TABLE agent_processes ADD COLUMN gpu_resident_bytes INTEGER
+    CHECK (gpu_resident_bytes IS NULL OR gpu_resident_bytes >= 0);
+ALTER TABLE agent_processes ADD COLUMN gpu_device_ms INTEGER
+    CHECK (gpu_device_ms IS NULL OR gpu_device_ms >= 0);
+ALTER TABLE agent_processes ADD COLUMN usage_unavailable_json TEXT;
+
+CREATE TRIGGER agent_processes_close_out_states_its_gaps
+BEFORE UPDATE OF state ON agent_processes
+WHEN NEW.state = 'exited' AND NEW.usage_unavailable_json IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'an exited agent process must state its unmeasured fields');
+END;
+"#;
+
 const MIGRATION_V7_SQL: &str = r#"
 ALTER TABLE agent_processes ADD COLUMN kill_requested INTEGER NOT NULL DEFAULT 0
     CHECK (kill_requested IN (0, 1));
@@ -3069,15 +3146,85 @@ mod tests {
         assert!(ledger.integrity_check().unwrap().is_ok());
     }
 
+    /// V8's columns are the resource ledger, and every one of them has to be
+    /// nullable: NULL is how the ledger says "not measured", so a `NOT NULL`
+    /// column here would force a zero for every process nobody sampled.
+    #[test]
+    fn migration_v8_adds_nullable_measurement_columns_and_is_forward_only() {
+        let database = TempDb::new("migration-v8");
+        {
+            let ledger = RunLedger::open(&database.path).unwrap();
+            let nullable: Vec<(String, i64)> = ledger
+                .connection
+                .prepare("SELECT name, \"notnull\" FROM pragma_table_info('agent_processes')")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for column in [
+                "cpu_time_ms",
+                "peak_rss_bytes",
+                "bytes_read",
+                "bytes_written",
+                "bytes_egressed",
+                "tokens_in",
+                "tokens_out",
+                "gpu_resident_bytes",
+                "gpu_device_ms",
+                "usage_unavailable_json",
+            ] {
+                let (_, not_null) = nullable
+                    .iter()
+                    .find(|(name, _)| name == column)
+                    .unwrap_or_else(|| panic!("V8 must add {column}"));
+                assert_eq!(
+                    *not_null, 0,
+                    "{column} must be nullable: NULL means unmeasured"
+                );
+            }
+            assert_eq!(
+                ledger
+                    .connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                8
+            );
+        }
+
+        // Forward-only: a database written by a newer build is refused rather
+        // than downgraded, the same guard every earlier version gets.
+        {
+            let connection = Connection::open(&database.path).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
+                     VALUES (9, 'from-the-future', 1)",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            RunLedger::open(&database.path),
+            Err(LedgerError::MigrationConflict { version: 9 })
+        ));
+    }
+
     #[test]
     fn migration_is_safe_to_rerun_and_installs_the_shared_profile_schema() {
         let database = TempDb::new("migration");
         {
             let ledger = RunLedger::open(&database.path).unwrap();
-            assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
+            assert_eq!(
+                ledger.applied_migrations().unwrap(),
+                vec![1, 2, 3, 4, 5, 6, 7, 8]
+            );
         }
         let ledger = RunLedger::open(&database.path).unwrap();
-        assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            ledger.applied_migrations().unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
 
         let journal_mode = ledger
             .connection
@@ -3216,10 +3363,7 @@ mod tests {
         let archived = ledger.archive_run("run-archive", 5_000).unwrap();
         assert_eq!(archived.archived_at_ms, Some(5_000));
         // Archiving is a view concern only — the event history is untouched.
-        assert_eq!(
-            ledger.load_events("run-archive", 0, 10).unwrap().len(),
-            2
-        );
+        assert_eq!(ledger.load_events("run-archive", 0, 10).unwrap().len(), 2);
         assert!(ledger.integrity_check().unwrap().is_ok());
 
         assert!(ledger

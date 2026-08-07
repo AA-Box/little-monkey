@@ -589,10 +589,7 @@ impl OAuthTransport for ReqwestOAuthTransport {
             ("code_verifier", request.pkce_verifier.expose().to_string()),
         ];
         run_async_worker("oauth-code-exchange", Self::CONNECTOR_SCOPE, async move {
-            let response = client
-                .post(request.token_endpoint)
-                .form(&form)
-                .send()
+            let response = crate::egress::send(client.post(request.token_endpoint).form(&form))
                 .await
                 .map_err(|e| format!("OAuth code exchange failed: {e}"))?;
             let status = response.status();
@@ -620,10 +617,7 @@ impl OAuthTransport for ReqwestOAuthTransport {
             ),
         ];
         run_async_worker("oauth-refresh", Self::CONNECTOR_SCOPE, async move {
-            let response = client
-                .post(request.token_endpoint)
-                .form(&form)
-                .send()
+            let response = crate::egress::send(client.post(request.token_endpoint).form(&form))
                 .await
                 .map_err(|e| format!("OAuth refresh failed: {e}"))?;
             let status = response.status();
@@ -646,10 +640,7 @@ impl OAuthTransport for ReqwestOAuthTransport {
             ("token", token.expose().to_string()),
         ];
         run_async_worker("oauth-revoke", Self::CONNECTOR_SCOPE, async move {
-            let response = client
-                .post(endpoint)
-                .form(&form)
-                .send()
+            let response = crate::egress::send(client.post(endpoint).form(&form))
                 .await
                 .map_err(|e| format!("OAuth revocation failed: {e}"))?;
             let status = response.status();
@@ -1180,8 +1171,7 @@ impl ProductionWorkflowNodeExecutor {
             if let Some(token) = bearer {
                 request = request.bearer_auth(token);
             }
-            let response = request
-                .send()
+            let response = crate::egress::send(request)
                 .await
                 .map_err(|e| format!("model request failed: {e}"))?;
             let status = response.status();
@@ -1242,11 +1232,11 @@ impl ProductionWorkflowNodeExecutor {
         }
         let client = self.http.clone();
         run_async_worker("workflow-model-discovery", scope, async move {
-            let response = client
-                .get(format!("{}/api/tags", crate::ollama::OLLAMA_BASE_URL))
-                .send()
-                .await
-                .map_err(|error| format!("discover Ollama models: {error}"))?;
+            let response = crate::egress::send(
+                client.get(format!("{}/api/tags", crate::ollama::OLLAMA_BASE_URL)),
+            )
+            .await
+            .map_err(|error| format!("discover Ollama models: {error}"))?;
             let status = response.status();
             let bytes = bounded_response_bytes(response).await?;
             if !status.is_success() {

@@ -10,8 +10,8 @@ import {
   sha256Text,
   type ChatTemplateLabReport,
   type LanServerPolicy,
-  type M3ApiDispatchRequest,
-  type M3CancelInferenceRequest,
+  type M3DiagnosticCancelRequest,
+  type M3DiagnosticDispatchRequest,
   type M3CatalogModel,
   type M3LoadModelRequest,
   type M3ModelCapabilities,
@@ -32,8 +32,8 @@ describe("runtimeHubClient", () => {
     const load = {} as M3LoadModelRequest;
     const unload = {} as M3UnloadModelRequest;
     const scheduling = {} as M3SchedulingInput;
-    const dispatch = {} as M3ApiDispatchRequest;
-    const cancel = {} as M3CancelInferenceRequest;
+    const dispatch = {} as M3DiagnosticDispatchRequest;
+    const cancel = {} as M3DiagnosticCancelRequest;
     const policy = {} as LanServerPolicy;
     const pairing = {} as PairingRequest;
 
@@ -157,6 +157,40 @@ describe("runtimeHubClient", () => {
   it("creates traceable operation ids and hashes the exact license declaration", async () => {
     expect(createM3OperationId("catalog")).toMatch(/^catalog-/);
     expect(await sha256Text("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  });
+
+  it("keeps trusted caller identity and time out of diagnostic IPC envelopes", async () => {
+    const dispatch: M3DiagnosticDispatchRequest = {
+      protocol: "open_ai_chat_completions",
+      runtimeId: "ollama",
+      requestId: "diagnostic-1",
+      body: [123, 125],
+    };
+    const cancel: M3DiagnosticCancelRequest = {
+      protocol: "open_ai_chat_completions",
+      runtimeId: "ollama",
+      requestId: "diagnostic-1",
+      modelId: "qwen",
+    };
+
+    await runtimeHubClient.apiDispatch({ operationId: "dispatch-1", timeoutMs: 1000, request: dispatch });
+    await runtimeHubClient.apiCancelInference({ operationId: "cancel-1", timeoutMs: 1000, request: cancel });
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "m3_api_dispatch", {
+      operationId: "dispatch-1",
+      timeoutMs: 1000,
+      request: dispatch,
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "m3_api_cancel_inference", {
+      operationId: "cancel-1",
+      timeoutMs: 1000,
+      request: cancel,
+    });
+    for (const request of [dispatch, cancel]) {
+      expect(request).not.toHaveProperty("caller");
+      expect(request).not.toHaveProperty("nowMs");
+      expect(request).not.toHaveProperty("authorizationReceipt");
+    }
   });
 });
 

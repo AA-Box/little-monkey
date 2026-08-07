@@ -640,9 +640,7 @@ async fn probe_health(port: u16) -> bool {
         Ok(client) => client,
         Err(_) => return false,
     };
-    client
-        .get(format!("http://127.0.0.1:{port}/health"))
-        .send()
+    crate::egress::send(client.get(format!("http://127.0.0.1:{port}/health")))
         .await
         .map(|response| response.status().is_success())
         .unwrap_or(false)

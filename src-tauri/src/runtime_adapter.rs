@@ -607,7 +607,7 @@ impl HttpTransport for ReqwestHttpTransport {
                     _ = cancellation.cancelled() => return Err(RuntimeAdapterError::Cancelled {
                         operation: "HTTP request".to_string(),
                     }),
-                    response = builder.send() => response.map_err(|error| RuntimeAdapterError::Transport {
+                    response = crate::egress::send(builder) => response.map_err(|error| RuntimeAdapterError::Transport {
                         operation: "HTTP request".to_string(),
                         message: error.to_string(),
                     })?,

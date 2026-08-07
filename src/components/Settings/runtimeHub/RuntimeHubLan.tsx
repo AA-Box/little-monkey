@@ -400,7 +400,10 @@ function PairingPanel() {
 
   return (
     <section className="rounded-lg border border-border bg-background p-4" aria-labelledby="lan-pairing-heading">
-      <SectionHeading title="Pair a client" description="Issue a narrowly scoped token. Plaintext is returned once and is never available from the token list again." />
+      <SectionHeading
+        title="Pair a new API client (recommended)"
+        description="Use this flow for every new IDE, script, agent, or widget. It issues a narrowly scoped token whose plaintext is returned once and is never available from the token list again."
+      />
       {!policy && <div className="mt-3"><ErrorNotice message="Enable and save a LAN policy before pairing clients." /></div>}
       <div className="mt-4 grid gap-4 sm:grid-cols-2">
         <Field label="Client label">

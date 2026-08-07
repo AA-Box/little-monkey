@@ -388,7 +388,7 @@ pub async fn browser_pane_favicon(
 
     let mut favicon: Option<String> = None;
     for candidate in candidates {
-        let Ok(response) = client.get(&candidate).send().await else {
+        let Ok(response) = crate::egress::send(client.get(&candidate)).await else {
             continue;
         };
         if !response.status().is_success() {

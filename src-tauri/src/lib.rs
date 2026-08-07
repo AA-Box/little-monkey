@@ -42,6 +42,9 @@ pub mod runtime_adapter;
 // stable-diffusion.cpp runtime. Tauri-free so the CLI can share it.
 pub mod generation;
 mod generation_commands;
+// The two generation backends the app talks to but never ships: a ComfyUI the
+// user installed, and hosted OpenAI-compatible image APIs. HTTP only.
+mod generation_remote;
 pub mod managed_runtime;
 // The stack registry and the embedding path, shared by v1 Knowledge Stacks
 // (`stacks`) and Knowledge 2.0 (`knowledge_service`/`knowledge_pipeline`).
@@ -186,12 +189,12 @@ pub mod connectors;
 // of GitHub/Slack/Jira work queues built on the Connector Catalog above, plus
 // draft-only reply/comment/status-update generation. Every write goes through
 // `permissions::request_permission`, same as every other mutating tool.
-pub mod triage;
 pub mod model_sources;
-mod process_lock;
 mod models;
 pub mod ollama;
+mod process_lock;
 pub mod providers;
+pub mod triage;
 // Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
 // Tauri-free static-registry + comparison logic shared by `providers.rs`'s
 // cloud-model command and `m3_runtime_hub.rs`'s local-model staleness check.
@@ -278,12 +281,27 @@ pub mod run_ledger;
 // runs, background shells, side tasks. Public for the same reason the two
 // modules above are: the CLI's `monkey ps` and the daemon both read it, and
 // neither should grow a second copy of the state machine.
-pub mod process_table;
 mod process_commands;
+pub mod process_table;
+// The measuring half of the process table's resource ledger: what one OS pid
+// actually cost, plus an explicit reason for every field this platform will not
+// report. Separate from `process_table` because it is all platform syscalls and
+// no storage.
+pub mod process_usage;
 // Policy shared by the two HTTP listeners, which default to the same port and
 // today report a bare "address already in use" naming neither the winner nor
 // the reason. Where the shared pieces accumulate as D1 collapses them into one.
 pub mod http_policy;
+// Pure, AppHandle-free allowlist and dispatch matrix shared by the legacy and
+// M3 HTTP implementations while D1 collapses them into one listener.
+pub mod http_route_registry;
+// Pure union model catalog used by the same D1 HTTP merge.
+pub mod http_model_catalog;
+pub mod http_model_service;
+pub mod http_model_sources;
+// One lifecycle/endpoint plan for the primary loopback and optional LAN HTTP
+// surfaces. Multiple sockets remain one service and one admission domain.
+pub mod unified_http_server;
 // Migration-controlled authoritative profile/session/search storage. Kept
 // reusable by the desktop, CLI, daemon, export/import, and restore paths.
 pub mod portability;
@@ -512,10 +530,7 @@ pub struct AppState {
     pub mcp_oauth_cancel: std::sync::Mutex<
         std::collections::HashMap<
             String,
-            (
-                std::sync::Arc<tokio_util::sync::CancellationToken>,
-                usize,
-            ),
+            (std::sync::Arc<tokio_util::sync::CancellationToken>, usize),
         >,
     >,
     /// Per-server async lock serializing OAuth access-token retrieval/refresh
@@ -810,7 +825,7 @@ pub fn run() {
         .manage(AppState::default())
         .manage(m3_state)
         .manage(quantization_state)
-        .manage(m3_http_server::M3HttpServerState::default())
+        .manage(unified_http_server::UnifiedHttpServerState::default())
         .manage(m4_state)
         .manage(native_skills_state)
         .manage(browser_state)
@@ -896,25 +911,13 @@ pub fn run() {
                 }
             });
 
-            // Autostart the local API server if `api_server.json` says to —
-            // the only reader of that file at launch time, since every
-            // other consumer (the Settings panel) fetches it on demand via
-            // `api_server_get_config`. Spawned rather than awaited here:
-            // `setup` must return promptly, and a bind failure just leaves
-            // the server in its default "stopped"/"error" state for the
-            // user to retry from the panel, the same as any other failed
-            // manual start.
+            // One startup reconciliation covers the primary compatibility
+            // endpoint and an optional persisted LAN/TLS policy endpoint.
+            // It owns one lifecycle, route authority and admission domain;
+            // there is deliberately no second M3 autostart task racing it.
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let Ok(path) = server::config_file_path(&app_handle) else {
-                    return;
-                };
-                let Ok(config) = server::load_config_impl(&path) else {
-                    return;
-                };
-                if config.autostart {
-                    let _ = server::api_server_start(app_handle).await;
-                }
+                let _ = server::autostart_unified_server(app_handle).await;
             });
 
             // A previous session's chat turns, subagents, crew members,
@@ -970,9 +973,6 @@ pub fn run() {
                 });
             }
 
-            // A persisted M3 policy represents an explicit user opt-in. Start
-            // its separate, capability-scoped compatibility listener without
-            // blocking app launch; failures remain visible in Runtime Hub.
             // Reconciles every enabled `WatchedFolder` Knowledge Sync source
             // against the live filesystem-watcher registry so a watcher
             // started in a previous session resumes across app restarts —
@@ -980,18 +980,6 @@ pub fn run() {
             // commands keep it in sync as the catalog changes.
             knowledge_service::sync_watched_folder_watchers(app.handle());
 
-            let m3_http_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let hub = m3_http_app
-                    .state::<m3_commands::M3CommandState>()
-                    .hub
-                    .clone();
-                if hub.lan_policy().ok().flatten().is_none() {
-                    return;
-                }
-                let server = m3_http_app.state::<m3_http_server::M3HttpServerState>();
-                let _ = m3_http_server::start_server_core(&server, hub).await;
-            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1079,6 +1067,7 @@ pub fn run() {
             process_commands::process_transition,
             process_commands::process_link_run,
             process_commands::process_reap_missing,
+            process_commands::process_usage_ledger,
             permissions::permission_respond,
             permissions::permission_dry_run,
             permissions::set_permission_mode,
@@ -1417,6 +1406,7 @@ pub fn run() {
             browser_worker::browser_capture_evidence,
             browser_worker::browser_stop,
             daemon_commands::daemon_desktop_status,
+            daemon_commands::daemon_desktop_decisions,
             daemon_commands::daemon_desktop_install,
             daemon_commands::daemon_desktop_start,
             daemon_commands::daemon_desktop_stop,
@@ -1493,6 +1483,9 @@ pub fn run() {
             generation_commands::generation_loras,
             generation_commands::generation_add_lora,
             generation_commands::generation_remove_lora,
+            generation_commands::generation_backends,
+            generation_commands::generation_add_backend,
+            generation_commands::generation_remove_backend,
             generation_commands::generation_run,
             generation_commands::generation_cancel,
             generation_commands::generation_gallery,
@@ -1542,8 +1535,7 @@ pub fn run() {
         // either process needs) — is the only chance those child processes
         // get to actually be killed before the process itself exits.
         if let tauri::RunEvent::Exit = event {
-            let m3_http = app_handle.state::<m3_http_server::M3HttpServerState>();
-            let _ = tauri::async_runtime::block_on(m3_http_server::stop_server_core(&m3_http));
+            let _ = tauri::async_runtime::block_on(server::shutdown_unified_server(app_handle));
 
             let m3 = app_handle.state::<m3_commands::M3CommandState>();
             let _ = m3.cancel_all_and_shutdown_owned(std::time::Duration::from_secs(5));
