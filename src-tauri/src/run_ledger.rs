@@ -25,6 +25,69 @@ use crate::run_protocol::{
 /// with — one of the per-payload `*_sha256` digests the ledger already stores.
 const CHAIN_HASH_DOMAIN: &[u8] = b"little-monkey/run-event-chain/v1";
 
+/// Domain separator for the subsystem stream's chain. Distinct from
+/// [`CHAIN_HASH_DOMAIN`] so a row cannot be lifted from one chain into the other
+/// and still verify.
+const SUBSYSTEM_CHAIN_HASH_DOMAIN: &[u8] = b"little-monkey/subsystem-event-chain/v1";
+
+/// One link of the subsystem event chain.
+///
+/// Same construction as [`event_chain_hash`] and for the same reasons —
+/// length-prefixed fields, a presence tag on every optional — with one
+/// difference worth stating: there is no "appended only when present" escape
+/// here. That trick exists in [`event_chain_hash`] to keep rows written before a
+/// column existed verifiable, and this table has no such rows. Every field is
+/// unconditional, so a future column added here will need the same treatment
+/// V10 needed there.
+#[allow(clippy::too_many_arguments)]
+fn subsystem_chain_hash(
+    previous: Option<&str>,
+    event_id: &str,
+    subsystem: &str,
+    action: &str,
+    occurred_at_ms: i64,
+    run_id: Option<&str>,
+    attribution: &str,
+    process_id: Option<&str>,
+    permission_request_id: Option<&str>,
+    outcome: &str,
+    detail_json: Option<&[u8]>,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    let mut field = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    };
+    field(SUBSYSTEM_CHAIN_HASH_DOMAIN);
+    field(previous.unwrap_or_default().as_bytes());
+    field(&[u8::from(previous.is_some())]);
+    field(event_id.as_bytes());
+    field(subsystem.as_bytes());
+    field(action.as_bytes());
+    field(&occurred_at_ms.to_be_bytes());
+    field(run_id.unwrap_or_default().as_bytes());
+    field(&[u8::from(run_id.is_some())]);
+    field(attribution.as_bytes());
+    field(process_id.unwrap_or_default().as_bytes());
+    field(&[u8::from(process_id.is_some())]);
+    field(permission_request_id.unwrap_or_default().as_bytes());
+    field(&[u8::from(permission_request_id.is_some())]);
+    field(outcome.as_bytes());
+    field(detail_json.unwrap_or_default());
+    field(&[u8::from(detail_json.is_some())]);
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        hex.push(HEX[(byte >> 4) as usize] as char);
+        hex.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    hex
+}
+
 /// One link of the run event chain: SHA-256 over every column of the row, bound
 /// to the previous row's hash.
 ///
@@ -127,6 +190,8 @@ const MIGRATION_V10: i64 = 10;
 const MIGRATION_V10_CHECKSUM: &str = "run-event-process-identity-v10-2026-08-07";
 const MIGRATION_V11: i64 = 11;
 const MIGRATION_V11_CHECKSUM: &str = "permission-decisions-v11-2026-08-07";
+const MIGRATION_V12: i64 = 12;
+const MIGRATION_V12_CHECKSUM: &str = "subsystem-events-v12-2026-08-07";
 
 /// The result of recomputing a run's event chain.
 ///
@@ -438,6 +503,147 @@ pub struct StoredPermissionDecision {
     /// carry.
     pub decided_by: Option<String>,
     pub decided_at_ms: Option<u64>,
+}
+
+/// Which subsystem produced an event. A closed set with stable codes, for the
+/// reason [`crate::run_scope::Unattributed`] is one: the code is what gets
+/// persisted and compared, so it has to outlive this enum's spelling.
+///
+/// The list is the acceptance's own list minus the two that already write to
+/// `run_events` — desktop and daemon both go through `RunLedger::append_event`
+/// and have a run to hang off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subsystem {
+    Http,
+    Mcp,
+    Browser,
+    Acp,
+    Remote,
+}
+
+impl Subsystem {
+    pub const ALL: &'static [Subsystem] = &[
+        Subsystem::Http,
+        Subsystem::Mcp,
+        Subsystem::Browser,
+        Subsystem::Acp,
+        Subsystem::Remote,
+    ];
+
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Subsystem::Http => "http",
+            Subsystem::Mcp => "mcp",
+            Subsystem::Browser => "browser",
+            Subsystem::Acp => "acp",
+            Subsystem::Remote => "remote",
+        }
+    }
+
+    fn parse(value: &str) -> LedgerResult<Self> {
+        Subsystem::ALL
+            .iter()
+            .find(|subsystem| subsystem.code() == value)
+            .copied()
+            .ok_or_else(|| LedgerError::Corrupt(format!("unknown subsystem '{value}'")))
+    }
+}
+
+impl Serialize for Subsystem {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.code())
+    }
+}
+
+/// How a subsystem action ended.
+///
+/// `Denied` is kept apart from `Failed` deliberately: a call the permission gate
+/// refused and a call that ran and errored are different findings, and a reader
+/// counting failures should not be counting refusals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubsystemOutcome {
+    Succeeded,
+    Failed,
+    Denied,
+    Cancelled,
+}
+
+impl SubsystemOutcome {
+    pub const ALL: &'static [SubsystemOutcome] = &[
+        SubsystemOutcome::Succeeded,
+        SubsystemOutcome::Failed,
+        SubsystemOutcome::Denied,
+        SubsystemOutcome::Cancelled,
+    ];
+
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            SubsystemOutcome::Succeeded => "succeeded",
+            SubsystemOutcome::Failed => "failed",
+            SubsystemOutcome::Denied => "denied",
+            SubsystemOutcome::Cancelled => "cancelled",
+        }
+    }
+
+    fn parse(value: &str) -> LedgerResult<Self> {
+        SubsystemOutcome::ALL
+            .iter()
+            .find(|outcome| outcome.code() == value)
+            .copied()
+            .ok_or_else(|| LedgerError::Corrupt(format!("unknown subsystem outcome '{value}'")))
+    }
+}
+
+impl Serialize for SubsystemOutcome {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.code())
+    }
+}
+
+/// One thing a run-less subsystem did.
+///
+/// Written once, when the action has an outcome. There is deliberately no
+/// "started" row: the action's authorization is already recorded in
+/// `permission_decisions` *before* it runs, so a second row would restate what
+/// the permission row already proves. An action that never finishes therefore
+/// leaves an open permission and no event, which reads correctly as "authorized,
+/// never completed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubsystemEvent {
+    pub event_id: String,
+    pub subsystem: Subsystem,
+    /// What was done, in the subsystem's own vocabulary — an MCP tool name, an
+    /// HTTP route, a browser action.
+    pub action: String,
+    pub occurred_at_ms: u64,
+    pub run_id: Option<String>,
+    pub attribution: PermissionAttribution,
+    pub process_id: Option<String>,
+    /// The `permission_decisions` row that authorized this. `None` means nothing
+    /// gated it — a finding, not a blank.
+    pub permission_request_id: Option<String>,
+    pub outcome: SubsystemOutcome,
+    /// Subsystem-specific detail. Whatever goes here is covered by the chain, so
+    /// it cannot be edited after the fact.
+    pub detail_json: Option<Vec<u8>>,
+}
+
+/// A stored subsystem event with the sequence the stream assigned it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredSubsystemEvent {
+    pub sequence: u64,
+    pub event_id: String,
+    pub subsystem: Subsystem,
+    pub action: String,
+    pub occurred_at_ms: u64,
+    pub run_id: Option<String>,
+    pub attribution: PermissionAttribution,
+    pub process_id: Option<String>,
+    pub permission_request_id: Option<String>,
+    pub outcome: SubsystemOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1132,6 +1338,161 @@ impl RunLedger {
         rows.into_iter().map(decode_permission_decision).collect()
     }
 
+    /// Append one subsystem event and return the sequence the stream gave it.
+    ///
+    /// The tail read and the insert share one transaction, so two concurrent
+    /// appends cannot both chain off the same predecessor — the second waits
+    /// and links to the first. Without that, the chain would fork and one branch
+    /// would be silently lost to the `UNIQUE` sequence.
+    pub fn append_subsystem_event(&mut self, event: &SubsystemEvent) -> LedgerResult<u64> {
+        if event.attribution.names_a_run() != event.run_id.is_some() {
+            return Err(LedgerError::Corrupt(format!(
+                "attribution '{}' and run id disagree about whether this event has a run",
+                event.attribution.code()
+            )));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<String> = transaction
+            .query_row(
+                "SELECT event_hash FROM subsystem_events ORDER BY sequence DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let occurred_at_ms = to_sql_i64(event.occurred_at_ms, "occurred_at_ms")?;
+        let hash = subsystem_chain_hash(
+            previous.as_deref(),
+            &event.event_id,
+            event.subsystem.code(),
+            &event.action,
+            occurred_at_ms,
+            event.run_id.as_deref(),
+            event.attribution.code(),
+            event.process_id.as_deref(),
+            event.permission_request_id.as_deref(),
+            event.outcome.code(),
+            event.detail_json.as_deref(),
+        );
+        transaction.execute(
+            "INSERT INTO subsystem_events (
+                event_id, subsystem, action, occurred_at_ms, run_id, attribution,
+                process_id, permission_request_id, outcome, detail_json,
+                event_hash, prev_event_hash
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                event.event_id,
+                event.subsystem.code(),
+                event.action,
+                occurred_at_ms,
+                event.run_id,
+                event.attribution.code(),
+                event.process_id,
+                event.permission_request_id,
+                event.outcome.code(),
+                event.detail_json,
+                hash,
+                previous,
+            ],
+        )?;
+        let sequence = transaction.last_insert_rowid();
+        transaction.commit()?;
+        from_sql_u64(sequence, "sequence")
+    }
+
+    /// Recompute the subsystem chain and report whether it is intact.
+    ///
+    /// Unlike [`verify_run_chain`](Self::verify_run_chain) there is no unchained
+    /// era to skip: this table was born chained, so a row without a hash is a
+    /// corruption rather than history. Tail truncation is the one thing a chain
+    /// cannot see on its own, and here — unlike `run_events`, where
+    /// `runs.last_sequence` is a second witness — there is no counter to
+    /// contradict it. That limit is stated rather than glossed; an integrity
+    /// claim that overstates itself is worse than none.
+    pub fn verify_subsystem_chain(&self) -> LedgerResult<ChainVerification> {
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, event_id, subsystem, action, occurred_at_ms, run_id, attribution,
+                    process_id, permission_request_id, outcome, detail_json,
+                    event_hash, prev_event_hash
+             FROM subsystem_events ORDER BY sequence ASC",
+        )?;
+        let mut rows = statement.query([])?;
+
+        let mut covered_from = None;
+        let mut covered_through = None;
+        let mut events_seen = 0u64;
+        let mut events_naming_a_process = 0u64;
+        let mut expected_previous: Option<String> = None;
+        while let Some(row) = rows.next()? {
+            events_seen += 1;
+            let sequence = from_sql_u64(row.get::<_, i64>(0)?, "sequence")?;
+            let process_id = row.get::<_, Option<String>>(7)?;
+            if process_id.is_some() {
+                events_naming_a_process += 1;
+            }
+            let stored_hash = row.get::<_, String>(11)?;
+            let stored_previous = row.get::<_, Option<String>>(12)?;
+            if stored_previous.as_deref() != expected_previous.as_deref() {
+                return Ok(ChainVerification::Broken {
+                    sequence,
+                    detail: "this event does not link to the previous event's hash".to_string(),
+                });
+            }
+            let recomputed = subsystem_chain_hash(
+                stored_previous.as_deref(),
+                &row.get::<_, String>(1)?,
+                &row.get::<_, String>(2)?,
+                &row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?.as_deref(),
+                &row.get::<_, String>(6)?,
+                process_id.as_deref(),
+                row.get::<_, Option<String>>(8)?.as_deref(),
+                &row.get::<_, String>(9)?,
+                row.get::<_, Option<Vec<u8>>>(10)?.as_deref(),
+            );
+            if recomputed != stored_hash {
+                return Ok(ChainVerification::Broken {
+                    sequence,
+                    detail: "this event's contents do not match its recorded hash".to_string(),
+                });
+            }
+            covered_from.get_or_insert(sequence);
+            covered_through = Some(sequence);
+            expected_previous = Some(stored_hash);
+        }
+
+        Ok(ChainVerification::Intact {
+            covered_from,
+            covered_through,
+            events_seen,
+            events_naming_a_process,
+        })
+    }
+
+    /// Subsystem events in stream order, newest first.
+    pub fn recent_subsystem_events(
+        &self,
+        subsystem: Option<Subsystem>,
+        limit: u32,
+    ) -> LedgerResult<Vec<StoredSubsystemEvent>> {
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, event_id, subsystem, action, occurred_at_ms, run_id, attribution,
+                    process_id, permission_request_id, outcome
+             FROM subsystem_events
+             WHERE ?1 IS NULL OR subsystem = ?1
+             ORDER BY sequence DESC LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![subsystem.map(Subsystem::code), limit],
+                subsystem_event_columns,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(decode_subsystem_event).collect()
+    }
+
     pub fn applied_migrations(&self) -> LedgerResult<Vec<i64>> {
         let mut statement = self
             .connection
@@ -1255,7 +1616,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
             row.get::<_, Option<i64>>(0)
         })?
     {
-        if version > MIGRATION_V11 {
+        if version > MIGRATION_V12 {
             return Err(LedgerError::MigrationConflict { version });
         }
     }
@@ -1272,6 +1633,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         (MIGRATION_V9, MIGRATION_V9_CHECKSUM),
         (MIGRATION_V10, MIGRATION_V10_CHECKSUM),
         (MIGRATION_V11, MIGRATION_V11_CHECKSUM),
+        (MIGRATION_V12, MIGRATION_V12_CHECKSUM),
     ] {
         if let Some(checksum) = connection
             .query_row(
@@ -1539,7 +1901,24 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
-    transaction.execute_batch("PRAGMA user_version = 11;")?;
+    let has_v12 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V12],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v12 {
+        transaction.execute_batch(MIGRATION_V12_SQL)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![MIGRATION_V12, MIGRATION_V12_CHECKSUM, now_ms_i64()?],
+        )?;
+    }
+
+    transaction.execute_batch("PRAGMA user_version = 12;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -2199,6 +2578,103 @@ END;
 /// would reintroduce the exact `durable_run_exists` gate this table exists to
 /// remove — and `process_id` follows `run_events.process_id` for the reason
 /// given there. Outer-join to read either.
+/// The one event stream the run-less subsystems write to (roadmap K12).
+///
+/// **Why this is not `run_events`.** The acceptance asks for "one event stream
+/// every subsystem writes to — desktop, daemon, HTTP, ACP, MCP, browser, remote
+/// node". `run_events.run_id` is `NOT NULL REFERENCES runs(run_id)`, its insert
+/// trigger requires contiguous per-run sequences, and its hash chain is per run.
+/// Every one of those is run-shaped, and an inbound HTTP request, an MCP tool
+/// call on a shared transport, and a browser action are not runs and will not
+/// become them — `run_scope`'s module doc argues that case at length. The choice
+/// was to manufacture a `runs` row per request or to have a stream that does not
+/// need one; this is the second.
+///
+/// **What it does not duplicate.** A gated action's *authorization* already
+/// lives in `permission_decisions` (V11), written before the action runs and for
+/// every caller, so this table records what happened and points back at the
+/// decision by `request_id` rather than restating it. That is also what closes
+/// the acceptance's "for anything gated, the exact policy decision that
+/// permitted it" for these subsystems: one join, in the direction the question
+/// is actually asked.
+///
+/// **One global chain, not one per anything.** There is no per-run sequence to
+/// hang a chain off, and a per-subsystem chain would let a whole subsystem's
+/// tail be removed without breaking any other. `sequence` is a single
+/// `AUTOINCREMENT` counter and each row's hash binds to its predecessor's,
+/// exactly as `run_events` does within one run.
+///
+/// Unlike V9's chain this one has **no unchained era to tolerate**: the table is
+/// new, so `event_hash` is `NOT NULL` from the first row and `prev_event_hash`
+/// is `NULL` only for `sequence = 1`. There is nothing to backfill and therefore
+/// nothing to launder.
+///
+/// ponytail: the global chain serializes appends, since each one reads the
+/// current tail. Fine at the volume these subsystems produce; if an HTTP server
+/// ever writes per-request rows at load, shard the chain by subsystem and anchor
+/// each shard's head in a parent chain rather than dropping the linkage.
+const MIGRATION_V12_SQL: &str = r#"
+CREATE TABLE subsystem_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    subsystem TEXT NOT NULL CHECK (subsystem IN
+        ('http', 'mcp', 'browser', 'acp', 'remote')),
+    action TEXT NOT NULL CHECK (length(action) > 0),
+    occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms > 0),
+    -- Plain columns, not foreign keys, for the reason `permission_decisions`
+    -- gives: the whole point is that these events exist without a run.
+    run_id TEXT,
+    attribution TEXT NOT NULL CHECK (attribution IN (
+        'ledger-run', 'unregistered-run', 'unknown',
+        'unattributed.user-action', 'unattributed.scheduled',
+        'unattributed.inbound-request', 'unattributed.startup',
+        'unattributed.shared-transport'
+    )),
+    process_id TEXT,
+    -- The `permission_decisions` row that authorized this action, when one did.
+    -- NULL means nothing gated it, which is a finding rather than a blank.
+    permission_request_id TEXT,
+    outcome TEXT NOT NULL CHECK (outcome IN
+        ('succeeded', 'failed', 'denied', 'cancelled')),
+    detail_json BLOB,
+    event_hash TEXT NOT NULL CHECK (length(event_hash) = 64),
+    prev_event_hash TEXT CHECK (prev_event_hash IS NULL OR length(prev_event_hash) = 64),
+    CHECK ((attribution IN ('ledger-run', 'unregistered-run')) = (run_id IS NOT NULL))
+) STRICT;
+
+CREATE INDEX subsystem_events_time_idx ON subsystem_events(occurred_at_ms, sequence);
+CREATE INDEX subsystem_events_subsystem_idx ON subsystem_events(subsystem, sequence);
+CREATE INDEX subsystem_events_run_idx
+    ON subsystem_events(run_id, sequence) WHERE run_id IS NOT NULL;
+CREATE INDEX subsystem_events_permission_idx
+    ON subsystem_events(permission_request_id) WHERE permission_request_id IS NOT NULL;
+
+CREATE TRIGGER subsystem_events_forbid_update
+BEFORE UPDATE ON subsystem_events
+BEGIN
+    SELECT RAISE(ABORT, 'subsystem events are append-only');
+END;
+
+CREATE TRIGGER subsystem_events_forbid_delete
+BEFORE DELETE ON subsystem_events
+BEGIN
+    SELECT RAISE(ABORT, 'subsystem events are append-only');
+END;
+
+-- Structural linkage, so it holds against a writer that never goes through
+-- Rust. SQLite cannot compute SHA-256, so the hash's *content* is
+-- `verify_subsystem_chain`'s job; "points at its predecessor" is the database's.
+CREATE TRIGGER subsystem_events_chain_links_to_its_predecessor
+BEFORE INSERT ON subsystem_events
+FOR EACH ROW
+WHEN NEW.prev_event_hash IS NOT (
+        SELECT event_hash FROM subsystem_events ORDER BY sequence DESC LIMIT 1
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'subsystem event must carry its predecessor''s hash');
+END;
+"#;
+
 const MIGRATION_V11_SQL: &str = r#"
 CREATE TABLE permission_decisions (
     request_id TEXT PRIMARY KEY,
@@ -3089,6 +3565,53 @@ fn parse_run_status(value: &str) -> LedgerResult<RunStatus> {
             "unknown run status '{other}'"
         ))),
     }
+}
+
+/// A `subsystem_events` row as SQLite hands it over, for the reason
+/// [`PermissionDecisionRow`] exists: the closure rusqlite calls may only fail
+/// with a rusqlite error, while parsing the three enum columns fails with a
+/// [`LedgerError::Corrupt`].
+struct SubsystemEventRow {
+    sequence: i64,
+    event_id: String,
+    subsystem: String,
+    action: String,
+    occurred_at_ms: i64,
+    run_id: Option<String>,
+    attribution: String,
+    process_id: Option<String>,
+    permission_request_id: Option<String>,
+    outcome: String,
+}
+
+fn subsystem_event_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubsystemEventRow> {
+    Ok(SubsystemEventRow {
+        sequence: row.get(0)?,
+        event_id: row.get(1)?,
+        subsystem: row.get(2)?,
+        action: row.get(3)?,
+        occurred_at_ms: row.get(4)?,
+        run_id: row.get(5)?,
+        attribution: row.get(6)?,
+        process_id: row.get(7)?,
+        permission_request_id: row.get(8)?,
+        outcome: row.get(9)?,
+    })
+}
+
+fn decode_subsystem_event(row: SubsystemEventRow) -> LedgerResult<StoredSubsystemEvent> {
+    Ok(StoredSubsystemEvent {
+        sequence: from_sql_u64(row.sequence, "sequence")?,
+        event_id: row.event_id,
+        subsystem: Subsystem::parse(&row.subsystem)?,
+        action: row.action,
+        occurred_at_ms: from_sql_u64(row.occurred_at_ms, "occurred_at_ms")?,
+        run_id: row.run_id,
+        attribution: PermissionAttribution::parse(&row.attribution)?,
+        process_id: row.process_id,
+        permission_request_id: row.permission_request_id,
+        outcome: SubsystemOutcome::parse(&row.outcome)?,
+    })
 }
 
 /// The column list every `permission_decisions` read shares, so the two readers
@@ -4416,7 +4939,7 @@ mod tests {
                     .connection
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                11
+                12
             );
         }
 
@@ -4429,14 +4952,14 @@ mod tests {
             connection
                 .execute(
                     "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
-                     VALUES (12, 'from-the-future', 1)",
+                     VALUES (13, 'from-the-future', 1)",
                     [],
                 )
                 .unwrap();
         }
         assert!(matches!(
             RunLedger::open(&database.path),
-            Err(LedgerError::MigrationConflict { version: 12 })
+            Err(LedgerError::MigrationConflict { version: 13 })
         ));
     }
 
@@ -4447,13 +4970,13 @@ mod tests {
             let ledger = RunLedger::open(&database.path).unwrap();
             assert_eq!(
                 ledger.applied_migrations().unwrap(),
-                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
             );
         }
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             "reopening must not re-apply or add a migration"
         );
 
@@ -4666,7 +5189,7 @@ mod tests {
     /// once — which is the branch `migration_is_safe_to_rerun_…` cannot reach,
     /// since that test never sees a database missing a version.
     #[test]
-    fn a_database_written_before_v11_gains_the_permission_table_on_open() {
+    fn a_database_written_before_v11_gains_the_later_tables_on_open() {
         let database = TempDb::new("permission-upgrade");
         {
             let ledger = RunLedger::open(&database.path).unwrap();
@@ -4685,7 +5208,8 @@ mod tests {
             connection
                 .execute_batch(
                     "DROP TABLE permission_decisions;
-                     DELETE FROM schema_migrations WHERE version = 11;
+                     DROP TABLE subsystem_events;
+                     DELETE FROM schema_migrations WHERE version IN (11, 12);
                      PRAGMA user_version = 10;",
                 )
                 .unwrap();
@@ -4694,15 +5218,15 @@ mod tests {
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-            "opening a V10 database must apply V11 and nothing else"
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            "opening a V10 database must apply every migration above it"
         );
         assert_eq!(
             ledger
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            11
+            12
         );
         // The table is back and empty: the upgrade adds the surface, it does not
         // invent rows for permissions nobody recorded at the time.
@@ -4909,5 +5433,216 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn subsystem_event(action: &str, outcome: SubsystemOutcome) -> SubsystemEvent {
+        SubsystemEvent {
+            event_id: format!("subsystem-{action}"),
+            subsystem: Subsystem::Mcp,
+            action: action.to_string(),
+            occurred_at_ms: 1_000,
+            run_id: None,
+            attribution: PermissionAttribution::Unattributed(
+                crate::run_scope::Unattributed::SharedTransport,
+            ),
+            process_id: None,
+            permission_request_id: Some("req-1".to_string()),
+            outcome,
+            detail_json: None,
+        }
+    }
+
+    /// The acceptance's "one event stream every subsystem writes to". `run_events`
+    /// cannot hold these — its `run_id` is a foreign key onto `runs`, and an MCP
+    /// call on a shared transport has no run.
+    #[test]
+    fn a_subsystem_event_needs_no_run_and_names_what_authorized_it() {
+        let database = TempDb::new("subsystem-basic");
+        let mut ledger = RunLedger::open(&database.path).unwrap();
+
+        let first = ledger
+            .append_subsystem_event(&subsystem_event(
+                "github:create_issue",
+                SubsystemOutcome::Succeeded,
+            ))
+            .unwrap();
+        let second = ledger
+            .append_subsystem_event(&subsystem_event(
+                "github:delete_repo",
+                SubsystemOutcome::Denied,
+            ))
+            .unwrap();
+        assert_eq!(
+            (first, second),
+            (1, 2),
+            "one global stream, not per subsystem"
+        );
+
+        let events = ledger.recent_subsystem_events(None, 10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 2, "newest first");
+        assert_eq!(events[0].outcome, SubsystemOutcome::Denied);
+        assert_eq!(events[0].permission_request_id.as_deref(), Some("req-1"));
+        assert_eq!(
+            events[0].attribution.code(),
+            "unattributed.shared-transport",
+            "why it has no run is recorded, not left blank"
+        );
+
+        // Filtering is by the persisted code, so a renamed variant cannot
+        // silently stop matching rows written by an older build.
+        assert_eq!(
+            ledger
+                .recent_subsystem_events(Some(Subsystem::Mcp), 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(ledger
+            .recent_subsystem_events(Some(Subsystem::Http), 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The chain covers every column, so an edited row is detectable. Unlike V9's
+    /// run chain there is no unchained era: this table was born chained.
+    #[test]
+    fn editing_a_subsystem_event_breaks_the_chain() {
+        let database = TempDb::new("subsystem-chain");
+        let mut ledger = RunLedger::open(&database.path).unwrap();
+        for index in 0..3 {
+            ledger
+                .append_subsystem_event(&subsystem_event(
+                    &format!("server:tool-{index}"),
+                    SubsystemOutcome::Succeeded,
+                ))
+                .unwrap();
+        }
+
+        assert_eq!(
+            ledger.verify_subsystem_chain().unwrap(),
+            ChainVerification::Intact {
+                covered_from: Some(1),
+                covered_through: Some(3),
+                events_seen: 3,
+                events_naming_a_process: 0,
+            }
+        );
+
+        // The append-only triggers are the first line of defence, so an edit has
+        // to drop them first — which is precisely the attacker the chain exists
+        // to catch, since dropping a trigger leaves the hashes untouched.
+        ledger
+            .connection
+            .execute_batch(
+                "DROP TRIGGER subsystem_events_forbid_update;
+                 UPDATE subsystem_events SET outcome = 'succeeded' WHERE sequence = 2;
+                 UPDATE subsystem_events SET action = 'server:something-else' WHERE sequence = 2;",
+            )
+            .unwrap();
+
+        let verdict = ledger.verify_subsystem_chain().unwrap();
+        assert!(
+            matches!(verdict, ChainVerification::Broken { sequence: 2, .. }),
+            "expected a break at the edited row, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn subsystem_events_cannot_be_updated_or_deleted() {
+        let database = TempDb::new("subsystem-append-only");
+        let mut ledger = RunLedger::open(&database.path).unwrap();
+        ledger
+            .append_subsystem_event(&subsystem_event("server:tool", SubsystemOutcome::Succeeded))
+            .unwrap();
+
+        for statement in [
+            "UPDATE subsystem_events SET action = 'other'",
+            "DELETE FROM subsystem_events",
+        ] {
+            let error = ledger
+                .connection
+                .execute(statement, [])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("subsystem events are append-only"),
+                "expected the append-only trigger for `{statement}`, got {error}"
+            );
+        }
+    }
+
+    /// A row whose `prev_event_hash` does not name the current tail is refused by
+    /// the database itself, so the linkage holds against a writer that never goes
+    /// through Rust.
+    #[test]
+    fn a_subsystem_event_must_carry_its_predecessors_hash() {
+        let database = TempDb::new("subsystem-linkage");
+        let mut ledger = RunLedger::open(&database.path).unwrap();
+        ledger
+            .append_subsystem_event(&subsystem_event(
+                "server:first",
+                SubsystemOutcome::Succeeded,
+            ))
+            .unwrap();
+
+        let error = ledger
+            .connection
+            .execute(
+                "INSERT INTO subsystem_events (
+                    event_id, subsystem, action, occurred_at_ms, attribution, outcome,
+                    event_hash, prev_event_hash
+                 ) VALUES ('forged', 'mcp', 'server:forged', 1, 'unknown', 'succeeded', ?1, ?2)",
+                params!["a".repeat(64), "b".repeat(64)],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("must carry its predecessor's hash"),
+            "expected the linkage trigger, got {error}"
+        );
+    }
+
+    /// Every persisted code must survive the round trip. A code the CHECK accepts
+    /// but `parse` rejects makes a row unreadable after it is written.
+    #[test]
+    fn every_subsystem_and_outcome_code_round_trips() {
+        let database = TempDb::new("subsystem-codes");
+        let mut ledger = RunLedger::open(&database.path).unwrap();
+
+        for (index, subsystem) in Subsystem::ALL.iter().enumerate() {
+            for (offset, outcome) in SubsystemOutcome::ALL.iter().enumerate() {
+                let mut event = subsystem_event(&format!("action-{index}-{offset}"), *outcome);
+                event.event_id = format!("subsystem-{index}-{offset}");
+                event.subsystem = *subsystem;
+                ledger.append_subsystem_event(&event).unwrap();
+            }
+        }
+
+        let stored = ledger.recent_subsystem_events(None, 100).unwrap();
+        assert_eq!(
+            stored.len(),
+            Subsystem::ALL.len() * SubsystemOutcome::ALL.len()
+        );
+        assert!(matches!(
+            ledger.verify_subsystem_chain().unwrap(),
+            ChainVerification::Intact { .. }
+        ));
+    }
+
+    #[test]
+    fn a_subsystem_event_whose_attribution_disagrees_with_its_run_id_is_refused() {
+        let database = TempDb::new("subsystem-disagree");
+        let mut ledger = RunLedger::open(&database.path).unwrap();
+        let mut event = subsystem_event("server:tool", SubsystemOutcome::Succeeded);
+        event.run_id = Some("run-1".to_string());
+        let error = ledger
+            .append_subsystem_event(&event)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("disagree about whether this event has a run"),
+            "expected the Rust guard, got {error}"
+        );
     }
 }
