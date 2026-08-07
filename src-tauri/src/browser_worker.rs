@@ -3071,10 +3071,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("lm-browser-sweep-{}", uuid::Uuid::new_v4()));
         let state = BrowserCommandState::production(&root).unwrap();
 
-        // Zero means "already past its budget on the first tick", which is the
-        // only way to age a session without sleeping. It is a test input, not a
-        // proposed default — see the counterpart below, which is what stops a
-        // sweep that reclaims everything from passing this.
+        // Zero is the smallest budget that ages a session without waiting out a
+        // real one. It is a test input, not a proposed default — `validate_limits`
+        // floors `max_session_ms` at 1000, so production never sees it — and the
+        // counterpart below is what stops a sweep that reclaims everything from
+        // passing this.
         let (expired, _) = quota_session_with(BrowserLimits {
             max_session_ms: 0,
             ..BrowserLimits::default()
@@ -3082,6 +3083,18 @@ mod tests {
         let (live, _) = quota_session_with(BrowserLimits::default());
         state.insert(expired.clone()).unwrap();
         state.insert(live.clone()).unwrap();
+
+        // `sweep_verdict` compares `elapsed_ms > max_session_ms` strictly, and
+        // `sweep_verdict_now` truncates `Instant::elapsed()` to whole milliseconds.
+        // So even a zero budget needs one millisecond on the clock: without this
+        // the fixture setup and the sweep can land in the same millisecond on a
+        // fast machine, `elapsed_ms` is 0, `0 > 0` is false, and the session this
+        // test is about reads as live. That is what made this flake — it passed
+        // only when the socket and profile setup above happened to straddle a
+        // millisecond boundary. Sleeping is the fix rather than relaxing the
+        // comparison, because `>` is correct for every budget production can
+        // actually receive.
+        std::thread::sleep(Duration::from_millis(2));
 
         let outcomes = state.sweep_sessions(&|_| false).unwrap();
 
