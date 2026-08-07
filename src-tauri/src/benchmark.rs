@@ -457,6 +457,88 @@ pub struct SampleReport {
     pub decode_tokens_per_second: Option<f64>,
 }
 
+/// The parts of a hardware snapshot a stored benchmark is only valid *for*.
+///
+/// A whole [`crate::runtime_adapter::HardwareSnapshot`] cannot be compared: it
+/// carries `captured_at_ms` and `available_ram_bytes`, both of which change
+/// second to second, so equality on it would call every stored report stale.
+/// This is the stable identity instead — swap the machine, add a GPU, or change
+/// how much RAM is fitted, and a number measured before that is no longer a
+/// number measured on the machine displaying it.
+///
+/// Deliberately **not** including `supported_runtimes`: it is derived from
+/// `os`/`arch`, so comparing it would only ever restate them, and a build that
+/// learns to support a new runtime would invalidate every stored report for no
+/// physical reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MachineIdentity {
+    pub os: String,
+    pub arch: String,
+    pub total_ram_bytes: u64,
+    pub logical_cpu_count: u32,
+    /// Sorted, so two snapshots that found the same devices in a different order
+    /// are the same machine.
+    pub accelerators: Vec<String>,
+}
+
+/// Why a stored benchmark does or does not describe the machine asking.
+///
+/// A tagged union rather than a `bool` plus a list, for the reason
+/// [`crate::run_ledger::ChainVerification`] is one: a caller must not be able to
+/// read the differences off a report and still present its numbers as this
+/// machine's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum BenchmarkFreshness {
+    /// Measured on the machine now asking. Its numbers may be displayed.
+    ThisMachine,
+    /// Measured somewhere else, or here before the hardware changed. Every
+    /// difference is named, and no number from it may be displayed as current.
+    DifferentMachine { changed: Vec<String> },
+}
+
+impl MachineIdentity {
+    /// Compare against `other`, naming every difference.
+    ///
+    /// The differences are for a human to read, so they say what changed rather
+    /// than dumping both structs.
+    #[must_use]
+    pub fn freshness_against(&self, other: &MachineIdentity) -> BenchmarkFreshness {
+        let mut changed = Vec::new();
+        if self.os != other.os || self.arch != other.arch {
+            changed.push(format!(
+                "platform {}/{} → {}/{}",
+                self.os, self.arch, other.os, other.arch
+            ));
+        }
+        if self.total_ram_bytes != other.total_ram_bytes {
+            changed.push(format!(
+                "installed RAM {} → {} bytes",
+                self.total_ram_bytes, other.total_ram_bytes
+            ));
+        }
+        if self.logical_cpu_count != other.logical_cpu_count {
+            changed.push(format!(
+                "logical CPUs {} → {}",
+                self.logical_cpu_count, other.logical_cpu_count
+            ));
+        }
+        if self.accelerators != other.accelerators {
+            changed.push(format!(
+                "accelerators [{}] → [{}]",
+                self.accelerators.join(", "),
+                other.accelerators.join(", ")
+            ));
+        }
+        if changed.is_empty() {
+            BenchmarkFreshness::ThisMachine
+        } else {
+            BenchmarkFreshness::DifferentMachine { changed }
+        }
+    }
+}
+
 /// One benchmark run of one model on one runtime on this machine.
 ///
 /// The hardware snapshot is deliberately not stored here: the caller attaches

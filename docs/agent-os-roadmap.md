@@ -2950,11 +2950,43 @@ of a very slow model. Two of its files carry comments claiming a sibling test
 "proves — mechanically, not just by convention" a property; neither test file was
 ever written.
 
+**Then shipped — the measurement now survives the session that produced it, and
+the prose stops deferring.** A benchmark that is measured and thrown away cannot
+inform anything, and that is what the surface did: the report lived in React
+component state and was gone on unmount, so `runtimeEdgeProfiles.ts`'s seven
+deferrals to "the local benchmark" stayed unanswerable no matter how many times
+you ran one.
+
+- Each report is persisted to `benchmarks.json` under the app data dir, the same
+  file-per-feature pattern as `web_settings.json`. **Not** a ledger table: a
+  benchmark measures *this machine*, not a run, and hanging it off the ledger's
+  run-shaped schema is the category error `permission_decisions` had to work
+  around.
+- **Stored with the machine it ran on, and that is what makes showing it safe.**
+  A whole `HardwareSnapshot` cannot be compared — `captured_at_ms` and
+  `available_ram_bytes` move second to second, so equality on it would call every
+  stored report stale a moment after writing it. `MachineIdentity` is the stable
+  part: OS, arch, fitted RAM, logical CPUs, sorted accelerator names. Deliberately
+  not `supported_runtimes`, which is derived from OS/arch and would invalidate
+  every report the day a build learns a new runtime, for no physical reason.
+- `BenchmarkFreshness` is a tagged union for the reason `ChainVerification` is
+  one: a caller cannot read the differences off a report measured elsewhere and
+  still render its numbers. The panel shows *what changed* instead of numbers,
+  and the edge profile ignores the entry entirely.
+- Re-running a model on a runtime **replaces** that pair's entry rather than
+  appending. Two reports for one pair differ only by when they ran, and keeping
+  both invites a reader to treat them as a time series they were never meant to
+  be. Capped at 32.
+- The edge profile now *appends* the measurement to its own prose rather than
+  replacing it — the caveat about context length and concurrency is still true,
+  and the measurement adds evidence rather than overriding advice it does not
+  cover. It reports the fastest measured pair, since the question that line
+  answers is what this machine is capable of.
+
 **Remaining.** Cost still comes from typed rates, which is ROADMAP #4's item rather
-than this one. `runtimeEdgeProfiles.ts` still returns eight hardcoded prose
-profiles, and its own text defers to "the local benchmark" seven times — those
-deferrals were false until now and are merely *satisfiable* today; replacing the
-prose with measurements is its own change.
+than this one. The eight profiles' *other* fields — recommended model class,
+context tokens, process slots — are still hardcoded prose; only the throughput
+line reads a measurement.
 
 **Blocks:** nothing now. K7 and K8 both shipped on top of it, and K8's fair-share
 reads `cpu_time_ms` out of this ledger rather than deriving a number of its own.
@@ -3263,15 +3295,79 @@ a broken chain so a scripted check cannot pass by printing bad news.
 
 **Remaining, and the recon turned up more than the entry implied:**
 
-- **"One event stream every subsystem writes to" is the large half.** Today
-  exactly two functions insert run events, and 46 production call sites funnel
-  through them — but **HTTP (`server.rs`, `m3_http_server.rs`), MCP (`mcp.rs`) and
-  the browser worker write no events at all**, and ACP is a read-only consumer. An
-  HTTP request, an MCP tool call and a browser action are simply not represented.
-  Separate stores also hold gating-relevant records with no join to the run
-  stream: `daemon_scheduler_decisions` and `remote_audit` in their own database
-  files, and `egress_denials`, which records denials only — **an allowed egress
-  produces no row anywhere** — and ring-buffers itself on every insert.
+- **"One event stream every subsystem writes to" — the stream now exists, and MCP
+  writes to it.** Migration V12 adds `subsystem_events`: run-optional,
+  hash-chained, append-only.
+
+  **The fork this settles.** `run_events.run_id` is `NOT NULL REFERENCES
+  runs(run_id)`, its insert trigger demands contiguous per-run sequences, and its
+  chain is per run — all three are run-shaped. So the acceptance had exactly two
+  readings: manufacture a `runs` row per HTTP request, MCP call and browser
+  action, or have a stream that does not need one. The first makes runs
+  high-volume and changes the runs list, admission control and archival to buy a
+  label; `run_scope`'s module doc argues the case against inventing an identity at
+  length. This is the second, and it generalizes what V11 already did for
+  permissions rather than introducing a third discipline.
+
+  - **It does not restate the authorization.** A gated action's decision is
+    already in `permission_decisions`, written *before* the action runs and for
+    every caller, so an event points back at it by `request_id`. That closes "for
+    anything gated, the exact policy decision that permitted it" with one join, in
+    the direction the question is actually asked — and `request_permission` now
+    returns that id so the caller can carry it. Widening the return type changed
+    no existing call site: `request_permission(..).await?;` in statement position
+    drops the value.
+  - **One global chain**, not one per subsystem: there is no per-run sequence to
+    hang a chain off, and a per-subsystem chain would let a whole subsystem's tail
+    be removed without breaking any other. Unlike V9 there is **no unchained era
+    to tolerate** — the table is new, so `event_hash` is `NOT NULL` from the first
+    row and there is nothing to backfill and therefore nothing to launder.
+  - **One row per completed action, deliberately — there is no "started" row.**
+    The permission row already proves the action was authorized before it ran, so
+    a second row would restate it. An action that never finishes leaves an open
+    permission and no event, which reads correctly as "authorized, never
+    completed".
+  - **What it cannot detect, stated rather than glossed:** a removed tail. The run
+    stream has `runs.last_sequence` as a second witness; this stream has no
+    counter outside itself to contradict one, and the CLI says so.
+
+  Reachable as `monkey security subsystem-events [--subsystem mcp]`, which exits
+  non-zero on a broken chain.
+
+  **HTTP writes to it too, through a recorder the remaining subsystems share.**
+  `subsystem_audit.rs` exists because the writers do not share a context: desktop
+  has a `tauri::AppHandle` and reaches the ledger through `AppState`, while the
+  CLI-hosted API server, the daemon and ACP have no `AppState` at all — only a
+  data directory. Four hand-rolled copies of "mint an id, read the clock, resolve
+  the attribution, append without breaking the action" would drift, and the field
+  most likely to drift is the attribution, which is the field the audit exists
+  for. The attribution *rule* is now one function, `permissions::attribution_for`,
+  with "is this run in the ledger" supplied by whichever ledger the context can
+  reach.
+
+  - **A third target, `disabled`, carries a reason** — and the reason is printed
+    at listener startup rather than living as a comment. "This subsystem wrote no
+    events" must never be indistinguishable from "this subsystem was never wired
+    up", which is the same ambiguity `run_scope`'s two-arm design exists to
+    prevent.
+  - **Not every request is recorded, and the rule is a pure function.**
+    `/health`, a CORS preflight and `GET /v1/models` carry no effect and are the
+    calls every client makes *before* acting; recording them would double the
+    stream and bury the rows that matter. Anything that runs a model, reads the
+    knowledge base or returns an artifact is recorded.
+  - **Status, never body or headers.** `detail_json` is covered by the chain and
+    therefore permanent, and a body may hold the user's own text.
+  - HTTP records no `permission_request_id` because nothing on those routes goes
+    through `request_permission` — it is bearer-token authenticated. `NULL` there
+    is the honest answer and the CLI prints it as "nothing gated this action".
+
+  **Still to write to it:** `m3_http_server.rs`, the browser worker, ACP (today a
+  read-only consumer) and the remote node — all four now have a recorder to call
+  rather than a pattern to copy. Separate stores still hold gating-relevant
+  records with no join to either stream: `daemon_scheduler_decisions` and
+  `remote_audit` in their own database files, and `egress_denials`, which records
+  denials only — **an allowed egress produces no row anywhere** — and
+  ring-buffers itself on every insert.
 - ~~**Per-event process identity does not exist.**~~ **Done** — migration V10 adds
   `run_events.process_id`, populated from the ambient `ProcessScope` (the D3
   `tokio::task_local!`) inside `append_event`. That is the single place all 46

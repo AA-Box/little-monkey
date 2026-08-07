@@ -285,6 +285,11 @@ pub mod run_protocol;
 // idempotency, leases, triggers, and the migration-controlled profile schema.
 // Like the protocol module, this remains reusable by non-Tauri clients.
 pub mod run_ledger;
+// The one place a run-less subsystem writes to the unified event stream
+// (`run_ledger`'s `subsystem_events`). Public because the three writing contexts
+// — desktop, a process that owns its data directory, and a disabled test — do
+// not all live in this crate's Tauri half.
+pub mod subsystem_audit;
 // The one process abstraction shared by every execution surface — desktop
 // turns, daemon jobs, subagents, crew members, workflow runs/nodes, remote
 // runs, background shells, side tasks. Public for the same reason the two
@@ -1294,6 +1299,7 @@ pub fn run() {
             m3_commands::m3_hardware_snapshot,
             m3_commands::m3_hardware_profile,
             m3_commands::m3_benchmark_run,
+            m3_commands::m3_benchmark_history,
             m3_commands::m3_hardware_compatibility_report,
             m3_commands::m3_storage_status,
             m3_commands::m3_installed_models,

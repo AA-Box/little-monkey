@@ -591,7 +591,12 @@ pub(crate) fn evaluate_gate(
             .unwrap()
             .contains(&(run_id.to_string(), tool.to_string()))
     } else {
-        state.permissions.session_allow.lock().unwrap().contains(tool)
+        state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .contains(tool)
     };
 
     if remembered {
@@ -643,10 +648,24 @@ fn durable_run_exists<R: tauri::Runtime>(
 /// `turn`, and is not used to widen which run events get written: an event
 /// written against a run the caller never named would leave `permission_respond`
 /// unable to find its own approval row later.
-fn permission_attribution<R: tauri::Runtime>(
+pub(crate) fn permission_attribution<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppState,
     turn: Option<&str>,
+) -> Result<(Option<String>, PermissionAttribution), String> {
+    attribution_for(turn, |run_id| durable_run_exists(app, state, Some(run_id)))
+}
+
+/// The attribution rule itself, with "is this run in the ledger" left to the
+/// caller.
+///
+/// Split out because `subsystem_audit` has to answer the same question against a
+/// ledger it opened itself, with no `AppState` anywhere — and two copies of this
+/// rule would drift on the field the whole audit exists for. `is_durable` is only
+/// consulted when there is a run id to ask about.
+pub(crate) fn attribution_for(
+    turn: Option<&str>,
+    is_durable: impl FnOnce(&str) -> Result<bool, String>,
 ) -> Result<(Option<String>, PermissionAttribution), String> {
     let run_id = turn
         .map(str::to_string)
@@ -660,7 +679,7 @@ fn permission_attribution<R: tauri::Runtime>(
             },
         ));
     };
-    let attribution = if durable_run_exists(app, state, Some(&run_id))? {
+    let attribution = if is_durable(&run_id)? {
         PermissionAttribution::LedgerRun
     } else {
         PermissionAttribution::UnregisteredRun
@@ -764,6 +783,15 @@ fn append_automatic_decision<R: tauri::Runtime>(
     Ok(())
 }
 
+/// Gate an operation, returning the `request_id` of the `permission_decisions`
+/// row it raised.
+///
+/// The id is returned so a caller that goes on to record *what it did* can point
+/// at the decision that permitted it — which is the acceptance's "for anything
+/// gated, the exact policy decision that permitted it", in the direction the
+/// question is actually asked. Callers with nothing to link simply discard it:
+/// `request_permission(..).await?;` in statement position drops the value, which
+/// is why widening this return type changed no existing call site.
 pub async fn request_permission<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppState,
@@ -773,7 +801,7 @@ pub async fn request_permission<R: tauri::Runtime>(
     tool_call_id: Option<&str>,
     risk: Option<RiskAssessment>,
     agent_label: Option<&str>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let request_id = uuid::Uuid::new_v4().to_string();
     let durable = durable_run_exists(app, state, turn)?;
     let run_id = turn.unwrap_or_default();
@@ -839,7 +867,7 @@ pub async fn request_permission<R: tauri::Runtime>(
                 append_automatic_decision(app, state, &audit, decision)?;
             }
             record_decision(app, state, &request_id, decision, DECIDED_BY_POLICY)?;
-            return outcome;
+            return outcome.map(|()| request_id);
         }
         GateOutcome::Remembered => {
             if durable {
@@ -853,7 +881,7 @@ pub async fn request_permission<R: tauri::Runtime>(
                 PermissionDecision::AllowForRun,
                 DECIDED_BY_POLICY,
             )?;
-            return Ok(());
+            return Ok(request_id);
         }
         GateOutcome::Prompt => {}
     }
@@ -924,7 +952,7 @@ pub async fn request_permission<R: tauri::Runtime>(
             // nothing, so the decision is written here for all of them.
             record_decision(app, state, &request_id, decision, decided_by)?;
             if decision_allows(decision) {
-                Ok(())
+                Ok(request_id)
             } else {
                 Err("Permission denied".to_string())
             }
