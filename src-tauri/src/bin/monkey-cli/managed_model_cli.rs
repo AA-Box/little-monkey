@@ -508,21 +508,38 @@ mod tests {
 
     #[test]
     fn available_port_is_ephemeral_and_loopback_rebindable() {
-        let port = match candidate_loopback_port() {
-            Ok(port) => port,
-            // Some restricted CI/sandbox profiles prohibit even a loopback
-            // bind. Production still reports that failure to the caller.
-            Err(error)
-                if error.contains("Operation not permitted")
-                    || error.contains("Permission denied") =>
-            {
-                return
+        // The probe listener is closed before we rebind, so a busy runner can
+        // claim the port in between. Production tolerates that with its own
+        // fresh-port retry in `start_server`; the test retries too instead of
+        // failing on a lost race.
+        const REBIND_ATTEMPTS: usize = 5;
+        for attempt in 1..=REBIND_ATTEMPTS {
+            let port = match candidate_loopback_port() {
+                Ok(port) => port,
+                // Some restricted CI/sandbox profiles prohibit even a loopback
+                // bind. Production still reports that failure to the caller.
+                Err(error)
+                    if error.contains("Operation not permitted")
+                        || error.contains("Permission denied") =>
+                {
+                    return
+                }
+                Err(error) => panic!("{error}"),
+            };
+            assert_ne!(port, 0);
+            match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => {
+                    assert_eq!(listener.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+                    return;
+                }
+                Err(error) if attempt < REBIND_ATTEMPTS => {
+                    eprintln!("port {port} was claimed before the rebind ({error}); retrying");
+                }
+                Err(error) => panic!(
+                    "no ephemeral loopback port stayed free across {REBIND_ATTEMPTS} attempts: {error}"
+                ),
             }
-            Err(error) => panic!("{error}"),
-        };
-        assert_ne!(port, 0);
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
-        assert_eq!(listener.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+        }
     }
 
     #[test]
