@@ -234,6 +234,15 @@ pub struct BrowserActionResult {
 pub struct BrowserCommandState {
     profile_root: PathBuf,
     sessions: Mutex<HashMap<String, Arc<OwnedBrowser>>>,
+    /// Where browser actions land in the unified subsystem event stream
+    /// (roadmap K12).
+    ///
+    /// Held here rather than threaded through each command because the twelve
+    /// `browser_*` commands have no other shared parameter — they take this
+    /// state and nothing else in common — and adding an `AppHandle` to twelve
+    /// signatures to reach a ledger this struct already knows the directory of
+    /// would be plumbing for its own sake.
+    audit: crate::subsystem_audit::SubsystemAudit,
 }
 
 impl BrowserCommandState {
@@ -243,7 +252,56 @@ impl BrowserCommandState {
         Ok(Self {
             profile_root,
             sessions: Mutex::new(HashMap::new()),
+            audit: crate::subsystem_audit::SubsystemAudit::in_data_dir(app_data_dir),
         })
+    }
+
+    /// Run one browser action against an existing session and record it.
+    ///
+    /// Every acting command routes through here so the recording cannot be
+    /// forgotten when a thirteenth is added — the failure mode of instrumenting
+    /// twelve call sites by hand. Resolving the session is *inside* the audited
+    /// region on purpose: "this action named a session that does not exist" is
+    /// an outcome worth having, not a reason to record nothing.
+    async fn audited<T, F>(&self, action: &str, session_id: &str, work: F) -> Result<T, String>
+    where
+        F: FnOnce(Arc<OwnedBrowser>) -> Result<T, String> + Send + 'static,
+        T: Send + 'static,
+    {
+        let outcome = match self.get(session_id) {
+            Ok(session) => tokio::task::spawn_blocking(move || work(session))
+                .await
+                .map_err(|error| error.to_string())?,
+            Err(error) => Err(error),
+        };
+        self.record(action, Some(session_id), outcome.is_ok());
+        outcome
+    }
+
+    /// The recording half, for the two commands that do not fit
+    /// [`audited`](Self::audited): `browser_start` has no session yet, and
+    /// `browser_stop` removes one rather than borrowing it.
+    fn record(&self, action: &str, session_id: Option<&str>, succeeded: bool) {
+        self.audit.record(crate::subsystem_audit::SubsystemAction {
+            subsystem: crate::run_ledger::Subsystem::Browser,
+            action: action.to_string(),
+            // A browser command carries no turn; the ambient `run_scope` is
+            // the only thing that can say which run it belongs to.
+            turn_id: None,
+            // Nothing here goes through `request_permission` — see the
+            // roadmap entry, which now records that as a finding rather than
+            // leaving the blank unexplained.
+            permission_request_id: None,
+            outcome: if succeeded {
+                crate::run_ledger::SubsystemOutcome::Succeeded
+            } else {
+                crate::run_ledger::SubsystemOutcome::Failed
+            },
+            // The session id only. Never a URL, selector or typed text: this
+            // is covered by the hash chain and therefore permanent, and
+            // typed text is exactly where a password would be.
+            detail: session_id.map(|id| serde_json::json!({ "sessionId": id })),
+        });
     }
 
     fn insert(&self, browser: Arc<OwnedBrowser>) -> Result<(), String> {
@@ -2598,7 +2656,10 @@ pub async fn browser_start(
             .await
             .map_err(|error| error.to_string())??;
     let view = browser.view();
-    state.insert(browser)?;
+    let session_id = view.session_id.clone();
+    let inserted = state.insert(browser);
+    state.record("start", Some(&session_id), inserted.is_ok());
+    inserted?;
     Ok(view)
 }
 
@@ -2621,10 +2682,11 @@ pub async fn browser_navigate(
     session_id: String,
     url: String,
 ) -> Result<BrowserActionResult, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.navigate(&url))
+    state
+        .audited("navigate", &session_id, move |session| {
+            session.navigate(&url)
+        })
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2632,10 +2694,9 @@ pub async fn browser_reload(
     state: tauri::State<'_, BrowserCommandState>,
     session_id: String,
 ) -> Result<BrowserActionResult, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.reload())
+    state
+        .audited("reload", &session_id, |session| session.reload())
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2644,10 +2705,11 @@ pub async fn browser_set_viewport(
     session_id: String,
     viewport: BrowserViewport,
 ) -> Result<BrowserActionResult, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.set_viewport(viewport))
+    state
+        .audited("set_viewport", &session_id, move |session| {
+            session.set_viewport(viewport)
+        })
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2655,10 +2717,9 @@ pub async fn browser_inspect(
     state: tauri::State<'_, BrowserCommandState>,
     session_id: String,
 ) -> Result<BrowserInspection, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.inspect())
+    state
+        .audited("inspect", &session_id, |session| session.inspect())
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2667,10 +2728,11 @@ pub async fn browser_annotate(
     session_id: String,
     selector: String,
 ) -> Result<BrowserAnnotation, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.annotate(&selector))
+    state
+        .audited("annotate", &session_id, move |session| {
+            session.annotate(&selector)
+        })
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2679,10 +2741,11 @@ pub async fn browser_click(
     session_id: String,
     selector: String,
 ) -> Result<BrowserActionResult, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.click(&selector))
+    state
+        .audited("click", &session_id, move |session| {
+            session.click(&selector)
+        })
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2692,10 +2755,11 @@ pub async fn browser_type_text(
     selector: String,
     text: String,
 ) -> Result<BrowserActionResult, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.type_text(&selector, &text))
+    state
+        .audited("type_text", &session_id, move |session| {
+            session.type_text(&selector, &text)
+        })
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2705,10 +2769,9 @@ pub async fn browser_scroll(
     x: i64,
     y: i64,
 ) -> Result<BrowserActionResult, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.scroll(x, y))
+    state
+        .audited("scroll", &session_id, move |session| session.scroll(x, y))
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2716,10 +2779,11 @@ pub async fn browser_capture_evidence(
     state: tauri::State<'_, BrowserCommandState>,
     session_id: String,
 ) -> Result<BrowserEvidence, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.capture_evidence())
+    state
+        .audited("capture_evidence", &session_id, |session| {
+            session.capture_evidence()
+        })
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2727,12 +2791,15 @@ pub async fn browser_stop(
     state: tauri::State<'_, BrowserCommandState>,
     session_id: String,
 ) -> Result<(), String> {
-    let session = state
-        .remove(&session_id)?
-        .ok_or_else(|| "Unknown browser session".to_string())?;
-    tokio::task::spawn_blocking(move || session.stop())
-        .await
-        .map_err(|error| error.to_string())?
+    let outcome = match state.remove(&session_id) {
+        Ok(Some(session)) => tokio::task::spawn_blocking(move || session.stop())
+            .await
+            .map_err(|error| error.to_string())?,
+        Ok(None) => Err("Unknown browser session".to_string()),
+        Err(error) => Err(error),
+    };
+    state.record("stop", Some(&session_id), outcome.is_ok());
+    outcome
 }
 
 #[cfg(test)]
@@ -3066,6 +3133,47 @@ mod tests {
     /// clock branch on every platform. The fixture has no long-lived Windows child,
     /// so a real probe would read every session there as crashed and this could
     /// never reach the clock at all.
+    /// Every acting command routes through `audited`, so the recording cannot be
+    /// forgotten when a thirteenth is added. This pins the funnel rather than the
+    /// twelve call sites: an action against a session that does not exist is
+    /// still an event, and `failed` is the honest outcome for it.
+    #[tokio::test]
+    async fn a_browser_action_is_recorded_even_when_the_session_is_unknown() {
+        let root = std::env::temp_dir().join(format!("lm-browser-audit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = BrowserCommandState::production(&root).unwrap();
+        assert!(
+            state.audit.is_recording(),
+            "a production state must audit — a disabled one here would make every \
+             assertion below vacuous"
+        );
+
+        let outcome: Result<(), String> = state
+            .audited("navigate", "no-such-session", |_| Ok(()))
+            .await;
+        assert!(outcome.is_err(), "the session does not exist");
+
+        let ledger = little_monkey_ledger_at(&root);
+        let events = ledger.recent_subsystem_events(None, 10).unwrap();
+        assert_eq!(events.len(), 1, "the failed action is still an event");
+        assert_eq!(events[0].subsystem, crate::run_ledger::Subsystem::Browser);
+        assert_eq!(events[0].action, "navigate");
+        assert_eq!(
+            events[0].outcome,
+            crate::run_ledger::SubsystemOutcome::Failed
+        );
+        assert!(
+            events[0].permission_request_id.is_none(),
+            "browser actions are not permission-gated today, and the stream says so"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn little_monkey_ledger_at(root: &Path) -> crate::run_ledger::RunLedger {
+        crate::run_ledger::RunLedger::open(root.join("profile-v1.sqlite3")).unwrap()
+    }
+
     #[test]
     fn the_sweep_reclaims_an_idle_expired_session_and_leaves_a_live_one() {
         let root = std::env::temp_dir().join(format!("lm-browser-sweep-{}", uuid::Uuid::new_v4()));

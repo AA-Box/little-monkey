@@ -3361,13 +3361,43 @@ a broken chain so a scripted check cannot pass by printing bad news.
     through `request_permission` — it is bearer-token authenticated. `NULL` there
     is the honest answer and the CLI prints it as "nothing gated this action".
 
-  **Still to write to it:** `m3_http_server.rs`, the browser worker, ACP (today a
-  read-only consumer) and the remote node — all four now have a recorder to call
-  rather than a pattern to copy. Separate stores still hold gating-relevant
-  records with no join to either stream: `daemon_scheduler_decisions` and
-  `remote_audit` in their own database files, and `egress_denials`, which records
-  denials only — **an allowed egress produces no row anywhere** — and
-  ring-buffers itself on every insert.
+  **HTTP is now complete, and the browser worker writes too.** The M3 routes and
+  the desktop-only extended routes return early from the dispatcher rather than
+  falling through to `handle_request`, so each got its own call to the same
+  filter — `LocalAppRun` above all, since it is the one HTTP route that *is*
+  permission-gated and leaving it out would have missed the request most worth
+  having.
+
+  The browser worker's twelve `browser_*` commands share no parameter but their
+  state, so the audit lives on `BrowserCommandState` (which already knows the
+  data directory) and every acting command routes through one `audited` helper.
+  That is deliberate: instrumenting twelve call sites by hand means the
+  thirteenth is forgotten. Resolving the session happens *inside* the audited
+  region, so "this action named a session that does not exist" is an event rather
+  than a reason to record nothing. `browser_list` is skipped under the same rule
+  as `GET /v1/models` — a read of local state that takes no action.
+
+  **A finding the stream surfaced rather than fixed:** no browser command goes
+  through `request_permission`. Navigating to an arbitrary URL, clicking, and
+  typing text into a page are ungated today, so every browser row records
+  `permission_request_id = NULL` — which the acceptance calls a bug, and which is
+  now visible as data instead of an assumption. Gating them is a behaviour change
+  to the permission path and wants its own review.
+
+  Detail columns stay narrow on purpose: HTTP records the status and nothing
+  else, browser records the session id and never a URL, selector or typed text.
+  `detail_json` is covered by the hash chain and therefore permanent, and typed
+  text is exactly where a password would be.
+
+  **Still to write to it:** ACP and the remote node. Both are JSON-RPC/HTTP
+  dispatch loops whose arms each send their own response, so there is no single
+  place holding the outcome — instrumenting the arms by hand is precisely the
+  miss-a-branch failure the browser helper exists to avoid. The honest fix is an
+  id→method map at their shared `send` choke point, which is its own change.
+  Separate stores also still hold gating-relevant records with no join to either
+  stream: `daemon_scheduler_decisions` and `remote_audit` in their own database
+  files, and `egress_denials`, which records denials only — **an allowed egress
+  produces no row anywhere** — and ring-buffers itself on every insert.
 - ~~**Per-event process identity does not exist.**~~ **Done** — migration V10 adds
   `run_events.process_id`, populated from the ambient `ProcessScope` (the D3
   `tokio::task_local!`) inside `append_event`. That is the single place all 46
