@@ -10,10 +10,12 @@
 //! the command additionally runs under a generated
 //! Seatbelt (`sandbox-exec`) profile that limits reads to the sandbox and
 //! explicit system/toolchain roots, denies writes outside the ephemeral run
-//! directory, and denies network access unless it was explicitly enabled;
-//! every other platform gets the restricted-cwd/env isolation only. Every
-//! run reports which of the two actually applied (see [`Isolation`]) — never
-//! more than what was really enforced.
+//! directory, and denies network access unless it was explicitly enabled. On
+//! Linux the equivalent boundary is a Landlock filesystem ruleset plus a
+//! seccomp-BPF network filter installed in `pre_exec` (see
+//! `crate::sandbox_linux`); Windows gets the restricted-cwd/env isolation
+//! only. Every run reports which of the two actually applied (see
+//! [`Isolation`]) — never more than what was really enforced.
 //!
 //! Nothing the sandboxed command writes ever reaches the real workspace
 //! automatically. Copying files back out is a separate, explicit two-phase
@@ -104,6 +106,10 @@ const SANDBOX_OWNED_ENV_KEYS: &[&str] = &["HOME", "USERPROFILE", "TMPDIR", "TMP"
 /// also contains `/System/Volumes/Data`), `/usr`, `/Library`, `/private`,
 /// and the user's home. Additional executable roots come only from PATH and
 /// are filtered against the real workspace and whole-home roots below.
+///
+/// `cfg`-gated (with `test`, which [`readable_roots`]' own test needs) so the
+/// platform that cannot use a list is not left holding it as dead code.
+#[cfg(any(target_os = "macos", test))]
 const MACOS_SYSTEM_READ_ROOTS: &[&str] = &[
     "/System/Library",
     "/System/Cryptexes/App/usr",
@@ -131,6 +137,56 @@ const MACOS_SYSTEM_READ_ROOTS: &[&str] = &[
     "/dev/urandom",
 ];
 
+/// The same policy as [`MACOS_SYSTEM_READ_ROOTS`], entry for entry, expressed in
+/// Linux's layout: executable and library roots, the dynamic loader's cache
+/// (`/etc/ld.so.*`, whose macOS counterpart is `/private/var/db/dyld`), the
+/// resolver/TLS/timezone configuration a network-enabled command needs, and the
+/// three character devices. `/etc/passwd`, `/etc/group` and `/etc/nsswitch.conf`
+/// stand in for the macOS profile's `(allow mach-lookup)` — they are how
+/// `getpwuid` answers on Linux — and `/etc/shadow` is deliberately not among
+/// them.
+///
+/// Not here, deliberately: `/proc`, `/sys`, `/tmp`, `/var`, `/home`, `/root`,
+/// and `/etc` as a whole. `/usr/local` is absent for the same reason
+/// `/opt/homebrew` is absent from the macOS list — [`readable_roots`] adds its
+/// executable/library subdirectories only when PATH actually points there. See
+/// `sandbox_linux`'s module docs for why `/proc` in particular stays out.
+#[cfg(target_os = "linux")]
+const LINUX_SYSTEM_READ_ROOTS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/lib",
+    "/usr/lib32",
+    "/usr/lib64",
+    "/usr/libexec",
+    "/usr/share",
+    "/usr/include",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/alternatives",
+    "/etc/ssl/certs",
+    "/etc/ssl/openssl.cnf",
+    "/etc/pki/tls/certs",
+    "/etc/ca-certificates",
+    "/etc/nsswitch.conf",
+    "/etc/passwd",
+    "/etc/group",
+    "/etc/hosts",
+    "/etc/resolv.conf",
+    "/etc/services",
+    "/etc/protocols",
+    "/etc/localtime",
+    "/dev/null",
+    "/dev/random",
+    "/dev/urandom",
+];
+
 /// Per-process, in-memory registry of prepared-but-not-yet-confirmed promote
 /// previews, keyed by digest. Unlike `m5_delivery`'s durable SQLite preview
 /// store, this is deliberately not persisted: the ephemeral sandbox copy a
@@ -151,11 +207,12 @@ struct PendingPromote {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Isolation {
-    /// The command ran under a generated macOS Seatbelt profile
-    /// (`sandbox-exec`) in addition to the restricted cwd/env.
+    /// A kernel-enforced filesystem boundary applied in addition to the
+    /// restricted cwd/env: a generated macOS Seatbelt profile (`sandbox-exec`),
+    /// or a Landlock ruleset on Linux.
     OsSandboxed,
-    /// Only the restricted cwd + allowlisted env applied — no OS-level
-    /// sandbox exists for this platform.
+    /// Only the restricted cwd + allowlisted env applied — either no OS-level
+    /// sandbox exists for this platform, or this kernel could not enforce one.
     ProcessOnly,
 }
 
@@ -168,18 +225,27 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// [`Isolation`] reports what a run got, which is honest but arrives too late to
 /// inform the decision to start one. The Sandbox panel offers the same button on
 /// every platform, and `probeGeneratedMcpArtifact` sends **model-authored MCP
-/// server code** through it — so on Windows and Linux that code runs with a
-/// restricted cwd and a scrubbed environment and no kernel boundary, free to read
-/// or write the real workspace by absolute path. That is worth knowing first.
+/// server code** through it — so on Windows, and on a Linux kernel without
+/// Landlock, that code runs with a restricted cwd and a scrubbed environment and
+/// no kernel boundary, free to read or write the real workspace by absolute
+/// path. That is worth knowing first.
 ///
 /// `Unavailable` is a third state, not a pessimistic reading of `ProcessOnly`: on
 /// macOS `execute_in_sandbox` spawns `sandbox-exec` unconditionally, so if the
 /// binary is missing the run fails outright rather than degrading. A user who sees
 /// only "no OS sandbox" would go looking for the wrong problem.
+///
+/// `Unavailable` has no meaning on Linux, and forcing the symmetry would be a
+/// lie in the other direction. There is no separate binary to be missing: the
+/// mechanism is a syscall, and when the kernel does not have it
+/// `crate::sandbox_linux` installs no ruleset and the run proceeds with the
+/// restricted-cwd/env isolation. Nothing fails, so `ProcessOnly` — the state
+/// that means "this ran without a kernel boundary" — is the whole truth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxEnforcement {
-    /// A kernel-enforced boundary applies: macOS Seatbelt via `sandbox-exec`.
+    /// A kernel-enforced boundary applies: macOS Seatbelt via `sandbox-exec`, or
+    /// Landlock on Linux.
     OsEnforced,
     /// Restricted cwd and allowlisted environment only. No kernel boundary.
     ProcessOnly,
@@ -191,9 +257,12 @@ pub enum SandboxEnforcement {
 /// This machine's enforcement capability.
 ///
 /// Deliberately a probe rather than a constant. On macOS the answer depends on
-/// `sandbox-exec` being present, which a `cfg!` cannot know — and reporting
+/// `sandbox-exec` being present, and on Linux on whether this kernel can enforce
+/// the Landlock baseline — neither of which a `cfg!` can know, and reporting
 /// `OsEnforced` from the target triple alone is exactly the kind of claim this
-/// function exists to stop making.
+/// function exists to stop making. A kernel built without Landlock, booted with
+/// it disabled, or running inside a container whose own policy blocks the
+/// syscall all answer `ProcessOnly` here.
 pub fn sandbox_enforcement() -> SandboxEnforcement {
     #[cfg(target_os = "macos")]
     {
@@ -203,11 +272,23 @@ pub fn sandbox_enforcement() -> SandboxEnforcement {
             SandboxEnforcement::Unavailable
         }
     }
-    // Windows and Linux have no enforcement path in this app at all — no
-    // Landlock, seccomp, namespace, job object, restricted token or AppContainer
-    // anywhere in the crate — so there is nothing to probe for. `Unavailable`
-    // would imply a mechanism that failed; `ProcessOnly` is the accurate answer.
-    #[cfg(not(target_os = "macos"))]
+    // Only the filesystem boundary is reported. A network-denied run on a kernel
+    // without Landlock still gets the seccomp filter, so its egress is denied
+    // even here — but its filesystem is not, and this answer is about the
+    // boundary that keeps the real workspace out of reach.
+    #[cfg(target_os = "linux")]
+    {
+        if crate::sandbox_linux::landlock_is_enforceable() {
+            SandboxEnforcement::OsEnforced
+        } else {
+            SandboxEnforcement::ProcessOnly
+        }
+    }
+    // Windows has no enforcement path in this app at all — no job object,
+    // restricted token or AppContainer anywhere in the crate — so there is
+    // nothing to probe for. `Unavailable` would imply a mechanism that failed;
+    // `ProcessOnly` is the accurate answer.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         SandboxEnforcement::ProcessOnly
     }
@@ -546,7 +627,16 @@ fn insert_existing_read_root(
     }
 }
 
-fn macos_readable_roots(
+/// The read boundary for one platform, given that platform's system roots
+/// ([`MACOS_SYSTEM_READ_ROOTS`] or [`LINUX_SYSTEM_READ_ROOTS`]).
+///
+/// Shared rather than one function per platform because everything interesting
+/// here is platform-independent policy — PATH entries become roots, Homebrew and
+/// rustup get narrowed to their executable/library subtrees, and the real
+/// workspace and whole-home roots are filtered out — and two copies of that
+/// would be two chances for one of them to drift wider than the other.
+fn readable_roots(
+    system_roots: &[&str],
     path_env: Option<&OsStr>,
     real_home: Option<&Path>,
     real_workspace: &Path,
@@ -555,7 +645,7 @@ fn macos_readable_roots(
     let real_home = canonical_home.as_deref().or(real_home);
     let canonical_workspace =
         fs::canonicalize(real_workspace).unwrap_or_else(|_| real_workspace.to_path_buf());
-    let mut candidates: Vec<PathBuf> = MACOS_SYSTEM_READ_ROOTS.iter().map(PathBuf::from).collect();
+    let mut candidates: Vec<PathBuf> = system_roots.iter().map(PathBuf::from).collect();
     let path_entries: Vec<PathBuf> = path_env
         .map(std::env::split_paths)
         .into_iter()
@@ -596,6 +686,10 @@ fn macos_readable_roots(
     roots.into_iter().collect()
 }
 
+/// Gated because only the macOS branch sets `RUSTUP_HOME`. The Linux branch
+/// still picks up `~/.rustup/toolchains` as a read root through
+/// [`readable_roots`], but it does not point a sandboxed Cargo at it.
+#[cfg(target_os = "macos")]
 fn macos_path_uses_rustup(path_env: Option<&OsStr>, real_home: &Path) -> bool {
     let cargo_bin = real_home.join(".cargo/bin");
     path_env
@@ -755,7 +849,9 @@ pub async fn execute_in_sandbox(
 
     #[cfg(target_os = "macos")]
     let mut env = env;
-    #[cfg(target_os = "macos")]
+    // Needed by both OS boundaries: it is the one path that must never become a
+    // read root, and the anchor for the toolchain roots that may.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let real_home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .and_then(|path| fs::canonicalize(path).ok());
@@ -784,8 +880,12 @@ pub async fn execute_in_sandbox(
             .iter()
             .find(|(key, _)| key == "PATH")
             .map(|(_, value)| OsStr::new(value));
-        let readable_roots =
-            macos_readable_roots(path_env, real_home.as_deref(), &real_workspace_root);
+        let readable_roots = readable_roots(
+            MACOS_SYSTEM_READ_ROOTS,
+            path_env,
+            real_home.as_deref(),
+            &real_workspace_root,
+        );
         let profile = build_seatbelt_profile(&sandbox_root, &readable_roots, allow_network);
         fs::write(profile_path, profile)?;
         (
@@ -838,6 +938,33 @@ pub async fn execute_in_sandbox(
     // enforcement the OS applies to the child at all. Inherited across the
     // `sandbox-exec` exec, so it reaches the sandboxed program itself.
     crate::os_limits::apply(crate::os_limits::ChildLimits::baseline(), &mut command);
+    // Linux's boundary is installed the same way, and *after* `os_limits` on
+    // purpose: `pre_exec` closures run in registration order, so the `setrlimit`
+    // bounds are already in place before anything starts denying syscalls.
+    // Reported from `confine`'s own answer rather than from the target triple —
+    // a kernel without Landlock keeps the `ProcessOnly` the branch above chose.
+    #[cfg(target_os = "linux")]
+    let isolation = {
+        let path_env = env
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| OsStr::new(value));
+        let readable_roots = readable_roots(
+            LINUX_SYSTEM_READ_ROOTS,
+            path_env,
+            real_home.as_deref(),
+            &real_workspace_root,
+        );
+        match crate::sandbox_linux::confine(
+            &mut command,
+            &sandbox_root,
+            &readable_roots,
+            allow_network,
+        )? {
+            true => Isolation::OsSandboxed,
+            false => isolation,
+        }
+    };
 
     let child = command.spawn()?;
     // Captured before `wait_with_output` consumes the child; with
@@ -1909,7 +2036,7 @@ mod tests {
         );
     }
 
-    /// The network clause, actually exercised.
+    /// The network denial, actually exercised.
     ///
     /// Everything else about `(deny network*)` was asserted as profile *text*: the
     /// sibling test above compares two generated strings, and the live Seatbelt
@@ -1928,18 +2055,16 @@ mod tests {
     /// internet would make a unit test depend on egress, and loopback is the
     /// stricter check anyway: a boundary that stops a connection to `127.0.0.1`
     /// is not merely failing to resolve DNS.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn seatbelt_denies_a_real_connection_when_network_is_not_allowed() {
-        if !Path::new(SANDBOX_EXEC).is_file() {
-            eprintln!("skipping Seatbelt network test: sandbox-exec is unavailable");
-            return;
-        }
-        if !Path::new("/usr/bin/nc").is_file() {
-            eprintln!("skipping Seatbelt network test: /usr/bin/nc is unavailable");
-            return;
-        }
-
+    ///
+    /// Shared by every platform with a network boundary, so the contrast is
+    /// asserted once and cannot drift into two differently-rigorous versions.
+    /// `connect_command` is the only platform-specific part: what to run to make
+    /// one TCP connection to a loopback port and exit non-zero if it fails.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn assert_loopback_is_reachable_only_when_network_is_allowed(
+        label: &str,
+        connect_command: impl Fn(u16) -> String,
+    ) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("listener address").port();
         let accepting = std::thread::spawn(move || {
@@ -1953,13 +2078,11 @@ mod tests {
             }
         });
 
-        let sandbox_root = temp_dir("seatbelt-network");
+        let sandbox_root = temp_dir(&format!("{label}-network"));
         let workspace_dir = sandbox_root.join("workspace");
         fs::create_dir_all(&workspace_dir).expect("create sandbox workspace");
-        let real_workspace = temp_dir("seatbelt-network-real");
-        // `-z` scans without sending data and `-w 2` bounds the wait, so a denied
-        // connection fails fast instead of hanging until the run times out.
-        let command = format!("/usr/bin/nc -w 2 -z 127.0.0.1 {port}");
+        let real_workspace = temp_dir(&format!("{label}-network-real"));
+        let command = connect_command(port);
 
         let mut outcomes = Vec::new();
         for allow_network in [true, false] {
@@ -1975,7 +2098,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("sandbox-exec launches");
+            .expect("the sandbox launches");
             outcomes.push((allow_network, outcome));
         }
 
@@ -1991,7 +2114,7 @@ mod tests {
         assert_ne!(
             denied.exit_code,
             Some(0),
-            "`(deny network*)` did not stop a connection the same sandbox makes \
+            "denying network did not stop a connection the same sandbox makes \
              successfully when network is allowed; stderr={}",
             String::from_utf8_lossy(&denied.stderr)
         );
@@ -2000,6 +2123,52 @@ mod tests {
         drop(accepting);
         let _ = fs::remove_dir_all(&sandbox_root);
         let _ = fs::remove_dir_all(&real_workspace);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_denies_a_real_connection_when_network_is_not_allowed() {
+        if !Path::new(SANDBOX_EXEC).is_file() {
+            eprintln!("skipping Seatbelt network test: sandbox-exec is unavailable");
+            return;
+        }
+        if !Path::new("/usr/bin/nc").is_file() {
+            eprintln!("skipping Seatbelt network test: /usr/bin/nc is unavailable");
+            return;
+        }
+        // `-z` scans without sending data and `-w 2` bounds the wait, so a denied
+        // connection fails fast instead of hanging until the run times out.
+        assert_loopback_is_reachable_only_when_network_is_allowed("seatbelt", |port| {
+            format!("/usr/bin/nc -w 2 -z 127.0.0.1 {port}")
+        })
+        .await;
+    }
+
+    /// The Linux arm of the contrast above, denied by the seccomp filter rather
+    /// than by `(deny network*)`.
+    ///
+    /// Bash's `/dev/tcp` rather than `nc`, because `nc` is not installed by
+    /// default on every distribution while `bash` effectively is, and because it
+    /// removes a variable: the redirection is a plain `socket(2)` + `connect(2)`
+    /// in the shell itself, which is exactly the pair the filter denies. There is
+    /// no timeout flag to pass because there is nothing to wait for — the allow
+    /// arm connects to a listening loopback socket immediately, and the deny arm
+    /// fails at `socket(2)` with `EACCES` before any connect is attempted.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn seccomp_denies_a_real_connection_when_network_is_not_allowed() {
+        if !Path::new("/bin/bash").is_file() {
+            skip_locally_but_fail_in_ci(
+                "bash",
+                "/bin/bash is unavailable, and its `/dev/tcp` is what opens the \
+                 socket this filter has to deny",
+            );
+            return;
+        }
+        assert_loopback_is_reachable_only_when_network_is_allowed("seccomp", |port| {
+            format!("exec /bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}'")
+        })
+        .await;
     }
 
     #[test]
@@ -2018,17 +2187,32 @@ mod tests {
             };
             assert_eq!(enforcement, expected);
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            // Same distinction, different mechanism: the answer tracks what this
+            // kernel can enforce, and never `Unavailable` — a kernel without
+            // Landlock degrades to the restricted-cwd/env isolation instead of
+            // failing the run, so there is no "mechanism exists but is unusable"
+            // state to report.
+            let expected = if crate::sandbox_linux::landlock_is_enforceable() {
+                SandboxEnforcement::OsEnforced
+            } else {
+                SandboxEnforcement::ProcessOnly
+            };
+            assert_eq!(enforcement, expected);
+            assert_ne!(enforcement, SandboxEnforcement::Unavailable);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             // Not `Unavailable`: that would imply a mechanism this app has and
-            // could not use, and there is no Landlock, seccomp, job object or
-            // restricted token anywhere in the crate.
+            // could not use, and there is no job object or restricted token
+            // anywhere in the crate.
             assert_eq!(enforcement, SandboxEnforcement::ProcessOnly);
         }
     }
 
     #[test]
-    fn macos_read_roots_reject_whole_home_and_real_workspace() {
+    fn read_roots_reject_whole_home_and_real_workspace() {
         let fixture = temp_dir("read-roots");
         let home = fixture.join("user-home");
         let workspace = home.join("Documents/project");
@@ -2046,7 +2230,12 @@ mod tests {
         ])
         .expect("join PATH");
 
-        let roots = macos_readable_roots(Some(&joined), Some(&home), &workspace);
+        let roots = readable_roots(
+            MACOS_SYSTEM_READ_ROOTS,
+            Some(&joined),
+            Some(&home),
+            &workspace,
+        );
         let canonical_home = fs::canonicalize(&home).expect("canonical home");
         let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
         let canonical_cargo = fs::canonicalize(&cargo_bin).expect("canonical cargo bin");
@@ -2064,23 +2253,27 @@ mod tests {
         let _ = fs::remove_dir_all(&fixture);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn sh_quote(path: &Path) -> String {
         format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
     }
 
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn sandbox_exec_cannot_read_or_write_real_workspace_with_or_without_network() {
-        if !Path::new("/usr/bin/sandbox-exec").is_file() {
-            eprintln!("skipping Seatbelt integration test: sandbox-exec is unavailable");
-            return;
-        }
-
-        let sandbox_root = temp_dir("seatbelt-integration");
+    /// The workspace boundary, exercised for real: one command that reads its own
+    /// copy, fails to read the real workspace, fails to overwrite it, and writes
+    /// to the sandbox-owned HOME and TMP — run once with network and once without,
+    /// because a boundary that only holds in one of those states is not a
+    /// boundary.
+    ///
+    /// Shared verbatim by macOS and Linux, which is the point: the two platforms
+    /// enforce it with completely different kernel machinery (a Seatbelt profile
+    /// versus a Landlock ruleset) and the assertion is that this is not
+    /// observable from inside. Only the `label` differs.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn assert_real_workspace_stays_out_of_reach(label: &str) {
+        let sandbox_root = temp_dir(&format!("{label}-integration"));
         let workspace_dir = sandbox_root.join("workspace");
         fs::create_dir_all(&workspace_dir).expect("create sandbox workspace");
-        let real_workspace = temp_dir("seatbelt-real-workspace");
+        let real_workspace = temp_dir(&format!("{label}-real-workspace"));
         let allowed_file = workspace_dir.join("allowed.txt");
         let forbidden_file = real_workspace.join("secret.txt");
         write(&allowed_file, "sandbox-visible");
@@ -2111,9 +2304,9 @@ mod tests {
 
         for allow_network in [false, true] {
             let profile_path = sandbox_root.join(if allow_network {
-                "seatbelt-network.sb"
+                "boundary-network.sb"
             } else {
-                "seatbelt-offline.sb"
+                "boundary-offline.sb"
             });
             let outcome = execute_in_sandbox(
                 &sandbox_root,
@@ -2126,11 +2319,11 @@ mod tests {
                 &[],
             )
             .await
-            .expect("sandbox-exec launches");
+            .expect("the sandbox launches");
             assert_eq!(
                 outcome.exit_code,
                 Some(0),
-                "Seatbelt boundary failed (network={allow_network}); stderr={}",
+                "{label} boundary failed (network={allow_network}); stderr={}",
                 String::from_utf8_lossy(&outcome.stderr)
             );
             assert_eq!(
@@ -2143,6 +2336,78 @@ mod tests {
 
         let _ = fs::remove_dir_all(&sandbox_root);
         let _ = fs::remove_dir_all(&real_workspace);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_exec_cannot_read_or_write_real_workspace_with_or_without_network() {
+        if !Path::new(SANDBOX_EXEC).is_file() {
+            skip_locally_but_fail_in_ci(
+                "Seatbelt",
+                "sandbox-exec is unavailable, and it is the only thing enforcing \
+                 confinement on this platform",
+            );
+            return;
+        }
+        assert_real_workspace_stays_out_of_reach("seatbelt").await;
+    }
+
+    /// The Linux arm of the same test.
+    ///
+    /// Skips rather than fails when the kernel cannot enforce Landlock — a
+    /// developer on a kernel built without it, or a container whose own policy
+    /// blocks the syscall, is not a regression in this code. On CI it fails
+    /// instead, via `skip_locally_but_fail_in_ci`: green has to mean the
+    /// assertions ran, and a captured `println!` cannot carry that difference.
+    /// Skip locally, fail in CI — because a skip and a pass are the same colour.
+    ///
+    /// An earlier version of the two tests below claimed that printing the reason
+    /// was enough to keep "green because it asserted" distinct from "green because
+    /// it asserted nothing". That was wrong: `cargo test` captures a *passing*
+    /// test's stdout and stderr, so the print never reaches the log that anyone
+    /// reads. The distinction matters more here than anywhere else in this file,
+    /// since the thing that would quietly stop being tested is a security
+    /// boundary — so on CI the absence of the mechanism is a failure. A runner
+    /// image that stops shipping Landlock must turn this red rather than silently
+    /// stop enforcing it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn skip_locally_but_fail_in_ci(mechanism: &str, reason: &str) {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{mechanism} is unavailable on this CI runner, so the isolation it \
+             enforces went untested: {reason}"
+        );
+        eprintln!("skipping {mechanism} integration test: {reason}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn landlock_cannot_read_or_write_real_workspace_with_or_without_network() {
+        if !crate::sandbox_linux::landlock_is_enforceable() {
+            skip_locally_but_fail_in_ci(
+                "Landlock",
+                "this kernel cannot enforce the Landlock ABI v1 baseline (not built \
+                 in, disabled at boot, or the syscall is blocked by an outer sandbox)",
+            );
+            return;
+        }
+        assert_real_workspace_stays_out_of_reach("landlock").await;
+    }
+
+    /// The network filter has to compile on the machine that will install it:
+    /// [`crate::sandbox_linux::network_denial_filter`] fails on an architecture
+    /// seccompiler has no audit value for, and that failure turns into a failed
+    /// run rather than a network-allowed one. Cheap to assert, and it is the only
+    /// part of the filter that can be checked without spawning anything.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_network_denial_filter_compiles_for_this_architecture() {
+        let program =
+            crate::sandbox_linux::network_denial_filter().expect("filter compiles for this arch");
+        assert!(
+            !program.is_empty(),
+            "an empty BPF program is rejected by `apply_filter`, so it would fail the spawn"
+        );
     }
 
     // --- promote digest / confirmation -----------------------------------

@@ -332,6 +332,12 @@ pub mod privacy_firewall;
 // action. Reuses `run_protocol`/`run_ledger` for run modeling exactly like
 // every other execution surface above.
 pub mod sandbox;
+// The Linux half of `sandbox`'s OS boundary (ROADMAP.md item K3): a Landlock
+// filesystem ruleset plus a seccomp-BPF network filter, installed in `pre_exec`
+// alongside `os_limits`. Linux-only because the crates behind it are, and
+// because a stub would just be a second place to claim confinement from.
+#[cfg(target_os = "linux")]
+pub mod sandbox_linux;
 // Local, single-machine "Team, Family, and Organization Mode" (ROADMAP.md
 // Phase 6): a named local profile switcher, capability-checked roles, and a
 // redacted audit export layered over `run_ledger`/`permissions`. See the
