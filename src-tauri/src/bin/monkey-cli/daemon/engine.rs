@@ -2787,6 +2787,7 @@ pub(super) mod tests {
                 tool_rules: vec![],
                 allow_network: false,
                 allow_external_mutations: false,
+                egress_allowlist: None,
             },
             budgets: RunBudgets {
                 wall_time_ms: 60_000,

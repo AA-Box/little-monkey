@@ -25,11 +25,20 @@
 //! which process row they belong to. See [`send`] for the byte unit — it is not
 //! the obvious one — and `Counted` for why counting a streamed body does not turn
 //! it into a buffered one.
+//!
+//! [`check_run_allowlist`] and `PinnedResolver` are the fifth, and they are the one
+//! part that is keyed to a **run** rather than to a URL or an address: the run's
+//! frozen host/port/protocol allowlist, enforced where every outbound request
+//! already converges, and its names pinned so an allowed one cannot be moved
+//! mid-run. See [`check_run_allowlist`] for which absences fail open and which fail
+//! closed, and `PinnedResolver` for what pinning costs a rotating CDN.
 
 use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::future::Future;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -230,6 +239,23 @@ egress_rules! {
     /// here would happily allow, because *this run* said it would not use the
     /// network.
     RunNetworkDenied => "egress.run-network-denied", "this run was submitted without network permission";
+    /// The host is not on the run's frozen
+    /// [`EgressAllowlist`](crate::run_protocol::EgressAllowlist). Deny-by-default
+    /// *within* a declaration: a host the spec did not name is refused even though
+    /// every address rule above would have allowed it.
+    RunHostNotAllowlisted => "egress.run-host-not-allowlisted", "the host is not on this run's egress allowlist";
+    /// The effective port — the URL's own, or the scheme's default — is not on the
+    /// run's frozen allowlist.
+    RunPortNotAllowlisted => "egress.run-port-not-allowlisted", "the port is not on this run's egress allowlist";
+    /// The URL scheme is not on the run's frozen allowlist. Distinct from
+    /// [`SchemeNotAllowed`](EgressRule::SchemeNotAllowed), which is a *caller's*
+    /// fixed set (`web.rs` sends only `http`/`https`); this one is the run's.
+    RunProtocolNotAllowlisted => "egress.run-protocol-not-allowlisted", "the protocol is not on this run's egress allowlist";
+    /// A run is in scope and its frozen policy could not be read, so whether it
+    /// declared an allowlist is unknown. Refused rather than assumed — see
+    /// [`run_allowlist_verdict`] for why this one fails closed while an absent
+    /// declaration fails open.
+    RunPolicyUnavailable => "egress.run-policy-unavailable", "this run's frozen egress policy could not be read";
 }
 
 impl EgressRule {
@@ -315,7 +341,11 @@ impl EgressRule {
             | EgressRule::RedirectHopLimit
             | EgressRule::RedirectCrossOrigin
             | EgressRule::RedirectOriginUnknown
-            | EgressRule::RunNetworkDenied => false,
+            | EgressRule::RunNetworkDenied
+            | EgressRule::RunHostNotAllowlisted
+            | EgressRule::RunPortNotAllowlisted
+            | EgressRule::RunProtocolNotAllowlisted
+            | EgressRule::RunPolicyUnavailable => false,
         }
     }
 }
@@ -601,10 +631,21 @@ pub fn hardened() -> reqwest::ClientBuilder {
 /// a test. Kept private so no production caller can quietly widen a budget by
 /// reaching for this instead of [`hardened`].
 fn hardened_with_timeouts(connect: Duration, read: Duration) -> reqwest::ClientBuilder {
+    hardened_with_lookup(connect, read, system_lookup)
+}
+
+/// [`hardened_with_timeouts`] with the name lookup injected, so a test can pin a
+/// resolution it controls. Same reason `hardened_with_timeouts` itself exists.
+fn hardened_with_lookup(
+    connect: Duration,
+    read: Duration,
+    lookup: HostLookup,
+) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(connect)
         .read_timeout(read)
         .redirect(same_origin_redirect_policy())
+        .dns_resolver(std::sync::Arc::new(PinnedResolver { lookup }))
 }
 
 /// Follows a redirect only when it stays on the origin the request was already
@@ -645,6 +686,14 @@ fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
         // call. Returning early also keeps the message off the happy path: it is
         // built from owned `String`s and would otherwise be allocated on every
         // hop that gets followed.
+        // The run's allowlist again, on the hop rather than the request. Not
+        // redundant with the check in `send`: `may_follow` permits an
+        // `http` -> `https` upgrade on the same authority, and that changes the
+        // effective port (80 to 443), so a hop can reach a protocol and a port the
+        // original request never asked for.
+        if let Err(denial) = check_run_allowlist(attempt.url()) {
+            return attempt.error(refused(denial));
+        }
         if may_follow(previous, attempt.url()) {
             return attempt.follow();
         }
@@ -748,6 +797,451 @@ pub(crate) fn origin_label(url: &Url) -> String {
         (Some(host), Some(port)) => format!("{}://{host}:{port}", url.scheme()),
         (Some(host), None) => format!("{}://{host}", url.scheme()),
         _ => url.scheme().to_string(),
+    }
+}
+
+/// What the installed source knows about one run's frozen egress policy.
+///
+/// Four answers and not two, because the two that look alike are the ones that must
+/// not behave alike: [`Unknown`](Self::Unknown) is "no such run", which is ordinary
+/// and permitted, while [`Unavailable`](Self::Unavailable) is "the row could not be
+/// read", which is refused. Collapsing them would either refuse every run id that is
+/// not a ledger entity (`browser_worker` and `m4_runtime` both scope work under ids
+/// the run ledger has never seen) or allow a declared policy to be skipped by
+/// breaking the ledger.
+pub enum RunEgressPolicy {
+    /// The run's frozen spec declares an allowlist.
+    Declared(std::sync::Arc<crate::run_protocol::EgressAllowlist>),
+    /// The run exists and its frozen spec declares nothing.
+    Undeclared,
+    /// No run by that id. A [`run_scope::RunScope::Run`] id is not necessarily a
+    /// row in the run ledger.
+    Unknown,
+    /// The frozen spec could not be read at all.
+    Unavailable,
+}
+
+type PolicySource = dyn Fn(&str) -> RunEgressPolicy + Send + Sync;
+
+/// The process-wide way to read a run's frozen policy, or `None` before one is
+/// installed.
+///
+/// A global for the reason `denial_sink`'s recorder is one, and the argument is
+/// stronger here: [`send`] is called from 92 sites whose signatures have no
+/// `AppHandle`, no `AppState` and no business acquiring either. The run *identity*
+/// arrives implicitly through [`run_scope`]; this is how the frozen row behind that
+/// identity is fetched, and it is installed once at startup by
+/// `run_commands::install_run_egress_policy_source`.
+///
+/// Unlike the sink, this global does decide something, so the direction of its
+/// absence matters: with no source installed there is no policy to enforce and
+/// [`send`] behaves exactly as it did before this existed. That is what keeps every
+/// unit test, the CLI, and any embedder that never opens a run ledger working, and
+/// it is not a hole a run can open — nothing reachable by a model, a skill or a
+/// package can uninstall a source, and the app installs one before it serves a
+/// window.
+static POLICY_SOURCE: OnceLock<std::sync::RwLock<Option<std::sync::Arc<PolicySource>>>> =
+    OnceLock::new();
+
+fn policy_source_slot() -> &'static std::sync::RwLock<Option<std::sync::Arc<PolicySource>>> {
+    POLICY_SOURCE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Frozen policies already read, so a ledger row is read once per run and not once
+/// per request.
+///
+/// Safe to cache at all only because a run spec is immutable: the row is written once
+/// at submission and there is no update path to it, so a cached answer cannot be
+/// stale in the direction that matters. Dropping an entry is therefore only ever a
+/// cost — the next request re-reads the same frozen answer, or fails closed if it
+/// cannot.
+///
+/// `None` covers both [`RunEgressPolicy::Undeclared`] and
+/// [`RunEgressPolicy::Unknown`]: both mean "no allowlist governs this run", and
+/// caching `Unknown` is sound because a scope is entered *after* its run row is
+/// written, so a real run cannot look unknown on its first request and declared on
+/// its second. [`RunEgressPolicy::Unavailable`] is never cached — a transient read
+/// failure must not be remembered as an answer.
+static POLICY_CACHE: OnceLock<
+    Mutex<
+        std::collections::HashMap<
+            String,
+            Option<std::sync::Arc<crate::run_protocol::EgressAllowlist>>,
+        >,
+    >,
+> = OnceLock::new();
+
+/// Cached runs kept. Concurrency here is a handful of runs, not thousands; the bound
+/// exists so a long-lived process that has seen ten thousand runs does not keep all
+/// of them.
+///
+/// ponytail: cleared wholesale at the bound rather than evicted per entry, because a
+/// dropped entry costs one re-read and can never widen a policy. Upgrade path if the
+/// re-read ever matters: an LRU, or eviction when a run reaches a terminal event.
+const MAX_CACHED_RUN_POLICIES: usize = 256;
+
+fn policy_cache() -> &'static Mutex<
+    std::collections::HashMap<String, Option<std::sync::Arc<crate::run_protocol::EgressAllowlist>>>,
+> {
+    POLICY_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Installs the process-wide policy source, replacing any previous one.
+///
+/// Clears the cache, because a new source may answer differently about the same run
+/// id — which in production never happens (it is installed once) and in tests
+/// happens constantly.
+pub fn install_run_policy_source<F>(source: F)
+where
+    F: Fn(&str) -> RunEgressPolicy + Send + Sync + 'static,
+{
+    if let Ok(mut slot) = policy_source_slot().write() {
+        *slot = Some(std::sync::Arc::new(source));
+    }
+    if let Ok(mut cache) = policy_cache().lock() {
+        cache.clear();
+    }
+}
+
+/// Uninstalls the source and forgets every cached answer.
+///
+/// Tests only, and they must hold `denial_sink::test_lock()` while they use it: the
+/// source is process-wide, so a test that left one installed would decide another
+/// test's requests.
+#[cfg(test)]
+pub(crate) fn clear_run_policy_source() {
+    if let Ok(mut slot) = policy_source_slot().write() {
+        *slot = None;
+    }
+    if let Ok(mut cache) = policy_cache().lock() {
+        cache.clear();
+    }
+}
+
+/// The allowlist governing `run_id`, `Ok(None)` when none does, and `Err` when the
+/// frozen policy could not be read.
+fn policy_for_run(
+    run_id: &str,
+) -> Result<Option<std::sync::Arc<crate::run_protocol::EgressAllowlist>>, EgressDenial> {
+    if let Ok(cache) = policy_cache().lock() {
+        if let Some(cached) = cache.get(run_id) {
+            return Ok(cached.clone());
+        }
+    }
+    let Some(source) = policy_source_slot()
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+    else {
+        // No source installed: nothing to enforce, and see `POLICY_SOURCE` for why
+        // that is the safe direction for this one absence.
+        return Ok(None);
+    };
+
+    let resolved = match source(run_id) {
+        RunEgressPolicy::Declared(allowlist) => Some(allowlist),
+        RunEgressPolicy::Undeclared | RunEgressPolicy::Unknown => None,
+        RunEgressPolicy::Unavailable => {
+            return Err(EgressDenial::about(
+                EgressRule::RunPolicyUnavailable,
+                format!("run {run_id}"),
+            ))
+        }
+    };
+    if let Ok(mut cache) = policy_cache().lock() {
+        if cache.len() >= MAX_CACHED_RUN_POLICIES {
+            cache.clear();
+        }
+        cache.insert(run_id.to_string(), resolved.clone());
+    }
+    Ok(resolved)
+}
+
+/// Whether one allowlist host entry matches `host`.
+///
+/// `host` must already be lowercased; entries are lowercase by validation, so no
+/// call site folds anything twice.
+///
+/// # The boundary is the whole point
+///
+/// A wildcard entry `*.example.com` matches a name that ends with `.example.com`
+/// *including the dot*, so `evil-example.com` does not match — the naive
+/// `ends_with("example.com")` would have said it did, and that is the classic
+/// suffix-matching bypass. The apex is deliberately excluded too: `*.example.com`
+/// does not match `example.com`, which must be named in its own right. Same shape as
+/// `http_route_registry`'s `ExactOrDescendant`, which checks for the `/` separator
+/// rather than trusting a prefix.
+#[must_use]
+pub fn allowlist_host_matches(entry: &str, host: &str) -> bool {
+    match entry.strip_prefix("*.") {
+        Some(suffix) => host
+            .strip_suffix(suffix)
+            .is_some_and(|label| label.ends_with('.') && label.len() > 1),
+        None => entry == host,
+    }
+}
+
+/// Names this gate in a denial record.
+const RUN_ALLOWLIST_GUARD: &str = "egress.run-allowlist";
+
+/// Refuses a request the ambient run's frozen allowlist does not permit, and writes
+/// the refusal down.
+///
+/// # Fail-closed and fail-open are both deliberate, and they are different cases
+///
+/// - **No run in scope** — behaves exactly as before. Some egress legitimately has
+///   no run and never will: timer-driven knowledge refresh, connector verification
+///   in Settings, model downloads, update checks, and every inbound request
+///   `server.rs` serves. Deny-by-default keyed to a run would silently disable all
+///   of them, which is why the run is the key and the absence of one is an answer.
+/// - **A run whose policy declares nothing** — also as before. Every run row frozen
+///   before this field existed says exactly this, and reading those as deny-all
+///   would refuse every in-flight run.
+/// - **A run whose policy cannot be read** — refused. This is the one that fails
+///   closed, and the cost is bounded by what it means: the frozen spec lives in the
+///   same ledger a run appends its events to, so a run whose spec cannot be read
+///   cannot record anything either. Refusing its egress is not the failure, it is a
+///   symptom of one.
+/// - **A declared allowlist** — deny-by-default within it, on all three dimensions.
+///
+/// Loopback is exempt, for [`is_loopback_target`]'s reason: a local-inference run
+/// talks to `127.0.0.1` and refusing that is a broken policy rather than a strict
+/// one.
+pub(crate) fn check_run_allowlist(url: &Url) -> Result<(), EgressDenial> {
+    let verdict = run_allowlist_verdict(url);
+    if let Err(denial) = &verdict {
+        // Recorded here, at the raise site, because by the time this reaches a
+        // command it is a `String` — `denial_sink`'s own finding. The run id comes
+        // from the ambient scope, so nothing has to be threaded.
+        crate::denial_sink::record(RUN_ALLOWLIST_GUARD, denial, None);
+    }
+    verdict
+}
+
+/// [`check_run_allowlist`] without the recording, so the rules can be tested as a
+/// pure function of a URL.
+fn run_allowlist_verdict(url: &Url) -> Result<(), EgressDenial> {
+    let Some(run_id) = run_scope::current_run_id() else {
+        return Ok(());
+    };
+    // Ahead of the policy read, not after it: the exemption holds whatever the policy
+    // says, so a local-inference run never reads a ledger row to be told what it is
+    // allowed to do on its own machine.
+    if is_loopback_target(url) {
+        return Ok(());
+    }
+    let Some(allowlist) = policy_for_run(&run_id)? else {
+        return Ok(());
+    };
+
+    let Some(host) = url.host_str() else {
+        return Err(EgressDenial::new(EgressRule::HostMissing));
+    };
+    let host = host.to_ascii_lowercase();
+    if !allowlist
+        .hosts
+        .iter()
+        .any(|entry| allowlist_host_matches(entry, &host))
+    {
+        return Err(EgressDenial::about(
+            EgressRule::RunHostNotAllowlisted,
+            format!(
+                "{host} is not among the {} hosts run {run_id} declared",
+                allowlist.hosts.len()
+            ),
+        ));
+    }
+
+    let Some(port) = url.port_or_known_default() else {
+        return Err(EgressDenial::new(EgressRule::PortMissing));
+    };
+    if !allowlist.ports.contains(&port) {
+        return Err(EgressDenial::about(
+            EgressRule::RunPortNotAllowlisted,
+            format!("port {port} is not among the ports run {run_id} declared"),
+        ));
+    }
+
+    let scheme = url.scheme();
+    if !allowlist
+        .protocols
+        .iter()
+        .any(|protocol| protocol == scheme)
+    {
+        return Err(EgressDenial::about(
+            EgressRule::RunProtocolNotAllowlisted,
+            format!("{scheme} is not among the protocols run {run_id} declared"),
+        ));
+    }
+    Ok(())
+}
+
+/// Host of the throwaway request [`refusal_error`] never sends.
+///
+/// `.invalid` is reserved by RFC 2606 and is never looked up: the resolver below
+/// refuses before any lookup happens, and the client is built `.no_proxy()` so a
+/// configured proxy cannot be handed the name instead.
+const REFUSAL_HOST: &str = "egress-denied.invalid";
+
+/// Turns a denial into the `reqwest::Error` a caller of [`send`] receives.
+///
+/// # Why this is a request and not a constructor
+///
+/// `reqwest::Error` has no public constructor — every one is built inside reqwest
+/// from a source it was handed. So a refusal reaches the caller the one way reqwest
+/// will carry somebody else's error: through a `dns_resolver` that refuses. The
+/// denial arrives on the far side as itself, recoverable with `downcast_ref` and
+/// rendered with its code, exactly like the redirect policy's refusals.
+///
+/// Nothing leaves this process. The throwaway request names [`REFUSAL_HOST`], the
+/// resolver refuses it without a lookup, and the denied target is never mentioned to
+/// anything outside this function.
+///
+/// ponytail: builds a client per refusal, because the denial has to be *in* the
+/// resolver and a shared client cannot hold a per-request one. A refusal already
+/// costs a sink insert, so this is not the expensive half. Upgrade path if it ever
+/// matters: one cached client per rule.
+async fn refusal_error(denial: EgressDenial) -> reqwest::Error {
+    struct AlwaysRefuse(EgressDenial);
+
+    impl reqwest::dns::Resolve for AlwaysRefuse {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let denial = self.0.clone();
+            Box::pin(
+                async move { Err(Box::new(denial) as Box<dyn std::error::Error + Send + Sync>) },
+            )
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .dns_resolver(std::sync::Arc::new(AlwaysRefuse(denial)))
+        .build();
+    match client {
+        Ok(client) => client
+            .get(format!("http://{REFUSAL_HOST}/"))
+            .send()
+            .await
+            // A resolver whose every answer is an error cannot produce a response,
+            // and the URL is a literal this function wrote.
+            .expect_err("a resolver that refuses every name cannot answer a request"),
+        // A `ClientBuilder` that will not build is itself a `reqwest::Error`, which
+        // is the right thing to return: the request is still refused, and the caller
+        // still gets an error rather than a response.
+        Err(error) => error,
+    }
+}
+
+/// Addresses pinned per `(run, host)` for the lifetime of the run.
+///
+/// See [`PinnedResolver`] for what this closes and what it costs.
+static DNS_PINS: OnceLock<Mutex<std::collections::HashMap<(String, String), Vec<SocketAddr>>>> =
+    OnceLock::new();
+
+/// Pins kept. A run touching more names than this is not the case this exists for.
+///
+/// ponytail: cleared wholesale at the bound, like [`POLICY_CACHE`]. Unlike that one
+/// a dropped pin is not merely a re-read — it is a re-resolution, which reopens the
+/// window this table closes for that name. Stated rather than hidden; upgrade path is
+/// eviction keyed to a run reaching a terminal event, which needs a hook this module
+/// does not have.
+const MAX_DNS_PINS: usize = 512;
+
+fn dns_pins() -> &'static Mutex<std::collections::HashMap<(String, String), Vec<SocketAddr>>> {
+    DNS_PINS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// How a name is resolved when no pin exists yet. A function pointer purely so a
+/// test can supply a resolver that answers differently on the second call, which is
+/// the only way to write a rebinding test that is not a mock of itself.
+type HostLookup =
+    fn(String) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+
+fn system_lookup(
+    host: String,
+) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> {
+    Box::pin(async move {
+        // Port `0`: reqwest replaces it with the URL's own port (its `Resolve` doc
+        // says so), which is also why a pin binds an *address* and not an endpoint.
+        // Formatted as an owned string so the returned future borrows nothing.
+        tokio::net::lookup_host(format!("{host}:0"))
+            .await
+            .map(|addresses| addresses.collect())
+    })
+}
+
+/// Resolves a name once per run and pins the answer for the rest of the run.
+///
+/// # The gap this closes
+///
+/// [`check_run_allowlist`] decides on a *name*. The connection is opened against an
+/// *address*, resolved afterwards, and an attacker who controls DNS for an
+/// allowlisted name (TTL 0, or a rebinding service) can answer the two lookups
+/// differently — so the name that passed the check and the address that gets
+/// connected to need not be the same place. Pinning removes the second lookup: the
+/// addresses handed back here are exactly what reqwest connects to, not a hint
+/// compared against a later answer, so there is no second resolution left to race.
+/// `web.rs`'s `SsrfGuardedResolver` closes the same gap for its own guard, and
+/// `browser_worker.rs` does it per Chromium launch with `--host-resolver-rules`.
+///
+/// # What it costs, which is real
+///
+/// A long run against a rotating CDN keeps the address it first saw. If that address
+/// is withdrawn mid-run the run's requests fail rather than following the rotation,
+/// and the fix is a new run — the pin is per run, so nothing outlives it. That is the
+/// deliberate trade: an allowed name that cannot be moved is worth more here than one
+/// that follows every answer, and a rebind is indistinguishable from a rotation at
+/// the resolver. Two further honest limits:
+///
+/// - **A pooled connection is not re-resolved at all.** reqwest keys its pool by
+///   scheme, host and port, so a request reusing a connection another run opened
+///   connects wherever that run's pin pointed. Both runs had to allow the same host
+///   for that to happen, and the address was a pinned answer for that name either
+///   way, so nothing unallowed is reached — but the pin that applies is the first
+///   run's.
+/// - **It applies to clients built from [`hardened`].** A caller that reaches for
+///   `Client::builder()` itself gets the default resolver and no pin; the ratchet at
+///   the bottom of this file is what keeps that set from growing quietly.
+struct PinnedResolver {
+    lookup: HostLookup,
+}
+
+impl reqwest::dns::Resolve for PinnedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        // Read synchronously, here, rather than inside the future: this call happens
+        // on the task that is driving the request, which is the task the scope was
+        // entered on.
+        let run = run_scope::current_run_id();
+        let host = name.as_str().to_ascii_lowercase();
+        let lookup = self.lookup;
+        Box::pin(async move {
+            let key = run.map(|run| (run, host.clone()));
+            if let Some(key) = &key {
+                if let Some(pinned) = dns_pins()
+                    .lock()
+                    .ok()
+                    .and_then(|pins| pins.get(key).cloned())
+                {
+                    return Ok(Box::new(pinned.into_iter()) as reqwest::dns::Addrs);
+                }
+            }
+
+            let addresses = lookup(host)
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            // An empty answer is passed through rather than pinned or renamed: the
+            // connector reports it, and pinning "nothing" would make one bad answer
+            // permanent for the run.
+            if let (Some(key), false) = (key, addresses.is_empty()) {
+                if let Ok(mut pins) = dns_pins().lock() {
+                    if pins.len() >= MAX_DNS_PINS {
+                        pins.clear();
+                    }
+                    pins.insert(key, addresses.clone());
+                }
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
     }
 }
 
@@ -961,6 +1455,13 @@ pub async fn send(request: reqwest::RequestBuilder) -> reqwest::Result<reqwest::
     let charge = Charge::resolve();
     let (client, built) = request.build_split();
     let mut built = built?;
+    // Before anything is written, resolved or connected: the run's own frozen
+    // allowlist. Checked on the built request's url rather than on whatever the
+    // caller believes it asked for, the same reason `provider_endpoint_for_run`
+    // reads the frozen endpoint instead of the claimed one.
+    if let Err(denial) = check_run_allowlist(built.url()) {
+        return Err(refusal_error(denial).await);
+    }
     if let Some(body) = built.body_mut().take() {
         // An in-memory body is counted by its length and left alone, so it stays
         // replayable across a redirect; only a streaming body is wrapped, which
@@ -1080,6 +1581,10 @@ mod tests {
             "egress.redirect-cross-origin",
             "egress.redirect-origin-unknown",
             "egress.run-network-denied",
+            "egress.run-host-not-allowlisted",
+            "egress.run-port-not-allowlisted",
+            "egress.run-protocol-not-allowlisted",
+            "egress.run-policy-unavailable",
         ];
 
         #[test]
@@ -1710,6 +2215,17 @@ mod tests {
             fn accepted(&self) -> usize {
                 self.accepted.load(Ordering::SeqCst)
             }
+
+            /// The port, for a test that needs to aim a *hostname* at this fixture
+            /// rather than its literal address — a resolved address's port is
+            /// replaced by the URL's own, so the URL has to carry this one.
+            fn port(&self) -> u16 {
+                self.origin
+                    .rsplit(':')
+                    .next()
+                    .and_then(|port| port.parse().ok())
+                    .expect("the fixture origin ends in its port")
+            }
         }
 
         fn redirect_to(location: &str) -> Answer {
@@ -2261,6 +2777,469 @@ mod tests {
                 "followed {} hops, which is past the {MAX_REDIRECT_HOPS}-hop cap",
                 host.accepted()
             );
+        }
+
+        /// K5's per-run allowlist: the deny-by-default half, its two deliberate
+        /// fail-open cases, and its one fail-closed case.
+        ///
+        /// Every test here installs a **process-wide** policy source, so they all take
+        /// `denial_sink::test_lock()` — the same lock and for the same reason that
+        /// module's own installing tests take it — and clear the source afterwards.
+        mod allowlist {
+            use super::*;
+            use crate::run_protocol::EgressAllowlist;
+            use std::sync::Arc;
+
+            fn declaring(hosts: &[&str], ports: &[u16], protocols: &[&str]) -> EgressAllowlist {
+                let list = EgressAllowlist {
+                    hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+                    ports: ports.to_vec(),
+                    protocols: protocols.iter().map(|p| (*p).to_string()).collect(),
+                };
+                list.validate().expect("the fixture must be a legal policy");
+                list
+            }
+
+            /// A source that answers for exactly one run and `Unknown` for anything
+            /// else, so a leaked install cannot decide another test's request.
+            fn install_declared(run_id: &str, allowlist: EgressAllowlist) {
+                let run_id = run_id.to_string();
+                install_run_policy_source(move |asked| {
+                    if asked == run_id {
+                        RunEgressPolicy::Declared(Arc::new(allowlist.clone()))
+                    } else {
+                        RunEgressPolicy::Unknown
+                    }
+                });
+            }
+
+            fn verdict_for(run_id: &str, url: &str) -> Result<(), EgressDenial> {
+                let url = Url::parse(url).expect("test url parses");
+                run_scope::scoped_sync(RunScope::run(run_id), || run_allowlist_verdict(&url))
+            }
+
+            fn rule_for(run_id: &str, url: &str) -> Option<EgressRule> {
+                verdict_for(run_id, url).err().map(|denial| denial.rule())
+            }
+
+            /// The empty declaration is the whole safety property: present-and-empty
+            /// denies, where absent permits. Both asserted here so the two cannot
+            /// quietly become one behaviour.
+            #[test]
+            fn an_empty_declaration_denies_and_an_absent_one_does_not() {
+                let _guard = crate::denial_sink::test_lock();
+                install_declared("run:empty", declaring(&[], &[], &[]));
+
+                assert_eq!(
+                    rule_for("run:empty", "https://api.example.com/v1"),
+                    Some(EgressRule::RunHostNotAllowlisted),
+                    "an empty allowlist must permit nothing"
+                );
+
+                install_run_policy_source(|_| RunEgressPolicy::Undeclared);
+                verdict_for("run:silent", "https://api.example.com/v1")
+                    .expect("a run that declares nothing keeps today's behaviour");
+
+                clear_run_policy_source();
+            }
+
+            #[test]
+            fn a_host_a_port_and_a_protocol_are_each_refused_by_their_own_rule() {
+                let _guard = crate::denial_sink::test_lock();
+                install_declared(
+                    "run:narrow",
+                    declaring(&["api.example.com"], &[443], &["https"]),
+                );
+
+                verdict_for("run:narrow", "https://api.example.com/v1/messages")
+                    .expect("the declared destination must be permitted");
+                assert_eq!(
+                    rule_for("run:narrow", "https://other.example.com/v1"),
+                    Some(EgressRule::RunHostNotAllowlisted)
+                );
+                assert_eq!(
+                    rule_for("run:narrow", "https://api.example.com:8443/v1"),
+                    Some(EgressRule::RunPortNotAllowlisted)
+                );
+                // Port 80 is not declared either, so the protocol case has to name a
+                // declared port explicitly to be a test of the protocol.
+                install_declared(
+                    "run:narrow",
+                    declaring(&["api.example.com"], &[443], &["https"]),
+                );
+                assert_eq!(
+                    rule_for("run:narrow", "http://api.example.com:443/v1"),
+                    Some(EgressRule::RunProtocolNotAllowlisted)
+                );
+
+                clear_run_policy_source();
+            }
+
+            /// The suffix-matching bypass, which is why the matcher checks for the
+            /// separator instead of trusting `ends_with`.
+            #[test]
+            fn a_wildcard_matches_at_a_label_boundary_and_nowhere_else() {
+                assert!(allowlist_host_matches("*.example.com", "api.example.com"));
+                assert!(allowlist_host_matches("*.example.com", "a.b.example.com"));
+                assert!(
+                    !allowlist_host_matches("*.example.com", "evil-example.com"),
+                    "the classic suffix bypass"
+                );
+                assert!(
+                    !allowlist_host_matches("*.example.com", "example.com"),
+                    "the apex must be named in its own right"
+                );
+                assert!(
+                    !allowlist_host_matches("*.example.com", ".example.com"),
+                    "an empty label is not a subdomain"
+                );
+                assert!(allowlist_host_matches("example.com", "example.com"));
+                assert!(!allowlist_host_matches("example.com", "api.example.com"));
+
+                // And through the real verdict, since a matcher that is right in
+                // isolation can still be called with the wrong argument.
+                let _guard = crate::denial_sink::test_lock();
+                install_declared(
+                    "run:wild",
+                    declaring(&["*.example.com"], &[443], &["https"]),
+                );
+                verdict_for("run:wild", "https://api.example.com/v1").expect("a subdomain");
+                assert_eq!(
+                    rule_for("run:wild", "https://evil-example.com/v1"),
+                    Some(EgressRule::RunHostNotAllowlisted)
+                );
+                clear_run_policy_source();
+            }
+
+            /// Loopback stays reachable under a deny-all declaration, for
+            /// [`is_loopback_target`]'s reason: a local-inference run legitimately
+            /// talks to this machine.
+            #[test]
+            fn loopback_survives_a_deny_all_declaration() {
+                let _guard = crate::denial_sink::test_lock();
+                install_declared("run:local", declaring(&[], &[], &[]));
+
+                for url in [
+                    "http://127.0.0.1:11434/api/chat",
+                    "http://localhost:8080/v1/chat/completions",
+                    "http://[::1]:1234/v1",
+                ] {
+                    verdict_for("run:local", url)
+                        .unwrap_or_else(|denial| panic!("{url} must stay reachable: {denial}"));
+                }
+
+                clear_run_policy_source();
+            }
+
+            /// Fail-closed, and the only case that does: a run is in scope, a source
+            /// is installed, and the frozen policy cannot be read — so whether it
+            /// declared anything is unknown and the request is refused.
+            #[test]
+            fn a_declared_policy_that_cannot_be_read_fails_closed() {
+                let _guard = crate::denial_sink::test_lock();
+                install_run_policy_source(|_| RunEgressPolicy::Unavailable);
+
+                assert_eq!(
+                    rule_for("run:blip", "https://api.example.com/v1"),
+                    Some(EgressRule::RunPolicyUnavailable)
+                );
+                // Not cached: the next read must be attempted again rather than
+                // remembering a transient failure as an answer.
+                assert_eq!(
+                    rule_for("run:blip", "https://api.example.com/v1"),
+                    Some(EgressRule::RunPolicyUnavailable)
+                );
+
+                clear_run_policy_source();
+            }
+
+            /// The two fail-open cases, asserted with a source installed so the pass
+            /// is about the *rules* and not about the source being absent.
+            #[test]
+            fn run_less_egress_behaves_exactly_as_it_did_before() {
+                let _guard = crate::denial_sink::test_lock();
+                // Deliberately hostile: this source would deny everything if it were
+                // ever consulted for work with no run.
+                install_run_policy_source(|_| {
+                    RunEgressPolicy::Declared(Arc::new(EgressAllowlist::default()))
+                });
+
+                let url = Url::parse("https://api.example.com/v1").expect("parses");
+                run_allowlist_verdict(&url).expect("no scope at all: today's behaviour");
+                run_scope::scoped_sync(
+                    RunScope::Unattributed(crate::run_scope::Unattributed::Scheduled),
+                    || {
+                        run_allowlist_verdict(&url)
+                            .expect("deliberately run-less work keeps its egress")
+                    },
+                );
+
+                clear_run_policy_source();
+            }
+
+            /// The frozen spec is immutable, so it is read once per run — a ledger
+            /// read on every request's hot path is the thing this cache exists to
+            /// avoid.
+            #[test]
+            fn a_frozen_policy_is_read_once_per_run_and_not_once_per_request() {
+                let _guard = crate::denial_sink::test_lock();
+                static READS: AtomicUsize = AtomicUsize::new(0);
+                READS.store(0, Ordering::SeqCst);
+                // Counted for this test's own run ids only. The source is
+                // process-wide, so a neighbouring test's run-scoped request would
+                // otherwise be counted here as well.
+                install_run_policy_source(|asked| {
+                    if !asked.starts_with("run:cached") {
+                        return RunEgressPolicy::Unknown;
+                    }
+                    READS.fetch_add(1, Ordering::SeqCst);
+                    RunEgressPolicy::Declared(Arc::new(EgressAllowlist {
+                        hosts: vec!["api.example.com".to_string()],
+                        ports: vec![443],
+                        protocols: vec!["https".to_string()],
+                    }))
+                });
+
+                for _ in 0..5 {
+                    verdict_for("run:cached", "https://api.example.com/v1").expect("permitted");
+                }
+                assert_eq!(READS.load(Ordering::SeqCst), 1);
+
+                // A different run is its own read, so the cache is keyed and not
+                // global.
+                verdict_for("run:cached-other", "https://api.example.com/v1").expect("permitted");
+                assert_eq!(READS.load(Ordering::SeqCst), 2);
+
+                clear_run_policy_source();
+            }
+
+            /// The choke point, end to end: a refused request must not reach its
+            /// target, and the caller must be able to ask *which rule* refused it
+            /// rather than substring-matching prose.
+            ///
+            /// The fake lookup points every name at the live fixture, so a missing
+            /// check would connect — `accepted()` is what proves the refusal happened
+            /// before the socket rather than after it.
+            #[tokio::test]
+            async fn a_denied_request_never_reaches_its_target_and_names_the_rule() {
+                fn to_the_fixture(
+                    _host: String,
+                ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+                {
+                    // Port `0`: reqwest substitutes the URL's own port.
+                    Box::pin(async { Ok(vec![SocketAddr::from(([127, 0, 0, 1], 0))]) })
+                }
+
+                let _guard = crate::denial_sink::test_lock();
+                let host = FakeHost::start(vec![ok_body("reached")]);
+                install_declared(
+                    "run:choke",
+                    declaring(&["allowed.test"], &[host.port()], &["http"]),
+                );
+
+                let client = hardened_with_lookup(
+                    Duration::from_millis(400),
+                    Duration::from_secs(2),
+                    to_the_fixture,
+                )
+                .build()
+                .expect("client builds");
+
+                // Entered *with* a process row, and every scope in this module does:
+                // a run with no process charges its bytes to a process-wide tally that
+                // a neighbouring test asserts exact numbers on, and tests run in
+                // parallel.
+                let error = run_scope::scoped_with_process(
+                    RunScope::run("run:choke"),
+                    crate::run_scope::ProcessScope::new("p-choke"),
+                    send(client.get(format!("http://blocked.test:{}/", host.port()))),
+                )
+                .await
+                .expect_err("a host the run never declared must be refused");
+
+                assert_eq!(
+                    host.accepted(),
+                    0,
+                    "the refusal must happen before anything is connected"
+                );
+                assert_eq!(
+                    denial_in(&error).map(|denial| denial.rule()),
+                    Some(EgressRule::RunHostNotAllowlisted),
+                    "the rule must survive the trip through reqwest: {error}"
+                );
+
+                // The counter-test: the same client, the same fixture, the declared
+                // host. Without it, "refuse everything" would pass the assertions
+                // above.
+                let response = run_scope::scoped_with_process(
+                    RunScope::run("run:choke"),
+                    crate::run_scope::ProcessScope::new("p-choke"),
+                    send(client.get(format!("http://allowed.test:{}/", host.port()))),
+                )
+                .await
+                .expect("the declared destination must still be reachable");
+                assert_eq!(response.text().await.expect("body"), "reached");
+                assert_eq!(host.accepted(), 1);
+
+                clear_run_policy_source();
+            }
+
+            /// Walks a `reqwest::Error`'s source chain for a denial, the way
+            /// `web.rs`'s helper does — `io::Error::source` delegates to its *inner*
+            /// error's source, so the inner one has to be unwrapped explicitly.
+            fn denial_in(error: &reqwest::Error) -> Option<&EgressDenial> {
+                let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+                while let Some(step) = current {
+                    if let Some(denial) = step.downcast_ref::<EgressDenial>() {
+                        return Some(denial);
+                    }
+                    if let Some(denial) = step
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(std::io::Error::get_ref)
+                        .and_then(|inner| inner.downcast_ref::<EgressDenial>())
+                    {
+                        return Some(denial);
+                    }
+                    current = step.source();
+                }
+                None
+            }
+
+            /// DNS pinning, exercised through a real connection rather than by reading
+            /// the pin table back.
+            ///
+            /// The lookup answers with the live fixture once and with `240.0.0.1` — a
+            /// reserved range nothing routes to — every time after, which is a rebind
+            /// in the only form a resolver can express one. The fixture answers
+            /// `Connection: close`, so the second request cannot reuse the first
+            /// connection: it must connect again, and `accepted() == 2` is what proves
+            /// it did.
+            #[tokio::test]
+            async fn a_pinned_name_keeps_its_address_when_resolution_moves() {
+                // Nothing here installs a policy source, but this makes a run-scoped
+                // request to a *non-loopback* name, so it must not overlap a test that
+                // has one installed — the source is process-wide and would decide this
+                // request too.
+                let _guard = crate::denial_sink::test_lock();
+                static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+                fn rebinding(
+                    _host: String,
+                ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+                {
+                    let first = CALLS.fetch_add(1, Ordering::SeqCst) == 0;
+                    Box::pin(async move {
+                        let address = if first {
+                            [127, 0, 0, 1]
+                        } else {
+                            [240, 0, 0, 1]
+                        };
+                        Ok(vec![SocketAddr::from((address, 0))])
+                    })
+                }
+
+                let host = FakeHost::start(vec![ok_body("pinned"), ok_body("pinned")]);
+                let client = hardened_with_lookup(
+                    Duration::from_millis(400),
+                    Duration::from_secs(2),
+                    rebinding,
+                )
+                .build()
+                .expect("client builds");
+                let url = format!("http://pinned.test:{}/", host.port());
+
+                let (first, second) = run_scope::scoped_with_process(
+                    RunScope::run("run:pin"),
+                    crate::run_scope::ProcessScope::new("p-pin"),
+                    async {
+                        let first = send(client.get(&url)).await.expect("first request");
+                        let first = first.text().await.expect("first body");
+                        let second = send(client.get(&url)).await.expect("second request");
+                        (first, second.text().await.expect("second body"))
+                    },
+                )
+                .await;
+
+                assert_eq!(first, "pinned");
+                assert_eq!(
+                    second, "pinned",
+                    "the second connection must have used the pinned address"
+                );
+                assert_eq!(
+                    host.accepted(),
+                    2,
+                    "the second request must be a new connection, or this proves nothing"
+                );
+                assert_eq!(
+                    CALLS.load(Ordering::SeqCst),
+                    1,
+                    "a pinned name must not be resolved a second time at all"
+                );
+            }
+
+            /// The counter-test that makes the pinning test mean something: with no run
+            /// in scope there is nothing to pin to, the second resolution is taken, and
+            /// the request lands on the moved address and fails. Same fixture, same
+            /// lookup, one difference.
+            #[tokio::test]
+            async fn without_a_run_the_same_rebind_moves_the_second_request() {
+                // Same reason as its sibling above, even though this one has no run: an
+                // installed source cannot decide a run-less request, but sharing the
+                // lock keeps the pair's timing comparable rather than only one of them
+                // serialized.
+                let _guard = crate::denial_sink::test_lock();
+                static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+                fn rebinding(
+                    _host: String,
+                ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+                {
+                    let first = CALLS.fetch_add(1, Ordering::SeqCst) == 0;
+                    Box::pin(async move {
+                        let address = if first {
+                            [127, 0, 0, 1]
+                        } else {
+                            [240, 0, 0, 1]
+                        };
+                        Ok(vec![SocketAddr::from((address, 0))])
+                    })
+                }
+
+                let host = FakeHost::start(vec![ok_body("unpinned"), ok_body("unpinned")]);
+                let client = hardened_with_lookup(
+                    Duration::from_millis(400),
+                    Duration::from_secs(2),
+                    rebinding,
+                )
+                .build()
+                .expect("client builds");
+                let url = format!("http://unpinned.test:{}/", host.port());
+
+                // No *run*, which is the one difference from the test above — and a
+                // process row all the same, so these bytes stay out of the
+                // process-wide tallies a neighbouring test asserts on.
+                let (first, moved) = run_scope::scoped_with_process(
+                    RunScope::Unattributed(Unattributed::UserAction),
+                    crate::run_scope::ProcessScope::new("p-unpinned"),
+                    async {
+                        let first = send(client.get(&url))
+                            .await
+                            .expect("first request")
+                            .text()
+                            .await
+                            .expect("first body");
+                        (first, send(client.get(&url)).await)
+                    },
+                )
+                .await;
+                assert_eq!(first, "unpinned");
+                assert!(
+                    moved.is_err(),
+                    "with no run there is no pin, so the rebind must be followed"
+                );
+                assert_eq!(host.accepted(), 1, "the fixture must not be reached twice");
+                assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+            }
         }
     }
 
