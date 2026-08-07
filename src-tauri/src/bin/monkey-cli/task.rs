@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use little_monkey_lib::knowledge_core::KnowledgeStack;
 use little_monkey_lib::mcp::McpServerEntry;
 use little_monkey_lib::recipes::{self, DesktopTurnSnapshot, Recipe};
 use little_monkey_lib::run_ledger::RunLedger;
@@ -27,7 +28,6 @@ use little_monkey_lib::run_protocol::{
     RootGrant, RunBudgets, RunEvent, RunKind, RunSpec, RunStatus, ToolPermissionRule,
     ToolPolicyDecision, WorkspaceContext, RUN_PROTOCOL_SCHEMA_VERSION,
 };
-use little_monkey_lib::stacks::KnowledgeStack;
 use little_monkey_lib::workspace;
 use little_monkey_lib::workspace::WorkspaceRoot;
 
@@ -339,7 +339,7 @@ fn resolve_desktop_stack_names(snapshot: &DesktopTurnSnapshot) -> Result<Vec<Str
     }
     let base =
         crate::stacks_cli::base_dir().ok_or("Could not resolve the knowledge stack directory")?;
-    let configured = little_monkey_lib::stacks::list_impl(&base)?;
+    let configured = little_monkey_lib::knowledge_core::list_impl(&base)?;
     select_desktop_stack_names(
         &snapshot.attached_stack_ids,
         &snapshot.attached_stack_names,
@@ -1361,8 +1361,8 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             sources: Vec::new(),
-            embedding: little_monkey_lib::stacks::EmbeddingSpec {
-                backend: little_monkey_lib::stacks::EmbeddingBackend::Llama,
+            embedding: little_monkey_lib::knowledge_core::EmbeddingSpec {
+                backend: little_monkey_lib::knowledge_core::EmbeddingBackend::Llama,
                 model_id_or_tag: "embed".to_string(),
                 dim: 768,
                 query_prefix: String::new(),
