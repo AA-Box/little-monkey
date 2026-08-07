@@ -209,6 +209,7 @@ pub mod stacks;
 // `pub` so `monkey-cli` (slice 4) can reuse `load_impl`/`PromptEntry` directly,
 // the same reasoning as `rules`/`checkpoints` above.
 pub mod prompts;
+mod login_path;
 mod sessions;
 mod system;
 mod terminal;
@@ -718,6 +719,10 @@ impl Default for AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before anything else, and before any thread exists: a GUI launch hands us
+    // launchd's `PATH`, so every shell tool would miss the user's own binaries
+    // (`~/.local/bin`, Homebrew, version-manager shims) until this runs.
+    login_path::hydrate();
     let app_data_dir = app_paths::data_dir()
         .expect("the operating system must provide an application data directory");
     // Installed before anything that can refuse an outbound request, and the only
