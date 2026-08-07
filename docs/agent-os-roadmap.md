@@ -3102,13 +3102,7 @@ a failure.
 **Blocks:** nothing hard — but without it "context" is the one resource the
 system does not manage, and it is the resource agents consume most.
 
-## K12. Tamper-evident unified event log
-
-**Today:** `run_ledger.rs` (~3k lines) records run events, checkpoints record
-mutating turns, Run Capsules export redacted replayable records, Security
-Doctor audits local posture, and periodic screenshots land in the ledger for
-Control Desktop sessions. Coverage is broad but per-subsystem, and the log is
-append-only by convention rather than by construction.
+## K12. Tamper-evident unified event log *(partially built)*
 
 **Acceptance:** one event stream every subsystem writes to — desktop, daemon,
 HTTP, ACP, MCP, browser, remote node — hash-chained so a deleted or edited
@@ -3116,6 +3110,85 @@ event is detectable, with each event naming the process (K1) and, for anything
 gated, the exact policy decision that permitted it. A tool call whose
 authorizing decision cannot be produced from the log is a bug. Redaction
 happens on export, never on write.
+
+**This entry's own premise was wrong, and correcting it is what made the work
+tractable.** It said the log is "append-only by convention rather than by
+construction". It is not: migration V1 installs `run_events_forbid_update` and
+`run_events_forbid_delete`, both `RAISE(ABORT, 'run events are append-only')`,
+and four tables hold `ON DELETE RESTRICT` references *into* the event table.
+Nothing in production code ever updates or deletes a run event — the only such
+statements in the tree are inside a `#[cfg(test)]` block that drops a trigger on
+purpose. So the precondition for a hash chain was already satisfied; what was
+missing was detection for the case that survives the triggers, which is a holder
+of the connection dropping them.
+
+**Shipped — migration V9 hash-chains the run event stream.**
+
+- Each event's hash covers **every column** of its row bound to its
+  predecessor's hash, so editing any field breaks the chain at that event. The
+  pre-existing `load_events` revalidation only catches a payload that stops being
+  *valid protocol*; a plausible, well-formed replacement — an event's timestamp
+  moved by a minute — passed it silently and does not now.
+- Fields are **length-prefixed, not concatenated**. Concatenation is ambiguous:
+  `("ab", "c")` and `("a", "bc")` are the same bytes, so a naive join would let
+  one event be rewritten as a different event with an unchanged hash. An absent
+  optional field and an empty one likewise carry a presence tag, so `actor_id =
+  NULL` cannot be rewritten to `actor_id = ''` for free.
+- **Deliberately no backfill, and this is the load-bearing decision.** Hashing
+  the rows already on disk would compute a chain over whatever they currently say
+  and then certify it — laundering an edit made *before* chaining existed into a
+  valid chain, and asserting an integrity property the feature does not have. Both
+  columns are nullable, `NULL` means "outside the chain's coverage", and the
+  verifier reports where coverage begins instead of implying sequence 1.
+- **Two SQL triggers make the linkage structural**, so it holds against a writer
+  that never goes through Rust: an event must carry its predecessor's hash, and a
+  chained run cannot append an unchained event. SQLite cannot compute SHA-256, so
+  the hash's *content* is the verifier's job; "points at its predecessor" is the
+  database's.
+- **Tail truncation is caught by a second, independent route.** Deleting the
+  newest events leaves every surviving hash correct and every link intact, so the
+  chain alone cannot see it — but `runs.last_sequence` is maintained by the
+  `run_events_project_run` trigger, so the run still claims events that are gone,
+  and concealing that requires a second edit to a different table.
+- **What it cannot detect, stated rather than glossed:** removal of the entire
+  covered range. A per-run chain has no anchor outside the database that holds it.
+  An integrity claim that overstates itself is worse than none, so
+  `ChainVerification` is a tagged union — a caller cannot read a coverage range
+  off a broken chain and present it as verified.
+
+Reachable as `monkey security verify-run-chain <run-id>`, which exits non-zero on
+a broken chain so a scripted check cannot pass by printing bad news.
+
+**Remaining, and the recon turned up more than the entry implied:**
+
+- **"One event stream every subsystem writes to" is the large half.** Today
+  exactly two functions insert run events, and 46 production call sites funnel
+  through them — but **HTTP (`server.rs`, `m3_http_server.rs`), MCP (`mcp.rs`) and
+  the browser worker write no events at all**, and ACP is a read-only consumer. An
+  HTTP request, an MCP tool call and a browser action are simply not represented.
+  Separate stores also hold gating-relevant records with no join to the run
+  stream: `daemon_scheduler_decisions` and `remote_audit` in their own database
+  files, and `egress_denials`, which records denials only — **an allowed egress
+  produces no row anywhere** — and ring-buffers itself on every insert.
+- **Per-event process identity does not exist, and the gap is structural.**
+  `run_events` has no process column, and the envelope's `emitter` is a
+  `ClientIdentity` naming a client *class* (`Desktop`/`Cli`/`Daemon`/…), not a K1
+  process. It cannot be recovered by joining, either: `agent_processes.run_id` is
+  not unique, because a run legitimately owns many processes.
+- **Redaction currently happens on write, contradicting the acceptance
+  directly.** `durable_run.rs`'s `redacted_tool_arguments` redacts before the
+  envelope is appended, and `permissions.rs` substitutes a fixed sentence for
+  classifier text at write time. Export-side redaction already exists separately
+  in `runCapsule.ts`. Moving the boundary is a behaviour change to the CLI path,
+  not a refactor.
+- Approvals *are* joinable at event granularity — three FKs onto
+  `run_events(run_id, sequence)` — but `approval_chain_stage_decisions` is not
+  (deliberately: a chain can gate a future action with no run yet), and
+  `ToolStarted` carries no reference to its authorizing decision. Worse, every
+  permission event is gated on `durable_run_exists`, so **a tool call outside a
+  ledger-registered run produces no permission event and no approval row at
+  all** — which is exactly the "authorizing decision cannot be produced from the
+  log" bug the acceptance names.
 
 **Blocks:** K21 — conformance needs evidence that cannot be quietly edited.
 
