@@ -495,6 +495,89 @@ export type TraceEvent =
   | { kind: "load"; timing: LoadTiming; offload: OffloadPlacementSummary | null; memory: MemoryFootprint | null }
   | { kind: "request"; timing: RequestTiming; sampler: SamplerStats; tokens: TokenTiming };
 
+/**
+ * Mirrors the Rust `benchmark::TraceFieldNote` usage: a field this run could not
+ * populate, and why. The panel renders the reason instead of the number, so a
+ * gap can never be mistaken for a zero.
+ */
+export interface BenchmarkFieldNote {
+  field: string;
+  reason: string;
+}
+
+/** Mirrors `benchmark::Spread`. `stddev` is null for a single repeat — one
+ * observation has no spread, and `0` would read as "perfectly repeatable". */
+export interface BenchmarkSpread {
+  n: number;
+  min: number;
+  median: number;
+  max: number;
+  stddev: number | null;
+}
+
+/** Mirrors `benchmark::SampleTimings`. */
+export interface BenchmarkSampleTimings {
+  totalMs: number;
+  timeToFirstTokenMs: number | null;
+  decodeMs: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  error: string | null;
+  unavailable: BenchmarkFieldNote[];
+}
+
+/** Mirrors `benchmark::SampleReport`. */
+export interface BenchmarkSample {
+  repeat: number;
+  warmup: boolean;
+  timings: BenchmarkSampleTimings;
+  decodeTokensPerSecond: number | null;
+}
+
+/**
+ * Mirrors `benchmark::PeakMemory`. The two fields are deliberately distinct:
+ * `processLifetimePeakBytes` is the runtime process's high-water mark, which
+ * bounds this run's peak, and `runPeakBytes` is set only when this run is what
+ * raised it. Rendering the bound as the run's peak would attribute an earlier
+ * request's memory to this benchmark.
+ */
+export interface BenchmarkPeakMemory {
+  processLifetimePeakBytes: number | null;
+  beforeBytes: number | null;
+  runPeakBytes: number | null;
+  unavailable: BenchmarkFieldNote[];
+}
+
+/** Mirrors `benchmark::BenchmarkReport`. */
+export interface BenchmarkReport {
+  schemaVersion: number;
+  runtimeId: string;
+  model: string;
+  quantization: string | null;
+  maxOutputTokens: number;
+  repeatsRequested: number;
+  warmupDiscarded: number;
+  samples: BenchmarkSample[];
+  timeToFirstTokenMs: BenchmarkSpread | null;
+  decodeTokensPerSecond: BenchmarkSpread | null;
+  peakMemory: BenchmarkPeakMemory;
+  unavailable: BenchmarkFieldNote[];
+}
+
+/** Mirrors the Rust `M3BenchmarkResponse`. */
+export interface BenchmarkRunResponse {
+  report: BenchmarkReport;
+  hardware: HardwareSnapshot;
+}
+
+export interface BenchmarkRunRequest {
+  runtimeId: string;
+  model: string;
+  prompt: string | null;
+  maxOutputTokens: number;
+  repeats: number;
+}
+
 export interface RuntimeTraceRecord {
   schemaVersion: number;
   traceId: string;
@@ -1098,6 +1181,12 @@ export const runtimeHubClient = {
   hardwareProfile: () => invoke<HardwareProfile>("m3_hardware_profile"),
   hardwareCompatibilityReport: () =>
     invoke<M3HardwareCompatibilityReport>("m3_hardware_compatibility_report"),
+  benchmarkRun: (operationId: string, request: BenchmarkRunRequest, timeoutMs?: number) =>
+    invoke<BenchmarkRunResponse>("m3_benchmark_run", {
+      operationId,
+      timeoutMs: timeoutMs ?? null,
+      request,
+    }),
   storageStatus: () => invoke<M3StorageStatus>("m3_storage_status"),
   installedModels: () => invoke<M3InstalledModel[]>("m3_installed_models"),
   catalogSources: () => invoke<M3CatalogSourceConfig[]>("m3_catalog_sources"),
