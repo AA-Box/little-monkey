@@ -11,6 +11,7 @@ import { RuntimeHubApi } from "./runtimeHub/RuntimeHubApi";
 import { RuntimeHubCompatibilityMatrix } from "./runtimeHub/RuntimeHubCompatibilityMatrix";
 import { RuntimeHubLan } from "./runtimeHub/RuntimeHubLan";
 import { RuntimeHubTelemetry } from "./runtimeHub/RuntimeHubTelemetry";
+import { RuntimeHubBenchmark } from "./runtimeHub/RuntimeHubBenchmark";
 import { RuntimeHubAgents } from "./runtimeHub/RuntimeHubAgents";
 import { RuntimeHubQuantization } from "./runtimeHub/RuntimeHubQuantization";
 import { RuntimeHubUpstreamWatcher } from "./runtimeHub/RuntimeHubUpstreamWatcher";
@@ -26,6 +27,7 @@ const SECTIONS: Array<{ id: RuntimeHubSection; label: string }> = [
   { id: "compatibility", label: "Compatibility" },
   { id: "lan", label: "LAN" },
   { id: "telemetry", label: "Telemetry" },
+  { id: "benchmark", label: "Benchmark" },
   { id: "agents", label: "Agents" },
   { id: "upstream-watcher", label: "Upstream Watcher" },
 ];
@@ -119,6 +121,7 @@ export function RuntimeHubPanel() {
           {section === "compatibility" && <RuntimeHubCompatibilityMatrix />}
           {section === "lan" && <RuntimeHubLan />}
           {section === "telemetry" && <RuntimeHubTelemetry />}
+          {section === "benchmark" && <RuntimeHubBenchmark />}
           {section === "agents" && <RuntimeHubAgents />}
           {section === "upstream-watcher" && <RuntimeHubUpstreamWatcher />}
         </>
