@@ -2432,6 +2432,16 @@ mod tests {
             // (256 MiB) — 2.8 MB/s across a loopback socket, and fully buffered
             // by `json()`, so there is no stream for the deadline to truncate.
             ("generation_commands.rs", 2),
+            // 1800s on the hosted image API, and it is (B): the body is
+            // `MAX_IMAGE_BYTES` (32 MiB) of base64 inside a JSON object — 18 KB/s —
+            // and the deadline also covers the provider's own render time, which is
+            // what actually justifies the half hour rather than the transfer. Fully
+            // buffered by `bytes()`, so there is no stream for it to truncate; but
+            // the cap is checked *after* that buffer, so as in `browser_pane.rs` the
+            // deadline is doing the byte cap's job. The sibling ComfyUI client is
+            // not counted here — it bounds silence with `read_timeout` instead,
+            // because its `/history` poll and result download do stream.
+            ("generation_remote.rs", 1),
             // 30s for OAuth token/revocation JSON under a 1 MiB cap (35 KB/s), and
             // 120s on the workflow client — the second is (C): `run_model` posts
             // `"stream": false`, so that budget is a cap on how long a local model
