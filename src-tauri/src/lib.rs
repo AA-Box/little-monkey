@@ -1227,6 +1227,7 @@ pub fn run() {
             knowledge_service::knowledge_v2_background_config_get,
             knowledge_service::knowledge_v2_background_config_save,
             knowledge_service::knowledge_v2_update_chunking,
+            knowledge_service::knowledge_v2_is_stale,
             knowledge_service::knowledge_v2_query,
             knowledge_service::knowledge_v2_cancel_query,
             knowledge_service::knowledge_v2_pii_preview,
