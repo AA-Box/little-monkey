@@ -1087,6 +1087,29 @@ fn audit_sandbox_enforcement(findings: &mut Vec<SecurityFinding>) {
             None,
             None,
         )),
+        // A Warning and not a Pass, for the reason the variant exists: the kernel
+        // holds the process tree, and the filesystem is still wide open. Anyone
+        // reading a green check here would draw exactly the wrong conclusion about
+        // running generated MCP server code.
+        SandboxEnforcement::ProcessContained => findings.push(finding(
+            "isolation.process_contained",
+            "isolation",
+            "Sandboxed runs are contained but not confined",
+            "A job object bounds the run's process count, its committed memory and its reach \
+             across the window station, and kills the whole tree when the run ends — so a \
+             sandboxed command cannot outlive its run or exhaust the machine. It can still read \
+             and write your real files by absolute path: this platform has no filesystem \
+             boundary, and none is claimed.",
+            FindingStatus::Warning,
+            false,
+            None,
+            Some(
+                "Review commands and generated MCP servers before running them here. A \
+                 filesystem boundary on Windows needs a restricted token or an AppContainer, \
+                 both of which must be supplied at process creation — see sandbox_windows.rs \
+                 for what that would take.",
+            ),
+        )),
         SandboxEnforcement::ProcessOnly => findings.push(finding(
             "isolation.process_only",
             "isolation",
@@ -1099,10 +1122,9 @@ fn audit_sandbox_enforcement(findings: &mut Vec<SecurityFinding>) {
             false,
             None,
             Some(
-                "Review commands and generated MCP servers before running them here. OS \
-                 enforcement on this platform (Landlock and seccomp on Linux, a restricted token \
-                 and job object on Windows) is not implemented yet — see K3 in \
-                 docs/agent-os-roadmap.md.",
+                "Review commands and generated MCP servers before running them here. This \
+                 machine reports no boundary at all: on Linux that means a kernel without \
+                 Landlock, and on Windows that a job object could not be created.",
             ),
         )),
         SandboxEnforcement::Unavailable => findings.push(finding(
@@ -1407,6 +1429,9 @@ mod tests {
         // same machine.
         let (expected_id, expected_status) = match crate::sandbox::sandbox_enforcement() {
             SandboxEnforcement::OsEnforced => ("isolation.os_enforced", FindingStatus::Pass),
+            SandboxEnforcement::ProcessContained => {
+                ("isolation.process_contained", FindingStatus::Warning)
+            }
             SandboxEnforcement::ProcessOnly => ("isolation.process_only", FindingStatus::Warning),
             SandboxEnforcement::Unavailable => ("isolation.unavailable", FindingStatus::Warning),
         };

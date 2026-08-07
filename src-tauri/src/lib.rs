@@ -347,6 +347,12 @@ pub mod sandbox;
 // because a stub would just be a second place to claim confinement from.
 #[cfg(target_os = "linux")]
 pub mod sandbox_linux;
+// The Windows half, and a narrower promise than the other two: a job object
+// bounds the run's process tree, committed memory and window-station reach, but
+// no filesystem boundary exists here that does not require this crate owning its
+// own `CreateProcess`. Reported as `ProcessContained`, never `OsSandboxed`.
+#[cfg(target_os = "windows")]
+pub mod sandbox_windows;
 // Local, single-machine "Team, Family, and Organization Mode" (ROADMAP.md
 // Phase 6): a named local profile switcher, capability-checked roles, and a
 // redacted audit export layered over `run_ledger`/`permissions`. See the
