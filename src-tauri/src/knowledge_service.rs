@@ -1364,7 +1364,10 @@ fn remove_source_generation(
     source_id: &str,
 ) -> Result<(), String> {
     let store = GenerationStore::new(root.join("indexes")).map_err(|error| error.to_string())?;
-    let Some(active) = store.active(stack_id).map_err(|error| error.to_string())? else {
+    let Some((active, index)) = store
+        .active_with_index(stack_id)
+        .map_err(|error| error.to_string())?
+    else {
         return Ok(());
     };
     let kept_objects = active
@@ -1381,12 +1384,7 @@ fn remove_source_generation(
         .iter()
         .flat_map(|object| object.chunk_ids.iter().cloned())
         .collect::<BTreeSet<_>>();
-    let entries = store
-        .open_active_index(stack_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "Active Knowledge generation lost its index".to_string())?
-        .entries()
-        .map_err(|error| error.to_string())?;
+    let entries = index.entries().map_err(|error| error.to_string())?;
     let (chunks, vectors): (Vec<_>, Vec<_>) = entries
         .into_iter()
         .filter(|(chunk, _)| kept_chunk_ids.contains(&chunk.chunk_id))
@@ -1970,26 +1968,20 @@ async fn refresh_inner_at(
     }
     let embedding = pipeline_embedding(&stack);
     let ocr_config = load_ocr_config(&root)?;
-    let chunking = ChunkingSpec {
-        strategy_version: crate::knowledge_pipeline::CHUNKER_CONTRACT_VERSION,
-        target_chars: stack.chunk_chars.max(64),
-        overlap_chars: stack.chunk_overlap.min(stack.chunk_chars.saturating_sub(1)),
-        min_chars: 40.min(stack.chunk_chars.max(1)),
-    };
+    let chunking = pipeline_chunking(&stack);
     let pipeline_fingerprint = refresh_pipeline_fingerprint(&chunking, &embedding, &ocr_config)?;
     let generation_store =
         GenerationStore::new(root.join("indexes")).map_err(|error| error.to_string())?;
     let active = generation_store
-        .active(stack_id)
+        .active_with_index(stack_id)
         .map_err(|error| error.to_string())?;
     let previous_snapshots = active
         .as_ref()
-        .map(|active| active.manifest.objects.clone())
+        .map(|(active, _)| active.manifest.objects.clone())
         .unwrap_or_default();
-    let previous_entries = generation_store
-        .open_active_index(stack_id)
-        .map_err(|error| error.to_string())?
-        .map(|index| index.entries())
+    let previous_entries = active
+        .as_ref()
+        .map(|(_, index)| index.entries())
         .transpose()
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
@@ -2168,7 +2160,7 @@ async fn refresh_inner_at(
     let generation_id = Uuid::new_v4().to_string();
     let parent_generation_id = active
         .as_ref()
-        .map(|active| active.manifest.generation_id.clone());
+        .map(|(active, _)| active.manifest.generation_id.clone());
     let build = GenerationBuild {
         draft: GenerationDraft {
             stack_id: stack_id.to_string(),
@@ -2307,6 +2299,15 @@ fn refresh_pipeline_fingerprint(
     ))
 }
 
+fn pipeline_chunking(stack: &KnowledgeStack) -> ChunkingSpec {
+    ChunkingSpec {
+        strategy_version: crate::knowledge_pipeline::CHUNKER_CONTRACT_VERSION,
+        target_chars: stack.chunk_chars.max(64),
+        overlap_chars: stack.chunk_overlap.min(stack.chunk_chars.saturating_sub(1)),
+        min_chars: 40.min(stack.chunk_chars.max(1)),
+    }
+}
+
 fn pipeline_embedding(stack: &KnowledgeStack) -> PipelineEmbeddingSpec {
     PipelineEmbeddingSpec {
         contract_version: EMBEDDING_CONTRACT_VERSION,
@@ -2320,6 +2321,127 @@ fn pipeline_embedding(stack: &KnowledgeStack) -> PipelineEmbeddingSpec {
         document_prefix: stack.embedding.doc_prefix.clone(),
         normalized: true,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Read-only staleness probe
+// ---------------------------------------------------------------------------
+
+/// What a *read-only, no-network* probe can honestly say about whether a v2
+/// stack's active generation still reflects its configuration and its sources.
+///
+/// v1's equivalent (`stacks_is_stale`) is a `bool`, which it can afford: every
+/// v1 source is a local path, so an mtime walk is a complete answer. v2 sources
+/// include GitHub repos, S3 buckets, Notion, Slack and Jira, and their change
+/// detection lives in `refresh_inner_at`'s content-hash/fingerprint comparison —
+/// whose inputs only exist *after* `collect_source_objects` has fetched
+/// everything over the network. `KnowledgeSource::cursor` does hold a real
+/// upstream cursor (a commit SHA, an ETag map, a high-water timestamp) for the
+/// connectors that have one, but comparing it to upstream is itself an API call.
+/// So a synchronous answer for a remote source would either do network I/O
+/// behind a badge render or make one up: [`Unknown`](Self::Unknown) is the third
+/// real state instead, and the UI is expected to render it as "unknown", never
+/// as "fresh".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KnowledgeV2Staleness {
+    /// No active generation: nothing has been indexed, so nothing is stale.
+    /// Matches v1's `indexed_at == None` case.
+    NotIndexed,
+    /// Nothing detectable without network I/O has changed, and every enabled
+    /// source is local — so this is a complete answer, not a partial one.
+    Fresh,
+    /// The chunking, embedding or OCR configuration no longer matches the one
+    /// the active generation was built with. Free to detect (a manifest field
+    /// against a recomputed fingerprint) and definitive: the next refresh
+    /// re-extracts and re-embeds every object.
+    StalePipeline,
+    /// A local source (`LocalFile`/`LocalFolder`/`Project`/`WatchedFolder`) has
+    /// a file with an mtime after the active generation was created, or can no
+    /// longer be `stat`-ed at all.
+    StaleSources,
+    /// Nothing locally detectable changed, but at least one enabled source is a
+    /// remote connector whose upstream state cannot be compared without network
+    /// I/O. Neither "fresh" nor "stale" is a true statement about this stack.
+    Unknown,
+}
+
+/// Three tiers, cheapest first, and the first definite answer wins — a stack
+/// with both a changed embedding model and remote sources is stale, not unknown.
+///
+/// Deliberately reads the manifest through `active_manifest` rather than
+/// `active`: the panel fans this out across every indexed stack on mount, and
+/// `active` opens the hybrid index, which revalidates every stored chunk.
+pub fn v2_staleness_impl(app_data: &Path, stack_id: &str) -> Result<KnowledgeV2Staleness, String> {
+    validate_id("stack id", stack_id)?;
+    let root = data_root_at(app_data)?;
+    let store = GenerationStore::new(root.join("indexes")).map_err(|error| error.to_string())?;
+    let Some(active) = store
+        .active_manifest(stack_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(KnowledgeV2Staleness::NotIndexed);
+    };
+
+    // Tier 1: free, no I/O beyond the small config files.
+    let stack = crate::stacks::list_impl(&app_data.join("stacks"))?
+        .into_iter()
+        .find(|stack| stack.id == stack_id)
+        .ok_or_else(|| "Knowledge stack not found".to_string())?;
+    let fingerprint = refresh_pipeline_fingerprint(
+        &pipeline_chunking(&stack),
+        &pipeline_embedding(&stack),
+        &load_ocr_config(&root)?,
+    )?;
+    if active.manifest.pipeline_fingerprint != fingerprint {
+        return Ok(KnowledgeV2Staleness::StalePipeline);
+    }
+
+    // Tiers 2 and 3: an mtime walk for local connectors — the same walk v1's
+    // `is_stale_impl` does, against the generation's creation time instead of
+    // `KnowledgeStack::indexed_at` — and no answer at all for remote ones.
+    let sources = {
+        let _guard = catalog_lock()
+            .lock()
+            .map_err(|_| "Knowledge catalog lock poisoned".to_string())?;
+        load_catalog(&root)?.sources
+    };
+    let mut unknown = false;
+    for source in sources
+        .iter()
+        .filter(|source| source.stack_id == stack_id && source.enabled)
+    {
+        match local_source_path(&source.connector) {
+            Some(path) => {
+                if crate::knowledge_core::source_has_newer_mtime(
+                    Path::new(path),
+                    active.manifest.created_unix_ms,
+                ) {
+                    return Ok(KnowledgeV2Staleness::StaleSources);
+                }
+            }
+            None => unknown = true,
+        }
+    }
+    Ok(if unknown {
+        KnowledgeV2Staleness::Unknown
+    } else {
+        KnowledgeV2Staleness::Fresh
+    })
+}
+
+/// Read-only staleness probe for one v2 stack — see [`KnowledgeV2Staleness`]
+/// for what each answer means and why "unknown" is one of them.
+#[tauri::command]
+pub fn knowledge_v2_is_stale(
+    app: AppHandle,
+    stack_id: String,
+) -> Result<KnowledgeV2Staleness, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
+    v2_staleness_impl(&app_data, &stack_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -6733,13 +6855,14 @@ mod tests {
     /// `vectors.bin`. `registry_dim` is separate from `header_dim` so the
     /// dimension-disagreement state can be built without hand-rolling the rest.
     /// `source_root` is the stack's one v1 source, the folder every row's
-    /// `source_path` must sit under — the import attributes rows to sources by
-    /// path, so a fixture whose rows live outside it is a fixture of a damaged
-    /// v1 index.
+    /// `source_path` must sit under (or, for `source_kind: "file"`, the one path
+    /// every row must *be*) — the import attributes rows to sources by path, so a
+    /// fixture whose rows live outside it is a fixture of a damaged v1 index.
     fn write_v1_stack_rooted(
         app_data: &Path,
         stack_id: &str,
         source_root: &str,
+        source_kind: &str,
         registry_dim: u32,
         header_dim: u32,
         rows: &[crate::stacks::ChunkMeta],
@@ -6751,7 +6874,7 @@ mod tests {
         let registry = json!([{
             "id": stack_id,
             "name": "Imported stack",
-            "sources": [{ "path": source_root, "kind": "folder" }],
+            "sources": [{ "path": source_root, "kind": source_kind }],
             "embedding": {
                 "backend": "ollama",
                 "model_id_or_tag": "nomic-embed-text",
@@ -6796,6 +6919,7 @@ mod tests {
             app_data,
             stack_id,
             "/docs",
+            "folder",
             registry_dim,
             header_dim,
             rows,
@@ -7435,6 +7559,7 @@ mod tests {
             &app_data,
             stack_id,
             docs.to_str().unwrap(),
+            "folder",
             4,
             4,
             &[row],
@@ -7683,5 +7808,276 @@ mod tests {
         fs::write(&path, b"LMVC").unwrap();
         assert!(read_v1_vectors(&path).unwrap_err().contains("truncated"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    // --- read-only staleness probe ---------------------------------------
+
+    /// Publishes an active generation for `stack_id` over one local source,
+    /// carrying the fingerprint the *live* configuration computes.
+    ///
+    /// The import path alone is not enough: an imported generation deliberately
+    /// carries a sentinel fingerprint no real configuration can equal (see
+    /// [`V1_IMPORT_FINGERPRINT_PREIMAGE`]), so a probe against it always stops at
+    /// the fingerprint tier. This republishes the imported generation's own
+    /// chunks under the live fingerprint, which is what a real refresh leaves
+    /// behind, without needing an embedding server.
+    fn publish_current_generation(
+        app_data: &Path,
+        stack_id: &str,
+        source_path: &str,
+        source_kind: &str,
+    ) {
+        let row_path = if source_kind == "file" {
+            source_path.to_string()
+        } else {
+            format!("{source_path}/alpha.md")
+        };
+        let mut row = v1_row(&row_path, 0, "alpha chunk text");
+        row.content_hash = sha256(b"alpha chunk text");
+        write_v1_stack_rooted(
+            app_data,
+            stack_id,
+            source_path,
+            source_kind,
+            4,
+            4,
+            &[row],
+            &[vec![0.5, 0.5, 0.5, 0.5]],
+        );
+        let imported = import_v1_generation_impl(app_data, stack_id).unwrap();
+
+        let root = data_root_at(app_data).unwrap();
+        let store = GenerationStore::new(root.join("indexes")).unwrap();
+        let (active, index) = store.active_with_index(stack_id).unwrap().unwrap();
+        let (chunks, vectors): (Vec<_>, Vec<_>) = index.entries().unwrap().into_iter().unzip();
+        let stack = crate::stacks::list_impl(&app_data.join("stacks"))
+            .unwrap()
+            .into_iter()
+            .find(|stack| stack.id == stack_id)
+            .unwrap();
+        let fingerprint = refresh_pipeline_fingerprint(
+            &pipeline_chunking(&stack),
+            &pipeline_embedding(&stack),
+            &load_ocr_config(&root).unwrap(),
+        )
+        .unwrap();
+        let objects = active
+            .manifest
+            .objects
+            .iter()
+            .cloned()
+            .map(|mut object| {
+                object.pipeline_fingerprint = fingerprint.clone();
+                object
+            })
+            .collect();
+        let build = GenerationBuild {
+            draft: GenerationDraft {
+                stack_id: stack_id.to_string(),
+                generation_id: Uuid::new_v4().to_string(),
+                parent_generation_id: Some(imported.generation_id),
+                created_unix_ms: now_ms(),
+                pipeline_fingerprint: fingerprint,
+                embedding_spec: active.manifest.embedding_spec.clone(),
+                objects,
+            },
+            chunks,
+            vectors,
+        };
+        let staged = store
+            .stage(
+                &build,
+                &PipelineLimits::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        store.activate(staged, &CancellationToken::new()).unwrap();
+        assert_eq!(
+            v2_staleness_impl(app_data, stack_id).unwrap(),
+            KnowledgeV2Staleness::Fresh,
+            "the fixture must start out fresh, or nothing below means anything"
+        );
+    }
+
+    /// A source folder holding one indexable file, plus its stack, published.
+    fn published_stack_with_folder(app_data: &Path, stack_id: &str) -> PathBuf {
+        let docs = app_data.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("doc.txt"), "hello").unwrap();
+        publish_current_generation(app_data, stack_id, docs.to_str().unwrap(), "folder");
+        docs
+    }
+
+    /// Long enough that a following write lands on a strictly later mtime.
+    fn wait_for_a_later_mtime() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    #[test]
+    fn v2_staleness_is_not_indexed_without_an_active_generation() {
+        let app_data = temporary_root("stale-not-indexed");
+        let stack_id = "stack-stale-none";
+        write_v1_stack_4d(
+            &app_data,
+            stack_id,
+            &[v1_row("/docs/alpha.md", 0, "alpha chunk text")],
+            &[vec![0.5, 0.5, 0.5, 0.5]],
+        );
+        // v1's `indexed_at == None` case: nothing has been indexed, so nothing
+        // can be out of date.
+        assert_eq!(
+            v2_staleness_impl(&app_data, stack_id).unwrap(),
+            KnowledgeV2Staleness::NotIndexed
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn v2_staleness_is_stale_when_a_local_source_is_missing() {
+        let app_data = temporary_root("stale-missing");
+        let stack_id = "stack-stale-missing";
+        let docs = published_stack_with_folder(&app_data, stack_id);
+        fs::remove_dir_all(&docs).unwrap();
+        // An unstat-able source counts as stale, exactly as in v1: a broken
+        // source surfaces through the badge instead of being silently skipped.
+        assert_eq!(
+            v2_staleness_impl(&app_data, stack_id).unwrap(),
+            KnowledgeV2Staleness::StaleSources
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn v2_staleness_is_fresh_when_the_source_file_predates_the_generation() {
+        let app_data = temporary_root("stale-predates");
+        let stack_id = "stack-stale-predates";
+        let file = app_data.join("doc.txt");
+        fs::write(&file, "hello").unwrap();
+        publish_current_generation(&app_data, stack_id, file.to_str().unwrap(), "file");
+        assert_eq!(
+            v2_staleness_impl(&app_data, stack_id).unwrap(),
+            KnowledgeV2Staleness::Fresh
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn v2_staleness_is_stale_when_the_source_file_is_modified_after_the_generation() {
+        let app_data = temporary_root("stale-modified");
+        let stack_id = "stack-stale-modified";
+        let file = app_data.join("doc.txt");
+        fs::write(&file, "hello").unwrap();
+        publish_current_generation(&app_data, stack_id, file.to_str().unwrap(), "file");
+        wait_for_a_later_mtime();
+        fs::write(&file, "hello again, changed").unwrap();
+        assert_eq!(
+            v2_staleness_impl(&app_data, stack_id).unwrap(),
+            KnowledgeV2Staleness::StaleSources
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn v2_staleness_ignores_a_touched_file_with_a_non_indexable_extension() {
+        let app_data = temporary_root("stale-extension");
+        let stack_id = "stack-stale-extension";
+        let docs = published_stack_with_folder(&app_data, stack_id);
+        wait_for_a_later_mtime();
+        // Indexing would never look at this file, so it must not flip the badge.
+        fs::write(docs.join("screenshot.png"), [0u8; 16]).unwrap();
+        assert_eq!(
+            v2_staleness_impl(&app_data, stack_id).unwrap(),
+            KnowledgeV2Staleness::Fresh
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn v2_staleness_ignores_an_oversized_touched_file() {
+        let app_data = temporary_root("stale-oversized");
+        let stack_id = "stack-stale-oversized";
+        let docs = published_stack_with_folder(&app_data, stack_id);
+        wait_for_a_later_mtime();
+        fs::write(
+            docs.join("huge.txt"),
+            vec![b'x'; (crate::knowledge_core::MAX_FILE_BYTES + 1) as usize],
+        )
+        .unwrap();
+        assert_eq!(
+            v2_staleness_impl(&app_data, stack_id).unwrap(),
+            KnowledgeV2Staleness::Fresh
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn v2_staleness_still_flags_a_genuinely_indexable_change_in_a_folder() {
+        let app_data = temporary_root("stale-real-change");
+        let stack_id = "stack-stale-real";
+        let docs = published_stack_with_folder(&app_data, stack_id);
+        wait_for_a_later_mtime();
+        fs::write(docs.join("doc.txt"), "hello again, changed").unwrap();
+        assert_eq!(
+            v2_staleness_impl(&app_data, stack_id).unwrap(),
+            KnowledgeV2Staleness::StaleSources
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn v2_staleness_is_stale_when_the_pipeline_configuration_changed() {
+        let app_data = temporary_root("stale-fingerprint");
+        let stack_id = "stack-stale-fingerprint";
+        published_stack_with_folder(&app_data, stack_id);
+        // v2 only: a chunking change nothing on disk reflects. Free to detect and
+        // definitive — the next refresh re-extracts and re-embeds everything.
+        crate::stacks::update_chunking_impl(&app_data.join("stacks"), stack_id, 900, 100).unwrap();
+        assert_eq!(
+            v2_staleness_impl(&app_data, stack_id).unwrap(),
+            KnowledgeV2Staleness::StalePipeline
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn v2_staleness_is_unknown_for_a_remote_source_but_never_hides_a_local_change() {
+        let app_data = temporary_root("stale-remote");
+        let stack_id = "stack-stale-remote";
+        let docs = published_stack_with_folder(&app_data, stack_id);
+        let root = data_root_at(&app_data).unwrap();
+        let mut catalog = load_catalog(&root).unwrap();
+        catalog.sources.push(KnowledgeSource {
+            id: Uuid::new_v4().to_string(),
+            stack_id: stack_id.to_string(),
+            label: "Notion".into(),
+            enabled: true,
+            connector: ConnectorConfig::NotionPages {
+                connector_account_id: "account-1".into(),
+                root_id: "page-1".into(),
+            },
+            cursor: Some("2026-01-01T00:00:00.000Z".into()),
+            checkpoint: None,
+            last_refresh_at_ms: None,
+            last_error: None,
+            objects: Vec::new(),
+            retries: Vec::new(),
+        });
+        save_catalog(&root, &catalog).unwrap();
+
+        // The cursor is right there, and comparing it to Notion still costs an
+        // API call — so the answer is "unknown", not "fresh".
+        assert_eq!(
+            v2_staleness_impl(&app_data, stack_id).unwrap(),
+            KnowledgeV2Staleness::Unknown
+        );
+
+        // A definite local answer outranks the remote unknown.
+        wait_for_a_later_mtime();
+        fs::write(docs.join("doc.txt"), "hello again, changed").unwrap();
+        assert_eq!(
+            v2_staleness_impl(&app_data, stack_id).unwrap(),
+            KnowledgeV2Staleness::StaleSources
+        );
+        fs::remove_dir_all(app_data).unwrap();
     }
 }

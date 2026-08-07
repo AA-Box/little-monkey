@@ -6466,8 +6466,15 @@ mod tests {
         let port = blocker.local_addr().unwrap().port();
         let path = temp_config_path();
 
+        // Generous on purpose. This bound exists to turn a hang into a failing
+        // test, not to assert how fast a refused bind comes back — a working
+        // `run_cli_server` returns its `Err` immediately, so a wide timeout costs
+        // a passing run nothing. Two seconds flaked on a loaded windows-latest
+        // runner (`Elapsed(())`, on a job that took nine minutes) while develop
+        // stayed green on the same code, which is the signature of a deadline
+        // measuring the runner rather than the behaviour under test.
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(30),
             run_cli_server(port, path.clone(), Vec::new),
         )
         .await
