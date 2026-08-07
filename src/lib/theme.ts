@@ -202,6 +202,21 @@ export function applyAppearance(settings: unknown = {}, options: ApplyAppearance
   return resolvedTheme;
 }
 
+/** The theme actually painted on `<html data-theme>`, which already folds in
+ * device preference, workspace overrides and the OS setting — for the rare
+ * component that has to pick a non-CSS value (a JS syntax-highlighting theme,
+ * a canvas colour) rather than a CSS variable. */
+export function useAppliedTheme(): Theme {
+  return useSyncExternalStore<Theme>(subscribeToAppliedTheme, getStoredTheme, () => "light");
+}
+
+function subscribeToAppliedTheme(callback: () => void): () => void {
+  if (typeof document === "undefined" || typeof MutationObserver !== "function") return () => {};
+  const observer = new MutationObserver(callback);
+  observer.observe(document.documentElement, { attributeFilter: ["data-theme"] });
+  return () => observer.disconnect();
+}
+
 export function subscribeToSystemTheme(callback: () => void): () => void {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") return () => {};
   const query = window.matchMedia("(prefers-color-scheme: dark)");
