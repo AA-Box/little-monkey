@@ -610,14 +610,51 @@ fn null_device() -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
+/// Variables `CreateProcessW` itself needs in order to *build* an AppContainer
+/// process, as opposed to variables the sandboxed command wants.
+///
+/// An AppContainer's private storage lives under
+/// `%LOCALAPPDATA%\Packages\<container>`, and the loader resolves that from the
+/// environment block it is handed. Hand it a block without these and process
+/// creation fails with `ERROR_ENVVAR_NOT_FOUND` (203) — the error names exactly
+/// what happened, but it points at `CreateProcessW` rather than at the missing
+/// key, which is a long way from obvious.
+///
+/// `crate::sandbox`'s allowlist deliberately does not carry them: `BASE_ENV_KEYS`
+/// is `PATH` + `SystemRoot`, and `HOME`/`USERPROFILE`/`TMP`/`TEMP` are replaced
+/// with sandbox-owned paths. So they are filled in here, from this process, and
+/// only when a container is actually being created.
+///
+/// Not a hole in the sandbox: these are *strings*, and the container has no grant
+/// on the directories they name, so it cannot read them. The confinement comes
+/// from the DACL, never from the environment.
+const APP_CONTAINER_ENV_KEYS: &[&str] = &["LOCALAPPDATA", "SystemRoot", "USERPROFILE"];
+
 /// `KEY=VALUE\0…\0\0` in UTF-16, which is what `CREATE_UNICODE_ENVIRONMENT`
 /// expects. An empty block would give the child *this* process's environment,
 /// so the caller's allowlist is passed even when it is short.
-fn environment_block(env: &[(String, String)]) -> Vec<u16> {
+///
+/// `extra` is appended only for keys the caller did not already set, so a
+/// sandbox-owned `USERPROFILE` always wins over the real one.
+fn environment_block(env: &[(String, String)], extra: &[&str]) -> Vec<u16> {
     let mut block = Vec::new();
     for (key, value) in env {
         block.extend(OsStr::new(&format!("{key}={value}")).encode_wide());
         block.push(0);
+    }
+    for key in extra {
+        if env
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case(key))
+        {
+            continue;
+        }
+        if let Some(value) = std::env::var_os(key) {
+            block.extend(OsStr::new(key).encode_wide());
+            block.push(u16::from(b'='));
+            block.extend(value.encode_wide());
+            block.push(0);
+        }
     }
     block.push(0);
     block
@@ -762,7 +799,15 @@ fn spawn_confined(
         std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string())
     ));
     let directory = wide_path(workspace_dir);
-    let mut block = environment_block(env);
+    // Only a container needs the extra keys, so a job-object-only run keeps the
+    // caller's allowlist exactly as given.
+    let mut block = environment_block(
+        env,
+        match container.is_some() {
+            true => APP_CONTAINER_ENV_KEYS,
+            false => &[],
+        },
+    );
     let mut process = PROCESS_INFORMATION {
         ..unsafe { std::mem::zeroed() }
     };
