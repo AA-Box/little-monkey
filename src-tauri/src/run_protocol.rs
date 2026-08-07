@@ -765,6 +765,159 @@ pub struct ToolPermissionRule {
     pub decision: ToolPolicyDecision,
 }
 
+/// Maximum entries in any one dimension of an [`EgressAllowlist`].
+///
+/// Small on purpose. A declaration is meant to be readable by whoever approves the
+/// run; a list of hundreds of hosts is not a policy, it is a shrug.
+pub const MAX_EGRESS_ALLOWLIST_ENTRIES: usize = 64;
+
+/// Longest host entry. The DNS limit, so a legal name always fits and a 40 KB
+/// "host" cannot be frozen into a spec.
+pub const MAX_EGRESS_HOST_BYTES: usize = 253;
+
+/// Where a run may send a request: allowed hosts, ports and protocols.
+///
+/// # Absent, empty, and present — the whole safety property is in this distinction
+///
+/// The field that holds this on [`PermissionPolicySnapshot`] is an `Option`, and the
+/// three states are deliberately three:
+///
+/// - **Absent** (`None`, which is what every already-frozen run row on disk says,
+///   because they were written before this field existed): the run declares nothing
+///   about hosts, ports or protocols, and `allow_network` alone governs — exactly
+///   today's behaviour. Retroactively reading those rows as "deny everything" would
+///   refuse every existing and in-flight run, so absence cannot mean deny.
+/// - **Present and empty** (`Some` with an empty `hosts`/`ports`/`protocols`): a
+///   declaration that permits nothing. Deny-all, apart from the loopback exemption
+///   below. This is the *point* of the shape: a submitter that wants a run with no
+///   egress has a way to say so, and it is not spelled the same way as saying
+///   nothing.
+/// - **Present and populated**: deny-by-default *within* the declaration. A host,
+///   port or protocol that is not named is refused, and the three dimensions are
+///   conjunctive — a request must satisfy all three.
+///
+/// # Making a declaration mandatory is a later release's job
+///
+/// The same staged shape D1 used for token families: the mechanism lands first and
+/// is honoured wherever it is declared, and only once submitters have been converted
+/// can absence become an error. Doing it in one step would mean either rewriting
+/// frozen specs — they are frozen for a reason, and no migration here will touch
+/// them — or refusing every run submitted by a build that predates the field.
+///
+/// # What it does not cover
+///
+/// Loopback. A local-inference run legitimately talks to `127.0.0.1`, and reading a
+/// network policy as "no sockets at all" is not a stricter policy but a broken one —
+/// the same exemption, for the same reason, as
+/// [`crate::egress::is_loopback_target`]'s.
+///
+/// Each dimension must be spelled out when the allowlist is present: the three
+/// fields carry no serde default, so `{"hosts": ["api.example.com"]}` is a
+/// deserialization error rather than a silent deny-all on ports. Absence is a
+/// statement at the allowlist level and nowhere else.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressAllowlist {
+    /// Hostnames, or `*.example.com` for "any subdomain of `example.com`".
+    ///
+    /// A wildcard matches at a label boundary only and never the apex, so
+    /// `*.example.com` covers `api.example.com` and does **not** cover
+    /// `example.com` (name it as well if it is wanted) or `evil-example.com`. The
+    /// matcher is [`crate::egress::allowlist_host_matches`].
+    pub hosts: Vec<String>,
+    /// Ports, as the request's effective port — the URL's own, or the scheme's
+    /// default when it omits one. So a run reaching `https://host/` needs `443`
+    /// listed.
+    pub ports: Vec<u16>,
+    /// URL schemes, lowercase (`https`, `http`).
+    pub protocols: Vec<String>,
+}
+
+impl EgressAllowlist {
+    pub fn validate(&self) -> ProtocolValidationResult {
+        for (field, len) in [
+            ("hosts", self.hosts.len()),
+            ("ports", self.ports.len()),
+            ("protocols", self.protocols.len()),
+        ] {
+            if len > MAX_EGRESS_ALLOWLIST_ENTRIES {
+                return Err(ProtocolValidationError::new(
+                    format!("permission_policy.egress_allowlist.{field}"),
+                    format!("contains more than {MAX_EGRESS_ALLOWLIST_ENTRIES} entries"),
+                ));
+            }
+        }
+
+        for host in &self.hosts {
+            validate_egress_host(host)?;
+        }
+        for port in &self.ports {
+            if *port == 0 {
+                return Err(ProtocolValidationError::new(
+                    "permission_policy.egress_allowlist.ports",
+                    "must not contain port 0, which is not a destination",
+                ));
+            }
+        }
+        for protocol in &self.protocols {
+            validate_egress_protocol(protocol)?;
+        }
+        Ok(())
+    }
+}
+
+/// One host entry: a name, or `*.` plus a name.
+///
+/// Lowercase is required rather than folded, so the matcher can compare a
+/// lowercased URL host against these bytes directly and no call site has to
+/// remember to fold. Rejecting mixed case at submission is the earliest and
+/// loudest place to say so.
+fn validate_egress_host(value: &str) -> ProtocolValidationResult {
+    const FIELD: &str = "permission_policy.egress_allowlist.hosts";
+    let name = value.strip_prefix("*.").unwrap_or(value);
+    if name.is_empty() || value.len() > MAX_EGRESS_HOST_BYTES {
+        return Err(ProtocolValidationError::new(
+            FIELD,
+            format!("each entry must name 1..={MAX_EGRESS_HOST_BYTES} bytes of host"),
+        ));
+    }
+    // `:`, `[` and `]` so an IPv6 literal can be named the way `Url::host_str`
+    // spells one, brackets included.
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-._:[]".contains(&byte))
+    {
+        return Err(ProtocolValidationError::new(
+            FIELD,
+            "each entry must be a lowercase host, optionally prefixed with `*.`",
+        ));
+    }
+    if name.starts_with('.') || name.ends_with('.') {
+        return Err(ProtocolValidationError::new(
+            FIELD,
+            "each entry must not start or end with a dot",
+        ));
+    }
+    Ok(())
+}
+
+/// One protocol entry: an RFC 3986 scheme, lowercase, no `://`.
+fn validate_egress_protocol(value: &str) -> ProtocolValidationResult {
+    const FIELD: &str = "permission_policy.egress_allowlist.protocols";
+    let mut bytes = value.bytes();
+    let valid = bytes.next().is_some_and(|first| first.is_ascii_lowercase())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.')
+        });
+    if !valid {
+        return Err(ProtocolValidationError::new(
+            FIELD,
+            "each entry must be a lowercase URL scheme such as `https`",
+        ));
+    }
+    Ok(())
+}
+
 /// Run-scoped permission snapshot. It records decisions and secret-free tool
 /// policy only; transient approval channel handles and credentials never
 /// enter the contract.
@@ -778,6 +931,17 @@ pub struct PermissionPolicySnapshot {
     pub tool_rules: Vec<ToolPermissionRule>,
     pub allow_network: bool,
     pub allow_external_mutations: bool,
+    /// The run's frozen host/port/protocol allowlist — see [`EgressAllowlist`] for
+    /// what absent, empty and present each mean.
+    ///
+    /// `default` so every run row written before this field existed still
+    /// deserializes, and `skip_serializing_if` so a spec that declares nothing
+    /// serializes to the **same bytes** it did before. That second half is not
+    /// cosmetic: `run_ledger` compares the serialized spec byte-for-byte to decide
+    /// whether a resubmission is the same run, so emitting `"egress_allowlist":null`
+    /// would turn every idempotent resubmit of an existing run into a conflict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_allowlist: Option<EgressAllowlist>,
 }
 
 impl PermissionPolicySnapshot {
@@ -810,6 +974,10 @@ impl PermissionPolicySnapshot {
                     "contains duplicate rules for one tool",
                 ));
             }
+        }
+
+        if let Some(allowlist) = &self.egress_allowlist {
+            allowlist.validate()?;
         }
         Ok(())
     }
@@ -1770,6 +1938,7 @@ mod tests {
                 }],
                 allow_network: false,
                 allow_external_mutations: false,
+                egress_allowlist: None,
             },
             budgets: RunBudgets {
                 wall_time_ms: 60_000,
@@ -2268,5 +2437,183 @@ mod tests {
             text: "x".repeat(MAX_EVENT_TEXT_BYTES + 1),
         };
         assert_eq!(event.validate().unwrap_err().field, "event.text");
+    }
+
+    mod egress_allowlist {
+        use super::*;
+
+        /// Exactly what a run row frozen before the field existed contains.
+        ///
+        /// Written out as a **string literal** and not built with `json!`, because the
+        /// claim is about bytes that already exist on disk: a `json!` fixture is built
+        /// from this build's own idea of the shape, so it would keep passing after a
+        /// change that broke every stored row. `deny_unknown_fields` is on this struct,
+        /// so this is also the test that would catch the field being added without a
+        /// `default`.
+        const FROZEN_WITHOUT_THE_FIELD: &str = r#"{
+            "mode": "manual",
+            "unattended": false,
+            "approval_timeout_ms": 60000,
+            "default_tool_decision": "prompt",
+            "tool_rules": [{"tool": "read_file", "decision": "allow"}],
+            "allow_network": false,
+            "allow_external_mutations": false
+        }"#;
+
+        #[test]
+        fn a_policy_frozen_before_the_field_existed_still_deserializes() {
+            let policy: PermissionPolicySnapshot = serde_json::from_str(FROZEN_WITHOUT_THE_FIELD)
+                .expect("every run row already on disk lacks this field and must keep loading");
+            assert_eq!(
+                policy.egress_allowlist, None,
+                "absent must mean absent, not an empty (deny-all) declaration"
+            );
+            policy.validate().expect("an absent allowlist is valid");
+        }
+
+        /// The other half of the compatibility property: a policy that declares
+        /// nothing must serialize to the same bytes it always did. `run_ledger`
+        /// compares the serialized spec byte-for-byte to decide whether a
+        /// resubmission is the same run, so an emitted `"egress_allowlist":null`
+        /// would turn every idempotent resubmit into a conflict.
+        #[test]
+        fn declaring_nothing_adds_no_bytes_to_a_frozen_spec() {
+            let policy: PermissionPolicySnapshot =
+                serde_json::from_str(FROZEN_WITHOUT_THE_FIELD).expect("loads");
+            let reserialized = serde_json::to_string(&policy).expect("serializes");
+            assert!(
+                !reserialized.contains("egress_allowlist"),
+                "an absent allowlist must not appear in the output at all: {reserialized}"
+            );
+        }
+
+        #[test]
+        fn a_declared_allowlist_round_trips() {
+            let mut policy: PermissionPolicySnapshot =
+                serde_json::from_str(FROZEN_WITHOUT_THE_FIELD).expect("loads");
+            policy.egress_allowlist = Some(EgressAllowlist {
+                hosts: vec![
+                    "api.example.com".to_string(),
+                    "*.cdn.example.com".to_string(),
+                ],
+                ports: vec![443],
+                protocols: vec!["https".to_string()],
+            });
+            policy.validate().expect("valid declaration");
+
+            let encoded = serde_json::to_string(&policy).expect("serializes");
+            let decoded: PermissionPolicySnapshot =
+                serde_json::from_str(&encoded).expect("deserializes");
+            assert_eq!(decoded, policy);
+        }
+
+        /// An empty declaration is legal and means deny-all. Pinned because the
+        /// temptation is to validate it as a mistake, which would remove the only way
+        /// a submitter can say "this run sends nothing".
+        #[test]
+        fn an_empty_declaration_is_valid_and_is_not_the_same_as_no_declaration() {
+            let empty = EgressAllowlist::default();
+            empty
+                .validate()
+                .expect("an empty allowlist is a legal policy");
+            assert_ne!(Some(empty), None::<EgressAllowlist>);
+        }
+
+        /// A dimension omitted from a present declaration is an error, not a silent
+        /// deny-all: absence is a statement at the allowlist level and nowhere else.
+        #[test]
+        fn a_declaration_must_name_all_three_dimensions() {
+            let partial = r#"{"hosts": ["api.example.com"]}"#;
+            assert!(serde_json::from_str::<EgressAllowlist>(partial).is_err());
+        }
+
+        #[test]
+        fn each_entry_shape_is_validated_at_submission() {
+            let cases: &[(EgressAllowlist, &str)] = &[
+                (
+                    EgressAllowlist {
+                        hosts: vec!["API.example.com".to_string()],
+                        ports: vec![443],
+                        protocols: vec!["https".to_string()],
+                    },
+                    "permission_policy.egress_allowlist.hosts",
+                ),
+                (
+                    EgressAllowlist {
+                        hosts: vec!["https://api.example.com/v1".to_string()],
+                        ports: vec![443],
+                        protocols: vec!["https".to_string()],
+                    },
+                    "permission_policy.egress_allowlist.hosts",
+                ),
+                (
+                    EgressAllowlist {
+                        hosts: vec!["*.".to_string()],
+                        ports: vec![443],
+                        protocols: vec!["https".to_string()],
+                    },
+                    "permission_policy.egress_allowlist.hosts",
+                ),
+                (
+                    EgressAllowlist {
+                        hosts: vec!["api.example.com".to_string()],
+                        ports: vec![0],
+                        protocols: vec!["https".to_string()],
+                    },
+                    "permission_policy.egress_allowlist.ports",
+                ),
+                (
+                    EgressAllowlist {
+                        hosts: vec!["api.example.com".to_string()],
+                        ports: vec![443],
+                        protocols: vec!["HTTPS".to_string()],
+                    },
+                    "permission_policy.egress_allowlist.protocols",
+                ),
+                (
+                    EgressAllowlist {
+                        hosts: vec!["api.example.com".to_string()],
+                        ports: vec![443],
+                        protocols: vec!["https://".to_string()],
+                    },
+                    "permission_policy.egress_allowlist.protocols",
+                ),
+                (
+                    EgressAllowlist {
+                        hosts: (0..=MAX_EGRESS_ALLOWLIST_ENTRIES)
+                            .map(|index| format!("host{index}.example.com"))
+                            .collect(),
+                        ports: vec![443],
+                        protocols: vec!["https".to_string()],
+                    },
+                    "permission_policy.egress_allowlist.hosts",
+                ),
+            ];
+
+            for (allowlist, field) in cases {
+                assert_eq!(
+                    allowlist.validate().expect_err("must be refused").field,
+                    *field,
+                    "for {allowlist:?}"
+                );
+            }
+        }
+
+        /// The allowlist is validated *through* the policy, so a bad declaration
+        /// cannot be frozen by a submitter that only calls the outer `validate`.
+        #[test]
+        fn a_bad_declaration_fails_the_policy_it_is_declared_on() {
+            let mut policy: PermissionPolicySnapshot =
+                serde_json::from_str(FROZEN_WITHOUT_THE_FIELD).expect("loads");
+            policy.egress_allowlist = Some(EgressAllowlist {
+                hosts: vec!["Api.Example.Com".to_string()],
+                ports: vec![443],
+                protocols: vec!["https".to_string()],
+            });
+            assert_eq!(
+                policy.validate().expect_err("must be refused").field,
+                "permission_policy.egress_allowlist.hosts"
+            );
+        }
     }
 }
