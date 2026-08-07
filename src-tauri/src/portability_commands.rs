@@ -306,7 +306,7 @@ pub struct PortableRestoreRequest {
     pub previous_sessions_payload: String,
     pub prompts_payload: String,
     #[serde(default)]
-    pub stacks: Vec<crate::stacks::KnowledgeStack>,
+    pub stacks: Vec<crate::knowledge_core::KnowledgeStack>,
     pub settings: Option<PortableRestoreSettingsRequest>,
 }
 
@@ -323,7 +323,7 @@ pub struct PendingPortableRestoreSettings {
 #[serde(rename_all = "camelCase")]
 pub struct PortableRestoreOutcome {
     pub transaction_id: String,
-    pub stacks: Vec<crate::stacks::KnowledgeStack>,
+    pub stacks: Vec<crate::knowledge_core::KnowledgeStack>,
     pub profile_counts: crate::profile_store::ProfileCounts,
     pub settings_pending: bool,
 }
@@ -391,7 +391,7 @@ struct PublishedRestore {
     base: PathBuf,
     transaction_root: PathBuf,
     journal: RestoreJournal,
-    stacks: Vec<crate::stacks::KnowledgeStack>,
+    stacks: Vec<crate::knowledge_core::KnowledgeStack>,
 }
 
 fn app_data_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -596,9 +596,9 @@ fn validated_pending_settings(
 fn prepare_stack_registry(
     base: &Path,
     transaction_root: &Path,
-    incoming: Vec<crate::stacks::KnowledgeStack>,
+    incoming: Vec<crate::knowledge_core::KnowledgeStack>,
     replace: bool,
-) -> Result<(Vec<crate::stacks::KnowledgeStack>, Vec<u8>), String> {
+) -> Result<(Vec<crate::knowledge_core::KnowledgeStack>, Vec<u8>), String> {
     let planning_root = transaction_root.join("stack-plan");
     fs::create_dir_all(&planning_root)
         .map_err(|error| format!("Failed to create {}: {error}", planning_root.display()))?;
@@ -607,7 +607,7 @@ fn prepare_stack_registry(
         fs::copy(&current, planning_root.join("index.json"))
             .map_err(|error| format!("Failed to stage {}: {error}", current.display()))?;
     }
-    let stacks = crate::stacks::import_definitions_impl(&planning_root, incoming, replace)?;
+    let stacks = crate::knowledge_core::import_definitions_impl(&planning_root, incoming, replace)?;
     let bytes = read_regular_bounded(&planning_root.join("index.json"), MAX_STACK_REGISTRY_BYTES)?;
     Ok((stacks, bytes))
 }
@@ -2823,13 +2823,13 @@ mod tests {
         .to_string()
     }
 
-    fn stack(id: &str, name: &str) -> crate::stacks::KnowledgeStack {
-        crate::stacks::KnowledgeStack {
+    fn stack(id: &str, name: &str) -> crate::knowledge_core::KnowledgeStack {
+        crate::knowledge_core::KnowledgeStack {
             id: id.to_string(),
             name: name.to_string(),
             sources: Vec::new(),
-            embedding: crate::stacks::EmbeddingSpec {
-                backend: crate::stacks::EmbeddingBackend::Ollama,
+            embedding: crate::knowledge_core::EmbeddingSpec {
+                backend: crate::knowledge_core::EmbeddingBackend::Ollama,
                 model_id_or_tag: "nomic-embed-text".to_string(),
                 dim: 768,
                 query_prefix: "search_query: ".to_string(),
@@ -3097,7 +3097,7 @@ mod tests {
             fs::read_to_string(restore_target(&directory.path, RestoreFileKind::Prompts)).unwrap(),
             expected_prompts
         );
-        let stacks: Vec<crate::stacks::KnowledgeStack> = serde_json::from_slice(
+        let stacks: Vec<crate::knowledge_core::KnowledgeStack> = serde_json::from_slice(
             &fs::read(restore_target(&directory.path, RestoreFileKind::Stacks)).unwrap(),
         )
         .unwrap();

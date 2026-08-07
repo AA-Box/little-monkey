@@ -450,7 +450,7 @@ const V1_IMPORT_FINDING_PREFIX: &str = "knowledge_index.v1_import.";
 
 fn audit_knowledge_index(app_data: &Path, findings: &mut Vec<DiagnosticFinding>) {
     let base = app_data.join("stacks");
-    let stacks = match crate::stacks::list_impl(&base) {
+    let stacks = match crate::knowledge_core::list_impl(&base) {
         Ok(stacks) => stacks,
         Err(error) => {
             findings.push(finding(

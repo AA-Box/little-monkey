@@ -16,13 +16,13 @@
 //! module the roadmap intends to delete. Extracting it here breaks that
 //! dependency *structurally*: nothing in this module needs v1.
 //!
-//! It does **not** yet break it in fact, and the distinction matters to whoever
-//! reads this next. v2's own call sites still spell `crate::stacks::…` and reach
-//! this code through the re-export at the top of `stacks.rs` — 16 sites in
-//! `knowledge_service.rs`, 11 in `portability_commands.rs`, 1 in `diagnostics.rs`
-//! and ~17 across `monkey-cli`. Deleting `stacks.rs` today would break v2 in
-//! every one of them. Repointing those is the next step; only after it can v1 be
-//! deleted without the registry and the embedding path going with it.
+//! It now breaks it in fact too, for the shared items: every call site that
+//! wanted the registry or the embedding path spells `crate::knowledge_core::…` /
+//! `little_monkey_lib::knowledge_core::…` directly, so `stacks.rs`'s re-export
+//! block is no longer load-bearing for any of them. What still reaches through
+//! it is v1 *index* behaviour — `ChunkMeta` (v1's `chunks.jsonl` row type, and
+//! the importer's input type), `query_impl`, `reindex_impl`, `stacks_reindex` —
+//! which is exactly the set that dies with `stacks.rs` rather than moving here.
 //!
 //! What is deliberately NOT here: everything that is an artefact of v1's
 //! *index format* rather than of the registry — `chunks.jsonl`/`vectors.bin`
@@ -153,15 +153,23 @@ pub struct StackQueryResult {
 // Registry I/O
 // ---------------------------------------------------------------------
 
-/// Resolves (and creates) `<app_data>/stacks`, the directory every `*_impl`
-/// here takes as its `base`. The one `AppHandle`-dependent function in this
-/// module — see the module doc for why the split is drawn here.
-pub(crate) fn stacks_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
+/// The app-data directory both index generations hang off of: v1's registry and
+/// `chunks.jsonl`/`vectors.bin` live under `<app_data>/stacks`, v2's catalog and
+/// generations under `<app_data>/knowledge-v2`. `monkey-cli` resolves the same
+/// path `AppHandle`-free via `app_paths::data_dir`, which is why every `*_impl`
+/// and `*_at` entry point takes a plain `&Path` and only the thin Tauri wrappers
+/// call this.
+pub(crate) fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
         .app_data_dir()
-        .map_err(|e| format!("Failed to resolve app data dir: {e}"))?
-        .join("stacks");
+        .map_err(|e| format!("Failed to resolve app data dir: {e}"))
+}
+
+/// Resolves (and creates) `<app_data>/stacks`, the directory every `*_impl`
+/// here takes as its `base`. One of the two `AppHandle`-dependent functions in
+/// this module — see the module doc for why the split is drawn here.
+pub(crate) fn stacks_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app_data_dir(app)?.join("stacks");
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create stacks dir: {e}"))?;
     Ok(dir)
 }
