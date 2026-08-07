@@ -48,6 +48,15 @@ const MAX_LORAS: usize = 32;
 /// A 15 s 2K clip with audio stays far under this; it exists so a runaway
 /// server response can never be buffered without bound.
 const MAX_MEDIA_BYTES: usize = 256 * 1024 * 1024;
+/// Images one request may ask for. The engine samples a batch serially, so a
+/// large count is a long run rather than a parallel one; this keeps a
+/// mistyped number from turning into an hour of sampling.
+const MAX_BATCH_COUNT: u32 = 8;
+/// Layers `llama-tts` is asked to put on the GPU. Speech backbones are around
+/// a billion parameters, so "all of them" fits everywhere the flag does
+/// anything, and llama.cpp clamps the number to the layers a model actually
+/// has rather than erroring on an overshoot.
+const SPEECH_GPU_LAYERS: u32 = 999;
 /// Weights are tens of gigabytes and are read lazily from disk on first use,
 /// so first-token latency after launch is dominated by IO, not compute.
 const READY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -538,7 +547,15 @@ pub fn speech_args(
     request: &GenerationRequest,
     output: &Path,
 ) -> Result<Vec<String>, String> {
-    let mut args = Vec::new();
+    // `llama-tts` is llama.cpp, and llama.cpp offloads nothing unless asked.
+    // The macOS arm64 archive this app pins ships `libggml-metal.dylib`, so
+    // without this speech synthesizes on the CPU of a machine holding a GPU
+    // that already has the weights' worth of unified memory. A build with no
+    // GPU backend parses the flag and ignores it, so this is safe on every
+    // target rather than gated to one. `extra_launch_args` is appended after,
+    // and llama.cpp takes the last occurrence of a flag, so a model that wants
+    // a different split — or none — still sets one.
+    let mut args = vec!["-ngl".to_string(), SPEECH_GPU_LAYERS.to_string()];
     for component in &spec.components {
         if !component.slot.is_speech_only() && component.slot != ComponentSlot::Checkpoint {
             continue;
@@ -672,6 +689,12 @@ pub struct GenerationRequest {
     pub hires: Option<HiresSettings>,
     /// Negative asks the backend for a random seed.
     pub seed: i64,
+    /// How many images to sample from this one prompt. Image tasks only:
+    /// video and speech produce one artifact per run by construction. Each
+    /// image after the first uses the next seed, so a pinned seed still
+    /// yields a varied batch rather than the same picture N times.
+    #[serde(default = "default_batch_count")]
+    pub batch_count: u32,
     #[serde(default)]
     pub video_frames: u32,
     #[serde(default)]
@@ -784,6 +807,11 @@ fn default_clip_skip() -> i32 {
     -1
 }
 
+/// One image, matching every request written before batching existed.
+fn default_batch_count() -> u32 {
+    1
+}
+
 /// Rejects a request that is out of bounds, and returns it with dimensions and
 /// frame count snapped to what the backend will actually use.
 pub fn validate_request(
@@ -823,7 +851,11 @@ pub fn validate_request(
         normalized.height = 0;
         normalized.video_frames = 1;
         normalized.fps = 1;
+        normalized.batch_count = 1;
         return Ok(normalized);
+    }
+    if !(1..=MAX_BATCH_COUNT).contains(&request.batch_count) {
+        return Err(format!("Batch size must be between 1 and {MAX_BATCH_COUNT}"));
     }
     if request.sample_method.len() > 64 || request.scheduler.len() > 64 {
         return Err("Sampler name is too long".to_string());
@@ -908,6 +940,10 @@ pub fn validate_request(
         if fps > MAX_FPS {
             return Err(format!("Frame rate may not exceed {MAX_FPS}"));
         }
+        // A clip is one artifact per run: the engine's batch field counts
+        // images, and asking a video job for eight of them would multiply the
+        // longest run in the app by eight without the UI ever offering it.
+        normalized.batch_count = 1;
         normalized.fps = fps;
         normalized.video_frames = normalize_video_frames(
             spec.defaults.frame_grid,
@@ -993,6 +1029,11 @@ pub fn request_body(spec: &GenerationModelSpec, request: &GenerationRequest) -> 
         body["output_format"] = json!("webm");
     } else {
         body["output_format"] = json!("png");
+        // Sent only when it is more than the default, so an engine build that
+        // predates the field is asked nothing new for the ordinary run.
+        if request.batch_count > 1 {
+            body["batch_count"] = json!(request.batch_count);
+        }
     }
     body
 }
@@ -1011,7 +1052,9 @@ pub struct GeneratedMedia {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobProgress {
     Running { queue_position: u32 },
-    Completed(Box<GeneratedMedia>),
+    /// Every artifact the job produced, in the engine's own order. One for a
+    /// clip or a single image; `batch_count` of them for a batch.
+    Completed(Vec<GeneratedMedia>),
     Failed(String),
     Cancelled,
 }
@@ -1061,41 +1104,69 @@ pub fn decode_job_status(value: &Value) -> Result<JobProgress, String> {
             // for the batch; `vid_gen` yields one encoded container inline with
             // its own `mime_type`. Read whichever is present rather than
             // assuming a mode from the caller.
-            let encoded = result
-                .pointer("/images/0/b64_json")
-                .or_else(|| result.get("b64_json"))
+            //
+            // The list is read whole. A batch of four comes back as four
+            // entries in it, and taking only the first would spend the whole
+            // run and then throw three quarters of it away.
+            let media_type = result
+                .get("mime_type")
                 .and_then(Value::as_str)
-                .ok_or("Generation result carried no payload")?;
-            // Reject before decoding: base64 is 4/3 the size of its payload, so
-            // this bounds the allocation rather than discovering it afterwards.
-            if encoded.len() / 4 * 3 > MAX_MEDIA_BYTES {
-                return Err("Generated media exceeds its size limit".to_string());
-            }
-            let bytes = STANDARD
-                .decode(encoded)
-                .map_err(|_| "Generation result is not valid base64".to_string())?;
-            if bytes.is_empty() {
-                return Err("Generated media is empty".to_string());
-            }
-            Ok(JobProgress::Completed(Box::new(GeneratedMedia {
-                media_type: result
-                    .get("mime_type")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| {
-                        result
-                            .get("output_format")
+                .map(str::to_string)
+                .or_else(|| {
+                    result
+                        .get("output_format")
+                        .and_then(Value::as_str)
+                        .map(media_type_for_format)
+                })
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let frame_count = result
+                .get("frame_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(1) as u32;
+            let fps = result.get("fps").and_then(Value::as_u64).unwrap_or(1) as u32;
+
+            let encoded: Vec<&str> = match result.get("images").and_then(Value::as_array) {
+                Some(images) => images
+                    .iter()
+                    .map(|image| {
+                        image
+                            .get("b64_json")
                             .and_then(Value::as_str)
-                            .map(media_type_for_format)
+                            .ok_or("A generated image carried no payload")
                     })
-                    .unwrap_or_else(|| "application/octet-stream".to_string()),
-                frame_count: result
-                    .get("frame_count")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1) as u32,
-                fps: result.get("fps").and_then(Value::as_u64).unwrap_or(1) as u32,
-                bytes,
-            })))
+                    .collect::<Result<_, _>>()?,
+                None => vec![result
+                    .get("b64_json")
+                    .and_then(Value::as_str)
+                    .ok_or("Generation result carried no payload")?],
+            };
+            if encoded.is_empty() {
+                return Err("Generation result carried no payload".to_string());
+            }
+            let media = encoded
+                .into_iter()
+                .map(|encoded| {
+                    // Reject before decoding: base64 is 4/3 the size of its
+                    // payload, so this bounds the allocation rather than
+                    // discovering it afterwards.
+                    if encoded.len() / 4 * 3 > MAX_MEDIA_BYTES {
+                        return Err("Generated media exceeds its size limit".to_string());
+                    }
+                    let bytes = STANDARD
+                        .decode(encoded)
+                        .map_err(|_| "Generation result is not valid base64".to_string())?;
+                    if bytes.is_empty() {
+                        return Err("Generated media is empty".to_string());
+                    }
+                    Ok(GeneratedMedia {
+                        media_type: media_type.clone(),
+                        frame_count,
+                        fps,
+                        bytes,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(JobProgress::Completed(media))
         }
         other => Err(format!("Unknown generation job status {other}")),
     }
@@ -1898,6 +1969,7 @@ mod tests {
             strength: None,
             hires: None,
             seed: -1,
+            batch_count: 1,
             video_frames: 34,
             fps: 24,
             speaker_file: None,
@@ -2354,9 +2426,10 @@ mod tests {
         let JobProgress::Completed(media) = completed else {
             panic!("expected a completed job");
         };
-        assert_eq!(media.bytes, b"webm-bytes");
-        assert_eq!(media.media_type, "video/webm");
-        assert_eq!(media.frame_count, 33);
+        assert_eq!(media.len(), 1, "a clip is one artifact");
+        assert_eq!(media[0].bytes, b"webm-bytes");
+        assert_eq!(media[0].media_type, "video/webm");
+        assert_eq!(media[0].frame_count, 33);
 
         // img_gen: a list of encoded images and no media type at all — the
         // format is stated once for the batch. Verified against a real
@@ -2372,9 +2445,35 @@ mod tests {
         let JobProgress::Completed(media) = completed else {
             panic!("expected a completed job");
         };
-        assert_eq!(media.bytes, b"png-bytes");
-        assert_eq!(media.media_type, "image/png");
-        assert_eq!(media.frame_count, 1);
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].bytes, b"png-bytes");
+        assert_eq!(media[0].media_type, "image/png");
+        assert_eq!(media[0].frame_count, 1);
+
+        // A batch comes back as several entries in that same list. Reading
+        // only the first is the bug this asserts against: the run has already
+        // been paid for by the time the response arrives, so a dropped entry
+        // is sampling time thrown away.
+        let completed = decode_job_status(&json!({
+            "status": "completed",
+            "result": {
+                "output_format": "png",
+                "images": [
+                    {"index": 0, "b64_json": STANDARD.encode(b"first")},
+                    {"index": 1, "b64_json": STANDARD.encode(b"second")},
+                    {"index": 2, "b64_json": STANDARD.encode(b"third")},
+                ],
+            }
+        }))
+        .unwrap();
+        let JobProgress::Completed(media) = completed else {
+            panic!("expected a completed job");
+        };
+        assert_eq!(media.len(), 3, "every image in the batch is kept");
+        assert_eq!(media[0].bytes, b"first");
+        assert_eq!(media[2].bytes, b"third");
+        // The format is stated once for the batch, so every image carries it.
+        assert!(media.iter().all(|item| item.media_type == "image/png"));
 
         // A completed job with no payload is a protocol error, not empty media.
         assert!(decode_job_status(&json!({"status": "completed", "result": {}})).is_err());
@@ -2384,6 +2483,58 @@ mod tests {
         }))
         .is_err());
         assert!(decode_job_status(&json!({"status": "invented"})).is_err());
+    }
+
+    /// A batch is an image-only idea, and only travels when it is asked for.
+    ///
+    /// The engine samples a batch serially, so `batch_count` on a video job
+    /// would multiply the app's longest run by eight; and an engine build that
+    /// predates the field should still see exactly the body it saw before, so
+    /// the ordinary single-image run must not carry it at all.
+    #[test]
+    fn a_batch_is_images_only_and_only_sent_when_asked_for() {
+        let mut spec = model(
+            "sdxl-mine",
+            vec![GenerationTask::TextToImage],
+            FrameGrid::default(),
+        );
+        spec.defaults.width = 512;
+        spec.defaults.height = 512;
+
+        let mut request = video_request(GenerationTask::TextToImage);
+        request.model_id = spec.id.clone();
+        let single = validate_request(&spec, &request).unwrap();
+        assert!(request_body(&spec, &single).get("batch_count").is_none());
+
+        request.batch_count = 4;
+        let batched = validate_request(&spec, &request).unwrap();
+        assert_eq!(request_body(&spec, &batched)["batch_count"], json!(4));
+
+        // Out of range is refused rather than clamped: silently returning one
+        // image for a request that asked for fifty is worse than saying no.
+        request.batch_count = MAX_BATCH_COUNT + 1;
+        assert!(validate_request(&spec, &request).is_err());
+        request.batch_count = 0;
+        assert!(validate_request(&spec, &request).is_err());
+
+        // Video and speech normalize back to one whatever the caller sent.
+        let wan = video_model();
+        let mut clip = video_request(GenerationTask::TextToVideo);
+        clip.batch_count = 4;
+        let clip = validate_request(&wan, &clip).unwrap();
+        assert_eq!(clip.batch_count, 1);
+        assert!(request_body(&wan, &clip).get("batch_count").is_none());
+
+        let mut voice = model("voice", vec![GenerationTask::TextToSpeech], FrameGrid::default());
+        voice.components = vec![ModelComponent::huggingface(
+            ComponentSlot::Checkpoint,
+            "r",
+            "backbone.gguf",
+            1,
+        )];
+        let mut utterance = video_request(GenerationTask::TextToSpeech);
+        utterance.batch_count = 4;
+        assert_eq!(validate_request(&voice, &utterance).unwrap().batch_count, 1);
     }
 
     /// The canvas and sampling controls belong to the run, not the library
@@ -2567,6 +2718,18 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
         }
         assert!(args.contains(&"--tts-use-guide-tokens".to_string()));
 
+        // Speech asks for the GPU by default. Without this the pinned macOS
+        // arm64 build — which ships libggml-metal.dylib — synthesizes on the
+        // CPU of a machine whose GPU is sitting idle.
+        let ngl = args.iter().position(|arg| arg == "-ngl").expect("-ngl");
+        assert_eq!(args[ngl + 1], SPEECH_GPU_LAYERS.to_string());
+        // ...and the model's own arguments come after it, so llama.cpp's
+        // last-one-wins parsing leaves the escape hatch open.
+        let mut cpu_only = spec.clone();
+        cpu_only.extra_launch_args = vec!["-ngl".to_string(), "0".to_string()];
+        let args = speech_args(&cpu_only, Path::new("/m"), &normalized, Path::new("/o.wav")).unwrap();
+        assert_eq!(args.last().unwrap(), "0");
+
         // The projector is llama-tts's flag; sd-server would reject it outright.
         assert!(!launch_args(&spec, Path::new("/m"), 1).contains(&"--mmproj".to_string()));
 
@@ -2714,7 +2877,10 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
                     JobProgress::Running { .. } => {
                         saw_progress = saw_progress.or_else(|| engine.progress());
                     }
-                    JobProgress::Completed(media) => break media,
+                    JobProgress::Completed(mut media) => {
+                        assert_eq!(media.len(), 1, "one image was asked for");
+                        break media.remove(0);
+                    }
                     other => panic!("{other:?}"),
                 }
                 tokio::time::sleep(Duration::from_millis(300)).await;

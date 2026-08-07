@@ -12,11 +12,11 @@
 //! exclude whole territories (see [`crate::generation::LicenseGate`]).
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -241,11 +241,38 @@ fn engine_binary(app: &AppHandle) -> Result<PathBuf, String> {
 /// print its version settles every one of those cases at once — loader
 /// failures included — for the price of one short process.
 ///
-/// Cached for the process: the answer cannot change while the app runs, and
-/// this is on the path of every Studio status refresh.
+/// Cached on the binary's identity — its path and modification time — because
+/// this is on the path of every Studio status refresh and spawning a process
+/// per refresh made switching tabs visibly slow.
+///
+/// Keyed rather than once-per-process: the answer *can* change while the app
+/// runs. Re-staging the runtime after a failed extraction, or pointing
+/// `LITTLE_MONKEY_SD_RUNTIME` at a build that works, writes a different file,
+/// and a process-wide answer would keep reporting the old one's verdict until
+/// the app was restarted — telling the user their fix did nothing.
 fn engine_starts(binary: &Path) -> bool {
-    static STARTS: OnceLock<bool> = OnceLock::new();
-    *STARTS.get_or_init(|| binary_starts(binary))
+    /// A binary's identity for the probe cache: where it is, and the version
+    /// of it that was probed. `None` is a file that could not be stat'd, which
+    /// re-probes rather than pretending the answer is still good.
+    type ProbeKey = (PathBuf, Option<SystemTime>);
+    static STARTS: OnceLock<Mutex<HashMap<ProbeKey, bool>>> = OnceLock::new();
+    let key: ProbeKey = (
+        binary.to_path_buf(),
+        std::fs::metadata(binary).and_then(|meta| meta.modified()).ok(),
+    );
+    if let Ok(cache) = STARTS.get_or_init(Default::default).lock() {
+        if let Some(&cached) = cache.get(&key) {
+            return cached;
+        }
+    }
+    // Probed outside the lock: it spawns a process, and holding the mutex
+    // across that would serialize every concurrent status refresh behind it.
+    // Two refreshes racing here both probe and both write the same answer.
+    let starts = binary_starts(binary);
+    if let Ok(mut cache) = STARTS.get_or_init(Default::default).lock() {
+        cache.insert(key, starts);
+    }
+    starts
 }
 
 fn binary_starts(binary: &Path) -> bool {
@@ -676,21 +703,26 @@ async fn run_speech_with(
 /// Runs one generation end to end: ensure the engine is serving the requested
 /// model, submit, poll to a terminal state, then publish the media as an
 /// artifact and record it in the gallery.
+///
+/// Returns every artifact the run produced, newest-first. A batch of images is
+/// one job and one set of settings, so it is one call — but it is several
+/// gallery entries, because each image is separately keepable and separately
+/// deletable.
 #[tauri::command]
 pub async fn generation_run(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
     request: GenerationRequest,
-) -> Result<GenerationEntry, String> {
+) -> Result<Vec<GenerationEntry>, String> {
     // A remote backend has no library entry to look up, no components to
     // override and no engine to launch, so it forks before all three rather
     // than threading an "is it local" flag through them.
-    let (model_id, request, media) =
+    let (model_id, request, batch) =
         if let Some((backend_id, model)) = generation::parse_remote_model_id(&request.model_id) {
             let backend = find_backend(&app, backend_id)?;
             let validated = generation::validate_remote_request(&backend, &request)?;
             let media = run_remote(&app, &state, &backend, model, &validated).await?;
-            (request.model_id.clone(), validated, media)
+            (request.model_id.clone(), validated, vec![media])
         } else {
             let spec = find_registered(&app, &request.model_id)?;
             let validated = generation::validate_request(&spec, &request)?;
@@ -707,50 +739,58 @@ pub async fn generation_run(
                     "studio://progress",
                     GenerationProgressEvent::new("speech", "running"),
                 );
-                run_speech(&app, &spec, &validated).await?
+                vec![run_speech(&app, &spec, &validated).await?]
             } else {
                 run_diffusion(&app, &state, &spec, &validated).await?
             };
             (spec.id.clone(), validated, media)
         };
 
-    let blob = artifacts(&app)?
-        .put(&media.bytes)
-        .map_err(|error| error.to_string())?;
-    let entry = GenerationEntry {
-        entry_id: format!("studio-{}", Uuid::new_v4()),
-        artifact_id: blob.id,
-        model_id,
-        task: request.task,
-        prompt: request.prompt.clone(),
-        negative_prompt: request.negative_prompt.clone(),
-        media_type: media.media_type,
-        size_bytes: blob.size,
-        width: request.width,
-        height: request.height,
-        steps: request.steps,
-        cfg_scale: request.cfg_scale,
-        seed: request.seed,
-        frame_count: media.frame_count,
-        fps: media.fps,
-        duration_ms: if media.fps > 0 {
-            u64::from(media.frame_count) * 1000 / u64::from(media.fps)
-        } else {
-            0
-        },
-        created_at_ms: now_ms(),
-    };
+    let store = artifacts(&app)?;
+    // One timestamp for the whole batch would make the gallery's sort — and so
+    // the order the images appear in — arbitrary between siblings. Offsetting
+    // by index keeps them in the order the engine sampled them.
+    let created_at_ms = now_ms();
+    let mut entries = Vec::with_capacity(batch.len());
+    for (index, media) in batch.into_iter().enumerate() {
+        let blob = store.put(&media.bytes).map_err(|error| error.to_string())?;
+        entries.push(GenerationEntry {
+            entry_id: format!("studio-{}", Uuid::new_v4()),
+            artifact_id: blob.id,
+            model_id: model_id.clone(),
+            task: request.task,
+            prompt: request.prompt.clone(),
+            negative_prompt: request.negative_prompt.clone(),
+            media_type: media.media_type,
+            size_bytes: blob.size,
+            width: request.width,
+            height: request.height,
+            steps: request.steps,
+            cfg_scale: request.cfg_scale,
+            seed: request.seed,
+            frame_count: media.frame_count,
+            fps: media.fps,
+            duration_ms: if media.fps > 0 {
+                u64::from(media.frame_count) * 1000 / u64::from(media.fps)
+            } else {
+                0
+            },
+            created_at_ms: created_at_ms + index as u64,
+        });
+    }
 
     let mut gallery: Vec<GenerationEntry> = read_state(&app, GALLERY_FILE)?;
-    gallery.push(entry.clone());
+    gallery.extend(entries.iter().cloned());
     gallery.sort_by_key(|item| item.created_at_ms);
     write_state(&app, GALLERY_FILE, &gallery)?;
 
-    let _ = app.emit(
-        "studio://progress",
-        GenerationProgressEvent::new(&entry.entry_id, "completed"),
-    );
-    Ok(entry)
+    if let Some(last) = entries.last() {
+        let _ = app.emit(
+            "studio://progress",
+            GenerationProgressEvent::new(&last.entry_id, "completed"),
+        );
+    }
+    Ok(entries)
 }
 
 fn find_backend(app: &AppHandle, backend_id: &str) -> Result<generation::RemoteBackend, String> {
@@ -820,7 +860,7 @@ async fn run_diffusion(
     state: &tauri::State<'_, AppState>,
     spec: &GenerationModelSpec,
     request: &GenerationRequest,
-) -> Result<generation::GeneratedMedia, String> {
+) -> Result<Vec<generation::GeneratedMedia>, String> {
     let root = model_root(app)?;
     let binary = engine_binary(app)?;
     let engine = &state.generation_engine;
@@ -855,7 +895,7 @@ async fn run_diffusion(
                 event.queue_position = queue_position;
                 let _ = app.emit("studio://progress", event);
             }
-            JobProgress::Completed(media) => return Ok(*media),
+            JobProgress::Completed(media) => return Ok(media),
             JobProgress::Failed(error) => return Err(error),
             JobProgress::Cancelled => return Err("Generation cancelled".to_string()),
         }
@@ -963,7 +1003,7 @@ pub fn generation_unload_engine(state: tauri::State<'_, AppState>) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use super::{binary_starts, Uuid};
+    use super::{binary_starts, Duration, SystemTime, Uuid};
 
     /// The whole point of the probe: a file that is present but cannot be
     /// executed here reads as "does not start", which is what an old-glibc
@@ -976,6 +1016,45 @@ mod tests {
         let fake = directory.join("sd-server");
         std::fs::write(&fake, b"not really a binary").unwrap();
         assert!(!binary_starts(&fake));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Restaging a broken engine has to be noticed without restarting the app.
+    ///
+    /// The probe is cached because it runs on every Studio status refresh, but
+    /// a cache keyed on nothing answers for the file that *used* to be there:
+    /// the user replaces a binary that would not exec, Studio keeps saying
+    /// unsupported, and the fix appears to have done nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_notices_a_binary_that_changed_underneath_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("lm-sd-cache-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("sd-server");
+
+        std::fs::write(&path, b"not really a binary").unwrap();
+        assert!(!super::engine_starts(&path), "a non-binary does not start");
+
+        // The replacement a user staging a working runtime would leave behind.
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Set rather than slept for: two writes in the same tick of a coarse
+        // filesystem clock would hand the new file the old one's cache key,
+        // and a test that sleeps to avoid that is a test that flakes.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+            .unwrap();
+
+        assert!(
+            super::engine_starts(&path),
+            "the replaced binary is probed again rather than answered from the old verdict"
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }
