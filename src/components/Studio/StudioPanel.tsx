@@ -33,6 +33,7 @@ import {
   normalizeVideoFrames,
   toSpec,
   ASPECT_PRESETS,
+  MAX_BATCH_COUNT,
   SAMPLERS,
   SCHEDULERS,
   studioClient,
@@ -219,6 +220,9 @@ export function StudioPanel() {
   // A string rather than a number so "empty means random" is expressible, the
   // way every other generation tool spells it.
   const [seed, setSeed] = useState("");
+  /** Images sampled from one prompt. The engine runs them serially, so this
+   *  multiplies the wait as well as the output. */
+  const [batchCount, setBatchCount] = useState(1);
   const [initImage, setInitImage] = useState<string | null>(null);
   const [speakerFile, setSpeakerFile] = useState("");
   const [language, setLanguage] = useState("");
@@ -512,7 +516,7 @@ export function StudioPanel() {
     setPercent(null);
     setPhase(t("Studio.phase.submitted"));
     try {
-      const entry = await studioClient.run({
+      const entries = await studioClient.run({
         modelId: selected.id,
         task,
         prompt,
@@ -529,6 +533,9 @@ export function StudioPanel() {
         hires: settings.hires,
         // Blank asks the engine for a fresh seed rather than pinning one.
         seed: seed.trim() === "" ? -1 : Number(seed),
+        // A clip and an utterance are one artifact per run whatever the
+        // control last said, and the backend normalizes it to 1 regardless.
+        batchCount: isVideoTask(task) || isSpeechTask(task) ? 1 : batchCount,
         videoFrames: isVideoTask(task)
           ? normalizeVideoFrames(selected.defaults.frameGrid, seconds * selected.defaults.fps)
           : 1,
@@ -540,8 +547,13 @@ export function StudioPanel() {
         loras: loras.filter((lora) => lora.path.trim().length > 0),
         componentOverrides: overrides,
       });
-      setGallery((current) => [entry, ...current]);
-      void loadPreview(entry);
+      // Newest first, and within one batch the engine's own order — which
+      // reversing the run's entries preserves once they are prepended.
+      setGallery((current) => [...[...entries].reverse(), ...current]);
+      // Only the last is previewed: it is the one the gallery shows first, and
+      // decoding eight images to data URLs to show one is eight times the work.
+      const newest = entries[entries.length - 1];
+      if (newest) void loadPreview(newest);
     } catch (reason) {
       if (!stopped.current) setError(errorText(reason));
     } finally {
@@ -1260,6 +1272,19 @@ export function StudioPanel() {
                   onChange={(cfgScale) => setSettings({ ...settings, cfgScale })}
                 />
               </div>
+
+              {/* Images only: a clip and an utterance are one artifact per
+                  run, so a batch control on them would promise nothing. */}
+              {!isVideoTask(task) && !isSpeechTask(task) && (
+                <SliderField
+                  label={t("Studio.batch")}
+                  value={batchCount}
+                  min={1}
+                  max={MAX_BATCH_COUNT}
+                  step={1}
+                  onChange={setBatchCount}
+                />
+              )}
 
               {needsInitImage(task) && (
                 <SliderField

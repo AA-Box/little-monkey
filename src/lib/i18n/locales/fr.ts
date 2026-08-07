@@ -2520,7 +2520,7 @@ export const fr: Record<string, string> = {
   "Studio.add.repoFilePlaceholder": "split_files/vae/wan2.2_vae.safetensors",
   "Studio.add.namePlaceholder": "Wan 2.2 TI2V 5B",
   "Studio.add.familyPlaceholder": "Wan",
-  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --offload-to-cpu",
+  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --threads 8 --offload-to-cpu",
   "Studio.speakerPlaceholder": "/Users/vous/voix/narrateur.wav",
   "Studio.languagePlaceholder": "fr",
   "Studio.add.name": "Nom",
