@@ -951,7 +951,7 @@ pub async fn execute_in_sandbox(
         // A fresh name per run, so two concurrent sandboxed runs never share a
         // container and one finishing never deletes the other's profile.
         let container =
-            crate::sandbox_windows::create_app_container(&Uuid::new_v4().simple().to_string());
+            crate::sandbox_windows::create_app_container(&uuid::Uuid::new_v4().simple().to_string());
         let container = match container {
             Ok(container) => {
                 // The single grant that makes the sandbox copy reachable. Fatal:
@@ -1004,91 +1004,99 @@ pub async fn execute_in_sandbox(
         Isolation::ProcessOnly,
     );
 
-    let mut command = tokio::process::Command::new(&program);
-    command
-        .args(&args)
-        .current_dir(&workspace_dir)
-        .env_clear()
-        .envs(env.iter().cloned())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // Its own process group, so the timeout below ends the whole tree. Without it
-    // `kill_on_drop` reaps only `sandbox-exec` (or the bare `sh` on the platforms
-    // with no Seatbelt), and a sandboxed command that spawns a build leaves that
-    // build running — with write access to the sandbox copy of the workspace and
-    // no remaining supervisor.
-    #[cfg(unix)]
-    command.process_group(0);
-    // Kernel-held bounds, which matter most here: on the platforms with no
-    // Seatbelt this is `Isolation::ProcessOnly`, so `os_limits` is the only
-    // enforcement the OS applies to the child at all. Inherited across the
-    // `sandbox-exec` exec, so it reaches the sandboxed program itself.
-    crate::os_limits::apply(crate::os_limits::ChildLimits::baseline(), &mut command);
-    // Linux's boundary is installed the same way, and *after* `os_limits` on
-    // purpose: `pre_exec` closures run in registration order, so the `setrlimit`
-    // bounds are already in place before anything starts denying syscalls.
-    // Reported from `confine`'s own answer rather than from the target triple —
-    // a kernel without Landlock keeps the `ProcessOnly` the branch above chose.
-    #[cfg(target_os = "linux")]
-    let isolation = {
-        let path_env = env
-            .iter()
-            .find(|(key, _)| key == "PATH")
-            .map(|(_, value)| OsStr::new(value));
-        let readable_roots = readable_roots(
-            LINUX_SYSTEM_READ_ROOTS,
-            path_env,
-            real_home.as_deref(),
-            &real_workspace_root,
-        );
-        match crate::sandbox_linux::confine(
-            &mut command,
-            &sandbox_root,
-            &readable_roots,
-            allow_network,
-        )? {
-            true => Isolation::OsSandboxed,
-            false => isolation,
-        }
-    };
+    // Every platform but Windows spawns through `tokio::process` from here.
+    // Windows returned above from its own `CreateProcessW` path, and this is
+    // `cfg`-gated rather than left unreachable so that `program`, `args` and
+    // `isolation` — none of which the Windows arm defines — are not even named
+    // there.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut command = tokio::process::Command::new(&program);
+        command
+            .args(&args)
+            .current_dir(&workspace_dir)
+            .env_clear()
+            .envs(env.iter().cloned())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        // Its own process group, so the timeout below ends the whole tree. Without it
+        // `kill_on_drop` reaps only `sandbox-exec` (or the bare `sh` on the platforms
+        // with no Seatbelt), and a sandboxed command that spawns a build leaves that
+        // build running — with write access to the sandbox copy of the workspace and
+        // no remaining supervisor.
+        #[cfg(unix)]
+        command.process_group(0);
+        // Kernel-held bounds, which matter most here: on the platforms with no
+        // Seatbelt this is `Isolation::ProcessOnly`, so `os_limits` is the only
+        // enforcement the OS applies to the child at all. Inherited across the
+        // `sandbox-exec` exec, so it reaches the sandboxed program itself.
+        crate::os_limits::apply(crate::os_limits::ChildLimits::baseline(), &mut command);
+        // Linux's boundary is installed the same way, and *after* `os_limits` on
+        // purpose: `pre_exec` closures run in registration order, so the `setrlimit`
+        // bounds are already in place before anything starts denying syscalls.
+        // Reported from `confine`'s own answer rather than from the target triple —
+        // a kernel without Landlock keeps the `ProcessOnly` the branch above chose.
+        #[cfg(target_os = "linux")]
+        let isolation = {
+            let path_env = env
+                .iter()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| OsStr::new(value));
+            let readable_roots = readable_roots(
+                LINUX_SYSTEM_READ_ROOTS,
+                path_env,
+                real_home.as_deref(),
+                &real_workspace_root,
+            );
+            match crate::sandbox_linux::confine(
+                &mut command,
+                &sandbox_root,
+                &readable_roots,
+                allow_network,
+            )? {
+                true => Isolation::OsSandboxed,
+                false => isolation,
+            }
+        };
 
-    // Windows never reaches here — it returned above, from its own
-    // `CreateProcessW` path.
-    let child = command.spawn()?;
+        // Windows never reaches here — it returned above, from its own
+        // `CreateProcessW` path.
+        let child = command.spawn()?;
 
-    // Captured before `wait_with_output` consumes the child; with
-    // `process_group(0)` the child's own pid is also its group id.
-    let child_pgid = child.id();
-    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    if result.is_err() {
-        if let Some(pgid) = child_pgid {
-            if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
-                eprintln!("sandbox: could not terminate process group {pgid}: {error}");
+        // Captured before `wait_with_output` consumes the child; with
+        // `process_group(0)` the child's own pid is also its group id.
+        let child_pgid = child.id();
+        let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if result.is_err() {
+            if let Some(pgid) = child_pgid {
+                if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
+                    eprintln!("sandbox: could not terminate process group {pgid}: {error}");
+                }
             }
         }
-    }
 
-    match result {
-        Ok(Ok(output)) => Ok(SandboxExecOutcome {
-            isolation,
-            exit_code: output.status.code(),
-            timed_out: false,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            duration_ms,
-        }),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Ok(SandboxExecOutcome {
-            isolation,
-            exit_code: None,
-            timed_out: true,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            duration_ms,
-        }),
+        match result {
+            Ok(Ok(output)) => Ok(SandboxExecOutcome {
+                isolation,
+                exit_code: output.status.code(),
+                timed_out: false,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                duration_ms,
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Ok(SandboxExecOutcome {
+                isolation,
+                exit_code: None,
+                timed_out: true,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                duration_ms,
+            }),
+        }
     }
 }
 
