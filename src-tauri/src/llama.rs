@@ -41,6 +41,10 @@ pub const EMBED_PORT: u16 = 8091;
 /// so `monkey-cli`'s `embed_cli::start` can build the exact same args via
 /// [`embed_server_args`].
 pub const EMBED_CTX: u32 = 2048;
+/// Layers the embeddings server offloads. Embedding models are a few hundred
+/// megabytes, so all of them fit; llama.cpp clamps an overshoot to the layers
+/// the model has, and a build with no GPU backend ignores the flag.
+pub const EMBED_GPU_LAYERS: u32 = 999;
 /// Upper bound for the startup identity response. A local process on the
 /// fixed port is untrusted until it proves the exact alias we passed to the
 /// child, so never buffer an arbitrarily large `/v1/models` body.
@@ -127,6 +131,13 @@ pub fn embed_server_args(model_path: &str, alias: &str) -> Vec<String> {
         EMBED_CTX.to_string(),
         "-ub".into(),
         EMBED_CTX.to_string(),
+        // Chat passes `-ngl` and embeddings did not, so on a Metal or CUDA
+        // build the same binary ran the chat model on the GPU and the
+        // embedding model on the CPU. Embedding models are small enough that
+        // "all layers" fits wherever the flag does anything, and indexing a
+        // corpus is the one place throughput is the whole experience.
+        "-ngl".into(),
+        EMBED_GPU_LAYERS.to_string(),
         "--embeddings".into(),
         "--pooling".into(),
         "mean".into(),
@@ -766,6 +777,10 @@ mod tests {
                 "2048",
                 "-ub",
                 "2048",
+                // Embeddings offload like chat does. The CLI builds its args
+                // from this same function, so both get the GPU or neither does.
+                "-ngl",
+                "999",
                 "--embeddings",
                 "--pooling",
                 "mean",
