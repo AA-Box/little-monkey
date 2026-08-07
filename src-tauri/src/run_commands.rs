@@ -114,6 +114,52 @@ pub(crate) fn desktop_identity<R: tauri::Runtime>(
     }
 }
 
+/// The single place the host opens the shared profile/run database.
+///
+/// # Why tests get their own directory
+///
+/// Under `cargo test` this resolves to a per-process temp directory instead of
+/// the real app data dir. `tauri::test::mock_app()` has no bundle identifier,
+/// so its `app_data_dir()` is the bare platform app-data root
+/// (`~/Library/Application Support` on macOS) — one file shared by every
+/// checkout, worktree, and branch on the machine. Any branch carrying a newer
+/// migration that ran its tests first leaves a `schema_migrations` row this
+/// binary refuses to open (`apply_migrations`' "newer than this binary" guard,
+/// correctly, for a real user database), and from then on every test that
+/// records a permission request fails on a developer machine while passing on
+/// a clean CI runner. Isolating the path keeps that guard intact and makes the
+/// database this process opens always one this binary created.
+fn open_ledger<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<RunLedger, String> {
+    #[cfg(test)]
+    let data_dir = test_ledger_dir();
+    #[cfg(not(test))]
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Failed to resolve app data dir: {error}"))?;
+    #[cfg(test)]
+    let _ = app;
+
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|error| format!("Failed to create app data dir: {error}"))?;
+    RunLedger::open(data_dir.join(DATABASE_FILE)).map_err(|error| error.to_string())
+}
+
+/// Created once per test process and wiped on first use, so a run never
+/// inherits the database a previous run of this binary (or of a differently
+/// migrated one) left behind.
+#[cfg(test)]
+fn test_ledger_dir() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir =
+            std::env::temp_dir().join(format!("little_monkey_test_ledger_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    })
+    .clone()
+}
+
 pub(crate) fn with_ledger<R: tauri::Runtime, T>(
     app: &tauri::AppHandle<R>,
     state: &AppState,
@@ -124,14 +170,7 @@ pub(crate) fn with_ledger<R: tauri::Runtime, T>(
         .lock()
         .map_err(|_| "Run ledger state lock was poisoned".to_string())?;
     if slot.is_none() {
-        let data_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| format!("Failed to resolve app data dir: {error}"))?;
-        std::fs::create_dir_all(&data_dir)
-            .map_err(|error| format!("Failed to create app data dir: {error}"))?;
-        *slot =
-            Some(RunLedger::open(data_dir.join(DATABASE_FILE)).map_err(|error| error.to_string())?);
+        *slot = Some(open_ledger(app)?);
     }
     operation(slot.as_mut().expect("run ledger initialized")).map_err(|error| error.to_string())
 }
@@ -146,14 +185,7 @@ pub(crate) fn with_profile_ledger<R: tauri::Runtime, T>(
         .lock()
         .map_err(|_| "Run ledger state lock was poisoned".to_string())?;
     if slot.is_none() {
-        let data_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| format!("Failed to resolve app data dir: {error}"))?;
-        std::fs::create_dir_all(&data_dir)
-            .map_err(|error| format!("Failed to create app data dir: {error}"))?;
-        *slot =
-            Some(RunLedger::open(data_dir.join(DATABASE_FILE)).map_err(|error| error.to_string())?);
+        *slot = Some(open_ledger(app)?);
     }
     operation(slot.as_mut().expect("run ledger initialized")).map_err(|error| error.to_string())
 }
@@ -817,6 +849,38 @@ mod tests {
         assert_eq!(run_protocol_version(), RUN_PROTOCOL_SCHEMA_VERSION);
     }
 
+    /// Pins the isolation `open_ledger` exists for. Without it every test in
+    /// this binary opens the machine-global app-data database — the same file
+    /// every other checkout and branch on the machine opens — and one branch
+    /// with a newer migration turns every permission-recording test red here
+    /// while CI's clean runners stay green.
+    #[test]
+    fn the_ledger_a_test_opens_is_never_the_real_app_data_database() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let real_app_data = handle
+            .path()
+            .app_data_dir()
+            .expect("mock app resolves an app data dir");
+
+        let dir = test_ledger_dir();
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "test ledger must live under the temp dir, got {dir:?}"
+        );
+        assert_ne!(
+            dir, real_app_data,
+            "test ledger must not be the real app data dir"
+        );
+
+        let state = AppState::default();
+        with_ledger(&handle, &state, |_| Ok(())).expect("opening the test ledger");
+        assert!(
+            dir.join(DATABASE_FILE).exists(),
+            "the ledger was opened somewhere other than the isolated dir"
+        );
+    }
+
     #[test]
     fn host_event_ids_are_protocol_safe() {
         let id = format!("event-{}", uuid::Uuid::new_v4().simple());
@@ -893,8 +957,8 @@ mod tests {
         use crate::run_ledger::RunLedger;
         use crate::run_protocol::{
             CapabilityAssessment, CapabilityState, EgressAllowlist, ModelCapabilitiesSnapshot,
-            ModelTargetSnapshot, PermissionMode, PermissionPolicySnapshot, RunBudgets, RunKind,
-            RunSpec, ToolPolicyDecision, RUN_PROTOCOL_SCHEMA_VERSION,
+            ModelTargetSnapshot, PermissionMode, PermissionPolicySnapshot,
+            RUN_PROTOCOL_SCHEMA_VERSION, RunBudgets, RunKind, RunSpec, ToolPolicyDecision,
         };
         use crate::run_scope::{self, RunScope};
 
