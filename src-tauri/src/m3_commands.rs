@@ -23,7 +23,8 @@ use crate::m3_runtime_hub::{
     M3ActivateComponentVersionRequest, M3ActivateModelVersionRequest, M3ApiCaller,
     M3ApiDispatchRequest, M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch,
     M3CleanupReport, M3CompatibilityMatrixReport, M3ComponentCatalogEntry, M3ComponentHub,
-    M3ComponentUpdateCheck, M3DeleteModelRequest, M3DownloadRequest, M3HardwareCompatibilityReport,
+    M3ComponentKind, M3ComponentUpdateCheck, M3DeleteModelRequest, M3DownloadRequest,
+    M3HardwareCompatibilityReport,
     M3HubError, M3InstallComponentRequest, M3InstalledComponentView, M3InstalledModelView,
     M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest, M3RuntimeCapabilityView,
     M3RuntimeHub, M3RuntimeKind, M3RuntimeMetricsView, M3RuntimeStatusView,
@@ -1007,6 +1008,75 @@ pub fn m3_component_installed(
     state: tauri::State<'_, M3CommandState>,
 ) -> Result<Vec<M3InstalledComponentView>, String> {
     state.component_hub.list_installed().map_err(command_error)
+}
+
+/// Installs a built, signed MLX service package and activates it.
+///
+/// `package_directory` is whatever the user picked — the output of
+/// `pnpm mlx:package`. Trust comes from the pinned Ed25519 release key over
+/// the manifest and every file digest, not from the path, so this deliberately
+/// does not restrict where the directory may live.
+///
+/// The runtime list is not refreshed here: the MLX driver reads
+/// `verify_active()` when it is next asked for status, so the caller's own
+/// refresh is what surfaces the newly installed package.
+#[tauri::command]
+pub fn m3_mlx_install(
+    app: tauri::AppHandle,
+    package_directory: String,
+) -> Result<crate::m3_production::MlxInstalledPackageView, String> {
+    use tauri::Manager as _;
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
+    crate::m3_production::install_mlx_package(
+        &app_data_dir,
+        std::path::Path::new(&package_directory),
+    )
+    .map_err(command_error)
+}
+
+/// Activates an MLX package that the component hub has already downloaded.
+///
+/// The two halves are deliberately separate commands rather than one: the
+/// component hub owns fetching, resuming, digest-checking, and version
+/// history, and the MLX installer owns signature verification and the active
+/// symlink. This joins them for the one component kind that needs unpacking,
+/// and re-running it on an already-installed version is a no-op that
+/// re-verifies rather than an error.
+#[tauri::command]
+pub fn m3_mlx_install_component(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, M3CommandState>,
+    component_id: String,
+) -> Result<crate::m3_production::MlxInstalledPackageView, String> {
+    use tauri::Manager as _;
+    let installed = state
+        .component_hub
+        .list_installed()
+        .map_err(command_error)?
+        .into_iter()
+        .find(|component| component.component_id == component_id)
+        .ok_or_else(|| format!("No component named '{component_id}' is installed"))?;
+    if installed.kind != M3ComponentKind::MlxRuntime {
+        return Err(format!(
+            "'{component_id}' is a {:?} component, not an MLX runtime",
+            installed.kind
+        ));
+    }
+    let artifact = installed
+        .versions
+        .iter()
+        .find(|version| version.version_key == installed.active_version_key)
+        .ok_or("The installed MLX component has no active version")?
+        .artifact_path
+        .clone();
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
+    crate::m3_production::install_mlx_from_artifact(&app_data_dir, &artifact).map_err(command_error)
 }
 
 #[tauri::command]

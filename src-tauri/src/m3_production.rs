@@ -22,10 +22,11 @@ use crate::m3_runtime_hub::{
     ReqwestM3DownloadTransport, RuntimeAdapterM3Driver, StaticM3ComponentSource, SystemM3Clock,
 };
 use crate::mlx_runtime::{
-    CurrentHostMlxProbe, MlxError, MlxFuture, MlxGenerationRequest, MlxGenerationSummary,
-    MlxInstallLimits, MlxLaunchSpec, MlxModelCapabilities, MlxModelRecord, MlxOperationContext,
-    MlxPackageInstaller, MlxProcessHandle, MlxProcessMetrics, MlxRuntimeAdapter, MlxRuntimeConfig,
-    MlxServiceController, MlxSignatureVerifier, MlxStreamEvent, MlxStreamSink,
+    self, CurrentHostMlxProbe, MlxError, MlxFuture, MlxGenerationRequest, MlxGenerationSummary,
+    MlxHostCapabilities, MlxInstallLimits, MlxLaunchSpec, MlxModelCapabilities, MlxModelRecord,
+    MlxOperationContext, MlxPackageInstaller, MlxProcessHandle, MlxProcessMetrics,
+    MlxRuntimeAdapter, MlxRuntimeConfig, MlxServiceController, MlxSignatureVerifier,
+    MlxStreamEvent, MlxStreamSink,
 };
 use crate::runtime_adapter::{
     AcceleratorKind, EndpointOrigin, EndpointPolicy, HardwareSnapshot, HttpTransport,
@@ -3537,6 +3538,105 @@ fn find_production_llama_binary(root: &Path) -> M3HubResult<Option<PathBuf>> {
     }
 }
 
+/// The one installer every MLX path goes through, install and status alike.
+///
+/// Factored out so the Tauri install command and the driver that reads
+/// `verify_active()` cannot drift onto different roots, verifiers, or limits —
+/// three settings where a mismatch would either silently install somewhere
+/// nothing reads or reject a package the rest of the app considers valid.
+///
+/// ponytail: a fresh instance per caller, so the installer's in-process
+/// operation lock does not span them. Safe because the on-disk protocol is
+/// already atomic — staging directory, rename into place, atomic `active.json`
+/// write — and installs are user-initiated and rare. Hand out a shared `Arc`
+/// if concurrent installs ever become a real path.
+pub fn production_mlx_installer(root: &Path) -> M3HubResult<Arc<MlxPackageInstaller>> {
+    Ok(Arc::new(
+        MlxPackageInstaller::new(
+            root.join("runtimes").join("mlx"),
+            Arc::new(ProductionMlxSignatureVerifier),
+            MlxInstallLimits::default(),
+        )
+        .map_err(|error| M3HubError::Runtime(error.to_string()))?,
+    ))
+}
+
+/// What an install reports back. Paths stay inside the app's private tree, so
+/// only the identity of the package crosses to the UI.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MlxInstalledPackageView {
+    pub package_version: String,
+    pub manifest_sha256: String,
+}
+
+/// Installs a built MLX package directory and makes it the active one.
+///
+/// `package_directory` is a tree the user points at — the output of
+/// `pnpm mlx:package`. Its trustworthiness is not a property of where it came
+/// from: the manifest inside it must be signed by the pinned release key, and
+/// every file's digest must match, or nothing is written. That is why an
+/// arbitrary caller-supplied path is safe here in a way it would not be for,
+/// say, a directory of binaries copied into place.
+pub fn install_mlx_package(
+    app_data_dir: &Path,
+    package_directory: &Path,
+) -> M3HubResult<MlxInstalledPackageView> {
+    let host = MlxHostCapabilities::current();
+    // Derived the same way `build_m3_command_state` derives it, so an install
+    // lands in the tree the running driver reads rather than beside it.
+    let installer = production_mlx_installer(&app_data_dir.join(M3_DIRECTORY))?;
+    let bundle = mlx_runtime::read_package_directory(package_directory, &MlxInstallLimits::default())
+        .map_err(|error| M3HubError::Runtime(error.to_string()))?;
+    let installed = installer
+        .install_and_activate(&bundle, &host)
+        .map_err(|error| M3HubError::Runtime(error.to_string()))?;
+    Ok(MlxInstalledPackageView {
+        package_version: installed.package_version,
+        manifest_sha256: installed.manifest_sha256,
+    })
+}
+
+/// Installs an MLX package from a `.tar.gz` the component hub downloaded.
+///
+/// This is what makes an artifact feed reach MLX. The component hub already
+/// fetches by URL with resume, refuses a body whose length or SHA-256 does not
+/// match the catalog entry, and keeps versions and channels — so nothing about
+/// downloading is reimplemented here. What was missing is only this: unpack
+/// that blob and put it through the signature-verifying installer.
+///
+/// The extraction goes to a temporary directory that is removed on every path,
+/// success or failure. Nothing under it is trusted: `read_package_directory`
+/// loads only manifest-declared files and `install_and_activate` re-derives
+/// every digest and verifies the publisher signature before publishing a byte.
+pub fn install_mlx_from_artifact(
+    app_data_dir: &Path,
+    artifact_path: &Path,
+) -> M3HubResult<MlxInstalledPackageView> {
+    let limits = MlxInstallLimits::default();
+    let staging = std::env::temp_dir().join(format!("mlx-unpack-{}", uuid::Uuid::new_v4()));
+    let unpacked = (|| {
+        mlx_runtime::extract_package_archive(artifact_path, &staging, &limits)?;
+        mlx_runtime::read_package_directory(&staging, &limits)
+    })();
+    let bundle = match unpacked {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(M3HubError::Runtime(error.to_string()));
+        }
+    };
+    let installed = production_mlx_installer(&app_data_dir.join(M3_DIRECTORY))?
+        .install_and_activate(&bundle, &MlxHostCapabilities::current())
+        .map_err(|error| M3HubError::Runtime(error.to_string()));
+    let _ = fs::remove_dir_all(&staging);
+    let installed = installed?;
+    Ok(MlxInstalledPackageView {
+        package_version: installed.package_version,
+        manifest_sha256: installed.manifest_sha256,
+    })
+}
+
 fn production_mlx_components(
     root: &Path,
     process: Arc<SystemManagedProcessController>,
@@ -3544,14 +3644,7 @@ fn production_mlx_components(
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         return Ok(None);
     }
-    let installer = Arc::new(
-        MlxPackageInstaller::new(
-            root.join("runtimes").join("mlx"),
-            Arc::new(ProductionMlxSignatureVerifier),
-            MlxInstallLimits::default(),
-        )
-        .map_err(|error| M3HubError::Runtime(error.to_string()))?,
-    );
+    let installer = production_mlx_installer(root)?;
     match installer.verify_active() {
         Ok(_) | Err(MlxError::NotInstalled) => Ok(Some(ProductionMlxComponents {
             installer,
