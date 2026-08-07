@@ -268,7 +268,11 @@ winreg = "0.56"
 # reach. `Win32_Security` comes with it and is not optional — `CreateJobObjectW`
 # names `SECURITY_ATTRIBUTES` in its signature, and that module is itself
 # feature-gated, so without it the job-object module does not resolve.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+# `Win32_Security_Isolation` is the AppContainer itself, `Win32_Security_Authorization`
+# the one ACE that grants it the sandbox root, and `Win32_System_Pipes` the
+# stdout/stderr pipes `run_confined` has to create by hand now that it calls
+# `CreateProcessW` directly.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [features]
 default = ["pdf-extraction"]
