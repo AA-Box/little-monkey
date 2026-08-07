@@ -333,8 +333,16 @@ migration over users' existing embedded vectors**:
   sites, not ~9** (16 `knowledge_service.rs`, 11 `portability_commands.rs`, 1
   `diagnostics.rs`, ~17 `monkey-cli`). Harmless for the move itself, since they all
   resolve through the re-export — but that is the size of the repointing below.
-- Port the two v1-only capabilities v2 lacks: source staleness, and the
-  query-path hot cache that keeps the test-search box at keystroke latency.
+- Port the one v1-only capability v2 genuinely lacks: **source staleness**
+  (`is_stale_impl`, an mtime-only probe that reads no file contents, which is why the panel
+  can fan it out across every stack on mount). v2 has no read-only staleness probe at any
+  granularity — its change detection lives inside `refresh_at` and only has its inputs
+  after the sources have been fetched and hashed, which for a remote connector means
+  network I/O. So the honest port has a free tier (pipeline fingerprint changed), a cheap
+  tier for local connectors (the same mtime walk), and **"unknown" for remote connectors** —
+  any design that answers synchronously for those either does network I/O in a badge render
+  or lies. The second capability this line used to name, a query hot cache, should not be
+  ported at all; see the correction below.
 - ~~**Synthesize a v2 generation from each v1 index without re-embedding.**~~ **Done**,
   and the entry understated the hard part. Every factual claim in it held — the vectors
   are reusable as-is, and all thirteen `validate_chunk`/`validate_generation_contents`
@@ -355,10 +363,58 @@ migration over users' existing embedded vectors**:
   between a real fix and a cosmetic one. All-or-nothing under the `catalog_lock`:
   stage → `save_catalog` → activate, with a rollback to `previous_catalog` if activation
   fails.
-- Port the remaining work: repoint the ~45 call sites off the re-export, route every
-  read through v2, delete the v1 index, and collapse the two panels. `stacks.rs` still
-  registers **12 Tauri commands**, so v1 is still live and this item is still
+
+  **"Done" was true of the function and false of the feature, and the gap is the whole
+  lesson.** `knowledge_v2_import_from_v1` was implemented, correct, and backed by 19
+  tests — and **never registered in `lib.rs`'s `invoke_handler`**. No frontend `invoke`,
+  no CLI subcommand; `grep -rn import_from_v1` returned one hit, its own definition. So
+  the population of users holding an un-imported v1 index was not "some hold-outs", it
+  was **everyone who had ever indexed a stack**, with no affordance anywhere to fix it.
+  Nineteen passing tests were exercising a code path no shipped build could reach, which
+  is exactly the failure mode a test suite cannot see: every assertion about the import's
+  behaviour held, and none of them asked whether anything could call it.
+
+  A crate-wide audit while fixing it found **531 `#[tauri::command]` declarations and 530
+  registrations** — this was the only miss, so it was one command rather than a pattern.
+  It is now registered, offered in the v2 panel for a stack that has a v1 index and no v2
+  generation, exposed as `monkey-cli stacks import-v1`, and wired as the diagnostics safe
+  fix. The fix that matters more than the registration is
+  `every_tauri_command_is_reachable_from_the_invoke_handler`, which scans the source for
+  every declared command and asserts both directions — declared-but-unregistered *and*
+  registered-but-undeclared, the second so the scan cannot quietly stop matching and
+  report success. A test naming only this one command would not have caught this one, and
+  would not catch the next.
+
+  `audit_knowledge_index` now emits `knowledge_index.v1_import.<stack_id>` for each
+  un-imported stack, so a support bundle answers "how many users still hold a v1 index?"
+  with a number. That number is the precondition for deleting anything.
+- Port the remaining work: repoint the call sites off the re-export, route every read
+  through v2, delete the v1 index, and collapse the two panels. `stacks.rs` registers
+  **11 Tauri commands** (an earlier revision of this line said 12, while the section's own
+  opening said 11 — the opening was right), so v1 is still live and this item is still
   *partially built*.
+
+  **Deletion cannot be one change, and the reason is the import above rather than the
+  refactor.** The repointing is largely mechanical — 53 code references to the re-export,
+  of which 42 need only an import path changed and 11 genuinely use v1 index behaviour.
+  What forbids a single-release deletion is that the import only became reachable *now*,
+  so shipping the deletion alongside it would require every affected user to have opened
+  the app and run the action in between. That is a race against the user, not a migration.
+  The staged shape is D1's: this release makes the import reachable and starts counting
+  the population; a later one deletes the code once that count is known, performing a
+  last-chance import first and failing loudly rather than removing anything it could not
+  convert. Deleting the *bytes* on disk can wait a release beyond that — leaving
+  `chunks.jsonl` and `vectors.bin` in place costs nothing and is the only remaining undo
+  if an import turns out to have been subtly wrong.
+
+  Two other claims in this section were also wrong and are corrected rather than quietly
+  edited. **v1's query cache is not a latency feature worth porting**: the test-search box
+  fires on Enter or a button press, not per keystroke, so "keystroke latency" describes
+  nothing that exists, and `LoadedStack` is an unbounded `HashMap` holding every parsed
+  chunk and vector — porting it would import a latent memory bug into the surviving code.
+  The real v2 regression is elsewhere and worth fixing on its own terms: `HybridIndex::open`
+  re-digests and re-validates every chunk on **every query**, so a warm v1 query does zero
+  deserialization passes where v2 does three. That is a fix to the open path, not a cache.
 
 **Blocks:** K11 — context accounting cannot be honest while two systems
 produce context by different rules.
