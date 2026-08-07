@@ -131,10 +131,22 @@ fn print_chain_verdict(run_id: &str, verdict: &ChainVerification) {
             covered_from,
             covered_through,
             events_seen,
+            events_naming_a_process,
         } => match (covered_from, covered_through) {
             (Some(from), Some(through)) => {
                 println!("[OK] run {run_id}: {events_seen} events stored, chain intact");
                 println!("  covered: sequence {from}..={through}");
+                // Reported as a fraction rather than a checkmark: an event
+                // appended outside a process scope names no process, so the gap
+                // is how far per-event attribution actually reaches.
+                println!(
+                    "  naming a process: {events_naming_a_process} of {events_seen}{}",
+                    if *events_naming_a_process < *events_seen {
+                        " (the rest were appended outside any process scope)"
+                    } else {
+                        ""
+                    }
+                );
                 if *from > 1 {
                     println!(
                         "  note: sequences 1..={} predate hash chaining and are outside its \
@@ -245,6 +257,7 @@ mod tests {
             covered_from: None,
             covered_through: None,
             events_seen: 4,
+            events_naming_a_process: 0,
         };
         // `print_chain_verdict` writes to stdout, so assert on the branch the
         // verdict selects rather than on captured output: the tagged union is

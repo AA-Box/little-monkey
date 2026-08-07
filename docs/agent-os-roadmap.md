@@ -3209,7 +3209,9 @@ HTTP, ACP, MCP, browser, remote node — hash-chained so a deleted or edited
 event is detectable, with each event naming the process (K1) and, for anything
 gated, the exact policy decision that permitted it. A tool call whose
 authorizing decision cannot be produced from the log is a bug. Redaction
-happens on export, never on write.
+happens on export, never on write — **amended**, see the redaction entry below:
+an authorizing *fact* may never be redacted on write, but a secret-bearing
+payload may be when a digest of the original is recorded alongside it.
 
 **This entry's own premise was wrong, and correcting it is what made the work
 tractable.** It said the log is "append-only by convention rather than by
@@ -3270,17 +3272,41 @@ a broken chain so a scripted check cannot pass by printing bad news.
   stream: `daemon_scheduler_decisions` and `remote_audit` in their own database
   files, and `egress_denials`, which records denials only — **an allowed egress
   produces no row anywhere** — and ring-buffers itself on every insert.
-- **Per-event process identity does not exist, and the gap is structural.**
-  `run_events` has no process column, and the envelope's `emitter` is a
-  `ClientIdentity` naming a client *class* (`Desktop`/`Cli`/`Daemon`/…), not a K1
-  process. It cannot be recovered by joining, either: `agent_processes.run_id` is
-  not unique, because a run legitimately owns many processes.
-- **Redaction currently happens on write, contradicting the acceptance
-  directly.** `durable_run.rs`'s `redacted_tool_arguments` redacts before the
-  envelope is appended, and `permissions.rs` substitutes a fixed sentence for
-  classifier text at write time. Export-side redaction already exists separately
-  in `runCapsule.ts`. Moving the boundary is a behaviour change to the CLI path,
-  not a refactor.
+- ~~**Per-event process identity does not exist.**~~ **Done** — migration V10 adds
+  `run_events.process_id`, populated from the ambient `ProcessScope` (the D3
+  `tokio::task_local!`) inside `append_event`. That is the single place all 46
+  production call sites funnel through, so no caller changed. `NULL` means "this
+  event names no process" rather than a guess — and a guess is all a join could
+  ever be, since `agent_processes.run_id` is not unique because a run legitimately
+  owns many processes. `verify_run_chain` reports `events_naming_a_process` as a
+  fraction of `events_seen`, so how far attribution actually reaches is a number
+  rather than an assumption.
+
+  **The interesting part is the interaction with V9's chain, which covers every
+  column.** Adding a column after a chain ships is a dilemma: fold it in
+  unconditionally and every row written before it existed stops verifying; leave
+  it out and it is the one column an attacker may rewrite for free. The escape is
+  that `process_id` contributes **nothing to the digest when absent** — so a row
+  with no process hashes byte-identically to what V9 produced, while setting,
+  changing or clearing a present id all break the chain. A test spells out V9's
+  field list explicitly, because a silent change there would invalidate every
+  chain already on disk. Any future column can be added the same way.
+- ~~**Redaction happens on write, contradicting the acceptance.**~~ **This entry
+  was wrong, and the acceptance clause is what should change.** The claim was
+  literally true and materially misleading: `redacted_tool_arguments` computes
+  `arguments_sha256` over `canonical_argument_bytes(raw)` — the **original**
+  arguments, before redaction — so the log already proves *which* operation was
+  authorized without storing the secret. `permissions.rs` likewise drops only
+  free-form classifier prose while keeping `operation_sha256`, `risk_level` and
+  the decision itself.
+
+  Taken literally, "redaction happens on export, never on write" would require
+  storing plaintext credentials in a local SQLite file to gain evidence the digest
+  already provides. The clause's *intent* — that the log must be able to prove
+  what happened — is satisfied by a digest of the original plus a redacted
+  payload, which is strictly better. **Amended acceptance: an authorizing fact may
+  never be redacted on write; a secret-bearing payload may be, provided a digest
+  of the original is recorded alongside it.**
 - Approvals *are* joinable at event granularity — three FKs onto
   `run_events(run_id, sequence)` — but `approval_chain_stage_decisions` is not
   (deliberately: a chain can gate a future action with no run yet), and
