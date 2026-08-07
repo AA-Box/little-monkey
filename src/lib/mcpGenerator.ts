@@ -225,7 +225,7 @@ export function suggestedFileName(spec: McpServerSpec): string {
 export interface GeneratedArtifactProbeReport {
   clean: boolean;
   runId: string | null;
-  isolation: 'os_sandboxed' | 'process_only' | null;
+  isolation: 'os_sandboxed' | 'process_contained' | 'process_only' | null;
   typechecked: boolean;
   executed: boolean;
   probedToolCount: number;
@@ -378,8 +378,13 @@ if (runtime.error || runtime.status !== 0 || !(runtime.stdout || '').includes('$
  * that "isolated" without qualification is the one claim here worth being precise
  * about. `null` means the probe never ran, so there is no isolation to describe.
  */
-function describeProbeIsolation(isolation: 'os_sandboxed' | 'process_only' | null): string {
+function describeProbeIsolation(
+  isolation: 'os_sandboxed' | 'process_contained' | 'process_only' | null,
+): string {
   if (isolation === 'os_sandboxed') return 'OS-sandboxed';
+  if (isolation === 'process_contained') {
+    return 'process tree contained by a job object, but no filesystem boundary — real files remain reachable by absolute path';
+  }
   if (isolation === 'process_only') {
     return 'no OS sandbox on this platform — restricted directory and environment only';
   }
