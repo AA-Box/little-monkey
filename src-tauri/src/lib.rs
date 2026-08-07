@@ -1229,6 +1229,10 @@ pub fn run() {
             knowledge_service::knowledge_v2_remove_source,
             knowledge_service::knowledge_v2_refresh,
             knowledge_service::knowledge_v2_cancel_refresh,
+            // Shipped implemented, tested and *unregistered* — see
+            // `tests::every_tauri_command_is_reachable_from_the_invoke_handler`,
+            // which exists so the next one cannot repeat the trick.
+            knowledge_service::knowledge_v2_import_from_v1,
             knowledge_service::knowledge_v2_background_config_get,
             knowledge_service::knowledge_v2_background_config_save,
             knowledge_service::knowledge_v2_update_chunking,
@@ -1581,4 +1585,146 @@ pub fn run() {
             llama::stop_all_blocking(state.inner());
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    /// A `#[tauri::command]` that is never named in `run`'s
+    /// `generate_handler!` list compiles, type-checks, and passes every unit
+    /// test written against it — while being unreachable from the frontend,
+    /// because `invoke` resolves against that list alone. `knowledge_v2_import_from_v1`
+    /// spent its whole life in that state: fully implemented, 19 passing tests,
+    /// documented as done, and impossible for any user to run.
+    ///
+    /// # Why a source scan
+    ///
+    /// The gap is between two *lists* — the commands that exist and the commands
+    /// that are registered — and nothing at runtime compares them. Following the
+    /// precedent of `egress.rs`'s `no_new_bare_reqwest_client_can_be_added_unnoticed`
+    /// and `m3_http_server.rs`'s self-scans, this reads the tree and compares
+    /// them directly. It needs no allowlist: at the time it was written every
+    /// one of the crate's 531 commands was registered except the one bug above,
+    /// so the assertion is simply "the difference is empty".
+    ///
+    /// # What it covers
+    ///
+    /// Every `#[tauri::command]` in every `.rs` file under `src/`, including
+    /// files that do not exist yet — a new command in a brand-new module is the
+    /// likeliest way the next unregistered one arrives, which is why this walks
+    /// `CARGO_MANIFEST_DIR` instead of `include_str!`-ing a hard-coded list.
+    ///
+    /// # What it cannot cover
+    ///
+    /// * **Wrong module path.** It matches the bare function name, so
+    ///   `wrong_module::some_command` counts as registered. The compiler rejects
+    ///   that anyway.
+    /// * **Registered but uncalled.** A command in the list with no frontend
+    ///   `invoke` and no CLI subcommand is still dead code; "reachable" here
+    ///   means only "dispatchable".
+    /// * **A command declared inside `#[cfg(test)]`.** A text scan cannot see
+    ///   `cfg` gating, so such a command would be a false positive. None exist,
+    ///   and a test-only Tauri command would be meaningless.
+    #[test]
+    fn every_tauri_command_is_reachable_from_the_invoke_handler() {
+        const ATTRIBUTE: &str = "#[tauri::command";
+
+        let source = include_str!("lib.rs");
+        let handler = source
+            .split_once("tauri::generate_handler![")
+            .expect("run() builds its handler with generate_handler!")
+            .1
+            .split_once("\n        ])")
+            .expect("the handler list is closed at its opening indentation")
+            .0;
+        // Comment lines inside the list (there is one) survive the split as
+        // non-identifier text; requiring a bare identifier drops them.
+        let registered: std::collections::HashSet<&str> = handler
+            .lines()
+            .filter_map(|line| line.split(',').next())
+            .map(|entry| entry.rsplit("::").next().unwrap_or(entry).trim())
+            .filter(|entry| {
+                !entry.is_empty() && entry.chars().all(|c| c.is_alphanumeric() || c == '_')
+            })
+            .collect();
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut unregistered: Vec<String> = Vec::new();
+        for entry in walkdir::WalkDir::new(&src)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if entry.path().extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let file = std::fs::read_to_string(entry.path()).expect("source file reads");
+            for declaration in file.split(ATTRIBUTE).skip(1) {
+                let Some((between, signature)) = declaration.split_once(" fn ") else {
+                    continue;
+                };
+                // Everything the attribute itself may carry — an optional
+                // `(rename_all = "...")` and its closing `]` — then only
+                // `pub`/`async`. Anything else means this `#[tauri::command` was
+                // prose in a comment and the `fn` found belongs to someone else.
+                let residue = between
+                    .trim_start_matches(|c| c != ']')
+                    .trim_start_matches(']')
+                    .replace("pub", "")
+                    .replace("async", "");
+                if !residue.trim().is_empty() {
+                    continue;
+                }
+                let name: String = signature
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if name.is_empty() {
+                    continue;
+                }
+                if !registered.contains(name.as_str()) {
+                    let relative = entry
+                        .path()
+                        .strip_prefix(&src)
+                        .expect("walked path is under src/")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    unregistered.push(format!("{relative}::{name}"));
+                }
+                declared.insert(name);
+            }
+        }
+        unregistered.sort();
+
+        // The reverse direction, which is what keeps the scan above honest: if a
+        // future signature shape stops matching, the commands it can no longer
+        // see turn up here as "registered but never declared" instead of
+        // silently passing.
+        let mut phantom: Vec<&str> = registered
+            .iter()
+            .copied()
+            .filter(|name| !declared.contains(*name))
+            .collect();
+        phantom.sort_unstable();
+        assert!(
+            phantom.is_empty(),
+            "{} name(s) in `run`'s `generate_handler!` list match no `#[tauri::command]` under \
+             src/: {}.\nEither the entry is stale and should be deleted, or this test's scanner \
+             no longer recognizes how the command is written — fix the scanner, because until it \
+             is fixed those commands are unguarded.",
+            phantom.len(),
+            phantom.join(", "),
+        );
+
+        assert!(
+            unregistered.is_empty(),
+            "{} `#[tauri::command]`(s) are not in `run`'s `generate_handler!` list, so no \
+             frontend `invoke` can reach them:\n  {}\n\
+             Add each one to that list. If a command is deliberately not exposed to the \
+             frontend, it should not carry `#[tauri::command]` at all — make it a plain \
+             function and call it directly.",
+            unregistered.len(),
+            unregistered.join("\n  "),
+        );
+    }
 }

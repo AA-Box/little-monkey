@@ -378,9 +378,9 @@ enum Cmd {
         port: Option<u16>,
     },
     /// Knowledge Stacks parity (RAG design doc, slice 4): list stacks
-    /// created in the desktop app's Settings > Knowledge tab, or reindex
-    /// one by name. Read-only management stays in the GUI — no
-    /// create/delete/add-source here.
+    /// created in the desktop app's Settings > Knowledge tab, reindex one by
+    /// name, or import one's older index into Knowledge 2.0. Read-only
+    /// management stays in the GUI — no create/delete/add-source here.
     #[command(subcommand)]
     Stacks(StacksCmd),
     /// Saved recipe (YAML/JSON) headless runner — CI-suitable, machine
@@ -471,6 +471,15 @@ enum StacksCmd {
     /// Reindex a stack by name, incrementally skipping any file whose
     /// content hasn't changed since the last index.
     Reindex {
+        /// Stack name, matched case-insensitively.
+        name: String,
+    },
+    /// Publish an already-indexed stack's older index as its first Knowledge
+    /// 2.0 generation, reusing the embeddings already stored for it. Nothing is
+    /// embedded again, so this needs no embeddings server and takes seconds.
+    /// Refused if the stack already has a Knowledge 2.0 generation.
+    #[command(name = "import-v1")]
+    ImportV1 {
         /// Stack name, matched case-insensitively.
         name: String,
     },
@@ -1365,6 +1374,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
         Cmd::Stacks(action) => match action {
             StacksCmd::List => stacks_cli::list(),
             StacksCmd::Reindex { name } => stacks_cli::reindex(name).await,
+            StacksCmd::ImportV1 { name } => stacks_cli::import_v1(name),
             StacksCmd::EmbedServer(EmbedServerCmd::Start { model_path }) => {
                 embed_cli::start(model_path.clone()).await
             }
