@@ -681,6 +681,12 @@ export type MlxRuntimeStatus =
       metrics: MlxProcessMetrics;
     };
 
+/** Identity of a newly installed MLX package. Paths stay app-private. */
+export interface MlxInstalledPackage {
+  packageVersion: string;
+  manifestSha256: string;
+}
+
 export interface MlxProcessMetrics {
   processAlive: boolean;
   residentMemoryBytes: number;
@@ -1196,6 +1202,15 @@ export const runtimeHubClient = {
   componentActivateVersion: (
     args: OperationArgs & { request: { componentId: string; versionKey: string } },
   ) => invoke<M3InstalledComponent>("m3_component_activate_version", args),
+  /** Installs and activates a signed MLX service package built by
+   *  `pnpm mlx:package`. The pinned release key over the manifest is what
+   *  makes the directory trustworthy, so any path the user picks is fine. */
+  mlxInstall: (packageDirectory: string) =>
+    invoke<MlxInstalledPackage>("m3_mlx_install", { packageDirectory }),
+  /** Unpacks and activates an `mlx_runtime` component the hub has downloaded.
+   *  The hub proved the digest; this proves the publisher signed it. */
+  mlxInstallComponent: (componentId: string) =>
+    invoke<MlxInstalledPackage>("m3_mlx_install_component", { componentId }),
   runtimePrWatcherState: () => invoke<RuntimePrWatcherState>("runtime_pr_watcher_state"),
   runtimePrWatcherCheckNow: () =>
     invoke<RuntimePrWatcherCheckResult>("runtime_pr_watcher_check_now"),

@@ -173,6 +173,8 @@ interface RuntimeHubStoreState {
   replaceCatalogSources: (sources: M3CatalogSourceConfig[]) => Promise<void>;
   refreshComponents: () => Promise<void>;
   installComponent: (entry: M3ComponentCatalogEntry) => Promise<void>;
+  /** Installs a signed MLX service package from a directory on this machine. */
+  installMlxPackage: (packageDirectory: string) => Promise<void>;
   activateComponentVersion: (componentId: string, versionKey: string) => Promise<void>;
   replaceComponentRegistry: (entries: M3ComponentCatalogEntry[]) => Promise<void>;
   planSchedule: (input: M3SchedulingInput) => Promise<void>;
@@ -612,7 +614,33 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           timeoutMs: null,
           request: { entry },
         });
+        // An MLX component arrives as an archive rather than the single blob
+        // every other kind is: downloading it leaves nothing runnable until
+        // it is unpacked through the signature-verifying installer. Chained
+        // here so one click installs, rather than leaving the user with a
+        // downloaded component and a runtime still reporting Not Installed.
+        if (entry.kind === "mlx_runtime") {
+          await runtimeHubClient.mlxInstallComponent(entry.componentId);
+          await get().refreshRuntime("mlx");
+        }
         await get().refreshComponents();
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    installMlxPackage: async (packageDirectory) => {
+      const key = "mlx-install";
+      begin(key);
+      try {
+        await runtimeHubClient.mlxInstall(packageDirectory);
+        // The MLX driver reports its state from `verify_active()` on the next
+        // status read, so refreshing the runtime is what turns the card from
+        // Not Installed into a version.
+        await get().refreshRuntime("mlx");
       } catch (error) {
         fail(key, error);
         throw error;
