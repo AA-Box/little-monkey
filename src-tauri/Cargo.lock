@@ -2973,6 +2973,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "system-memory",
+ "tar",
  "tauri",
  "tauri-build",
  "tauri-plugin-deep-link",
