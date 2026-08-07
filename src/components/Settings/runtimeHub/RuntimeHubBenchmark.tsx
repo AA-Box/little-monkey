@@ -13,11 +13,12 @@
  * rather than "zero", which is exactly the lie this feature exists to prevent.
  * The per-repeat view is a table, where a cell can carry a sentence.
  */
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { Gauge, Play } from "lucide-react";
 
 import type {
   BenchmarkFieldNote,
+  BenchmarkHistoryEntry,
   BenchmarkPeakMemory,
   BenchmarkRunResponse,
   BenchmarkSample,
@@ -162,6 +163,86 @@ function Headline({ label, value, note }: { label: string; value: Measured; note
   );
 }
 
+/**
+ * Measurements kept from earlier sessions.
+ *
+ * A benchmark that is measured and then thrown away cannot inform anything, so
+ * the backend persists each report with the machine it ran on. The machine is
+ * what makes this safe to show: an entry measured somewhere else — or here
+ * before the RAM, CPU count or accelerators changed — renders **what changed**
+ * and no numbers at all, because "on the machine displaying it" is the whole
+ * claim this surface makes.
+ */
+function SavedMeasurements({ entries }: { entries: BenchmarkHistoryEntry[] }) {
+  if (!entries.length) return null;
+  return (
+    <section className="flex flex-col gap-3" aria-labelledby="runtime-hub-benchmark-history">
+      <h3 id="runtime-hub-benchmark-history" className="text-sm font-semibold text-foreground">
+        Saved measurements
+      </h3>
+      <div className="min-w-0 overflow-x-auto rounded-lg border border-border">
+        <table className="w-full min-w-[40rem] text-left text-xs">
+          <caption className="px-3 py-2 text-left text-[11px] text-faint">
+            Most recent first, one per model per runtime. Re-running a pair replaces its entry rather than
+            appending, since two reports for the same pair are not a time series.
+          </caption>
+          <thead className="bg-surface-2 text-faint">
+            <tr>
+              <th scope="col" className="px-3 py-2 font-medium">Model</th>
+              <th scope="col" className="px-3 py-2 font-medium">Runtime</th>
+              <th scope="col" className="px-3 py-2 font-medium">Time to first token</th>
+              <th scope="col" className="px-3 py-2 font-medium">Decode rate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {entries.map((entry) => {
+              const key = `${entry.report.runtimeId}/${entry.report.model}`;
+              if (entry.freshness.state !== "thisMachine") {
+                return (
+                  <tr key={key} className="border-t border-border align-top">
+                    <td className="px-3 py-2 text-foreground">{entry.report.model}</td>
+                    <td className="px-3 py-2 text-muted">{entry.report.runtimeId}</td>
+                    <td className="px-3 py-2 text-warning" colSpan={2}>
+                      Measured on different hardware, so its numbers are not shown:{" "}
+                      {entry.freshness.changed.join("; ")}. Re-run the benchmark to measure this machine.
+                    </td>
+                  </tr>
+                );
+              }
+              return (
+                <tr key={key} className="border-t border-border align-top">
+                  <td className="px-3 py-2 text-foreground">{entry.report.model}</td>
+                  <td className="px-3 py-2 text-muted">{entry.report.runtimeId}</td>
+                  <td className="px-3 py-2">
+                    <MeasuredText
+                      value={measuredSpread(
+                        entry.report.timeToFirstTokenMs,
+                        entry.report.unavailable,
+                        "timeToFirstTokenMs",
+                        "ms",
+                      )}
+                    />
+                  </td>
+                  <td className="px-3 py-2">
+                    <MeasuredText
+                      value={measuredSpread(
+                        entry.report.decodeTokensPerSecond,
+                        entry.report.unavailable,
+                        "decodeTokensPerSecond",
+                        "tok/s",
+                      )}
+                    />
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
 export function RuntimeHubBenchmark() {
   const runtimes = useRuntimeHubStore((state) => state.runtimes);
   const runtimeDetails = useRuntimeHubStore((state) => state.runtimeDetails);
@@ -175,6 +256,23 @@ export function RuntimeHubBenchmark() {
   const [busy, setBusy] = useState(false);
   const [backendError, setBackendError] = useState<string | null>(null);
   const [result, setResult] = useState<BenchmarkRunResponse | null>(null);
+  const [history, setHistory] = useState<BenchmarkHistoryEntry[]>([]);
+
+  // Loaded once on mount and refreshed after each run. A read failure leaves the
+  // section absent rather than showing an error: the history is context for the
+  // measurement, and failing to load it must not look like a failed benchmark.
+  useEffect(() => {
+    let cancelled = false;
+    runtimeHubClient
+      .benchmarkHistory()
+      .then((entries) => {
+        if (!cancelled) setHistory(entries);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [result]);
 
   const selectedRuntime = runtimeId || inferRuntimes[0]?.descriptor.runtimeId || "";
   // The runtime's own inventory when `refreshRuntime` has already loaded it
@@ -316,6 +414,8 @@ export function RuntimeHubBenchmark() {
           </BusyButton>
         </div>
       </form>
+
+      <SavedMeasurements entries={history} />
 
       {report && hardware && (
         <section className="flex flex-col gap-4" aria-labelledby="runtime-hub-benchmark-results">

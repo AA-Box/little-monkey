@@ -1,8 +1,10 @@
+import { useEffect, useState } from "react";
 import { Boxes, Cpu, Database, Gauge, HardDrive, Server } from "lucide-react";
 import { StatusPill } from "../../ui";
 import { useRuntimeHubStore } from "../../../store/runtimeHubStore";
 import { resolveEdgeRuntimeProfile } from "../../../lib/runtimeEdgeProfiles";
-import type { M3AcceleratorStatus } from "../../../lib/runtimeHubClient";
+import type { BenchmarkHistoryEntry, M3AcceleratorStatus } from "../../../lib/runtimeHubClient";
+import { runtimeHubClient } from "../../../lib/runtimeHubClient";
 import { ErrorNotice, formatBytes, labelize, SectionHeading } from "./RuntimeHubShared";
 
 const COMPATIBILITY_TONE: Record<M3AcceleratorStatus, "success" | "warning" | "danger" | "neutral"> = {
@@ -54,6 +56,24 @@ export function RuntimeHubOverview() {
   const compatibilityReport = useRuntimeHubStore((state) => state.compatibilityReport);
   const compatibilityError = useRuntimeHubStore((state) => state.errors.compatibility);
 
+  // The edge profile's throughput line defers to "the local benchmark" — this is
+  // what lets it stop deferring once one has actually been run. A read failure
+  // leaves the list empty, which is the same state as "never benchmarked" and
+  // renders the same hedge, so there is nothing to report.
+  const [benchmarks, setBenchmarks] = useState<BenchmarkHistoryEntry[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    runtimeHubClient
+      .benchmarkHistory()
+      .then((entries) => {
+        if (!cancelled) setBenchmarks(entries);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const usedPercent = storage?.quotaBytes
     ? Math.min(100, Math.max(0, (storage.usedBytes / storage.quotaBytes) * 100))
     : 0;
@@ -79,7 +99,7 @@ export function RuntimeHubOverview() {
     },
   ];
   const edgeProfile = hardware && profile
-    ? resolveEdgeRuntimeProfile(hardware, profile, compatibilityReport)
+    ? resolveEdgeRuntimeProfile(hardware, profile, compatibilityReport, benchmarks)
     : null;
 
   return (

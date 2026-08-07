@@ -1288,6 +1288,7 @@ pub fn run() {
             m3_commands::m3_hardware_snapshot,
             m3_commands::m3_hardware_profile,
             m3_commands::m3_benchmark_run,
+            m3_commands::m3_benchmark_history,
             m3_commands::m3_hardware_compatibility_report,
             m3_commands::m3_storage_status,
             m3_commands::m3_installed_models,
