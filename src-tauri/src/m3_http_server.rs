@@ -1017,6 +1017,7 @@ fn filter_runtime_status(
                 running_models,
             }
         }
+        #[cfg(target_os = "macos")]
         M3RuntimeStatusView::Mlx {
             status:
                 crate::mlx_runtime::MlxRuntimeStatus::Running {
@@ -1033,6 +1034,9 @@ fn filter_runtime_status(
                 package_version,
             },
         },
+        // Only reachable while the MLX arm above exists — without it, `Adapter`
+        // is the whole enum and a catch-all would be dead.
+        #[cfg(target_os = "macos")]
         other => other,
     }
 }

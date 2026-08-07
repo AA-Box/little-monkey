@@ -916,6 +916,9 @@ impl M3RuntimeDriver for MockRuntimeDriver {
                     status,
                     running_models,
                 }),
+                // `Adapter` is the whole enum unless the macOS-only MLX variant
+                // is compiled in, and a catch-all over one variant is dead code.
+                #[cfg(target_os = "macos")]
                 _ => unreachable!(),
             }
         })

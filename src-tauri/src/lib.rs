@@ -138,9 +138,10 @@ pub mod command_palette;
 // `m7_companion`. See `docs/safe-desktop-control-design.md` for the full
 // threat model and explicit non-goals.
 pub mod desktop_control;
-// Apple-Silicon-only MLX lifecycle adapter. The module reports explicit
-// unsupported capability on every other platform rather than implying a
-// portable backend.
+// Apple-Silicon-only MLX lifecycle adapter. It is compiled only into the macOS
+// build: MLX needs Metal, so a Windows or Linux binary that carried this module
+// would ship an implementation it can never run.
+#[cfg(target_os = "macos")]
 pub mod mlx_runtime;
 // Inbound OpenAI/Anthropic compatibility translations and the scoped,
 // authenticated LAN policy shared by the API server and user-owned runners.
@@ -1356,7 +1357,9 @@ pub fn run() {
             m3_commands::m3_component_check_updates,
             m3_commands::m3_component_install,
             m3_commands::m3_component_activate_version,
+            #[cfg(target_os = "macos")]
             m3_commands::m3_mlx_install,
+            #[cfg(target_os = "macos")]
             m3_commands::m3_mlx_install_component,
             m3_commands::m3_telemetry_record_load,
             m3_commands::m3_telemetry_record_request,

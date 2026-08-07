@@ -18,9 +18,14 @@ use crate::m3_runtime_hub::{
     M3ComponentHubDependencies, M3ComponentSource, M3HardwareCompatibilityReport, M3HardwareProbe,
     M3HubConfig, M3HubError, M3HubFuture, M3HubResult, M3InferenceEngine, M3InstalledModelView,
     M3JetsonInfo, M3ModelCapabilities, M3OperationContext, M3RuntimeDriver, M3RuntimeHub,
-    M3RuntimeHubDependencies, M3RuntimeKind, M3RuntimeReconciler, M3RuntimeStatusView, MlxM3Driver,
+    M3RuntimeHubDependencies, M3RuntimeKind, M3RuntimeReconciler, M3RuntimeStatusView,
     ReqwestM3DownloadTransport, RuntimeAdapterM3Driver, StaticM3ComponentSource, SystemM3Clock,
 };
+// MLX is Metal-only, so the module and everything that assembles it are compiled
+// into the macOS build alone.
+#[cfg(target_os = "macos")]
+use crate::m3_runtime_hub::MlxM3Driver;
+#[cfg(target_os = "macos")]
 use crate::mlx_runtime::{
     self, CurrentHostMlxProbe, MlxError, MlxFuture, MlxGenerationRequest, MlxGenerationSummary,
     MlxHostCapabilities, MlxInstallLimits, MlxLaunchSpec, MlxModelCapabilities, MlxModelRecord,
@@ -38,8 +43,11 @@ use crate::runtime_adapter::{
 };
 use base64::Engine as _;
 use futures_util::StreamExt;
+use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
-use ring::{hmac, signature};
+// Only the MLX release-key verifier checks a signature here.
+#[cfg(target_os = "macos")]
+use ring::signature;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -48,6 +56,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+// Only the MLX service controller counts generated tokens atomically.
+#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -57,7 +67,8 @@ use uuid::Uuid;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-#[cfg(unix)]
+// `ps`-based resident-memory sampling, reached only from MLX metrics.
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 const M3_DIRECTORY: &str = "m3";
@@ -78,7 +89,9 @@ const MAX_INFERENCE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_INFERENCE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const KEYCHAIN_SERVICE: &str = "com.littlemonkey.m3-lan";
 const KEYCHAIN_ACCOUNT: &str = "lan-state-hmac-v1";
+#[cfg(target_os = "macos")]
 const MLX_RELEASE_KEY_ID: &str = "release-2026-1";
+#[cfg(target_os = "macos")]
 const MLX_RELEASE_PUBLIC_KEY_HEX: &str =
     "84db8c4dfdca72589631be1513f45083e893c9c373ba5be6e49928e43c7b828c";
 
@@ -2854,9 +2867,11 @@ fn ensure_private_directory(path: &Path) -> M3HubResult<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Default)]
 struct ProductionMlxSignatureVerifier;
 
+#[cfg(target_os = "macos")]
 impl MlxSignatureVerifier for ProductionMlxSignatureVerifier {
     fn verify(
         &self,
@@ -2875,6 +2890,7 @@ impl MlxSignatureVerifier for ProductionMlxSignatureVerifier {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("pinned key is not valid hexadecimal".to_string());
@@ -2897,6 +2913,7 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
 /// process is supervised by the same structured process boundary as
 /// llama.cpp; generation uses a loopback-only SSE endpoint whose data values
 /// are the versioned [`MlxStreamEvent`] schema.
+#[cfg(target_os = "macos")]
 struct ProductionMlxServiceController {
     process: Arc<SystemManagedProcessController>,
     handles: Mutex<BTreeMap<String, ManagedProcessHandle>>,
@@ -2905,6 +2922,7 @@ struct ProductionMlxServiceController {
     client: reqwest::Client,
 }
 
+#[cfg(target_os = "macos")]
 impl ProductionMlxServiceController {
     fn new(process: Arc<SystemManagedProcessController>) -> M3HubResult<Self> {
         let client = reqwest::Client::builder()
@@ -2936,6 +2954,7 @@ impl ProductionMlxServiceController {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl MlxServiceController for ProductionMlxServiceController {
     fn port_owner<'a>(&'a self, port: u16) -> MlxFuture<'a, Option<String>> {
         Box::pin(async move {
@@ -3197,6 +3216,7 @@ impl MlxServiceController for ProductionMlxServiceController {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn ingest_mlx_service_line(
     raw_line: &[u8],
     sink: &mut dyn MlxStreamSink,
@@ -3227,7 +3247,9 @@ fn ingest_mlx_service_line(
     sink.emit(event).map_err(MlxError::StreamProtocol)
 }
 
-#[cfg(unix)]
+// MLX metrics only; macOS is always unix, so there is no non-unix variant to
+// keep alive here.
+#[cfg(target_os = "macos")]
 fn process_resident_memory_bytes(pid: u32) -> Option<u64> {
     let output = Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
@@ -3244,11 +3266,7 @@ fn process_resident_memory_bytes(pid: u32) -> Option<u64> {
         .checked_mul(1_024)
 }
 
-#[cfg(not(unix))]
-fn process_resident_memory_bytes(_pid: u32) -> Option<u64> {
-    None
-}
-
+#[cfg(target_os = "macos")]
 struct ProductionMlxComponents {
     installer: Arc<MlxPackageInstaller>,
     controller: Arc<ProductionMlxServiceController>,
@@ -3256,6 +3274,9 @@ struct ProductionMlxComponents {
 
 struct ProductionRuntimeFactory {
     root: PathBuf,
+    // Only the MLX driver needs a clock; the other drivers take their timestamps
+    // from the runtime adapter they wrap.
+    #[cfg(target_os = "macos")]
     clock: Arc<dyn M3Clock>,
     process_controller: Arc<SystemManagedProcessController>,
 }
@@ -3307,6 +3328,7 @@ impl ProductionRuntimeFactory {
             drivers.push(Arc::new(RuntimeAdapterM3Driver::new(adapter, inference)?)
                 as Arc<dyn M3RuntimeDriver>);
         }
+        #[cfg(target_os = "macos")]
         if let Some(mlx) = production_mlx_components(&self.root, self.process_controller.clone())? {
             let models = mlx_models(installed)?;
             let adapter = Arc::new(
@@ -3384,6 +3406,7 @@ impl M3RuntimeReconciler for ProductionRuntimeReconciler {
                     M3RuntimeStatusView::Adapter { running_models, .. } => {
                         !running_models.is_empty()
                     }
+                    #[cfg(target_os = "macos")]
                     M3RuntimeStatusView::Mlx { status } => {
                         matches!(status, crate::mlx_runtime::MlxRuntimeStatus::Running { .. })
                     }
@@ -3454,6 +3477,7 @@ fn runtime_models(
         .collect()
 }
 
+#[cfg(target_os = "macos")]
 fn mlx_models(installed: &[M3InstalledModelView]) -> M3HubResult<Vec<MlxModelRecord>> {
     let mut model_ids = BTreeSet::new();
     installed
@@ -3550,6 +3574,7 @@ fn find_production_llama_binary(root: &Path) -> M3HubResult<Option<PathBuf>> {
 /// already atomic — staging directory, rename into place, atomic `active.json`
 /// write — and installs are user-initiated and rare. Hand out a shared `Arc`
 /// if concurrent installs ever become a real path.
+#[cfg(target_os = "macos")]
 pub fn production_mlx_installer(root: &Path) -> M3HubResult<Arc<MlxPackageInstaller>> {
     Ok(Arc::new(
         MlxPackageInstaller::new(
@@ -3563,6 +3588,7 @@ pub fn production_mlx_installer(root: &Path) -> M3HubResult<Arc<MlxPackageInstal
 
 /// What an install reports back. Paths stay inside the app's private tree, so
 /// only the identity of the package crosses to the UI.
+#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MlxInstalledPackageView {
@@ -3578,6 +3604,7 @@ pub struct MlxInstalledPackageView {
 /// every file's digest must match, or nothing is written. That is why an
 /// arbitrary caller-supplied path is safe here in a way it would not be for,
 /// say, a directory of binaries copied into place.
+#[cfg(target_os = "macos")]
 pub fn install_mlx_package(
     app_data_dir: &Path,
     package_directory: &Path,
@@ -3609,6 +3636,7 @@ pub fn install_mlx_package(
 /// success or failure. Nothing under it is trusted: `read_package_directory`
 /// loads only manifest-declared files and `install_and_activate` re-derives
 /// every digest and verifies the publisher signature before publishing a byte.
+#[cfg(target_os = "macos")]
 pub fn install_mlx_from_artifact(
     app_data_dir: &Path,
     artifact_path: &Path,
@@ -3637,6 +3665,7 @@ pub fn install_mlx_from_artifact(
     })
 }
 
+#[cfg(target_os = "macos")]
 fn production_mlx_components(
     root: &Path,
     process: Arc<SystemManagedProcessController>,
@@ -3731,6 +3760,7 @@ pub fn build_m3_command_state(app_data_dir: impl AsRef<Path>) -> M3HubResult<M3C
     let process = Arc::new(SystemManagedProcessController::new(root.join("logs"))?);
     let factory = Arc::new(ProductionRuntimeFactory {
         root: root.clone(),
+        #[cfg(target_os = "macos")]
         clock: clock.clone(),
         process_controller: process.clone(),
     });
@@ -4603,6 +4633,7 @@ GPU1:
     /// than only in m3_runtime_hub.rs) because this is the other real
     /// composition path the roadmap's "at least one real backend" bar
     /// applies to, alongside the OpenAI-compatible wire above.
+    #[cfg(target_os = "macos")]
     #[test]
     fn canonical_message_to_mlx_carries_inline_images_separately_from_text() {
         let message = CanonicalMessage {
