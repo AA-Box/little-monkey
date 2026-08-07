@@ -3416,8 +3416,26 @@ a broken chain so a scripted check cannot pass by printing bad news.
   it through seventeen `send` call sites plus the spawned relay tasks that
   outlive the loop would buy nothing.
 
-  **Still to write to it:** the remote node (`daemon/remote/api.rs`). Separate
-  stores also still hold gating-relevant records with no join to either stream: `daemon_scheduler_decisions` and `remote_audit` in their own database
+  **The remote node writes to it too, and it needed no id bookkeeping.** Unlike
+  ACP, every path through `RemoteApi` returns one `ApiResponse` from one
+  `handle`, so wrapping that is already a choke point with the request and its
+  response in scope together. An unauthenticated request — the one that never
+  reaches a route at all — is therefore still an event, which is the property the
+  wrapper buys over instrumenting routes.
+
+  This does **not** replace `remote_audit`. That table holds the protocol-level
+  denial detail this stream deliberately does not; what was missing was a row
+  readable alongside everything else, and that is what the join now gives.
+
+  One consequence worth noting: `server.rs` and `RemoteApi` both answer HTTP, so
+  the status-to-outcome rule moved into `subsystem_audit::outcome_for_status`.
+  Two copies would have drifted, and the drift would stay invisible until
+  somebody counted failures and got refusals.
+
+  **Every subsystem the acceptance names now writes to the stream** — desktop and
+  daemon through `run_events`, and HTTP, MCP, browser, ACP and the remote node
+  through `subsystem_events`. Separate stores still hold gating-relevant records
+  with no join to either stream: `daemon_scheduler_decisions` and `remote_audit` in their own database
   files, and `egress_denials`, which records denials only — **an allowed egress
   produces no row anywhere** — and ring-buffers itself on every insert.
 - ~~**Per-event process identity does not exist.**~~ **Done** — migration V10 adds

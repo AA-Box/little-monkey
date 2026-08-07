@@ -69,6 +69,26 @@ pub struct SubsystemAction<'a> {
     pub detail: Option<serde_json::Value>,
 }
 
+/// How an HTTP-style response status reads as an outcome.
+///
+/// Lives here rather than beside either caller because `server.rs` and the
+/// remote node's `RemoteApi` both answer HTTP and must classify it the same way
+/// — two copies of this would drift, and the drift would be invisible until
+/// somebody counted failures and got refusals.
+///
+/// `Denied` is kept apart from `Failed` for the reason [`SubsystemOutcome`]
+/// gives: a refusal and an error are different findings. Rate limiting is the
+/// server failing the caller rather than refusing them on policy, so it is
+/// `Failed`.
+#[must_use]
+pub fn outcome_for_status(status: u16) -> SubsystemOutcome {
+    match status {
+        200..=299 => SubsystemOutcome::Succeeded,
+        401 | 403 => SubsystemOutcome::Denied,
+        _ => SubsystemOutcome::Failed,
+    }
+}
+
 /// Where a subsystem's events go.
 #[derive(Clone)]
 pub struct SubsystemAudit {
@@ -305,6 +325,30 @@ mod tests {
         audit.record(action(SubsystemOutcome::Succeeded));
         let ledger = RunLedger::open(directory.0.join(crate::run_commands::DATABASE_FILE)).unwrap();
         assert_eq!(ledger.recent_subsystem_events(None, 10).unwrap().len(), 2);
+    }
+
+    /// One status rule, two HTTP-answering callers (`server.rs` and the remote
+    /// node). Two copies would drift, and the drift would be invisible until
+    /// somebody counted failures and got refusals.
+    #[test]
+    fn a_refusal_is_not_a_failure() {
+        assert_eq!(outcome_for_status(200), SubsystemOutcome::Succeeded);
+        assert_eq!(outcome_for_status(204), SubsystemOutcome::Succeeded);
+        assert_eq!(outcome_for_status(299), SubsystemOutcome::Succeeded);
+        assert_eq!(outcome_for_status(401), SubsystemOutcome::Denied);
+        assert_eq!(outcome_for_status(403), SubsystemOutcome::Denied);
+        assert_eq!(
+            outcome_for_status(429),
+            SubsystemOutcome::Failed,
+            "rate limiting is the server failing the caller, not refusing them on policy"
+        );
+        assert_eq!(outcome_for_status(404), SubsystemOutcome::Failed);
+        assert_eq!(outcome_for_status(500), SubsystemOutcome::Failed);
+        assert_eq!(
+            outcome_for_status(302),
+            SubsystemOutcome::Failed,
+            "a redirect is not a completed action for these APIs"
+        );
     }
 
     /// A disabled audit writes nothing and says so, rather than looking like a
