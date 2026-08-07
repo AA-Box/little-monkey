@@ -179,13 +179,6 @@ rustls = "0.23.41"
 flate2 = "1.1.9"
 quick-xml = "0.41.0"
 crc32fast = "1.5.0"
-# tar 0.4.46 is already locked and compiled through tauri-plugin-updater, which
-# unpacks macOS update archives with it. Making it direct lets mlx_runtime.rs
-# unpack the MLX service package the component hub downloads, without adding a
-# crate to the graph. Entries are read as data only: the extractor takes bytes
-# and a validated relative path from each header and applies its own modes, so
-# no permission, symlink, or device entry in an archive is ever honored.
-tar = "0.4.46"
 # stacks.rs (RAG design doc, slice 4): pure-Rust PDF text extraction for
 # Knowledge Stacks sources. `optional = true` + the `pdf-extraction` feature
 # below (default-on) so PDF support is a build-time toggle, not a hard
@@ -234,6 +227,18 @@ enigo = "0.6.1"
 # desktop and CLI pulls from mutating the same resumable partial download.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# mlx_runtime.rs only. tar 0.4.46 is already locked and compiled through
+# tauri-plugin-updater, which unpacks macOS update archives with it. Making it
+# direct lets mlx_runtime.rs unpack the MLX service package the component hub
+# downloads, without adding a crate to the graph. macOS-scoped because
+# `mlx_runtime` itself is: the Windows and Linux builds have no MLX package to
+# unpack, so they should not carry an archive parser for one. Entries are read as
+# data only: the extractor takes bytes and a validated relative path from each
+# header and applies its own modes, so no permission, symlink, or device entry in
+# an archive is ever honored.
+[target.'cfg(target_os = "macos")'.dependencies]
+tar = "0.4.46"
 
 # sandbox_linux.rs: the Linux half of the sandbox's OS boundary (ROADMAP.md item
 # K3). `landlock` rather than raw `landlock_create_ruleset`/`landlock_add_rule`/

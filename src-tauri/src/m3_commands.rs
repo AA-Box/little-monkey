@@ -27,13 +27,17 @@ use crate::m3_runtime_hub::{
     M3ActivateComponentVersionRequest, M3ActivateModelVersionRequest, M3ApiCaller,
     M3ApiDispatchRequest, M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch,
     M3CleanupReport, M3CompatibilityMatrixReport, M3ComponentCatalogEntry, M3ComponentHub,
-    M3ComponentKind, M3ComponentUpdateCheck, M3DeleteModelRequest, M3DownloadRequest,
-    M3HardwareCompatibilityReport, M3HubError, M3InstallComponentRequest, M3InstalledComponentView,
+    M3ComponentUpdateCheck, M3DeleteModelRequest, M3DownloadRequest, M3HardwareCompatibilityReport,
+    M3HubError, M3InstallComponentRequest, M3InstalledComponentView,
     M3InstalledModelView, M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest,
     M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeKind, M3RuntimeMetricsView,
     M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3SettingCapabilitiesView, M3StorageStatus,
     M3UnloadModelRequest, M3VerifyProjectorRequest,
 };
+// Only `m3_mlx_install_component` inspects a component kind, and that
+// command exists only in the macOS build.
+#[cfg(target_os = "macos")]
+use crate::m3_runtime_hub::M3ComponentKind;
 use crate::quantization::{
     BackendDescriptor, ConversionReport, ConversionRequest, DeclaredLicense, GgufQuantType,
     QuantizationWorkbench,
@@ -1346,6 +1350,7 @@ pub fn m3_component_installed(
 /// The runtime list is not refreshed here: the MLX driver reads
 /// `verify_active()` when it is next asked for status, so the caller's own
 /// refresh is what surfaces the newly installed package.
+#[cfg(target_os = "macos")]
 #[tauri::command]
 pub fn m3_mlx_install(
     app: tauri::AppHandle,
@@ -1371,6 +1376,7 @@ pub fn m3_mlx_install(
 /// symlink. This joins them for the one component kind that needs unpacking,
 /// and re-running it on an already-installed version is a no-op that
 /// re-verifies rather than an error.
+#[cfg(target_os = "macos")]
 #[tauri::command]
 pub fn m3_mlx_install_component(
     app: tauri::AppHandle,
