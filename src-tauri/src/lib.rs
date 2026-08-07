@@ -202,9 +202,10 @@ pub mod triage;
 // Tauri-free static-registry + comparison logic shared by `providers.rs`'s
 // cloud-model command and `m3_runtime_hub.rs`'s local-model staleness check.
 pub mod model_retirement;
-// `pub` so a future `monkey-cli` `Stacks` subcommand (RAG design doc, slice 4)
-// can call `stacks::list_impl`/`reindex_impl`/`query_impl` directly, the
-// same AppHandle-free-core reasoning as `checkpoints`/`rules`/`memory`.
+// `pub` so `monkey-cli`'s `Stacks` subcommand (RAG design doc, slice 4) can call
+// `stacks::reindex_impl`/`query_impl`/`query_stacks_v2_first` directly, the same
+// AppHandle-free-core reasoning as `checkpoints`/`rules`/`memory`. The registry
+// half it also needs now comes from `knowledge_core` instead.
 pub mod stacks;
 // `pub` so `monkey-cli` (slice 4) can reuse `load_impl`/`PromptEntry` directly,
 // the same reasoning as `rules`/`checkpoints` above.

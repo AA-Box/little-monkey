@@ -1053,10 +1053,14 @@ async fn execute_tool_call(
         // including Plan Mode's hard block (see `stacks.rs::tool_search_docs`'s
         // own doc comment for the full reasoning, which applies verbatim
         // here). `stacks_cli::search_docs` resolves the model's `stack` name
-        // argument through the same `stacks::resolve_search_stack_ids` the
-        // desktop app's Tauri command uses, over the same `stacks::query_impl`
-        // ranking, so this and the GUI's `search_docs` produce identically
-        // shaped results for the same stack/query.
+        // argument through the same `knowledge_core::resolve_search_stack_ids`
+        // the desktop app's Tauri command uses, over the same
+        // `stacks::query_stacks_v2_first` ranking, so this and the GUI's
+        // `search_docs` produce identically shaped results for the same
+        // stack/query. That last clause used to be false: this path called v1's
+        // `query_impl` directly and so never consulted Knowledge 2.0, meaning an
+        // imported stack was answered from the hybrid index in the GUI and from
+        // v1's cosine scan here.
         "search_docs" => {
             let query = args["query"].as_str().unwrap_or_default().to_string();
             let stack = args["stack"].as_str().map(str::to_string);

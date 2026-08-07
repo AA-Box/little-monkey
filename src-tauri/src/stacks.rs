@@ -60,14 +60,14 @@ use walkdir::WalkDir;
 use crate::AppState;
 
 // The shared registry + embedding core this module used to own moved to
-// `knowledge_core` so Knowledge 2.0 stops depending on v1. Re-exported from
-// here — rather than repointing the ~45 `crate::stacks::…` /
-// `little_monkey_lib::stacks::…` references spread across `knowledge_service`,
-// `portability_commands`, `diagnostics`, and `monkey-cli` in the same change —
-// so the extraction is provably behaviour-neutral: not one call site,
-// signature, or test assertion moved with it. Later steps of the v1→v2 collapse
-// repoint those callers at `knowledge_core` directly and delete this block
-// along with the rest of the file.
+// `knowledge_core` so Knowledge 2.0 stops depending on v1. Callers outside this
+// file have since been repointed at `knowledge_core` directly, so nothing
+// reaches the shared items through here any more; this block now exists only for
+// `stacks.rs`'s own body below, which still spells them unqualified. It goes
+// away with the rest of the file. What is *not* re-exported and must stay
+// reachable until then is [`ChunkMeta`]: it is v1's `chunks.jsonl` row type and
+// the input type of `knowledge_service`'s v1→v2 importer, i.e. the migration
+// path rather than leftover v1 surface.
 pub use crate::knowledge_core::{
     add_source_impl, create_impl, delete_impl, embed_batch, import_definitions_impl, list_impl,
     mark_v2_indexed_impl, remove_source_impl, rename_impl, resolve_search_stack_ids,
@@ -1263,18 +1263,51 @@ pub async fn stacks_query(
     query: String,
     k: Option<u32>,
 ) -> Result<Vec<StackQueryResult>, String> {
-    let base = stacks_base_dir(&app)?;
-    let registry = load_registry(&base)?;
+    let app_data = crate::knowledge_core::app_data_dir(&app)?;
+    let registry = load_registry(&stacks_base_dir(&app)?)?;
     let k = k.unwrap_or(DEFAULT_QUERY_K as u32) as usize;
-    let cancel = CancellationToken::new();
+    query_stacks_v2_first(
+        &app_data,
+        state.inner(),
+        &registry,
+        &stack_ids,
+        &query,
+        k,
+        &CancellationToken::new(),
+    )
+    .await
+}
+
+/// Retrieval over already-resolved stack ids: each stack is served by its active
+/// Knowledge 2.0 generation if it has one, and by v1's `chunks.jsonl`/
+/// `vectors.bin` if it does not, with the two families woven together by
+/// [`merge_stack_results`] rather than score-compared.
+///
+/// The v1 arm is the reason the v1 index cannot be deleted yet: a stack whose
+/// owner has not run the v1→v2 import has no active generation, and must still
+/// answer. Shared by `stacks_query`, [`tool_search_docs`] and `monkey-cli`'s
+/// `search_docs` — `AppHandle`-free precisely so the CLI can call it, since
+/// while it could not, the CLI agent answered from v1 alone and the two agents
+/// ranked the same query differently on the same machine.
+pub async fn query_stacks_v2_first(
+    app_data: &Path,
+    state: &AppState,
+    registry: &[KnowledgeStack],
+    stack_ids: &[String],
+    query: &str,
+    k: usize,
+    cancel: &CancellationToken,
+) -> Result<Vec<StackQueryResult>, String> {
     let mut hybrid_groups: Vec<Vec<StackQueryResult>> = Vec::new();
     let mut legacy_ids = Vec::new();
-    for id in &stack_ids {
+    for id in stack_ids {
         let stack = registry
             .iter()
             .find(|stack| &stack.id == id)
             .ok_or_else(|| format!("Stack '{id}' not found"))?;
-        match crate::knowledge_service::query_for_agent(&app, stack, &query, k, &cancel).await? {
+        match crate::knowledge_service::query_for_agent_at(app_data, stack, query, k, cancel)
+            .await?
+        {
             Some(hybrid) => hybrid_groups.push(hybrid),
             None => legacy_ids.push(id.clone()),
         }
@@ -1282,7 +1315,7 @@ pub async fn stacks_query(
     let legacy_group = if legacy_ids.is_empty() {
         Vec::new()
     } else {
-        query_impl(&base, state.inner(), &legacy_ids, &query, k).await?
+        query_impl(&app_data.join("stacks"), state, &legacy_ids, query, k).await?
     };
 
     Ok(merge_stack_results(hybrid_groups, legacy_group, k))
@@ -1408,8 +1441,8 @@ pub async fn tool_search_docs(
     max_results: Option<u32>,
     allowed_stack_names: Option<Vec<String>>,
 ) -> Result<Vec<StackQueryResult>, String> {
-    let base = stacks_base_dir(&app)?;
-    let registry = load_registry(&base)?;
+    let app_data = crate::knowledge_core::app_data_dir(&app)?;
+    let registry = load_registry(&stacks_base_dir(&app)?)?;
     // Always `Some(...)` here (an empty `Vec` when the caller sent nothing),
     // never `None` — see this function's and `resolve_search_stack_ids`'s doc
     // comments for why the desktop app must fail closed (scope to nothing)
@@ -1440,26 +1473,16 @@ pub async fn tool_search_docs(
         ids
     };
 
-    let cancel = CancellationToken::new();
-    let mut hybrid_groups: Vec<Vec<StackQueryResult>> = Vec::new();
-    let mut legacy_ids = Vec::new();
-    for id in &stack_ids {
-        let candidate = registry
-            .iter()
-            .find(|candidate| &candidate.id == id)
-            .ok_or_else(|| format!("Stack '{id}' not found"))?;
-        match crate::knowledge_service::query_for_agent(&app, candidate, &query, k, &cancel).await? {
-            Some(hybrid) => hybrid_groups.push(hybrid),
-            None => legacy_ids.push(id.clone()),
-        }
-    }
-    let legacy_group = if legacy_ids.is_empty() {
-        Vec::new()
-    } else {
-        query_impl(&base, state.inner(), &legacy_ids, &query, k).await?
-    };
-
-    Ok(merge_stack_results(hybrid_groups, legacy_group, k))
+    query_stacks_v2_first(
+        &app_data,
+        state.inner(),
+        &registry,
+        &stack_ids,
+        &query,
+        k,
+        &CancellationToken::new(),
+    )
+    .await
 }
 
 #[cfg(test)]
