@@ -21,6 +21,72 @@ use crate::run_protocol::{
     RunEvent, RunEventEnvelope, RunSpec, RunStatus,
 };
 
+/// Domain separator, so a chain hash can never be mistaken for — or collide
+/// with — one of the per-payload `*_sha256` digests the ledger already stores.
+const CHAIN_HASH_DOMAIN: &[u8] = b"little-monkey/run-event-chain/v1";
+
+/// One link of the run event chain: SHA-256 over every column of the row, bound
+/// to the previous row's hash.
+///
+/// Fields are **length-prefixed**, not concatenated. Concatenation alone is
+/// ambiguous — `("ab", "c")` and `("a", "bc")` produce identical bytes — so a
+/// naive join would let one event be rewritten as a different event with the
+/// same hash. Each field contributes its big-endian `u64` length followed by its
+/// bytes, which no two distinct field lists can produce.
+///
+/// `previous` is `None` only at the start of a chain: either the run's first
+/// event, or the first event appended after V9 to a run whose earlier events
+/// predate chaining. Both cases are reported by
+/// [`RunLedger::verify_run_chain`] rather than papered over.
+#[allow(clippy::too_many_arguments)]
+fn event_chain_hash(
+    previous: Option<&str>,
+    event_id: &str,
+    run_id: &str,
+    sequence: u64,
+    occurred_at_ms: i64,
+    actor_id: Option<&str>,
+    event_type: &str,
+    emitter_json: &[u8],
+    envelope_json: &[u8],
+    derived_status: Option<&str>,
+    is_terminal: bool,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    let mut field = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    };
+    field(CHAIN_HASH_DOMAIN);
+    // An absent optional field and an empty one must not hash alike, so each
+    // carries a one-byte presence tag ahead of its value.
+    field(previous.unwrap_or_default().as_bytes());
+    field(&[u8::from(previous.is_some())]);
+    field(event_id.as_bytes());
+    field(run_id.as_bytes());
+    field(&sequence.to_be_bytes());
+    field(&occurred_at_ms.to_be_bytes());
+    field(actor_id.unwrap_or_default().as_bytes());
+    field(&[u8::from(actor_id.is_some())]);
+    field(event_type.as_bytes());
+    field(emitter_json);
+    field(envelope_json);
+    field(derived_status.unwrap_or_default().as_bytes());
+    field(&[u8::from(derived_status.is_some())]);
+    field(&[u8::from(is_terminal)]);
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest.iter() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SQLITE_VALUE_BYTES: i32 = 8 * 1024 * 1024;
 const MAX_SQL_TEXT_BYTES: i32 = 1024 * 1024;
@@ -41,6 +107,30 @@ const MIGRATION_V7: i64 = 7;
 const MIGRATION_V7_CHECKSUM: &str = "process-kill-intent-v7-2026-08-03";
 const MIGRATION_V8: i64 = 8;
 const MIGRATION_V8_CHECKSUM: &str = "process-resource-ledger-v8-2026-08-06";
+const MIGRATION_V9: i64 = 9;
+const MIGRATION_V9_CHECKSUM: &str = "run-event-hash-chain-v9-2026-08-07";
+
+/// The result of recomputing a run's event chain.
+///
+/// A tagged union rather than a `bool` plus fields, so a caller cannot read
+/// `covered_from` off a broken chain and present it as a verified range — the
+/// same reason the resource ledger's panel renders a tagged union.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum ChainVerification {
+    Intact {
+        /// First sequence the chain vouches for. `None` when no event carries a
+        /// hash at all, which is every run written before migration V9 —
+        /// distinct from "verified and empty".
+        covered_from: Option<u64>,
+        covered_through: Option<u64>,
+        events_seen: u64,
+    },
+    Broken {
+        sequence: u64,
+        detail: String,
+    },
+}
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -433,11 +523,37 @@ impl RunLedger {
         validate_status_transition(current_status, effects.status)?;
 
         let derived_status = effects.status.map(run_status_token);
+        // Read inside the same transaction that just pinned `sequence` to
+        // `last_sequence + 1`, so the row this links to cannot change underneath
+        // it. `None` means the predecessor predates V9 (or there is none), which
+        // starts a new covered range rather than being an error.
+        let previous_hash = transaction
+            .query_row(
+                "SELECT event_hash FROM run_events WHERE run_id = ?1 AND sequence = ?2",
+                params![envelope.run_id, sequence - 1],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let event_hash = event_chain_hash(
+            previous_hash.as_deref(),
+            &envelope.event_id,
+            &envelope.run_id,
+            envelope.sequence,
+            occurred_at_ms,
+            envelope.actor_id.as_deref(),
+            effects.event_type,
+            &emitter_json,
+            &envelope_json,
+            derived_status,
+            effects.terminal,
+        );
         transaction.execute(
             "INSERT INTO run_events (
                 event_id, run_id, sequence, occurred_at_ms, actor_id,
-                emitter_json, event_type, envelope_json, derived_status, is_terminal
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                emitter_json, event_type, envelope_json, derived_status, is_terminal,
+                event_hash, prev_event_hash
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 envelope.event_id,
                 envelope.run_id,
@@ -448,7 +564,9 @@ impl RunLedger {
                 effects.event_type,
                 envelope_json,
                 derived_status,
-                i64::from(effects.terminal)
+                i64::from(effects.terminal),
+                event_hash,
+                previous_hash
             ],
         )?;
 
@@ -461,6 +579,111 @@ impl RunLedger {
             sequence: envelope.sequence,
             status: resulting_status,
             terminal: effects.terminal,
+        })
+    }
+
+    /// Recomputes one run's event chain and reports what it can and cannot
+    /// vouch for.
+    ///
+    /// Detects, within the covered range: any edited column of any event, a
+    /// deleted interior event, and a reordering. Detects a **truncated tail**
+    /// too, but by a second route — `runs.last_sequence` is maintained by the
+    /// `run_events_project_run` trigger, so removing the newest events leaves it
+    /// claiming more events than exist, and hiding that requires a second,
+    /// separate edit to a different table.
+    ///
+    /// Cannot detect: removal of the entire covered range, since a per-run chain
+    /// has no anchor outside the database it lives in. Saying so is the point —
+    /// an integrity claim that overstates itself is worse than none.
+    pub fn verify_run_chain(&self, run_id: &str) -> LedgerResult<ChainVerification> {
+        let claimed_last_sequence = self
+            .connection
+            .query_row(
+                "SELECT last_sequence FROM runs WHERE run_id = ?1",
+                [run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or_else(|| LedgerError::NotFound {
+                entity: "run",
+                id: run_id.to_string(),
+            })?;
+        let claimed_last_sequence = from_sql_u64(claimed_last_sequence, "last_sequence")?;
+
+        let mut statement = self.connection.prepare(
+            "SELECT event_id, sequence, occurred_at_ms, actor_id, emitter_json, event_type,
+                    envelope_json, derived_status, is_terminal, event_hash, prev_event_hash
+             FROM run_events WHERE run_id = ?1 ORDER BY sequence ASC",
+        )?;
+        let mut rows = statement.query([run_id])?;
+
+        let mut covered_from = None;
+        let mut covered_through = None;
+        let mut events_seen = 0u64;
+        let mut expected_previous: Option<String> = None;
+        while let Some(row) = rows.next()? {
+            events_seen += 1;
+            let sequence = from_sql_u64(row.get::<_, i64>(1)?, "sequence")?;
+            let stored_hash = row.get::<_, Option<String>>(9)?;
+            let stored_previous = row.get::<_, Option<String>>(10)?;
+            let Some(stored_hash) = stored_hash else {
+                // Predates V9. Anything after it starts a fresh covered range;
+                // an unchained row appearing *inside* one is a broken link,
+                // which the `expected_previous` check below catches.
+                if covered_from.is_some() {
+                    return Ok(ChainVerification::Broken {
+                        sequence,
+                        detail: "an event inside the covered range carries no hash".to_string(),
+                    });
+                }
+                continue;
+            };
+            if let Some(expected) = &expected_previous {
+                if stored_previous.as_deref() != Some(expected.as_str()) {
+                    return Ok(ChainVerification::Broken {
+                        sequence,
+                        detail: "this event does not link to the previous event's hash".to_string(),
+                    });
+                }
+            }
+            let recomputed = event_chain_hash(
+                stored_previous.as_deref(),
+                &row.get::<_, String>(0)?,
+                run_id,
+                sequence,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?.as_deref(),
+                &row.get::<_, String>(5)?,
+                &row.get::<_, Vec<u8>>(4)?,
+                &row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, Option<String>>(7)?.as_deref(),
+                row.get::<_, i64>(8)? != 0,
+            );
+            if recomputed != stored_hash {
+                return Ok(ChainVerification::Broken {
+                    sequence,
+                    detail: "this event's contents do not match its recorded hash".to_string(),
+                });
+            }
+            covered_from.get_or_insert(sequence);
+            covered_through = Some(sequence);
+            expected_previous = Some(stored_hash);
+        }
+
+        if events_seen < claimed_last_sequence {
+            return Ok(ChainVerification::Broken {
+                sequence: claimed_last_sequence,
+                detail: format!(
+                    "the run projects {claimed_last_sequence} events but only {events_seen} are \
+                     stored, so events were removed"
+                ),
+            });
+        }
+
+        Ok(ChainVerification::Intact {
+            covered_from,
+            covered_through,
+            events_seen,
         })
     }
 
@@ -784,7 +1007,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
             row.get::<_, Option<i64>>(0)
         })?
     {
-        if version > MIGRATION_V8 {
+        if version > MIGRATION_V9 {
             return Err(LedgerError::MigrationConflict { version });
         }
     }
@@ -798,6 +1021,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         (MIGRATION_V6, MIGRATION_V6_CHECKSUM),
         (MIGRATION_V7, MIGRATION_V7_CHECKSUM),
         (MIGRATION_V8, MIGRATION_V8_CHECKSUM),
+        (MIGRATION_V9, MIGRATION_V9_CHECKSUM),
     ] {
         if let Some(checksum) = connection
             .query_row(
@@ -1014,7 +1238,24 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
-    transaction.execute_batch("PRAGMA user_version = 8;")?;
+    let has_v9 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V9],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v9 {
+        transaction.execute_batch(MIGRATION_V9_SQL)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![MIGRATION_V9, MIGRATION_V9_CHECKSUM, now_ms_i64()?],
+        )?;
+    }
+
+    transaction.execute_batch("PRAGMA user_version = 9;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -1637,6 +1878,55 @@ BEFORE UPDATE OF state ON agent_processes
 WHEN NEW.state = 'exited' AND NEW.usage_unavailable_json IS NULL
 BEGIN
     SELECT RAISE(ABORT, 'an exited agent process must state its unmeasured fields');
+END;
+"#;
+
+/// Hash-chains the run event stream (roadmap K12).
+///
+/// **Deliberately does not backfill.** Hashing the rows already on disk would
+/// compute a chain over whatever those rows currently say and then certify it —
+/// so a row edited *before* this migration ran would be laundered into a valid
+/// chain, and the feature would assert an integrity property it does not have.
+/// Both columns are therefore nullable, `NULL` means "written before chaining
+/// existed, and outside the chain's coverage", and
+/// [`RunLedger::verify_run_chain`] reports where coverage begins instead of
+/// implying it begins at sequence 1.
+///
+/// The two triggers make the *linkage* structural even for a writer that never
+/// goes through Rust — SQLite cannot compute SHA-256, so the hash's *content* is
+/// checked by `verify_run_chain`, but "this row points at its predecessor" and
+/// "a chained run cannot silently stop being chained" are enforced here.
+const MIGRATION_V9_SQL: &str = r#"
+ALTER TABLE run_events ADD COLUMN event_hash TEXT
+    CHECK (event_hash IS NULL OR length(event_hash) = 64);
+ALTER TABLE run_events ADD COLUMN prev_event_hash TEXT
+    CHECK (prev_event_hash IS NULL OR length(prev_event_hash) = 64);
+
+CREATE TRIGGER run_events_chain_links_to_its_predecessor
+BEFORE INSERT ON run_events
+FOR EACH ROW
+WHEN (
+        SELECT event_hash FROM run_events
+        WHERE run_id = NEW.run_id AND sequence = NEW.sequence - 1
+    ) IS NOT NULL
+    AND NEW.prev_event_hash IS NOT (
+        SELECT event_hash FROM run_events
+        WHERE run_id = NEW.run_id AND sequence = NEW.sequence - 1
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'run event must carry its predecessor''s hash');
+END;
+
+CREATE TRIGGER run_events_chain_must_not_stop
+BEFORE INSERT ON run_events
+FOR EACH ROW
+WHEN NEW.event_hash IS NULL
+    AND (
+        SELECT event_hash FROM run_events
+        WHERE run_id = NEW.run_id AND sequence = NEW.sequence - 1
+    ) IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'a chained run cannot append an unchained event');
 END;
 "#;
 
@@ -2972,6 +3262,263 @@ mod tests {
         ));
     }
 
+    /// Length-prefixing is the whole reason the canonicalization is not a join.
+    /// Concatenated, `("ab", "c")` and `("a", "bc")` are the same bytes — so a
+    /// naive chain would let one event be rewritten as a different event with an
+    /// unchanged hash, which is precisely the tamper this feature exists to
+    /// catch. The two calls below differ only in where the field boundary falls.
+    #[test]
+    fn the_chain_hash_cannot_be_forged_by_moving_a_field_boundary() {
+        let left = event_chain_hash(
+            None, "ab", "c", 1, 2_000, None, "queued", b"{}", b"{}", None, false,
+        );
+        let right = event_chain_hash(
+            None, "a", "bc", 1, 2_000, None, "queued", b"{}", b"{}", None, false,
+        );
+        assert_ne!(
+            left, right,
+            "concatenating fields without their lengths would make these collide"
+        );
+
+        // An absent optional and an empty one must also differ, or a row with
+        // `actor_id = NULL` could be rewritten to `actor_id = ''` for free.
+        assert_ne!(
+            event_chain_hash(None, "e", "r", 1, 2_000, None, "queued", b"{}", b"{}", None, false,),
+            event_chain_hash(
+                None,
+                "e",
+                "r",
+                1,
+                2_000,
+                Some(""),
+                "queued",
+                b"{}",
+                b"{}",
+                None,
+                false,
+            ),
+            "a NULL actor and an empty-string actor are different rows"
+        );
+        assert_eq!(
+            left.len(),
+            64,
+            "the column's CHECK constraint expects 64 hex chars"
+        );
+    }
+
+    #[test]
+    fn a_freshly_appended_run_verifies_from_its_first_event() {
+        let mut ledger = RunLedger::open_in_memory().unwrap();
+        ledger
+            .submit_run(&spec("run-chain", "submit/chain"))
+            .unwrap();
+        for sequence in 1..=3 {
+            ledger.append_event(&queued("run-chain", sequence)).unwrap();
+        }
+
+        assert_eq!(
+            ledger.verify_run_chain("run-chain").unwrap(),
+            ChainVerification::Intact {
+                covered_from: Some(1),
+                covered_through: Some(3),
+                events_seen: 3,
+            }
+        );
+    }
+
+    /// Editing any column of any event breaks the chain at that event. The
+    /// pre-existing `load_events` revalidation only catches a payload that stops
+    /// being *valid protocol*; this catches a replacement that parses perfectly.
+    #[test]
+    fn editing_an_event_breaks_the_chain_at_that_event() {
+        let mut ledger = RunLedger::open_in_memory().unwrap();
+        ledger.submit_run(&spec("run-edit", "submit/edit")).unwrap();
+        for sequence in 1..=3 {
+            ledger.append_event(&queued("run-edit", sequence)).unwrap();
+        }
+
+        // A change that is entirely valid protocol and entirely plausible: the
+        // second event now claims to have happened a minute later.
+        ledger
+            .connection
+            .execute_batch("DROP TRIGGER run_events_forbid_update")
+            .unwrap();
+        ledger
+            .connection
+            .execute(
+                "UPDATE run_events SET occurred_at_ms = occurred_at_ms + 60000
+                 WHERE run_id = 'run-edit' AND sequence = 2",
+                [],
+            )
+            .unwrap();
+
+        match ledger.verify_run_chain("run-edit").unwrap() {
+            ChainVerification::Broken { sequence, detail } => {
+                assert_eq!(sequence, 2);
+                assert!(
+                    detail.contains("do not match its recorded hash"),
+                    "got {detail}"
+                );
+            }
+            other => panic!("an edited timestamp must break the chain, got {other:?}"),
+        }
+    }
+
+    /// Deleting an interior event is caught by the link check rather than by the
+    /// hash check: the survivors' own hashes are still correct, but the event
+    /// after the hole now points at a predecessor that is not there.
+    #[test]
+    fn deleting_an_interior_event_breaks_the_link_to_its_predecessor() {
+        let mut ledger = RunLedger::open_in_memory().unwrap();
+        ledger.submit_run(&spec("run-hole", "submit/hole")).unwrap();
+        for sequence in 1..=3 {
+            ledger.append_event(&queued("run-hole", sequence)).unwrap();
+        }
+
+        ledger
+            .connection
+            .execute_batch("DROP TRIGGER run_events_forbid_delete")
+            .unwrap();
+        ledger
+            .connection
+            .execute(
+                "DELETE FROM run_events WHERE run_id = 'run-hole' AND sequence = 2",
+                [],
+            )
+            .unwrap();
+
+        match ledger.verify_run_chain("run-hole").unwrap() {
+            ChainVerification::Broken { sequence, detail } => {
+                assert_eq!(sequence, 3, "the event after the hole is where it shows");
+                assert!(detail.contains("does not link"), "got {detail}");
+            }
+            other => panic!("a deleted interior event must break the chain, got {other:?}"),
+        }
+    }
+
+    /// Truncating the newest events leaves every surviving hash correct and every
+    /// link intact, so the chain alone cannot see it. `runs.last_sequence` can:
+    /// the projection trigger maintains it, so the run still claims events that
+    /// are gone, and concealing that needs a second edit to a different table.
+    #[test]
+    fn truncating_the_newest_events_is_caught_by_the_runs_projection() {
+        let mut ledger = RunLedger::open_in_memory().unwrap();
+        ledger
+            .submit_run(&spec("run-truncated", "submit/truncated"))
+            .unwrap();
+        for sequence in 1..=4 {
+            ledger
+                .append_event(&queued("run-truncated", sequence))
+                .unwrap();
+        }
+
+        ledger
+            .connection
+            .execute_batch("DROP TRIGGER run_events_forbid_delete")
+            .unwrap();
+        ledger
+            .connection
+            .execute(
+                "DELETE FROM run_events WHERE run_id = 'run-truncated' AND sequence >= 3",
+                [],
+            )
+            .unwrap();
+
+        match ledger.verify_run_chain("run-truncated").unwrap() {
+            ChainVerification::Broken { sequence, detail } => {
+                assert_eq!(sequence, 4);
+                assert!(detail.contains("events were removed"), "got {detail}");
+            }
+            other => panic!("a truncated tail must be reported, got {other:?}"),
+        }
+    }
+
+    /// A run whose events predate V9 is reported as covered from the first
+    /// *chained* event, not from sequence 1. Backfilling those rows instead would
+    /// have hashed whatever they currently say and certified it — laundering an
+    /// edit made before chaining existed into a valid chain.
+    #[test]
+    fn events_written_before_the_chain_existed_are_reported_outside_its_coverage() {
+        let mut ledger = RunLedger::open_in_memory().unwrap();
+        ledger
+            .submit_run(&spec("run-legacy", "submit/legacy"))
+            .unwrap();
+        for sequence in 1..=2 {
+            ledger
+                .append_event(&queued("run-legacy", sequence))
+                .unwrap();
+        }
+        // Simulate rows written before V9 by clearing their hashes.
+        ledger
+            .connection
+            .execute_batch("DROP TRIGGER run_events_forbid_update")
+            .unwrap();
+        ledger
+            .connection
+            .execute(
+                "UPDATE run_events SET event_hash = NULL, prev_event_hash = NULL
+                 WHERE run_id = 'run-legacy'",
+                [],
+            )
+            .unwrap();
+        ledger.append_event(&queued("run-legacy", 3)).unwrap();
+
+        assert_eq!(
+            ledger.verify_run_chain("run-legacy").unwrap(),
+            ChainVerification::Intact {
+                covered_from: Some(3),
+                covered_through: Some(3),
+                events_seen: 3,
+            },
+            "coverage begins where hashing began, and says so"
+        );
+    }
+
+    /// The linkage is enforced in SQL, so it holds against a writer that never
+    /// goes through this module. SQLite cannot compute SHA-256, so the hash's
+    /// *content* is `verify_run_chain`'s job — but "points at its predecessor"
+    /// and "a chained run does not silently stop being chained" are the
+    /// database's.
+    #[test]
+    fn a_direct_sql_writer_cannot_append_an_event_outside_the_chain() {
+        let mut ledger = RunLedger::open_in_memory().unwrap();
+        ledger
+            .submit_run(&spec("run-bypass", "submit/bypass"))
+            .unwrap();
+        ledger.append_event(&queued("run-bypass", 1)).unwrap();
+
+        let unchained = ledger.connection.execute(
+            "INSERT INTO run_events (
+                 event_id, run_id, sequence, occurred_at_ms, actor_id,
+                 emitter_json, event_type, envelope_json, derived_status, is_terminal
+             ) VALUES ('event-raw', 'run-bypass', 2, 3000, NULL,
+                       CAST('{}' AS BLOB), 'queued', CAST('{}' AS BLOB), NULL, 0)",
+            [],
+        );
+        let message = unchained
+            .expect_err("an unchained append must abort")
+            .to_string();
+        assert!(
+            message.contains("cannot append an unchained event"),
+            "got {message}"
+        );
+
+        let wrong_link = ledger.connection.execute(
+            "INSERT INTO run_events (
+                 event_id, run_id, sequence, occurred_at_ms, actor_id,
+                 emitter_json, event_type, envelope_json, derived_status, is_terminal,
+                 event_hash, prev_event_hash
+             ) VALUES ('event-raw', 'run-bypass', 2, 3000, NULL,
+                       CAST('{}' AS BLOB), 'queued', CAST('{}' AS BLOB), NULL, 0,
+                       ?1, ?2)",
+            params!["a".repeat(64), "b".repeat(64)],
+        );
+        let message = wrong_link
+            .expect_err("a wrong predecessor hash must abort")
+            .to_string();
+        assert!(message.contains("predecessor"), "got {message}");
+    }
+
     #[test]
     fn artifact_checkpoint_and_external_mutation_projections_commit_with_events() {
         let mut ledger = RunLedger::open_in_memory().unwrap();
@@ -3184,30 +3731,34 @@ mod tests {
                     "{column} must be nullable: NULL means unmeasured"
                 );
             }
+            // The ladder head, not V8's own number — bump this with every new
+            // migration, alongside the `PRAGMA user_version` the applier sets.
             assert_eq!(
                 ledger
                     .connection
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                8
+                9
             );
         }
 
         // Forward-only: a database written by a newer build is refused rather
-        // than downgraded, the same guard every earlier version gets.
+        // than downgraded, the same guard every earlier version gets. The version
+        // used here must stay one *above* the ladder head, or this asserts the
+        // checksum mismatch instead of the forward-only guard.
         {
             let connection = Connection::open(&database.path).unwrap();
             connection
                 .execute(
                     "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
-                     VALUES (9, 'from-the-future', 1)",
+                     VALUES (10, 'from-the-future', 1)",
                     [],
                 )
                 .unwrap();
         }
         assert!(matches!(
             RunLedger::open(&database.path),
-            Err(LedgerError::MigrationConflict { version: 9 })
+            Err(LedgerError::MigrationConflict { version: 10 })
         ));
     }
 
@@ -3218,13 +3769,14 @@ mod tests {
             let ledger = RunLedger::open(&database.path).unwrap();
             assert_eq!(
                 ledger.applied_migrations().unwrap(),
-                vec![1, 2, 3, 4, 5, 6, 7, 8]
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
             );
         }
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+            "reopening must not re-apply or add a migration"
         );
 
         let journal_mode = ledger
