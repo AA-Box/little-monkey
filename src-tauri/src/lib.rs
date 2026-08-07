@@ -1328,6 +1328,8 @@ pub fn run() {
             m3_commands::m3_component_check_updates,
             m3_commands::m3_component_install,
             m3_commands::m3_component_activate_version,
+            m3_commands::m3_mlx_install,
+            m3_commands::m3_mlx_install_component,
             m3_commands::m3_telemetry_record_load,
             m3_commands::m3_telemetry_record_request,
             m3_commands::m3_telemetry_recent_traces,
