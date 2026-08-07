@@ -1004,6 +1004,17 @@ pub struct ServerDeps {
     /// before either listing or exact resolution.
     pub providers: Vec<ProviderSummary>,
     tokens: Vec<StoredToken>,
+    /// Where this listener's requests are recorded in the unified subsystem
+    /// event stream (roadmap K12).
+    ///
+    /// Carried on `ServerDeps` rather than threaded as a parameter because the
+    /// two production listeners reach a ledger by different routes — the desktop
+    /// one through `AppState`, the CLI-hosted one through the data directory it
+    /// already derives from `config_path` — and `handle_request` should not have
+    /// to know which it is running under. Unit tests build a
+    /// [`SubsystemAudit::disabled`] with the reason named, so "no events" in a
+    /// test is never mistaken for "this route was never wired up".
+    audit: crate::subsystem_audit::SubsystemAudit,
     /// The client for peers on this machine: the bundled `llama-server` and the
     /// local Ollama daemon. Deliberately a default `reqwest::Client`, with no
     /// timeout and reqwest's stock ten-hop redirect policy.
@@ -2245,18 +2256,93 @@ pub async fn handle_request(
     };
     let matched_token_id = authed.as_ref().map(|a| a.id.clone());
 
-    let response = match (method, path.as_str()) {
-        (Method::GET, "/v1/models") => handle_models(deps, authed.as_ref()).await,
-        (Method::POST, "/v1/chat/completions") => {
+    let response = match (&method, path.as_str()) {
+        (&Method::GET, "/v1/models") => handle_models(deps, authed.as_ref()).await,
+        (&Method::POST, "/v1/chat/completions") => {
             handle_chat_completions(deps, authed.as_ref(), &headers, body).await
         }
-        (Method::POST, "/v1/embeddings") => {
+        (&Method::POST, "/v1/embeddings") => {
             handle_embeddings(deps, authed.as_ref(), &headers, body).await
         }
         _ => not_found_response(),
     };
 
+    record_http_request(deps, &method, &path, response.status());
+
     (with_cors(response), matched_token_id)
+}
+
+/// Record one served HTTP request in the unified subsystem event stream
+/// (roadmap K12).
+///
+/// **Which requests are recorded, and why not all of them.** An inbound request
+/// that runs a model, reads the user's knowledge base or returns an artifact is
+/// an action taken on this machine at someone else's request, and that is what
+/// the stream is for. `/health`, a CORS preflight and `GET /v1/models` are not:
+/// they are the discovery calls every client makes *before* acting, they carry
+/// no effect, and recording them would double the stream while making the rows
+/// that matter harder to find. They are filtered by
+/// [`http_action_worth_recording`] rather than here so the rule is one testable
+/// function instead of a condition buried in a handler.
+///
+/// The response *status* is recorded, never the body or the headers: a body may
+/// hold the user's own text and `detail_json` is covered by the chain, so it is
+/// permanent. An authorization header would be worse still.
+fn record_http_request(deps: &ServerDeps, method: &Method, path: &str, status: StatusCode) {
+    let Some(action) = http_action_worth_recording(method, path) else {
+        return;
+    };
+    deps.audit.record(crate::subsystem_audit::SubsystemAction {
+        subsystem: crate::run_ledger::Subsystem::Http,
+        action,
+        // An inbound request is not a run and never will be — `run_scope`'s
+        // `InboundRequest` exists to say exactly that — so no turn is passed and
+        // the attribution comes from the ambient scope.
+        turn_id: None,
+        // Bearer-token auth, not the permission gate: nothing here goes through
+        // `request_permission`, so there is no decision to point at. `None` is
+        // the honest answer and the CLI prints it as "nothing gated this
+        // action" rather than leaving it blank.
+        permission_request_id: None,
+        outcome: http_outcome(status),
+        detail: Some(serde_json::json!({ "status": status.as_u16() })),
+    });
+}
+
+/// How a response status reads as an outcome.
+///
+/// `Denied` is kept apart from `Failed` for the reason `SubsystemOutcome` gives:
+/// a refusal and an error are different findings, and a reader counting failures
+/// must not be counting refusals. A pure function so the mapping is testable —
+/// asserting it inline in the caller would only restate it.
+fn http_outcome(status: StatusCode) -> crate::run_ledger::SubsystemOutcome {
+    use crate::run_ledger::SubsystemOutcome;
+    if status.is_success() {
+        SubsystemOutcome::Succeeded
+    } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        SubsystemOutcome::Denied
+    } else {
+        SubsystemOutcome::Failed
+    }
+}
+
+/// The action string for a request worth recording, or `None` to skip it.
+///
+/// Kept pure and separate from [`record_http_request`] so the rule can be tested
+/// without standing up a listener — and so adding a route means adding a line
+/// here rather than remembering to instrument a handler.
+fn http_action_worth_recording(method: &Method, path: &str) -> Option<String> {
+    // A preflight carries no bearer token and takes no action; a liveness probe
+    // is answered before authentication even runs.
+    if method == Method::OPTIONS || path == "/health" {
+        return None;
+    }
+    // Discovery, not action: every client asks before it does anything, and the
+    // request that follows is the one that acted.
+    if method == Method::GET && path == "/v1/models" {
+        return None;
+    }
+    Some(format!("{method} {path}"))
 }
 
 // ---------------------------------------------------------------------
@@ -2525,6 +2611,7 @@ fn build_deps(
         m3_service: runtime.m3_service.clone(),
         m3_policy: runtime.m3_policy.clone(),
         cancel,
+        audit: crate::subsystem_audit::SubsystemAudit::desktop(app.clone()),
     }
 }
 
@@ -3237,6 +3324,19 @@ async fn run_cli_server_with_m3_hub_and_connection_limit(
         .map_err(|error| format!("Failed to build the cloud-provider HTTP client: {error}"))?;
     let llama_port = endpoints.llama_port;
     let ollama_base_url = endpoints.ollama_base_url;
+    // Built once for the whole listener. The CLI-hosted server has no
+    // `AppState`, only the data directory `config_path` already sits in, so it
+    // opens the ledger itself — see `subsystem_audit`'s module docs for why the
+    // three contexts differ by what they can reach rather than by taste.
+    let audit = match config_path.parent() {
+        Some(app_data_dir) => crate::subsystem_audit::SubsystemAudit::in_data_dir(app_data_dir),
+        None => crate::subsystem_audit::SubsystemAudit::disabled(
+            "the API server config path has no app-data parent to find a ledger in",
+        ),
+    };
+    // Said once at startup, so an operator learns a listener is not auditing now
+    // rather than inferring it later from an empty stream.
+    eprintln!("API server subsystem audit: {}", audit.describe());
     let configured_m3_policy = m3_hub.lan_policy().map_err(|error| error.to_string())?;
     let model_service = HttpModelService::for_m3_hub(m3_hub.clone());
     let m3_service = M3HttpRequestService::with_model_service(m3_hub, model_service.clone());
@@ -3308,6 +3408,7 @@ async fn run_cli_server_with_m3_hub_and_connection_limit(
         let m3_policy_for_conn = m3_policy.clone();
         let ollama_base_url_for_conn = ollama_base_url.clone();
         let shutdown_for_conn = server_shutdown.clone();
+        let audit_for_conn = audit.clone();
 
         connections.spawn(async move {
             let _connection_permit = connection_permit;
@@ -3324,6 +3425,10 @@ async fn run_cli_server_with_m3_hub_and_connection_limit(
                 let m3_policy_for_req = m3_policy_for_conn.clone();
                 let ollama_base_url_for_req = ollama_base_url_for_conn.clone();
                 let shutdown_for_req = shutdown_for_conn.clone();
+                // Cloned, never rebuilt: the clones share one lazily-opened
+                // ledger, so the listener pays a SQLite open once rather than
+                // once per request.
+                let audit_for_req = audit_for_conn.clone();
                 async move {
                     let response = serve_with_admission(
                         &admission_for_req,
@@ -3348,6 +3453,7 @@ async fn run_cli_server_with_m3_hub_and_connection_limit(
                                 &cloud_client,
                             );
                             let deps = ServerDeps {
+                                audit: audit_for_req,
                                 llama_port,
                                 llama_ready: false,
                                 llama_model_stem: None,
@@ -4433,6 +4539,85 @@ mod tests {
         }
     }
 
+    /// Which inbound requests reach the subsystem event stream. The rule is a
+    /// pure function precisely so it can be pinned here rather than inferred
+    /// from whichever handlers somebody remembered to instrument.
+    #[test]
+    fn only_requests_that_act_are_recorded() {
+        // Acts on this machine at someone else's request: recorded.
+        for (method, path) in [
+            (Method::POST, "/v1/chat/completions"),
+            (Method::POST, "/v1/embeddings"),
+            (Method::POST, "/v1/knowledge/query"),
+        ] {
+            assert_eq!(
+                http_action_worth_recording(&method, path).as_deref(),
+                Some(format!("{method} {path}").as_str()),
+                "{method} {path} takes an action and must be recorded"
+            );
+        }
+
+        // Discovery and liveness: no effect, and every client sends them before
+        // the request that does act.
+        for (method, path) in [
+            (Method::GET, "/health"),
+            (Method::OPTIONS, "/v1/chat/completions"),
+            (Method::GET, "/v1/models"),
+        ] {
+            assert!(
+                http_action_worth_recording(&method, path).is_none(),
+                "{method} {path} carries no effect and must not be recorded"
+            );
+        }
+
+        // A `POST` to the models route would not be discovery, so the skip is
+        // bound to the method too rather than to the path alone.
+        assert!(http_action_worth_recording(&Method::POST, "/v1/models").is_some());
+    }
+
+    /// An unauthenticated caller is `denied`, not `failed`: a reader counting
+    /// failures must not be counting refusals.
+    #[test]
+    fn refusals_and_errors_are_different_outcomes() {
+        use crate::run_ledger::SubsystemOutcome;
+        assert_eq!(http_outcome(StatusCode::OK), SubsystemOutcome::Succeeded);
+        assert_eq!(
+            http_outcome(StatusCode::NO_CONTENT),
+            SubsystemOutcome::Succeeded
+        );
+        assert_eq!(
+            http_outcome(StatusCode::UNAUTHORIZED),
+            SubsystemOutcome::Denied
+        );
+        assert_eq!(
+            http_outcome(StatusCode::FORBIDDEN),
+            SubsystemOutcome::Denied
+        );
+        assert_eq!(
+            http_outcome(StatusCode::TOO_MANY_REQUESTS),
+            SubsystemOutcome::Failed,
+            "rate limiting is the server failing the caller, not refusing them on policy"
+        );
+        assert_eq!(
+            http_outcome(StatusCode::INTERNAL_SERVER_ERROR),
+            SubsystemOutcome::Failed
+        );
+        assert_eq!(
+            http_outcome(StatusCode::NOT_FOUND),
+            SubsystemOutcome::Failed
+        );
+    }
+
+    /// A disabled audit is inert: the recording path must run end to end in a
+    /// test without a ledger and without panicking.
+    #[test]
+    fn recording_through_a_disabled_audit_is_inert() {
+        let deps = test_deps("http://127.0.0.1:11434".to_string());
+        assert!(!deps.audit.is_recording());
+        record_http_request(&deps, &Method::POST, "/v1/embeddings", StatusCode::OK);
+        record_http_request(&deps, &Method::GET, "/health", StatusCode::OK);
+    }
+
     fn test_deps(ollama_base_url: String) -> ServerDeps {
         let providers = vec![
             test_provider("openai", "https://api.openai.com/v1"),
@@ -4452,6 +4637,11 @@ mod tests {
             &cloud_client,
         );
         ServerDeps {
+            // Named rather than silent: a test that records nothing must not
+            // look like a route that was never wired up.
+            audit: crate::subsystem_audit::SubsystemAudit::disabled(
+                "server unit test with no ledger",
+            ),
             llama_port: 8090,
             llama_ready: true,
             llama_model_stem: Some("qwen2.5-7b-instruct".to_string()),

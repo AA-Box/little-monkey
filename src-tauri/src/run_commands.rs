@@ -19,7 +19,11 @@ use crate::AppState;
 
 pub const RUNS_CHANGED_EVENT: &str = "runs://changed";
 pub const RUN_CANCELLATION_REQUESTED_EVENT: &str = "runs://cancellation-requested";
-const DATABASE_FILE: &str = "profile-v1.sqlite3";
+/// The ledger filename under the app data directory.
+///
+/// `pub(crate)` so `subsystem_audit` can open the same file from a process that
+/// has only a path — one spelling, rather than a second literal that could drift.
+pub(crate) const DATABASE_FILE: &str = "profile-v1.sqlite3";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

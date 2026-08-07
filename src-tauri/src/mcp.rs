@@ -1362,7 +1362,6 @@ pub async fn mcp_call_tool(
         // reaches the append at the end.
         record_mcp_event(
             &app,
-            state.inner(),
             &server_id,
             &tool_name,
             turn_id.as_deref(),
@@ -1429,7 +1428,6 @@ pub async fn mcp_call_tool(
 
     record_mcp_event(
         &app,
-        state.inner(),
         &server_id,
         &tool_name,
         turn_id.as_deref(),
@@ -1451,43 +1449,29 @@ pub async fn mcp_call_tool(
 /// row would restate what that row proves. A call that never finishes therefore
 /// leaves an open permission and no event, which reads correctly as "authorized,
 /// never completed".
-///
-/// A write failure is logged, never propagated: failing an MCP call that already
-/// succeeded because its audit row could not be appended would turn a
-/// bookkeeping problem into a user-visible one. The permission decision — the
-/// security-relevant half — is written on the `permissions.rs` path, which does
-/// fail closed.
-fn record_mcp_event<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    state: &AppState,
+fn record_mcp_event(
+    app: &tauri::AppHandle,
     server_id: &str,
     tool_name: &str,
     turn_id: Option<&str>,
     permission_request_id: Option<&str>,
     outcome: crate::run_ledger::SubsystemOutcome,
 ) {
-    let recorded = (|| -> Result<(), String> {
-        let (run_id, attribution) = permissions::permission_attribution(app, state, turn_id)?;
-        let event = crate::run_ledger::SubsystemEvent {
-            event_id: format!("subsystem-{}", uuid::Uuid::new_v4().simple()),
+    crate::subsystem_audit::SubsystemAudit::desktop(app.clone()).record(
+        crate::subsystem_audit::SubsystemAction {
             subsystem: crate::run_ledger::Subsystem::Mcp,
             action: format!("{server_id}:{tool_name}"),
-            occurred_at_ms: crate::run_commands::unix_time_ms()?,
-            run_id,
-            attribution,
-            process_id: crate::run_scope::current_process()
-                .map(|process| process.process_id().to_string()),
-            permission_request_id: permission_request_id.map(str::to_string),
+            turn_id,
+            permission_request_id,
             outcome,
-            detail_json: None,
-        };
-        crate::run_commands::with_ledger(app, state, |ledger| {
-            ledger.append_subsystem_event(&event).map(|_| ())
-        })
-    })();
-    if let Err(error) = recorded {
-        eprintln!("MCP call completed but was not recorded in the event stream: {error}");
-    }
+            // Deliberately no arguments: `detail_json` is covered by the chain
+            // and therefore permanent, and an MCP tool's arguments routinely
+            // carry secrets. The `permission_decisions` row already holds
+            // `operation_sha256` over the real arguments, which proves *which*
+            // call this was without storing them.
+            detail: None,
+        },
+    );
 }
 
 #[cfg(test)]
