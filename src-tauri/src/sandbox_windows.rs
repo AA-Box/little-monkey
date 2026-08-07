@@ -203,9 +203,13 @@ impl JobConfinement {
     /// job. See "the assignment race" above for why this cannot happen at
     /// creation.
     ///
-    /// Windows 8 and later allow a process to be in nested jobs, so this
-    /// succeeds even when the app itself is already inside one — a CI runner or
-    /// a terminal that wraps its children both do that.
+    /// Works when the app itself is already inside someone else's job, which is
+    /// the normal case under a CI runner or a job-wrapping terminal: since
+    /// Windows 8 the child ends up in both, with this job nested under the outer
+    /// one. What is *not* allowed is putting one process into two unrelated jobs
+    /// that cannot form that hierarchy — the kernel answers `ERROR_ACCESS_DENIED`,
+    /// which is why the test below pins the error path rather than asserting a
+    /// second assignment succeeds.
     pub fn assign(&self, child: &tokio::process::Child) -> io::Result<()> {
         let Some(handle) = child.raw_handle() else {
             // Only `None` once the child has been reaped, which cannot have
@@ -281,23 +285,30 @@ mod tests {
         );
     }
 
-    /// A process must be assignable to a second, nested job.
+    /// A refused assignment must surface as `Err`, not as a silent success.
     ///
-    /// This is the shape a CI runner or a job-wrapping terminal produces — the
-    /// app is already inside someone else's job, and `execute_in_sandbox` adds
-    /// its own on top. Windows 8 allowed that; before it, the second assignment
-    /// failed and would mean every sandboxed run on such a machine cannot start.
+    /// `execute_in_sandbox` turns this `Result` into a failed run with `?`, so
+    /// the entire safety of "a run that returned was contained" rests on this
+    /// function reporting failure. An `Ok` on a refused assignment would produce
+    /// exactly the unconfined-child-reported-as-contained case the design exists
+    /// to prevent.
     ///
-    /// The child has to outlive both assignments, so it sleeps rather than
-    /// exiting: `cmd /C exit 0` can be gone before the first `assign`, and a
-    /// failure to assign an already-dead process would look like a failure to
-    /// nest.
+    /// Two unrelated jobs is the reliable way to get a refusal: nesting is only
+    /// established when the second job can become a child of the first, and one
+    /// process placed directly into two sibling jobs cannot form that hierarchy,
+    /// so the kernel answers `ERROR_ACCESS_DENIED`. The production shape — this
+    /// app inside a CI runner's job, its child into a fresh one — does nest, and
+    /// `closing_the_job_kills_the_process_inside_it` covers it: that test assigns
+    /// and kills on a runner that puts its own processes in a job.
+    ///
+    /// The child sleeps rather than exiting, so a refusal here cannot be confused
+    /// with assigning an already-dead process.
     #[tokio::test]
-    async fn a_process_can_be_assigned_to_a_second_nested_job() {
+    async fn a_refused_assignment_is_reported_rather_than_swallowed() {
         use std::process::Stdio;
 
-        let outer = create_job().expect("outer job");
-        let inner = create_job().expect("inner job");
+        let first = create_job().expect("first job");
+        let sibling = create_job().expect("sibling job");
         let mut child = tokio::process::Command::new("cmd")
             .args(["/C", "ping -n 10 127.0.0.1"])
             .stdin(Stdio::null())
@@ -305,15 +316,16 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn");
-        outer.assign(&child).expect("assign to the outer job");
-        inner
-            .assign(&child)
-            .expect("a nested assignment must be allowed on Windows 8+");
+        first.assign(&child).expect("the first assignment holds");
+        assert!(
+            sibling.assign(&child).is_err(),
+            "a refused assignment must be an Err, or a run could report containment it never got"
+        );
 
-        // Both jobs kill on close, so dropping either ends the child; dropping
-        // both and waiting is what keeps the test from leaking a `ping`.
-        drop(inner);
-        drop(outer);
+        // `first` kills on close, which is what keeps the test from leaking a
+        // `ping` that outlives it.
+        drop(sibling);
+        drop(first);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
     }
 }
