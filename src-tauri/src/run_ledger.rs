@@ -125,6 +125,8 @@ const MIGRATION_V9: i64 = 9;
 const MIGRATION_V9_CHECKSUM: &str = "run-event-hash-chain-v9-2026-08-07";
 const MIGRATION_V10: i64 = 10;
 const MIGRATION_V10_CHECKSUM: &str = "run-event-process-identity-v10-2026-08-07";
+const MIGRATION_V11: i64 = 11;
+const MIGRATION_V11_CHECKSUM: &str = "permission-decisions-v11-2026-08-07";
 
 /// The result of recomputing a run's event chain.
 ///
@@ -328,6 +330,114 @@ pub struct StoredApproval {
     pub decision: Option<PermissionDecision>,
     pub decided_sequence: Option<u64>,
     pub decided_by: Option<ClientIdentity>,
+}
+
+/// What a permission decision belongs to.
+///
+/// The two arms of [`crate::run_scope::RunScope`] plus the two states a scope
+/// cannot express. Keeping them apart is the whole point: a blank attribution
+/// that might mean "background work" or might mean "we lost it" cannot be read
+/// either way, and an audit trail you cannot read is not one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionAttribution {
+    /// Raised inside a run that the ledger holds, so `run_id` joins to `runs`
+    /// and the matching `PermissionRequested` event exists too.
+    LedgerRun,
+    /// Raised inside a run whose id is real but was never registered in the
+    /// ledger — a chat turn running without durable runs enabled. Before this
+    /// table, this case wrote nothing at all.
+    UnregisteredRun,
+    /// Deliberately outside any run, with the reason named.
+    Unattributed(crate::run_scope::Unattributed),
+    /// Nobody told us. A call site not yet carrying a [`crate::run_scope`], kept
+    /// distinct from `Unattributed` so "not instrumented" never reads as
+    /// "background work".
+    Unknown,
+}
+
+impl PermissionAttribution {
+    /// The stable identity that gets persisted. Never reworded — it is what the
+    /// `attribution` CHECK constraint lists.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            PermissionAttribution::LedgerRun => "ledger-run",
+            PermissionAttribution::UnregisteredRun => "unregistered-run",
+            PermissionAttribution::Unknown => "unknown",
+            PermissionAttribution::Unattributed(reason) => reason.code(),
+        }
+    }
+
+    fn parse(value: &str) -> LedgerResult<Self> {
+        match value {
+            "ledger-run" => Ok(PermissionAttribution::LedgerRun),
+            "unregistered-run" => Ok(PermissionAttribution::UnregisteredRun),
+            "unknown" => Ok(PermissionAttribution::Unknown),
+            other => crate::run_scope::Unattributed::ALL
+                .iter()
+                .find(|reason| reason.code() == other)
+                .map(|reason| PermissionAttribution::Unattributed(*reason))
+                .ok_or_else(|| {
+                    LedgerError::Corrupt(format!("unknown permission attribution '{other}'"))
+                }),
+        }
+    }
+
+    /// True when this attribution requires a run id, which is what the table's
+    /// CHECK enforces. Kept next to [`code`](Self::code) so the two cannot drift.
+    #[must_use]
+    fn names_a_run(self) -> bool {
+        matches!(
+            self,
+            PermissionAttribution::LedgerRun | PermissionAttribution::UnregisteredRun
+        )
+    }
+}
+
+/// Serialized as its [`code`](PermissionAttribution::code), so a machine-readable
+/// trail carries the same token the database does.
+impl Serialize for PermissionAttribution {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.code())
+    }
+}
+
+/// A permission request, at the moment it was raised.
+///
+/// Everything here is fixed by the act of asking, which is why the table's
+/// update trigger refuses to let any of it change afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRequestRecord {
+    pub request_id: String,
+    pub run_id: Option<String>,
+    pub attribution: PermissionAttribution,
+    pub process_id: Option<String>,
+    pub tool_name: String,
+    pub tool_call_id: String,
+    pub operation_sha256: String,
+    /// The permission mode in force, after any turn-scoped override. Recorded
+    /// because "why did this not prompt" is unanswerable without it.
+    pub mode: String,
+    pub risk_level: Option<RiskLevel>,
+    /// Whether the risk level came from the deterministic path floor rather than
+    /// a classifier — the difference between a fact and an advisory opinion.
+    pub risk_floored: bool,
+    pub requested_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredPermissionDecision {
+    pub request: PermissionRequestRecord,
+    /// `None` while the request is still open. Every terminal path in
+    /// `permissions.rs` fills this, including expiry and "no window to ask".
+    pub decision: Option<PermissionDecision>,
+    /// Who decided, as the same `engine:`/`user:` identity string the run events
+    /// carry.
+    pub decided_by: Option<String>,
+    pub decided_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -924,6 +1034,104 @@ impl RunLedger {
             .transpose()
     }
 
+    /// Record a permission request, whatever it belongs to.
+    ///
+    /// Unlike the `approvals` table this has no run precondition, which is the
+    /// point — see [`MIGRATION_V11_SQL`]. Calling it twice for one `request_id`
+    /// is a caller bug and fails on the primary key rather than overwriting what
+    /// was asked.
+    pub fn record_permission_request(&self, record: &PermissionRequestRecord) -> LedgerResult<()> {
+        if record.attribution.names_a_run() != record.run_id.is_some() {
+            return Err(LedgerError::Corrupt(format!(
+                "attribution '{}' and run id disagree about whether this permission has a run",
+                record.attribution.code()
+            )));
+        }
+        self.connection.execute(
+            "INSERT INTO permission_decisions (
+                request_id, run_id, attribution, process_id, tool_name, tool_call_id,
+                operation_sha256, mode, risk_level, risk_floored, requested_at_ms, expires_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                record.request_id,
+                record.run_id,
+                record.attribution.code(),
+                record.process_id,
+                record.tool_name,
+                record.tool_call_id,
+                record.operation_sha256,
+                record.mode,
+                record.risk_level.as_ref().map(enum_token).transpose()?,
+                i64::from(record.risk_floored),
+                to_sql_i64(record.requested_at_ms, "requested_at_ms")?,
+                to_sql_i64(record.expires_at_ms, "expires_at_ms")?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Close out a recorded request. The `permission_decisions_decide_once`
+    /// trigger rejects a second decision, so this reports one rather than
+    /// quietly winning.
+    pub fn record_permission_decision(
+        &self,
+        request_id: &str,
+        decision: PermissionDecision,
+        decided_by: &str,
+        decided_at_ms: u64,
+    ) -> LedgerResult<()> {
+        let changed = self.connection.execute(
+            "UPDATE permission_decisions
+             SET decision = ?2, decided_by = ?3, decided_at_ms = ?4
+             WHERE request_id = ?1",
+            params![
+                request_id,
+                enum_token(&decision)?,
+                decided_by,
+                to_sql_i64(decided_at_ms, "decided_at_ms")?,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(LedgerError::NotFound {
+                entity: "permission request",
+                id: request_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn load_permission_decision(
+        &self,
+        request_id: &str,
+    ) -> LedgerResult<Option<StoredPermissionDecision>> {
+        let mut statement = self.connection.prepare(&format!(
+            "{PERMISSION_DECISION_SELECT} WHERE request_id = ?1"
+        ))?;
+        let row = statement
+            .query_map([request_id], permission_decision_columns)?
+            .next()
+            .transpose()?;
+        row.map(decode_permission_decision).transpose()
+    }
+
+    /// Every permission decision recorded for a tool call, oldest first.
+    ///
+    /// This is the query the acceptance asks for: given a tool call, produce the
+    /// decision that authorized it. An empty answer means nothing gated the
+    /// call, which is a finding rather than an absence.
+    pub fn permission_decisions_for_tool_call(
+        &self,
+        tool_call_id: &str,
+    ) -> LedgerResult<Vec<StoredPermissionDecision>> {
+        let mut statement = self.connection.prepare(&format!(
+            "{PERMISSION_DECISION_SELECT} WHERE tool_call_id = ?1 ORDER BY requested_at_ms, request_id"
+        ))?;
+        let rows = statement
+            .query_map([tool_call_id], permission_decision_columns)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(decode_permission_decision).collect()
+    }
+
     pub fn applied_migrations(&self) -> LedgerResult<Vec<i64>> {
         let mut statement = self
             .connection
@@ -1047,7 +1255,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
             row.get::<_, Option<i64>>(0)
         })?
     {
-        if version > MIGRATION_V10 {
+        if version > MIGRATION_V11 {
             return Err(LedgerError::MigrationConflict { version });
         }
     }
@@ -1063,6 +1271,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         (MIGRATION_V8, MIGRATION_V8_CHECKSUM),
         (MIGRATION_V9, MIGRATION_V9_CHECKSUM),
         (MIGRATION_V10, MIGRATION_V10_CHECKSUM),
+        (MIGRATION_V11, MIGRATION_V11_CHECKSUM),
     ] {
         if let Some(checksum) = connection
             .query_row(
@@ -1313,7 +1522,24 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
-    transaction.execute_batch("PRAGMA user_version = 10;")?;
+    let has_v11 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V11],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v11 {
+        transaction.execute_batch(MIGRATION_V11_SQL)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![MIGRATION_V11, MIGRATION_V11_CHECKSUM, now_ms_i64()?],
+        )?;
+    }
+
+    transaction.execute_batch("PRAGMA user_version = 11;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -1936,6 +2162,102 @@ BEFORE UPDATE OF state ON agent_processes
 WHEN NEW.state = 'exited' AND NEW.usage_unavailable_json IS NULL
 BEGIN
     SELECT RAISE(ABORT, 'an exited agent process must state its unmeasured fields');
+END;
+"#;
+
+/// Records every permission decision, including the ones no run can hold
+/// (roadmap K12).
+///
+/// **Why this is a table and not more run events.** The acceptance says a tool
+/// call whose authorizing decision cannot be produced from the log is a bug, and
+/// that bug was live: `permissions.rs` wrote its `PermissionRequested` /
+/// `PermissionDecided` events only when `durable_run_exists`, because
+/// `run_events.run_id` is a foreign key onto `runs`. So deleting a model from
+/// Settings, running a local app definition over HTTP, and posting a triage
+/// reply to Slack — three gated, security-relevant approvals — left no record
+/// anywhere at all.
+///
+/// The alternative was to register a `runs` row for that work so events could
+/// hang off it. That was rejected: a run carries a spec, an idempotency key, an
+/// event budget and a status lifecycle, and it shows up in the runs list. Making
+/// one up so a Settings click has somewhere to write is inventing an identity,
+/// which is the failure mode `run_scope`'s own module doc argues against.
+///
+/// So the attribution is recorded as what it actually is. `attribution` is a
+/// closed set covering both arms of [`crate::run_scope::RunScope`] plus the two
+/// states that scope cannot express: a run id that exists but was never
+/// registered in the ledger, and nobody having said either way.
+///
+/// A row is written when the request is raised and updated exactly once when the
+/// decision lands. The two triggers hold that shape against any writer: a
+/// decision is final, the request half is immutable once recorded, and rows
+/// cannot be deleted. This mirrors `run_events`' append-only triggers rather
+/// than inventing a second discipline.
+///
+/// ponytail: `run_id` and `process_id` are plain columns, not foreign keys. A
+/// permission is gated *before* its run is registered, so a foreign key here
+/// would reintroduce the exact `durable_run_exists` gate this table exists to
+/// remove — and `process_id` follows `run_events.process_id` for the reason
+/// given there. Outer-join to read either.
+const MIGRATION_V11_SQL: &str = r#"
+CREATE TABLE permission_decisions (
+    request_id TEXT PRIMARY KEY,
+    run_id TEXT,
+    attribution TEXT NOT NULL CHECK (attribution IN (
+        'ledger-run', 'unregistered-run', 'unknown',
+        'unattributed.user-action', 'unattributed.scheduled',
+        'unattributed.inbound-request', 'unattributed.startup',
+        'unattributed.shared-transport'
+    )),
+    process_id TEXT,
+    tool_name TEXT NOT NULL,
+    tool_call_id TEXT NOT NULL,
+    operation_sha256 TEXT NOT NULL CHECK (length(operation_sha256) = 64),
+    mode TEXT NOT NULL,
+    risk_level TEXT CHECK (risk_level IS NULL OR risk_level IN ('low', 'medium', 'high')),
+    risk_floored INTEGER NOT NULL CHECK (risk_floored IN (0, 1)),
+    requested_at_ms INTEGER NOT NULL CHECK (requested_at_ms > 0),
+    expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > 0),
+    decision TEXT CHECK (decision IS NULL OR decision IN
+        ('allow_once', 'allow_for_run', 'deny', 'expired')),
+    decided_by TEXT,
+    decided_at_ms INTEGER CHECK (decided_at_ms IS NULL OR decided_at_ms > 0),
+    CHECK ((attribution IN ('ledger-run', 'unregistered-run')) = (run_id IS NOT NULL)),
+    CHECK ((decision IS NULL) = (decided_at_ms IS NULL)),
+    CHECK ((decision IS NULL) = (decided_by IS NULL))
+) STRICT;
+
+CREATE INDEX permission_decisions_tool_call_idx
+    ON permission_decisions(tool_call_id, requested_at_ms);
+CREATE INDEX permission_decisions_run_idx
+    ON permission_decisions(run_id, requested_at_ms) WHERE run_id IS NOT NULL;
+CREATE INDEX permission_decisions_undecided_idx
+    ON permission_decisions(expires_at_ms) WHERE decision IS NULL;
+
+CREATE TRIGGER permission_decisions_decide_once
+BEFORE UPDATE ON permission_decisions
+FOR EACH ROW
+BEGIN
+    SELECT CASE WHEN OLD.decision IS NOT NULL
+        THEN RAISE(ABORT, 'a permission decision is final') END;
+    SELECT CASE WHEN NEW.run_id IS NOT OLD.run_id
+                  OR NEW.attribution IS NOT OLD.attribution
+                  OR NEW.process_id IS NOT OLD.process_id
+                  OR NEW.tool_name IS NOT OLD.tool_name
+                  OR NEW.tool_call_id IS NOT OLD.tool_call_id
+                  OR NEW.operation_sha256 IS NOT OLD.operation_sha256
+                  OR NEW.mode IS NOT OLD.mode
+                  OR NEW.risk_level IS NOT OLD.risk_level
+                  OR NEW.risk_floored IS NOT OLD.risk_floored
+                  OR NEW.requested_at_ms IS NOT OLD.requested_at_ms
+                  OR NEW.expires_at_ms IS NOT OLD.expires_at_ms
+        THEN RAISE(ABORT, 'what was asked cannot change once it has been asked') END;
+END;
+
+CREATE TRIGGER permission_decisions_forbid_delete
+BEFORE DELETE ON permission_decisions
+BEGIN
+    SELECT RAISE(ABORT, 'permission decisions are append-only');
 END;
 "#;
 
@@ -2765,6 +3087,101 @@ fn parse_run_status(value: &str) -> LedgerResult<RunStatus> {
         "needs_reconciliation" => Ok(RunStatus::NeedsReconciliation),
         other => Err(LedgerError::Corrupt(format!(
             "unknown run status '{other}'"
+        ))),
+    }
+}
+
+/// The column list every `permission_decisions` read shares, so the two readers
+/// cannot drift out of order with [`permission_decision_columns`].
+const PERMISSION_DECISION_SELECT: &str = "SELECT request_id, run_id, attribution, process_id, \
+     tool_name, tool_call_id, operation_sha256, mode, risk_level, risk_floored, \
+     requested_at_ms, expires_at_ms, decision, decided_by, decided_at_ms \
+     FROM permission_decisions";
+
+/// A `permission_decisions` row exactly as SQLite hands it over. Kept separate
+/// from [`StoredPermissionDecision`] because the closure rusqlite calls may only
+/// fail with a rusqlite error, while parsing the three enum columns fails with a
+/// [`LedgerError::Corrupt`].
+struct PermissionDecisionRow {
+    request_id: String,
+    run_id: Option<String>,
+    attribution: String,
+    process_id: Option<String>,
+    tool_name: String,
+    tool_call_id: String,
+    operation_sha256: String,
+    mode: String,
+    risk_level: Option<String>,
+    risk_floored: i64,
+    requested_at_ms: i64,
+    expires_at_ms: i64,
+    decision: Option<String>,
+    decided_by: Option<String>,
+    decided_at_ms: Option<i64>,
+}
+
+fn permission_decision_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<PermissionDecisionRow> {
+    Ok(PermissionDecisionRow {
+        request_id: row.get(0)?,
+        run_id: row.get(1)?,
+        attribution: row.get(2)?,
+        process_id: row.get(3)?,
+        tool_name: row.get(4)?,
+        tool_call_id: row.get(5)?,
+        operation_sha256: row.get(6)?,
+        mode: row.get(7)?,
+        risk_level: row.get(8)?,
+        risk_floored: row.get(9)?,
+        requested_at_ms: row.get(10)?,
+        expires_at_ms: row.get(11)?,
+        decision: row.get(12)?,
+        decided_by: row.get(13)?,
+        decided_at_ms: row.get(14)?,
+    })
+}
+
+fn decode_permission_decision(
+    row: PermissionDecisionRow,
+) -> LedgerResult<StoredPermissionDecision> {
+    Ok(StoredPermissionDecision {
+        request: PermissionRequestRecord {
+            request_id: row.request_id,
+            run_id: row.run_id,
+            attribution: PermissionAttribution::parse(&row.attribution)?,
+            process_id: row.process_id,
+            tool_name: row.tool_name,
+            tool_call_id: row.tool_call_id,
+            operation_sha256: row.operation_sha256,
+            mode: row.mode,
+            risk_level: row
+                .risk_level
+                .as_deref()
+                .map(parse_risk_level)
+                .transpose()?,
+            risk_floored: row.risk_floored != 0,
+            requested_at_ms: from_sql_u64(row.requested_at_ms, "requested_at_ms")?,
+            expires_at_ms: from_sql_u64(row.expires_at_ms, "expires_at_ms")?,
+        },
+        decision: row
+            .decision
+            .as_deref()
+            .map(parse_permission_decision)
+            .transpose()?,
+        decided_by: row.decided_by,
+        decided_at_ms: row
+            .decided_at_ms
+            .map(|value| from_sql_u64(value, "decided_at_ms"))
+            .transpose()?,
+    })
+}
+
+fn parse_risk_level(value: &str) -> LedgerResult<RiskLevel> {
+    match value {
+        "low" => Ok(RiskLevel::Low),
+        "medium" => Ok(RiskLevel::Medium),
+        "high" => Ok(RiskLevel::High),
+        other => Err(LedgerError::Corrupt(format!(
+            "unknown risk level '{other}'"
         ))),
     }
 }
@@ -3999,7 +4416,7 @@ mod tests {
                     .connection
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                10
+                11
             );
         }
 
@@ -4012,14 +4429,14 @@ mod tests {
             connection
                 .execute(
                     "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
-                     VALUES (11, 'from-the-future', 1)",
+                     VALUES (12, 'from-the-future', 1)",
                     [],
                 )
                 .unwrap();
         }
         assert!(matches!(
             RunLedger::open(&database.path),
-            Err(LedgerError::MigrationConflict { version: 11 })
+            Err(LedgerError::MigrationConflict { version: 12 })
         ));
     }
 
@@ -4030,13 +4447,13 @@ mod tests {
             let ledger = RunLedger::open(&database.path).unwrap();
             assert_eq!(
                 ledger.applied_migrations().unwrap(),
-                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
             );
         }
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
             "reopening must not re-apply or add a migration"
         );
 
@@ -4217,5 +4634,280 @@ mod tests {
             .unwrap()
             .iter()
             .any(|run| run.spec.run_id == "run-active"));
+    }
+
+    fn permission_request(
+        request_id: &str,
+        attribution: PermissionAttribution,
+    ) -> PermissionRequestRecord {
+        PermissionRequestRecord {
+            request_id: request_id.to_string(),
+            run_id: match attribution {
+                PermissionAttribution::LedgerRun | PermissionAttribution::UnregisteredRun => {
+                    Some("run-1".to_string())
+                }
+                _ => None,
+            },
+            attribution,
+            process_id: None,
+            tool_name: "delete_model".to_string(),
+            tool_call_id: "tool-77".to_string(),
+            operation_sha256: "a".repeat(64),
+            mode: "manual".to_string(),
+            risk_level: Some(RiskLevel::High),
+            risk_floored: true,
+            requested_at_ms: 1_000,
+            expires_at_ms: 2_000,
+        }
+    }
+
+    /// The upgrade path, not just the fresh-install one. A database written by a
+    /// build that predates V11 must gain the table on open, and gain it *only*
+    /// once — which is the branch `migration_is_safe_to_rerun_…` cannot reach,
+    /// since that test never sees a database missing a version.
+    #[test]
+    fn a_database_written_before_v11_gains_the_permission_table_on_open() {
+        let database = TempDb::new("permission-upgrade");
+        {
+            let ledger = RunLedger::open(&database.path).unwrap();
+            ledger
+                .record_permission_request(&permission_request(
+                    "req-old",
+                    PermissionAttribution::Unknown,
+                ))
+                .unwrap();
+        }
+
+        // Wind the database back to what V10 left behind. Dropping the table is
+        // the only way to get there from here — the build that wrote it is gone.
+        {
+            let connection = Connection::open(&database.path).unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE permission_decisions;
+                     DELETE FROM schema_migrations WHERE version = 11;
+                     PRAGMA user_version = 10;",
+                )
+                .unwrap();
+        }
+
+        let ledger = RunLedger::open(&database.path).unwrap();
+        assert_eq!(
+            ledger.applied_migrations().unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            "opening a V10 database must apply V11 and nothing else"
+        );
+        assert_eq!(
+            ledger
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            11
+        );
+        // The table is back and empty: the upgrade adds the surface, it does not
+        // invent rows for permissions nobody recorded at the time.
+        assert!(ledger
+            .load_permission_decision("req-old")
+            .unwrap()
+            .is_none());
+        ledger
+            .record_permission_request(&permission_request(
+                "req-new",
+                PermissionAttribution::Unknown,
+            ))
+            .unwrap();
+        assert!(ledger
+            .load_permission_decision("req-new")
+            .unwrap()
+            .is_some());
+    }
+
+    /// The bug K12's acceptance names: before this table, a gated tool call
+    /// outside a ledger-registered run — deleting a model from Settings, a local
+    /// app definition run over HTTP, a triage reply posted to Slack — produced no
+    /// permission event and no approval row anywhere at all.
+    #[test]
+    fn a_permission_with_no_run_is_still_recorded_and_readable() {
+        let database = TempDb::new("permission-no-run");
+        let ledger = RunLedger::open(&database.path).unwrap();
+
+        let request = permission_request(
+            "req-1",
+            PermissionAttribution::Unattributed(crate::run_scope::Unattributed::UserAction),
+        );
+        ledger.record_permission_request(&request).unwrap();
+        ledger
+            .record_permission_decision(
+                "req-1",
+                PermissionDecision::AllowOnce,
+                "user:desktop-prompt",
+                1_500,
+            )
+            .unwrap();
+
+        let stored = ledger
+            .permission_decisions_for_tool_call("tool-77")
+            .unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "the authorizing decision must be findable from the tool call"
+        );
+        assert_eq!(stored[0].request, request);
+        assert_eq!(stored[0].decision, Some(PermissionDecision::AllowOnce));
+        assert_eq!(stored[0].decided_by.as_deref(), Some("user:desktop-prompt"));
+        assert_eq!(stored[0].decided_at_ms, Some(1_500));
+        assert_eq!(
+            stored[0].request.attribution.code(),
+            "unattributed.user-action",
+            "the reason it has no run is recorded, not left blank"
+        );
+    }
+
+    /// Every attribution code must survive the round trip. A code the CHECK
+    /// accepts but `parse` rejects would make a row unreadable after it is
+    /// written, which is the worst time to find out.
+    #[test]
+    fn every_attribution_round_trips_through_the_database() {
+        let database = TempDb::new("permission-attribution");
+        let ledger = RunLedger::open(&database.path).unwrap();
+
+        let mut attributions = vec![
+            PermissionAttribution::LedgerRun,
+            PermissionAttribution::UnregisteredRun,
+            PermissionAttribution::Unknown,
+        ];
+        attributions.extend(
+            crate::run_scope::Unattributed::ALL
+                .iter()
+                .map(|reason| PermissionAttribution::Unattributed(*reason)),
+        );
+
+        for (index, attribution) in attributions.iter().enumerate() {
+            let request_id = format!("req-{index}");
+            ledger
+                .record_permission_request(&permission_request(&request_id, *attribution))
+                .unwrap();
+            let stored = ledger
+                .load_permission_decision(&request_id)
+                .unwrap()
+                .expect("just written");
+            assert_eq!(stored.request.attribution, *attribution);
+            assert_eq!(stored.decision, None, "an open request has no decision yet");
+        }
+    }
+
+    /// A decision is final. Answering twice — a replayed IPC message, a second
+    /// window — must fail loudly rather than overwrite what was decided.
+    #[test]
+    fn a_permission_decision_cannot_be_changed_once_made() {
+        let database = TempDb::new("permission-final");
+        let ledger = RunLedger::open(&database.path).unwrap();
+        ledger
+            .record_permission_request(&permission_request("req-1", PermissionAttribution::Unknown))
+            .unwrap();
+        ledger
+            .record_permission_decision(
+                "req-1",
+                PermissionDecision::Deny,
+                "user:desktop-prompt",
+                1_500,
+            )
+            .unwrap();
+
+        let error = ledger
+            .record_permission_decision(
+                "req-1",
+                PermissionDecision::AllowOnce,
+                "user:desktop-prompt",
+                1_600,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("a permission decision is final"),
+            "expected the decide-once trigger, got {error}"
+        );
+
+        // And the request half cannot be rewritten either, so an approval cannot
+        // be relabelled onto a different, more dangerous operation after the fact.
+        let error = ledger
+            .connection
+            .execute(
+                "UPDATE permission_decisions SET tool_name = 'run_shell' WHERE request_id = 'req-1'",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("a permission decision is final"),
+            "expected the decide-once trigger, got {error}"
+        );
+
+        let error = ledger
+            .connection
+            .execute("DELETE FROM permission_decisions", [])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("permission decisions are append-only"),
+            "expected the delete trigger, got {error}"
+        );
+    }
+
+    /// The `attribution` code and the presence of a run id are two spellings of
+    /// one fact, so they are checked in Rust *and* by the table, and neither is
+    /// allowed to be the only guard.
+    #[test]
+    fn an_attribution_that_disagrees_with_its_run_id_is_refused() {
+        let database = TempDb::new("permission-disagree");
+        let ledger = RunLedger::open(&database.path).unwrap();
+
+        let mut record = permission_request("req-1", PermissionAttribution::Unknown);
+        record.run_id = Some("run-1".to_string());
+        let error = ledger
+            .record_permission_request(&record)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("disagree about whether this permission has a run"),
+            "expected the Rust guard, got {error}"
+        );
+
+        let error = ledger
+            .connection
+            .execute(
+                "INSERT INTO permission_decisions (
+                    request_id, run_id, attribution, tool_name, tool_call_id,
+                    operation_sha256, mode, risk_floored, requested_at_ms, expires_at_ms
+                 ) VALUES ('req-2', 'run-1', 'unknown', 't', 'tc', ?1, 'manual', 0, 1, 2)",
+                params!["a".repeat(64)],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("CHECK constraint failed"),
+            "expected the table's own CHECK, got {error}"
+        );
+    }
+
+    /// Deciding a request that was never recorded is a caller bug, not a silent
+    /// no-op — a silent one would leave the decision nowhere at all.
+    #[test]
+    fn deciding_an_unrecorded_permission_is_an_error() {
+        let database = TempDb::new("permission-missing");
+        let ledger = RunLedger::open(&database.path).unwrap();
+        assert!(matches!(
+            ledger.record_permission_decision(
+                "req-nope",
+                PermissionDecision::AllowOnce,
+                "user:desktop-prompt",
+                1_500
+            ),
+            Err(LedgerError::NotFound {
+                entity: "permission request",
+                ..
+            })
+        ));
     }
 }
