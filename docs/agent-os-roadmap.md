@@ -333,16 +333,16 @@ migration over users' existing embedded vectors**:
   sites, not ~9** (16 `knowledge_service.rs`, 11 `portability_commands.rs`, 1
   `diagnostics.rs`, ~17 `monkey-cli`). Harmless for the move itself, since they all
   resolve through the re-export — but that is the size of the repointing below.
-- Port the one v1-only capability v2 genuinely lacks: **source staleness**
-  (`is_stale_impl`, an mtime-only probe that reads no file contents, which is why the panel
-  can fan it out across every stack on mount). v2 has no read-only staleness probe at any
-  granularity — its change detection lives inside `refresh_at` and only has its inputs
-  after the sources have been fetched and hashed, which for a remote connector means
-  network I/O. So the honest port has a free tier (pipeline fingerprint changed), a cheap
-  tier for local connectors (the same mtime walk), and **"unknown" for remote connectors** —
-  any design that answers synchronously for those either does network I/O in a badge render
-  or lies. The second capability this line used to name, a query hot cache, should not be
-  ported at all; see the correction below.
+- ~~Port the one v1-only capability v2 genuinely lacks: **source staleness**.~~ **Done** —
+  `v2_staleness_impl`, built exactly as this line specified: a free tier (pipeline
+  fingerprint changed), a cheap tier for local connectors (the same mtime walk v1 does,
+  against the generation's creation time), and **`Unknown` for remote connectors**, because
+  any design that answers synchronously for those either does network I/O inside a badge
+  render or makes something up. `Unknown` must render as unknown and never as fresh.
+
+  It sat unwired in the UI for a release, which is its own lesson and is recorded in the
+  panel-collapse entry below. The second capability this line used to name, a query hot
+  cache, should not be ported at all; see the correction below.
 - ~~**Synthesize a v2 generation from each v1 index without re-embedding.**~~ **Done**,
   and the entry understated the hard part. Every factual claim in it held — the vectors
   are reusable as-is, and all thirteen `validate_chunk`/`validate_generation_contents`
@@ -388,11 +388,40 @@ migration over users' existing embedded vectors**:
   `audit_knowledge_index` now emits `knowledge_index.v1_import.<stack_id>` for each
   un-imported stack, so a support bundle answers "how many users still hold a v1 index?"
   with a number. That number is the precondition for deleting anything.
-- Port the remaining work: repoint the call sites off the re-export, route every read
-  through v2, delete the v1 index, and collapse the two panels. `stacks.rs` registers
-  **11 Tauri commands** (an earlier revision of this line said 12, while the section's own
-  opening said 11 — the opening was right), so v1 is still live and this item is still
-  *partially built*.
+- ~~Repoint the call sites off the re-export, and route every read through v2.~~ **Done.**
+  The final count is **57 references**, of which 47 were repointed at `knowledge_core` and
+  ten genuinely need v1: `ChunkMeta` ×7 — the *importer's* input type, so deleting it as
+  cruft would delete the migration path — plus `reindex_impl`, `query_impl` and
+  `stacks_reindex`. An earlier revision of this line estimated 53/42/11 before the work;
+  57/47/10 is what the repointing actually found, and both the re-export's comment and
+  `knowledge_core.rs`'s module doc asserted the opposite of the `ChunkMeta` fact and were
+  corrected.
+
+  Routing found a real divergence rather than a tidy-up: **the CLI could not read v2 at
+  all.** `monkey stacks search` and the CLI agent's `search_docs` answered from v1 while
+  the GUI preferred v2 — same query, same stack, different answers — and `agent.rs`
+  carried a comment asserting the two produce identically shaped results. All three callers
+  now share `query_stacks_v2_first`, so that parity is structural rather than a comment.
+- ~~Collapse the two panels' duplicated stack selection.~~ **Done**, and it found another
+  command implemented, tested, registered and never called: `knowledge_v2_is_stale`. Its
+  doc comment says it reads the manifest through `active_manifest` rather than `active`
+  *because the panel fans it out across every indexed stack on mount* — and the panel never
+  did. Two consequences, both user-visible: **a native v2 stack could never report as
+  stale at all**, and the badge that did render was v1's, describing the freshness of an
+  index that stack is no longer answered from. Wiring it also gives each row a "which index
+  answers this?" badge for free, because `NotIndexed` *is* the predicate the read path
+  branches on. Same class of finding as the unregistered import above, which is now twice
+  in this item — the guard test catches unregistered commands, not unused ones.
+
+  The selection itself is now single: the expanded stack row *is* the stack the Knowledge
+  2.0 section configures, derived from one piece of state rather than synchronised by an
+  effect. Before, the two halves could sit on different stacks, so a stack's v1 sources and
+  some other stack's v2 sources were on screen together with nothing saying so.
+- **Remaining, and gated on a release rather than a merge:** deleting v1 — its commands,
+  its panel controls, its `KnowledgePanel.*` strings, and last of all its bytes on disk.
+  `stacks.rs` registers **11 Tauri commands** (an earlier revision of this line said 12,
+  while the section's own opening said 11 — the opening was right), so v1 is still live and
+  this item is still *partially built*.
 
   **Deletion cannot be one change, and the reason is the import above rather than the
   refactor.** The repointing is largely mechanical — 53 code references to the re-export,
