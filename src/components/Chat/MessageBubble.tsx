@@ -360,22 +360,26 @@ function AssistantMessage({
   const { t } = useT();
   const components = buildAssistantMarkdownComponents(sessionId, index, t);
   return (
-    <div className="group relative w-full min-w-0">
-      {onStartSideTask && (
-        <button
-          type="button"
-          onClick={onStartSideTask}
-          aria-label="Start side task from this message"
-          title="Start side task from this message"
-          className="absolute -top-1 right-0 flex h-5 w-5 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
-        >
-          <Split size={12} />
-        </button>
-      )}
+    <div className="group w-full min-w-0">
       <div className={PROSE_CLASSES}>
         <ReactMarkdown components={components}>{content}</ReactMarkdown>
       </div>
-      {translationControls && <div className="absolute -bottom-5 left-0 z-10">{translationControls}</div>}
+      {(translationControls || onStartSideTask) && (
+        <div className="mt-1 flex items-center gap-0.5">
+          {translationControls}
+          {onStartSideTask && (
+            <button
+              type="button"
+              onClick={onStartSideTask}
+              aria-label="Start side task from this message"
+              title="Start side task from this message"
+              className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
+            >
+              <Split size={13} />
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

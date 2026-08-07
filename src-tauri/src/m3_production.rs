@@ -80,7 +80,7 @@ const KEYCHAIN_SERVICE: &str = "com.littlemonkey.m3-lan";
 const KEYCHAIN_ACCOUNT: &str = "lan-state-hmac-v1";
 const MLX_RELEASE_KEY_ID: &str = "release-2026-1";
 const MLX_RELEASE_PUBLIC_KEY_HEX: &str =
-    "0fd1a0b2a2e6a90c5f61eb8e9db503bf4e123c4cee11888650748c2f0efc669e";
+    "84db8c4dfdca72589631be1513f45083e893c9c373ba5be6e49928e43c7b828c";
 
 fn lock<T>(mutex: &Mutex<T>) -> M3HubResult<MutexGuard<'_, T>> {
     mutex.lock().map_err(|_| M3HubError::LockPoisoned)
