@@ -3334,13 +3334,40 @@ a broken chain so a scripted check cannot pass by printing bad news.
   Reachable as `monkey security subsystem-events [--subsystem mcp]`, which exits
   non-zero on a broken chain.
 
-  **Still to write to it:** HTTP (`server.rs`, `m3_http_server.rs`), the browser
-  worker, ACP (today a read-only consumer) and the remote node. MCP is wired as
-  the first writer because it is the clearest gated action and already carries a
-  turn id. Separate stores still hold gating-relevant records with no join to
-  either stream: `daemon_scheduler_decisions` and `remote_audit` in their own
-  database files, and `egress_denials`, which records denials only — **an allowed
-  egress produces no row anywhere** — and ring-buffers itself on every insert.
+  **HTTP writes to it too, through a recorder the remaining subsystems share.**
+  `subsystem_audit.rs` exists because the writers do not share a context: desktop
+  has a `tauri::AppHandle` and reaches the ledger through `AppState`, while the
+  CLI-hosted API server, the daemon and ACP have no `AppState` at all — only a
+  data directory. Four hand-rolled copies of "mint an id, read the clock, resolve
+  the attribution, append without breaking the action" would drift, and the field
+  most likely to drift is the attribution, which is the field the audit exists
+  for. The attribution *rule* is now one function, `permissions::attribution_for`,
+  with "is this run in the ledger" supplied by whichever ledger the context can
+  reach.
+
+  - **A third target, `disabled`, carries a reason** — and the reason is printed
+    at listener startup rather than living as a comment. "This subsystem wrote no
+    events" must never be indistinguishable from "this subsystem was never wired
+    up", which is the same ambiguity `run_scope`'s two-arm design exists to
+    prevent.
+  - **Not every request is recorded, and the rule is a pure function.**
+    `/health`, a CORS preflight and `GET /v1/models` carry no effect and are the
+    calls every client makes *before* acting; recording them would double the
+    stream and bury the rows that matter. Anything that runs a model, reads the
+    knowledge base or returns an artifact is recorded.
+  - **Status, never body or headers.** `detail_json` is covered by the chain and
+    therefore permanent, and a body may hold the user's own text.
+  - HTTP records no `permission_request_id` because nothing on those routes goes
+    through `request_permission` — it is bearer-token authenticated. `NULL` there
+    is the honest answer and the CLI prints it as "nothing gated this action".
+
+  **Still to write to it:** `m3_http_server.rs`, the browser worker, ACP (today a
+  read-only consumer) and the remote node — all four now have a recorder to call
+  rather than a pattern to copy. Separate stores still hold gating-relevant
+  records with no join to either stream: `daemon_scheduler_decisions` and
+  `remote_audit` in their own database files, and `egress_denials`, which records
+  denials only — **an allowed egress produces no row anywhere** — and
+  ring-buffers itself on every insert.
 - ~~**Per-event process identity does not exist.**~~ **Done** — migration V10 adds
   `run_events.process_id`, populated from the ambient `ProcessScope` (the D3
   `tokio::task_local!`) inside `append_event`. That is the single place all 46

@@ -653,6 +653,20 @@ pub(crate) fn permission_attribution<R: tauri::Runtime>(
     state: &AppState,
     turn: Option<&str>,
 ) -> Result<(Option<String>, PermissionAttribution), String> {
+    attribution_for(turn, |run_id| durable_run_exists(app, state, Some(run_id)))
+}
+
+/// The attribution rule itself, with "is this run in the ledger" left to the
+/// caller.
+///
+/// Split out because `subsystem_audit` has to answer the same question against a
+/// ledger it opened itself, with no `AppState` anywhere — and two copies of this
+/// rule would drift on the field the whole audit exists for. `is_durable` is only
+/// consulted when there is a run id to ask about.
+pub(crate) fn attribution_for(
+    turn: Option<&str>,
+    is_durable: impl FnOnce(&str) -> Result<bool, String>,
+) -> Result<(Option<String>, PermissionAttribution), String> {
     let run_id = turn
         .map(str::to_string)
         .or_else(crate::run_scope::current_run_id);
@@ -665,7 +679,7 @@ pub(crate) fn permission_attribution<R: tauri::Runtime>(
             },
         ));
     };
-    let attribution = if durable_run_exists(app, state, Some(&run_id))? {
+    let attribution = if is_durable(&run_id)? {
         PermissionAttribution::LedgerRun
     } else {
         PermissionAttribution::UnregisteredRun
