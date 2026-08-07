@@ -3339,14 +3339,49 @@ a broken chain so a scripted check cannot pass by printing bad news.
   payload, which is strictly better. **Amended acceptance: an authorizing fact may
   never be redacted on write; a secret-bearing payload may be, provided a digest
   of the original is recorded alongside it.**
+- ~~**Every permission event is gated on `durable_run_exists`.**~~ **Fixed —
+  migration V11 adds `permission_decisions`, which every permission is written to
+  whether or not a run holds it.** This was the acceptance's own named bug, live
+  in the tree: `run_events.run_id` is a foreign key onto `runs`, so a permission
+  raised outside a ledger-registered run had nowhere to go and simply wrote
+  nothing. Four call sites hard-code `None` for the run — deleting a model from
+  Settings, running a local app definition over HTTP, and the two triage paths
+  that post to Slack — and all four were gated, security-relevant approvals
+  leaving no record anywhere.
+
+  - **Registering a `runs` row for that work was the obvious fix and the wrong
+    one.** A run carries a spec, an idempotency key, an event budget and a status
+    lifecycle, and it appears in the runs list. Manufacturing one so a Settings
+    click has somewhere to write is inventing an identity, which is what `run_scope`'s
+    module doc argues against at length. So the attribution is recorded as what it
+    actually is: a closed `attribution` column covering both arms of `RunScope`
+    plus the two states a scope cannot express — a run id that is real but was
+    never registered, and nobody having said either way. "Not instrumented" never
+    reads as "background work".
+  - **The responder is recorded, not just the verdict.** Stop withdrawing a
+    prompt and a person refusing it were both a bare `false` on the resolution
+    channel, and three responders — `deny_pending`, the Stop path, and the expiry
+    check — recorded nothing at all. The channel now carries the decision and who
+    made it, which moves recording to the *awaiting* task: the one place every
+    outcome funnels through, instead of each responder having to remember.
+  - **Expiry is now decided outside the durable branch.** It was computed only
+    when a run held the permission, so a stale prompt outside one could still be
+    answered.
+  - Two triggers hold the table's shape against any writer: a decision is final,
+    the request half is immutable once recorded — an approval cannot be
+    relabelled onto a different operation after the fact — and rows cannot be
+    deleted. This mirrors `run_events`' append-only triggers rather than inventing
+    a second discipline.
+
+  Reachable as `monkey security permission-trail <tool-call-id>`, which exits
+  non-zero when nothing gated the call, since that is the bug rather than an
+  empty report.
 - Approvals *are* joinable at event granularity — three FKs onto
   `run_events(run_id, sequence)` — but `approval_chain_stage_decisions` is not
   (deliberately: a chain can gate a future action with no run yet), and
-  `ToolStarted` carries no reference to its authorizing decision. Worse, every
-  permission event is gated on `durable_run_exists`, so **a tool call outside a
-  ledger-registered run produces no permission event and no approval row at
-  all** — which is exactly the "authorizing decision cannot be produced from the
-  log" bug the acceptance names.
+  `ToolStarted` still carries no reference to its authorizing decision. The join
+  now exists in the other direction — `permission_decisions.tool_call_id` — so
+  what remains is a pointer on the tool event itself.
 
 **Blocks:** K21 — conformance needs evidence that cannot be quietly edited.
 
