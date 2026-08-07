@@ -38,7 +38,10 @@ use crate::compatibility_hub::{
     COMPATIBILITY_SCHEMA_VERSION,
 };
 use crate::m3_production::{ingest_sse_line, openai_request_body, parse_openai_response, OpenAiStreamState};
-use crate::m3_runtime_hub::{canonical_message_to_mlx, M3CanonicalStreamSink, M3ModelCapabilities};
+use crate::m3_runtime_hub::{M3CanonicalStreamSink, M3ModelCapabilities};
+// The MLX leg of the tool-call fixture only exists where the MLX driver does.
+#[cfg(target_os = "macos")]
+use crate::m3_runtime_hub::canonical_message_to_mlx;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -410,49 +413,56 @@ fn fixture_tool_calling(_family: TemplateFamily) -> ChatTemplateLabResult {
         );
     }
 
-    // --- 1d. MLX driver's flattened text representation. ---
-    let mlx_assistant = match canonical_message_to_mlx(&CanonicalMessage {
-        role: CanonicalRole::Assistant,
-        content: vec![CanonicalContent::ToolUse {
-            id: "call_1".to_string(),
-            name: "read_file".to_string(),
-            input: tool_input.clone(),
-        }],
-    }) {
-        Ok(message) => message,
-        Err(error) => return ChatTemplateLabResult::fail(area, format!("MLX assistant flattening failed: {error}")),
-    };
-    let mlx_tool_result = match canonical_message_to_mlx(&CanonicalMessage {
-        role: CanonicalRole::Tool,
-        content: vec![CanonicalContent::ToolResult {
-            tool_use_id: "call_1".to_string(),
-            content: "fn main() {}".to_string(),
-            is_error: false,
-        }],
-    }) {
-        Ok(message) => message,
-        Err(error) => return ChatTemplateLabResult::fail(area, format!("MLX tool-result flattening failed: {error}")),
-    };
-    let mlx_assistant_json: Option<Value> = serde_json::from_str(&mlx_assistant.text).ok();
-    let mlx_ok = mlx_assistant_json
-        .as_ref()
-        .and_then(|value| value.get("input"))
-        == Some(&tool_input)
-        && mlx_assistant_json.as_ref().and_then(|value| value.get("name")) == Some(&json!("read_file"))
-        && mlx_tool_result.text.contains("fn main() {}");
-    if !mlx_ok {
-        return ChatTemplateLabResult::fail(
-            area,
-            "MLX driver's flattened tool_use/tool_result text did not round-trip the same call".to_string(),
-        );
+    // --- 1d. MLX driver's flattened text representation. Only the macOS build
+    // carries an MLX driver, so this leg — and the claim the pass message makes
+    // about it — exists only there. ---
+    #[cfg(target_os = "macos")]
+    {
+        let mlx_assistant = match canonical_message_to_mlx(&CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            content: vec![CanonicalContent::ToolUse {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                input: tool_input.clone(),
+            }],
+        }) {
+            Ok(message) => message,
+            Err(error) => return ChatTemplateLabResult::fail(area, format!("MLX assistant flattening failed: {error}")),
+        };
+        let mlx_tool_result = match canonical_message_to_mlx(&CanonicalMessage {
+            role: CanonicalRole::Tool,
+            content: vec![CanonicalContent::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "fn main() {}".to_string(),
+                is_error: false,
+            }],
+        }) {
+            Ok(message) => message,
+            Err(error) => return ChatTemplateLabResult::fail(area, format!("MLX tool-result flattening failed: {error}")),
+        };
+        let mlx_assistant_json: Option<Value> = serde_json::from_str(&mlx_assistant.text).ok();
+        let mlx_ok = mlx_assistant_json
+            .as_ref()
+            .and_then(|value| value.get("input"))
+            == Some(&tool_input)
+            && mlx_assistant_json.as_ref().and_then(|value| value.get("name")) == Some(&json!("read_file"))
+            && mlx_tool_result.text.contains("fn main() {}");
+        if !mlx_ok {
+            return ChatTemplateLabResult::fail(
+                area,
+                "MLX driver's flattened tool_use/tool_result text did not round-trip the same call".to_string(),
+            );
+        }
     }
 
-    ChatTemplateLabResult::pass(
-        area,
-        "tool_calls round-trip through the OpenAI-compatible wire format (compose, streamed parse, and \
+    #[cfg(target_os = "macos")]
+    let detail = "tool_calls round-trip through the OpenAI-compatible wire format (compose, streamed parse, and \
          non-streaming parse) and through the MLX driver's flattened text representation, all matching the \
-         original tool name/arguments/result",
-    )
+         original tool name/arguments/result";
+    #[cfg(not(target_os = "macos"))]
+    let detail = "tool_calls round-trip through the OpenAI-compatible wire format (compose, streamed parse, and \
+         non-streaming parse), matching the original tool name/arguments/result";
+    ChatTemplateLabResult::pass(area, detail)
 }
 
 /// System-prompt-present conversation. Whether Little Monkey's renderer
