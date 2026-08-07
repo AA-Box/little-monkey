@@ -624,15 +624,22 @@ fn environment_block(env: &[(String, String)]) -> Vec<u16> {
 /// [`crate::sandbox::Isolation::ProcessContained`] for it. Same spawn either way,
 /// so there is one implementation of the pipes, the environment block and the
 /// timeout rather than two that can drift.
-pub async fn run_confined(
+///
+/// Everything raw lives in [`spawn_confined`], which is deliberately synchronous:
+/// `STARTUPINFOEXW`, `PROCESS_INFORMATION`, the attribute list and the
+/// `SID_AND_ATTRIBUTES` array are all raw pointers and therefore not `Send`, and a
+/// `tauri::command`'s future must be. Holding any of them across the `await` below
+/// makes the whole command non-`Send`, which is a compile error several call
+/// frames away from the cause — so they are confined to a scope that ends before
+/// the first `await`, and only `OwnedHandle`/`File`/`usize` cross it.
+fn spawn_confined(
     container: Option<&AppContainer>,
     job: &JobConfinement,
     shell_command: &str,
     workspace_dir: &Path,
     env: &[(String, String)],
     allow_network: bool,
-    timeout: Duration,
-) -> io::Result<ConfinedOutput> {
+) -> io::Result<(OwnedHandle, std::fs::File, std::fs::File)> {
     let (stdout_read, stdout_write) = piped()?;
     let (stderr_read, stderr_write) = piped()?;
     let stdin = null_device()?;
@@ -789,8 +796,32 @@ pub async fn run_confined(
 
     job.assign_raw(process.hProcess)?;
 
-    let mut stdout_file = unsafe { std::fs::File::from_raw_handle(stdout_read.into_raw_handle()) };
-    let mut stderr_file = unsafe { std::fs::File::from_raw_handle(stderr_read.into_raw_handle()) };
+    // `File` rather than `OwnedHandle` so the reads below are plain `io::Read`,
+    // and because both are `Send` and can therefore cross an `await`.
+    let stdout_file = unsafe { std::fs::File::from_raw_handle(stdout_read.into_raw_handle()) };
+    let stderr_file = unsafe { std::fs::File::from_raw_handle(stderr_read.into_raw_handle()) };
+    Ok((child, stdout_file, stderr_file))
+}
+
+/// See [`spawn_confined`] for why the raw work is not inlined here.
+pub async fn run_confined(
+    container: Option<&AppContainer>,
+    job: &JobConfinement,
+    shell_command: &str,
+    workspace_dir: &Path,
+    env: &[(String, String)],
+    allow_network: bool,
+    timeout: Duration,
+) -> io::Result<ConfinedOutput> {
+    let (child, mut stdout_file, mut stderr_file) = spawn_confined(
+        container,
+        job,
+        shell_command,
+        workspace_dir,
+        env,
+        allow_network,
+    )?;
+
     let reader = tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -802,7 +833,7 @@ pub async fn run_confined(
     // Moved as a `usize` because `HANDLE` is a raw pointer and so not `Send`,
     // which `spawn_blocking` requires. The handle itself outlives the task:
     // `child` owns it and is held until after the join below.
-    let waiter_handle = process.hProcess as usize;
+    let waiter_handle = child.as_raw_handle() as usize;
     let waited = tokio::task::spawn_blocking(move || {
         let handle = waiter_handle as HANDLE;
         unsafe { WaitForSingleObject(handle, INFINITE) };
