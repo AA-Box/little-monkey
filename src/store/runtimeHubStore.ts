@@ -73,6 +73,7 @@ export type RuntimeHubSection =
   | "lan"
   | "quantization"
   | "telemetry"
+  | "benchmark"
   | "agents"
   | "upstream-watcher";
 

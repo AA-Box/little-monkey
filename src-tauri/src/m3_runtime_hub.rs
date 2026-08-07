@@ -4645,6 +4645,58 @@ impl M3RuntimeHub {
         }
     }
 
+    /// Streams one generation purely to time it, and returns only the timings.
+    ///
+    /// Deliberately not routed through `dispatch_api_stream`: that path exists to
+    /// serve an external API caller, so it translates a wire protocol, authorizes
+    /// a principal against a scope, and debits a quota — none of which a local
+    /// measurement of the user's own model is. Going through it would also put the
+    /// protocol encoder between the runtime and the clock, so time-to-first-token
+    /// would be stamped on an SSE frame rather than on the canonical text delta
+    /// that produced it.
+    ///
+    /// A driver error is recorded on the sample rather than discarding the repeat:
+    /// a stream that failed after emitting text still measured a real
+    /// time-to-first-token, and `summarize` excludes errored samples from the
+    /// statistics anyway.
+    pub async fn benchmark_stream_once(
+        &self,
+        runtime_id: &str,
+        request: &CanonicalInferenceRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<crate::benchmark::SampleTimings> {
+        context.preflight("benchmark one generation")?;
+        let runtime = self.runtime(runtime_id)?;
+        let mut sink = crate::benchmark::TimingSink::started_now();
+        let outcome = runtime.stream(request, &mut sink, context).await;
+        let mut timings = sink.finish();
+        if let Err(error) = outcome {
+            timings.record_error(error.to_string());
+        }
+        Ok(timings)
+    }
+
+    /// The OS pid of the process hosting `runtime_id`, or `None` when there is no
+    /// local process to sample — a remote OpenAI-compatible endpoint has none, and
+    /// neither does a managed runtime that is not currently running.
+    pub async fn benchmark_runtime_pid(
+        &self,
+        runtime_id: &str,
+        context: &M3OperationContext,
+    ) -> M3HubResult<Option<i64>> {
+        let runtime = self.runtime(runtime_id)?;
+        let os_pid = match runtime.status(context).await? {
+            M3RuntimeStatusView::Adapter { status, .. } => {
+                status.process.as_ref().and_then(|handle| handle.os_pid)
+            }
+            M3RuntimeStatusView::Mlx { status } => match status {
+                MlxRuntimeStatus::Running { handle, .. } => handle.os_pid,
+                _ => None,
+            },
+        };
+        Ok(os_pid.map(i64::from))
+    }
+
     fn runtime_after_authorization(
         &self,
         runtime_id: &str,
