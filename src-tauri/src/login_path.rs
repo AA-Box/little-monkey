@@ -125,7 +125,12 @@ fn merge(login: &str, current: &str) -> Option<String> {
     (merged != current && !merged.is_empty()).then_some(merged)
 }
 
-#[cfg(test)]
+// Unix-only, like the module: `hydrate` returns before it does anything on
+// Windows, and every fixture here is a Unix path. `merge` drops entries that
+// are not existing directories, so on Windows `/usr/bin` and `/bin` are
+// dropped, the merge comes back empty, and the assertions fail against a
+// function that behaved correctly.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
