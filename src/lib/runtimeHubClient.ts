@@ -570,6 +570,32 @@ export interface BenchmarkRunResponse {
   hardware: HardwareSnapshot;
 }
 
+/** Mirrors `benchmark::MachineIdentity` — the stable parts a stored report is valid for. */
+export interface BenchmarkMachineIdentity {
+  os: string;
+  arch: string;
+  totalRamBytes: number;
+  logicalCpuCount: number;
+  accelerators: string[];
+}
+
+/**
+ * Mirrors `benchmark::BenchmarkFreshness`. A discriminated union rather than a
+ * boolean plus a list, so no caller can read the differences off a stale report
+ * and still render its numbers as this machine's.
+ */
+export type BenchmarkFreshness =
+  | { state: "thisMachine" }
+  | { state: "differentMachine"; changed: string[] };
+
+/** Mirrors the Rust `BenchmarkHistoryEntry` (the stored report is flattened in). */
+export interface BenchmarkHistoryEntry {
+  report: BenchmarkReport;
+  machine: BenchmarkMachineIdentity;
+  measuredAtMs: number;
+  freshness: BenchmarkFreshness;
+}
+
 export interface BenchmarkRunRequest {
   runtimeId: string;
   model: string;
@@ -1187,6 +1213,7 @@ export const runtimeHubClient = {
       timeoutMs: timeoutMs ?? null,
       request,
     }),
+  benchmarkHistory: () => invoke<BenchmarkHistoryEntry[]>("m3_benchmark_history"),
   storageStatus: () => invoke<M3StorageStatus>("m3_storage_status"),
   installedModels: () => invoke<M3InstalledModel[]>("m3_installed_models"),
   catalogSources: () => invoke<M3CatalogSourceConfig[]>("m3_catalog_sources"),

@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { HardwareProfile, HardwareSnapshot, M3HardwareCompatibilityReport } from "./runtimeHubClient";
+import type {
+  BenchmarkHistoryEntry,
+  BenchmarkReport,
+  HardwareProfile,
+  HardwareSnapshot,
+  M3HardwareCompatibilityReport,
+} from "./runtimeHubClient";
 import { resolveEdgeRuntimeProfile } from "./runtimeEdgeProfiles";
 
 const GIB = 1024 ** 3;
@@ -104,5 +110,95 @@ describe("resolveEdgeRuntimeProfile", () => {
     expect(result.kind).toBe("raspberry_pi");
     expect(result.confidence).toBe("inferred");
     expect(result.processSlots).toBe(1);
+  });
+
+  describe("measured throughput", () => {
+    function entry(
+      overrides: {
+        median?: number;
+        n?: number;
+        model?: string;
+        decodeTokensPerSecond?: BenchmarkReport["decodeTokensPerSecond"];
+        freshness?: BenchmarkHistoryEntry["freshness"];
+      } = {},
+    ): BenchmarkHistoryEntry {
+      const median = overrides.median ?? 42;
+      return {
+        report: {
+          schemaVersion: 1,
+          runtimeId: "llama-local",
+          model: overrides.model ?? "qwen3-4b",
+          quantization: null,
+          maxOutputTokens: 128,
+          repeatsRequested: 5,
+          warmupDiscarded: 1,
+          samples: [],
+          timeToFirstTokenMs: null,
+          decodeTokensPerSecond:
+            overrides.decodeTokensPerSecond !== undefined
+              ? overrides.decodeTokensPerSecond
+              : { median, min: median, max: median, stddev: null, n: overrides.n ?? 4 },
+          peakMemory: {
+            processLifetimePeakBytes: null,
+            beforeBytes: null,
+            runPeakBytes: null,
+            unavailable: [],
+          },
+          unavailable: [],
+        },
+        machine: {
+          os: "linux",
+          arch: "x86_64",
+          totalRamBytes: 16 * GIB,
+          logicalCpuCount: 8,
+          accelerators: [],
+        },
+        measuredAtMs: 1,
+        freshness: overrides.freshness ?? { state: "thisMachine" },
+      };
+    }
+
+    it("keeps deferring to the benchmark when nothing has been measured here", () => {
+      const result = resolveEdgeRuntimeProfile(snapshot(), profile, compatibility(), []);
+      expect(result.expectedSpeed).not.toContain("Measured here");
+    });
+
+    it("reports the number once this machine has one", () => {
+      const result = resolveEdgeRuntimeProfile(snapshot(), profile, compatibility(), [
+        entry({ median: 37.5, n: 4, model: "qwen3-4b" }),
+      ]);
+      expect(result.expectedSpeed).toContain("Measured here: 37.5 tok/s");
+      expect(result.expectedSpeed).toContain("qwen3-4b");
+      expect(result.expectedSpeed).toContain("n=4");
+      expect(result.evidence).toContain("Benchmarked on this machine: 1 model");
+    });
+
+    it("reports the fastest measured pair, not the most recent one", () => {
+      const result = resolveEdgeRuntimeProfile(snapshot(), profile, compatibility(), [
+        entry({ median: 12, model: "slow-model" }),
+        entry({ median: 90, model: "fast-model" }),
+      ]);
+      expect(result.expectedSpeed).toContain("90 tok/s");
+      expect(result.expectedSpeed).toContain("fast-model");
+    });
+
+    /** The whole claim this surface makes is "measured on the machine displaying it". */
+    it("ignores a report measured on different hardware", () => {
+      const result = resolveEdgeRuntimeProfile(snapshot(), profile, compatibility(), [
+        entry({
+          median: 900,
+          freshness: { state: "differentMachine", changed: ["installed RAM 64 → 16 bytes"] },
+        }),
+      ]);
+      expect(result.expectedSpeed).not.toContain("900");
+      expect(result.expectedSpeed).not.toContain("Measured here");
+    });
+
+    it("ignores a report that produced no decode rate", () => {
+      const result = resolveEdgeRuntimeProfile(snapshot(), profile, compatibility(), [
+        entry({ decodeTokensPerSecond: null }),
+      ]);
+      expect(result.expectedSpeed).not.toContain("Measured here");
+    });
   });
 });
