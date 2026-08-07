@@ -38,6 +38,14 @@ const CHAIN_HASH_DOMAIN: &[u8] = b"little-monkey/run-event-chain/v1";
 /// event, or the first event appended after V9 to a run whose earlier events
 /// predate chaining. Both cases are reported by
 /// [`RunLedger::verify_run_chain`] rather than papered over.
+///
+/// **`process_id` contributes nothing at all when it is `None`, and that is what
+/// keeps V9-era rows verifiable.** A column added after the chain shipped is
+/// otherwise a dilemma: fold it in unconditionally and every row written before
+/// it existed fails to verify; leave it out and it is the one column an attacker
+/// may rewrite for free. Skipping the field entirely for `None` gives both — a
+/// row with no process hashes exactly as it did under V9, while setting,
+/// changing, or clearing a process id all change the digest and are caught.
 #[allow(clippy::too_many_arguments)]
 fn event_chain_hash(
     previous: Option<&str>,
@@ -51,6 +59,7 @@ fn event_chain_hash(
     envelope_json: &[u8],
     derived_status: Option<&str>,
     is_terminal: bool,
+    process_id: Option<&str>,
 ) -> String {
     use sha2::{Digest, Sha256};
 
@@ -76,6 +85,11 @@ fn event_chain_hash(
     field(derived_status.unwrap_or_default().as_bytes());
     field(&[u8::from(derived_status.is_some())]);
     field(&[u8::from(is_terminal)]);
+    // Appended only when present — see this function's doc for why that is what
+    // lets a column added after V9 be covered without invalidating V9's rows.
+    if let Some(process_id) = process_id {
+        field(process_id.as_bytes());
+    }
 
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = hasher.finalize();
@@ -109,6 +123,8 @@ const MIGRATION_V8: i64 = 8;
 const MIGRATION_V8_CHECKSUM: &str = "process-resource-ledger-v8-2026-08-06";
 const MIGRATION_V9: i64 = 9;
 const MIGRATION_V9_CHECKSUM: &str = "run-event-hash-chain-v9-2026-08-07";
+const MIGRATION_V10: i64 = 10;
+const MIGRATION_V10_CHECKSUM: &str = "run-event-process-identity-v10-2026-08-07";
 
 /// The result of recomputing a run's event chain.
 ///
@@ -125,6 +141,11 @@ pub enum ChainVerification {
         covered_from: Option<u64>,
         covered_through: Option<u64>,
         events_seen: u64,
+        /// How many of `events_seen` name a K1 process. Reported rather than
+        /// assumed complete: an event appended outside a process scope names
+        /// none, and the gap between the two numbers is the honest measure of how
+        /// far per-event attribution actually reaches today.
+        events_naming_a_process: u64,
     },
     Broken {
         sequence: u64,
@@ -535,6 +556,16 @@ impl RunLedger {
             )
             .optional()?
             .flatten();
+        // Read from the ambient scope rather than threaded through a parameter:
+        // every one of the 46 production call sites funnels through here, so this
+        // is the single place that can name the process without touching any of
+        // them. `None` — no scope, or a scope with no process — is recorded as
+        // NULL, which honestly means "this event names no process" rather than
+        // guessing one from the run. It cannot be recovered by joining later:
+        // `agent_processes.run_id` is not unique, because a run legitimately owns
+        // many processes.
+        let process_id =
+            crate::run_scope::current_process().map(|process| process.process_id().to_string());
         let event_hash = event_chain_hash(
             previous_hash.as_deref(),
             &envelope.event_id,
@@ -547,13 +578,14 @@ impl RunLedger {
             &envelope_json,
             derived_status,
             effects.terminal,
+            process_id.as_deref(),
         );
         transaction.execute(
             "INSERT INTO run_events (
                 event_id, run_id, sequence, occurred_at_ms, actor_id,
                 emitter_json, event_type, envelope_json, derived_status, is_terminal,
-                event_hash, prev_event_hash
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                event_hash, prev_event_hash, process_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 envelope.event_id,
                 envelope.run_id,
@@ -566,7 +598,8 @@ impl RunLedger {
                 derived_status,
                 i64::from(effects.terminal),
                 event_hash,
-                previous_hash
+                previous_hash,
+                process_id
             ],
         )?;
 
@@ -612,7 +645,8 @@ impl RunLedger {
 
         let mut statement = self.connection.prepare(
             "SELECT event_id, sequence, occurred_at_ms, actor_id, emitter_json, event_type,
-                    envelope_json, derived_status, is_terminal, event_hash, prev_event_hash
+                    envelope_json, derived_status, is_terminal, event_hash, prev_event_hash,
+                    process_id
              FROM run_events WHERE run_id = ?1 ORDER BY sequence ASC",
         )?;
         let mut rows = statement.query([run_id])?;
@@ -620,9 +654,13 @@ impl RunLedger {
         let mut covered_from = None;
         let mut covered_through = None;
         let mut events_seen = 0u64;
+        let mut events_naming_a_process = 0u64;
         let mut expected_previous: Option<String> = None;
         while let Some(row) = rows.next()? {
             events_seen += 1;
+            if row.get::<_, Option<String>>(11)?.is_some() {
+                events_naming_a_process += 1;
+            }
             let sequence = from_sql_u64(row.get::<_, i64>(1)?, "sequence")?;
             let stored_hash = row.get::<_, Option<String>>(9)?;
             let stored_previous = row.get::<_, Option<String>>(10)?;
@@ -658,6 +696,7 @@ impl RunLedger {
                 &row.get::<_, Vec<u8>>(6)?,
                 row.get::<_, Option<String>>(7)?.as_deref(),
                 row.get::<_, i64>(8)? != 0,
+                row.get::<_, Option<String>>(11)?.as_deref(),
             );
             if recomputed != stored_hash {
                 return Ok(ChainVerification::Broken {
@@ -684,6 +723,7 @@ impl RunLedger {
             covered_from,
             covered_through,
             events_seen,
+            events_naming_a_process,
         })
     }
 
@@ -1007,7 +1047,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
             row.get::<_, Option<i64>>(0)
         })?
     {
-        if version > MIGRATION_V9 {
+        if version > MIGRATION_V10 {
             return Err(LedgerError::MigrationConflict { version });
         }
     }
@@ -1022,6 +1062,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         (MIGRATION_V7, MIGRATION_V7_CHECKSUM),
         (MIGRATION_V8, MIGRATION_V8_CHECKSUM),
         (MIGRATION_V9, MIGRATION_V9_CHECKSUM),
+        (MIGRATION_V10, MIGRATION_V10_CHECKSUM),
     ] {
         if let Some(checksum) = connection
             .query_row(
@@ -1255,7 +1296,24 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
-    transaction.execute_batch("PRAGMA user_version = 9;")?;
+    let has_v10 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V10],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v10 {
+        transaction.execute_batch(MIGRATION_V10_SQL)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![MIGRATION_V10, MIGRATION_V10_CHECKSUM, now_ms_i64()?],
+        )?;
+    }
+
+    transaction.execute_batch("PRAGMA user_version = 10;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -1879,6 +1937,21 @@ WHEN NEW.state = 'exited' AND NEW.usage_unavailable_json IS NULL
 BEGIN
     SELECT RAISE(ABORT, 'an exited agent process must state its unmeasured fields');
 END;
+"#;
+
+/// Names the K1 process each event came from (roadmap K12).
+///
+/// Deliberately **not** a foreign key onto `agent_processes`. An FK would make a
+/// stale or already-reaped process id fail the *event* insert, and losing an
+/// event to protect a join is the wrong trade for an append-only log. A
+/// dangling id is honest data; a missing event is not.
+///
+/// ponytail: outer-join to read it, since an id may name a row that no longer
+/// exists. Add the FK if `agent_processes` ever becomes strictly append-only too.
+const MIGRATION_V10_SQL: &str = r#"
+ALTER TABLE run_events ADD COLUMN process_id TEXT;
+
+CREATE INDEX run_events_process_idx ON run_events(process_id) WHERE process_id IS NOT NULL;
 "#;
 
 /// Hash-chains the run event stream (roadmap K12).
@@ -3270,10 +3343,10 @@ mod tests {
     #[test]
     fn the_chain_hash_cannot_be_forged_by_moving_a_field_boundary() {
         let left = event_chain_hash(
-            None, "ab", "c", 1, 2_000, None, "queued", b"{}", b"{}", None, false,
+            None, "ab", "c", 1, 2_000, None, "queued", b"{}", b"{}", None, false, None,
         );
         let right = event_chain_hash(
-            None, "a", "bc", 1, 2_000, None, "queued", b"{}", b"{}", None, false,
+            None, "a", "bc", 1, 2_000, None, "queued", b"{}", b"{}", None, false, None,
         );
         assert_ne!(
             left, right,
@@ -3283,7 +3356,9 @@ mod tests {
         // An absent optional and an empty one must also differ, or a row with
         // `actor_id = NULL` could be rewritten to `actor_id = ''` for free.
         assert_ne!(
-            event_chain_hash(None, "e", "r", 1, 2_000, None, "queued", b"{}", b"{}", None, false,),
+            event_chain_hash(
+                None, "e", "r", 1, 2_000, None, "queued", b"{}", b"{}", None, false, None,
+            ),
             event_chain_hash(
                 None,
                 "e",
@@ -3296,6 +3371,7 @@ mod tests {
                 b"{}",
                 None,
                 false,
+                None,
             ),
             "a NULL actor and an empty-string actor are different rows"
         );
@@ -3303,6 +3379,187 @@ mod tests {
             left.len(),
             64,
             "the column's CHECK constraint expects 64 hex chars"
+        );
+    }
+
+    /// V10 added a column to a table the chain already covered. The escape from
+    /// "break every V9 row or leave the column unprotected" is that `process_id`
+    /// contributes nothing when absent — so a row with no process hashes exactly
+    /// as it did before the column existed, while every mutation of a present one
+    /// is caught. This test is the contract for that, and it is the reason a
+    /// future column may be added the same way.
+    #[test]
+    fn a_process_id_is_covered_when_present_and_costs_nothing_when_absent() {
+        let without = event_chain_hash(
+            None, "e", "r", 1, 2_000, None, "queued", b"{}", b"{}", None, false, None,
+        );
+        let with = event_chain_hash(
+            None,
+            "e",
+            "r",
+            1,
+            2_000,
+            None,
+            "queued",
+            b"{}",
+            b"{}",
+            None,
+            false,
+            Some("p-turn-1"),
+        );
+        let other = event_chain_hash(
+            None,
+            "e",
+            "r",
+            1,
+            2_000,
+            None,
+            "queued",
+            b"{}",
+            b"{}",
+            None,
+            false,
+            Some("p-turn-2"),
+        );
+
+        assert_ne!(with, without, "setting a process id must change the digest");
+        assert_ne!(with, other, "changing it must change the digest");
+        // The load-bearing assertion: an event with no process is byte-identical
+        // to what V9 produced, so every row written before V10 still verifies.
+        assert_eq!(
+            without,
+            {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                let mut field = |bytes: &[u8]| {
+                    hasher.update((bytes.len() as u64).to_be_bytes());
+                    hasher.update(bytes);
+                };
+                field(CHAIN_HASH_DOMAIN);
+                field(b"");
+                field(&[0]);
+                field(b"e");
+                field(b"r");
+                field(&1u64.to_be_bytes());
+                field(&2_000i64.to_be_bytes());
+                field(b"");
+                field(&[0]);
+                field(b"queued");
+                field(b"{}");
+                field(b"{}");
+                field(b"");
+                field(&[0]);
+                field(&[0]);
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                hasher
+                    .finalize()
+                    .iter()
+                    .fold(String::new(), |mut out, byte| {
+                        out.push(HEX[(byte >> 4) as usize] as char);
+                        out.push(HEX[(byte & 0x0f) as usize] as char);
+                        out
+                    })
+            },
+            "the V9 field list, spelled out — a change here silently invalidates \
+             every chain already on disk"
+        );
+    }
+
+    /// Rewriting which process an event came from breaks the chain, which is the
+    /// point of covering the column rather than merely adding it.
+    #[test]
+    fn editing_an_events_process_id_breaks_the_chain() {
+        let mut ledger = RunLedger::open_in_memory().unwrap();
+        ledger
+            .submit_run(&spec("run-process", "submit/process"))
+            .unwrap();
+        ledger.append_event(&queued("run-process", 1)).unwrap();
+        ledger
+            .connection
+            .execute_batch("DROP TRIGGER run_events_forbid_update")
+            .unwrap();
+        ledger
+            .connection
+            .execute(
+                "UPDATE run_events SET process_id = 'p-someone-else'
+                 WHERE run_id = 'run-process' AND sequence = 1",
+                [],
+            )
+            .unwrap();
+
+        match ledger.verify_run_chain("run-process").unwrap() {
+            ChainVerification::Broken { sequence, detail } => {
+                assert_eq!(sequence, 1);
+                assert!(
+                    detail.contains("do not match its recorded hash"),
+                    "got {detail}"
+                );
+            }
+            other => panic!("attributing an event to another process must break it, got {other:?}"),
+        }
+    }
+
+    /// With no ambient scope there is no process to name, and the column records
+    /// that rather than guessing one from the run — which it could not do
+    /// correctly anyway, since a run owns many processes.
+    #[test]
+    fn an_append_with_no_process_scope_records_no_process() {
+        let mut ledger = RunLedger::open_in_memory().unwrap();
+        ledger
+            .submit_run(&spec("run-scopeless", "submit/scopeless"))
+            .unwrap();
+        ledger.append_event(&queued("run-scopeless", 1)).unwrap();
+
+        let process_id = ledger
+            .connection
+            .query_row(
+                "SELECT process_id FROM run_events WHERE run_id = 'run-scopeless'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        assert_eq!(process_id, None);
+        assert!(matches!(
+            ledger.verify_run_chain("run-scopeless").unwrap(),
+            ChainVerification::Intact { .. }
+        ));
+    }
+
+    /// The wiring that makes the column worth having: an append inside a process
+    /// scope names that process, with no change at any of the 46 call sites.
+    #[test]
+    fn an_append_inside_a_process_scope_names_that_process() {
+        let mut ledger = RunLedger::open_in_memory().unwrap();
+        ledger
+            .submit_run(&spec("run-scoped", "submit/scoped"))
+            .unwrap();
+
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(crate::run_scope::scoped_with_process(
+                crate::run_scope::RunScope::run("run-scoped"),
+                crate::run_scope::ProcessScope::new("p-turn-9"),
+                async {
+                    ledger.append_event(&queued("run-scoped", 1)).unwrap();
+                },
+            ));
+
+        let process_id = ledger
+            .connection
+            .query_row(
+                "SELECT process_id FROM run_events WHERE run_id = 'run-scoped'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        assert_eq!(process_id.as_deref(), Some("p-turn-9"));
+        assert!(
+            matches!(
+                ledger.verify_run_chain("run-scoped").unwrap(),
+                ChainVerification::Intact { .. }
+            ),
+            "a named process must still verify — the hash covers it"
         );
     }
 
@@ -3322,6 +3579,9 @@ mod tests {
                 covered_from: Some(1),
                 covered_through: Some(3),
                 events_seen: 3,
+                // No ambient process scope in this test, so none is named — the
+                // gap is reported rather than assumed away.
+                events_naming_a_process: 0,
             }
         );
     }
@@ -3469,6 +3729,7 @@ mod tests {
                 covered_from: Some(3),
                 covered_through: Some(3),
                 events_seen: 3,
+                events_naming_a_process: 0,
             },
             "coverage begins where hashing began, and says so"
         );
@@ -3738,7 +3999,7 @@ mod tests {
                     .connection
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                9
+                10
             );
         }
 
@@ -3751,14 +4012,14 @@ mod tests {
             connection
                 .execute(
                     "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
-                     VALUES (10, 'from-the-future', 1)",
+                     VALUES (11, 'from-the-future', 1)",
                     [],
                 )
                 .unwrap();
         }
         assert!(matches!(
             RunLedger::open(&database.path),
-            Err(LedgerError::MigrationConflict { version: 10 })
+            Err(LedgerError::MigrationConflict { version: 11 })
         ));
     }
 
@@ -3769,13 +4030,13 @@ mod tests {
             let ledger = RunLedger::open(&database.path).unwrap();
             assert_eq!(
                 ledger.applied_migrations().unwrap(),
-                vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
             );
         }
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
             "reopening must not re-apply or add a migration"
         );
 
