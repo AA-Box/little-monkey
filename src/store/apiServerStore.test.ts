@@ -53,7 +53,6 @@ beforeEach(() => {
     config: DEFAULT_API_SERVER_CONFIG,
     tokens: [],
     loaded: false,
-    mintedToken: null,
   });
 });
 
@@ -116,27 +115,10 @@ describe("apiServerStore.setConfig", () => {
   });
 });
 
-describe("apiServerStore.createToken/revokeToken", () => {
-  // Split so secret scanners don't flag the fixture as a real token.
-  const FAKE_TOKEN = ["lmk-", "abcdef0123456789abcdef0123456789"].join("");
-
-  it("createToken stores the minted plaintext once and appends the entry to the token list", async () => {
-    const entry = makeToken({ id: "tok-new", label: "New key" });
-    invokeMock.mockResolvedValueOnce({ token: FAKE_TOKEN, entry });
-
-    await useApiServerStore.getState().createToken("New key", ["chat"], ["local"]);
-
-    expect(invokeMock).toHaveBeenCalledWith("api_server_create_token", {
-      label: "New key",
-      scopes: ["chat"],
-      backends: ["local"],
-      expiresAt: null,
-    });
-    expect(useApiServerStore.getState().mintedToken).toEqual({
-      token: FAKE_TOKEN,
-      entry,
-    });
-    expect(useApiServerStore.getState().tokens).toEqual([entry]);
+describe("apiServerStore legacy-token migration", () => {
+  it("does not expose the retired general-purpose mint action", () => {
+    expect(useApiServerStore.getState()).not.toHaveProperty("createToken");
+    expect(useApiServerStore.getState()).not.toHaveProperty("mintedToken");
   });
 
   it("revokeToken removes the entry from the local list on success", async () => {
@@ -147,20 +129,6 @@ describe("apiServerStore.createToken/revokeToken", () => {
 
     expect(invokeMock).toHaveBeenCalledWith("api_server_revoke_token", { id: "a" });
     expect(useApiServerStore.getState().tokens.map((t) => t.id)).toEqual(["b"]);
-  });
-
-  it("createToken forwards an explicit expiresAt through to the backend", async () => {
-    const entry = makeToken({ id: "tok-expiring", expires_at: 1700000900000 });
-    invokeMock.mockResolvedValueOnce({ token: FAKE_TOKEN, entry });
-
-    await useApiServerStore.getState().createToken("Expiring key", ["chat"], ["local"], 1700000900000);
-
-    expect(invokeMock).toHaveBeenCalledWith("api_server_create_token", {
-      label: "Expiring key",
-      scopes: ["chat"],
-      backends: ["local"],
-      expiresAt: 1700000900000,
-    });
   });
 });
 
@@ -184,14 +152,6 @@ describe("apiServerStore.exportAudit", () => {
 
     expect(invokeMock).toHaveBeenCalledWith("api_server_export_audit");
     expect(result).toEqual(audit);
-  });
-});
-
-describe("apiServerStore.dismissMintedToken", () => {
-  it("clears mintedToken without touching anything else", () => {
-    useApiServerStore.setState({ mintedToken: { token: "lmk-x", entry: makeToken() } });
-    useApiServerStore.getState().dismissMintedToken();
-    expect(useApiServerStore.getState().mintedToken).toBeNull();
   });
 });
 

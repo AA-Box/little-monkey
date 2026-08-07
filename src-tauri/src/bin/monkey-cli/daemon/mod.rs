@@ -1,6 +1,8 @@
+mod admission;
 mod engine;
 mod ledger;
 mod remote;
+mod scheduler;
 mod service;
 mod store;
 mod trigger;
@@ -46,8 +48,17 @@ pub enum DaemonCmd {
     Install(DaemonInstallArgs),
     /// Start the previously installed user service.
     Start,
-    /// Show service, heartbeat, kill-switch, queue, and active-run state.
+    /// Show service, heartbeat, kill-switch, queue, backpressure, and
+    /// active-run state.
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show recent scheduling decisions: what was chosen, over what, and which
+    /// measurement decided it.
+    Decisions {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
         #[arg(long)]
         json: bool,
     },
@@ -347,6 +358,37 @@ struct DaemonStatus {
     paused: u32,
     managed_run_ids: Vec<String>,
     platform: service::ServicePlatform,
+    /// The K8 backpressure signal. Added to *this* payload rather than given its
+    /// own command because this is already the thing every producer polls — the
+    /// desktop reads it through `daemon_desktop_status`, which shells out to
+    /// `monkey daemon status --json`, so the JSON shape is the API.
+    ///
+    /// Producers should branch on `backpressure.state` (`accepting` / `slow` /
+    /// `closed`) or, if they only care about the hard case, on
+    /// `backpressure.accepting`. A `closed` signal is already enforced by
+    /// `enqueue`, so a producer that ignores it gets an error instead of a
+    /// silently overfull queue; `slow` is advisory and only a producer can honour
+    /// it, because only a producer knows whether its work can wait.
+    backpressure: scheduler::Backpressure,
+}
+
+/// The backpressure signal, composed once (K8).
+///
+/// One function so the signal a producer polls on `status` and the refusal
+/// `enqueue` returns cannot disagree about which counters feed it. Everything it
+/// needs is already a cheap indexed count on the daemon's own database.
+fn backpressure_for(
+    store: &DaemonStore,
+    config: &DaemonConfig,
+) -> Result<scheduler::Backpressure, String> {
+    Ok(scheduler::backpressure(
+        store.kill_switch()?,
+        store.nonterminal_count()?,
+        config.max_queue,
+        store.queued_count()?,
+        store.held_count()?,
+        config.poll_interval_ms,
+    ))
 }
 
 pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
@@ -356,6 +398,7 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
             ServiceManager::<service::RealCommandRunner>::real()?.start(&DaemonPaths::resolve()?)
         }
         DaemonCmd::Status { json } => status(*json),
+        DaemonCmd::Decisions { limit, json } => decisions(*limit, *json),
         DaemonCmd::Stop => stop().await,
         DaemonCmd::Uninstall { purge_state } => uninstall(*purge_state),
         DaemonCmd::Run(args) => queue_command(cli, args),
@@ -418,9 +461,17 @@ fn status(json: bool) -> Result<(), String> {
     let mut heartbeat = None;
     let mut pid = None;
     let mut managed_run_ids = Vec::new();
+    let mut held = 0;
+    let mut nonterminal = 0;
+    // The installed config when there is one, defaults otherwise: an uninstalled
+    // daemon still has to report a coherent capacity rather than zero, or every
+    // producer reads "queue full" before the daemon exists.
+    let config = DaemonConfig::load(&paths).unwrap_or_default();
     if paths.state_db.is_file() {
         let store = DaemonStore::open(&paths)?;
         kill_switch = store.kill_switch()?;
+        held = store.held_count()?;
+        nonterminal = store.nonterminal_count()?;
         heartbeat = store
             .get_meta("heartbeat_ms")?
             .and_then(|value| value.parse::<u64>().ok());
@@ -452,6 +503,15 @@ fn status(json: bool) -> Result<(), String> {
         paused,
         managed_run_ids,
         platform: manager.platform(),
+        backpressure: scheduler::backpressure(
+            kill_switch,
+            nonterminal,
+            config.max_queue,
+            queued,
+            held,
+            config.poll_interval_ms,
+        ),
+
     };
     if json {
         println!(
@@ -460,7 +520,7 @@ fn status(json: bool) -> Result<(), String> {
         );
     } else {
         println!(
-            "installed={} service={} heartbeat={} pid={} kill_switch={} queued={} active={} waiting_approval={} paused={}",
+            "installed={} service={} heartbeat={} pid={} kill_switch={} queued={} active={} waiting_approval={} paused={} backpressure={} held={}",
             result.installed,
             result.service_running,
             result.heartbeat_fresh,
@@ -470,6 +530,54 @@ fn status(json: bool) -> Result<(), String> {
             result.active,
             result.waiting_approval,
             result.paused,
+            result.backpressure.state.token(),
+            result.backpressure.held,
+        );
+    }
+    Ok(())
+}
+
+/// `monkey daemon decisions` — the scheduling decision log, newest first.
+///
+/// Its own command rather than more fields on `status`, which the desktop polls
+/// several times a second: a decision log is read when somebody is asking why,
+/// not continuously.
+fn decisions(limit: u32, json: bool) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    if !paths.state_db.is_file() {
+        return Err("Daemon has no state to inspect".to_string());
+    }
+    let entries = DaemonStore::open(&paths)?.recent_decisions(limit)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&entries).unwrap_or_default()
+        );
+        return Ok(());
+    }
+    if entries.is_empty() {
+        println!("No scheduling decisions recorded yet.");
+        return Ok(());
+    }
+    for entry in entries {
+        println!(
+            "{} {} {} class={}/{} over=[{}] {}={} @{} — {}",
+            entry.decided_at_ms,
+            entry.outcome,
+            entry.job_id,
+            entry.process_class,
+            entry.effective_class,
+            entry.passed_over.join(","),
+            entry.measurement,
+            entry
+                .measured_value
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
+            entry
+                .measured_at_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
+            entry.detail,
         );
     }
     Ok(())
@@ -766,11 +874,17 @@ impl QueueOptions {
 /// Fail-soft. The job is already queued and durable by the time this runs; a
 /// projection failure must not turn a successful enqueue into an error the
 /// caller sees.
+/// `workspace` is the canonicalized root this job will run in. It is threaded
+/// through because `reconcile` only writes the `workspace` column when it
+/// *admits* a row, and this function is what admits the row for a remote-origin
+/// job — omitting it would make every mobile and ACP run permanently invisible to
+/// the fair-share charge, which is the class of work most worth charging.
 fn project_queue_origin(
     shared: &SharedLedger,
     origin: &QueueOrigin,
     job_id: &str,
     run_id: &str,
+    workspace: Option<&str>,
 ) {
     use little_monkey_lib::process_table::{
         ExitStatus, ProcessExit, ProcessKind, ProcessProjection, ProcessState,
@@ -779,9 +893,9 @@ fn project_queue_origin(
     let QueueOrigin::Remote { request_id } = origin else {
         return;
     };
-    let now_ms = match now_ms().and_then(|value| {
-        i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string())
-    }) {
+    let now_ms = match now_ms()
+        .and_then(|value| i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string()))
+    {
         Ok(value) => value,
         Err(error) => {
             eprintln!("monkey daemon: could not project remote origin: {error}");
@@ -834,7 +948,8 @@ fn project_queue_origin(
             ProcessState::Admitted,
         )
         .with_parent(ProcessKind::RemoteRun, request_id)
-        .with_run(Some(run_id.to_string())),
+        .with_run(Some(run_id.to_string()))
+        .with_workspace(workspace.map(str::to_string)),
         now_ms,
     ) {
         eprintln!("monkey daemon: could not project remote job {job_id}: {error}");
@@ -857,6 +972,20 @@ fn enqueue(
     }
     if options.max_runtime_ms == 0 || options.max_runtime_ms > 7 * 24 * 60 * 60 * 1_000 {
         return Err("daemon max runtime must be between 1 second and 7 days".to_string());
+    }
+    // Backpressure is honoured here, before anything is created, and that is the
+    // point of doing it in this function rather than at the five call sites:
+    // every producer — CLI, desktop, ACP, mobile, remote, retry — routes through
+    // `enqueue`, so one check covers all of them and none of them can forget it.
+    // Checking early also matters because the work below creates an owned git
+    // worktree and writes a snapshot; refusing after that would leave both behind
+    // for a job that never existed.
+    //
+    // `insert_preparing`'s own transactional cap stays where it is. That one is
+    // authoritative under concurrent enqueues; this one is the informative refusal
+    // that names the reason and a retry delay.
+    if let Some(refusal) = backpressure_for(store, config)?.refusal() {
+        return Err(refusal);
     }
     let job_id = options
         .deterministic_job_id
@@ -887,9 +1016,8 @@ fn enqueue(
     let effective_system = if snapshot_is_frozen {
         rendered.system.clone()
     } else {
-        let cli = cli.ok_or(
-            "A non-frozen recipe submission requires CLI context for rules merging",
-        )?;
+        let cli =
+            cli.ok_or("A non-frozen recipe submission requires CLI context for rules merging")?;
         let state = crate::build_state(&Some(original_workspace.clone()))?;
         crate::effective_system(cli, &state, rendered.system.as_deref())
     };
@@ -976,7 +1104,13 @@ fn enqueue(
             }
         };
     store.mark_queued(&job_id, &run_id, now_ms()?)?;
-    project_queue_origin(shared, &options.origin, &job_id, &run_id);
+    project_queue_origin(
+        shared,
+        &options.origin,
+        &job_id,
+        &run_id,
+        snapshot.workspace.as_deref(),
+    );
     if let Some(owned) = &worktree {
         shared.record_worktree_lease(
             &owned.lease_id,
@@ -1676,9 +1810,9 @@ fn read_payload(path: &Path) -> Result<Vec<u8>, String> {
 ///
 /// Logged and swallowed: a stale row is not a reason to refuse to serve.
 fn reap_dead_workflow_hosts(shared: &SharedLedger) {
-    let now = match now_ms().and_then(|value| {
-        i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string())
-    }) {
+    let now = match now_ms()
+        .and_then(|value| i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string()))
+    {
         Ok(value) => value,
         Err(error) => {
             eprintln!("monkey daemon: workflow host reap skipped: {error}");
@@ -2132,6 +2266,7 @@ mod tests {
             },
             "job-remoteorigin",
             run_id,
+            Some("/tmp/remote-origin-workspace"),
         );
 
         let table = shared.process_table();

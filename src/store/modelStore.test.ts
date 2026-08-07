@@ -216,6 +216,51 @@ describe("modelStore.download", () => {
 
     expect(useModelStore.getState().downloadProgress[model.file]).toBeUndefined();
   });
+
+  it("starts the model it just pulled, so Pull is one click and not two", async () => {
+    const model = makeModel({ file: "qwen2.5-14b-instruct.gguf", installed: false, path: undefined });
+    const installed = makeModel({
+      file: "qwen2.5-14b-instruct.gguf",
+      path: "/models/qwen2.5-14b-instruct.gguf",
+    });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "models_list_installed") return Promise.resolve([installed]);
+      if (command === "models_list_curated") return Promise.resolve([]);
+      if (command === "llama_status") return Promise.resolve({ status: "stopped", port: 8090, model_path: null });
+      if (command === "llama_start") return Promise.resolve(8192);
+      return Promise.resolve(undefined);
+    });
+
+    await useModelStore.getState().download(model);
+
+    expect(invokeMock).toHaveBeenCalledWith("llama_start", {
+      modelPath: installed.path,
+      gpuLayers: 999,
+      embeddings: false,
+    });
+    expect(useModelStore.getState().active?.path).toBe(installed.path);
+  });
+
+  it("leaves a running model alone — a background pull must not kill a live chat", async () => {
+    const running = makeModel();
+    useModelStore.setState({ active: running, llamaStatus: "ready" });
+    const model = makeModel({ file: "qwen2.5-14b-instruct.gguf", installed: false, path: undefined });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "models_list_installed") {
+        return Promise.resolve([running, makeModel({ file: model.file, path: "/models/new.gguf" })]);
+      }
+      if (command === "models_list_curated") return Promise.resolve([]);
+      if (command === "llama_status") {
+        return Promise.resolve({ status: "ready", port: 8090, model_path: running.path });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    await useModelStore.getState().download(model);
+
+    expect(invokeMock).not.toHaveBeenCalledWith("llama_start", expect.anything());
+    expect(useModelStore.getState().active?.path).toBe(running.path);
+  });
 });
 
 describe("modelStore.createModelfileModel", () => {

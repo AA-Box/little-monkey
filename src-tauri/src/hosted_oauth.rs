@@ -258,12 +258,13 @@ fn relay_client() -> Result<reqwest::Client, String> {
 }
 
 async fn redeem_handoff(handoff: &str) -> Result<BackendTokenResponse, String> {
-    let response = relay_client()?
-        .post(format!("{BACKEND_BASE}/mcp/oauth/exchange"))
-        .json(&serde_json::json!({ "handoff": handoff }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach the OAuth relay: {e}"))?;
+    let response = crate::egress::send(
+        relay_client()?
+            .post(format!("{BACKEND_BASE}/mcp/oauth/exchange"))
+            .json(&serde_json::json!({ "handoff": handoff })),
+    )
+    .await
+    .map_err(|e| format!("Failed to reach the OAuth relay: {e}"))?;
     let body: BackendTokenResponse = response
         .json()
         .await
@@ -275,12 +276,13 @@ async fn redeem_handoff(handoff: &str) -> Result<BackendTokenResponse, String> {
 }
 
 async fn refresh_via_backend(provider: &str, refresh_token: &str) -> Result<BackendTokenResponse, String> {
-    let response = relay_client()?
-        .post(format!("{BACKEND_BASE}/mcp/oauth/refresh"))
-        .json(&serde_json::json!({ "provider": provider, "refresh_token": refresh_token }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach the OAuth relay: {e}"))?;
+    let response = crate::egress::send(
+        relay_client()?
+            .post(format!("{BACKEND_BASE}/mcp/oauth/refresh"))
+            .json(&serde_json::json!({ "provider": provider, "refresh_token": refresh_token })),
+    )
+    .await
+    .map_err(|e| format!("Failed to reach the OAuth relay: {e}"))?;
     let body: BackendTokenResponse = response
         .json()
         .await

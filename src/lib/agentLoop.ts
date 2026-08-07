@@ -67,7 +67,7 @@ import { usePermissionStore, type PermissionMode } from '../store/permissionStor
 import { useStackStore, type StackQueryResult } from '../store/stackStore';
 import { useMcpStore } from '../store/mcpStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
-import { admitProcess, exitProcess, exitStatusFor, markProcessRunning, reconcileProcess } from './processTable';
+import { admitProcess, exitProcess, exitStatusFor, linkProcessRun, markProcessRunning, reconcileProcess } from './processTable';
 import { honourPause, forgetPause } from './pauseRegistry';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import {
@@ -2353,6 +2353,23 @@ async function runAgentTurnBody(
     console.error('Failed to start durable run', error);
     return null;
   });
+  // Now that the run row exists, point this turn's process row at it, so the
+  // per-process resource ledger can charge this run's measured usage (CPU, RSS,
+  // egress bytes) to the turn that caused it. It cannot be done at admission
+  // time: `runAgentTurn` mints the row before any run exists, and
+  // `agent_processes.run_id` is a foreign key into `runs` — see
+  // `linkProcessRun`.
+  //
+  // Exactly one link, for this first run only. `switchTurnToLocalForPrivacy`
+  // below starts a SECOND durable run and deliberately does not re-link: moving
+  // the row would leave this run's already-measured bytes claimed by nobody,
+  // which the ledger buckets as unattributed just like a double claim. The
+  // daemon route never reaches here at all, and must not — the `daemon_job` row
+  // is the single claimant of the daemon's run id.
+  if (durable.recorder) {
+    const turnProcessId = chatTurnProcesses.get(turnId);
+    if (turnProcessId) await linkProcessRun(turnProcessId, durable.recorder.runId);
+  }
 
   const switchTurnToLocalForPrivacy = async (
     blockedTarget: ResolvedTarget,

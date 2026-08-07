@@ -48,8 +48,39 @@
 //! design (most likely an explicit per-run approval, mirroring
 //! `permissions.rs`) before it can be added safely.
 //!
+//! # K8 scheduler backpressure: nothing to honour here, and why
+//!
+//! This listener is not a daemon-work producer, so the K8 backpressure signal
+//! (`monkey daemon status --json` → `backpressure`) has no refusal to express on
+//! any route in this file. That is a consequence of the invariant directly above,
+//! not a separate decision: every route either proxies model inference, reads
+//! state (`/v1/models`, `/v1/artifacts/{id}`, `/v1/workflows/runs/{id}`,
+//! `/v1/knowledge/query`), or — in `handle_local_app_run`'s case — emits
+//! `LOCAL_APP_RUN_REQUESTED_EVENT` to the app's own frontend and answers `202`.
+//! None of them reach `daemon::enqueue`, and this module names `monkey-cli` only
+//! to talk about reusing [`handle_request`], never to invoke it.
+//!
+//! Gating inference on the daemon's job queue would therefore mean spawning
+//! `monkey daemon status --json` on the hot path of every chat completion in order
+//! to refuse work that never enters the queue being measured. The signal is
+//! honoured where work is actually produced: `daemon_commands.rs` (desktop),
+//! `monkey-cli`'s `acp.rs` and remote mobile-chat seam, and the CLI itself — all
+//! of which funnel through `daemon::enqueue`, which refuses `closed` before
+//! creating a worktree or a snapshot.
+//!
+//! **If a future route does submit daemon work** (the "trigger a workflow over the
+//! API" design above is the obvious candidate) it acquires this obligation, and
+//! must refuse in the OpenAI-compatible envelope [`error_response`] builds — `429`
+//! with `Retry-After` derived from `backpressure.retry_after_ms`, distinct from the
+//! `503`/`server_busy` that [`RequestAdmission`] returns. Those two are not the
+//! same refusal: admission bounds *requests in flight on this listener* and clears
+//! as soon as a response ends, whereas backpressure says the *work queue behind
+//! the listener* is full and clears only when runs drain.
+//!
+//! [`RequestAdmission`]: crate::http_policy::RequestAdmission
+//!
 //! Structured like `checkpoints.rs`/`web.rs`: an `AppHandle`-free,
-//! independently testable core ([`handle_request`], [`route_model`]) plus a
+//! independently testable core ([`handle_request`]) plus a
 //! thin `#[tauri::command]` layer that owns the actual listening socket and
 //! `AppState` bookkeeping. `pub` (not `mod`) so a future `monkey-cli` `api-serve`
 //! subcommand (design doc phase 4) can reuse [`handle_request`] directly,
@@ -100,13 +131,15 @@
 //! to pick up one credential change.
 use std::convert::Infallible;
 use std::io::ErrorKind;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use futures_util::StreamExt;
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full, StreamBody};
-use hyper::body::{Bytes, Frame, Incoming};
+use http_body_util::{BodyExt, StreamBody};
+use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -117,10 +150,36 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+use crate::http_model_catalog::{
+    CatalogAuthorization, CatalogBackend, CatalogDispatchTarget, CatalogError, CatalogPolicy,
+    CatalogRequestContext, ModelCatalogSource,
+};
+use crate::http_model_service::{
+    openai_model_list, HttpModelService, ModelListRequest, ModelResolveRequest,
+};
+use crate::http_model_sources::{
+    CloudProviderCatalogSource, LegacyLlamaCatalogSource, OllamaCatalogSource,
+    OpenAiRuntimeCatalogSource, ProviderCredentialResolver, ProviderCredentialSource,
+    StaticLoadedLlamaSnapshot,
+};
+use crate::http_policy::{
+    hold_admission_until_response_ends, BoxError, CappedBodyRejection, ResponseBody,
+};
+use crate::http_route_registry::{
+    classify_bearer_family, classify_request, AuthFamily, ClassificationInput, ListenerExposure,
+    RouteDecision, RouteFamily, RouteId, RouteOwner,
+};
+use crate::m3_http_server::{M3HttpModelExtensions, M3HttpRequestService, M3HttpServiceRequest};
+use crate::m3_runtime_hub::{M3OperationContext, M3RuntimeHub};
+use crate::unified_http_server::{
+    EndpointTransport, PrimaryServiceConfig, RunningEndpoint, UnifiedEndpoint,
+    UnifiedGenerationSpec, UnifiedHttpServerState,
+};
 use crate::{ollama, providers, AppState};
 
 /// LM Studio-compatible default port, so drop-in clients that hardcode 1234
@@ -154,78 +213,10 @@ const CONFIG_FILE: &str = "api_server.json";
 /// security-review finding this addresses).
 const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
-/// Boxed error type for [`ResponseBody`] — reqwest's streaming errors and
-/// our own infallible bodies both erase to this.
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
-/// Unified response body type: either a fully-buffered JSON payload ([`Full`])
-/// or an SSE byte-stream passthrough ([`StreamBody`]), both boxed so
-/// [`handle_request`] can return one concrete type regardless of which route
-/// it took.
-type ResponseBody = BoxBody<Bytes, BoxError>;
-
-/// Keeps an [`AdmissionGuard`] alive until the response body it belongs to is
-/// finished or the client stops reading it.
-///
-/// The bug this fixes: the accept loop dropped its guard as soon as
-/// `serve_one_request` *returned a `Response`*, which for the dominant traffic
-/// shape is far too early. A streaming `/v1/chat/completions` returns as soon as
-/// upstream headers arrive and hands back a [`StreamBody`] wrapping reqwest's
-/// `bytes_stream` — not one byte of which has been read yet. So the permit was
-/// released before the request did any of its work, and concurrent SSE streams
-/// were not bounded by [`http_policy::MAX_ACTIVE_REQUESTS`] at all: the counter
-/// measured time-to-first-header, not time in flight.
-///
-/// Wrapping the body rather than threading the guard into each handler is
-/// deliberate. The guard belongs to the accept loop, the body is built deep
-/// inside a route, and every route already funnels through one `Response` — so
-/// this attaches at the one place both facts are available, and no handler
-/// signature has to learn that admission control exists. `m3_http_server.rs`
-/// reaches the same end by moving its guard into `sse_body`'s unfold state; it
-/// can, because it constructs its own stream and has exactly one streaming shape.
-///
-/// [`http_body_util::BodyStream`] rather than `into_data_stream` so trailers
-/// survive: nothing legacy sends them today, and a wrapper that silently ate
-/// them would be a trap for whatever does first.
-fn hold_permit_until_body_ends(
-    body: ResponseBody,
-    guard: crate::http_policy::AdmissionGuard,
-) -> ResponseBody {
-    // Racing the guard's own token here is safe, and the ordering is the reason:
-    // the token is cancelled by `AdmissionGuard::drop`, and the guard lives in
-    // this stream's state — so it cannot fire from this stream's own teardown
-    // while the stream is still being polled. It fires only from the *parent*
-    // token, which the accept loop cancels when it exits. That is a stopping
-    // server, and this is where a stream in flight finds out about it.
-    let cancel = guard.cancellation();
-    // The guard lives in the unfold state, so it drops when the stream finishes
-    // *or* when hyper drops the body because the client went away — which is the
-    // release this needs, and the reason there is no explicit drop below.
-    let stream = futures_util::stream::unfold(
-        (http_body_util::BodyStream::new(body), guard, cancel, false),
-        |(mut frames, guard, cancel, done)| async move {
-            if done {
-                return None;
-            }
-            tokio::select! {
-                frame = frames.next() => frame.map(|frame| (frame, (frames, guard, cancel, false))),
-                _ = cancel.cancelled() => {
-                    // An error, not a clean end. A truncated SSE stream that
-                    // closes successfully is indistinguishable to the client from
-                    // a completed one that happens to lack `[DONE]` — it would
-                    // read a partial answer as the whole answer. `done` ends the
-                    // stream on the next poll so the error is emitted exactly
-                    // once.
-                    let error: BoxError = Box::new(std::io::Error::other(
-                        "The API server stopped while this response was streaming",
-                    ));
-                    Some((Err(error), (frames, guard, cancel, true)))
-                }
-            }
-        },
-    );
-    BodyExt::boxed(StreamBody::new(stream))
-}
+/// Slow or idle peers consume a connection task before they present a request
+/// that can enter [`RequestAdmission`]. Keep that earlier resource bounded as
+/// well. The same cap is shared by the desktop endpoints and `api-serve`.
+const MAX_HTTP_CONNECTIONS: usize = crate::http_policy::MAX_ACTIVE_REQUESTS * 2;
 
 /// Awaits `work` unless this request is cancelled first.
 ///
@@ -279,18 +270,110 @@ async fn serve_with_admission<Fut>(
 where
     Fut: std::future::Future<Output = Response<ResponseBody>>,
 {
+    let refused = error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "The API server active-request quota is exhausted",
+        "server_busy",
+    );
+    serve_with_admission_response(admission, server_shutdown, refused, serve).await
+}
+
+async fn serve_with_admission_response<Fut>(
+    admission: &crate::http_policy::RequestAdmission,
+    server_shutdown: &tokio_util::sync::CancellationToken,
+    refused: Response<ResponseBody>,
+    serve: impl FnOnce(tokio_util::sync::CancellationToken) -> Fut,
+) -> Response<ResponseBody>
+where
+    Fut: std::future::Future<Output = Response<ResponseBody>>,
+{
     let Some(guard) = admission.try_admit(server_shutdown) else {
-        // Refused rather than queued without bound. The legacy OpenAI error
-        // envelope is preserved so existing SDK clients still parse it.
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The API server active-request quota is exhausted",
-            "server_busy",
-        );
+        return refused;
     };
-    serve(guard.cancellation())
-        .await
-        .map(|body| hold_permit_until_body_ends(body, guard))
+    let response = serve(guard.cancellation()).await;
+    hold_admission_until_response_ends(response, guard)
+}
+
+/// Runs one callback after the response body really finishes (or is dropped),
+/// preserving the wrapped body's frames and framing metadata exactly.
+///
+/// This sits *outside* `AdmissionBody`: dropping `inner` first releases the
+/// authoritative admission guard and updates its counters, then the callback
+/// projects those already-updated counters to the UI. Running the projection
+/// when the handler returns would count streaming responses too early.
+struct CompletionBody {
+    inner: Option<ResponseBody>,
+    callback: Option<Box<dyn FnOnce() + Send + Sync + 'static>>,
+}
+
+impl CompletionBody {
+    fn new(inner: ResponseBody, callback: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Some(inner),
+            callback: Some(Box::new(callback)),
+        }
+    }
+
+    fn finish(&mut self) {
+        // AdmissionBody owns the guard. Its drop must happen before the
+        // projection callback reads the counters.
+        drop(self.inner.take());
+        if let Some(callback) = self.callback.take() {
+            callback();
+        }
+    }
+}
+
+impl Drop for CompletionBody {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+impl Body for CompletionBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let poll = match self.inner.as_mut() {
+            Some(inner) => Pin::new(inner).poll_frame(cx),
+            None => return Poll::Ready(None),
+        };
+        match poll {
+            Poll::Ready(None) => {
+                self.finish();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.finish();
+                Poll::Ready(Some(Err(error)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_none_or(hyper::body::Body::is_end_stream)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner
+            .as_ref()
+            .map(hyper::body::Body::size_hint)
+            .unwrap_or_else(|| SizeHint::with_exact(0))
+    }
+}
+
+fn after_response_ends(
+    response: Response<ResponseBody>,
+    callback: impl FnOnce() + Send + Sync + 'static,
+) -> Response<ResponseBody> {
+    response.map(|body| BodyExt::boxed(CompletionBody::new(body, callback)))
 }
 
 /// In-memory lifecycle state for the managed API server process — mirrors
@@ -298,12 +381,6 @@ where
 /// phase 2 (that was a phase-1-only stopgap before `api_server.json`
 /// existed) — tokens are minted/revoked/listed via their own commands below.
 pub struct ApiServerState {
-    /// Present while the accept loop is running; `notify_one()`-ing this is
-    /// how `api_server_stop` asks it to close the listening socket — same
-    /// cancel idiom as `AppState::stream_cancels`/`tool_cancel`. Exactly one
-    /// task (the accept loop) ever awaits this, so `notify_one` (not
-    /// `notify_waiters`) is correct here.
-    pub shutdown: Option<Arc<Notify>>,
     pub port: u16,
     /// `"stopped" | "starting" | "running" | "error"`.
     pub status: String,
@@ -317,29 +394,16 @@ pub struct ApiServerState {
     /// this is the other half.
     pub last_request_at: Option<u64>,
     pub last_error: Option<String>,
-    /// `JoinHandle` of the currently-spawned [`run_accept_loop`] task, so
-    /// [`stop_server_core`] can `.await` it — actually confirming the task
-    /// observed the `shutdown` notify, broke out of its `select!`, and
-    /// dropped its `TcpListener` (freeing the port) — before reporting
-    /// "stopped" or letting a caller (e.g. `start_server_core`'s own
-    /// restart path) attempt to rebind the same port. Without this, a
-    /// same-port restart races the old listener's teardown against the new
-    /// bind and fails almost every time with "Address already in use" (see
-    /// the review finding this addresses). Never serialized/cloned — this
-    /// is pure internal bookkeeping, never part of [`ApiServerStatusPayload`].
-    accept_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Default for ApiServerState {
     fn default() -> Self {
         ApiServerState {
-            shutdown: None,
             port: DEFAULT_PORT,
             status: "stopped".to_string(),
             request_count: 0,
             last_request_at: None,
             last_error: None,
-            accept_task: None,
         }
     }
 }
@@ -372,12 +436,7 @@ fn emit_status(app: &AppHandle, payload: &ApiServerStatusPayload) {
     let _ = app.emit("apiserver://status", payload.clone());
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use crate::http_policy::unix_time_ms as now_ms;
 
 // ---------------------------------------------------------------------
 // Token generation + constant-time verification
@@ -460,22 +519,13 @@ pub enum Scope {
     LocalAppRun,
 }
 
-/// Which upstream a [`TokenEntry`] may be routed to. Mirrors [`ModelRoute`]
-/// one level up — see [`route_backend`] for the mapping.
+/// Which upstream classes a [`TokenEntry`] may discover and use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Backend {
     Local,
     Ollama,
     Providers,
-}
-
-fn backend_label(backend: Backend) -> &'static str {
-    match backend {
-        Backend::Local => "local",
-        Backend::Ollama => "ollama",
-        Backend::Providers => "providers",
-    }
 }
 
 /// A single persisted bearer token. `sha256` is the only trace of the
@@ -762,6 +812,9 @@ pub fn save_config_impl(path: &Path, config: &ApiServerConfig) -> Result<(), Str
 pub enum ModelRoute {
     Llama,
     Ollama,
+    M3Runtime {
+        target: CatalogDispatchTarget,
+    },
     Providers {
         provider_id: String,
         model_id: String,
@@ -775,54 +828,11 @@ pub enum ModelRoute {
 /// per request from `providers::providers_list_presets` + the app's
 /// `providers.json` custom list — see [`build_provider_catalog`]. Never
 /// carries a key or a `has_key` probe: whether a provider is *usable* is
-/// decided lazily via `providers::read_key` at the point of use, not here —
-/// same "routing decision is separate from credential availability" stance
-/// [`route_model`]'s doc comment already takes for Ollama tags.
+/// decided lazily after authentication by the unified model catalog.
 #[derive(Debug, Clone)]
 pub struct ProviderSummary {
     pub id: String,
     pub base_url: String,
-}
-
-/// Pure routing decision, split out from [`handle_chat_completions`] so it's
-/// directly unit-testable with no I/O — same `*_impl`-style extraction as
-/// `web.rs::validate_fetch_url`. `model` is `Unknown` only when blank
-/// (missing/empty `model` field); a non-empty id that isn't the exact
-/// ready-llama filename stem and isn't `"{known_provider_id}/..."` is always
-/// assumed to be an Ollama tag — Ollama itself is the source of truth for
-/// whether that tag actually exists, and a wrong guess there surfaces as a
-/// `502` wrapping Ollama's own error rather than a possibly-stale local
-/// "unknown model" guess. Whether a provider actually has a key saved is
-/// deliberately not checked here (that's `handle_chat_completions`'
-/// `providers::read_key` call, at the point the request would actually be
-/// sent) — this function only decides which *upstream* a request targets,
-/// mirroring how it never checks Ollama reachability either.
-pub fn route_model(
-    model: &str,
-    llama_ready: bool,
-    llama_model_stem: Option<&str>,
-    known_providers: &[ProviderSummary],
-) -> ModelRoute {
-    let trimmed = model.trim();
-    if trimmed.is_empty() {
-        return ModelRoute::Unknown;
-    }
-    if llama_ready {
-        if let Some(stem) = llama_model_stem {
-            if stem == trimmed {
-                return ModelRoute::Llama;
-            }
-        }
-    }
-    if let Some((provider_id, model_id)) = trimmed.split_once('/') {
-        if known_providers.iter().any(|p| p.id == provider_id) {
-            return ModelRoute::Providers {
-                provider_id: provider_id.to_string(),
-                model_id: model_id.to_string(),
-            };
-        }
-    }
-    ModelRoute::Ollama
 }
 
 /// Which of the two clients a route's upstream is allowed to be reached with.
@@ -837,24 +847,16 @@ pub fn route_model(
 /// client for it is the safe direction: that client reaches only this machine.
 fn client_for<'deps>(deps: &'deps ServerDeps, route: &ModelRoute) -> &'deps reqwest::Client {
     match route {
-        // Hardcoded loopback both: `127.0.0.1:{llama_port}` and
-        // `ollama::OLLAMA_BASE_URL`. Neither is user-configurable at this layer.
-        ModelRoute::Llama | ModelRoute::Ollama | ModelRoute::Unknown => &deps.local_client,
+        // Both endpoint values are trusted loopback runtime configuration;
+        // production supplies the app defaults and the CLI harness supplies
+        // ephemeral loopback fakes.
+        ModelRoute::Llama
+        | ModelRoute::Ollama
+        | ModelRoute::M3Runtime { .. }
+        | ModelRoute::Unknown => &deps.local_client,
         // The provider's `base_url` is whatever the user configured, and the
         // request carries their API key.
         ModelRoute::Providers { .. } => &deps.cloud_client,
-    }
-}
-
-/// Maps a routing decision to the [`Backend`] a token's `backends` list is
-/// checked against — `Unknown` never reaches here (handled earlier as a
-/// 404).
-fn route_backend(route: &ModelRoute) -> Option<Backend> {
-    match route {
-        ModelRoute::Llama => Some(Backend::Local),
-        ModelRoute::Ollama => Some(Backend::Ollama),
-        ModelRoute::Providers { .. } => Some(Backend::Providers),
-        ModelRoute::Unknown => None,
     }
 }
 
@@ -928,7 +930,10 @@ enum ExtendedRoute {
     /// `GET /local-apps/{id}` or `GET /local-apps/{id}/{rel_path}` — see
     /// [`handle_local_app_static`]. Unauthenticated: a published Local App's
     /// static page must open in a plain browser tab with no bearer token.
-    LocalAppStatic { app_id: String, rel_path: String },
+    LocalAppStatic {
+        app_id: String,
+        rel_path: String,
+    },
 }
 
 fn extended_route_for(method: &Method, path: &str) -> Option<ExtendedRoute> {
@@ -995,8 +1000,8 @@ pub struct ServerDeps {
     /// slice + one small JSON file read) in [`build_deps`], same "never
     /// stale" reasoning as `tokens` below. Populated regardless of
     /// `expose_providers` so routing decisions stay consistent whether or
-    /// not the toggle is on (see [`route_model`]'s doc comment) — the toggle
-    /// only gates whether a `Providers` route is actually served.
+    /// not the toggle is on; the catalog policy applies the exposure toggle
+    /// before either listing or exact resolution.
     pub providers: Vec<ProviderSummary>,
     tokens: Vec<StoredToken>,
     /// The client for peers on this machine: the bundled `llama-server` and the
@@ -1023,6 +1028,14 @@ pub struct ServerDeps {
     /// leaving it bare left a credential exposed to a redirect. No single policy
     /// fits both, and that is not a defect in either policy.
     pub cloud_client: reqwest::Client,
+    /// Release-window limiter for the legacy-token fallback branch. Pairing
+    /// tokens use the durable controller limiter; both feed the same unified
+    /// route service but are never silently converted into each other.
+    pub legacy_rate_limiter: Arc<crate::http_policy::LegacyTokenRateLimiter>,
+    model_service: HttpModelService,
+    model_extensions: M3HttpModelExtensions,
+    m3_service: Option<M3HttpRequestService>,
+    m3_policy: Option<Arc<crate::compatibility_hub::LanServerPolicy>>,
     /// This request's cancellation token, from its [`http_policy::AdmissionGuard`].
     ///
     /// A field rather than a parameter so no handler signature has to learn that
@@ -1052,25 +1065,16 @@ pub struct ServerRequest {
     pub body: Bytes,
 }
 
-fn full_body(bytes: impl Into<Bytes>) -> ResponseBody {
-    // `Full<Bytes>`'s `Error` is `Infallible` — map it into `BoxError` so
-    // every response path shares one concrete body type.
-    Full::new(bytes.into())
-        .map_err(|never: Infallible| match never {})
-        .boxed()
-}
-
-fn json_response(status: StatusCode, value: serde_json::Value) -> Response<ResponseBody> {
-    let bytes = Bytes::from(value.to_string());
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(full_body(bytes))
-        .expect("building a response from a fixed status + static header never fails")
-}
+use crate::http_policy::{full_body, json_response};
 
 /// OpenAI-shaped error body: `{"error":{"message","type","code"}}` — the
 /// same envelope real OpenAI-compatible clients already parse.
+///
+/// Deliberately **not** shared with `m3_http_server.rs`'s same-named helper:
+/// that one emits `{"error":{"code","message","type":"little_monkey_m3_error"}}`
+/// and takes its arguments in the other order. The two envelopes are a
+/// client-visible contract (`tests/legacy_route_compatibility.rs` pins these
+/// bytes), so merging them would be a wire regression, not a cleanup.
 fn error_response(status: StatusCode, message: &str, code: &str) -> Response<ResponseBody> {
     json_response(
         status,
@@ -1140,7 +1144,7 @@ fn with_cors(mut resp: Response<ResponseBody>) -> Response<ResponseBody> {
 /// means the request is authenticated as that specific token, and route
 /// handlers must still check `auth.scopes`/`auth.backends`. `Err(response)`
 /// is the exact response to return immediately.
-fn authenticate(
+fn authenticate_credential(
     deps: &ServerDeps,
     headers: &HeaderMap,
 ) -> Result<Option<TokenAuth>, Response<ResponseBody>> {
@@ -1219,6 +1223,42 @@ fn authenticate(
     ))
 }
 
+fn debit_legacy_auth(
+    deps: &ServerDeps,
+    authed: Option<&TokenAuth>,
+    input_bytes: u64,
+) -> Result<(), Response<ResponseBody>> {
+    let Some(authed) = authed else {
+        return Ok(());
+    };
+    if let Err(retry_after_ms) =
+        deps.legacy_rate_limiter
+            .check_and_debit(&authed.id, input_bytes, now_ms())
+    {
+        let mut response = error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "This API token has exceeded its request or input-byte limit.",
+            "rate_limit_exceeded",
+        );
+        if let Ok(value) = HeaderValue::from_str(&retry_after_ms.div_ceil(1_000).max(1).to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return Err(response);
+    }
+    Ok(())
+}
+
+fn authenticate(
+    deps: &ServerDeps,
+    headers: &HeaderMap,
+    input_bytes: u64,
+) -> Result<Option<TokenAuth>, Response<ResponseBody>> {
+    let authed = authenticate_credential(deps, headers)?;
+    debit_legacy_auth(deps, authed.as_ref(), input_bytes)?;
+    Ok(authed)
+}
+
 /// Whether a token (if any) is allowed to see/route to `backend` — split out
 /// as a pure, directly unit-testable helper (no I/O), mirroring
 /// [`route_backend`]'s style. `None` (no matched token, i.e. `require_token`
@@ -1229,6 +1269,127 @@ fn authenticate(
 /// `handle_chat_completions`/`handle_embeddings`.
 fn backend_visible(authed: Option<&TokenAuth>, backend: Backend) -> bool {
     authed.map_or(true, |auth| auth.backends.contains(&backend))
+}
+
+fn legacy_catalog_authorization(authed: Option<&TokenAuth>) -> CatalogAuthorization {
+    let mut allowed_backends = std::collections::BTreeSet::new();
+    if backend_visible(authed, Backend::Local) {
+        allowed_backends.insert(CatalogBackend::ManagedLocal);
+        allowed_backends.insert(CatalogBackend::Mlx);
+    }
+    if backend_visible(authed, Backend::Ollama) {
+        allowed_backends.insert(CatalogBackend::Ollama);
+    }
+    if backend_visible(authed, Backend::Providers) {
+        allowed_backends.insert(CatalogBackend::CloudProvider);
+    }
+    CatalogAuthorization::Authorized { allowed_backends }
+}
+
+fn legacy_catalog_policy(deps: &ServerDeps) -> CatalogPolicy {
+    let mut enabled_backends =
+        std::collections::BTreeSet::from([CatalogBackend::ManagedLocal, CatalogBackend::Mlx]);
+    if deps.expose_ollama {
+        enabled_backends.insert(CatalogBackend::Ollama);
+    }
+    if deps.expose_providers {
+        enabled_backends.insert(CatalogBackend::CloudProvider);
+    }
+    CatalogPolicy { enabled_backends }
+}
+
+fn legacy_catalog_context(deps: &ServerDeps) -> CatalogRequestContext {
+    CatalogRequestContext::with_timeout(
+        deps.cancel.clone(),
+        std::time::Duration::from_secs(30 * 60),
+    )
+}
+
+fn legacy_catalog_error(error: CatalogError) -> Response<ResponseBody> {
+    if matches!(error, CatalogError::Cancelled) {
+        return cancelled_response();
+    }
+    let (status, code) = match &error {
+        CatalogError::Unauthorized => (StatusCode::UNAUTHORIZED, "invalid_api_key"),
+        CatalogError::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
+        CatalogError::RateLimited { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded"),
+        CatalogError::Cancelled => unreachable!("handled above"),
+        CatalogError::DeadlineExceeded => (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout"),
+        CatalogError::InvalidRequest(_) | CatalogError::InvalidSource(_) => {
+            (StatusCode::BAD_REQUEST, "invalid_request_error")
+        }
+        CatalogError::LimitExceeded { .. } => {
+            (StatusCode::PAYLOAD_TOO_LARGE, "catalog_limit_exceeded")
+        }
+        CatalogError::SourceUnavailable { .. } => (StatusCode::BAD_GATEWAY, "upstream_unreachable"),
+        CatalogError::NotFound { .. } => (StatusCode::NOT_FOUND, "model_not_found"),
+        CatalogError::Conflict(_) => (StatusCode::CONFLICT, "model_conflict"),
+    };
+    let mut response = error_response(status, &error.to_string(), code);
+    if let CatalogError::RateLimited { retry_after_ms } = error {
+        if let Ok(value) = HeaderValue::from_str(&retry_after_ms.div_ceil(1_000).max(1).to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+    }
+    response
+}
+
+async fn resolve_legacy_model(
+    deps: &ServerDeps,
+    authed: Option<&TokenAuth>,
+    model_id: &str,
+    runtime_override: Option<&str>,
+) -> Result<ModelRoute, Response<ResponseBody>> {
+    let policy = legacy_catalog_policy(deps);
+    let context = legacy_catalog_context(deps);
+    let model_result = deps
+        .model_service
+        .resolve(ModelResolveRequest {
+            authorization: legacy_catalog_authorization(authed),
+            policy: &policy,
+            allowed_models: &std::collections::BTreeSet::new(),
+            model_id,
+            runtime_override,
+            extra_sources: &deps.model_extensions.sources,
+            context: &context,
+        })
+        .await;
+    let model = match model_result {
+        Ok(model) => model,
+        Err(CatalogError::SourceUnavailable {
+            failure: crate::http_model_catalog::CatalogSourceError::PermissionDenied,
+            ..
+        }) if model_id.contains('/') => {
+            return Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                "No API key is configured for this provider.",
+                "provider_not_configured",
+            ));
+        }
+        Err(error) => return Err(legacy_catalog_error(error)),
+    };
+    match model.into_dispatch_target().map_err(legacy_catalog_error)? {
+        CatalogDispatchTarget::Provider {
+            provider_id,
+            provider_model_id,
+            ..
+        } => Ok(ModelRoute::Providers {
+            provider_id,
+            model_id: provider_model_id,
+        }),
+        CatalogDispatchTarget::Runtime {
+            runtime_id,
+            backend: CatalogBackend::ManagedLocal,
+            ..
+        } if runtime_id == "managed-llama" => Ok(ModelRoute::Llama),
+        CatalogDispatchTarget::Runtime {
+            runtime_id,
+            backend: CatalogBackend::Ollama,
+            ..
+        } if runtime_id == "ollama" => Ok(ModelRoute::Ollama),
+        target @ CatalogDispatchTarget::Runtime { .. } => Ok(ModelRoute::M3Runtime { target }),
+    }
 }
 
 /// `GET /v1/models`. Every section of the merged listing is gated on BOTH
@@ -1247,76 +1408,36 @@ async fn handle_models(deps: &ServerDeps, authed: Option<&TokenAuth>) -> Respons
         }
     }
 
-    let mut data = Vec::new();
-
-    if deps.llama_ready && backend_visible(authed, Backend::Local) {
-        if let Some(stem) = &deps.llama_model_stem {
-            data.push(json!({ "id": stem, "object": "model", "owned_by": "local" }));
-        }
-    }
-
-    // A skipped capability probe on purpose — `ollama::list_tag_names`
-    // fetches only `/api/tags`, never `/api/show`, per the design doc's
-    // "Ollama model listing latency" risk note. Gated behind the config's
-    // `expose_ollama` toggle: when it's off, `/v1/models` must only ever
-    // advertise what will actually serve — see the design doc's "Jan
-    // pitfall to avoid" note. Also gated on `Backend::Ollama` visibility —
-    // a token not scoped for the `ollama` backend must never see (or cause a
-    // request against) it, exactly like `handle_chat_completions` already
-    // enforces for that backend.
-    if deps.expose_ollama && backend_visible(authed, Backend::Ollama) {
-        match ollama::list_tag_names(&deps.local_client).await {
-            Ok(tags) => {
-                for tag in tags {
-                    data.push(json!({ "id": tag, "object": "model", "owned_by": "ollama" }));
+    let policy = legacy_catalog_policy(deps);
+    let context = legacy_catalog_context(deps);
+    let allowed_models = std::collections::BTreeSet::new();
+    match deps
+        .model_service
+        .list(ModelListRequest {
+            authorization: legacy_catalog_authorization(authed),
+            policy: &policy,
+            allowed_models: &allowed_models,
+            extra_sources: &deps.model_extensions.sources,
+            context: &context,
+        })
+        .await
+    {
+        Ok(mut models) => {
+            for model in &mut models {
+                if model.backend == CatalogBackend::ManagedLocal {
+                    model.owned_by = "local".to_string();
                 }
             }
-            Err(_) => {
-                // Ollama being unreachable is a normal state (mirrors
-                // `ollama.rs`'s own stance) — just omit its models rather
-                // than failing the whole `/v1/models` call.
-            }
+            json_response(StatusCode::OK, openai_model_list(&models, false))
         }
+        Err(error) => legacy_catalog_error(error),
     }
-
-    // Cloud provider models, only when the money-spending switch is on (see
-    // the design doc's Msty-reference note) — `owned_by` is set to the
-    // provider id itself (e.g. "openai", "anthropic") rather than "local"/
-    // "ollama", so a client immediately sees which entries in the merged
-    // list can incur billing. A provider with no key saved (`read_key` err)
-    // or unreachable (`fetch_models` err) is just omitted, same
-    // "unreachable is normal, don't fail the whole list" stance as Ollama
-    // above — a misconfigured provider shouldn't take `/v1/models` down for
-    // every other backend. Also gated on `Backend::Providers` visibility —
-    // without this, a token scoped away from `providers` could still force a
-    // real keychain read + authenticated outbound request to every
-    // configured cloud provider just by calling this route (the exact
-    // security-review finding this gate closes).
-    if deps.expose_providers && backend_visible(authed, Backend::Providers) {
-        for provider in &deps.providers {
-            let Ok(api_key) = providers::read_key(&provider.id) else {
-                continue;
-            };
-            if let Ok(models) =
-                providers::fetch_models(&provider.base_url, &provider.id, &api_key).await
-            {
-                for model in models {
-                    data.push(json!({
-                        "id": format!("{}/{}", provider.id, model.id),
-                        "object": "model",
-                        "owned_by": provider.id,
-                    }));
-                }
-            }
-        }
-    }
-
-    json_response(StatusCode::OK, json!({ "object": "list", "data": data }))
 }
 
 async fn handle_chat_completions(
     deps: &ServerDeps,
     authed: Option<&TokenAuth>,
+    headers: &HeaderMap,
     body: Bytes,
 ) -> Response<ResponseBody> {
     if let Some(auth) = authed {
@@ -1346,14 +1467,7 @@ async fn handle_chat_completions(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let route = route_model(
-        &model,
-        deps.llama_ready,
-        deps.llama_model_stem.as_deref(),
-        &deps.providers,
-    );
-
-    if route == ModelRoute::Unknown {
+    if model.trim().is_empty() {
         // Mirrors OpenAI's own wording for a request with no `model`.
         return error_response(
             StatusCode::NOT_FOUND,
@@ -1362,31 +1476,54 @@ async fn handle_chat_completions(
         );
     }
 
-    // Same "only advertise/serve what's actually exposed" stance as
-    // `handle_models` — an Ollama- or provider-routed id must 404 exactly
-    // like an unknown one when its toggle is off, not silently proxy anyway.
-    let backend_disabled = match &route {
-        ModelRoute::Ollama => !deps.expose_ollama,
-        ModelRoute::Providers { .. } => !deps.expose_providers,
-        ModelRoute::Llama | ModelRoute::Unknown => false,
-    };
-    if backend_disabled {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            &format!("Unknown model '{model}'"),
-            "model_not_found",
-        );
+    if let Some((provider_id, _)) = model.split_once('/') {
+        if deps
+            .providers
+            .iter()
+            .any(|provider| provider.id == provider_id)
+            && !deps.expose_providers
+        {
+            // Preserve the legacy surface's "unexposed means unknown" byte
+            // contract. The shared catalog deliberately reports a policy
+            // denial for paired callers, so this compatibility translation
+            // must happen at the legacy edge before any source is polled.
+            return error_response(
+                StatusCode::NOT_FOUND,
+                &format!("Unknown model '{model}'"),
+                "model_not_found",
+            );
+        }
     }
 
-    if let Some(auth) = authed {
-        if let Some(backend) = route_backend(&route) {
-            if !auth.backends.contains(&backend) {
-                return forbidden_response(&format!(
-                    "This token isn't scoped for the '{}' backend.",
-                    backend_label(backend)
-                ));
-            }
-        }
+    let runtime_override = headers
+        .get("x-little-monkey-runtime-id")
+        .and_then(|value| value.to_str().ok());
+    let route = match resolve_legacy_model(deps, authed, &model, runtime_override).await {
+        Ok(route) => route,
+        Err(response) => return response,
+    };
+
+    if let ModelRoute::M3Runtime { target } = &route {
+        let Some(service) = &deps.m3_service else {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "The resolved M3 runtime is unavailable",
+                "upstream_unreachable",
+            );
+        };
+        return service
+            .clone()
+            .with_model_extensions(deps.model_extensions.clone())
+            .dispatch_resolved_internal_runtime(
+                RouteId::ChatCompletions,
+                target.clone(),
+                body,
+                M3OperationContext {
+                    cancellation: deps.cancel.clone(),
+                    timeout_ms: 30 * 60 * 1_000,
+                },
+            )
+            .await;
     }
 
     let request_builder = match &route {
@@ -1406,8 +1543,8 @@ async fn handle_chat_completions(
             model_id,
         } => {
             // `provider_id` is guaranteed to match an entry in
-            // `deps.providers` — `route_model` only ever produces this
-            // variant for a known provider id — but a defensive `NOT_FOUND`
+            // `deps.providers` — the catalog only produces this variant for
+            // a configured provider id — but a defensive `NOT_FOUND`
             // beats an `unwrap` panic if that invariant is ever broken.
             let Some(base_url) = deps
                 .providers
@@ -1450,10 +1587,19 @@ async fn handle_chat_completions(
                 .json(&outgoing);
             providers::add_anthropic_headers(request, provider_id, &api_key)
         }
+        ModelRoute::M3Runtime { .. } => unreachable!("handled above"),
         ModelRoute::Unknown => unreachable!("handled above"),
     };
 
-    let Some(sent) = unless_cancelled(&deps.cancel, request_builder.send()).await else {
+    // Metered, and safe on the streaming branch below: `egress::send` wraps the
+    // body in a frame-by-frame passthrough that adds a counter to `poll_frame` and
+    // forwards `size_hint`/`is_end_stream` untouched, so it buffers nothing. That
+    // matters here specifically because this one call site serves both the
+    // buffered and the raw-SSE response, and buffering an SSE stream is a hang
+    // rather than a delay. `streamed_upstream_sse_bytes_reach_the_client_unmodified`
+    // pins the bytes.
+    let Some(sent) = unless_cancelled(&deps.cancel, crate::egress::send(request_builder)).await
+    else {
         return cancelled_response();
     };
     let upstream = match sent {
@@ -1530,6 +1676,7 @@ async fn handle_chat_completions(
 async fn handle_embeddings(
     deps: &ServerDeps,
     authed: Option<&TokenAuth>,
+    headers: &HeaderMap,
     body: Bytes,
 ) -> Response<ResponseBody> {
     if let Some(auth) = authed {
@@ -1554,14 +1701,7 @@ async fn handle_embeddings(
         .unwrap_or("")
         .to_string();
 
-    let route = route_model(
-        &model,
-        deps.llama_ready,
-        deps.llama_model_stem.as_deref(),
-        &deps.providers,
-    );
-
-    if route == ModelRoute::Unknown {
+    if model.trim().is_empty() {
         return error_response(
             StatusCode::NOT_FOUND,
             "you must provide a model parameter",
@@ -1569,19 +1709,43 @@ async fn handle_embeddings(
         );
     }
 
+    if let Some((provider_id, _)) = model.split_once('/') {
+        if deps
+            .providers
+            .iter()
+            .any(|provider| provider.id == provider_id)
+        {
+            if !deps.expose_providers {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Unknown model '{model}'"),
+                    "model_not_found",
+                );
+            }
+            if !backend_visible(authed, Backend::Providers) {
+                return forbidden_response("This token isn't scoped for the 'providers' backend.");
+            }
+            return error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "Embeddings via a cloud provider aren't supported yet — use a local llama-server model (started with --embeddings) or an Ollama tag.",
+                "embeddings_not_supported",
+            );
+        }
+    }
+
+    let runtime_override = headers
+        .get("x-little-monkey-runtime-id")
+        .and_then(|value| value.to_str().ok());
+    let route = match resolve_legacy_model(deps, authed, &model, runtime_override).await {
+        Ok(route) => route,
+        Err(response) => return response,
+    };
+
     if let ModelRoute::Providers { .. } = &route {
         return error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Embeddings via a cloud provider aren't supported yet — use a local llama-server model (started with --embeddings) or an Ollama tag.",
             "embeddings_not_supported",
-        );
-    }
-
-    if route == ModelRoute::Ollama && !deps.expose_ollama {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            &format!("Unknown model '{model}'"),
-            "model_not_found",
         );
     }
 
@@ -1593,29 +1757,42 @@ async fn handle_embeddings(
         );
     }
 
-    if let Some(auth) = authed {
-        if let Some(backend) = route_backend(&route) {
-            if !auth.backends.contains(&backend) {
-                return forbidden_response(&format!(
-                    "This token isn't scoped for the '{}' backend.",
-                    backend_label(backend)
-                ));
-            }
-        }
+    if let ModelRoute::M3Runtime { target } = &route {
+        let Some(service) = &deps.m3_service else {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "The resolved M3 runtime is unavailable",
+                "upstream_unreachable",
+            );
+        };
+        return service
+            .clone()
+            .with_model_extensions(deps.model_extensions.clone())
+            .dispatch_resolved_internal_runtime(
+                RouteId::Embeddings,
+                target.clone(),
+                body,
+                M3OperationContext {
+                    cancellation: deps.cancel.clone(),
+                    timeout_ms: 30 * 60 * 1_000,
+                },
+            )
+            .await;
     }
 
     let upstream_url = match route {
         ModelRoute::Llama => format!("http://127.0.0.1:{}/v1/embeddings", deps.llama_port),
         ModelRoute::Ollama => format!("{}/v1/embeddings", deps.ollama_base_url),
-        ModelRoute::Providers { .. } | ModelRoute::Unknown => unreachable!("handled above"),
+        ModelRoute::Providers { .. } | ModelRoute::M3Runtime { .. } | ModelRoute::Unknown => {
+            unreachable!("handled above")
+        }
     };
 
     let request = client_for(deps, &route)
         .post(&upstream_url)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .send();
-    let Some(sent) = unless_cancelled(&deps.cancel, request).await else {
+        .body(body);
+    let Some(sent) = unless_cancelled(&deps.cancel, crate::egress::send(request)).await else {
         return cancelled_response();
     };
     let upstream = match sent {
@@ -1828,7 +2005,9 @@ async fn handle_local_app_static(
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .body(full_body(bytes))
-            .expect("building a static-file response from a fixed status + content-type never fails"),
+            .expect(
+                "building a static-file response from a fixed status + content-type never fails",
+            ),
         Err(_) => not_found_response(),
     }
 }
@@ -1851,7 +2030,9 @@ async fn handle_local_app_run(
     app_id: String,
     body: Bytes,
 ) -> Response<ResponseBody> {
-    if !crate::local_apps::is_valid_app_id(&app_id) || authed.bound_local_app_id.as_deref() != Some(app_id.as_str()) {
+    if !crate::local_apps::is_valid_app_id(&app_id)
+        || authed.bound_local_app_id.as_deref() != Some(app_id.as_str())
+    {
         return not_found_response();
     }
     let Ok(app_data_dir) = app.path().app_data_dir() else {
@@ -1865,9 +2046,7 @@ async fn handle_local_app_run(
         .and_then(|path| crate::local_apps::load_config_impl(&path))
     {
         Ok(config) => config,
-        Err(e) => {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e, "internal_error")
-        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e, "internal_error"),
     };
     let Some(def) = config.apps.iter().find(|a| a.id == app_id) else {
         return not_found_response();
@@ -1988,12 +2167,28 @@ async fn handle_extended_request(
             Ok(authed) => authed,
             Err(response) => return Some((with_cors(response), None)),
         };
+        if let Err(retry_after_ms) =
+            deps.legacy_rate_limiter
+                .check_and_debit(&authed.id, body.len() as u64, now_ms())
+        {
+            let mut response = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "This Local App token has exceeded its request or input-byte limit.",
+                "rate_limit_exceeded",
+            );
+            if let Ok(value) =
+                HeaderValue::from_str(&retry_after_ms.div_ceil(1_000).max(1).to_string())
+            {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            return Some((with_cors(response), None));
+        }
         let matched_token_id = Some(authed.id.clone());
         let response = handle_local_app_run(app, &authed, app_id.clone(), body.clone()).await;
         return Some((with_cors(response), matched_token_id));
     }
 
-    let authed = match authenticate(deps, headers) {
+    let authed = match authenticate(deps, headers, body.len() as u64) {
         Ok(authed) => authed,
         Err(response) => return Some((with_cors(response), None)),
     };
@@ -2044,7 +2239,7 @@ pub async fn handle_request(
         return (cors_preflight_response(), None);
     }
 
-    let authed = match authenticate(deps, &headers) {
+    let authed = match authenticate(deps, &headers, body.len() as u64) {
         Ok(authed) => authed,
         Err(response) => return (with_cors(response), None),
     };
@@ -2053,9 +2248,11 @@ pub async fn handle_request(
     let response = match (method, path.as_str()) {
         (Method::GET, "/v1/models") => handle_models(deps, authed.as_ref()).await,
         (Method::POST, "/v1/chat/completions") => {
-            handle_chat_completions(deps, authed.as_ref(), body).await
+            handle_chat_completions(deps, authed.as_ref(), &headers, body).await
         }
-        (Method::POST, "/v1/embeddings") => handle_embeddings(deps, authed.as_ref(), body).await,
+        (Method::POST, "/v1/embeddings") => {
+            handle_embeddings(deps, authed.as_ref(), &headers, body).await
+        }
         _ => not_found_response(),
     };
 
@@ -2071,6 +2268,7 @@ pub async fn handle_request(
 /// into every accepted connection to assemble that connection's per-request
 /// `ServerDeps` (which additionally reads `AppState::llama`'s live status
 /// and `api_server.json`'s live token list — see [`build_deps`]).
+#[derive(Clone)]
 struct ServerRuntime {
     /// See [`ServerDeps::local_client`] — built once per server, cloned per request.
     local_client: reqwest::Client,
@@ -2080,6 +2278,10 @@ struct ServerRuntime {
     require_token: bool,
     expose_ollama: bool,
     expose_providers: bool,
+    legacy_rate_limiter: Arc<crate::http_policy::LegacyTokenRateLimiter>,
+    model_service: HttpModelService,
+    m3_service: Option<M3HttpRequestService>,
+    m3_policy: Option<Arc<crate::compatibility_hub::LanServerPolicy>>,
 }
 
 /// Pure merge of built-in presets + a caller-supplied custom-provider list
@@ -2101,6 +2303,101 @@ fn provider_catalog_from(custom: Vec<providers::CustomProviderEntry>) -> Vec<Pro
         base_url: c.base_url,
     }));
     out
+}
+
+enum LegacyLlamaInventory {
+    Snapshot(Option<String>),
+    OpenAiModels(reqwest::Url),
+}
+
+fn model_extensions(
+    llama_inventory: LegacyLlamaInventory,
+    expose_ollama: bool,
+    expose_providers: bool,
+    ollama_base_url: &str,
+    providers_catalog: &[ProviderSummary],
+    local_client: &reqwest::Client,
+    cloud_client: &reqwest::Client,
+) -> M3HttpModelExtensions {
+    let managed_source: Arc<dyn ModelCatalogSource> = match llama_inventory {
+        LegacyLlamaInventory::Snapshot(model_id) => Arc::new(LegacyLlamaCatalogSource::new(
+            Arc::new(StaticLoadedLlamaSnapshot { model_id }),
+            "legacy-managed-llama",
+            "managed-llama",
+        )),
+        LegacyLlamaInventory::OpenAiModels(models_url) => {
+            Arc::new(OpenAiRuntimeCatalogSource::new(
+                "legacy-managed-llama",
+                "managed-llama",
+                CatalogBackend::ManagedLocal,
+                "local",
+                models_url,
+                local_client.clone(),
+            ))
+        }
+    };
+    let mut sources: Vec<Arc<dyn ModelCatalogSource>> = vec![managed_source];
+    if expose_ollama {
+        if let Ok(base_url) = reqwest::Url::parse(ollama_base_url) {
+            if let Ok(source) =
+                OllamaCatalogSource::new("legacy-ollama", "ollama", base_url, local_client.clone())
+            {
+                sources.push(Arc::new(source));
+            }
+        }
+    }
+    let credentials: Arc<dyn ProviderCredentialSource> =
+        Arc::new(ProviderCredentialResolver::new(|provider_id| {
+            providers::read_key(provider_id)
+                .map(Some)
+                .map_err(|_| crate::http_model_catalog::CatalogSourceError::PermissionDenied)
+        }));
+    let provider_extensions = provider_model_extensions(
+        expose_providers,
+        providers_catalog,
+        cloud_client,
+        credentials,
+    );
+    sources.extend(provider_extensions.sources);
+    M3HttpModelExtensions {
+        sources,
+        provider_base_urls: provider_extensions.provider_base_urls,
+        cloud_client: provider_extensions.cloud_client,
+        provider_credentials: provider_extensions.provider_credentials,
+    }
+}
+
+pub(crate) fn provider_model_extensions(
+    enabled: bool,
+    providers_catalog: &[ProviderSummary],
+    cloud_client: &reqwest::Client,
+    credentials: Arc<dyn ProviderCredentialSource>,
+) -> M3HttpModelExtensions {
+    let mut sources: Vec<Arc<dyn ModelCatalogSource>> = Vec::new();
+    let mut provider_base_urls = std::collections::BTreeMap::new();
+    if enabled {
+        for provider in providers_catalog {
+            let Ok(base_url) = reqwest::Url::parse(&provider.base_url) else {
+                continue;
+            };
+            let Ok(source) = CloudProviderCatalogSource::new(
+                provider.id.clone(),
+                base_url,
+                cloud_client.clone(),
+                credentials.clone(),
+            ) else {
+                continue;
+            };
+            provider_base_urls.insert(provider.id.clone(), provider.base_url.clone());
+            sources.push(Arc::new(source));
+        }
+    }
+    M3HttpModelExtensions {
+        sources,
+        provider_base_urls,
+        cloud_client: enabled.then(|| cloud_client.clone()),
+        provider_credentials: enabled.then_some(credentials),
+    }
 }
 
 /// Builds the routing catalog of configured cloud providers (built-in
@@ -2133,6 +2430,44 @@ fn tokens_from_config(config: &ApiServerConfig) -> Vec<StoredToken> {
         .collect()
 }
 
+fn primary_m3_policy(
+    configured: Option<&crate::compatibility_hub::LanServerPolicy>,
+    port: u16,
+) -> Option<Arc<crate::compatibility_hub::LanServerPolicy>> {
+    let mut policy = configured?.clone();
+    policy.bind_address = "127.0.0.1".to_string();
+    policy.port = port;
+    policy.tls = crate::compatibility_hub::TlsPolicy::Disabled;
+    // A network request is never promoted to `HttpAuth::Internal`. The
+    // primary socket accepts M3-only routes only through a real persisted
+    // pairing policy and a scoped bearer token.
+    policy.require_authentication = true;
+    policy.pairing_required = true;
+    Some(Arc::new(policy))
+}
+
+pub(crate) fn provider_sources_enabled(
+    legacy_expose_providers: bool,
+    policy: Option<&crate::compatibility_hub::LanServerPolicy>,
+) -> bool {
+    legacy_expose_providers
+        || policy.is_some_and(|policy| {
+            policy
+                .allowed_backends
+                .contains(&crate::compatibility_hub::ApiBackend::CloudProvider)
+        })
+}
+
+fn bounded_loopback_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .read_timeout(std::time::Duration::from_secs(30 * 60))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("Failed to build the bounded loopback HTTP client: {error}"))
+}
+
 fn build_deps(
     app: &AppHandle,
     runtime: &ServerRuntime,
@@ -2160,6 +2495,16 @@ fn build_deps(
         .and_then(|p| load_config_impl(&p))
         .map(|cfg| tokens_from_config(&cfg))
         .unwrap_or_default();
+    let providers = build_provider_catalog(app);
+    let model_extensions = model_extensions(
+        LegacyLlamaInventory::Snapshot(llama_ready.then(|| llama_model_stem.clone()).flatten()),
+        runtime.expose_ollama,
+        provider_sources_enabled(runtime.expose_providers, runtime.m3_policy.as_deref()),
+        &runtime.ollama_base_url,
+        &providers,
+        &runtime.local_client,
+        &runtime.cloud_client,
+    );
 
     ServerDeps {
         llama_port,
@@ -2170,110 +2515,81 @@ fn build_deps(
         require_token: runtime.require_token,
         expose_ollama: runtime.expose_ollama,
         expose_providers: runtime.expose_providers,
-        providers: build_provider_catalog(app),
+        providers,
         tokens,
         local_client: runtime.local_client.clone(),
         cloud_client: runtime.cloud_client.clone(),
+        legacy_rate_limiter: runtime.legacy_rate_limiter.clone(),
+        model_service: runtime.model_service.clone(),
+        model_extensions,
+        m3_service: runtime.m3_service.clone(),
+        m3_policy: runtime.m3_policy.clone(),
         cancel,
     }
 }
 
-/// Probes the managed llama-server process's readiness and reports the
-/// model id it advertises — the CLI-context substitute for reading
-/// `AppState::llama` in-process (which only exists inside the GUI). Used
-/// exclusively by [`run_cli_server`]: `monkey-cli api-serve` runs as its own OS
-/// process with no Tauri `AppState`, but llama-server (if the GUI already
-/// started it) is a plain independent TCP listener on `port` that anyone on
-/// loopback can reach, so a `/health` + `/v1/models` probe is a faithful
-/// (if slightly higher-latency) stand-in for the GUI's in-memory
-/// `LlamaState::status`/`model_path`. Any failure (unreachable, non-200,
-/// unexpected body) is reported as "not ready" — same "absence is normal,
-/// don't fail routing" stance as [`handle_models`]'s Ollama/provider
-/// omission.
-async fn probe_llama_server(client: &reqwest::Client, port: u16) -> (bool, Option<String>) {
-    let healthy = client
-        .get(format!("http://127.0.0.1:{port}/health"))
-        .send()
-        .await
-        .map(|resp| resp.status().is_success())
-        .unwrap_or(false);
-    if !healthy {
-        return (false, None);
-    }
-
-    let model_id = client
-        .get(format!("http://127.0.0.1:{port}/v1/models"))
-        .send()
-        .await
-        .ok()
-        .and_then(|resp| resp.error_for_status().ok())
-        .map(|resp| async move { resp.json::<serde_json::Value>().await.ok() });
-    let model_id = match model_id {
-        Some(fut) => fut.await,
-        None => None,
-    };
-    let model_id = model_id
-        .and_then(|v| {
-            v.get("data")
-                .and_then(|d| d.as_array())
-                .and_then(|arr| arr.first().cloned())
-        })
-        .and_then(|entry| {
-            entry
-                .get("id")
-                .and_then(|id| id.as_str())
-                .map(str::to_string)
-        });
-
-    (true, model_id)
-}
-
-/// Streams a real hyper request's body in frame by frame, rejecting it the
-/// moment the running total would exceed [`MAX_REQUEST_BODY_BYTES`] — unlike
-/// `Incoming::collect()`, this never buffers past the cap, so an oversized
-/// body can't force an unbounded allocation before it's rejected (the
-/// security-review finding this addresses: `collect()` used to buffer the
-/// *entire* body — no matter how large — before `handle_request` had even
-/// looked at the Authorization header). A read that fails partway through
-/// (client disconnect, malformed chunked encoding) is reported as its own
-/// distinct `400 body_read_error`, rather than silently substituting an
-/// empty body and letting it fail later as a confusing generic "Invalid JSON
-/// body" — a second, independently-reported review finding.
-/// Generic over the body type (rather than hardcoded to [`Incoming`]) purely
-/// so unit tests can drive it with a synthetic `StreamBody` instead of a real
-/// hyper connection — [`serve_one_request`] always calls it with a real
-/// `Incoming` and [`MAX_REQUEST_BODY_BYTES`].
-async fn read_capped_body<B>(mut body: B, limit: usize) -> Result<Bytes, Response<ResponseBody>>
+/// The shared capped body read ([`crate::http_policy::read_capped_body`]) in
+/// this listener's own wire bytes.
+///
+/// The read *semantics* — never buffering past the cap, ignoring
+/// `Content-Length`, dropping rather than draining a rejected body — live in
+/// `http_policy.rs` so a change to them cannot take effect on one listener and
+/// silently not on the other. Only the rendering is local, and it has to be:
+/// this listener owes an OpenAI-shaped envelope plus the wildcard CORS header
+/// that `tests/legacy_route_compatibility.rs` pins, where the compatibility
+/// router owes `little_monkey_m3_error` under its own origin allowlist.
+async fn read_capped_body<B>(
+    body: B,
+    limit: usize,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<Bytes, Response<ResponseBody>>
 where
     B: hyper::body::Body<Data = Bytes> + Unpin,
 {
-    let mut collected: Vec<u8> = Vec::new();
-    loop {
-        match body.frame().await {
-            Some(Ok(frame)) => {
-                let Some(data) = frame.data_ref() else {
-                    continue;
-                };
-                if collected.len() + data.len() > limit {
-                    return Err(with_cors(error_response(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        &format!("Request body exceeds the {limit}-byte limit."),
-                        "request_too_large",
-                    )));
-                }
-                collected.extend_from_slice(data);
-            }
-            Some(Err(_)) => {
-                return Err(with_cors(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "The request body could not be fully read — the connection was interrupted or the transfer encoding was malformed.",
-                    "body_read_error",
-                )));
-            }
-            None => break,
-        }
-    }
-    Ok(Bytes::from(collected))
+    crate::http_policy::read_capped_body(body, limit, cancellation)
+        .await
+        .map_err(|rejection| match rejection {
+            CappedBodyRejection::Cancelled => with_cors(cancelled_response()),
+            CappedBodyRejection::TooLarge { limit } => with_cors(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!("Request body exceeds the {limit}-byte limit."),
+                "request_too_large",
+            )),
+            CappedBodyRejection::ReadFailed => with_cors(error_response(
+                StatusCode::BAD_REQUEST,
+                "The request body could not be fully read — the connection was interrupted or the transfer encoding was malformed.",
+                "body_read_error",
+            )),
+        })
+}
+
+async fn dispatch_m3_route(
+    deps: &ServerDeps,
+    route: RouteId,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+    remote_address: IpAddr,
+) -> Response<ResponseBody> {
+    let (Some(service), Some(policy)) = (&deps.m3_service, &deps.m3_policy) else {
+        return with_cors(not_found_response());
+    };
+    service
+        .clone()
+        .with_model_extensions(deps.model_extensions.clone())
+        .handle(M3HttpServiceRequest {
+            route,
+            method,
+            headers,
+            body,
+            remote_address,
+            policy: policy.clone(),
+            context: M3OperationContext {
+                cancellation: deps.cancel.clone(),
+                timeout_ms: 30 * 60 * 1_000,
+            },
+        })
+        .await
 }
 
 /// Adapts a real hyper request into the `AppHandle`-free [`handle_request`]
@@ -2282,17 +2598,158 @@ where
 /// `monkey-cli`, which has none), also gives [`handle_extended_request`] a
 /// chance to claim one of the three phase-5 extended routes before falling
 /// through to `handle_request`'s original five.
-async fn serve_one_request(
+async fn serve_one_request<B>(
     deps: ServerDeps,
-    req: Request<Incoming>,
+    req: Request<B>,
     app: Option<&AppHandle>,
-) -> Result<(Response<ResponseBody>, Option<String>), Infallible> {
+    exposure: ListenerExposure,
+    primary_routes: bool,
+    remote_address: IpAddr,
+) -> Result<(Response<ResponseBody>, Option<String>), Infallible>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let headers = req.headers().clone();
-    let body = match read_capped_body(req.into_body(), MAX_REQUEST_BODY_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(response) => return Ok((response, None)),
+    let auth_family = if primary_routes {
+        classify_bearer_family(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+        )
+    } else {
+        // A policy-only loopback endpoint has the same route surface as a LAN
+        // endpoint. This is an ownership selector only; the M3 service still
+        // performs real authentication before any model/runtime probe.
+        AuthFamily::PairedLanToken
+    };
+    let decision = classify_request(
+        &method,
+        &path,
+        ClassificationInput::new(exposure, auth_family),
+    );
+    let mut route = match decision {
+        RouteDecision::Allowed(route) => Some(route),
+        RouteDecision::MethodNotAllowed {
+            route,
+            owner: RouteOwner::M3,
+            ..
+        } => {
+            let response =
+                dispatch_m3_route(&deps, route, method, headers, Bytes::new(), remote_address)
+                    .await;
+            return Ok((response, None));
+        }
+        RouteDecision::MethodNotAllowed { .. }
+            if primary_routes && auth_family != AuthFamily::PairedLanToken =>
+        {
+            // Byte-compatible migration path: legacy authenticated every
+            // non-preflight request before falling through to its 404. A typed
+            // 405 here would become both a route oracle and a wire regression.
+            None
+        }
+        RouteDecision::MethodNotAllowed { .. } => {
+            let response = deps
+                .m3_policy
+                .as_deref()
+                .map(|policy| crate::m3_http_server::route_not_found_response(policy, &headers))
+                .unwrap_or_else(|| with_cors(not_found_response()));
+            return Ok((response, None));
+        }
+        RouteDecision::Denied(_) | RouteDecision::NotFound
+            if primary_routes && auth_family != AuthFamily::PairedLanToken =>
+        {
+            // Keep denied capabilities non-dispatchable, but preserve legacy
+            // auth/body/preflight ordering and its exact 401/404/204 bytes.
+            None
+        }
+        RouteDecision::Denied(_) | RouteDecision::NotFound => {
+            // Explicit capability denials and unknown paths are intentionally
+            // indistinguishable, and neither allocates a request body.
+            let response = if primary_routes && auth_family != AuthFamily::PairedLanToken {
+                with_cors(not_found_response())
+            } else {
+                deps.m3_policy
+                    .as_deref()
+                    .map(|policy| crate::m3_http_server::route_not_found_response(policy, &headers))
+                    .unwrap_or_else(|| with_cors(not_found_response()))
+            };
+            return Ok((response, None));
+        }
+    };
+
+    if route.is_some_and(|route| {
+        route.owner == RouteOwner::Legacy
+            && (!primary_routes
+                || (auth_family == AuthFamily::PairedLanToken
+                    && route.route.family == RouteFamily::LegacyHost))
+    }) {
+        let response = deps
+            .m3_policy
+            .as_deref()
+            .map(|policy| crate::m3_http_server::route_not_found_response(policy, &headers))
+            .unwrap_or_else(|| with_cors(not_found_response()));
+        return Ok((response, None));
+    }
+    if route.is_some_and(|route| route.route.family == RouteFamily::LegacyHost) && app.is_none() {
+        // Host routes only exist in the desktop process. The historical CLI
+        // treated these paths like any other unknown legacy route, including
+        // its authentication/body ordering, so fall through to that core
+        // instead of exposing a pre-auth typed-router 404.
+        route = None;
+    }
+
+    if route.is_some_and(|route| route.owner == RouteOwner::M3) {
+        let (Some(service), Some(policy)) = (&deps.m3_service, &deps.m3_policy) else {
+            return Ok((with_cors(not_found_response()), None));
+        };
+        let response = crate::m3_http_server::handle_http_request(
+            service
+                .clone()
+                .with_model_extensions(deps.model_extensions.clone()),
+            route.expect("M3 route match").route.id,
+            policy.clone(),
+            remote_address,
+            req,
+            M3OperationContext {
+                cancellation: deps.cancel.clone(),
+                timeout_ms: 30 * 60 * 1_000,
+            },
+        )
+        .await;
+        return Ok((response, None));
+    }
+
+    let public_legacy_request = (method == Method::GET && path == "/health")
+        || (method == Method::OPTIONS && path.starts_with("/v1/"))
+        || (app.is_some()
+            && matches!(
+                extended_route_for(&method, &path),
+                Some(ExtendedRoute::LocalAppStatic { .. })
+            ));
+    if !public_legacy_request {
+        let preflight = match extended_route_for(&method, &path) {
+            Some(ExtendedRoute::LocalAppRun(app_id)) if app.is_some() => {
+                authenticate_local_app_token(&deps, &headers, &app_id).map(Some)
+            }
+            _ => authenticate_credential(&deps, &headers),
+        };
+        if let Err(response) = preflight {
+            return Ok((with_cors(response), None));
+        }
+    }
+
+    let body = if public_legacy_request {
+        // Health, preflight, and published static pages never consume a
+        // request envelope. Dropping the body here prevents an unauthenticated
+        // caller from forcing the listener to buffer 32 MiB for a public route.
+        Bytes::new()
+    } else {
+        match read_capped_body(req.into_body(), MAX_REQUEST_BODY_BYTES, &deps.cancel).await {
+            Ok(bytes) => bytes,
+            Err(response) => return Ok((response, None)),
+        }
     };
 
     if let Some(app) = app {
@@ -2313,22 +2770,6 @@ async fn serve_one_request(
         },
     )
     .await)
-}
-
-fn bump_request_count(app: &AppHandle) {
-    let state = app.state::<AppState>();
-    let payload = {
-        let Ok(mut s) = state.api_server.lock() else {
-            return;
-        };
-        s.request_count += 1;
-        s.last_request_at = Some(now_ms());
-        status_payload(&s)
-    };
-    // Emitted per-request rather than throttled — phase 1 traffic volume
-    // (a human-driven external tool, not a benchmark loop) makes this a
-    // non-issue; worth revisiting if that assumption changes.
-    emit_status(app, &payload);
 }
 
 /// Pure update: sets `last_used_at` on the matching token only. Split out
@@ -2357,94 +2798,264 @@ fn record_token_used(app: &AppHandle, token_id: &str) {
     record_token_used_with_state(&app.state::<AppState>(), &path, token_id);
 }
 
-/// The accept loop. Exits only when `shutdown` is notified — `stop_server_core`
-/// is the only caller of that, and it `.await`s this task's `JoinHandle`
-/// specifically so it can rely on `listener` having actually been dropped
-/// (freeing the port) by the time it returns. Status bookkeeping ("stopped",
-/// clearing `shutdown`/`accept_task`) is deliberately NOT done here — it's
-/// `stop_server_core`'s job, since it already took both fields out of
-/// `ApiServerState` before notifying this loop, and doing it here too would
-/// race that same-port-restart concern right back in (see the review finding
-/// `ApiServerState::accept_task`'s doc comment addresses).
-async fn run_accept_loop(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointRequestSurface {
+    Legacy,
+    M3,
+    HiddenLegacy,
+    HiddenM3,
+}
+
+fn endpoint_request_surface(
+    endpoint: &UnifiedEndpoint,
+    has_m3_policy: bool,
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+) -> EndpointRequestSurface {
+    let auth_family = if endpoint.primary {
+        classify_bearer_family(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+        )
+    } else {
+        AuthFamily::PairedLanToken
+    };
+    match classify_request(
+        method,
+        path,
+        ClassificationInput::new(endpoint.exposure, auth_family),
+    ) {
+        RouteDecision::Allowed(route) if route.owner == RouteOwner::M3 => {
+            if has_m3_policy {
+                EndpointRequestSurface::M3
+            } else {
+                EndpointRequestSurface::HiddenLegacy
+            }
+        }
+        RouteDecision::MethodNotAllowed {
+            owner: RouteOwner::M3,
+            ..
+        } => {
+            if has_m3_policy {
+                EndpointRequestSurface::M3
+            } else {
+                EndpointRequestSurface::HiddenLegacy
+            }
+        }
+        RouteDecision::Allowed(route)
+            if route.owner == RouteOwner::Legacy
+                && endpoint.primary
+                && !(auth_family == AuthFamily::PairedLanToken
+                    && route.route.family == RouteFamily::LegacyHost) =>
+        {
+            EndpointRequestSurface::Legacy
+        }
+        RouteDecision::MethodNotAllowed {
+            owner: RouteOwner::Legacy,
+            ..
+        } if endpoint.primary && auth_family != AuthFamily::PairedLanToken => {
+            EndpointRequestSurface::Legacy
+        }
+        RouteDecision::Allowed(_) | RouteDecision::MethodNotAllowed { .. } => {
+            EndpointRequestSurface::HiddenM3
+        }
+        RouteDecision::Denied(_) | RouteDecision::NotFound
+            if !endpoint.primary || auth_family == AuthFamily::PairedLanToken =>
+        {
+            EndpointRequestSurface::HiddenM3
+        }
+        RouteDecision::Denied(_) | RouteDecision::NotFound => EndpointRequestSurface::HiddenLegacy,
+    }
+}
+
+fn endpoint_refusal_response(
+    surface: EndpointRequestSurface,
+    policy: Option<&crate::compatibility_hub::LanServerPolicy>,
+    headers: &HeaderMap,
+) -> Response<ResponseBody> {
+    match surface {
+        EndpointRequestSurface::Legacy => with_cors(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The API server active-request quota is exhausted",
+            "server_busy",
+        )),
+        EndpointRequestSurface::M3 => policy
+            .map(|policy| crate::m3_http_server::server_busy_response(policy, headers))
+            .unwrap_or_else(|| with_cors(not_found_response())),
+        EndpointRequestSurface::HiddenM3 => policy
+            .map(|policy| crate::m3_http_server::route_not_found_response(policy, headers))
+            .unwrap_or_else(|| with_cors(not_found_response())),
+        EndpointRequestSurface::HiddenLegacy => with_cors(not_found_response()),
+    }
+}
+
+async fn serve_desktop_connection<I>(
+    io: I,
+    app: AppHandle,
+    runtime: Arc<ServerRuntime>,
+    endpoint: UnifiedEndpoint,
+    remote_address: IpAddr,
+    admission: Arc<crate::http_policy::RequestAdmission>,
+    shutdown: tokio_util::sync::CancellationToken,
+) where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let connection_shutdown = shutdown.clone();
+    let endpoint_policy = runtime.m3_policy.clone();
+    let service = service_fn(move |req: Request<Incoming>| {
+        let app = app.clone();
+        let runtime = runtime.clone();
+        let endpoint = endpoint.clone();
+        let endpoint_policy = endpoint_policy.clone();
+        let admission = admission.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            let surface = endpoint_request_surface(
+                &endpoint,
+                endpoint_policy.is_some(),
+                req.method(),
+                req.uri().path(),
+                req.headers(),
+            );
+            if matches!(
+                surface,
+                EndpointRequestSurface::HiddenLegacy | EndpointRequestSurface::HiddenM3
+            ) {
+                return Ok::<_, Infallible>(endpoint_refusal_response(
+                    surface,
+                    endpoint_policy.as_deref(),
+                    req.headers(),
+                ));
+            }
+            let refused =
+                endpoint_refusal_response(surface, endpoint_policy.as_deref(), req.headers());
+            let projection_app = app.clone();
+            let response = serve_with_admission_response(
+                &admission,
+                &shutdown,
+                refused,
+                |cancel| async move {
+                    let deps = build_deps(&app, &runtime, cancel);
+                    let (response, matched_token_id) = match serve_one_request(
+                        deps,
+                        req,
+                        Some(&app),
+                        endpoint.exposure,
+                        endpoint.primary,
+                        remote_address,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(never) => match never {},
+                    };
+                    if let Some(token_id) = matched_token_id {
+                        record_token_used(&app, &token_id);
+                    }
+                    response
+                },
+            )
+            .await;
+            Ok::<_, Infallible>(after_response_ends(response, move || {
+                let _ = sync_api_server_projection(&projection_app);
+            }))
+        }
+    });
+    let connection = http1::Builder::new().serve_connection(TokioIo::new(io), service);
+    tokio::pin!(connection);
+    tokio::select! {
+        _ = connection_shutdown.cancelled() => {
+            connection.as_mut().graceful_shutdown();
+            let _ = connection.await;
+        }
+        _ = &mut connection => {}
+    }
+}
+
+/// One endpoint accept task. It owns and joins every connection task it
+/// creates, so awaiting this handle means both the listening socket and all
+/// already-admitted HTTP work are gone.
+async fn run_unified_endpoint(
     app: AppHandle,
     listener: TcpListener,
-    shutdown: Arc<Notify>,
+    endpoint: UnifiedEndpoint,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     runtime: Arc<ServerRuntime>,
+    admission: Arc<crate::http_policy::RequestAdmission>,
+    connection_limit: Arc<Semaphore>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
-    // Bounded admission, shared with the compatibility listener and with
-    // `run_cli_server` — see [`serve_with_admission`], which is the whole rule.
-    // Before this, every connection here spawned an unbounded task with no permit
-    // and no in-flight accounting.
-    //
-    // The permit is now held until the response *body* ends rather than until the
-    // handler returns, so the bound covers streaming requests. Cancellation is a
-    // separate matter and is still not wired: the guard carries a token, and no
-    // legacy handler reads it — see [`serve_with_admission`].
-    let admission = Arc::new(crate::http_policy::RequestAdmission::new(
-        crate::http_policy::MAX_ACTIVE_REQUESTS,
-    ));
-    // Cancelled when the loop exits, so every in-flight request is torn down
-    // rather than outliving the listener that accepted it.
-    let server_shutdown = tokio_util::sync::CancellationToken::new();
-    let _shutdown_on_exit = server_shutdown.clone().drop_guard();
-
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
-            _ = shutdown.notified() => break,
+            _ = shutdown.cancelled() => break,
+            completed = connections.join_next(), if !connections.is_empty() => {
+                let _ = completed;
+            }
             accepted = listener.accept() => {
-                let (stream, _addr) = match accepted {
-                    Ok(pair) => pair,
-                    Err(_) => continue, // transient accept error — keep serving
+                let (stream, remote) = match accepted {
+                    Ok(value) => value,
+                    Err(_) => continue,
                 };
-                let io = TokioIo::new(stream);
-                let app_for_conn = app.clone();
-                let runtime_for_conn = runtime.clone();
-                let admission_for_conn = admission.clone();
-                let shutdown_for_conn = server_shutdown.clone();
-                tokio::spawn(async move {
-                    let service = service_fn(move |req: Request<Incoming>| {
-                        let app_for_req = app_for_conn.clone();
-                        let runtime_for_req = runtime_for_conn.clone();
-                        let admission_for_req = admission_for_conn.clone();
-                        let shutdown_for_req = shutdown_for_conn.clone();
-                        async move {
-                            let response = serve_with_admission(
-                                &admission_for_req,
-                                &shutdown_for_req,
-                                |cancel| async move {
-                                    // Built inside, so the deps carry this
-                                    // request's token; there is no way to
-                                    // construct them without one.
-                                    let deps =
-                                        build_deps(&app_for_req, &runtime_for_req, cancel);
-                                    let (resp, matched_token_id) =
-                                        match serve_one_request(deps, req, Some(&app_for_req)).await
-                                        {
-                                            Ok(pair) => pair,
-                                            // `serve_one_request`'s error type is
-                                            // `Infallible`, so this arm is
-                                            // unreachable rather than swallowed.
-                                            Err(never) => match never {},
-                                        };
-                                    if let Some(token_id) = matched_token_id {
-                                        record_token_used(&app_for_req, &token_id);
-                                    }
-                                    bump_request_count(&app_for_req);
-                                    resp
-                                },
-                            )
-                            .await;
-                            Ok::<_, Infallible>(response)
+                let connection_permit = match connection_limit.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => continue,
+                };
+                let app = app.clone();
+                let endpoint = endpoint.clone();
+                let runtime = runtime.clone();
+                let admission = admission.clone();
+                let shutdown = shutdown.clone();
+                if let Some(acceptor) = tls_acceptor.clone() {
+                    connections.spawn(async move {
+                        let _connection_permit = connection_permit;
+                        let accepted = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            acceptor.accept(stream),
+                        ).await;
+                        if let Ok(Ok(stream)) = accepted {
+                            serve_desktop_connection(
+                                stream,
+                                app,
+                                runtime,
+                                endpoint,
+                                remote.ip(),
+                                admission,
+                                shutdown,
+                            ).await;
                         }
                     });
-                    let _ = http1::Builder::new().serve_connection(io, service).await;
-                });
+                } else {
+                    connections.spawn(async move {
+                        let _connection_permit = connection_permit;
+                        serve_desktop_connection(
+                            stream,
+                            app,
+                            runtime,
+                            endpoint,
+                            remote.ip(),
+                            admission,
+                            shutdown,
+                        ).await;
+                    });
+                }
             }
         }
     }
-    // `listener` drops here as the function returns — the exact event
-    // `stop_server_core` is waiting for by awaiting this task's handle.
+
+    // Connection futures observe the same cancellation token and ask Hyper
+    // for graceful shutdown. Bound the drain so a malicious peer that never
+    // finishes TLS/HTTP teardown cannot wedge application exit forever.
+    let drain = async { while connections.join_next().await.is_some() {} };
+    if tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+        .await
+        .is_err()
+    {
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    }
 }
 
 /// Attempts to bind `port` on loopback only. Split out from
@@ -2452,20 +3063,16 @@ async fn run_accept_loop(
 /// directly unit-testable without a `#[tauri::command]`/`AppHandle` — see
 /// `tests::bind_conflict_surfaces_as_status_error`.
 async fn bind_listener(port: u16) -> Result<TcpListener, String> {
-    TcpListener::bind(("127.0.0.1", port)).await.map_err(|error| {
-        crate::http_policy::describe_bind_error(
-            crate::http_policy::ListenerRole::LegacyProxy,
-            "127.0.0.1",
-            port,
-            &error,
-        )
-    })
-}
-
-fn record_bind_error(state: &mut ApiServerState, message: String) {
-    state.status = "error".to_string();
-    state.last_error = Some(message);
-    state.shutdown = None;
+    TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|error| {
+            crate::http_policy::describe_bind_error(
+                crate::http_policy::ListenerRole::LegacyProxy,
+                "127.0.0.1",
+                port,
+                &error,
+            )
+        })
 }
 
 // ---------------------------------------------------------------------
@@ -2473,8 +3080,7 @@ fn record_bind_error(state: &mut ApiServerState, message: String) {
 // (`ServerDeps`/`serve_one_request`/`handle_request`/`bind_listener`/
 // `load_config_impl`) the GUI uses, with no `AppHandle`/`AppState` at all —
 // only the surrounding bookkeeping differs (stdout/stderr logging instead
-// of `apiserver://status` events, an `AtomicU64` instead of
-// `AppState::api_server.request_count`, an HTTP probe instead of reading
+// of `apiserver://status` events, an HTTP probe instead of reading
 // `AppState::llama` in-process). `monkey-cli`'s `main.rs` resolves the
 // `api_server.json`/`providers.json` paths itself (the same
 // `APP_IDENTIFIER`-hardcoding technique `providers_cli.rs`/
@@ -2483,6 +3089,21 @@ fn record_bind_error(state: &mut ApiServerState, message: String) {
 // `api_server.json` the GUI writes, so tokens and toggles set in Settings
 // carry over to the CLI and vice versa.
 // ---------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CliRuntimeEndpoints {
+    pub llama_port: u16,
+    pub ollama_base_url: String,
+}
+
+impl Default for CliRuntimeEndpoints {
+    fn default() -> Self {
+        Self {
+            llama_port: crate::llama::LlamaState::default().port,
+            ollama_base_url: ollama::OLLAMA_BASE_URL.to_string(),
+        }
+    }
+}
 
 /// Runs the local API server as a blocking, headless accept loop — never
 /// returns on success (Ctrl+C/SIGINT ends the process the same way `ollama
@@ -2500,20 +3121,131 @@ pub async fn run_cli_server(
     config_path: PathBuf,
     load_custom_providers: impl Fn() -> Vec<providers::CustomProviderEntry> + Send + Sync + 'static,
 ) -> Result<(), String> {
-    let listener = bind_listener(port).await?;
-    println!("Little Monkey API server listening on http://127.0.0.1:{port}/v1 (Ctrl+C to stop)");
+    let app_data_dir = config_path
+        .parent()
+        .ok_or_else(|| "API server config path has no app-data parent".to_string())?
+        .to_path_buf();
+    let m3_hub = bounded_thread_initialization(
+        "unified M3 HTTP service",
+        std::time::Duration::from_secs(15),
+        move || {
+            crate::m3_production::build_m3_command_state(&app_data_dir)
+                .map(|state| state.hub.clone())
+                .map_err(|error| error.to_string())
+        },
+    )
+    .await?;
 
+    run_cli_server_with_m3_hub(port, config_path, m3_hub, load_custom_providers).await
+}
+
+/// Runs one synchronous initializer on its own OS thread, but never leaves
+/// async startup waiting on a platform service indefinitely. In particular,
+/// macOS Security.framework can block inside a keychain call before yielding
+/// control back to Rust; `spawn_blocking` plus an async timeout would still
+/// leave a Tokio runtime waiting for that worker during shutdown. A dedicated
+/// thread can be detached safely after this bounded channel wait.
+async fn bounded_thread_initialization<T, F>(
+    label: &'static str,
+    budget: std::time::Duration,
+    initialize: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(format!("little-monkey-{label}"))
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(initialize))
+                .map_err(|_| format!("Could not initialize the {label}: initializer panicked"))
+                .and_then(|result| {
+                    result.map_err(|error| format!("Could not initialize the {label}: {error}"))
+                });
+            let _ = sender.send(result);
+        })
+        .map_err(|error| format!("Could not start the {label} initializer: {error}"))?;
+
+    match tokio::time::timeout(budget, receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(format!(
+            "Could not initialize the {label}: initializer thread exited without a result"
+        )),
+        Err(_) => Err(format!(
+            "Could not initialize the {label} within {} seconds; no HTTP listener was opened",
+            budget.as_secs()
+        )),
+    }
+}
+
+/// AppHandle-free common CLI server used by production after its bounded M3
+/// initialization and by compatibility tests with an explicitly constructed
+/// test hub. Injection stops tests from touching the developer's OS keychain;
+/// production still fails closed if its real hub cannot initialize, so pairing
+/// support is never silently omitted.
+pub async fn run_cli_server_with_m3_hub(
+    port: u16,
+    config_path: PathBuf,
+    m3_hub: Arc<M3RuntimeHub>,
+    load_custom_providers: impl Fn() -> Vec<providers::CustomProviderEntry> + Send + Sync + 'static,
+) -> Result<(), String> {
+    run_cli_server_with_m3_hub_and_endpoints(
+        port,
+        config_path,
+        m3_hub,
+        CliRuntimeEndpoints::default(),
+        load_custom_providers,
+    )
+    .await
+}
+
+pub async fn run_cli_server_with_m3_hub_and_endpoints(
+    port: u16,
+    config_path: PathBuf,
+    m3_hub: Arc<M3RuntimeHub>,
+    endpoints: CliRuntimeEndpoints,
+    load_custom_providers: impl Fn() -> Vec<providers::CustomProviderEntry> + Send + Sync + 'static,
+) -> Result<(), String> {
+    run_cli_server_with_m3_hub_and_connection_limit(
+        port,
+        config_path,
+        m3_hub,
+        endpoints,
+        load_custom_providers,
+        MAX_HTTP_CONNECTIONS,
+    )
+    .await
+}
+
+async fn run_cli_server_with_m3_hub_and_connection_limit(
+    port: u16,
+    config_path: PathBuf,
+    m3_hub: Arc<M3RuntimeHub>,
+    endpoints: CliRuntimeEndpoints,
+    load_custom_providers: impl Fn() -> Vec<providers::CustomProviderEntry> + Send + Sync + 'static,
+    max_connections: usize,
+) -> Result<(), String> {
     // Two clients, one per policy — see `ServerDeps::local_client` for why one
     // client cannot serve both loopback inference and a credentialed cloud
     // provider. A failure to build the hardened one is fatal rather than a silent
     // fallback to the bare client: falling back would mean serving cloud requests
     // with no redirect policy, which is the hole this split exists to close.
-    let local_client = reqwest::Client::new();
+    let local_client = bounded_loopback_client()?;
     let cloud_client = crate::egress::hardened()
         .build()
         .map_err(|error| format!("Failed to build the cloud-provider HTTP client: {error}"))?;
-    let llama_port = crate::llama::LlamaState::default().port;
-    let request_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let llama_port = endpoints.llama_port;
+    let ollama_base_url = endpoints.ollama_base_url;
+    let configured_m3_policy = m3_hub.lan_policy().map_err(|error| error.to_string())?;
+    let model_service = HttpModelService::for_m3_hub(m3_hub.clone());
+    let m3_service = M3HttpRequestService::with_model_service(m3_hub, model_service.clone());
+    let m3_policy = primary_m3_policy(configured_m3_policy.as_ref(), port);
+    // Bind and announce readiness only after every fallible dependency is
+    // initialized. A rejected app-data directory or client build must never
+    // leave a caller waiting on a listener that can no longer reach its loop.
+    let listener = bind_listener(port).await?;
+    println!("Little Monkey API server listening on http://127.0.0.1:{port}/v1 (Ctrl+C to stop)");
     let load_custom_providers = Arc::new(load_custom_providers);
     // Guards this process's own `api_server.json` read-modify-write cycles
     // for the `last_used_at` bump below — a fresh, CLI-local `AppState` is
@@ -2537,35 +3269,60 @@ pub async fn run_cli_server(
     let admission = Arc::new(crate::http_policy::RequestAdmission::new(
         crate::http_policy::MAX_ACTIVE_REQUESTS,
     ));
+    let legacy_rate_limiter = Arc::new(crate::http_policy::LegacyTokenRateLimiter::default());
+    let connection_limit = Arc::new(Semaphore::new(max_connections.max(1)));
+    let mut connections = tokio::task::JoinSet::new();
     // This loop owns its process, so its shutdown token is only ever cancelled by
     // the process ending. It exists because a guard's token is derived from one;
     // it is not a claim that `api-serve` has a graceful stop.
     let server_shutdown = tokio_util::sync::CancellationToken::new();
 
     loop {
-        let (stream, _addr) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(_) => continue, // transient accept error — keep serving
+        let (stream, remote) = tokio::select! {
+            completed = connections.join_next(), if !connections.is_empty() => {
+                let _ = completed;
+                continue;
+            }
+            accepted = listener.accept() => match accepted {
+                Ok(pair) => pair,
+                Err(_) => continue,
+            }
+        };
+        let connection_permit = match connection_limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            // Do not allocate a task or buffer headers for a peer beyond the
+            // connection bound. Dropping the stream makes the refusal cheap
+            // and leaves admitted connections unaffected.
+            Err(_) => continue,
         };
         let io = TokioIo::new(stream);
         let local_client = local_client.clone();
         let cloud_client = cloud_client.clone();
         let config_path = config_path.clone();
-        let request_count = request_count.clone();
         let load_custom_providers = load_custom_providers.clone();
         let cli_state = cli_state.clone();
         let admission_for_conn = admission.clone();
+        let legacy_rate_limiter_for_conn = legacy_rate_limiter.clone();
+        let model_service_for_conn = model_service.clone();
+        let m3_service_for_conn = m3_service.clone();
+        let m3_policy_for_conn = m3_policy.clone();
+        let ollama_base_url_for_conn = ollama_base_url.clone();
         let shutdown_for_conn = server_shutdown.clone();
 
-        tokio::spawn(async move {
+        connections.spawn(async move {
+            let _connection_permit = connection_permit;
             let service = service_fn(move |req: Request<Incoming>| {
                 let local_client = local_client.clone();
                 let cloud_client = cloud_client.clone();
                 let config_path = config_path.clone();
-                let request_count = request_count.clone();
                 let load_custom_providers = load_custom_providers.clone();
                 let cli_state = cli_state.clone();
                 let admission_for_req = admission_for_conn.clone();
+                let legacy_rate_limiter_for_req = legacy_rate_limiter_for_conn.clone();
+                let model_service_for_req = model_service_for_conn.clone();
+                let m3_service_for_req = Some(m3_service_for_conn.clone());
+                let m3_policy_for_req = m3_policy_for_conn.clone();
+                let ollama_base_url_for_req = ollama_base_url_for_conn.clone();
                 let shutdown_for_req = shutdown_for_conn.clone();
                 async move {
                     let response = serve_with_admission(
@@ -2573,12 +3330,27 @@ pub async fn run_cli_server(
                         &shutdown_for_req,
                         |cancel| async move {
                             let config = load_config_impl(&config_path).unwrap_or_default();
-                            let (llama_ready, llama_model_stem) =
-                                probe_llama_server(&local_client, llama_port).await;
+                            let providers = provider_catalog_from(load_custom_providers());
+                            let llama_models_url = reqwest::Url::parse(&format!(
+                                "http://127.0.0.1:{llama_port}/v1/models"
+                            ))
+                            .expect("loopback llama model URL is valid");
+                            let extensions = model_extensions(
+                                LegacyLlamaInventory::OpenAiModels(llama_models_url),
+                                config.expose_ollama,
+                                provider_sources_enabled(
+                                    config.expose_providers,
+                                    m3_policy_for_req.as_deref(),
+                                ),
+                                &ollama_base_url_for_req,
+                                &providers,
+                                &local_client,
+                                &cloud_client,
+                            );
                             let deps = ServerDeps {
                                 llama_port,
-                                llama_ready,
-                                llama_model_stem,
+                                llama_ready: false,
+                                llama_model_stem: None,
                                 // The CLI can't know whether the GUI started
                                 // llama-server with `--embeddings` (that flag lives
                                 // only in the GUI's in-memory `LlamaState`, not on
@@ -2586,30 +3358,41 @@ pub async fn run_cli_server(
                                 // `POST /v1/embeddings` 501s with a clear message
                                 // instead of guessing.
                                 llama_embeddings_enabled: false,
-                                ollama_base_url: ollama::OLLAMA_BASE_URL.to_string(),
+                                ollama_base_url: ollama_base_url_for_req,
                                 require_token: config.require_token,
                                 expose_ollama: config.expose_ollama,
                                 expose_providers: config.expose_providers,
-                                providers: provider_catalog_from(load_custom_providers()),
+                                providers,
                                 tokens: tokens_from_config(&config),
                                 local_client,
                                 cloud_client,
+                                legacy_rate_limiter: legacy_rate_limiter_for_req,
+                                model_service: model_service_for_req,
+                                model_extensions: extensions,
+                                m3_service: m3_service_for_req,
+                                m3_policy: m3_policy_for_req,
                                 cancel,
                             };
 
-                            let (resp, matched_token_id) =
-                                match serve_one_request(deps, req, None).await {
-                                    Ok(pair) => pair,
-                                    // `Infallible`: unreachable, not swallowed.
-                                    Err(never) => match never {},
-                                };
-                            let n =
-                                request_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            let (resp, matched_token_id) = match serve_one_request(
+                                deps,
+                                req,
+                                None,
+                                ListenerExposure::Loopback,
+                                true,
+                                remote.ip(),
+                            )
+                            .await
+                            {
+                                Ok(pair) => pair,
+                                // `Infallible`: unreachable, not swallowed.
+                                Err(never) => match never {},
+                            };
                             if let Some(token_id) = &matched_token_id {
                                 record_token_used_with_state(&cli_state, &config_path, token_id);
                             }
                             eprintln!(
-                                "[api-serve] request #{n} {} -> {}",
+                                "[api-serve] request {} -> {}",
                                 req_log_hint(matched_token_id.as_deref()),
                                 resp.status()
                             );
@@ -2639,108 +3422,690 @@ fn req_log_hint(token_id: Option<&str>) -> String {
 // lib.rs's autostart setup hook + api_server_set_config's restart path.
 // ---------------------------------------------------------------------
 
-/// Starts the server using whatever's currently persisted in
-/// `api_server.json` (port/require_token/expose_*), stopping any previous
-/// instance first (so re-starting after an edited port field rebinds
-/// cleanly instead of erroring on our own still-open old listener). A bind
-/// failure (most commonly: something else already has the port) surfaces
-/// synchronously as `Err` *and* as `status: "error"` with `last_error` set —
-/// never a silent no-op, never a panic. No `State` parameter — callers
-/// without one (the `setup` autostart hook, `api_server_set_config`'s
-/// restart) can call this with just an `AppHandle`.
-async fn start_server_core(app: &AppHandle) -> Result<ApiServerStatusPayload, String> {
-    let state = app.state::<AppState>();
-    // Awaited (not fire-and-forget) — see `ApiServerState::accept_task`'s
-    // doc comment: without actually waiting for a previous instance's accept
-    // loop to observe the shutdown notify and drop its `TcpListener`, the
-    // `bind_listener` call below would race that teardown and fail almost
-    // every time on a same-port restart.
-    let _ = stop_server_core(app).await;
-
-    let config = load_config_impl(&config_file_path(app)?)?;
-
-    let listener = match bind_listener(config.port).await {
-        Ok(listener) => listener,
-        Err(message) => {
-            let payload = {
-                let mut s = state.api_server.lock().map_err(|e| e.to_string())?;
-                record_bind_error(&mut s, message.clone());
-                status_payload(&s)
-            };
-            emit_status(app, &payload);
-            return Err(message);
-        }
+async fn stop_running_unified(state: &UnifiedHttpServerState) -> Result<(), String> {
+    let (shutdown, endpoints) = {
+        let mut inner = state.lock()?;
+        inner.status = "stopping".to_string();
+        (inner.shutdown.take(), std::mem::take(&mut inner.endpoints))
     };
+    if let Some(shutdown) = shutdown {
+        shutdown.cancel();
+    }
+    for endpoint in endpoints {
+        let _ = endpoint.task.await;
+    }
+    let mut inner = state.lock()?;
+    inner.status = "stopped".to_string();
+    inner.started_at_ms = None;
+    Ok(())
+}
 
-    let shutdown = Arc::new(Notify::new());
-
+fn sync_api_server_projection(app: &AppHandle) -> Result<ApiServerStatusPayload, String> {
+    let unified = app.state::<UnifiedHttpServerState>().snapshot()?;
+    let state = app.state::<AppState>();
     let payload = {
-        let mut s = state.api_server.lock().map_err(|e| e.to_string())?;
-        s.shutdown = Some(shutdown.clone());
-        s.port = config.port;
-        s.status = "running".to_string();
-        s.request_count = 0;
-        s.last_request_at = None;
-        s.last_error = None;
-        status_payload(&s)
+        let mut api = state.api_server.lock().map_err(|error| error.to_string())?;
+        if let Some(primary) = unified.endpoints.iter().find(|endpoint| endpoint.primary) {
+            api.port = primary.port;
+        }
+        api.status = if unified.primary_enabled {
+            unified.status.clone()
+        } else {
+            "stopped".to_string()
+        };
+        api.request_count = unified.request_count;
+        api.last_request_at = unified.last_request_at_ms;
+        api.last_error = unified
+            .primary_enabled
+            .then(|| unified.last_error.clone())
+            .flatten();
+        status_payload(&api)
     };
     emit_status(app, &payload);
-
-    // Two clients, one per policy — see `ServerDeps::local_client`. Fatal rather
-    // than falling back to the bare client, for the reason `run_cli_server` gives.
-    let cloud_client = crate::egress::hardened()
-        .build()
-        .map_err(|error| format!("Failed to build the cloud-provider HTTP client: {error}"))?;
-    let runtime = Arc::new(ServerRuntime {
-        local_client: reqwest::Client::new(),
-        cloud_client,
-        ollama_base_url: ollama::OLLAMA_BASE_URL.to_string(),
-        require_token: config.require_token,
-        expose_ollama: config.expose_ollama,
-        expose_providers: config.expose_providers,
-    });
-
-    let accept_task = tokio::spawn(run_accept_loop(app.clone(), listener, shutdown, runtime));
-    if let Ok(mut s) = state.api_server.lock() {
-        s.accept_task = Some(accept_task);
-    }
-
     Ok(payload)
 }
 
-/// Stops the server if running (a no-op, not an error, if it's already
-/// stopped). Async — and must stay that way — because it `.await`s the
-/// accept loop's `JoinHandle` after notifying it, so the port is
-/// *guaranteed* free by the time this returns (see
-/// `ApiServerState::accept_task`'s doc comment). Every caller (the
-/// `api_server_stop` command, `start_server_core`'s own leading call,
-/// `api_server_set_config`'s restart path) awaits this for exactly that
-/// reason.
-async fn stop_server_core(app: &AppHandle) -> Result<ApiServerStatusPayload, String> {
-    let state = app.state::<AppState>();
-    let (shutdown, accept_task) = {
-        let mut s = state.api_server.lock().map_err(|e| e.to_string())?;
-        (s.shutdown.take(), s.accept_task.take())
-    };
-    if let Some(shutdown) = shutdown {
-        shutdown.notify_one();
+fn record_unified_error(state: &UnifiedHttpServerState, message: &str) -> Result<(), String> {
+    let mut inner = state.lock()?;
+    inner.last_error = Some(message.to_string());
+    if inner.endpoints.is_empty() {
+        inner.status = "error".to_string();
+        inner.started_at_ms = None;
     }
-    if let Some(accept_task) = accept_task {
-        // The actual fix: block until the accept loop has broken out of its
-        // `select!` and dropped its `TcpListener`, not just until we've
-        // asked it to. A plain `notify_one()` with no `.await` here is
-        // exactly the bug this addresses — the task may not even have been
-        // polled yet when the caller goes on to rebind the same port.
-        let _ = accept_task.await;
+    Ok(())
+}
+
+struct PreparedEndpoint {
+    endpoint: UnifiedEndpoint,
+    listener: TcpListener,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+}
+
+#[derive(Clone)]
+struct EndpointCandidate {
+    endpoint: UnifiedEndpoint,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+}
+
+struct PreviousGeneration {
+    spec: Option<UnifiedGenerationSpec>,
+    status: String,
+    generation: u64,
+    started_at_ms: Option<u64>,
+    last_error: Option<String>,
+    primary_enabled: bool,
+    policy_enabled: bool,
+    admission: Arc<crate::http_policy::RequestAdmission>,
+    had_endpoints: bool,
+}
+
+fn applied_generation_is_healthy(
+    inner: &crate::unified_http_server::UnifiedServerInner,
+    desired: &[EndpointCandidate],
+) -> bool {
+    if desired.is_empty() {
+        return inner.endpoints.is_empty() && inner.shutdown.is_none() && inner.status == "stopped";
+    }
+    if inner.status != "running"
+        || inner.endpoints.len() != desired.len()
+        || inner
+            .shutdown
+            .as_ref()
+            .is_none_or(tokio_util::sync::CancellationToken::is_cancelled)
+        || inner
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.task.is_finished())
+    {
+        return false;
+    }
+    desired.iter().all(|candidate| {
+        inner
+            .endpoints
+            .iter()
+            .any(|running| running.endpoint == candidate.endpoint)
+    })
+}
+
+fn generation_spec(
+    config: &ApiServerConfig,
+    configured_policy: Option<crate::compatibility_hub::LanServerPolicy>,
+    primary_enabled: bool,
+    policy_enabled: bool,
+) -> Result<UnifiedGenerationSpec, String> {
+    if policy_enabled && configured_policy.is_none() {
+        return Err("Configure an M3 LAN policy before starting its HTTP endpoint".to_string());
+    }
+    Ok(UnifiedGenerationSpec {
+        primary: primary_enabled.then(|| PrimaryServiceConfig {
+            port: config.port,
+            require_token: config.require_token,
+            expose_ollama: config.expose_ollama,
+            expose_providers: config.expose_providers,
+        }),
+        policy_endpoint: policy_enabled.then(|| configured_policy.clone()).flatten(),
+        pairing_policy: configured_policy,
+    })
+}
+
+async fn endpoint_candidates(
+    spec: &UnifiedGenerationSpec,
+) -> Result<Vec<EndpointCandidate>, String> {
+    let plan = spec.endpoint_plan()?;
+    let mut candidates = Vec::with_capacity(plan.endpoints.len());
+    for endpoint in plan.endpoints {
+        let tls_acceptor = match endpoint.transport {
+            EndpointTransport::Plaintext => None,
+            EndpointTransport::Tls => {
+                let policy = endpoint
+                    .policy
+                    .as_ref()
+                    .ok_or_else(|| "A TLS endpoint requires an M3 LAN policy".to_string())?;
+                crate::m3_http_server::tls_acceptor(policy).await?
+            }
+        };
+        candidates.push(EndpointCandidate {
+            endpoint,
+            tls_acceptor,
+        });
+    }
+    Ok(candidates)
+}
+
+fn runtime_for_spec(
+    hub: Arc<crate::m3_runtime_hub::M3RuntimeHub>,
+    spec: &UnifiedGenerationSpec,
+) -> Result<ServerRuntime, String> {
+    let cloud_client = crate::egress::hardened()
+        .build()
+        .map_err(|error| format!("Failed to build the cloud-provider HTTP client: {error}"))?;
+    let primary = spec.primary.as_ref();
+    let model_service = HttpModelService::for_m3_hub(hub.clone());
+    Ok(ServerRuntime {
+        local_client: bounded_loopback_client()?,
+        cloud_client,
+        ollama_base_url: ollama::OLLAMA_BASE_URL.to_string(),
+        require_token: primary.is_none_or(|config| config.require_token),
+        expose_ollama: primary.is_some_and(|config| config.expose_ollama),
+        expose_providers: primary.is_some_and(|config| config.expose_providers),
+        legacy_rate_limiter: Arc::new(crate::http_policy::LegacyTokenRateLimiter::default()),
+        model_service: model_service.clone(),
+        m3_service: Some(M3HttpRequestService::with_model_service(hub, model_service)),
+        m3_policy: None,
+    })
+}
+
+async fn bind_candidate(candidate: EndpointCandidate) -> Result<PreparedEndpoint, String> {
+    let endpoint = candidate.endpoint;
+    let listener = TcpListener::bind((endpoint.bind_address, endpoint.port))
+        .await
+        .map_err(|error| {
+            let role = if endpoint.primary {
+                crate::http_policy::ListenerRole::LegacyProxy
+            } else {
+                crate::http_policy::ListenerRole::CompatibilityListener
+            };
+            crate::http_policy::describe_bind_error(
+                role,
+                &endpoint.bind_address.to_string(),
+                endpoint.port,
+                &error,
+            )
+        })?;
+    Ok(PreparedEndpoint {
+        endpoint,
+        listener,
+        tls_acceptor: candidate.tls_acceptor,
+    })
+}
+
+fn spawn_generation(
+    app: &AppHandle,
+    prepared: Vec<PreparedEndpoint>,
+    base_runtime: ServerRuntime,
+    pairing_policy: Option<&crate::compatibility_hub::LanServerPolicy>,
+    admission: Arc<crate::http_policy::RequestAdmission>,
+) -> (tokio_util::sync::CancellationToken, Vec<RunningEndpoint>) {
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let connection_limit = Arc::new(Semaphore::new(MAX_HTTP_CONNECTIONS));
+    let mut running = Vec::with_capacity(prepared.len());
+    for prepared in prepared {
+        let mut runtime = base_runtime.clone();
+        runtime.m3_policy = match prepared.endpoint.policy.as_ref() {
+            Some(policy) => Some(Arc::new(policy.clone())),
+            None => primary_m3_policy(pairing_policy, prepared.endpoint.port),
+        };
+        let endpoint = prepared.endpoint.clone();
+        let task = tokio::spawn(run_unified_endpoint(
+            app.clone(),
+            prepared.listener,
+            prepared.endpoint,
+            prepared.tls_acceptor,
+            Arc::new(runtime),
+            admission.clone(),
+            connection_limit.clone(),
+            shutdown.clone(),
+        ));
+        running.push(RunningEndpoint { endpoint, task });
+    }
+    (shutdown, running)
+}
+
+async fn restore_previous_generation(
+    app: &AppHandle,
+    state: &UnifiedHttpServerState,
+    previous: PreviousGeneration,
+    candidates: Vec<EndpointCandidate>,
+    runtime: Option<ServerRuntime>,
+    desired_error: &str,
+) -> Result<(), String> {
+    if !previous.had_endpoints {
+        let mut inner = state.lock()?;
+        inner.status = previous.status;
+        inner.generation = previous.generation;
+        inner.started_at_ms = previous.started_at_ms;
+        inner.last_error = previous.last_error;
+        inner.primary_enabled = previous.primary_enabled;
+        inner.policy_enabled = previous.policy_enabled;
+        inner.applied_spec = previous.spec;
+        inner.admission = previous.admission;
+        return Ok(());
+    }
+    let spec = previous
+        .spec
+        .clone()
+        .ok_or_else(|| "running HTTP generation has no rollback specification".to_string())?;
+    let runtime =
+        runtime.ok_or_else(|| "running HTTP generation has no rollback runtime".to_string())?;
+    let mut prepared = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        match bind_candidate(candidate).await {
+            Ok(endpoint) => prepared.push(endpoint),
+            Err(rollback_error) => {
+                drop(prepared);
+                let combined = format!(
+                    "HTTP reconciliation failed ({desired_error}); restoring the previous generation also failed: {rollback_error}"
+                );
+                let mut inner = state.lock()?;
+                inner.status = "error".to_string();
+                inner.last_error = Some(combined.clone());
+                inner.started_at_ms = None;
+                inner.primary_enabled = previous.primary_enabled;
+                inner.policy_enabled = previous.policy_enabled;
+                inner.applied_spec = previous.spec;
+                inner.admission = previous.admission;
+                return Err(combined);
+            }
+        }
+    }
+    let (shutdown, endpoints) = spawn_generation(
+        app,
+        prepared,
+        runtime,
+        spec.pairing_policy.as_ref(),
+        previous.admission.clone(),
+    );
+    let mut inner = state.lock()?;
+    inner.status = previous.status;
+    inner.generation = previous.generation;
+    inner.started_at_ms = previous.started_at_ms;
+    inner.last_error = previous.last_error;
+    inner.primary_enabled = previous.primary_enabled;
+    inner.policy_enabled = previous.policy_enabled;
+    inner.applied_spec = previous.spec;
+    inner.admission = previous.admission;
+    inner.shutdown = Some(shutdown);
+    inner.endpoints = endpoints;
+    Ok(())
+}
+
+async fn reconcile_unified_server_locked(
+    app: &AppHandle,
+    primary_enabled: Option<bool>,
+    policy_enabled: Option<bool>,
+) -> Result<(), String> {
+    let state = app.state::<UnifiedHttpServerState>();
+    let (primary_enabled, policy_enabled) = {
+        let inner = state.lock()?;
+        (
+            primary_enabled.unwrap_or(inner.primary_enabled),
+            policy_enabled.unwrap_or(inner.policy_enabled),
+        )
+    };
+
+    let config = load_config_impl(&config_file_path(app)?)?;
+    let hub = app
+        .state::<crate::m3_commands::M3CommandState>()
+        .hub
+        .clone();
+    let configured_policy = hub.lan_policy().map_err(|error| error.to_string())?;
+    let desired_spec = match generation_spec(
+        &config,
+        configured_policy.clone(),
+        primary_enabled,
+        policy_enabled,
+    ) {
+        Ok(spec) => spec,
+        Err(error) => {
+            record_unified_error(&state, &error)?;
+            let _ = sync_api_server_projection(app);
+            return Err(error);
+        }
+    };
+    let desired_candidates = match endpoint_candidates(&desired_spec).await {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            record_unified_error(&state, &error)?;
+            let _ = sync_api_server_projection(app);
+            return Err(error);
+        }
+    };
+    let desired_runtime = match runtime_for_spec(hub.clone(), &desired_spec) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            record_unified_error(&state, &error)?;
+            let _ = sync_api_server_projection(app);
+            return Err(error);
+        }
+    };
+    let previous = {
+        let inner = state.lock()?;
+        if inner.applied_spec.as_ref() == Some(&desired_spec)
+            && applied_generation_is_healthy(&inner, &desired_candidates)
+        {
+            return Ok(());
+        }
+        PreviousGeneration {
+            spec: inner.applied_spec.clone(),
+            status: inner.status.clone(),
+            generation: inner.generation,
+            started_at_ms: inner.started_at_ms,
+            last_error: inner.last_error.clone(),
+            primary_enabled: inner.primary_enabled,
+            policy_enabled: inner.policy_enabled,
+            admission: inner.admission.clone(),
+            had_endpoints: !inner.endpoints.is_empty(),
+        }
+    };
+    let old_socket_set = {
+        let inner = state.lock()?;
+        inner
+            .endpoints
+            .iter()
+            .map(|running| (running.endpoint.bind_address, running.endpoint.port))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let (rollback_candidates, rollback_runtime) = if let Some(spec) = previous.spec.as_ref() {
+        let candidates = match endpoint_candidates(spec).await {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                record_unified_error(&state, &error)?;
+                let _ = sync_api_server_projection(app);
+                return Err(format!("Could not prepare a safe HTTP rollback: {error}"));
+            }
+        };
+        let runtime = match runtime_for_spec(hub, spec) {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                record_unified_error(&state, &error)?;
+                let _ = sync_api_server_projection(app);
+                return Err(format!("Could not prepare a safe HTTP rollback: {error}"));
+            }
+        };
+        (candidates, runtime)
+    } else {
+        (Vec::new(), None)
+    };
+
+    // Bind every non-conflicting desired socket while the healthy generation
+    // is still live. A normal port change therefore fails without downtime.
+    let mut prepared = Vec::new();
+    let mut deferred = Vec::new();
+    for candidate in desired_candidates {
+        let socket = (candidate.endpoint.bind_address, candidate.endpoint.port);
+        if old_socket_set.contains(&socket) {
+            deferred.push(candidate);
+        } else {
+            match bind_candidate(candidate).await {
+                Ok(endpoint) => prepared.push(endpoint),
+                Err(error) => {
+                    drop(prepared);
+                    record_unified_error(&state, &error)?;
+                    let _ = sync_api_server_projection(app);
+                    return Err(error);
+                }
+            }
+        }
     }
 
-    let payload = {
-        let mut s = state.api_server.lock().map_err(|e| e.to_string())?;
-        s.status = "stopped".to_string();
-        status_payload(&s)
-    };
-    emit_status(app, &payload);
-    Ok(payload)
+    stop_running_unified(&state).await?;
+    for candidate in deferred {
+        match bind_candidate(candidate).await {
+            Ok(endpoint) => prepared.push(endpoint),
+            Err(error) => {
+                drop(prepared);
+                let rollback = restore_previous_generation(
+                    app,
+                    &state,
+                    previous,
+                    rollback_candidates,
+                    rollback_runtime,
+                    &error,
+                )
+                .await;
+                let _ = sync_api_server_projection(app);
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(rollback_error),
+                };
+            }
+        }
+    }
+
+    if prepared.is_empty() {
+        let mut inner = state.lock()?;
+        inner.generation = inner.generation.saturating_add(1);
+        inner.primary_enabled = desired_spec.primary_enabled();
+        inner.policy_enabled = desired_spec.policy_enabled();
+        inner.applied_spec = Some(desired_spec);
+        inner.last_error = None;
+        inner.admission = Arc::new(crate::http_policy::RequestAdmission::new(
+            crate::http_policy::MAX_ACTIVE_REQUESTS,
+        ));
+        drop(inner);
+        let _ = sync_api_server_projection(app)?;
+        return Ok(());
+    }
+
+    let admission = Arc::new(crate::http_policy::RequestAdmission::new(
+        crate::http_policy::MAX_ACTIVE_REQUESTS,
+    ));
+    let (shutdown, running) = spawn_generation(
+        app,
+        prepared,
+        desired_runtime,
+        desired_spec.pairing_policy.as_ref(),
+        admission.clone(),
+    );
+    {
+        let mut inner = state.lock()?;
+        inner.generation = inner.generation.saturating_add(1);
+        inner.primary_enabled = desired_spec.primary_enabled();
+        inner.policy_enabled = desired_spec.policy_enabled();
+        inner.applied_spec = Some(desired_spec);
+        inner.status = "running".to_string();
+        inner.started_at_ms = Some(now_ms());
+        inner.last_error = None;
+        inner.shutdown = Some(shutdown);
+        inner.endpoints = running;
+        inner.admission = admission;
+    }
+    let _ = sync_api_server_projection(app)?;
+    Ok(())
+}
+
+async fn reconcile_unified_server(
+    app: &AppHandle,
+    primary_enabled: Option<bool>,
+    policy_enabled: Option<bool>,
+) -> Result<(), String> {
+    let state = app.state::<UnifiedHttpServerState>();
+    let _lifecycle = state.lifecycle.lock().await;
+    reconcile_unified_server_locked(app, primary_enabled, policy_enabled).await
+}
+
+pub async fn autostart_unified_server(app: AppHandle) -> Result<(), String> {
+    let config = load_config_impl(&config_file_path(&app)?)?;
+    let has_policy = app
+        .state::<crate::m3_commands::M3CommandState>()
+        .hub
+        .lan_policy()
+        .map_err(|error| error.to_string())?
+        .is_some();
+    reconcile_unified_server(&app, Some(config.autostart), Some(has_policy)).await
+}
+
+pub async fn shutdown_unified_server(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<UnifiedHttpServerState>();
+    let _lifecycle = state.lifecycle.lock().await;
+    {
+        let mut inner = state.lock()?;
+        inner.primary_enabled = false;
+        inner.policy_enabled = false;
+    }
+    stop_running_unified(&state).await?;
+    let _ = sync_api_server_projection(app)?;
+    Ok(())
+}
+
+async fn start_server_core(app: &AppHandle) -> Result<ApiServerStatusPayload, String> {
+    reconcile_unified_server(app, Some(true), None).await?;
+    sync_api_server_projection(app)
+}
+
+async fn stop_server_core(app: &AppHandle) -> Result<ApiServerStatusPayload, String> {
+    reconcile_unified_server(app, Some(false), None).await?;
+    sync_api_server_projection(app)
+}
+
+pub(crate) async fn m3_http_server_start_core(
+    app: &AppHandle,
+) -> Result<crate::m3_http_server::M3HttpServerStatus, String> {
+    reconcile_unified_server(app, None, Some(true)).await?;
+    m3_http_server_status_core(app)
+}
+
+pub(crate) async fn m3_http_server_stop_core(
+    app: &AppHandle,
+) -> Result<crate::m3_http_server::M3HttpServerStatus, String> {
+    reconcile_unified_server(app, None, Some(false)).await?;
+    m3_http_server_status_core(app)
+}
+
+fn restore_m3_policy(
+    hub: &M3RuntimeHub,
+    previous: Option<crate::compatibility_hub::LanServerPolicy>,
+) -> Result<(), String> {
+    match previous {
+        Some(policy) => hub
+            .configure_lan(policy)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        None => hub
+            .disable_lan("DISABLE LAN API")
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+    }
+}
+
+async fn rollback_m3_policy_transaction(
+    app: &AppHandle,
+    hub: &M3RuntimeHub,
+    previous_policy: Option<crate::compatibility_hub::LanServerPolicy>,
+    previous_policy_enabled: bool,
+    original_error: String,
+) -> String {
+    if let Err(error) = restore_m3_policy(hub, previous_policy) {
+        return format!(
+            "{original_error}; restoring the previous M3 LAN policy also failed: {error}"
+        );
+    }
+    match reconcile_unified_server_locked(app, None, Some(previous_policy_enabled)).await {
+        Ok(()) => original_error,
+        Err(error) => format!(
+            "{original_error}; restoring the previous unified HTTP generation also failed: {error}"
+        ),
+    }
+}
+
+/// Persists a LAN policy and reconciles every affected HTTP endpoint while
+/// holding the one lifecycle lock. A concurrent start/stop command therefore
+/// cannot observe the new hub policy with the old listener generation. On any
+/// listener failure, both the persisted policy and generation are restored.
+pub async fn configure_m3_policy_and_reconcile(
+    app: &AppHandle,
+    policy: crate::compatibility_hub::LanServerPolicy,
+) -> Result<crate::compatibility_hub::LanServerPolicy, String> {
+    let state = app.state::<UnifiedHttpServerState>();
+    let _lifecycle = state.lifecycle.lock().await;
+    let command_state = app.state::<crate::m3_commands::M3CommandState>();
+    let hub = command_state.hub.clone();
+    let previous_policy = hub.lan_policy().map_err(|error| error.to_string())?;
+    let previous_policy_enabled = state.lock()?.policy_enabled;
+    let configured = hub
+        .configure_lan(policy)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = reconcile_unified_server_locked(app, None, Some(true)).await {
+        return Err(rollback_m3_policy_transaction(
+            app,
+            &hub,
+            previous_policy,
+            previous_policy_enabled,
+            error,
+        )
+        .await);
+    }
+    Ok(configured)
+}
+
+/// Disables LAN policy and its endpoint as one serialized transaction. The
+/// exact-confirmation check remains owned by `M3RuntimeHub`; no listener is
+/// changed unless that mutation succeeds.
+pub async fn disable_m3_policy_and_reconcile(
+    app: &AppHandle,
+    confirmation: &str,
+) -> Result<bool, String> {
+    let state = app.state::<UnifiedHttpServerState>();
+    let _lifecycle = state.lifecycle.lock().await;
+    let command_state = app.state::<crate::m3_commands::M3CommandState>();
+    let hub = command_state.hub.clone();
+    let previous_policy = hub.lan_policy().map_err(|error| error.to_string())?;
+    let previous_policy_enabled = state.lock()?.policy_enabled;
+    let existed = hub
+        .disable_lan(confirmation)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = reconcile_unified_server_locked(app, None, Some(false)).await {
+        return Err(rollback_m3_policy_transaction(
+            app,
+            &hub,
+            previous_policy,
+            previous_policy_enabled,
+            error,
+        )
+        .await);
+    }
+    Ok(existed)
+}
+
+pub(crate) fn m3_http_server_status_core(
+    app: &AppHandle,
+) -> Result<crate::m3_http_server::M3HttpServerStatus, String> {
+    let unified = app.state::<UnifiedHttpServerState>().snapshot()?;
+    if !unified.policy_enabled {
+        return Ok(crate::m3_http_server::M3HttpServerStatus {
+            status: "stopped".to_string(),
+            bind_address: None,
+            port: None,
+            tls: false,
+            started_at_ms: None,
+            request_count: unified.request_count,
+            active_requests: unified.active_requests,
+            last_request_at_ms: unified.last_request_at_ms,
+            last_error: None,
+        });
+    }
+    let policy = app
+        .state::<crate::m3_commands::M3CommandState>()
+        .hub
+        .lan_policy()
+        .map_err(|error| error.to_string())?;
+    let endpoint = policy.as_ref().and_then(|policy| {
+        unified.endpoints.iter().find(|endpoint| {
+            endpoint.bind_address == policy.bind_address && endpoint.port == policy.port
+        })
+    });
+    Ok(crate::m3_http_server::M3HttpServerStatus {
+        status: unified.status,
+        bind_address: endpoint
+            .map(|endpoint| endpoint.bind_address.clone())
+            .or_else(|| policy.as_ref().map(|policy| policy.bind_address.clone())),
+        port: endpoint
+            .map(|endpoint| endpoint.port)
+            .or_else(|| policy.as_ref().map(|policy| policy.port)),
+        tls: endpoint.map(|endpoint| endpoint.tls).unwrap_or_else(|| {
+            policy.as_ref().is_some_and(|policy| {
+                matches!(
+                    policy.tls,
+                    crate::compatibility_hub::TlsPolicy::Certificate { .. }
+                )
+            })
+        }),
+        started_at_ms: unified.started_at_ms,
+        request_count: unified.request_count,
+        active_requests: unified.active_requests,
+        last_request_at_ms: unified.last_request_at_ms,
+        last_error: unified.last_error,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -2760,9 +4125,8 @@ pub async fn api_server_stop(app: AppHandle) -> Result<ApiServerStatusPayload, S
 /// Returns the current status snapshot — same shape as the
 /// `apiserver://status` event, for the Settings panel's initial load.
 #[tauri::command]
-pub fn api_server_status(state: State<'_, AppState>) -> Result<ApiServerStatusPayload, String> {
-    let s = state.api_server.lock().map_err(|e| e.to_string())?;
-    Ok(status_payload(&s))
+pub fn api_server_status(app: AppHandle) -> Result<ApiServerStatusPayload, String> {
+    sync_api_server_projection(&app)
 }
 
 #[tauri::command]
@@ -2781,24 +4145,25 @@ fn set_config_with_state_impl(
     state: &AppState,
     path: &Path,
     config: ApiServerConfigView,
-) -> Result<(ApiServerConfig, bool), String> {
+) -> Result<(ApiServerConfig, ApiServerConfig, bool), String> {
     if config.port == 0 {
         return Err("Port must be between 1 and 65535".to_string());
     }
 
-    let updated = {
+    let (previous, updated) = {
         let _guard = state
             .api_server_config_lock
             .lock()
             .map_err(|_| "API server config lock poisoned".to_string())?;
         let mut existing = load_config_impl(path)?;
+        let previous = existing.clone();
         existing.port = config.port;
         existing.autostart = config.autostart;
         existing.require_token = config.require_token;
         existing.expose_ollama = config.expose_ollama;
         existing.expose_providers = config.expose_providers;
         save_config_impl(path, &existing)?;
-        existing
+        (previous, existing)
     };
 
     let needs_restart = {
@@ -2806,7 +4171,25 @@ fn set_config_with_state_impl(
         s.status == "running" || s.status == "starting"
     };
 
-    Ok((updated, needs_restart))
+    Ok((previous, updated, needs_restart))
+}
+
+fn restore_config_runtime_fields(
+    state: &AppState,
+    path: &Path,
+    previous: &ApiServerConfig,
+) -> Result<(), String> {
+    let _guard = state
+        .api_server_config_lock
+        .lock()
+        .map_err(|_| "API server config lock poisoned".to_string())?;
+    let mut current = load_config_impl(path)?;
+    current.port = previous.port;
+    current.autostart = previous.autostart;
+    current.require_token = previous.require_token;
+    current.expose_ollama = previous.expose_ollama;
+    current.expose_providers = previous.expose_providers;
+    save_config_impl(path, &current)
 }
 
 /// Updates the persisted config. Any change — port, autostart,
@@ -2822,11 +4205,18 @@ pub async fn api_server_set_config(
     state: State<'_, AppState>,
     config: ApiServerConfigView,
 ) -> Result<ApiServerConfigView, String> {
-    let (updated, needs_restart) =
-        set_config_with_state_impl(state.inner(), &config_file_path(&app)?, config)?;
+    let path = config_file_path(&app)?;
+    let (previous, updated, needs_restart) =
+        set_config_with_state_impl(state.inner(), &path, config)?;
     if needs_restart {
-        stop_server_core(&app).await?;
-        start_server_core(&app).await?;
+        if let Err(error) = reconcile_unified_server(&app, None, None).await {
+            return match restore_config_runtime_fields(state.inner(), &path, &previous) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(format!(
+                    "{error}; restoring the previous API server config also failed: {rollback_error}"
+                )),
+            };
+        }
     }
     Ok(ApiServerConfigView::from(&updated))
 }
@@ -3028,7 +4418,13 @@ pub fn api_server_list_tokens(app: AppHandle) -> Result<Vec<TokenEntryView>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::Full;
     use std::io::{Read, Write};
+
+    fn record_bind_error(state: &mut ApiServerState, message: String) {
+        state.status = "error".to_string();
+        state.last_error = Some(message);
+    }
 
     fn test_provider(id: &str, base_url: &str) -> ProviderSummary {
         ProviderSummary {
@@ -3038,6 +4434,23 @@ mod tests {
     }
 
     fn test_deps(ollama_base_url: String) -> ServerDeps {
+        let providers = vec![
+            test_provider("openai", "https://api.openai.com/v1"),
+            test_provider("anthropic", "https://api.anthropic.com/v1"),
+        ];
+        let local_client = reqwest::Client::new();
+        let cloud_client = crate::egress::hardened()
+            .build()
+            .expect("the hardened client builds");
+        let model_extensions = model_extensions(
+            LegacyLlamaInventory::Snapshot(Some("qwen2.5-7b-instruct".to_string())),
+            true,
+            false,
+            &ollama_base_url,
+            &providers,
+            &local_client,
+            &cloud_client,
+        );
         ServerDeps {
             llama_port: 8090,
             llama_ready: true,
@@ -3047,22 +4460,38 @@ mod tests {
             require_token: false,
             expose_ollama: true,
             expose_providers: false,
-            providers: vec![
-                test_provider("openai", "https://api.openai.com/v1"),
-                test_provider("anthropic", "https://api.anthropic.com/v1"),
-            ],
+            providers,
             tokens: Vec::new(),
-            local_client: reqwest::Client::new(),
+            local_client,
             // The real hardened client, not a stand-in: the tests below assert its
             // actual redirect behaviour, so a bare client here would make them pass
             // for the wrong reason.
-            cloud_client: crate::egress::hardened()
-                .build()
-                .expect("the hardened client builds"),
+            cloud_client,
+            legacy_rate_limiter: Arc::new(crate::http_policy::LegacyTokenRateLimiter::default()),
+            model_service: HttpModelService::from_sources(Vec::new()),
+            model_extensions,
+            m3_service: None,
+            m3_policy: None,
             // Never cancelled, so every existing test keeps asserting the
             // uncancelled path. The cancellation tests build their own token.
             cancel: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    fn refresh_test_model_extensions(deps: &mut ServerDeps) {
+        deps.model_extensions = model_extensions(
+            LegacyLlamaInventory::Snapshot(
+                deps.llama_ready
+                    .then(|| deps.llama_model_stem.clone())
+                    .flatten(),
+            ),
+            deps.expose_ollama,
+            deps.expose_providers,
+            &deps.ollama_base_url,
+            &deps.providers,
+            &deps.local_client,
+            &deps.cloud_client,
+        );
     }
 
     /// `test_deps` with a token the caller controls, for the cancellation paths.
@@ -3074,6 +4503,736 @@ mod tests {
             cancel,
             ..test_deps(ollama_base_url)
         }
+    }
+
+    struct NoPolicyBody {
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl hyper::body::Body for NoPolicyBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    struct PendingRequestBody {
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl hyper::body::Body for PendingRequestBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_invalid_bearer_and_public_routes_never_poll_the_transport_body() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = true;
+        deps.tokens.push(stored_token(
+            "legacy",
+            "lmk-valid",
+            vec![Scope::Chat],
+            vec![Backend::Local],
+        ));
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, "Bearer lmk-invalid")
+            .body(NoPolicyBody {
+                polls: polls.clone(),
+            })
+            .expect("invalid legacy request");
+        let (response, _) = serve_one_request(
+            deps,
+            request,
+            None,
+            ListenerExposure::Loopback,
+            true,
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        )
+        .await
+        .expect("infallible adapter");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        for (method, path) in [
+            (Method::GET, "/health"),
+            (Method::OPTIONS, "/v1/chat/completions"),
+        ] {
+            let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let request = Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .body(NoPolicyBody {
+                    polls: polls.clone(),
+                })
+                .expect("public legacy request");
+            let _ = serve_one_request(
+                test_deps("http://127.0.0.1:1".to_string()),
+                request,
+                None,
+                ListenerExposure::Loopback,
+                true,
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            )
+            .await
+            .expect("infallible adapter");
+            assert_eq!(
+                polls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{method} {path} must drop its unused body without polling"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_stalled_upload_is_cancelled_with_exact_503_and_cors() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let deps = test_deps_cancelled_by("http://127.0.0.1:1".to_string(), cancellation.clone());
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .body(PendingRequestBody {
+                polls: polls.clone(),
+            })
+            .expect("pending legacy request");
+        let task = tokio::spawn(serve_one_request(
+            deps,
+            request,
+            None,
+            ListenerExposure::Loopback,
+            true,
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        ));
+        while polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        cancellation.cancel();
+        let (response, _) = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("cancelled upload must not stall")
+            .expect("transport task")
+            .expect("infallible adapter");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("*"))
+        );
+        let bytes = body_bytes(response).await;
+        assert_eq!(
+            bytes,
+            Bytes::from_static(br#"{"error":{"code":"server_stopping","message":"The API server stopped before this request completed","type":"invalid_request_error"}}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_without_a_pairing_policy_conceals_every_m3_only_route_before_body_or_hub() {
+        for (method, path) in [
+            (Method::POST, "/v1/responses"),
+            (Method::POST, "/v1/models/download"),
+            (Method::POST, "/v1/models/load"),
+            (Method::POST, "/v1/models/delete"),
+            (Method::POST, "/v1/requests/cancel"),
+        ] {
+            let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .body(NoPolicyBody {
+                    polls: polls.clone(),
+                })
+                .expect("no-policy request");
+            let (response, token) = serve_one_request(
+                test_deps("http://127.0.0.1:1".to_string()),
+                request,
+                None,
+                ListenerExposure::Loopback,
+                true,
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            )
+            .await
+            .expect("infallible transport adapter");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            assert!(token.is_none());
+            assert_eq!(
+                polls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{path} must be rejected before the body is polled"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_wrong_methods_unknown_denials_and_preflight_keep_baseline_auth_bytes() {
+        for (method, path) in [
+            (Method::GET, "/v1/chat/completions"),
+            (Method::POST, "/health"),
+            (Method::GET, "/v1/tool_run_shell"),
+            // This is a real desktop host route, but `api-serve` has no
+            // AppHandle. It must retain the CLI's historical unknown-route
+            // authentication ordering instead of returning a pre-auth 404.
+            (Method::POST, "/v1/knowledge/query"),
+        ] {
+            let mut missing = test_deps("http://127.0.0.1:1".to_string());
+            missing.require_token = true;
+            missing.tokens.push(stored_token(
+                "legacy",
+                "lmk-byte-compatible",
+                vec![Scope::Chat, Scope::Models],
+                vec![Backend::Local],
+            ));
+            let request = Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .body(Full::new(Bytes::from_static(b"{}")))
+                .expect("legacy request");
+            let (response, _) = serve_one_request(
+                missing,
+                request,
+                None,
+                ListenerExposure::Loopback,
+                true,
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            )
+            .await
+            .expect("infallible adapter");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+
+            let mut authorized = test_deps("http://127.0.0.1:1".to_string());
+            authorized.require_token = true;
+            authorized.tokens.push(stored_token(
+                "legacy",
+                "lmk-byte-compatible",
+                vec![Scope::Chat, Scope::Models],
+                vec![Backend::Local],
+            ));
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::AUTHORIZATION, "Bearer lmk-byte-compatible")
+                .body(Full::new(Bytes::from_static(b"{}")))
+                .expect("authorized legacy request");
+            let (response, _) = serve_one_request(
+                authorized,
+                request,
+                None,
+                ListenerExposure::Loopback,
+                true,
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            )
+            .await
+            .expect("infallible adapter");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            let value: serde_json::Value =
+                serde_json::from_slice(&body_bytes(response).await).expect("legacy 404 JSON");
+            assert_eq!(value["error"]["code"], "not_found");
+        }
+
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/v1/tools")
+            .body(Full::new(Bytes::new()))
+            .expect("legacy preflight");
+        let (preflight, _) = serve_one_request(
+            test_deps("http://127.0.0.1:1".to_string()),
+            request,
+            None,
+            ListenerExposure::Loopback,
+            true,
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        )
+        .await
+        .expect("infallible adapter");
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
+    }
+
+    #[test]
+    fn primary_m3_policy_never_synthesizes_internal_http_authority() {
+        assert!(primary_m3_policy(None, 1234).is_none());
+        let mut configured = crate::compatibility_hub::LanServerPolicy::default();
+        configured.require_authentication = false;
+        configured.pairing_required = false;
+        let normalized = primary_m3_policy(Some(&configured), 4321).expect("configured policy");
+        assert!(normalized.require_authentication);
+        assert!(normalized.pairing_required);
+        assert_eq!(normalized.bind_address, "127.0.0.1");
+        assert_eq!(normalized.port, 4321);
+    }
+
+    #[tokio::test]
+    async fn unified_stop_cancels_and_joins_every_endpoint_drain_task() {
+        let state = UnifiedHttpServerState::default();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let drained = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut endpoints = Vec::new();
+        for port in [12_341, 12_342] {
+            let task_shutdown = shutdown.clone();
+            let task_drained = drained.clone();
+            let task = tokio::spawn(async move {
+                task_shutdown.cancelled().await;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                task_drained.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+            endpoints.push(RunningEndpoint {
+                endpoint: UnifiedEndpoint {
+                    key: format!("http://127.0.0.1:{port}"),
+                    bind_address: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    port,
+                    exposure: ListenerExposure::Loopback,
+                    transport: EndpointTransport::Plaintext,
+                    primary: port == 12_341,
+                    policy: None,
+                },
+                task,
+            });
+        }
+        {
+            let mut inner = state.lock().expect("unified state");
+            inner.status = "running".to_string();
+            inner.shutdown = Some(shutdown);
+            inner.endpoints = endpoints;
+        }
+
+        stop_running_unified(&state).await.expect("unified stop");
+
+        assert_eq!(drained.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let inner = state.lock().expect("unified state");
+        assert_eq!(inner.status, "stopped");
+        assert!(inner.shutdown.is_none());
+        assert!(inner.endpoints.is_empty());
+    }
+
+    #[tokio::test]
+    async fn identical_generation_is_a_noop_only_while_every_endpoint_task_is_alive() {
+        let state = UnifiedHttpServerState::default();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            task_shutdown.cancelled().await;
+        });
+        let endpoint = UnifiedEndpoint {
+            key: "http://127.0.0.1:12340".to_string(),
+            bind_address: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 12_340,
+            exposure: ListenerExposure::Loopback,
+            transport: EndpointTransport::Plaintext,
+            primary: true,
+            policy: None,
+        };
+        let candidates = vec![EndpointCandidate {
+            endpoint: endpoint.clone(),
+            tls_acceptor: None,
+        }];
+        {
+            let mut inner = state.lock().expect("state");
+            inner.status = "running".to_string();
+            inner.shutdown = Some(shutdown.clone());
+            inner.endpoints = vec![RunningEndpoint { endpoint, task }];
+            assert!(applied_generation_is_healthy(&inner, &candidates));
+            inner.endpoints[0].task.abort();
+        }
+        tokio::task::yield_now().await;
+        {
+            let inner = state.lock().expect("state");
+            assert!(inner.endpoints[0].task.is_finished());
+            assert!(!applied_generation_is_healthy(&inner, &candidates));
+        }
+        stop_running_unified(&state).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn status_projection_runs_after_the_authoritative_admission_counter_completes() {
+        let admission = Arc::new(crate::http_policy::RequestAdmission::new(1));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let response = serve_with_admission(&admission, &shutdown, |_| async {
+            with_cors(json_response(StatusCode::OK, json!({"ok": true})))
+        })
+        .await;
+        assert_eq!(admission.request_count(), 0, "body is still in flight");
+
+        let observed = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let observed_for_callback = observed.clone();
+        let admission_for_callback = admission.clone();
+        let response = after_response_ends(response, move || {
+            observed_for_callback.store(
+                admission_for_callback.request_count(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        });
+        let _ = body_bytes(response).await;
+
+        assert_eq!(admission.request_count(), 1);
+        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cli_m3_initialization_timeout_does_not_wait_for_a_stuck_platform_thread() {
+        let started = std::time::Instant::now();
+        let error = bounded_thread_initialization(
+            "test keychain",
+            std::time::Duration::from_millis(20),
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                Ok::<_, String>(())
+            },
+        )
+        .await
+        .expect_err("initializer must time out");
+        assert!(error.contains("no HTTP listener was opened"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "the detached platform thread must not hold async startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_connection_cap_rejects_an_extra_slow_header_peer_and_recovers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-cli-connection-cap-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("test root");
+        let download: Arc<dyn crate::m3_runtime_hub::M3DownloadTransport> = Arc::new(
+            crate::m3_runtime_hub::ReqwestM3DownloadTransport::new().expect("download transport"),
+        );
+        let hub = Arc::new(
+            M3RuntimeHub::new(
+                root.join("m3"),
+                crate::m3_runtime_hub::M3HubConfig {
+                    storage_quota_bytes: 8 * 1024 * 1024 * 1024,
+                    storage_reserve_bytes: 1024 * 1024 * 1024,
+                    ..crate::m3_runtime_hub::M3HubConfig::default()
+                },
+                crate::m3_runtime_hub::M3RuntimeHubDependencies {
+                    clock: Arc::new(crate::m3_runtime_hub::SystemM3Clock),
+                    hardware: Arc::new(crate::m3_production::SystemM3HardwareProbe),
+                    download,
+                    catalogs: Vec::new(),
+                    runtimes: Vec::new(),
+                    runtime_reconciler: None,
+                    lan_factory: None,
+                },
+            )
+            .expect("test M3 hub"),
+        );
+        let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("fake llama listener");
+        let upstream_port = upstream_listener
+            .local_addr()
+            .expect("fake llama address")
+            .port();
+        let upstream = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = upstream_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0u8; 2048];
+                    let read = stream.read(&mut request).await.unwrap_or(0);
+                    let body: &[u8] = if request[..read]
+                        .windows(14)
+                        .any(|part| part == b"GET /v1/models")
+                    {
+                        br#"{"data":[{"id":"connection-cap-model"}]}"#
+                    } else {
+                        br#"{"status":"ok"}"#
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                });
+            }
+        });
+        let probe = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("port probe");
+        let port = probe.local_addr().expect("probe address").port();
+        drop(probe);
+        let config_path = root.join("api_server.json");
+        save_config_impl(&config_path, &ApiServerConfig::default()).expect("test config");
+        let endpoints = CliRuntimeEndpoints {
+            llama_port: upstream_port,
+            ollama_base_url: format!("http://127.0.0.1:{upstream_port}"),
+        };
+        let server = tokio::spawn(run_cli_server_with_m3_hub_and_connection_limit(
+            port,
+            config_path,
+            hub,
+            endpoints,
+            Vec::<providers::CustomProviderEntry>::new,
+            1,
+        ));
+
+        // Wait for the listener with a close-delimited request so readiness
+        // itself does not retain the single connection permit.
+        let mut ready = false;
+        for _ in 0..100 {
+            if let Ok(Ok(mut stream)) = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await
+            {
+                let _ = stream
+                    .write_all(
+                        b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let mut bytes = Vec::new();
+                if tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    stream.read_to_end(&mut bytes),
+                )
+                .await
+                .is_ok()
+                    && bytes.windows(6).any(|window| window == b"200 OK")
+                {
+                    ready = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(ready, "CLI server did not become ready");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let mut slow = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("slow peer");
+        slow.write_all(b"GET /health HTTP/1.1\r\nHost:")
+            .await
+            .expect("partial header");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut excess = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("excess peer connects to backlog");
+        excess
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("excess request");
+        let mut excess_bytes = [0u8; 128];
+        let excess_read = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            excess.read(&mut excess_bytes),
+        )
+        .await;
+        assert!(
+            !matches!(excess_read, Ok(Ok(read)) if read > 0),
+            "an excess slow-header connection must not allocate a serving task"
+        );
+        drop(excess);
+        drop(slow);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut recovered = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("recovered peer");
+        recovered
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("recovered request");
+        let mut recovered_bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            recovered.read_to_end(&mut recovered_bytes),
+        )
+        .await
+        .expect("recovered response timeout")
+        .expect("recovered response");
+        assert!(
+            recovered_bytes.windows(6).any(|window| window == b"200 OK"),
+            "the permit must return when the slow peer disconnects"
+        );
+
+        server.abort();
+        let _ = server.await;
+        upstream.abort();
+        let _ = upstream.await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn occupied_new_port_does_not_quiesce_the_healthy_generation() {
+        let healthy_listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("healthy listener");
+        let healthy_port = healthy_listener
+            .local_addr()
+            .expect("healthy address")
+            .port();
+        let blocker = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("occupied desired port");
+        let desired_port = blocker.local_addr().expect("blocker address").port();
+        let state = UnifiedHttpServerState::default();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            task_shutdown.cancelled().await;
+            drop(healthy_listener);
+        });
+        {
+            let mut inner = state.lock().expect("state");
+            inner.status = "running".to_string();
+            inner.generation = 9;
+            inner.primary_enabled = true;
+            inner.policy_enabled = false;
+            inner.shutdown = Some(shutdown.clone());
+            inner.endpoints = vec![RunningEndpoint {
+                endpoint: UnifiedEndpoint {
+                    key: format!("http://127.0.0.1:{healthy_port}"),
+                    bind_address: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    port: healthy_port,
+                    exposure: ListenerExposure::Loopback,
+                    transport: EndpointTransport::Plaintext,
+                    primary: true,
+                    policy: None,
+                },
+                task,
+            }];
+        }
+        let candidate = EndpointCandidate {
+            endpoint: UnifiedEndpoint {
+                key: format!("http://127.0.0.1:{desired_port}"),
+                bind_address: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: desired_port,
+                exposure: ListenerExposure::Loopback,
+                transport: EndpointTransport::Plaintext,
+                primary: true,
+                policy: None,
+            },
+            tls_acceptor: None,
+        };
+
+        assert!(bind_candidate(candidate).await.is_err());
+        {
+            let inner = state.lock().expect("state");
+            assert_eq!(inner.status, "running");
+            assert_eq!(inner.generation, 9);
+            assert!(inner.primary_enabled);
+            assert!(!inner.policy_enabled);
+            assert_eq!(inner.endpoints.len(), 1);
+            assert!(!shutdown.is_cancelled());
+        }
+        drop(blocker);
+        stop_running_unified(&state)
+            .await
+            .expect("cleanup generation");
+    }
+
+    #[test]
+    fn missing_policy_validation_leaves_applied_flags_unchanged() {
+        let state = UnifiedHttpServerState::default();
+        {
+            let mut inner = state.lock().expect("state");
+            inner.status = "running".to_string();
+            inner.generation = 4;
+            inner.primary_enabled = true;
+            inner.policy_enabled = false;
+        }
+        let result = generation_spec(&ApiServerConfig::default(), None, true, true);
+        assert!(result.is_err());
+        let inner = state.lock().expect("state");
+        assert_eq!(inner.status, "running");
+        assert_eq!(inner.generation, 4);
+        assert!(inner.primary_enabled);
+        assert!(!inner.policy_enabled);
+    }
+
+    #[tokio::test]
+    async fn saturated_dedup_socket_uses_the_selected_routes_own_busy_envelope() {
+        let origin = "https://paired.example";
+        let mut policy = crate::compatibility_hub::LanServerPolicy::default();
+        policy.port = 12_343;
+        policy.cors_allowlist = vec![origin.to_string()];
+        let endpoint = UnifiedEndpoint {
+            key: "http://127.0.0.1:12343".to_string(),
+            bind_address: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 12_343,
+            exposure: ListenerExposure::Loopback,
+            transport: EndpointTransport::Plaintext,
+            primary: true,
+            policy: Some(policy.clone()),
+        };
+        let admission = crate::http_policy::RequestAdmission::new(1);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let _held = admission.try_admit(&shutdown).expect("fill admission pool");
+        assert!(admission.try_admit(&shutdown).is_none());
+
+        let legacy_headers = HeaderMap::new();
+        let legacy_surface =
+            endpoint_request_surface(&endpoint, true, &Method::GET, "/v1/models", &legacy_headers);
+        assert_eq!(legacy_surface, EndpointRequestSurface::Legacy);
+        let legacy = endpoint_refusal_response(legacy_surface, Some(&policy), &legacy_headers);
+        assert_eq!(legacy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            legacy
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
+        let legacy_body: serde_json::Value =
+            serde_json::from_slice(&body_bytes(legacy).await).expect("legacy busy JSON");
+        assert_eq!(legacy_body["error"]["type"], "invalid_request_error");
+
+        let mut paired_headers = HeaderMap::new();
+        paired_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer lmk-lan-paired"),
+        );
+        paired_headers.insert(header::ORIGIN, HeaderValue::from_static(origin));
+        let paired_surface =
+            endpoint_request_surface(&endpoint, true, &Method::GET, "/v1/models", &paired_headers);
+        assert_eq!(paired_surface, EndpointRequestSurface::M3);
+        let paired = endpoint_refusal_response(paired_surface, Some(&policy), &paired_headers);
+        assert_eq!(paired.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            paired
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some(origin)
+        );
+        let paired_body: serde_json::Value =
+            serde_json::from_slice(&body_bytes(paired).await).expect("M3 busy JSON");
+        assert_eq!(paired_body["error"]["type"], "little_monkey_m3_error");
     }
 
     fn stored_token(
@@ -3155,124 +5314,6 @@ mod tests {
             n,
             nanos
         ))
-    }
-
-    fn no_providers() -> Vec<ProviderSummary> {
-        Vec::new()
-    }
-
-    fn two_providers() -> Vec<ProviderSummary> {
-        vec![
-            test_provider("openai", "https://api.openai.com/v1"),
-            test_provider("anthropic", "https://api.anthropic.com/v1"),
-        ]
-    }
-
-    #[test]
-    fn route_model_matches_llama_exactly() {
-        assert_eq!(
-            route_model(
-                "qwen2.5-7b-instruct",
-                true,
-                Some("qwen2.5-7b-instruct"),
-                &no_providers()
-            ),
-            ModelRoute::Llama
-        );
-    }
-
-    #[test]
-    fn route_model_falls_back_to_ollama_for_any_other_nonempty_id() {
-        assert_eq!(
-            route_model(
-                "llama3.1:8b",
-                true,
-                Some("qwen2.5-7b-instruct"),
-                &no_providers()
-            ),
-            ModelRoute::Ollama
-        );
-        // Even when llama isn't ready, a non-empty id is assumed to be an
-        // Ollama tag — Ollama is the source of truth for whether it exists.
-        assert_eq!(
-            route_model(
-                "qwen2.5-7b-instruct",
-                false,
-                Some("qwen2.5-7b-instruct"),
-                &no_providers()
-            ),
-            ModelRoute::Ollama
-        );
-        assert_eq!(
-            route_model("anything", true, None, &no_providers()),
-            ModelRoute::Ollama
-        );
-    }
-
-    #[test]
-    fn route_model_is_unknown_only_when_blank() {
-        assert_eq!(
-            route_model("", true, Some("qwen2.5-7b-instruct"), &no_providers()),
-            ModelRoute::Unknown
-        );
-        assert_eq!(
-            route_model("   ", true, Some("qwen2.5-7b-instruct"), &no_providers()),
-            ModelRoute::Unknown
-        );
-    }
-
-    #[test]
-    fn route_model_routes_a_known_provider_prefixed_id_to_providers() {
-        assert_eq!(
-            route_model(
-                "openai/gpt-4o",
-                true,
-                Some("qwen2.5-7b-instruct"),
-                &two_providers()
-            ),
-            ModelRoute::Providers {
-                provider_id: "openai".to_string(),
-                model_id: "gpt-4o".to_string()
-            }
-        );
-        assert_eq!(
-            route_model("anthropic/claude-opus-4-8", false, None, &two_providers()),
-            ModelRoute::Providers {
-                provider_id: "anthropic".to_string(),
-                model_id: "claude-opus-4-8".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn route_model_falls_back_to_ollama_for_a_slash_id_with_an_unknown_provider_prefix() {
-        // "library/llama3" isn't a configured provider id, so it's treated
-        // as an Ollama tag (Ollama namespaced tags can themselves contain a
-        // slash) — exactly the design doc's "otherwise treat as Ollama tag"
-        // fallback.
-        assert_eq!(
-            route_model(
-                "library/llama3",
-                true,
-                Some("qwen2.5-7b-instruct"),
-                &two_providers()
-            ),
-            ModelRoute::Ollama
-        );
-    }
-
-    #[test]
-    fn route_backend_maps_every_known_route_but_not_unknown() {
-        assert_eq!(route_backend(&ModelRoute::Llama), Some(Backend::Local));
-        assert_eq!(route_backend(&ModelRoute::Ollama), Some(Backend::Ollama));
-        assert_eq!(
-            route_backend(&ModelRoute::Providers {
-                provider_id: "openai".to_string(),
-                model_id: "gpt-4o".to_string()
-            }),
-            Some(Backend::Providers)
-        );
-        assert_eq!(route_backend(&ModelRoute::Unknown), None);
     }
 
     /// Every route's client, by identity. The interesting half is the third case:
@@ -3489,6 +5530,7 @@ mod tests {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
         deps.llama_ready = false;
+        refresh_test_model_extensions(&mut deps);
         deps.tokens = vec![stored_token(
             "tok-1",
             "lmk-real-token",
@@ -3545,7 +5587,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_scoped_to_local_backend_is_rejected_when_the_request_routes_to_ollama() {
+    async fn token_scoped_to_local_backend_cannot_probe_or_infer_an_ollama_model() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
         deps.tokens = vec![stored_token(
@@ -3555,14 +5597,14 @@ mod tests {
             vec![Backend::Local],
         )];
 
-        // "llama3.1:8b" isn't the ready llama stem, so `route_model` sends
-        // it to Ollama — a token scoped to `local` only must be rejected.
+        // Exact resolution inspects only the authorized local source. It does
+        // not probe Ollama or infer a backend from an unknown string.
         let req = with_bearer(
             post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#),
             "lmk-local-only",
         );
         let (resp, _) = handle_request(&deps, req).await;
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -3636,6 +5678,7 @@ mod tests {
     async fn models_endpoint_omits_ollama_entirely_when_expose_ollama_is_off() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_ollama = false;
+        refresh_test_model_extensions(&mut deps);
         let (resp, _) = handle_request(&deps, get_request("/v1/models")).await;
         let bytes = body_bytes(resp).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -3647,6 +5690,7 @@ mod tests {
     async fn chat_completions_404s_for_an_ollama_routed_model_when_expose_ollama_is_off() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_ollama = false;
+        refresh_test_model_extensions(&mut deps);
         let (resp, _) = handle_request(
             &deps,
             post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#),
@@ -3681,6 +5725,7 @@ mod tests {
     {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_providers = true;
+        refresh_test_model_extensions(&mut deps);
         deps.require_token = true;
         deps.tokens = vec![stored_token(
             "tok-no-providers",
@@ -3716,6 +5761,7 @@ mod tests {
             "zzz-test-provider-no-key",
             "https://example.invalid/v1",
         )];
+        refresh_test_model_extensions(&mut deps);
         deps.tokens = vec![stored_token(
             "tok-with-providers",
             "lmk-with-providers",
@@ -3750,6 +5796,7 @@ mod tests {
             "zzz-test-provider-no-key",
             "https://example.invalid/v1",
         )];
+        refresh_test_model_extensions(&mut deps);
 
         let (resp, _) = handle_request(
             &deps,
@@ -3773,6 +5820,7 @@ mod tests {
             "zzz-test-provider-no-key",
             "https://example.invalid/v1",
         )];
+        refresh_test_model_extensions(&mut deps);
 
         let (resp, _) = handle_request(&deps, get_request("/v1/models")).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3831,6 +5879,7 @@ mod tests {
     async fn embeddings_501s_for_a_provider_routed_model() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_providers = true;
+        refresh_test_model_extensions(&mut deps);
         let (resp, _) = handle_request(
             &deps,
             post_request(
@@ -3933,6 +5982,21 @@ mod tests {
             b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
 
         let handle = std::thread::spawn(move || {
+            // Exact union resolution first verifies the Ollama identity via
+            // `/api/tags`; only then may dispatch reach chat. Keep this unit
+            // fake faithful to the real two-request protocol so the SSE pin
+            // still tests the relay bytes rather than bypassing resolution.
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let tags = br#"{"models":[{"name":"llama3.1:8b"}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    tags.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(tags);
+            }
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buf = [0u8; 4096];
                 let _ = stream.read(&mut buf);
@@ -3987,7 +6051,6 @@ mod tests {
 
         assert_eq!(state.status, "error");
         assert!(state.last_error.is_some());
-        assert!(state.shutdown.is_none());
     }
 
     #[tokio::test]
@@ -4053,9 +6116,9 @@ mod tests {
             created_at: 1,
             last_used_at: None,
             expires_at: None,
-        
+
             ..Default::default()
-};
+        };
         let view = TokenEntryView::from(&entry);
         let json = serde_json::to_string(&view).unwrap();
         assert!(!json.contains("sha256"));
@@ -4116,7 +6179,7 @@ mod tests {
             expose_ollama: true,
             expose_providers: false,
         };
-        let (_, needs_restart) = set_config_with_state_impl(&state, &path, view).unwrap();
+        let (_, _, needs_restart) = set_config_with_state_impl(&state, &path, view).unwrap();
         assert!(!needs_restart, "server is stopped — no restart needed");
 
         {
@@ -4130,7 +6193,7 @@ mod tests {
             expose_ollama: true,
             expose_providers: false,
         };
-        let (updated, needs_restart) = set_config_with_state_impl(&state, &path, view).unwrap();
+        let (_, updated, needs_restart) = set_config_with_state_impl(&state, &path, view).unwrap();
         assert!(
             needs_restart,
             "server is running — a config change must trigger a restart"
@@ -4152,6 +6215,51 @@ mod tests {
             expose_providers: false,
         };
         assert!(set_config_with_state_impl(&state, &path, view).is_err());
+    }
+
+    #[test]
+    fn failed_config_apply_restores_the_previous_port_without_clobbering_live_tokens() {
+        let path = temp_config_path();
+        let state = AppState::default();
+        let mut initial = ApiServerConfig::default();
+        initial.port = 4_321;
+        save_config_impl(&path, &initial).expect("initial config");
+        let view = ApiServerConfigView {
+            port: 5_432,
+            autostart: true,
+            require_token: false,
+            expose_ollama: false,
+            expose_providers: true,
+        };
+        let (previous, _, _) =
+            set_config_with_state_impl(&state, &path, view).expect("stage config");
+
+        // Simulate a token minted while the async listener reconciliation was
+        // attempting its bind. Rollback must restore only runtime fields.
+        let mut concurrent = load_config_impl(&path).expect("staged config");
+        concurrent.tokens.push(TokenEntry {
+            id: "concurrent-token".to_string(),
+            label: "Concurrent".to_string(),
+            sha256: sha256_hex("lmk-concurrent"),
+            scopes: vec![Scope::Models],
+            backends: vec![Backend::Local],
+            created_at: 1,
+            last_used_at: None,
+            expires_at: None,
+            ..Default::default()
+        });
+        save_config_impl(&path, &concurrent).expect("concurrent token update");
+
+        restore_config_runtime_fields(&state, &path, &previous).expect("config rollback");
+        let restored = load_config_impl(&path).expect("restored config");
+        assert_eq!(restored.port, 4_321);
+        assert!(!restored.autostart);
+        assert!(restored.require_token);
+        assert!(restored.expose_ollama);
+        assert!(!restored.expose_providers);
+        assert_eq!(restored.tokens.len(), 1);
+        assert_eq!(restored.tokens[0].id, "concurrent-token");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -4266,21 +6374,14 @@ mod tests {
         let first_listener = bind_listener(0).await.unwrap();
         state.port = first_listener.local_addr().unwrap().port();
         state.status = "running".to_string();
-        state.shutdown = Some(Arc::new(Notify::new()));
 
         // Something else holds the port the new config wants — e.g. LM
         // Studio, or the port field was edited to collide with another app.
         let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let conflicting_port = blocker.local_addr().unwrap().port();
 
-        // `api_server_set_config`'s restart path: stop (notify + clear the
-        // handle) immediately followed by a fresh bind attempt on the new
-        // port — the same order `start_server_core`'s own leading
-        // `stop_server_core` call plus `api_server_set_config`'s explicit
-        // one produce.
-        if let Some(shutdown) = state.shutdown.take() {
-            shutdown.notify_one();
-        }
+        // The unified reconciler has already joined the old generation before
+        // attempting the replacement bind.
         state.status = "stopped".to_string();
 
         let bind_result = tokio::time::timeout(
@@ -4297,7 +6398,6 @@ mod tests {
 
         assert_eq!(state.status, "error");
         assert!(state.last_error.is_some());
-        assert!(state.shutdown.is_none());
 
         drop(first_listener);
         drop(blocker);
@@ -4305,7 +6405,7 @@ mod tests {
 
     // -------------------------------------------------------------
     // Phase 4: monkey-cli `api-serve` reuse (`provider_catalog_from`,
-    // `tokens_from_config`, `probe_llama_server`)
+    // `tokens_from_config`)
     // -------------------------------------------------------------
 
     #[test]
@@ -4353,56 +6453,6 @@ mod tests {
         assert_eq!(tokens[0].sha256, sha256_hex("lmk-cli-token"));
         assert_eq!(tokens[0].scopes, vec![Scope::Chat, Scope::Embeddings]);
         assert_eq!(tokens[0].backends, vec![Backend::Local, Backend::Ollama]);
-    }
-
-    #[tokio::test]
-    async fn probe_llama_server_reports_not_ready_when_unreachable() {
-        // Port 1 on loopback: nothing listens there.
-        let client = reqwest::Client::new();
-        let (ready, model_id) = probe_llama_server(&client, 1).await;
-        assert!(!ready);
-        assert!(model_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn probe_llama_server_reports_ready_and_model_id_when_healthy() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let handle = std::thread::spawn(move || {
-            // /health
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let body = r#"{"status":"ok"}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes());
-            }
-            // /v1/models
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let body =
-                    r#"{"object":"list","data":[{"id":"qwen2.5-7b-instruct","object":"model"}]}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes());
-            }
-        });
-
-        let client = reqwest::Client::new();
-        let (ready, model_id) = probe_llama_server(&client, addr.port()).await;
-        assert!(ready);
-        assert_eq!(model_id.as_deref(), Some("qwen2.5-7b-instruct"));
-
-        handle.join().unwrap();
     }
 
     /// Regression guard for the phase-4 CLI reuse: `run_cli_server` must
@@ -4513,7 +6563,7 @@ mod tests {
         deps.require_token = true;
         deps.tokens = tokens_from_config(&load_config_impl(&path).unwrap());
         assert!(
-            authenticate(&deps, &with_bearer(get_request("/"), &token).headers).is_ok(),
+            authenticate(&deps, &with_bearer(get_request("/"), &token).headers, 0).is_ok(),
             "the token must authenticate before it's revoked"
         );
 
@@ -4521,7 +6571,7 @@ mod tests {
 
         deps.tokens = tokens_from_config(&load_config_impl(&path).unwrap());
         assert!(
-            authenticate(&deps, &with_bearer(get_request("/"), &token).headers).is_err(),
+            authenticate(&deps, &with_bearer(get_request("/"), &token).headers, 0).is_err(),
             "a revoked token must be denied, not silently accepted"
         );
 
@@ -4664,9 +6714,15 @@ mod tests {
         // Wrong method for the knowledge route, empty ids, and unrelated
         // paths must all fall through so `handle_request`'s original five
         // routes (or the final 404) still get a chance at them.
-        assert_eq!(extended_route_for(&Method::GET, "/v1/knowledge/query"), None);
+        assert_eq!(
+            extended_route_for(&Method::GET, "/v1/knowledge/query"),
+            None
+        );
         assert_eq!(extended_route_for(&Method::GET, "/v1/artifacts/"), None);
-        assert_eq!(extended_route_for(&Method::GET, "/v1/workflows/runs/"), None);
+        assert_eq!(
+            extended_route_for(&Method::GET, "/v1/workflows/runs/"),
+            None
+        );
         assert_eq!(extended_route_for(&Method::GET, "/v1/models"), None);
     }
 
@@ -4692,8 +6748,14 @@ mod tests {
         );
         // Wrong method, a blank id, and a run path with an extra segment
         // must all fall through instead of matching.
-        assert_eq!(extended_route_for(&Method::GET, "/v1/local-apps/app-1/run"), None);
-        assert_eq!(extended_route_for(&Method::POST, "/v1/local-apps//run"), None);
+        assert_eq!(
+            extended_route_for(&Method::GET, "/v1/local-apps/app-1/run"),
+            None
+        );
+        assert_eq!(
+            extended_route_for(&Method::POST, "/v1/local-apps//run"),
+            None
+        );
         assert_eq!(extended_route_for(&Method::GET, "/local-apps/"), None);
     }
 
@@ -4749,13 +6811,19 @@ mod tests {
     #[test]
     fn authenticate_local_app_token_rejects_a_token_with_no_local_app_run_scope() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
-        deps.tokens = vec![stored_token("tok-chat", "lmk-chat-only", vec![Scope::Chat], vec![Backend::Local])];
+        deps.tokens = vec![stored_token(
+            "tok-chat",
+            "lmk-chat-only",
+            vec![Scope::Chat],
+            vec![Backend::Local],
+        )];
         let headers = with_bearer(get_request("/"), "lmk-chat-only").headers;
         assert!(authenticate_local_app_token(&deps, &headers, "app-1").is_err());
     }
 
     #[test]
-    fn authenticate_local_app_token_rejects_missing_or_wrong_bearer_and_ignores_require_token_toggle() {
+    fn authenticate_local_app_token_rejects_missing_or_wrong_bearer_and_ignores_require_token_toggle(
+    ) {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = false; // must not matter for this route
         deps.tokens = vec![local_app_stored_token("tok-app1", "lmk-app1", "app-1")];
@@ -4938,41 +7006,46 @@ mod tests {
         let stream = futures_util::stream::iter(vec![Ok::<_, BoxError>(Frame::data(
             Bytes::from_static(b"hello world"),
         ))]);
-        let bytes = read_capped_body(StreamBody::new(stream), 1024)
-            .await
-            .unwrap();
+        let bytes = read_capped_body(
+            StreamBody::new(stream),
+            1024,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(&bytes[..], b"hello world");
     }
 
+    /// The cap *semantics* now live in `http_policy.rs` and are tested there
+    /// once, for both listeners. What stays here is this listener's rendering of
+    /// each rejection, because those bytes (OpenAI envelope + wildcard CORS)
+    /// are the client-visible half and differ from the compatibility router's
+    /// on purpose.
     #[tokio::test]
-    async fn read_capped_body_rejects_a_single_oversized_frame_with_413() {
+    async fn read_capped_body_renders_an_over_cap_body_as_the_legacy_413_envelope() {
         let stream = futures_util::stream::iter(vec![Ok::<_, BoxError>(Frame::data(
             Bytes::from_static(b"0123456789"),
         ))]);
-        let response = read_capped_body(StreamBody::new(stream), 4)
-            .await
-            .unwrap_err();
+        let response = read_capped_body(
+            StreamBody::new(stream),
+            4,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
         let bytes = body_bytes(response).await;
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["error"]["code"], "request_too_large");
-    }
-
-    /// The running total, not just any single frame in isolation, must be
-    /// checked against the limit — otherwise a caller could smuggle an
-    /// arbitrarily large body past the cap by splitting it into many
-    /// small-enough frames (exactly what a real chunked-encoded upload from
-    /// an oversized client would look like at the hyper frame level).
-    #[tokio::test]
-    async fn read_capped_body_catches_an_oversized_body_split_across_many_small_frames() {
-        let stream = futures_util::stream::iter(vec![
-            Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"12345"))),
-            Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"67890"))),
-        ]);
-        let response = read_capped_body(StreamBody::new(stream), 6)
-            .await
-            .unwrap_err();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            r#"{"error":{"code":"request_too_large","message":"Request body exceeds the 4-byte limit.","type":"invalid_request_error"}}"#
+        );
     }
 
     /// The core regression for the "partial read silently becomes an empty
@@ -4984,9 +7057,13 @@ mod tests {
         let stream = futures_util::stream::iter(vec![Err::<Frame<Bytes>, BoxError>(
             "simulated connection drop".into(),
         )]);
-        let response = read_capped_body(StreamBody::new(stream), 1024)
-            .await
-            .unwrap_err();
+        let response = read_capped_body(
+            StreamBody::new(stream),
+            1024,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let bytes = body_bytes(response).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -5018,12 +7095,12 @@ mod tests {
             // unheld between "chosen" and "in use".
             let listener = bind_listener(0).await.unwrap();
             let port = listener.local_addr().unwrap().port();
-            let shutdown = Arc::new(Notify::new());
+            let shutdown = tokio_util::sync::CancellationToken::new();
             let shutdown_for_task = shutdown.clone();
             let handle = tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        _ = shutdown_for_task.notified() => break,
+                        _ = shutdown_for_task.cancelled() => break,
                         _ = listener.accept() => {}
                     }
                 }
@@ -5036,7 +7113,7 @@ mod tests {
             // while before any restart is triggered.
             tokio::task::yield_now().await;
 
-            shutdown.notify_one();
+            shutdown.cancel();
             handle.await.unwrap();
 
             // The rebind itself still has an unavoidable window (closing and
@@ -5086,7 +7163,9 @@ mod tests {
             // that no test covered.
             let admission = RequestAdmission::new(1);
             let shutdown = CancellationToken::new();
-            let held = admission.try_admit(&shutdown).expect("first request admits");
+            let held = admission
+                .try_admit(&shutdown)
+                .expect("first request admits");
 
             let refused = serve_with_admission(&admission, &shutdown, |_cancel| async {
                 panic!("the handler must not run once the quota is exhausted")
@@ -5149,7 +7228,10 @@ mod tests {
             );
 
             let admitted_again = serve_with_admission(&admission, &shutdown, |_cancel| async {
-                Response::builder().status(StatusCode::OK).body(full_body("ok")).unwrap()
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(full_body("ok"))
+                    .unwrap()
             })
             .await;
             assert_eq!(admitted_again.status(), StatusCode::OK);
@@ -5207,8 +7289,8 @@ mod tests {
             );
         }
 
-        /// Structural: both accept loops must reach `serve_one_request` through
-        /// the admission helper.
+        /// Structural: the unified desktop endpoint and AppHandle-free CLI
+        /// reach `serve_one_request` only through shared admission.
         ///
         /// A behavioural test cannot cover this — it would have to bind a socket
         /// per loop and saturate a pool — and the defect was exactly a *second*
@@ -5224,24 +7306,26 @@ mod tests {
 
             assert_eq!(
                 production.matches("serve_one_request(").count(),
-                3,
-                "production `serve_one_request` sites changed: one definition plus one \
-                 call per accept loop. A new call site must go through \
-                 `serve_with_admission`, or that loop bypasses the quota exactly as \
-                 `run_cli_server` used to."
+                2,
+                "one call from the unified endpoint and one from the CLI"
             );
             assert!(production.contains("async fn serve_with_admission<Fut>("));
             assert_eq!(
-                // The definition is generic, so its name is followed by `<Fut>`
-                // and is not counted here — this is calls only, one per loop.
                 production.matches("serve_with_admission(").count(),
-                2,
-                "one call per accept loop"
+                1,
+                "the CLI uses the legacy-envelope admission wrapper"
             );
+            assert_eq!(
+                production.matches("serve_with_admission_response(").count(),
+                2,
+                "the wrapper and unified endpoint share the same guard implementation"
+            );
+            assert!(production.contains("async fn run_unified_endpoint("));
+            assert!(!production.contains("async fn run_accept_loop("));
             assert!(
                 !production.contains("drop(guard)"),
                 "the guard must be owned by the response body, not dropped when the \
-                 handler returns — see `hold_permit_until_body_ends`"
+                 handler returns — see `hold_admission_until_response_ends`"
             );
         }
     }
@@ -5280,8 +7364,7 @@ mod tests {
             /// so a test can move the signal into a waiter task and still own the
             /// upstream for `finish`.
             fn start() -> (Self, std::sync::mpsc::Receiver<()>) {
-                let listener =
-                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind upstream");
                 listener
                     .set_nonblocking(true)
                     .expect("upstream listener goes non-blocking");
@@ -5293,8 +7376,7 @@ mod tests {
                 // blocking accept would never return, so joining would hang the
                 // very test it is meant to prove.
                 let handle = std::thread::spawn(move || {
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                     let mut accepted = None;
                     while std::time::Instant::now() < deadline {
                         match listener.accept() {
@@ -5361,8 +7443,7 @@ mod tests {
             // 503 and not 502: the upstream did nothing wrong, and a client that
             // retries on 502 would retry against a listener that is gone.
             let status = resp.status();
-            let body: serde_json::Value =
-                serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={body}");
             assert_eq!(body["error"]["code"], "server_stopping");
             assert_eq!(body["error"]["type"], "invalid_request_error");
@@ -5418,9 +7499,13 @@ mod tests {
             server_shutdown.cancel();
 
             let collected = streaming.into_body().collect().await;
-            let error = collected.err().expect("a cut stream must not collect cleanly");
+            let error = collected
+                .err()
+                .expect("a cut stream must not collect cleanly");
             assert!(
-                error.to_string().contains("stopped while this response was streaming"),
+                error
+                    .to_string()
+                    .contains("stopped while this response was streaming"),
                 "unexpected stream error: {error}"
             );
         }
@@ -5458,19 +7543,98 @@ mod tests {
                 Arc::new(std::sync::Mutex::new(None));
 
             let captured = seen.clone();
-            let response = serve_with_admission(&admission, &server_shutdown, |cancel| async move {
-                *captured.lock().unwrap() = Some(cancel);
-                json_response(StatusCode::OK, json!({"ok": true}))
-            })
-            .await;
+            let response =
+                serve_with_admission(&admission, &server_shutdown, |cancel| async move {
+                    *captured.lock().unwrap() = Some(cancel);
+                    json_response(StatusCode::OK, json!({"ok": true}))
+                })
+                .await;
             assert_eq!(response.status(), StatusCode::OK);
 
-            let token = seen.lock().unwrap().clone().expect("handler received a token");
+            let token = seen
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("handler received a token");
             assert!(!token.is_cancelled());
             server_shutdown.cancel();
             assert!(
                 token.is_cancelled(),
                 "cancelling the server must reach a request's own token"
+            );
+        }
+    }
+
+    /// Pins the two claims the module doc's K8 section makes.
+    ///
+    /// The first — that neither HTTP listener produces daemon work — is why those
+    /// listeners have no backpressure refusal to make. It is true today by
+    /// inspection, which is exactly the kind of fact that rots: a future route
+    /// that calls `enqueue` would inherit the obligation silently. So it is
+    /// asserted rather than only written down.
+    ///
+    /// The second is that upstream model traffic goes through the egress meter.
+    /// Both are source-level assertions in the style of
+    /// `m3_http_server.rs::every_admitted_route_is_guarded_at_the_service_boundary`,
+    /// because what is being constrained is which calls exist at all, and no
+    /// runtime fixture can observe the absence of a call.
+    #[test]
+    fn neither_http_listener_produces_daemon_work_and_both_meter_upstream_bytes() {
+        fn production<'a>(source: &'a str, label: &str) -> &'a str {
+            source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .map(|(before, _)| before)
+                .unwrap_or_else(|| panic!("{label} has a #[cfg(test)] module"))
+        }
+
+        let legacy = production(include_str!("server.rs"), "server.rs");
+        let managed = production(include_str!("m3_http_server.rs"), "m3_http_server.rs");
+
+        // No route on either listener enqueues daemon work, so K8 backpressure has
+        // nothing to refuse here. If one of these trips, that route owes the
+        // caller a `429` + `Retry-After` built from `backpressure.retry_after_ms`
+        // — never the `503`/`server_busy` that bounded admission returns, which is
+        // a different condition on a different timescale.
+        for (label, source) in [("server.rs", legacy), ("m3_http_server.rs", managed)] {
+            // Every way this library can reach the daemon's queue. Not
+            // `run_commands::run_submit`: that records a `RunSpec` in the durable
+            // ledger for the app's own frontend loop to pick up, which is a
+            // different mechanism from the daemon queue and is already forbidden
+            // as a route by this module's core invariant. It also appears in the
+            // doc comment above, so matching it here would only ever assert that
+            // the prose still exists.
+            for producer in [
+                "daemon_commands::command",
+                "queue_client_recipe",
+                "queue_mobile_chat_recipe",
+            ] {
+                assert!(
+                    !source.contains(producer),
+                    "{label} reached `{producer}`: this listener now produces daemon work \
+                     and must honour K8 backpressure in its own error envelope"
+                );
+            }
+        }
+
+        // Upstream model traffic is metered. Both listeners proxy raw SSE, so this
+        // also pins that the meter — not a buffering wrapper — is what sits on the
+        // streaming path; `streamed_upstream_sse_bytes_reach_the_client_unmodified`
+        // pins the resulting bytes.
+        assert_eq!(
+            legacy.matches("crate::egress::send(").count(),
+            2,
+            "server.rs meters exactly its chat-completions and embeddings proxies"
+        );
+        assert_eq!(
+            managed.matches("crate::egress::send(").count(),
+            1,
+            "m3_http_server.rs meters its provider-inference proxy"
+        );
+        for (label, source) in [("server.rs", legacy), ("m3_http_server.rs", managed)] {
+            assert!(
+                !source.contains(".send()"),
+                "{label} has an unmetered upstream request: use `egress::send(builder)`, \
+                 or comment why the site cannot be metered"
             );
         }
     }

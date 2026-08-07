@@ -1,5 +1,39 @@
 import { invoke } from "@tauri-apps/api/core";
 
+/**
+ * What a producer is told about whether to send more work (K8).
+ *
+ * Three states rather than a boolean because the useful middle case exists:
+ * `slow` means the queue has room but is deep enough that a producer *with a
+ * choice* should wait. Branch on {@link Backpressure.state} or on `reason`,
+ * both of which are stable tokens. **Never branch on `detail`** — it is a
+ * sentence written for a human and its wording is free to change.
+ */
+export type BackpressureState = "accepting" | "slow" | "closed";
+
+export type BackpressureReason = "kill_switch" | "queue_full" | "memory_saturated" | "queue_deep";
+
+export interface Backpressure {
+  state: BackpressureState;
+  /** Mirror of `state !== "closed"`, so the common check is one field. */
+  accepting: boolean;
+  reason: BackpressureReason | null;
+  /** Prose for a human. Displayed verbatim, never parsed. */
+  detail: string | null;
+  /**
+   * Advisory wait before retrying. Derived from the poll interval and the
+   * backlog — **not** a prediction of when anything will finish, because
+   * nothing in the daemon knows that.
+   */
+  retryAfterMs: number | null;
+  queueDepth: number;
+  queueCapacity: number;
+  queued: number;
+  /** Queued jobs admission is refusing for resources. `held === queued` means
+   * the machine is full rather than the queue. */
+  held: number;
+}
+
 export interface DaemonStatus {
   installed: boolean;
   serviceRunning: boolean;
@@ -12,6 +46,31 @@ export interface DaemonStatus {
   paused: number;
   managedRunIds: string[];
   platform: unknown;
+  /**
+   * Optional because an older daemon does not send it. Absent is treated as
+   * `accepting` by {@link backpressureOf} — a missing signal must never block
+   * the app.
+   *
+   * `monkey daemon status --json` emits this block in snake_case
+   * (`retry_after_ms`); `daemon_desktop_status` re-serializes the envelope in
+   * camelCase. Which casing the nested block arrives in therefore depends on the
+   * serde attributes on the Rust mirror struct, so `backpressureOf` accepts
+   * either rather than betting on one and rendering an empty card if it loses.
+   */
+  backpressure?: Backpressure | RawBackpressure | null;
+}
+
+/** The CLI's own casing, tolerated on the way in. See `DaemonStatus.backpressure`. */
+export interface RawBackpressure {
+  state: BackpressureState;
+  accepting: boolean;
+  reason: BackpressureReason | null;
+  detail: string | null;
+  retry_after_ms: number | null;
+  queue_depth: number;
+  queue_capacity: number;
+  queued: number;
+  held: number;
 }
 
 export interface DaemonInstallRequest {
@@ -115,6 +174,153 @@ export const remotePairList = () => invoke<string>("remote_pair_list");
 export const remotePairRevoke = (deviceId: string, reason: string) => invoke<string>("remote_pair_revoke", { deviceId, reason });
 export const remotePairRotate = (deviceId: string, output: string) => invoke<string>("remote_pair_rotate", { deviceId, output });
 export const remoteAudit = (limit = 100) => invoke<unknown>("remote_audit", { limit });
+
+/**
+ * What an older daemon — or one whose status could not be read — means.
+ *
+ * Wide open. A signal the app cannot see must not be treated as a refusal:
+ * failing closed on a missing field would make an upgrade break every enqueue.
+ */
+export const OPEN_BACKPRESSURE: Backpressure = {
+  state: "accepting",
+  accepting: true,
+  reason: null,
+  detail: null,
+  retryAfterMs: null,
+  queueDepth: 0,
+  queueCapacity: 0,
+  queued: 0,
+  held: 0,
+};
+
+function numberOr(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+/**
+ * The backpressure signal from a status payload, in one casing, always present.
+ *
+ * Absent field → {@link OPEN_BACKPRESSURE}. An unrecognised `state` is also
+ * treated as accepting: a token this build has never heard of is a signal it
+ * cannot honour, and guessing "closed" would block work over a vocabulary
+ * mismatch.
+ */
+export function backpressureOf(status: Pick<DaemonStatus, "backpressure"> | null | undefined): Backpressure {
+  const raw = status?.backpressure as Record<string, unknown> | null | undefined;
+  if (!raw || typeof raw !== "object") return OPEN_BACKPRESSURE;
+  const state = raw.state;
+  if (state !== "accepting" && state !== "slow" && state !== "closed") return OPEN_BACKPRESSURE;
+  return {
+    state,
+    accepting: state !== "closed",
+    reason: (raw.reason as BackpressureReason | null) ?? null,
+    detail: typeof raw.detail === "string" ? raw.detail : null,
+    retryAfterMs: typeof raw.retryAfterMs === "number"
+      ? raw.retryAfterMs
+      : typeof raw.retry_after_ms === "number" ? raw.retry_after_ms : null,
+    queueDepth: numberOr(raw.queueDepth ?? raw.queue_depth, 0),
+    queueCapacity: numberOr(raw.queueCapacity ?? raw.queue_capacity, 0),
+    queued: numberOr(raw.queued, 0),
+    held: numberOr(raw.held, 0),
+  };
+}
+
+/**
+ * What kind of work a producer is about to send.
+ *
+ * The distinction only matters at `slow`, and it is the whole reason the state
+ * is not a boolean:
+ *
+ * - `interactive` — a user is sitting there waiting on this turn. Deferring it
+ *   is a refusal they did not ask for and cannot act on, so a `slow` signal is
+ *   *reported* (the caller may show the sentence) and the work goes through.
+ * - `batch` — a queued job nobody is watching. It can wait, which is exactly
+ *   what `slow` is asking for, so this defers and the caller offers an override.
+ *
+ * `closed` blocks both: the daemon's own `enqueue` refuses there, so attempting
+ * it only trades the signal for an error.
+ */
+export type ProducerWork = "interactive" | "batch";
+
+export interface BackpressureGate {
+  /** Whether to attempt the enqueue at all. */
+  proceed: boolean;
+  /** True when `proceed` is false only because a batch producer can wait — the
+   * caller may offer "queue anyway". A blocked `closed` signal is not deferrable. */
+  deferrable: boolean;
+  signal: Backpressure;
+}
+
+export function backpressureGate(signal: Backpressure, work: ProducerWork): BackpressureGate {
+  if (signal.state === "closed") return { proceed: false, deferrable: false, signal };
+  if (signal.state === "slow" && work === "batch") return { proceed: false, deferrable: true, signal };
+  return { proceed: true, deferrable: false, signal };
+}
+
+/**
+ * The daemon's own sentence, plus its advisory retry hint.
+ *
+ * Mirrors `Backpressure::refusal()` on the Rust side so the text a user reads
+ * here and the error the daemon would have returned cannot disagree. `fallback`
+ * and `retryHint` are translated strings from the caller; `detail` is the
+ * daemon's prose and is never translated — paraphrasing it would mean inventing
+ * a claim about the queue.
+ */
+export function backpressureMessage(
+  signal: Backpressure,
+  fallback: string,
+  retryHint: (retryAfterMs: number) => string,
+): string {
+  const detail = signal.detail ?? fallback;
+  return signal.retryAfterMs === null ? detail : `${detail} ${retryHint(signal.retryAfterMs)}`;
+}
+
+/**
+ * One arbitration decision, as `monkey daemon decisions --json` prints it
+ * (`SchedulerDecision` in the CLI's `daemon/store.rs`, serialized camelCase).
+ *
+ * The point of the row is the last three fields: `measurement` names *which*
+ * number decided it, and `measuredAtMs` is **that reading's own observation
+ * time**, not when this row was written. A re-derived guess carrying a fresh
+ * timestamp is exactly what that column exists to rule out, so it must never be
+ * relabelled as the decision time — `decidedAtMs` is that.
+ */
+export interface SchedulerDecision {
+  decidedAtMs: number;
+  jobId: string;
+  outcome: string;
+  /** The class the run's frozen kind declares. */
+  processClass: string;
+  /** That class after aging promotion — what the ranking actually used. */
+  effectiveClass: string;
+  workspace: string | null;
+  /** What this job was chosen over, most-nearly-chosen first. Bounded when written. */
+  passedOver: string[];
+  detail: string;
+  measurement: string;
+  measuredValue: number | null;
+  measuredAtMs: number | null;
+}
+
+export type SchedulerOutcome = "admitted" | "held" | "preempted" | "resumed" | "rejected";
+
+/** The log is bounded to this many rows on the daemon side. */
+export const MAX_SCHEDULER_DECISIONS = 512;
+
+/**
+ * Recent scheduling decisions, newest first.
+ *
+ * `daemon_desktop_decisions` is a fixed-argument shell-out to
+ * `monkey daemon decisions --limit N --json`, like every other daemon call here.
+ * The CLI emits camelCase for every field of `SchedulerDecision`, and both ends
+ * assert that spelling — the nested `backpressure` block on `daemon_desktop_status`
+ * does not, so the two are not interchangeable.
+ *
+ * A read failure surfaces as the panel's read error rather than sample rows: a
+ * decision log that shows invented decisions is worse than one that shows none.
+ */
+export const daemonDecisions = (limit = 50) =>
+  invoke<SchedulerDecision[]>("daemon_desktop_decisions", { limit });
 
 /** Exact daemon ownership comes from daemon state rather than a run-key
  * heuristic: task run keys are intentionally hashed before they reach the
