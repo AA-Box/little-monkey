@@ -860,6 +860,11 @@ pub fn run() {
             // `hosted_oauth.rs`'s module doc for the full flow.
             hosted_oauth::register(app.handle());
 
+            // Installed before any window can submit a run, so a run that declares
+            // an egress allowlist is enforced from its first request. Nothing here
+            // opens the ledger — the closure reads it on demand and caches per run.
+            run_commands::install_run_egress_policy_source(app.handle());
+
             // Verify and copy the bundled llama.cpp runtime into app data at
             // launch so the separately installed `monkey` CLI can use the
             // same app-owned runtime without Ollama or a system install.

@@ -268,6 +268,48 @@ fn enforce_run_network_permission(
     Err(denial.to_string())
 }
 
+/// Installs the process-wide source [`crate::egress::send`] consults for a run's
+/// frozen egress allowlist.
+///
+/// # Why the ledger read lives behind an installed closure
+///
+/// The 92 sites that route through `egress::send` have no `AppHandle` and no
+/// `AppState`, and giving them one is the parameter threading `run_scope` exists to
+/// replace. So the identity travels implicitly (the task-local) and the *row* behind
+/// it is fetched through a closure installed once at startup, holding the one handle
+/// that can reach the ledger. This is the only file that knows both halves.
+///
+/// Every outcome is deliberate and [`crate::egress::RunEgressPolicy`] documents which
+/// direction each fails in. In particular a run id the ledger has never seen is
+/// `Unknown` and permitted — `browser_worker` and `m4_runtime` both scope work under
+/// ids that are not ledger runs — while a read that *fails* is `Unavailable` and
+/// refused.
+///
+/// The read is cached per run inside `egress`, so this closure runs once per run
+/// rather than once per request; a run spec is written once and never updated, so
+/// there is nothing for a cache to go stale against.
+///
+/// One caller obligation, the same one [`drain_egress`] has and for the same reason:
+/// this locks the ledger, so nothing may hold [`with_ledger`]'s guard across an
+/// `egress::send`. A `std::sync::Mutex` is not reentrant, so that would deadlock
+/// rather than block. No caller does, and none should.
+pub(crate) fn install_run_egress_policy_source<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let app = app.clone();
+    crate::egress::install_run_policy_source(move |run_id| {
+        let state = app.state::<AppState>();
+        match with_ledger(&app, state.inner(), |ledger| ledger.load_run(run_id)) {
+            Ok(Some(run)) => match run.spec.permission_policy.egress_allowlist {
+                Some(allowlist) => {
+                    crate::egress::RunEgressPolicy::Declared(std::sync::Arc::new(allowlist))
+                }
+                None => crate::egress::RunEgressPolicy::Undeclared,
+            },
+            Ok(None) => crate::egress::RunEgressPolicy::Unknown,
+            Err(_) => crate::egress::RunEgressPolicy::Unavailable,
+        }
+    });
+}
+
 /// How often a still-running scope's counted egress is written to its row.
 ///
 /// Drained on a timer *and* once more when the scope ends, and both halves are
@@ -833,6 +875,178 @@ mod tests {
         let denial = enforce_run_network_permission("not a url", "run-corrupt", false)
             .expect_err("a malformed frozen endpoint must not be treated as local");
         assert!(denial.contains(crate::egress::EgressRule::UrlMalformed.code()));
+    }
+
+    /// The seam between a frozen run row and the choke point: what the installed
+    /// policy source answers for a real ledger, and what `egress` then does with it.
+    ///
+    /// Worth its own module because it is the only place the two halves meet. The
+    /// `egress` tests install a hand-written source, so they prove the *rules*; this
+    /// proves the source reads the frozen field and maps each ledger outcome to the
+    /// direction it is supposed to fail in.
+    mod allowlist_source {
+        use super::*;
+        use crate::run_ledger::RunLedger;
+        use crate::run_protocol::{
+            CapabilityAssessment, CapabilityState, EgressAllowlist, ModelCapabilitiesSnapshot,
+            ModelTargetSnapshot, PermissionMode, PermissionPolicySnapshot, RunBudgets, RunKind,
+            RunSpec, ToolPolicyDecision, RUN_PROTOCOL_SCHEMA_VERSION,
+        };
+        use crate::run_scope::{self, RunScope};
+
+        fn capability(state: CapabilityState) -> CapabilityAssessment {
+            CapabilityAssessment {
+                state,
+                evidence: "fixture".to_string(),
+            }
+        }
+
+        /// The smallest spec this ledger accepts, with `egress_allowlist` as the only
+        /// thing the test varies.
+        fn spec(run_id: &str, allowlist: Option<EgressAllowlist>) -> RunSpec {
+            let unknown = || capability(CapabilityState::Unknown);
+            RunSpec {
+                schema_version: RUN_PROTOCOL_SCHEMA_VERSION,
+                run_id: run_id.to_string(),
+                idempotency_key: run_id.to_string(),
+                created_at_ms: 1_784_000_000_000,
+                kind: RunKind::Interactive,
+                submitted_by: ClientIdentity {
+                    client_id: "test".to_string(),
+                    instance_id: "window-01".to_string(),
+                    kind: ClientKind::Desktop,
+                    version: "1.0.0-test".to_string(),
+                },
+                task: "fixture".to_string(),
+                instructions: None,
+                input_artifact_ids: Vec::new(),
+                target: ModelTargetSnapshot::Provider {
+                    target_id: "provider-main-model".to_string(),
+                    label: "Provider model".to_string(),
+                    provider_id: "provider-main".to_string(),
+                    endpoint: "https://api.example.com/v1".to_string(),
+                    model: "example-model".to_string(),
+                    credential_ref_id: "provider-key-main".to_string(),
+                    capabilities: ModelCapabilitiesSnapshot {
+                        tool_calling: unknown(),
+                        vision: unknown(),
+                        embeddings: unknown(),
+                        structured_output: unknown(),
+                        image_generation: unknown(),
+                        audio: unknown(),
+                        runtime_lifecycle: unknown(),
+                        fim: capability(CapabilityState::Unsupported),
+                        code_completion: unknown(),
+                        inline_edit: unknown(),
+                        fim_metadata: None,
+                    },
+                },
+                workspace: None,
+                permission_policy: PermissionPolicySnapshot {
+                    mode: PermissionMode::Auto,
+                    unattended: true,
+                    approval_timeout_ms: 60_000,
+                    default_tool_decision: ToolPolicyDecision::Allow,
+                    tool_rules: Vec::new(),
+                    allow_network: true,
+                    allow_external_mutations: false,
+                    egress_allowlist: allowlist,
+                },
+                budgets: RunBudgets {
+                    wall_time_ms: 60_000,
+                    max_iterations: 10,
+                    max_model_calls: 10,
+                    max_tool_calls: 20,
+                    max_input_tokens: 100_000,
+                    max_output_tokens: 10_000,
+                    max_cost_micros: None,
+                    max_artifact_bytes: 10_000_000,
+                    max_event_count: 10_000,
+                },
+            }
+        }
+
+        fn refusal(run_id: &str, url: &str) -> Option<crate::egress::EgressRule> {
+            let url = url::Url::parse(url).expect("parses");
+            run_scope::scoped_sync(RunScope::run(run_id), || {
+                crate::egress::check_run_allowlist(&url)
+                    .err()
+                    .map(|denial| denial.rule())
+            })
+        }
+
+        /// One ledger, four run states, one installed source.
+        ///
+        /// Written as one test rather than four because they share an installed
+        /// process-wide source, and four tests would be four races over it.
+        #[test]
+        fn what_the_ledger_says_is_what_the_choke_point_enforces() {
+            let _guard = crate::denial_sink::test_lock();
+            let state = AppState::default();
+            *state.run_ledger.lock().unwrap() =
+                Some(RunLedger::open_in_memory().expect("an in-memory ledger opens"));
+            let app = tauri::test::mock_app().handle().clone();
+            // Managed, not held on the side, because the installed source resolves the
+            // state through the handle exactly as it does in production.
+            app.manage(state);
+            let state = app.state::<AppState>();
+
+            with_ledger(&app, state.inner(), |ledger| {
+                ledger.submit_run(&spec(
+                    "run:declared",
+                    Some(EgressAllowlist {
+                        hosts: vec!["api.example.com".to_string()],
+                        ports: vec![443],
+                        protocols: vec!["https".to_string()],
+                    }),
+                ))?;
+                ledger.submit_run(&spec("run:silent", None))?;
+                // A row this build cannot parse. Seeded directly, because a spec that
+                // will not deserialize cannot be submitted through the front door.
+                ledger
+                    .connection()
+                    .execute(
+                        "INSERT INTO runs (run_id, idempotency_key, spec_json, created_at_ms,
+                                           updated_at_ms, status, last_sequence, max_event_count)
+                         VALUES ('run:corrupt', 'run:corrupt', x'7b7d', 1000, 1000, 'running', 0, 1000)",
+                        [],
+                    )
+                    .expect("a corrupt row is seeded");
+                Ok(())
+            })
+            .expect("the ledger opens");
+
+            // The production installer, not a stand-in for it.
+            install_run_egress_policy_source(&app);
+
+            assert_eq!(
+                refusal("run:declared", "https://api.example.com/v1"),
+                None,
+                "the frozen declaration must permit what it names"
+            );
+            assert_eq!(
+                refusal("run:declared", "https://other.example.com/v1"),
+                Some(crate::egress::EgressRule::RunHostNotAllowlisted),
+                "a host the frozen spec did not name must be refused"
+            );
+            assert_eq!(
+                refusal("run:silent", "https://other.example.com/v1"),
+                None,
+                "a run that declares nothing keeps today's behaviour"
+            );
+            assert_eq!(
+                refusal("run:absent-from-the-ledger", "https://other.example.com/v1"),
+                None,
+                "a scope id that is not a ledger run is permitted, not refused"
+            );
+            assert_eq!(
+                refusal("run:corrupt", "https://other.example.com/v1"),
+                Some(crate::egress::EgressRule::RunPolicyUnavailable),
+                "a row this build cannot read must fail closed"
+            );
+
+            crate::egress::clear_run_policy_source();
+        }
     }
 
     /// The egress accounting seam, end to end and against a real socket.

@@ -719,6 +719,7 @@ fn permission_policy(mode: PermissionMode, approval_timeout_ms: u64) -> Permissi
         allow_external_mutations: std::env::var_os("LITTLE_MONKEY_DAEMON_ALLOW_EXTERNAL_MUTATIONS")
             .as_deref()
             == Some(std::ffi::OsStr::new("1")),
+        egress_allowlist: None,
     }
 }
 
