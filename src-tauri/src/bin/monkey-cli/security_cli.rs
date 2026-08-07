@@ -2,7 +2,9 @@ use std::path::Path;
 
 use clap::Subcommand;
 use little_monkey_lib::native_skills::{NativeSkillManager, SkillSource};
-use little_monkey_lib::run_ledger::{ChainVerification, RunLedger, StoredPermissionDecision};
+use little_monkey_lib::run_ledger::{
+    ChainVerification, RunLedger, StoredPermissionDecision, StoredSubsystemEvent, Subsystem,
+};
 use little_monkey_lib::run_protocol::PermissionDecision;
 use little_monkey_lib::security_doctor::{
     run_security_audit, FindingStatus, NativeSkillSnapshot, SecurityAuditRequest,
@@ -45,6 +47,22 @@ pub enum SecurityCmd {
         /// The tool call id to trace.
         tool_call_id: String,
         /// Print the versioned machine-readable trail.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the unified subsystem event stream, and verify its hash chain.
+    ///
+    /// This is the stream the run-less subsystems write to — HTTP, MCP, browser,
+    /// ACP, remote node — because `run_events` requires a run and those are not
+    /// runs. Exits non-zero if the chain is broken.
+    SubsystemEvents {
+        /// Show only one subsystem: http, mcp, browser, acp or remote.
+        #[arg(long)]
+        subsystem: Option<String>,
+        /// How many of the most recent events to show.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        /// Print the versioned machine-readable stream.
         #[arg(long)]
         json: bool,
     },
@@ -125,6 +143,56 @@ pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> R
                 ));
             }
             Ok(())
+        }
+        SecurityCmd::SubsystemEvents {
+            subsystem,
+            limit,
+            json,
+        } => {
+            let selected = subsystem
+                .as_deref()
+                .map(|value| {
+                    Subsystem::ALL
+                        .iter()
+                        .find(|candidate| candidate.code() == value)
+                        .copied()
+                        .ok_or_else(|| {
+                            format!(
+                                "unknown subsystem '{value}' — expected one of {}",
+                                Subsystem::ALL
+                                    .iter()
+                                    .map(|candidate| candidate.code())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        })
+                })
+                .transpose()?;
+            let ledger = open_existing_ledger(data_dir)?;
+            let events = ledger
+                .recent_subsystem_events(selected, *limit)
+                .map_err(|error| error.to_string())?;
+            let verdict = ledger
+                .verify_subsystem_chain()
+                .map_err(|error| error.to_string())?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "events": events,
+                        "chain": verdict,
+                    }))
+                    .map_err(|error| error.to_string())?
+                );
+            } else {
+                print_subsystem_events(&events, &verdict);
+            }
+            match verdict {
+                ChainVerification::Intact { .. } => Ok(()),
+                ChainVerification::Broken { .. } => {
+                    Err("the subsystem event chain is broken".to_string())
+                }
+            }
         }
         SecurityCmd::VerifyRunChain { run_id, json } => {
             let ledger = open_existing_ledger(data_dir)?;
@@ -208,6 +276,46 @@ fn print_permission_trail(tool_call_id: &str, trail: &[StoredPermissionDecision]
         match (&entry.decision, &entry.decided_by) {
             (Some(_), Some(decided_by)) => println!("  decided by: {decided_by}"),
             _ => println!("  still open — nothing has answered it yet"),
+        }
+    }
+}
+
+fn print_subsystem_events(events: &[StoredSubsystemEvent], verdict: &ChainVerification) {
+    match verdict {
+        ChainVerification::Intact {
+            events_seen,
+            events_naming_a_process,
+            ..
+        } => {
+            println!("[OK] subsystem stream: {events_seen} events, chain intact");
+            println!("  naming a process: {events_naming_a_process} of {events_seen}");
+            // Stated rather than glossed: unlike the run stream, where
+            // `runs.last_sequence` is a second witness, nothing here contradicts
+            // a removed tail.
+            println!(
+                "  note: a removed tail cannot be detected — this stream has no counter outside \
+                 itself to contradict one"
+            );
+        }
+        ChainVerification::Broken { sequence, detail } => {
+            println!("[CRIT] subsystem stream: chain broken at sequence {sequence}");
+            println!("  {detail}");
+        }
+    }
+    for event in events {
+        println!(
+            "#{} [{}] {} {} — {}",
+            event.sequence,
+            event.outcome.code(),
+            event.subsystem.code(),
+            event.action,
+            event.attribution.code()
+        );
+        match &event.permission_request_id {
+            Some(request_id) => println!("  authorized by: {request_id}"),
+            // The acceptance calls an ungated action a bug, so it is named
+            // rather than left as an empty field.
+            None => println!("  authorized by: nothing gated this action"),
         }
     }
 }
@@ -359,6 +467,47 @@ mod tests {
             Harness::try_parse_from(["monkey", "permission-trail"]).is_err(),
             "the tool call id is required — 'whichever call' is not a question"
         );
+    }
+
+    #[test]
+    fn subsystem_events_parses_its_filters_and_rejects_an_unknown_subsystem() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            command: SecurityCmd,
+        }
+
+        let parsed = Harness::try_parse_from([
+            "monkey",
+            "subsystem-events",
+            "--subsystem",
+            "mcp",
+            "--limit",
+            "5",
+        ])
+        .expect("subsystem-events should parse");
+        match parsed.command {
+            SecurityCmd::SubsystemEvents {
+                subsystem,
+                limit,
+                json,
+            } => {
+                assert_eq!(subsystem.as_deref(), Some("mcp"));
+                assert_eq!(limit, 5);
+                assert!(!json);
+            }
+            other => panic!("expected SubsystemEvents, got {other:?}"),
+        }
+
+        // The subsystem name is validated against `Subsystem::ALL` at run time
+        // rather than by clap, so an unknown one is a clear error naming the
+        // valid set instead of an empty result that reads like "nothing
+        // happened".
+        assert!(Subsystem::ALL
+            .iter()
+            .all(|value| value.code() != "carrier-pigeon"));
     }
 
     /// The human output must never imply coverage it does not have. A run whose

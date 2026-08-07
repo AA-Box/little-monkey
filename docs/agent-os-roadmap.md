@@ -3295,15 +3295,52 @@ a broken chain so a scripted check cannot pass by printing bad news.
 
 **Remaining, and the recon turned up more than the entry implied:**
 
-- **"One event stream every subsystem writes to" is the large half.** Today
-  exactly two functions insert run events, and 46 production call sites funnel
-  through them — but **HTTP (`server.rs`, `m3_http_server.rs`), MCP (`mcp.rs`) and
-  the browser worker write no events at all**, and ACP is a read-only consumer. An
-  HTTP request, an MCP tool call and a browser action are simply not represented.
-  Separate stores also hold gating-relevant records with no join to the run
-  stream: `daemon_scheduler_decisions` and `remote_audit` in their own database
-  files, and `egress_denials`, which records denials only — **an allowed egress
-  produces no row anywhere** — and ring-buffers itself on every insert.
+- **"One event stream every subsystem writes to" — the stream now exists, and MCP
+  writes to it.** Migration V12 adds `subsystem_events`: run-optional,
+  hash-chained, append-only.
+
+  **The fork this settles.** `run_events.run_id` is `NOT NULL REFERENCES
+  runs(run_id)`, its insert trigger demands contiguous per-run sequences, and its
+  chain is per run — all three are run-shaped. So the acceptance had exactly two
+  readings: manufacture a `runs` row per HTTP request, MCP call and browser
+  action, or have a stream that does not need one. The first makes runs
+  high-volume and changes the runs list, admission control and archival to buy a
+  label; `run_scope`'s module doc argues the case against inventing an identity at
+  length. This is the second, and it generalizes what V11 already did for
+  permissions rather than introducing a third discipline.
+
+  - **It does not restate the authorization.** A gated action's decision is
+    already in `permission_decisions`, written *before* the action runs and for
+    every caller, so an event points back at it by `request_id`. That closes "for
+    anything gated, the exact policy decision that permitted it" with one join, in
+    the direction the question is actually asked — and `request_permission` now
+    returns that id so the caller can carry it. Widening the return type changed
+    no existing call site: `request_permission(..).await?;` in statement position
+    drops the value.
+  - **One global chain**, not one per subsystem: there is no per-run sequence to
+    hang a chain off, and a per-subsystem chain would let a whole subsystem's tail
+    be removed without breaking any other. Unlike V9 there is **no unchained era
+    to tolerate** — the table is new, so `event_hash` is `NOT NULL` from the first
+    row and there is nothing to backfill and therefore nothing to launder.
+  - **One row per completed action, deliberately — there is no "started" row.**
+    The permission row already proves the action was authorized before it ran, so
+    a second row would restate it. An action that never finishes leaves an open
+    permission and no event, which reads correctly as "authorized, never
+    completed".
+  - **What it cannot detect, stated rather than glossed:** a removed tail. The run
+    stream has `runs.last_sequence` as a second witness; this stream has no
+    counter outside itself to contradict one, and the CLI says so.
+
+  Reachable as `monkey security subsystem-events [--subsystem mcp]`, which exits
+  non-zero on a broken chain.
+
+  **Still to write to it:** HTTP (`server.rs`, `m3_http_server.rs`), the browser
+  worker, ACP (today a read-only consumer) and the remote node. MCP is wired as
+  the first writer because it is the clearest gated action and already carries a
+  turn id. Separate stores still hold gating-relevant records with no join to
+  either stream: `daemon_scheduler_decisions` and `remote_audit` in their own
+  database files, and `egress_denials`, which records denials only — **an allowed
+  egress produces no row anywhere** — and ring-buffers itself on every insert.
 - ~~**Per-event process identity does not exist.**~~ **Done** — migration V10 adds
   `run_events.process_id`, populated from the ambient `ProcessScope` (the D3
   `tokio::task_local!`) inside `append_event`. That is the single place all 46
