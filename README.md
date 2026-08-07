@@ -371,7 +371,7 @@ Security Doctor is a posture aid, not a substitute for operating-system updates,
 
 **Runtimes and hardware**
 
-- No publisher-operated, platform-complete signed `llama.cpp` or MLX artifact feed ships with this repository. ROCm, Vulkan, and DirectML are not advertised as maintained managed runtimes.
+- No publisher-operated, platform-complete signed `llama.cpp` or MLX artifact feed ships with this repository. ROCm, Vulkan, and DirectML are not advertised as maintained managed runtimes. The MLX service package can be built locally with `pnpm mlx:package` and installed from the Runtime Hub, but it installs only when signed by the pinned release key — there is no hosted feed serving one.
 - Hardware-fit estimates and runtime controls are implemented, but the ±15% memory matrix, clean-machine lifecycle checks, and the MLX release gate need maintained physical reference hardware. Edge-device profiles are static heuristics: no benchmark here measures throughput or latency.
 - `/v1/embeddings` produces real vectors only when the resolved runtime reaches an embeddings-capable backend (Ollama today); otherwise it returns an unsupported error rather than a fabricated vector. Native Ollama `/api/generate`, `/api/pull`, and `/api/show` are not implemented, and `/api/chat` returns a complete response rather than per-token streaming — real SSE streaming is OpenAI-compatible only.
 - Vision is projector management and wire transport, not in-app vision chat: the main chat UI does not yet route attached images through that path, and the renderer cannot represent image blocks or reasoning content, so vision is never advertised as ready.
