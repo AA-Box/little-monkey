@@ -2950,11 +2950,43 @@ of a very slow model. Two of its files carry comments claiming a sibling test
 "proves — mechanically, not just by convention" a property; neither test file was
 ever written.
 
+**Then shipped — the measurement now survives the session that produced it, and
+the prose stops deferring.** A benchmark that is measured and thrown away cannot
+inform anything, and that is what the surface did: the report lived in React
+component state and was gone on unmount, so `runtimeEdgeProfiles.ts`'s seven
+deferrals to "the local benchmark" stayed unanswerable no matter how many times
+you ran one.
+
+- Each report is persisted to `benchmarks.json` under the app data dir, the same
+  file-per-feature pattern as `web_settings.json`. **Not** a ledger table: a
+  benchmark measures *this machine*, not a run, and hanging it off the ledger's
+  run-shaped schema is the category error `permission_decisions` had to work
+  around.
+- **Stored with the machine it ran on, and that is what makes showing it safe.**
+  A whole `HardwareSnapshot` cannot be compared — `captured_at_ms` and
+  `available_ram_bytes` move second to second, so equality on it would call every
+  stored report stale a moment after writing it. `MachineIdentity` is the stable
+  part: OS, arch, fitted RAM, logical CPUs, sorted accelerator names. Deliberately
+  not `supported_runtimes`, which is derived from OS/arch and would invalidate
+  every report the day a build learns a new runtime, for no physical reason.
+- `BenchmarkFreshness` is a tagged union for the reason `ChainVerification` is
+  one: a caller cannot read the differences off a report measured elsewhere and
+  still render its numbers. The panel shows *what changed* instead of numbers,
+  and the edge profile ignores the entry entirely.
+- Re-running a model on a runtime **replaces** that pair's entry rather than
+  appending. Two reports for one pair differ only by when they ran, and keeping
+  both invites a reader to treat them as a time series they were never meant to
+  be. Capped at 32.
+- The edge profile now *appends* the measurement to its own prose rather than
+  replacing it — the caveat about context length and concurrency is still true,
+  and the measurement adds evidence rather than overriding advice it does not
+  cover. It reports the fastest measured pair, since the question that line
+  answers is what this machine is capable of.
+
 **Remaining.** Cost still comes from typed rates, which is ROADMAP #4's item rather
-than this one. `runtimeEdgeProfiles.ts` still returns eight hardcoded prose
-profiles, and its own text defers to "the local benchmark" seven times — those
-deferrals were false until now and are merely *satisfiable* today; replacing the
-prose with measurements is its own change.
+than this one. The eight profiles' *other* fields — recommended model class,
+context tokens, process slots — are still hardcoded prose; only the throughput
+line reads a measurement.
 
 **Blocks:** nothing now. K7 and K8 both shipped on top of it, and K8's fair-share
 reads `cpu_time_ms` out of this ledger rather than deriving a number of its own.

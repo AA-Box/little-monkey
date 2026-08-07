@@ -1,4 +1,5 @@
 import type {
+  BenchmarkHistoryEntry,
   HardwareProfile,
   HardwareSnapshot,
   M3HardwareCompatibilityReport,
@@ -209,6 +210,57 @@ export function resolveEdgeRuntimeProfile(
   snapshot: HardwareSnapshot,
   profile: HardwareProfile,
   compatibility: M3HardwareCompatibilityReport | null,
+  benchmarks: BenchmarkHistoryEntry[] = [],
 ): EdgeRuntimeProfile {
-  return baseProfile(snapshot, profile, compatibility);
+  return withMeasuredSpeed(baseProfile(snapshot, profile, compatibility), benchmarks);
+}
+
+/**
+ * Replaces the "run the local benchmark" deferral with the number, once there is
+ * one.
+ *
+ * Every `expectedSpeed` string here is a hedge written for a machine that had
+ * never been measured — seven of the eight profiles defer to a benchmark that,
+ * until now, was measured and then discarded. When a real measurement exists for
+ * this machine the hedge is no longer the honest answer, and the measurement is.
+ *
+ * Three rules keep it honest:
+ *
+ * - only entries whose `freshness` is `thisMachine` count, so a report carried
+ *   over from other hardware can never be shown as this machine's;
+ * - only entries that actually produced a decode rate count — a run whose rate
+ *   was unavailable has nothing to say here;
+ * - the prose is *appended*, not replaced. The profile's own caveat about
+ *   context length and concurrency is still true; the measurement adds evidence
+ *   rather than overriding advice it does not cover.
+ */
+function withMeasuredSpeed(
+  profile: EdgeRuntimeProfile,
+  benchmarks: BenchmarkHistoryEntry[],
+): EdgeRuntimeProfile {
+  const measured = benchmarks.filter(
+    (entry) => entry.freshness.state === "thisMachine" && entry.report.decodeTokensPerSecond !== null,
+  );
+  if (!measured.length) return profile;
+
+  // The fastest measured pair, because the question this line answers is what
+  // this machine is capable of, not what the most recently benchmarked model
+  // happened to do.
+  const best = measured.reduce((fastest, entry) =>
+    // Non-null on both sides by the filter above.
+    entry.report.decodeTokensPerSecond!.median > fastest.report.decodeTokensPerSecond!.median
+      ? entry
+      : fastest,
+  );
+  const rate = best.report.decodeTokensPerSecond!;
+  return {
+    ...profile,
+    expectedSpeed: `${profile.expectedSpeed} Measured here: ${rate.median.toLocaleString(undefined, {
+      maximumFractionDigits: 1,
+    })} tok/s decode for ${best.report.model} on ${best.report.runtimeId} (median of n=${rate.n}).`,
+    evidence: [
+      ...profile.evidence,
+      `Benchmarked on this machine: ${measured.length} model${measured.length === 1 ? "" : "s"}`,
+    ],
+  };
 }

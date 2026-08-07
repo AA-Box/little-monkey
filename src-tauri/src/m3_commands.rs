@@ -9,7 +9,9 @@ use crate::agent_launcher::{
     self, AgentConfigDriftReport, AgentTool, DriftCheckInput, GenerateAgentConfigRequest,
     GeneratedAgentConfig,
 };
-use crate::benchmark::{self, BenchmarkReport, BenchmarkRequest, PeakMemory};
+use crate::benchmark::{
+    self, BenchmarkFreshness, BenchmarkReport, BenchmarkRequest, MachineIdentity, PeakMemory,
+};
 use crate::chat_template_lab::{run_chat_template_lab, ChatTemplateLabReport, TemplateFamily};
 use crate::compatibility_hub::{
     CanonicalContent, CanonicalInferenceRequest, CanonicalMessage, CanonicalRole,
@@ -26,12 +28,11 @@ use crate::m3_runtime_hub::{
     M3ApiDispatchRequest, M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch,
     M3CleanupReport, M3CompatibilityMatrixReport, M3ComponentCatalogEntry, M3ComponentHub,
     M3ComponentKind, M3ComponentUpdateCheck, M3DeleteModelRequest, M3DownloadRequest,
-    M3HardwareCompatibilityReport,
-    M3HubError, M3InstallComponentRequest, M3InstalledComponentView, M3InstalledModelView,
-    M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest, M3RuntimeCapabilityView,
-    M3RuntimeHub, M3RuntimeKind, M3RuntimeMetricsView, M3RuntimeStatusView,
-    M3SetRuntimeConfigRequest, M3SettingCapabilitiesView, M3StorageStatus, M3UnloadModelRequest,
-    M3VerifyProjectorRequest,
+    M3HardwareCompatibilityReport, M3HubError, M3InstallComponentRequest, M3InstalledComponentView,
+    M3InstalledModelView, M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest,
+    M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeKind, M3RuntimeMetricsView,
+    M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3SettingCapabilitiesView, M3StorageStatus,
+    M3UnloadModelRequest, M3VerifyProjectorRequest,
 };
 use crate::quantization::{
     BackendDescriptor, ConversionReport, ConversionRequest, DeclaredLicense, GgufQuantType,
@@ -48,7 +49,7 @@ use crate::runtime_telemetry::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
@@ -290,6 +291,7 @@ pub struct M3BenchmarkResponse {
 /// that does not run here at all (below).
 #[tauri::command]
 pub async fn m3_benchmark_run(
+    app: tauri::AppHandle,
     state: tauri::State<'_, M3CommandState>,
     operation_id: String,
     timeout_ms: Option<u64>,
@@ -298,7 +300,54 @@ pub async fn m3_benchmark_run(
     let request = request.validated()?;
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let result = benchmark_with_context(&state, &request, &context).await;
-    finish(&state, &operation_id, result).await
+    let response = finish(&state, &operation_id, result).await?;
+
+    // Persisted after the operation is finished, not inside it: a benchmark that
+    // measured fine but could not be written down is still a valid measurement,
+    // and failing the command would throw away the wall-clock the user spent.
+    // The write error is surfaced through the log rather than swallowed.
+    let path = benchmark_history_path(&app)?;
+    let stored = StoredBenchmark {
+        report: response.report.clone(),
+        machine: machine_identity(&response.hardware),
+        measured_at_ms: trusted_now_ms(),
+    };
+    if let Err(error) = load_benchmarks(&path)
+        .and_then(|existing| save_benchmarks(&path, &remember_benchmark(existing, stored)))
+    {
+        eprintln!("benchmark measured but not saved: {error}");
+    }
+    Ok(response)
+}
+
+/// Every benchmark this machine has kept, most recent first, each labelled with
+/// whether its numbers still describe the machine asking.
+///
+/// The freshness verdict is computed here rather than stored, because the
+/// question is "is this still true *now*" — a report that was fresh yesterday
+/// and stale today has not changed, the machine has.
+#[tauri::command]
+pub fn m3_benchmark_history(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, M3CommandState>,
+) -> Result<Vec<BenchmarkHistoryEntry>, String> {
+    let current = machine_identity(&state.hub.hardware_snapshot().map_err(command_error)?);
+    Ok(load_benchmarks(&benchmark_history_path(&app)?)?
+        .into_iter()
+        .map(|stored| BenchmarkHistoryEntry {
+            freshness: stored.machine.freshness_against(&current),
+            stored,
+        })
+        .collect())
+}
+
+fn benchmark_history_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    use tauri::Manager as _;
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Failed to resolve app data dir: {error}"))?
+        .join(BENCHMARK_FILE))
 }
 
 /// The I/O half of the benchmark, kept out of `benchmark.rs` for the same reason
@@ -395,6 +444,114 @@ async fn refuse_a_model_this_machine_does_not_run(
         )));
     }
     Ok(())
+}
+
+/// Filename for the persisted benchmark history under the app data directory —
+/// the same file-per-feature pattern as `web_settings.json`/`providers.json`.
+///
+/// Not a table in the run ledger: a benchmark measures *this machine*, not a
+/// run, and hanging it off the ledger's run-shaped schema would be the same
+/// category error `permission_decisions` had to work around.
+const BENCHMARK_FILE: &str = "benchmarks.json";
+
+/// How many reports to keep. One per model per runtime is the useful unit, and a
+/// user with more than this many benchmarked models is better served by the most
+/// recent ones than by an unbounded file.
+const MAX_STORED_BENCHMARKS: usize = 32;
+
+/// A report, the machine it was measured on, and when.
+///
+/// The machine identity is stored *with* the report rather than derived later,
+/// because "was this measured here" is unanswerable once the snapshot is gone —
+/// and answering it wrong is exactly the failure the benchmark surface exists to
+/// prevent.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoredBenchmark {
+    pub report: BenchmarkReport,
+    pub machine: MachineIdentity,
+    pub measured_at_ms: u64,
+}
+
+/// A stored report paired with whether its numbers may be shown.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkHistoryEntry {
+    #[serde(flatten)]
+    pub stored: StoredBenchmark,
+    pub freshness: BenchmarkFreshness,
+}
+
+/// The stable parts of a snapshot a stored benchmark is valid for.
+///
+/// Lives here rather than in `benchmark.rs` so that module keeps no dependency
+/// on hardware probing — it may compare an identity it is handed, never build
+/// one from the host.
+fn machine_identity(hardware: &HardwareSnapshot) -> MachineIdentity {
+    let mut accelerators: Vec<String> = hardware
+        .platform
+        .accelerators
+        .iter()
+        .flat_map(|accelerator| accelerator.device_names.iter().cloned())
+        .collect();
+    accelerators.sort();
+    MachineIdentity {
+        os: hardware.platform.os.clone(),
+        arch: hardware.platform.arch.clone(),
+        total_ram_bytes: hardware.total_ram_bytes,
+        logical_cpu_count: hardware.logical_cpu_count,
+        accelerators,
+    }
+}
+
+/// Reads the stored history, treating a missing file as empty.
+///
+/// A *corrupt* file is an error rather than an empty history: silently starting
+/// over would discard measurements the user paid real wall-clock time for, and
+/// they would never learn it happened.
+fn load_benchmarks(path: &Path) -> Result<Vec<StoredBenchmark>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("Corrupt {BENCHMARK_FILE}: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("Failed to read {BENCHMARK_FILE}: {e}")),
+    }
+}
+
+/// Atomic sibling temp file + rename, the same idiom as `web.rs`'s
+/// `save_settings_impl` and `mcp.rs`'s `save_config_impl`.
+fn save_benchmarks(path: &Path, stored: &[StoredBenchmark]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create the app data dir: {e}"))?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    let serialized = serde_json::to_vec_pretty(stored)
+        .map_err(|e| format!("Failed to encode benchmarks: {e}"))?;
+    std::fs::write(&temporary, serialized)
+        .map_err(|e| format!("Failed to write {BENCHMARK_FILE}: {e}"))?;
+    std::fs::rename(&temporary, path).map_err(|e| format!("Failed to save {BENCHMARK_FILE}: {e}"))
+}
+
+/// Insert `fresh`, replacing any earlier report for the same runtime and model.
+///
+/// Most recent first, capped at [`MAX_STORED_BENCHMARKS`]. Replacing rather than
+/// appending is deliberate: two reports for one model on one runtime differ only
+/// by when they ran, and keeping both invites a reader to compare numbers that
+/// were never meant to be a time series.
+fn remember_benchmark(
+    existing: Vec<StoredBenchmark>,
+    fresh: StoredBenchmark,
+) -> Vec<StoredBenchmark> {
+    let mut kept: Vec<StoredBenchmark> = existing
+        .into_iter()
+        .filter(|entry| {
+            entry.report.runtime_id != fresh.report.runtime_id
+                || entry.report.model != fresh.report.model
+        })
+        .collect();
+    kept.insert(0, fresh);
+    kept.truncate(MAX_STORED_BENCHMARKS);
+    kept
 }
 
 /// Reads the runtime process's high-water mark, collecting the platform's own
@@ -1585,5 +1742,133 @@ mod tests {
             cancel[forbidden.0] = forbidden.1;
             assert!(serde_json::from_value::<M3DiagnosticCancelRequest>(cancel).is_err());
         }
+    }
+
+    fn stored(runtime_id: &str, model: &str, measured_at_ms: u64) -> StoredBenchmark {
+        StoredBenchmark {
+            report: BenchmarkReport {
+                schema_version: 1,
+                runtime_id: runtime_id.to_string(),
+                model: model.to_string(),
+                quantization: None,
+                max_output_tokens: 128,
+                repeats_requested: 5,
+                warmup_discarded: 1,
+                samples: Vec::new(),
+                time_to_first_token_ms: None,
+                decode_tokens_per_second: None,
+                peak_memory: PeakMemory::measure(None, None, None),
+                unavailable: Vec::new(),
+            },
+            machine: MachineIdentity {
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                total_ram_bytes: 16 << 30,
+                logical_cpu_count: 8,
+                accelerators: Vec::new(),
+            },
+            measured_at_ms,
+        }
+    }
+
+    /// Two reports for one model on one runtime differ only by when they ran, so
+    /// keeping both would invite a reader to compare numbers that were never
+    /// meant to be a time series.
+    #[test]
+    fn re_benchmarking_a_pair_replaces_its_entry_rather_than_appending() {
+        let history = remember_benchmark(Vec::new(), stored("llama-local", "qwen3-4b", 1));
+        let history = remember_benchmark(history, stored("llama-local", "gemma3-4b", 2));
+        let history = remember_benchmark(history, stored("llama-local", "qwen3-4b", 3));
+
+        assert_eq!(
+            history.len(),
+            2,
+            "the qwen entry was replaced, not appended"
+        );
+        assert_eq!(history[0].report.model, "qwen3-4b");
+        assert_eq!(history[0].measured_at_ms, 3, "most recent first");
+        assert_eq!(history[1].report.model, "gemma3-4b");
+
+        // Same model on a different runtime is a different measurement.
+        let history = remember_benchmark(history, stored("ollama", "qwen3-4b", 4));
+        assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn the_history_is_capped_and_drops_the_oldest() {
+        let mut history = Vec::new();
+        for index in 0..(MAX_STORED_BENCHMARKS + 5) {
+            history = remember_benchmark(
+                history,
+                stored("llama-local", &format!("model-{index}"), index as u64 + 1),
+            );
+        }
+        assert_eq!(history.len(), MAX_STORED_BENCHMARKS);
+        assert_eq!(
+            history[0].report.model,
+            format!("model-{}", MAX_STORED_BENCHMARKS + 4),
+            "the newest survives"
+        );
+        assert!(
+            !history.iter().any(|entry| entry.report.model == "model-0"),
+            "the oldest was dropped"
+        );
+    }
+
+    /// A stored report may only be shown when the machine still matches. The
+    /// volatile fields — `captured_at_ms`, `available_ram_bytes` — are excluded
+    /// from the identity precisely so a fresh report does not read as stale a
+    /// second after it was written.
+    #[test]
+    fn freshness_ignores_volatile_fields_and_names_real_changes() {
+        let here = stored("llama-local", "qwen3-4b", 1).machine;
+        assert_eq!(
+            here.freshness_against(&here.clone()),
+            BenchmarkFreshness::ThisMachine
+        );
+
+        let mut more_ram = here.clone();
+        more_ram.total_ram_bytes = 32 << 30;
+        let BenchmarkFreshness::DifferentMachine { changed } = here.freshness_against(&more_ram)
+        else {
+            panic!("refitted RAM must invalidate a stored report");
+        };
+        assert_eq!(changed.len(), 1);
+        assert!(changed[0].contains("installed RAM"), "got {changed:?}");
+
+        let mut gpu_added = here.clone();
+        gpu_added.accelerators = vec!["NVIDIA RTX 4090".to_string()];
+        let BenchmarkFreshness::DifferentMachine { changed } = here.freshness_against(&gpu_added)
+        else {
+            panic!("a new accelerator must invalidate a stored report");
+        };
+        assert!(changed[0].contains("accelerators"), "got {changed:?}");
+    }
+
+    /// A corrupt file must not read as "never benchmarked": silently starting
+    /// over would discard measurements the user paid wall-clock time for, and
+    /// they would never learn it happened.
+    #[test]
+    fn a_corrupt_history_is_an_error_but_a_missing_one_is_empty() {
+        let directory = std::env::temp_dir().join(format!(
+            "little-monkey-benchmarks-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(BENCHMARK_FILE);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(load_benchmarks(&path).unwrap().is_empty());
+
+        let history = vec![stored("llama-local", "qwen3-4b", 1)];
+        save_benchmarks(&path, &history).unwrap();
+        assert_eq!(load_benchmarks(&path).unwrap(), history, "round trip");
+
+        std::fs::write(&path, b"{ not json").unwrap();
+        let error = load_benchmarks(&path).unwrap_err();
+        assert!(error.contains("Corrupt"), "got {error}");
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
