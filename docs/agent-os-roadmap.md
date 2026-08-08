@@ -1113,7 +1113,7 @@ only a stop. What K8 still needs from elsewhere is the reservation question
 above — a suspended process holds its resident model slot, worktree lease and
 workspace root — which is a K7/K8 decision, not a signals one.
 
-## K3. Isolation parity across platforms *(partially built)*
+## K3. Isolation parity across platforms *(built on all three; parity test owed on Windows)*
 
 **Today:** real Seatbelt (`sandbox-exec`) confinement on macOS, with an
 integration test asserting a sandboxed command cannot read or write the real
@@ -1215,80 +1215,89 @@ absence of the mechanism is now a failure, so green means the assertions ran; th
 skip survives only for a developer whose kernel lacks Landlock, which is not a
 regression in this code.
 
-**Remaining — Windows, and the acceptance above was worded backwards.** Assessing it
-before writing any of it changed the answer, so the acceptance is amended rather
-than merely deferred:
+**Shipped — the Windows leg, and the entry below it predicted the cost correctly while
+predicting the outcome wrongly.** `sandbox_windows.rs`. An **AppContainer** is the
+filesystem and network boundary, so a run that gets one reports `Isolation::OsSandboxed`
+like Seatbelt and Landlock do, and `sandbox_enforcement()` answers `OsEnforced`. A job
+object underneath it bounds the process tree, its memory and its window-station reach; a
+machine that can create a job but not a container degrades to `ProcessContained`, and one
+that can create neither to `ProcessOnly`. Three answers from two mechanisms, probed rather
+than read off the target triple, because group policy can refuse either.
 
-- **A job object contributes nothing to this item.** It gives resource caps,
-  kill-on-close and UI restrictions, and *no* filesystem restriction at all — it
-  never participates in an access check. Its one security-relevant knob,
-  `JOB_OBJECT_UILIMIT_HANDLES`, closes the `SendMessage` hole that
-  `CreateRestrictedToken`'s own documentation warns about, which is why the original
-  pairing was right about needing both and wrong about which one isolates. The job
-  object belongs to K4, and `Isolation` stays `ProcessOnly` with it.
-- **A restricted token's denial depends on the user's directory ACLs.** It works
-  only with a restricting-SID list that excludes the user's SID, and even then an
-  ACE for `Users`/`Everyone` — common on a hand-made `C:\dev` — satisfies the second
-  access check and the workspace stays reachable. So it cannot be stated as a
-  guarantee. Worse, the version most likely to get written (`DISABLE_MAX_PRIVILEGE`,
-  no `SidsToRestrict`) confines *nothing* while passing a smoke test, which would
-  let this app report `OsSandboxed` falsely — the exact overstatement this file
-  exists to prevent. It is a hardening layer, not the mechanism.
-- **AppContainer/LPAC is the mechanism**, because a lowbox token makes the
-  filesystem deny-by-default regardless of the workspace's DACL, and turns network
-  into a capability that maps directly onto `allow_network`. That is the real
-  analogue of Seatbelt's deny-plus-allowlist.
+**The filesystem boundary inverts the other two platforms' shape and is stronger for it.**
+An AppContainer process can reach an object only if its DACL grants that container's SID or
+`ALL APPLICATION PACKAGES`, so the grant is a single ACE on the sandbox root and nothing
+else. `build_seatbelt_profile` and `sandbox_linux` have to *enumerate* readable system roots
+and keep that list correct per distribution; here the user's home, the real workspace and
+every other user file are denied because nothing granted them, not because a list remembered
+to leave them out.
 
-The cost is the reason it is not in this change. It needs
-`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` through a process attribute list, and
-`spawn_with_attributes` is **nightly-only** (rust-lang/rust#114854) while CI builds
-on stable; `tokio`'s `spawn_with` is additionally behind `tokio_unstable`. `std`
-exposes no token parameter at any stability level, so `CreateProcessAsUserW` is
-unreachable by construction. Doing it means replacing the twelve-line tokio spawn
-with hand-rolled FFI that re-implements the UTF-16 environment block, three pipe
-pairs with *concurrent* stdout/stderr draining (serial reads deadlock at the 64 KiB
-buffer), `kill_on_drop`, and the timeout path — several hundred lines of unsafe on a
-security boundary, for a target this repo's dev machines cannot typecheck. It also
-needs runtime ACL edits so the confined child can write its own `HOME`/`TMPDIR`, or
-the *positive* half of the parity test fails.
+**Every cost this entry named was real, and paid rather than avoided.** It said
+AppContainer needs `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` through a process attribute
+list, that `spawn_with_attributes` is nightly-only, and that reaching it means hand-rolled
+FFI re-implementing the UTF-16 environment block, three pipe pairs with concurrent draining,
+`kill_on_drop` and the timeout path — "several hundred lines of unsafe on a security
+boundary". That is exactly what the module is: it owns `CreateProcessW` and rebuilds what
+`tokio::process` was doing. Two of its own findings are the ones that entry could not have
+had: the parent's copies of the child's pipe *write* ends must close the moment the child
+holds its own, or every run blocks until its timeout instead of until the command finishes;
+and the timeout kills through `TerminateJobObject` rather than the process, so it takes the
+whole tree.
 
-Two further findings for whoever picks it up: the network contrast test does **not**
-port as written, because AppContainer blocks loopback by default even with
-`internetClient` (it needs a `CheckNetIsolation` exemption); and on a hosted runner
-the calling account is an administrator, so CI is the *privileged* case — a green
-Windows run would not prove the mechanism works for a standard user. The cheap first
-step is a CI-only probe in the existing `verify-*.yml` pattern rather than an edit to
-`sandbox.rs`.
+**Its two warnings for whoever picked it up were both correct.** Loopback does not port:
+Windows blocks it from an AppContainer unless the container SID holds a machine-wide
+`CheckNetIsolation` exemption, which is an admin-level setting this app has no business
+writing. So a network-allowed run on Windows reaches a public address but not `127.0.0.1`,
+where macOS and Linux reach both — stricter than those, never looser, so it cannot turn a
+denied run into an allowed one, and it is documented at the module rather than discovered.
 
-Also unbuilt on Linux: user namespaces. `unshare(CLONE_NEWNET)` needs
-`CLONE_NEWUSER` first for an unprivileged process, which changes uid semantics and is
-disabled outright in many container and CI environments, so seccomp on socket
-creation was taken instead. Landlock plus that filter covers what the acceptance
-asks of the Linux leg; namespaces would add a stronger network boundary and a mount
-view, and the latter is K10's business rather than this item's.
+**Remaining — the parity test, which is a narrower gap than the mechanism was.** The two
+live-enforcement helpers macOS and Linux share, `assert_real_workspace_stays_out_of_reach`
+and `assert_loopback_is_reachable_only_when_network_is_allowed`, are still gated
+`#[cfg(any(target_os = "macos", target_os = "linux"))]`. Windows has a real enforcement-state
+test and its job-object containment test, but it has not joined the shared assertion body, so
+"the real workspace is denied" is asserted on two platforms and argued on the third. The
+second warning that entry left is why this is not a one-line `cfg` widening: **on a hosted
+runner the calling account is an administrator, so CI is the *privileged* case** — a green
+Windows run would not prove the mechanism works for a standard user. Closing it honestly
+means a test that establishes its own unprivileged context, not one that widens a `cfg` and
+reports success.
 
-Also open, and deliberately **not** treated as a quick win after checking it: the
-agent's own shell tool has no `env_clear()` on any platform, so a tool call
-inherits the app's full parent environment. The tempting framing is "it leaks
-secrets", and that overstates it — there is no production `std::env::set_var`
-anywhere in the crate and no provider key is injected into any child's
-environment, so what a tool call inherits is whatever launched the app: close to
-nothing from Finder, and a developer's own exports when started from a terminal.
+Also unbuilt on Linux: user namespaces. `unshare(CLONE_NEWNET)` needs `CLONE_NEWUSER` first
+for an unprivileged process, which changes uid semantics and is disabled outright in many
+container and CI environments, so seccomp on socket creation was taken instead. Landlock plus
+that filter covers what the acceptance asks of the Linux leg; namespaces would add a stronger
+network boundary and a mount view, and the latter is K10's business rather than this item's.
 
-The reason this is not a one-line fix is that the obvious fix is wrong. A blanket
-`env_clear()` would strip `PATH`, `HOME`, toolchain and proxy variables from every
-tool call, and an allowlist narrow enough to be safe breaks the same commands —
-`sandbox.rs`'s `allowlisted_env` can be that strict only because it serves a
-disposable probe, not the user's real workspace. What tool calls should inherit is
-a policy decision that belongs with K5's egress work, not a hardening tweak to
-smuggle in here.
+**The two caveats that outlived the platform work, and are now the whole of this item.**
+Both were true when the sandbox was macOS-only and are unchanged by having three legs:
 
-**Blocks:** still the claim, but for one platform rather than two. Isolation is now
-kernel-enforced on macOS and Linux and advisory on Windows, so the honest sentence
-changed from "advisory on two of three" to "advisory on Windows" — a smaller gap,
-and not a closed one. Also K21 concretely: its conformance suite must cover the
-isolation guarantees, and while they can now be asserted on two platforms with the
-same test body, Windows still cannot join it.
+- **The sandbox is still opt-in, with exactly one non-test caller.** `execute_in_sandbox` is
+  reached only from `sandbox_run`, behind the Sandbox panel and `probeGeneratedMcpArtifact`.
+  Kernel-enforced confinement on every desktop platform describes one *feature*, not how
+  agent tools run.
+- **The agent's own shell tool is not routed through it on any platform**, and has no
+  `env_clear()` — it spawns `sh -c` / `cmd /C` with the workspace as cwd, inheriting whatever
+  launched the app. The tempting framing is "it leaks secrets", and that overstates it: there
+  is no production `std::env::set_var` anywhere in the crate and no provider key is injected
+  into any child's environment, so what a tool call inherits is close to nothing from Finder
+  and a developer's own exports from a terminal.
+
+  This is not a one-line fix because the obvious fix is wrong. A blanket `env_clear()` would
+  strip `PATH`, `HOME`, toolchain and proxy variables from every tool call, and an allowlist
+  narrow enough to be safe breaks the same commands — `sandbox.rs`'s `allowlisted_env` can be
+  that strict only because it serves a disposable probe, not the user's real workspace. Nor
+  is pointing the shell tool at `execute_in_sandbox` the answer: the sandbox denies the real
+  workspace by design and the agent's job is to edit it. What tool calls should be allowed to
+  reach is a policy question, and it belongs with K5.
+
+**Blocks:** no longer the platform half of the claim — isolation is kernel-enforced on
+macOS, Linux and Windows. What it still blocks is narrower and stated above: the sandbox is
+opt-in and the agent's shell tool does not go through it, so "enforced by the platform" is
+true of a feature rather than of how agent tools run. K21 concretely: its conformance suite
+must cover the isolation guarantees, and Windows has the mechanism but not yet the shared
+assertion body, so a suite written today could certify two platforms by test and the third
+by argument.
 
 ## K4. Enforced per-process resource limits *(userspace built; platform legs deferred)*
 
@@ -1716,17 +1725,25 @@ about whether the app can obtain a cgroup; a probe-and-skip test would be green 
 asserting nothing, which reads as coverage. **If wanted, file the transient-scope
 route as its own item with an `Unavailable(reason)` surfaced to the user.**
 
-**Windows job objects — real and CI-testable, but the sharpest asymmetric hazard in
-this item.** `KILL_ON_JOB_CLOSE` makes a dropped guard tear down the whole tree on
-Windows while being a silent no-op on macOS: invisible on the machine the code is
-written on, fatal on the platform that cannot be typechecked there (Homebrew rustc,
-`aarch64-apple-darwin` only). `background_shell.rs` is exactly the wrong-owner case —
-its child is *meant* to outlive the spawning call — so a misplaced guard would kill
-every Windows background shell instantly. It also needs a signature change, since
-`apply` returns `()` while a job handle is an owned resource whose lifetime must span
-the child, plus four call-site changes. **It is not the fill-in-the-no-op the
-acceptance wording implies, and it should be built with CI in the loop from the first
-commit rather than written blind.**
+**Windows job objects — now built for one owner, and still deferred for the rest, which
+is the distinction this entry was written to protect.** K3's Windows sandbox
+(`sandbox_windows.rs`) puts every *sandboxed* run in a job object with
+`JOB_OBJECT_LIMIT_ACTIVE_PROCESS`, `JOB_OBJECT_LIMIT_JOB_MEMORY` and
+`KILL_ON_JOB_CLOSE`, and the committed-memory bound there is strictly better than the
+per-process `setrlimit` unix gets: a tree of small processes cannot add up to an unbounded
+total. That is one caller, chosen because a sandboxed run is exactly the case whose tree
+*should* die with its guard.
+
+**The hazard this entry named is why it stops there.** `KILL_ON_JOB_CLOSE` makes a dropped
+guard tear down the whole tree on Windows while being a silent no-op on macOS: invisible on
+the machine the code is written on, fatal on the platform that cannot be typechecked there
+(Homebrew rustc, `aarch64-apple-darwin` only). `background_shell.rs` is the wrong-owner
+case — its child is *meant* to outlive the spawning call — and it still has no job object,
+deliberately: a misplaced guard would kill every Windows background shell instantly. The
+signature problem is unchanged too, since a job handle is an owned resource whose lifetime
+must span the child. **Extending job objects to the process table's other kinds is still
+not the fill-in-the-no-op the acceptance wording implies**, and the sandbox leg is evidence
+for that rather than against it — it took owning `CreateProcessW` to get there.
 
 ### Still genuinely missing, after the corrections above narrowed the list
 
@@ -3943,23 +3960,28 @@ and shares fairly on CPU milliseconds it measured itself (K6–K8). Resource
 arbitration is real: admission consults live hardware and the offload plan, holds
 what does not fit, and rejects at enqueue what can never fit.
 
-**Isolation (K3) is the clause that still decides the name, and it is now half
-met.** Landlock and seccomp confinement ship on Linux and are exercised against a
-real kernel in CI, so "enforced by the platform, not requested politely by the
-program" — the definition this file opens with — is true on macOS and Linux. It is
-not true on Windows, where the only mechanism that could make it true is
-AppContainer and the cost of reaching it is set out under K3.
+**Isolation (K3) is the clause that decided the name, and the platform half of it is
+now met on all three.** Seatbelt on macOS, Landlock plus seccomp on Linux, AppContainer
+plus a job object on Windows — so "enforced by the platform, not requested politely by the
+program", the definition this file opens with, is true wherever this app runs. Two of those
+three are exercised against a real kernel in CI by a shared assertion body; Windows has the
+mechanism and its own enforcement test but has not joined that body, and K3 states why
+widening the `cfg` would not be honest (a hosted runner's account is an administrator, so
+CI is the privileged case).
 
-Two things temper that even on the platforms where it holds, and both are worth
-stating plainly rather than leaving for a reader to find. The sandbox is still
-**opt-in**, with one non-test caller. And **the agent's own shell tool is not routed
-through it on any platform** — it spawns `sh -c` / `cmd /C` with the workspace as
-cwd. That is not an oversight to be fixed by pointing the shell tool at
-`execute_in_sandbox`, because the sandbox denies the real workspace by design and
-the agent's job is to edit it; what tool calls should be allowed to reach is a
-policy question, and it belongs with K5.
+**What still decides the name is no longer a platform, and that is a sharper problem
+rather than a smaller one.** The sandbox is **opt-in**, with exactly one non-test caller,
+and **the agent's own shell tool is not routed through it on any platform** — it spawns
+`sh -c` / `cmd /C` with the workspace as cwd. So the honest sentence has changed from
+"advisory on Windows" to something less comfortable: confinement is real and available on
+every platform, and the agent does not use it. That is not fixed by pointing the shell tool
+at `execute_in_sandbox`, because the sandbox denies the real workspace by design and the
+agent's job is to edit it; what tool calls should be allowed to reach is a policy question,
+and it belongs with K5.
 
-So the name does not change yet. The reason is narrower than it was — Windows
-isolation, the sandbox being opt-in, and Phase 3 (copy-on-write namespace,
-tamper-evident log chaining, freeze/restore, transactional effects) still being
-largely ahead — but it is still a reason.
+So the name does not change yet, and the reasons have moved rather than shrunk: the
+sandbox is opt-in and unused by the agent's own tools, and Phase 3 (copy-on-write namespace
+— now started on macOS under K10 — tamper-evident log chaining, freeze/restore,
+transactional effects) is still largely ahead. Platform isolation is no longer one of them,
+which means the next honest step is a policy decision about what tool calls may reach, not
+another platform leg.
