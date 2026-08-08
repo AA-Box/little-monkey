@@ -11,6 +11,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   availableConditioning,
+  formatLaunchArgs,
+  parseLaunchArgs,
   engineSupports,
   CONDITIONING_SLOTS,
   COMPONENT_SLOTS,
@@ -96,5 +98,69 @@ describe("COMPONENT_SLOTS", () => {
     for (const slot of Object.keys(CONDITIONING_SLOTS) as ComponentSlot[]) {
       expect(listed.has(slot)).toBe(true);
     }
+  });
+});
+
+describe("parseLaunchArgs", () => {
+  it("splits on whitespace like it always did", () => {
+    expect(parseLaunchArgs("--diffusion-fa --threads 8")).toEqual([
+      "--diffusion-fa",
+      "--threads",
+      "8",
+    ]);
+    expect(parseLaunchArgs("   ")).toEqual([]);
+    expect(parseLaunchArgs("")).toEqual([]);
+  });
+
+  it("keeps a quoted path with spaces in one argument", () => {
+    // The whole reason this parser exists: --embd-dir, --hires-upscalers-dir,
+    // --upscale-model and --ad-model all take a path, and a whitespace split
+    // handed the engine a truncated one.
+    expect(parseLaunchArgs("--embd-dir '/My Weights/embeddings'")).toEqual([
+      "--embd-dir",
+      "/My Weights/embeddings",
+    ]);
+    expect(parseLaunchArgs('--embd-dir "/My Weights/embeddings"')).toEqual([
+      "--embd-dir",
+      "/My Weights/embeddings",
+    ]);
+  });
+
+  it("lets each quote style carry the other literally", () => {
+    expect(parseLaunchArgs(`--name "Ahmad's models"`)).toEqual(["--name", "Ahmad's models"]);
+    expect(parseLaunchArgs(`--name 'say "hi"'`)).toEqual(["--name", 'say "hi"']);
+  });
+
+  it("treats an explicitly empty argument as one the user typed", () => {
+    expect(parseLaunchArgs('--model-args ""')).toEqual(["--model-args", ""]);
+  });
+
+  it("does not expand anything, because there is no shell behind it", () => {
+    // Arguments go to Command::args directly, so a parser that expanded these
+    // would promise a substitution that never happens.
+    expect(parseLaunchArgs("--dir $HOME/*.safetensors")).toEqual([
+      "--dir",
+      "$HOME/*.safetensors",
+    ]);
+  });
+});
+
+describe("formatLaunchArgs", () => {
+  it("round-trips whatever the parser produced", () => {
+    for (const text of [
+      "--diffusion-fa --threads 8",
+      "--embd-dir '/My Weights/embeddings'",
+      `--name "Ahmad's models"`,
+      '--model-args ""',
+    ]) {
+      const args = parseLaunchArgs(text);
+      expect(parseLaunchArgs(formatLaunchArgs(args))).toEqual(args);
+    }
+  });
+
+  it("leaves ordinary arguments unquoted so the field stays readable", () => {
+    expect(formatLaunchArgs(["--diffusion-fa", "--threads", "8"])).toBe(
+      "--diffusion-fa --threads 8",
+    );
   });
 });

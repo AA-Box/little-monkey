@@ -67,6 +67,8 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.grid4n1": "Round down to 4n+1 (Wan, most video)",
   "Studio.add.grid17k5": "Round up to 17k+5 (MiniMax H3)",
   "Studio.add.engineArgs": "Extra engine arguments",
+  "Studio.add.engineArgsHint":
+    "Passed to the engine as typed — no shell, so quote any path with spaces. This is how flags without their own field are reached: --hires-upscalers-dir, --embd-dir, --vae-format, --model-args.",
   "Studio.add.save": "Add to library",
   "Studio.lora.title": "LoRAs",
   "Studio.lora.add": "Add LoRA",
@@ -175,6 +177,10 @@ export const studioLocale: Record<string, string> = {
   "Studio.reference.remove": "Remove reference",
   "Studio.reference.hint": "Photographs of the subject to keep consistent.",
   "Studio.reference.full": "At most {{max}} reference images per run.",
+  "Studio.reference.numbered": "Number them so the prompt can tell them apart",
+  "Studio.reference.numberedHint":
+    "Each reference is numbered in the order shown, so a prompt can say \"the jacket from image 2\".",
+  "Studio.reference.numberedAlt": "Reference image {{index}}",
   "Studio.duration": "Duration",
   "Studio.frames": "{{frames}} frames · {{fps}} fps",
   "Studio.settings": "Settings",

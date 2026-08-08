@@ -7,6 +7,8 @@ import { describeWeightFile } from "../../lib/weightFileHints";
 import {
   ALL_TASKS,
   emptyModelSpec,
+  formatLaunchArgs,
+  parseLaunchArgs,
   studioClient,
   type GenerationModelSpec,
   type GenerationTask,
@@ -192,14 +194,11 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
         {t("Studio.add.engineArgs")}
         <input
           className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
-          value={spec.extraLaunchArgs.join(" ")}
+          value={formatLaunchArgs(spec.extraLaunchArgs)}
           placeholder={t("Studio.add.engineArgsPlaceholder")}
-          onChange={(event) =>
-            patch({
-              extraLaunchArgs: event.target.value.split(/\s+/).filter(Boolean),
-            })
-          }
+          onChange={(event) => patch({ extraLaunchArgs: parseLaunchArgs(event.target.value) })}
         />
+        <span className="text-faint">{t("Studio.add.engineArgsHint")}</span>
       </label>
 
       <Button

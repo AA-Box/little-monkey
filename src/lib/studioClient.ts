@@ -250,6 +250,67 @@ export interface ComponentOverride {
   path: string;
 }
 
+/**
+ * Splits the extra-engine-arguments field into the argv the engine is handed.
+ *
+ * Quote-aware, because several `sd-server` flags take a path and a path can
+ * contain a space: `--hires-upscalers-dir`, `--embd-dir`, `--upscale-model`,
+ * `--ad-model`. Splitting on whitespace turned `--embd-dir /My Weights/embs`
+ * into three arguments, and the engine either rejected the unknown ones or read
+ * a truncated path — so those flags were unusable for anyone whose folder had a
+ * space in it, which on macOS is most people.
+ *
+ * Deliberately not a shell: no variable expansion, no globbing, no backslash
+ * escapes. Arguments go straight to `Command::args`, never through a shell, and
+ * a parser that pretended otherwise would imply substitutions that cannot
+ * happen. Quotes group, and a quote is included literally by using the other
+ * kind around it.
+ */
+export function parseLaunchArgs(value: string): string[] {
+  const args: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let started = false;
+  for (const character of value) {
+    if (quote) {
+      if (character === quote) quote = null;
+      else current += character;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      // An empty quoted string is still an argument the user typed.
+      started = true;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      if (started) args.push(current);
+      current = "";
+      started = false;
+      continue;
+    }
+    current += character;
+    started = true;
+  }
+  if (started) args.push(current);
+  return args;
+}
+
+/** Renders argv back into the field, re-quoting anything that would not
+ *  survive [`parseLaunchArgs`]. Without this the round trip through the input
+ *  loses the grouping the user typed the moment they edit the field again. */
+export function formatLaunchArgs(args: string[]): string {
+  return args
+    .map((argument) => {
+      if (argument === "") return '""';
+      if (!/[\s"']/.test(argument)) return argument;
+      // Single quotes unless the argument contains one, in which case double
+      // quotes group it — matching what the parser accepts.
+      return argument.includes("'") ? `"${argument}"` : `'${argument}'`;
+    })
+    .join(" ");
+}
+
 /** The slots the generation page offers a chooser for: everything the library
  *  has a part for. A denoiser is what the model *is*, so it is never one. */
 export function choosableSlots(parts: PartAsset[]): ComponentSlot[] {
