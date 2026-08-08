@@ -41,6 +41,29 @@
 //! daemon store is already a second database with its own schema, so neither the
 //! extra file nor the convention is new.
 //!
+//! ## That constraint has since been lifted, and this file has not moved
+//!
+//! The paragraphs above were right about the ledger as it stood, and the
+//! reasoning is kept because it is what justified this file. What changed is the
+//! premise: `run_ledger`'s migration V13 records, per migration, whether it
+//! actually rejects an older binary's writes, and the forward-only guard now
+//! refuses only up to the newest *breaking* migration rather than the newest
+//! migration. An additive table no longer costs a rollback anything, which is
+//! precisely the one-way door this file was built to route around.
+//!
+//! This file stays where it is anyway, for a reason that outlived the original
+//! one: **the volume here is attacker-influenced.** See [`MAX_ROWS`] — a remote
+//! page can cause denials as fast as it can request subresources, and the ring
+//! buffer that bounds them would be a poor neighbour for a hash-chained,
+//! strictly append-only stream that must never drop a row. Moving these rows
+//! into `subsystem_events` would mean either giving that stream an eviction
+//! policy or letting a remote party grow it without limit; neither is
+//! acceptable, and the separate file is the honest place for a bounded log.
+//!
+//! What the ledger *should* gain is the other half — an **allowed** egress
+//! produces no row anywhere today — and that belongs in the ledger precisely
+//! because its volume is the app's own, not a remote party's.
+//!
 //! # Why a new refusal kind needs no migration
 //!
 //! Worth stating, because the instinct on being handed four new rules — K5's per-run
