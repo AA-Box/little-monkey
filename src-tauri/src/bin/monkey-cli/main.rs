@@ -474,15 +474,6 @@ enum StacksCmd {
         /// Stack name, matched case-insensitively.
         name: String,
     },
-    /// Publish an already-indexed stack's older index as its first Knowledge
-    /// 2.0 generation, reusing the embeddings already stored for it. Nothing is
-    /// embedded again, so this needs no embeddings server and takes seconds.
-    /// Refused if the stack already has a Knowledge 2.0 generation.
-    #[command(name = "import-v1")]
-    ImportV1 {
-        /// Stack name, matched case-insensitively.
-        name: String,
-    },
     /// Manage the embeddings-only `llama-server` instance a `llama`-backend
     /// stack's `reindex`/`search_docs` needs reachable on port 8091 — see
     /// `embed_cli.rs`'s module doc for why this exists as a pid-file-based
@@ -1374,7 +1365,6 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
         Cmd::Stacks(action) => match action {
             StacksCmd::List => stacks_cli::list(),
             StacksCmd::Reindex { name } => stacks_cli::reindex(name).await,
-            StacksCmd::ImportV1 { name } => stacks_cli::import_v1(name),
             StacksCmd::EmbedServer(EmbedServerCmd::Start { model_path }) => {
                 embed_cli::start(model_path.clone()).await
             }

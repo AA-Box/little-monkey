@@ -215,13 +215,6 @@ pub(crate) fn save_registry(base: &Path, stacks: &[KnowledgeStack]) -> Result<()
     Ok(())
 }
 
-pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 // ---------------------------------------------------------------------
 // Registry CRUD (AppHandle-free core)
 // ---------------------------------------------------------------------
@@ -532,15 +525,6 @@ pub fn resolve_search_stack_ids(
 // Embedding core
 // ---------------------------------------------------------------------
 
-/// True if two `EmbeddingSpec`s are compatible for reuse (same backend,
-/// same model/tag, same dimensionality) — the cheap check backing the
-/// design doc's #1 risk ("embedding-spec drift"): a spec change anywhere
-/// along this triple must hard-fail to "reindex required" rather than let a
-/// cached/loaded stack silently mix vectors from two different models.
-pub(crate) fn spec_matches(a: &EmbeddingSpec, b: &EmbeddingSpec) -> bool {
-    a.backend == b.backend && a.model_id_or_tag == b.model_id_or_tag && a.dim == b.dim
-}
-
 fn l2_normalize(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
@@ -818,30 +802,6 @@ mod tests {
     }
 
     // --- embedding-spec mismatch hard-fails ---
-
-    #[test]
-    fn spec_matches_true_for_identical_specs() {
-        assert!(spec_matches(&test_spec(768), &test_spec(768)));
-    }
-
-    #[test]
-    fn spec_matches_false_when_dim_changes() {
-        assert!(!spec_matches(&test_spec(768), &test_spec(1024)));
-    }
-
-    #[test]
-    fn spec_matches_false_when_model_changes() {
-        let mut other = test_spec(768);
-        other.model_id_or_tag = "different-model".to_string();
-        assert!(!spec_matches(&test_spec(768), &other));
-    }
-
-    #[test]
-    fn spec_matches_false_when_backend_changes() {
-        let mut other = test_spec(768);
-        other.backend = EmbeddingBackend::Ollama;
-        assert!(!spec_matches(&test_spec(768), &other));
-    }
 
     // --- registry CRUD ---
 

@@ -19,6 +19,7 @@ import { Button, IconButton, Listbox, StatusPill, Tabs } from "../ui";
 import { AddBackendForm } from "./AddBackendForm";
 import { AddModelForm } from "./AddModelForm";
 import { LoraStack } from "./LoraStack";
+import { MaskCanvas } from "./MaskCanvas";
 import { ModelFiles } from "./ModelFiles";
 import { useT } from "../../lib/i18n";
 import { describeWeightFile } from "../../lib/weightFileHints";
@@ -34,6 +35,7 @@ import {
   toSpec,
   ASPECT_PRESETS,
   MAX_BATCH_COUNT,
+  MAX_REF_IMAGES,
   SAMPLERS,
   SCHEDULERS,
   studioClient,
@@ -46,10 +48,12 @@ import {
   type LoraAsset,
   type LoraSelection,
   type ModelComponent,
+  availableConditioning,
   choosableSlots,
   COMPONENT_SLOTS,
   type ComponentOverride,
   type ComponentSlot,
+  type ConditioningImage,
   type PartAsset,
   backendModels,
   isRemoteModelId,
@@ -126,6 +130,145 @@ function SliderField({
         />
       </span>
     </label>
+  );
+}
+
+/** A thumbnail of a chosen conditioning image, small enough to sit inline in
+ *  the controls column. */
+function Thumbnail({ base64, alt }: { base64: string; alt: string }) {
+  return (
+    <img
+      src={`data:image/png;base64,${base64}`}
+      alt={alt}
+      className="h-12 w-12 shrink-0 rounded border border-border object-cover"
+    />
+  );
+}
+
+/** One conditioning image plus how strongly it applies. Shared by the control
+ *  image and the IP-Adapter reference, which differ only in wording — the two
+ *  are read by different weights but chosen the same way. */
+function ConditioningImageField({
+  label,
+  hint,
+  value,
+  onPick,
+  onClear,
+  strength,
+  onStrength,
+  strengthLabel,
+}: {
+  label: string;
+  hint: string;
+  value: string | null;
+  onPick: (file: File) => void;
+  onClear: () => void;
+  strength: number;
+  onStrength: (value: number) => void;
+  strengthLabel: string;
+}) {
+  const { t } = useT();
+  const input = useRef<HTMLInputElement | null>(null);
+  return (
+    <div className="grid gap-2 rounded-md border border-border p-2">
+      <span className="text-xs text-muted">{label}</span>
+      <div className="flex items-center gap-2">
+        <input
+          ref={input}
+          type="file"
+          accept="image/png,image/jpeg,image/webp"
+          className="hidden"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) onPick(file);
+            // Cleared so re-picking the same file still fires a change event.
+            event.target.value = "";
+          }}
+        />
+        {value && <Thumbnail base64={value} alt={label} />}
+        <Button size="sm" variant="secondary" onClick={() => input.current?.click()}>
+          <Upload size={13} />
+          {t("Studio.chooseImage")}
+        </Button>
+        {value && (
+          <IconButton size="sm" aria-label={t("Studio.clearImage")} onClick={onClear}>
+            <Trash2 size={12} />
+          </IconButton>
+        )}
+      </div>
+      {value && (
+        <SliderField
+          label={strengthLabel}
+          value={strength}
+          min={0}
+          max={1}
+          step={0.05}
+          onChange={onStrength}
+        />
+      )}
+      <p className="text-[11px] text-faint">{hint}</p>
+    </div>
+  );
+}
+
+/** The reference-image list for the identity- and edit-conditioned models,
+ *  which take several rather than one. */
+function ReferenceImages({
+  images,
+  onAdd,
+  onRemove,
+}: {
+  images: string[];
+  onAdd: (file: File) => void;
+  onRemove: (index: number) => void;
+}) {
+  const { t } = useT();
+  const input = useRef<HTMLInputElement | null>(null);
+  const full = images.length >= MAX_REF_IMAGES;
+  return (
+    <div className="grid gap-2 rounded-md border border-border p-2">
+      <span className="text-xs text-muted">{t("Studio.reference.title")}</span>
+      <div className="flex flex-wrap items-center gap-2">
+        {images.map((image, index) => (
+          <span key={`${index}-${image.slice(0, 16)}`} className="relative">
+            <Thumbnail base64={image} alt={t("Studio.reference.title")} />
+            <IconButton
+              size="sm"
+              className="absolute -right-1 -top-1"
+              aria-label={t("Studio.reference.remove")}
+              onClick={() => onRemove(index)}
+            >
+              <Trash2 size={10} />
+            </IconButton>
+          </span>
+        ))}
+        <input
+          ref={input}
+          type="file"
+          accept="image/png,image/jpeg,image/webp"
+          className="hidden"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) onAdd(file);
+            event.target.value = "";
+          }}
+        />
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={full}
+          onClick={() => input.current?.click()}
+        >
+          <Plus size={13} />
+          {t("Studio.reference.add")}
+        </Button>
+      </div>
+      <p className="text-[11px] text-faint">
+        {full
+          ? t("Studio.reference.full", { max: String(MAX_REF_IMAGES) })
+          : t("Studio.reference.hint")}
+      </p>
+    </div>
   );
 }
 
@@ -224,6 +367,18 @@ export function StudioPanel() {
    *  multiplies the wait as well as the output. */
   const [batchCount, setBatchCount] = useState(1);
   const [initImage, setInitImage] = useState<string | null>(null);
+  /** Inpainting: white is repainted, black is kept. Only ever set while an
+   *  init image exists, because it is a mask *over* that image. */
+  const [maskImage, setMaskImage] = useState<string | null>(null);
+  /** Structure to follow — already a depth map, pose skeleton or edge map. The
+   *  engine runs no detector, so a plain photo is followed as if it were one. */
+  const [controlImage, setControlImage] = useState<string | null>(null);
+  const [controlStrength, setControlStrength] = useState(0.9);
+  /** Style/content to borrow, read through the IP-Adapter. */
+  const [ipAdapterImage, setIpAdapterImage] = useState<string | null>(null);
+  const [ipAdapterStrength, setIpAdapterStrength] = useState(1);
+  /** Subjects to keep consistent, for the identity-conditioned architectures. */
+  const [refImages, setRefImages] = useState<string[]>([]);
   const [speakerFile, setSpeakerFile] = useState("");
   const [language, setLanguage] = useState("");
   const [loras, setLoras] = useState<LoraSelection[]>([]);
@@ -286,6 +441,20 @@ export function StudioPanel() {
   );
   const shown = shownGallery[0] ?? null;
   const shownHistory = shownGallery.slice(1);
+
+  // Which conditioning images this run can actually use. Read off the slots
+  // that will be *loaded* — the model's own plus anything overridden for this
+  // run — because a ControlNet chosen from the library counts exactly as much
+  // as one the model entry names. A remote backend has none of them: its
+  // conditioning fields are dropped on the way out, so offering the inputs
+  // would promise something the backend is never sent.
+  const conditioning = useMemo(() => {
+    if (remote || !selected) return new Set<ConditioningImage>();
+    return availableConditioning([
+      ...selected.components.map((component) => component.slot),
+      ...overrides.map((override) => override.slot),
+    ]);
+  }, [remote, selected, overrides]);
 
   // One chooser per slot the library has a part for. Not per slot the *model*
   // has: a checkpoint that needs a separate VAE does not name one, so keying
@@ -498,14 +667,26 @@ export function StudioPanel() {
     }
   };
 
-  const pickImage = async (file: File) => {
+  /** Reads a chosen file as bare base64 and hands it to whichever image slot
+   *  asked. One reader for the init image, the control image, the IP-Adapter
+   *  reference and the reference list — they differ only in where the bytes
+   *  land. */
+  const pickImage = async (file: File, receive: (base64: string) => void) => {
     const reader = new FileReader();
     reader.onload = () => {
       const result = String(reader.result ?? "");
       const comma = result.indexOf(",");
-      setInitImage(comma < 0 ? null : result.slice(comma + 1));
+      if (comma >= 0) receive(result.slice(comma + 1));
     };
     reader.readAsDataURL(file);
+  };
+
+  /** Dropping the source image drops the mask with it: a mask addresses that
+   *  image's pixels, so keeping it would silently repaint the wrong region of
+   *  whatever came next. */
+  const changeInitImage = (next: string | null) => {
+    setInitImage(next);
+    setMaskImage(null);
   };
 
   const generate = async () => {
@@ -543,6 +724,20 @@ export function StudioPanel() {
         speakerFile: isSpeechTask(task) ? speakerFile.trim() || null : null,
         language: isSpeechTask(task) ? language.trim() || null : null,
         initImageBase64: needsInitImage(task) ? initImage : null,
+        // Each conditioning input is sent only where its own control was
+        // offered, so a mask painted before switching task and a control image
+        // chosen before switching model cannot follow the run somewhere they
+        // mean nothing. The backend refuses them again on its own side.
+        maskImageBase64: task === "image_to_image" && initImage ? maskImage : null,
+        controlImageBase64: conditioning.has("control") ? controlImage : null,
+        controlStrength: conditioning.has("control") && controlImage ? controlStrength : null,
+        ipAdapterImageBase64: conditioning.has("ip_adapter") ? ipAdapterImage : null,
+        ipAdapterStrength:
+          conditioning.has("ip_adapter") && ipAdapterImage ? ipAdapterStrength : null,
+        refImagesBase64: conditioning.has("reference") ? refImages : [],
+        // Architecture-specific and not worth a control of its own until a
+        // model needs it; the engine's own default is what this matches.
+        increaseRefIndex: false,
         // Blank rows are a half-typed path, not a LoRA the user meant.
         loras: loras.filter((lora) => lora.path.trim().length > 0),
         componentOverrides: overrides,
@@ -618,7 +813,7 @@ export function StudioPanel() {
     try {
       const dataUrl = previews[entry.artifactId] ?? (await studioClient.mediaDataUrl(entry.artifactId));
       setPreviews((current) => ({ ...current, [entry.artifactId]: dataUrl }));
-      setInitImage(dataUrl.slice(dataUrl.indexOf(",") + 1));
+      changeInitImage(dataUrl.slice(dataUrl.indexOf(",") + 1));
       setTask(next);
       setPrompt(entry.prompt);
     } catch (reason) {
@@ -1131,7 +1326,7 @@ export function StudioPanel() {
                 className="hidden"
                 onChange={(event) => {
                   const file = event.target.files?.[0];
-                  if (file) void pickImage(file);
+                  if (file) void pickImage(file, changeInitImage);
                 }}
               />
               <Button size="sm" variant="secondary" onClick={() => fileInput.current?.click()}>
@@ -1144,13 +1339,65 @@ export function StudioPanel() {
                   <IconButton
                     size="sm"
                     aria-label={t("Studio.clearImage")}
-                    onClick={() => setInitImage(null)}
+                    onClick={() => changeInitImage(null)}
                   >
                     <Trash2 size={12} />
                   </IconButton>
                 </>
               )}
             </div>
+          )}
+
+          {/* Inpainting. Offered only for the still-image edit task: a mask
+              over the first frame of a clip would describe one frame out of
+              thirty-three, which is not what anyone means by it. */}
+          {task === "image_to_image" && initImage && !remote && (
+            <div className="grid gap-2">
+              <span className="text-xs text-muted">{t("Studio.mask.title")}</span>
+              <MaskCanvas imageBase64={initImage} value={maskImage} onChange={setMaskImage} />
+            </div>
+          )}
+
+          {conditioning.has("control") && (
+            <ConditioningImageField
+              label={t("Studio.control.title")}
+              hint={t("Studio.control.hint")}
+              value={controlImage}
+              onPick={(file) => void pickImage(file, setControlImage)}
+              onClear={() => setControlImage(null)}
+              strength={controlStrength}
+              onStrength={setControlStrength}
+              strengthLabel={t("Studio.control.strength")}
+            />
+          )}
+
+          {conditioning.has("ip_adapter") && (
+            <ConditioningImageField
+              label={t("Studio.ipAdapter.title")}
+              hint={t("Studio.ipAdapter.hint")}
+              value={ipAdapterImage}
+              onPick={(file) => void pickImage(file, setIpAdapterImage)}
+              onClear={() => setIpAdapterImage(null)}
+              strength={ipAdapterStrength}
+              onStrength={setIpAdapterStrength}
+              strengthLabel={t("Studio.ipAdapter.strength")}
+            />
+          )}
+
+          {conditioning.has("reference") && (
+            <ReferenceImages
+              images={refImages}
+              onAdd={(file) =>
+                void pickImage(file, (base64) =>
+                  setRefImages((current) =>
+                    current.length >= MAX_REF_IMAGES ? current : [...current, base64],
+                  ),
+                )
+              }
+              onRemove={(index) =>
+                setRefImages((current) => current.filter((_, at) => at !== index))
+              }
+            />
           )}
 
           {isVideoTask(task) && (
