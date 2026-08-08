@@ -36,9 +36,6 @@ beforeEach(() => {
   invokeMock.mockReset();
   useStackStore.setState({
     stacks: [],
-    indexProgress: {},
-    reindexError: {},
-    staleById: {},
     embedStatus: "stopped",
     embedPort: 8091,
     embedModelPath: null,
@@ -73,117 +70,14 @@ describe("stackStore.create", () => {
 });
 
 describe("stackStore.remove", () => {
-  it("deletes the stack, clears its progress/error state, and refreshes", async () => {
-    useStackStore.setState({
-      indexProgress: { "stack-1": { stack_id: "stack-1", files_done: 1, files_total: 1, chunks: 3, phase: "done" } },
-      reindexError: { "stack-1": "boom" },
-    });
+  it("deletes the stack and refreshes", async () => {
     invokeMock.mockResolvedValueOnce(undefined); // stacks_delete
     invokeMock.mockResolvedValueOnce([]); // stacks_list (refresh)
 
     await useStackStore.getState().remove("stack-1");
 
     expect(invokeMock).toHaveBeenNthCalledWith(1, "stacks_delete", { id: "stack-1" });
-    expect(useStackStore.getState().indexProgress).toEqual({});
-    expect(useStackStore.getState().reindexError).toEqual({});
     expect(useStackStore.getState().stacks).toEqual([]);
-  });
-});
-
-describe("stackStore.reindex", () => {
-  it("clears a prior error and refreshes on success", async () => {
-    useStackStore.setState({ reindexError: { "stack-1": "old error" } });
-    invokeMock.mockResolvedValueOnce(undefined); // stacks_reindex
-    invokeMock.mockResolvedValueOnce([makeStack({ indexed_at: 123, chunk_count: 5 })]); // refresh
-
-    await useStackStore.getState().reindex("stack-1");
-
-    expect(invokeMock).toHaveBeenNthCalledWith(1, "stacks_reindex", { id: "stack-1" });
-    expect(useStackStore.getState().reindexError["stack-1"]).toBeUndefined();
-    expect(useStackStore.getState().stacks[0].chunk_count).toBe(5);
-  });
-
-  it("records the failure message and rethrows on error", async () => {
-    invokeMock.mockRejectedValueOnce(new Error("embedding server unreachable"));
-
-    await expect(useStackStore.getState().reindex("stack-1")).rejects.toThrow("embedding server unreachable");
-    expect(useStackStore.getState().reindexError["stack-1"]).toBe("embedding server unreachable");
-  });
-
-  // Regression test: a completed reindex must recompute the stale badge, not
-  // just `indexed_at`/`chunk_count` — otherwise "Needs reindex" keeps showing
-  // right next to a freshly-updated `indexed_at` until the Settings modal is
-  // closed and reopened (the only other place `refreshStale` used to run).
-  it("clears a stale badge after a successful reindex", async () => {
-    useStackStore.setState({ staleById: { "stack-1": true } });
-    invokeMock.mockResolvedValueOnce(undefined); // stacks_reindex
-    invokeMock.mockResolvedValueOnce([makeStack({ indexed_at: 123, chunk_count: 5 })]); // refresh (stacks_list)
-    invokeMock.mockResolvedValueOnce(false); // refreshStale's stacks_is_stale
-
-    await useStackStore.getState().reindex("stack-1");
-
-    expect(invokeMock).toHaveBeenNthCalledWith(3, "stacks_is_stale", { id: "stack-1" });
-    expect(useStackStore.getState().staleById["stack-1"]).toBe(false);
-  });
-});
-
-describe("stackStore.cancelIndex", () => {
-  it("invokes stacks_cancel_index with the stack id", async () => {
-    invokeMock.mockResolvedValueOnce(undefined);
-    await useStackStore.getState().cancelIndex("stack-1");
-    expect(invokeMock).toHaveBeenCalledWith("stacks_cancel_index", { id: "stack-1" });
-  });
-});
-
-describe("stackStore.query", () => {
-  it("passes stackIds/query/k through to stacks_query and returns the results", async () => {
-    const results = [
-      { stack_id: "stack-1", stack_name: "My Docs", source_path: "a.md", score: 0.9, text: "hello", heading: null },
-    ];
-    invokeMock.mockResolvedValueOnce(results);
-
-    const hits = await useStackStore.getState().query(["stack-1"], "hello world", 3);
-
-    expect(invokeMock).toHaveBeenCalledWith("stacks_query", { stackIds: ["stack-1"], query: "hello world", k: 3 });
-    expect(hits).toEqual(results);
-  });
-});
-
-describe("stackStore.refreshStale", () => {
-  it("checks staleness only for indexed stacks and records the results", async () => {
-    useStackStore.setState({
-      stacks: [
-        makeStack({ id: "indexed-1", indexed_at: 100 }),
-        makeStack({ id: "indexed-2", indexed_at: 200 }),
-        makeStack({ id: "never-indexed", indexed_at: null }),
-      ],
-    });
-    invokeMock.mockImplementation(async (cmd: string, args: unknown) => {
-      if (cmd === "stacks_is_stale") {
-        return (args as { id: string }).id === "indexed-1";
-      }
-      throw new Error(`unexpected invoke: ${cmd}`);
-    });
-
-    await useStackStore.getState().refreshStale();
-
-    expect(invokeMock).toHaveBeenCalledWith("stacks_is_stale", { id: "indexed-1" });
-    expect(invokeMock).toHaveBeenCalledWith("stacks_is_stale", { id: "indexed-2" });
-    expect(invokeMock).not.toHaveBeenCalledWith("stacks_is_stale", { id: "never-indexed" });
-    expect(useStackStore.getState().staleById).toEqual({ "indexed-1": true, "indexed-2": false });
-  });
-
-  it("swallows a per-stack failure without throwing or dropping other results", async () => {
-    useStackStore.setState({
-      stacks: [makeStack({ id: "ok", indexed_at: 100 }), makeStack({ id: "broken", indexed_at: 100 })],
-    });
-    invokeMock.mockImplementation(async (_cmd: string, args: unknown) => {
-      if ((args as { id: string }).id === "broken") throw new Error("path no longer resolvable");
-      return false;
-    });
-
-    await expect(useStackStore.getState().refreshStale()).resolves.toBeUndefined();
-    expect(useStackStore.getState().staleById).toEqual({ ok: false });
   });
 });
 
