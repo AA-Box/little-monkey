@@ -186,6 +186,10 @@ export interface ProviderConfig {
 /** Mirrors the Rust `ProviderModelInfo` struct exactly. */
 export interface ProviderModelInfo {
   id: string;
+  /** The provider's own image-input answer, absent when its `/models` doesn't
+   * carry one (the Rust side skips the field rather than sending `null`) — see
+   * `lib/visionModels.ts`, which prefers this over its name-pattern guess. */
+  vision?: boolean;
 }
 
 /**

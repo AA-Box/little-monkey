@@ -114,6 +114,15 @@ struct ProvidersFile {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderModelInfo {
     pub id: String,
+    /// What the provider itself says about image input, when it says anything
+    /// at all. `None` for the providers whose `/models` returns an id and
+    /// nothing else (OpenAI, Gemini's OpenAI-compatible shim, most custom base
+    /// URLs) — the frontend falls back to `visionModels.ts`'s name heuristic
+    /// there, which is a guess and is wrong every time a new family ships.
+    /// Skipped rather than serialized as `null` so the TS mirror can be
+    /// optional: every `{ id }` literal in the existing tests stays valid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
 }
 
 /// Minimal shape of an OpenAI-style `GET /models` response — same defensive,
@@ -128,6 +137,51 @@ struct RawModelsResponse {
 struct RawModelEntry {
     #[serde(default)]
     id: Option<String>,
+    /// OpenRouter: `architecture.input_modalities: ["text", "image"]`.
+    #[serde(default)]
+    architecture: Option<RawArchitecture>,
+    /// Anthropic: `capabilities.image_input.supported`.
+    #[serde(default)]
+    capabilities: Option<RawCapabilities>,
+}
+
+#[derive(Deserialize)]
+struct RawArchitecture {
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct RawCapabilities {
+    #[serde(default)]
+    image_input: Option<RawSupported>,
+}
+
+#[derive(Deserialize)]
+struct RawSupported {
+    #[serde(default)]
+    supported: Option<bool>,
+}
+
+impl RawModelEntry {
+    /// The provider's own vision answer, or `None` if it didn't give one.
+    /// An entry that carries the field but says "no image input" is a real
+    /// `Some(false)` — it overrides the name heuristic just as `Some(true)`
+    /// does, since the provider knows better than a regex either way.
+    fn vision(&self) -> Option<bool> {
+        if let Some(supported) = self
+            .capabilities
+            .as_ref()
+            .and_then(|c| c.image_input.as_ref())
+            .and_then(|image| image.supported)
+        {
+            return Some(supported);
+        }
+        self.architecture
+            .as_ref()
+            .and_then(|a| a.input_modalities.as_ref())
+            .map(|modalities| modalities.iter().any(|m| m == "image"))
+    }
 }
 
 /// Resolves (and creates, if missing) `<app_data_dir>/providers.json`'s path.
@@ -367,7 +421,9 @@ pub fn add_anthropic_headers(
     }
 }
 
-/// GETs `${base_url}/models` and parses the OpenAI-style `data[].id` list.
+/// GETs `${base_url}/models` and parses the OpenAI-style `data[].id` list,
+/// plus whatever that entry says about image input (see
+/// [`RawModelEntry::vision`]).
 /// `pub` so `server.rs`'s `GET /v1/models` (phase 3) can list cloud provider
 /// models the same keychain-authed way `providers_list_models` already does
 /// — no behavior change.
@@ -417,7 +473,10 @@ pub async fn fetch_models(
     let mut models: Vec<ProviderModelInfo> = parsed
         .data
         .into_iter()
-        .filter_map(|entry| entry.id.map(|id| ProviderModelInfo { id }))
+        .filter_map(|entry| {
+            let vision = entry.vision();
+            entry.id.map(|id| ProviderModelInfo { id, vision })
+        })
         .collect();
     models.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(models)
@@ -915,6 +974,32 @@ mod tests {
             assert!(ids.insert(preset.id), "duplicate preset id '{}'", preset.id);
             assert!(validate_base_url(preset.base_url).is_ok());
         }
+    }
+
+    /// The two providers that answer the vision question themselves, in their
+    /// own shapes, plus the OpenAI shape that answers nothing — a `None` there
+    /// is what keeps the name heuristic in play for them.
+    #[test]
+    fn model_entries_report_vision_when_the_provider_says_so() {
+        let parsed: RawModelsResponse = serde_json::from_str(
+            r#"{"data": [
+                {"id": "anthropic/claude-opus-5",
+                 "architecture": {"input_modalities": ["text", "image"]}},
+                {"id": "openai/gpt-oss-120b",
+                 "architecture": {"input_modalities": ["text"]}},
+                {"id": "claude-opus-5",
+                 "capabilities": {"image_input": {"supported": true}}},
+                {"id": "claude-instant-1.2",
+                 "capabilities": {"image_input": {"supported": false}}},
+                {"id": "gpt-4o", "object": "model", "owned_by": "openai"}
+            ]}"#,
+        )
+        .expect("the fixture is a valid /models response");
+        let vision: Vec<Option<bool>> = parsed.data.iter().map(RawModelEntry::vision).collect();
+        assert_eq!(
+            vision,
+            vec![Some(true), Some(false), Some(true), Some(false), None]
+        );
     }
 
     #[test]

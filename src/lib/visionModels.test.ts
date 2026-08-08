@@ -1,6 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { isVisionCapableProviderModel } from "./visionModels";
+import { useModelStore } from "../store/modelStore";
+import { useSettingsStore } from "../store/settingsStore";
+
+afterEach(() => {
+  useModelStore.setState({ providerModels: {} });
+  useSettingsStore.setState({ visionOverrides: {} });
+});
 
 /** A false "no" here is silent data loss: `stripImagesForTextOnlyTarget` in
  *  `agentLoop.ts` drops the attached image and leaves a marker behind, so a
@@ -24,5 +31,30 @@ describe("isVisionCapableProviderModel", () => {
     ] as const) {
       expect(isVisionCapableProviderModel("anthropic", modelId), modelId).toBe(vision);
     }
+  });
+
+  it("prefers what the provider reported over the name heuristic", () => {
+    useModelStore.setState({
+      providerModels: {
+        openrouter: [
+          // A name the heuristic can't know about, that OpenRouter says sees images.
+          { id: "some-vendor/brand-new-vlm", vision: true },
+          // And the reverse: a name that looks vision-capable but isn't.
+          { id: "some-vendor/gemini-text-only", vision: false },
+          // Provider said nothing — the field is absent, not null.
+          { id: "some-vendor/unreported" },
+        ],
+      },
+    });
+    expect(isVisionCapableProviderModel("openrouter", "some-vendor/brand-new-vlm")).toBe(true);
+    expect(isVisionCapableProviderModel("openrouter", "some-vendor/gemini-text-only")).toBe(false);
+    // Nothing reported, and no pattern matches → the heuristic's "no".
+    expect(isVisionCapableProviderModel("openrouter", "some-vendor/unreported")).toBe(false);
+  });
+
+  it("lets the user's override beat the provider", () => {
+    useModelStore.setState({ providerModels: { openrouter: [{ id: "vendor/model", vision: false }] } });
+    useSettingsStore.setState({ visionOverrides: { "provider:openrouter:vendor/model": true } });
+    expect(isVisionCapableProviderModel("openrouter", "vendor/model")).toBe(true);
   });
 });
