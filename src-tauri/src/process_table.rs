@@ -553,6 +553,26 @@ pub struct ProcessLimits {
     /// own session is busy. This needs the cgroup `pids` controller or a job
     /// object.
     pub max_child_processes: Option<u32>,
+    /// Prompt-token ceiling for one request (roadmap K11). **Enforced**, for
+    /// runtimes that can count exactly — today that is llama.cpp, via
+    /// `m3_production`'s pre-flight; Ollama and MLX expose no tokenizer, so a
+    /// budget set on a process running either is reported as unenforceable rather
+    /// than silently ignored.
+    ///
+    /// Enforced *before* the request rather than discovered from the runtime's
+    /// refusal afterwards, which is the whole point of the acceptance criterion:
+    /// `classify_context_failure` explains a failure that already happened, and a
+    /// limit that only explains is not a limit.
+    ///
+    /// # It ships enforced and unset
+    ///
+    /// Nothing picks a number: `default_limits` returns `None` for every kind and
+    /// no admit call site passes one, exactly as `processWallBudget.ts` describes
+    /// for the wall budget. The mechanism is live and fires for nobody until a
+    /// budget is configured, because a default here is a judgement about what a
+    /// conversation is *for* — too low silently ends long sessions that were
+    /// working fine — and that belongs to settings, not to a constant.
+    pub max_context_tokens: Option<u64>,
 }
 
 impl ProcessLimits {
@@ -1402,12 +1422,14 @@ impl<'a> ProcessTable<'a> {
                 process_id, parent_process_id, kind, external_id, state, run_id,
                 workspace, profile, native_pid,
                 max_wall_ms, max_memory_bytes, max_output_bytes, max_child_processes,
+                max_context_tokens,
                 exit_status, exit_code, exit_signal, exit_reason,
                 created_at_ms, updated_at_ms, started_at_ms, exited_at_ms
              ) VALUES (
                 ?1, ?2, ?3, ?4, 'admitted', ?5,
                 ?6, ?7, NULL,
                 ?8, ?9, ?10, ?11,
+                ?13,
                 NULL, NULL, NULL, NULL,
                 ?12, ?12, NULL, NULL
              )",
@@ -1424,6 +1446,7 @@ impl<'a> ProcessTable<'a> {
                 request.limits.max_output_bytes.map(|v| v as i64),
                 request.limits.max_child_processes.map(|v| v as i64),
                 now_ms,
+                request.limits.max_context_tokens.map(|v| v as i64),
             ],
         )?;
 
@@ -2826,7 +2849,8 @@ const SELECT_COLUMNS: &str = "SELECT process_id, parent_process_id, kind, extern
      run_id, workspace, profile, native_pid, max_wall_ms, max_memory_bytes, max_output_bytes, \
      max_child_processes, exit_status, exit_code, exit_signal, exit_reason, created_at_ms, \
      updated_at_ms, started_at_ms, exited_at_ms, stop_requested, suspend_requested, \
-     signal_reason, signal_requested_at_ms, kill_requested FROM agent_processes";
+     signal_reason, signal_requested_at_ms, kill_requested, max_context_tokens \
+     FROM agent_processes";
 
 /// The nine V8 measurement columns, in [`MeasuredUsage::fields`]' order so the
 /// column list and the invariant's field list cannot drift apart.
@@ -2975,6 +2999,9 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<Proce
             max_memory_bytes: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
             max_output_bytes: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
             max_child_processes: row.get::<_, Option<i64>>(12)?.map(|v| v as u32),
+            // Appended at 26 rather than slotted beside the other four, so every
+            // index above stays where it was.
+            max_context_tokens: row.get::<_, Option<i64>>(26)?.map(|v| v as u64),
         },
         exit,
         signal_intent: SignalIntent {
@@ -4763,6 +4790,7 @@ mod tests {
             max_memory_bytes: Some(2 * 1024 * 1024 * 1024),
             max_output_bytes: Some(1_048_576),
             max_child_processes: Some(8),
+            max_context_tokens: Some(32_768),
         };
         let record = table
             .admit(
@@ -4782,6 +4810,20 @@ mod tests {
             T0,
         );
         assert!(zero.is_err());
+
+        // And a zero context budget for the sharper reason V17's `CHECK` names:
+        // the chat template alone is tokens, so no request could ever satisfy it
+        // — it would refuse every turn while reading like a configured limit.
+        let zero_context = table.admit(
+            &AdmitProcess::new(ProcessKind::DaemonJob, "job-zero-context").with_limits(
+                ProcessLimits {
+                    max_context_tokens: Some(0),
+                    ..ProcessLimits::default()
+                },
+            ),
+            T0,
+        );
+        assert!(zero_context.is_err());
     }
 
     #[test]

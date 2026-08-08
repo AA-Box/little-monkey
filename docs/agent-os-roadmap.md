@@ -3343,16 +3343,113 @@ have outlived the change that widened the candidate window.
 
 **Blocks:** nothing now.
 
-## K9. Dispatch policy (model routing)
-
-**Today:** one hardcoded fallback toggle; provider failover follows a fixed
-sequence.
+## K9. Dispatch policy (model routing) *(built for chat and summarization; subagent classes and a durable record owed)*
 
 **Acceptance:** ROADMAP #1 — user-authored named routing policies by task
 class, cost ceiling, latency target, data sensitivity, or tool requirement;
 per-turn inspection of which policy chose the target and why; reorder and
 disable without editing code. A policy can never widen a permission, bypass
 the Privacy Firewall, or widen a run's egress policy (K5).
+
+**Shipped.** `modelRouting.ts` is the engine and is pure — candidates, the
+active target and the turn's own hard requirements are all arguments, so the
+whole decision is testable without a provider or a model.
+`routingPolicyStore.ts` persists the authored list, `routeFromActive` /
+`routeTarget` in `agentLoop.ts` is the one place that reads live stores, and
+**Settings → Automation → Dispatch policies** authors, reorders, enables and
+deletes them. All five criteria the acceptance names are real: task class, a
+cost ceiling, a latency target, data sensitivity, and a tool requirement.
+
+Two of them needed a decision about what the number even means, and both
+decisions are narrower than the acceptance line sounds:
+
+- **The cost ceiling is a *rate* ceiling** (USD per million input or output
+  tokens, against the rates the user entered themselves in
+  `costControlStore.rates`), not a per-turn cost ceiling. A turn's token count
+  is not known before the turn runs, so "max $ per turn" could only have been
+  enforced against a guess — and this file's own rule is that no number is
+  displayed or acted on that was not measured.
+- **The latency target needed a measurement that did not exist.** Nothing
+  recorded per-target first-token latency: `benchmark.rs` measures TTFT for
+  *local* runtimes only, and no cloud target had a number at all. So
+  `attemptStream` now records milliseconds-to-first-fragment onto the
+  per-request entry `costControlStore` was already writing (one optional
+  field, no new store, no new retention rule), and
+  `observedTimeToFirstTokenMs` takes the **median** of a target's recent
+  samples — one cold start or one rate-limited retry would otherwise
+  disqualify a target that normally meets its ceiling.
+
+**"Provider failover follows a fixed sequence" is also answered**, which was
+the other half of the old "Today". A matched policy supplies the whole ordered
+attempt sequence, so it replaces `buildFailoverChain` for that turn rather than
+being overruled on the second attempt. It is still gated on the same
+`autoFailoverEnabled` toggle, and it is ignored when the Privacy Firewall
+redirected the turn.
+
+**Why it cannot widen anything, structurally rather than by intention:**
+
+- **It selects, it never invents.** Every key it can return came in as a
+  candidate, and candidates are built from `buildModelTargetInventory` — the
+  same inventory the model picker shows. A policy cannot name a provider the
+  user has not configured or reach a model their own credentials do not cover.
+- **Routing strictly precedes the Privacy Firewall gate** at all three call
+  sites, so a routed target is gated exactly like a hand-picked one and the
+  firewall's own switch-to-local still overrides a policy. The engine takes no
+  permission, privacy or egress input at all — there is nothing in it to widen.
+- **A policy cannot break a turn.** One that matches but excludes everything
+  keeps the active target and says so in the decision reason. Routing is
+  allowed to be unhelpful; it is not allowed to leave a turn with nowhere to
+  run.
+
+**Two defects found while building it, both recorded because the shape of each
+is the interesting part:**
+
+- **The default configuration had undefined ranking order.** The candidate
+  comparator mapped an unknown rate or latency to `POSITIVE_INFINITY` and then
+  *subtracted*, and `Infinity - Infinity` is `NaN` — a comparator returning
+  `NaN` means "unordered", so `sort` was free to do anything. This was not an
+  edge case: a fresh profile has no rates and no latency samples for anything,
+  so the common path was the broken one. It compares rather than subtracts now.
+  A determinism test over a two-way tie is what caught it, which is the only
+  form of assertion that could have.
+- **"Requires tools" would have matched nothing.** `modelTargets.ts` records
+  `unknown` tool-calling and vision for *every* provider model, so a filter
+  written as `!== "yes"` excludes all of them — a criterion the user could
+  enable and silently never route with. Only an explicit `"no"` excludes now:
+  unknown means the request is attempted and the provider answers, which is
+  what happens with no policy at all. Vision is resolved through
+  `resolvedTargetSupportsVision` — the same predicate the turn itself uses —
+  rather than the snapshot's `unknown`, so a policy cannot route an image to a
+  model `stripImagesForTextOnlyTarget` then strips it for.
+
+**Per-turn inspection** is a `[Model switch]`-prefixed transcript note naming
+the policy and why that target won, plus the last decision (including every
+rejected candidate and its reason) in the Settings panel. The note fires only
+when the choice actually moves off the active target — an enabled policy that
+the current model already satisfies is a no-op, not an announcement every turn.
+
+**Remaining.**
+
+- **Subagents do not route, and the reason is a layering rule rather than
+  effort.** They dispatch through `subagent.ts::resolveSubagentTarget`, and
+  that module must not import `agentLoop.ts` — `turnEngine.ts` imports
+  `subagent.ts`, so the edge would be a cycle, which is a rule that module
+  states explicitly and keeps a duplicated helper to honour. Per-profile
+  subagent models are already covered by
+  `settingsStore.subagentProfileModels` (`explore`/`code`, provider targets
+  only), so nothing is unreachable today; folding them into policies means
+  lifting target resolution out of `agentLoop.ts` into its own module first.
+  That is a refactor, and it is what the two missing task classes cost.
+- **Inspection is not durable.** The decision lives in the transcript and in
+  session state, not in the run ledger, so "which policy chose this run's
+  target" is not answerable after a restart the way K12's events are. The
+  frozen `ModelTargetSnapshot` on the durable run already records *what* ran;
+  what is missing is *why*.
+- **Managed llama.cpp is not a routable target.** `applyTargetSwitch` has no
+  `local` arm, for the reason `buildFailoverChain` and `findLocalOnlyTarget`
+  already document — making it the active target is not something an automatic
+  switch has a basis to do unattended. So `local_only` policies are served by
+  non-cloud Ollama, exactly as the Privacy Firewall's own local fallback is.
 
 **Note:** in OS terms K8 decides *when* a process runs and K9 decides *which
 device* executes it. They are separable and K8 is the harder half. Shipping
@@ -3423,7 +3520,7 @@ quota clause is K4's and is untouched here.
 **Blocks:** K8 in practice — preempting and resuming runs is only affordable
 if their namespaces are cheap.
 
-## K11. Context memory manager *(partially built)*
+## K11. Context memory manager *(built)*
 
 **Today:** `context_cache.rs` is honest observability — configured vs. live
 context from a managed `llama.cpp` process's `/props`/`/slots`, headroom,
@@ -3493,20 +3590,151 @@ runtime on every response all along and simply thrown away. And
 which was true of an older `llama.cpp` — the pinned build enables it by default,
 checked against that binary's `--help` rather than assumed.
 
-**Remaining, and none of it is blocked:**
+**Shipped — the stated policy per process class, and one `ProcessClass`
+instead of two vocabularies.**
 
-- **The policy half of the first clause.** What ships is the measurement; there
-  is still no stated eviction or compaction policy per process class, and
-  `ProcessClass` lives in the daemon scheduler while the ledger classifies by
-  `kind`. Stating a policy per class first needs those two vocabularies joined,
-  which is a decision rather than a wiring job.
-- **Read-only prefix sharing.** llama-server's own `--slot-save-path` and
-  `--cache-reuse` are the runtime support this clause wants; neither is wired,
-  and nothing yet establishes that two of this app's processes ever hold the
-  same prefix against one resident model.
-- **The budget as a K4 limit.** `resolve_effective_context` clamps a *load*, not
-  a running process, so a per-process context budget is still discovered as a
-  failure — which is exactly what `classify_context_failure` exists to explain.
+`ProcessClass` and `classify` moved from the daemon scheduler into
+`run_protocol`, beside the `RunKind` that decides a class. That is the join this
+clause needed, and it is a deletion rather than an addition: the desktop, the
+ledger and the scheduler now get the same answer from the same four-arm enum,
+where a second copy would have drifted. A process's class comes from its run's
+own frozen kind through the scheduler's own `classify` — never a second opinion.
+
+**The policy, and the argument for each arm.** Every one is read off that class's
+existing definition rather than chosen as a preference, which is the whole reason
+this is per class and not a global setting:
+
+| class | when the context fills | why |
+| --- | --- | --- |
+| Interactive | **compact** | "Something is blocked on the answer: a person at a desktop turn." Refusing throws away a conversation the person is in the middle of and can still see; compacting costs them the oldest detail. They are present to notice a bad summary, which is what nobody downstream of the other three can do. |
+| Batch | **compact** | "Submitted work that wants throughput." Finishing is what the class is for. But nobody is watching this turn either, so the compaction is recorded on the run rather than left silent. |
+| Background | **refuse** | "Opportunistic … the first thing asked to step aside." Work already first to yield should not spend a scarce window on a degraded answer, and stopping is cheap here in a way it is nowhere else. |
+| Maintenance | **refuse** | "May always be deferred, because the next occurrence will come around anyway." Its own definition is the argument: a compacted pass writes a worse result where a later whole one would have written a good one. |
+
+- **Two outcomes, not three.** Once the context is full the honest options are
+  continue with less of the conversation, or stop. The third — carry on and let
+  the runtime silently drop the oldest turns — is exactly what
+  `ContextFailureClass::CacheExhaustedContextShift` exists to *report*, and it is
+  what this policy replaces.
+- **The policy is what the budget's refusal *means*.** V17's pre-flight decides
+  *when* a request is over; the class decides what being over implies, and
+  `refusal_under` carries the rationale into the message so a caller can act
+  rather than only report. With no run to derive a class from, the refusal stays
+  bare rather than assuming a policy.
+- Reachable as `m3_context_policies`, which returns all four together: the policy
+  is only meaningful as a comparison, and one class alone reads like a global
+  setting.
+
+**Shipped — the policy reaches whoever can act on it, and the refusal stopped
+claiming to be a runtime failure.** An earlier draft of this line said
+auto-compacting on a `Compact` class was frontend work "and the compaction it
+would call already exists". Both halves turned out to be wrong, and tracing it
+is what produced the actual answer:
+
+- **The desktop chat loop never sees this refusal.** The budget guards
+  `M3RuntimeHub::dispatch_api` — this app's own OpenAI-compatible server. A chat
+  turn streams through `providers.rs` under `RunScope::Unattributed`, with no
+  process row attached and therefore no budget to exceed.
+- **The loop that *is* budgeted has nothing to compact.** A crew actor's history
+  is one user message plus its own tool round trips, and
+  `applyContextCompaction` refuses to touch a history with fewer than two user
+  turns — deliberately, since trimming a single ongoing turn destroys the only
+  context the model has. A compaction retry there would have been dead code.
+- **So the party that can compact is the API client**, which owns the
+  conversation this app is declining to forward. What it needs is not a
+  compaction it cannot be given, but the policy in a form it can branch on.
+
+`ContextPolicy::code()` is that form — `context_budget_compact` /
+`context_budget_refuse`, or a bare `context_budget` when the process has no run
+to derive a class from, which says *a limit was hit* and refuses to guess at the
+rest. It rides in `error.code`, where an API client already looks.
+
+**And the status code was wrong in a way that mattered.** The refusal was an
+`M3HubError::Runtime`, which renders as **502** — a client reading that has been
+told the upstream broke, and the correct response to a 502 is to retry the
+identical request. Retrying is the one thing that cannot work here. It is now
+its own error variant and a **413**, which asks for the shortening that actually
+helps. Nothing on this side failed: the request was never forwarded.
+**Shipped — the context budget as a K4 limit, enforced before the request.**
+
+Migration V17 adds `max_context_tokens` to `agent_processes`, the fifth `max_*`
+column beside V5's four. `ProcessScope` carries it, and `m3_production` refuses
+an over-budget request before sending it.
+
+- **The obstacle was a token count, and it turned out not to be one.** This app
+  has no tokenizer — the only counter in the tree is `crewRunner.ts`'s
+  `length / 4` — and enforcing a *context* limit against an estimate would refuse
+  real work for a made-up reason, strictly worse than today's honest
+  classification of the runtime's own refusal. But llama-server answers
+  `POST /apply-template` with the exact prompt a completion would send (template
+  included, and the template alone is tens of tokens) and `POST /tokenize` with
+  its exact tokens. Measured against the pinned b9637: `/tokenize` answered in
+  **0.5 ms** on loopback. The count is the runtime's own, and a pre-flight is
+  affordable per turn.
+- **"Enforced as a limit rather than discovered as a failure" is the assertion,
+  not the error text.** Discovering it means the prompt is evaluated, the runtime
+  refuses or shifts its context, and `classify_context_failure` explains what
+  already happened. Enforcing it means the request never leaves — so the test
+  asserts that `/v1/chat/completions` was never reached, and that the only paths
+  touched were the two pre-flight calls.
+- **Fail-closed, deliberately, and only where a budget exists.** A process with
+  no budget — every process today — returns before sending anything, so a limit
+  nobody set costs nothing, and a test pins that too. When a budget *is* set and
+  no count can be produced, the request is refused with that reason rather than
+  sent unchecked: "I set a limit and it silently did nothing" is the outcome this
+  direction exists to prevent. `ContextBudgetEnforcement` is the tagged union that
+  carries it, and the Runtime Hub prints the `unenforceable` reason.
+- **`> 0`, and `>` not `>=`.** V17's `CHECK` refuses a zero budget because no
+  request could satisfy one — the chat template alone is tokens, so a zero would
+  refuse every turn while reading like a configured limit. And a prompt landing
+  exactly *on* the budget fits, or the configured number would mean one less than
+  it says.
+- **It ships enforced and unset**, like the wall budget and for the reason
+  `processWallBudget.ts` records: `default_limits` returns `None` for every kind
+  and no admit call site passes one. Picking the number is a judgement about what
+  a conversation is *for* — too low silently ends long sessions that were working
+  — and that belongs to settings, not to a constant.
+- **It refuses rather than compacting.** Compaction exists in the chat path and
+  the user can invoke it; a limit that quietly rewrites the conversation instead
+  of reporting that it was reached is not a limit.
+
+**Shipped — read-only prefix sharing, and this clause was already satisfied by
+the runtime rather than missing.**
+
+The plan for this clause was to wire `--slot-save-path` or `--cache-reuse`. That
+was based on a wrong picture of what the pinned runtime does, and running it
+settled the question:
+
+- With **no** `--parallel` argument — which is what `llama_args` passes today —
+  b9637 resolves `n_parallel` to `auto`, reporting `total_slots = 4` with a
+  unified KV cache. The app was never limited to one sequence.
+- It routes each request to the slot whose cached prefix matches best — "selected
+  slot by LCP similarity, sim_best = 0.993" in its own log — and
+  `--cache-idle-slots` saves an idle slot's KV into a server-wide RAM pool
+  (`--cache-ram`, 8192 MiB by default).
+- **Measured:** two different conversations sharing a 454-token prefix. The
+  second reused **451 of 456** prompt tokens, on a slot the first had warmed. The
+  sharing is read-only by construction — no KV is copied between sequences; the
+  *request* is routed to where the prefix already lives.
+
+So there was nothing to build, and one thing to protect. **The app gets this by
+not doing two things**, and either would cost the whole feature with nothing
+failing: pinning `id_slot`, and sending `cache_prompt: false`. A test on
+`openai_request_body` asserts both absences, in streaming and non-streaming form.
+
+That guard is not hypothetical. The first probe of this pinned `id_slot` and
+measured **zero** reuse of the same 454-token prefix — which read as "the runtime
+cannot share across slots" until it turned out to be the pin defeating the
+router. `--cache-reuse` stays at its default 0: it shifts KV to reuse a prefix
+that changed in the *middle*, which is a different (and behaviour-changing)
+feature from the one this clause asks for.
+
+`PrefixSharing` is a tagged union for `RenderedMeasurement`'s reason — a caller
+cannot render "supported" without the mechanism, or "unsupported" without the
+reason. Ollama is `unsupported` because its API exposes no slot or prompt-cache
+surface at all, so whatever its server does internally this app cannot observe or
+claim it; MLX because it keeps no prompt cache between requests. Neither is
+"unimplemented" dressed up as a refusal.
 
 ## K12. Tamper-evident unified event log *(partially built)*
 
@@ -3863,7 +4091,7 @@ a broken chain so a scripted check cannot pass by printing bad news.
 
 **Blocks:** K21 — conformance needs evidence that cannot be quietly edited.
 
-## K13. Freeze and restore a live process
+## K13. Freeze and restore a live process *(built)*
 
 **Today:** checkpoints capture mutating turns with per-file diff, artifacts,
 screenshots, verification state, read-only compare of any two, and a rollback
@@ -3878,6 +4106,108 @@ same machine after a restart, with a determinism statement about what is and
 is not reproducible.
 
 **Blocks:** K18.
+
+**Shipped — the durable image, its restore gate, and the determinism
+statement.** The loop re-entry that acts on all three is the entry below this
+one.
+
+The image is a **checkpoint**, not a new store. A checkpoint is already a
+durable, versioned manifest of a turn's conversation anchor and workspace files;
+`resume` is one more `serde(default)` section on it holding what a checkpoint
+does not already have. Inventing a second store would have meant a second copy
+of the conversation and the files that could disagree with the first — and the
+disagreement would surface at restore, the moment it can least be dealt with.
+
+- **It references rather than copies.** The conversation is in the profile
+  store, the files are in the checkpoint's own entries, an approval is a
+  `permission_decisions` row. `resume` holds the process id, the model and
+  runtime, the K10 workspace path, and the outstanding `request_id`s.
+  `restorability` is what checks they still resolve.
+- **A restore refuses rather than substituting.** A missing workspace took the
+  process's uncommitted work with it, so resuming into a fresh one would silently
+  lose it. A model that is no longer resident would continue the conversation in
+  another model's voice. An approval that has expired would carry on past a
+  permission nobody currently grants. Each is a named `RestoreBlocker` with its
+  reason, and `Restorability` is a tagged union so a caller cannot offer Resume
+  without holding the state that says it is safe.
+- **Every blocker at once, not the first.** A user told the workspace is gone,
+  who fixes it and is then told the model is missing, has been made to discover
+  the refusals one at a time.
+- **Freezing twice is refused.** A second freeze would replace the image's
+  process id and approvals while the entries beneath it still describe the first
+  turn, so a restore would resume one process into another's files.
+- **The determinism statement ships beside the verdict**, not in a doc, because
+  the reader who needs it is whoever is deciding to press Resume.
+  `DETERMINISM_CAVEATS` enumerates only what is *not* reproduced — sampling, the
+  prompt cache, wall-clock time, external effects already taken, and everything
+  outside the recorded workspace. There is deliberately no balancing "reproduced"
+  list: the conversation, the files and the approvals are reproduced *because the
+  restore refuses when they cannot be*, and a second list asserting it would be
+  prose restating a guard.
+- **"Resource reservations" is in the acceptance and not in the image, on
+  purpose.** There is no per-process resource reservation to capture: searching
+  for one finds `workflow_core`'s token-budget reservation and the daemon's
+  delivery-payload reservation, neither of which is a K7 admission hold on memory
+  or a device. A field for it would be empty in every image ever written, which
+  reads as "this process reserved nothing" rather than "this system does not
+  reserve". The field arrives when the thing it names does.
+
+**Shipped — the loop re-entry, which closes K13. It also closes a lie the
+storage half left standing.**
+
+A chat turn suspended and then carried across a restart has a `suspended` process
+row and no loop behind it. `deliverPause`'s resume arm cleared an in-memory latch
+nobody was holding and answered `"resumed"` — so the two-second sweep reported a
+resume every tick, forever, while nothing continued. The Resume button in the
+Processes panel did the same. The image existed and nothing read it.
+
+- **`freeze_impl` could not have served this, and the reason is structural.** It
+  reads a manifest, and a manifest only exists after `checkpoint_end`. So it can
+  only freeze a turn that already finished — a turn with nothing left to resume.
+  A process worth freezing is by definition mid-flight: its checkpoint is open in
+  `AppState::checkpoints` and *nothing of it is on disk*, which is exactly the
+  state a quit destroys. `freeze_live_impl` writes the manifest early, from the
+  open checkpoint, and leaves the checkpoint open.
+- **The image is written on the way *into* the park, not out of it.** The agent
+  loop's own safe point — the tool boundary the acceptance names — freezes first
+  and parks second. Writing it on the way out would write it at the one moment it
+  is already too late.
+- **The entries recorded so far travel with it, and no `after/` snapshots do.**
+  The conversation and the files have to describe the same instant; restoring
+  files from a later one would be a state the process was never in. `after/`
+  records what a turn *produced*, and this turn has not produced it yet.
+- **The turn's own end overwrites the image with `resume: None`.** A turn that
+  reached its end has nothing to resume, and an entry-less one has its directory
+  removed — taking the stale image with it. Nothing sweeps; the existing
+  lifecycle already disposes of it.
+- **`pending_approvals` is empty, and that is a fact rather than a shortcut.** A
+  cooperative loop parks at a round boundary, after the previous round's tool
+  calls and their permission prompts have resolved. There is no outstanding
+  approval to record, so `ApprovalExpired` cannot fire on this path.
+- **Resident models is the one target the app would run right now**, not what is
+  installed. `ModelNotResident`'s own words are that resuming against a different
+  model "would continue the conversation in another model's voice" — so the
+  question is what the next round trip would actually reach.
+- **A resume starts a new turn and exits the frozen row.** Re-admitting the
+  original `externalId` would put two rows on one id, and the ledger's rule is
+  that a run claimed by two rows is claimed by neither. The image is the link,
+  which is what an image is for.
+- **The image is cleared before the loop starts, not after.** Cleared afterwards,
+  it would briefly describe a turn that is already running — and the next restart
+  would offer to resume it a second time.
+- **A refused restore is answered once and the row retired.** The blockers'
+  explanations go into the session's own transcript, because the person who
+  pressed Resume is the only one who can fix a missing workspace or load a model;
+  leaving the row suspended would append that same refusal every two seconds.
+- **The determinism caveats are written into the transcript beside the
+  continuation**, which is why `checkpoint_restorability` returns them rather
+  than a doc holding them: a resumed turn is a fresh generation from the frozen
+  point, not a replay of the one that was interrupted, and the transcript is
+  where the reader is.
+
+No UI was added. Suspend and Resume already existed in the Processes panel and
+already wrote durable intent; what changed is that the resume now reaches
+something.
 
 ## K14. Transactional external effects
 
@@ -3938,11 +4268,86 @@ reverted with no warning at all** — and not merely a missing one: a
   the other three kinds stay absent. Pinned by a test that strips the field back
   out of a real manifest.
 
-**Remaining:** the two-phase declare/commit contract itself. What exists now is
-the enumeration and its honest coverage, which is the half that makes
-`needs_reconciliation` mean something. No tool yet declares an intent before
-acting, and no compensating action is registered because none exists to
-register.
+**Shipped — the first real compensating action, and the enum was built for
+exactly this.**
+
+`Compensation` was an enum with one variant so that adding a real undo would be
+"a new variant and a compile error at every match, instead of a flag somebody
+forgets to flip". That is what happened: adding `Undo { action }` broke one
+`let`-binding, which is the whole return on having made it a type.
+
+**Memory is the one of the four this app can genuinely take back**, and the old
+reason for saying otherwise was a non-sequitur worth naming. It read "remembered
+facts are not part of the checkpointed workspace" — still true, and never the
+question. Not being *snapshotted* is not the same as not being *undoable*, and
+conflating the two left the arm reading as unrecoverable when the app already
+had `delete_fact_impl`.
+
+- **The checkpoint records which facts, not just that some.** `tool_remember`
+  notes the id and text the store actually assigned, after the write —
+  `add_fact_impl` returns the *pre-existing* fact on duplicate text, so an id
+  guessed beforehand could name a fact that was never created. Recording is
+  deduplicated by id for the same reason.
+- **The text is kept beside the id**, for the reason `redo/` keeps a file's
+  post-turn bytes: revert deletes the fact, and without the text a reapply could
+  not put it back. An undo that cannot itself be undone is data loss with a
+  friendly name.
+- **The compensator runs off the recorded list, not off the effect kind.** A
+  manifest that knows a fact was remembered but not *which* one deletes nothing,
+  because an empty list there means unrecorded rather than none — the same rule
+  `external_effects` already follows. A manifest written before this existed
+  therefore compensates nothing and says so, rather than deleting a guess.
+- **A fact already gone is not an error.** The user may have pressed Forget on it
+  themselves, and reporting that as a failed revert would send them chasing a
+  problem they had already fixed.
+- **`needs_reconciliation` narrowed on its own.** It is derived from
+  `Compensation::None`, so an effect gaining an undo drops out of it with no
+  second place to update — which is what the acceptance means by the flag
+  becoming "the exception for the enumerated set, not the default answer for
+  everything external". A turn whose only external effect was a `remember` no
+  longer reports as unreconcilable, and the preview shows what reverting will do
+  instead of colouring it as a warning nothing can fix.
+
+**Shipped — declare then commit, and it separates two things the record used to
+say identically.** Every effect was already declared *before* its call and after
+the permission gate, deliberately: a request that is permitted and then times out
+may still have reached the network, so recording afterwards would lose exactly
+the effects worth warning about. The cost of that pessimism was that the record
+could not tell a cancelled call from a completed one — a `web_fetch` the user
+stopped before a single byte left the machine reverted with the same warning as
+one that posted a form.
+
+- **The commit phase is the success path, and only the success path.**
+  `commit_external_effect` runs where the call returned: after
+  `wait_with_output`, after the fetch resolved, after the MCP server answered,
+  after `add_fact_impl` returned the fact. An error or a timeout leaves the
+  declaration standing alone, which is the safe direction — "we did not see a
+  response" is not "the server saw nothing".
+- **Three states, not a `committed` bool.** `EffectStatus::Unobserved` is what a
+  checkpoint written before this change reports, because it carries no
+  completion signal either way. Collapsing it into "declared" would make every
+  historical turn's shell command read as abandoned — a downgrade invented by
+  the reader rather than recorded by the writer, the same mistake an empty
+  `external_effects` list would be if it were trusted to mean *none*.
+- **`Option<Vec<_>>` on the manifest, for that reason.** `None` is "nothing
+  observed this", `Some([])` is "this build watched, and nothing completed".
+  A new checkpoint always writes `Some`, even when empty.
+- **Committing declares.** The two lists are a subset relation by construction,
+  so no reader that iterates the declarations can miss a kind that only ever
+  reached the commit call.
+- **Status informs, it does not excuse.** `needs_reconciliation` is unchanged: a
+  declared-but-unfinished effect is still an effect that may have landed, and
+  the preview says so in its own words rather than quietly dropping the warning.
+
+**Remaining: the two named compensators.** The three effects other than memory
+still have none, and the reasons are unchanged and still honest — a shell
+command can change anything, a sent request cannot be un-sent, an MCP server's
+effects are outside this app. The acceptance's other two named undos (a Git
+worktree revert, closing an owned draft PR) are reachable the same way the memory
+one was, and each is a `Compensation` variant away rather than a redesign — but
+neither has a caller yet: no chat tool creates a worktree or opens a PR, so
+building the compensator first would be a compensator for an effect this app's
+turns cannot produce.
 
 ---
 

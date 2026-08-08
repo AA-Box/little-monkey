@@ -170,6 +170,8 @@ pub struct ProcessAdmitArgs {
     pub max_output_bytes: Option<u64>,
     #[serde(default)]
     pub max_child_processes: Option<u32>,
+    #[serde(default)]
+    pub max_context_tokens: Option<u64>,
 }
 
 /// Admit a process. Called by the frontend surfaces — a chat turn, a subagent,
@@ -215,6 +217,7 @@ pub fn process_admit(
             max_memory_bytes: args.max_memory_bytes,
             max_output_bytes: args.max_output_bytes,
             max_child_processes: args.max_child_processes,
+            max_context_tokens: args.max_context_tokens,
         },
     };
 

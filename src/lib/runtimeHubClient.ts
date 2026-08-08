@@ -849,6 +849,30 @@ export interface ConfiguredContext {
 
 export type ContextRuntimeKind = "ollama" | "llama_cpp" | "mlx";
 
+/**
+ * Whether two of this app's processes on one resident model can reuse each
+ * other's cached prompt prefix.
+ *
+ * A tagged union, not a boolean: "supported" is unrenderable without the
+ * mechanism that makes it true, and "unsupported" without the reason it is not.
+ */
+export type PrefixSharing =
+  | { state: "supported"; mechanism: string }
+  | { state: "unsupported"; reason: string };
+
+/**
+ * Whether a per-process context budget can be *enforced* against this runtime,
+ * which is a different question from whether one is set.
+ *
+ * Enforcement needs an exact prompt-token count before the request, so only a
+ * runtime that will tokenize on demand can have one. Tagged for
+ * {@link PrefixSharing}'s reason: a budget that cannot be enforced must never be
+ * shown as if it were.
+ */
+export type ContextBudgetEnforcement =
+  | { state: "enforceable" }
+  | { state: "unenforceable"; reason: string };
+
 export interface ContextCacheView {
   runtimeId: string;
   runtimeKind: ContextRuntimeKind;
@@ -858,6 +882,8 @@ export interface ContextCacheView {
   contextHeadroomTokens: number | null;
   contextShiftDetected: boolean | null;
   totalSlots: number | null;
+  prefixSharing: PrefixSharing;
+  contextBudget: ContextBudgetEnforcement;
   notes: string[];
   sampledAtMs: number;
 }

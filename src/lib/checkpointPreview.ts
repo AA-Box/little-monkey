@@ -97,11 +97,23 @@ export interface RestorePlanEntry {
 /** One external effect the backend recorded, and what undoes it. */
 export interface ExternalEffectRecord {
   kind: 'shell' | 'network' | 'mcp-tool' | 'memory';
-  /** Only `none` exists today — this app has no compensator for any of the
-   * four kinds. A tagged object rather than a bool so adding a real undo (a
-   * Git worktree revert, closing an owned draft PR) is a new variant every
-   * reader must handle, not a flag somebody forgets to check. */
-  compensation: { kind: 'none'; reason: string };
+  /** A tagged object rather than a bool, which is what made adding the first
+   * real undo a compile error at every reader instead of a flag somebody
+   * forgets to check.
+   *
+   * `undo` exists for `memory`: a remembered fact is this app's own record, and
+   * reverting the turn forgets exactly the facts that turn added. The other
+   * three are still `none`, each with its own reason — a shell command can
+   * change anything, a request cannot be un-sent, an MCP server is outside this
+   * app. */
+  compensation: { kind: 'none'; reason: string } | { kind: 'undo'; action: string };
+  /** How far the effect got through the declare-then-commit contract.
+   *
+   * `declared` is not "it failed" — the declaration is written before the call
+   * on purpose, so a permitted request that then timed out still counts. Only
+   * `committed` means the app watched it finish; `unobserved` is a checkpoint
+   * written before the commit phase existed and has no signal either way. */
+  status: 'committed' | 'declared' | 'unobserved';
 }
 
 export interface RestoreSimulation {

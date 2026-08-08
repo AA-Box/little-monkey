@@ -205,6 +205,18 @@ pub struct ProcessScope {
     egress_bytes: Arc<AtomicU64>,
     destinations: Arc<Mutex<DestinationLog>>,
     context_reuse: Arc<ContextReuseTally>,
+    /// The row's `max_context_tokens`, read once when the scope was entered.
+    ///
+    /// Carried here rather than re-read per request for the reason this whole
+    /// module exists: the request path is Tauri-free and has no ledger handle, and
+    /// the alternative is threading a budget through signatures that have no other
+    /// reason to carry one. `None` is "no budget", which is every process today.
+    max_context_tokens: Option<u64>,
+    /// The scheduler class this process's run belongs to, read once when the
+    /// scope was entered. Decides what happens when the context fills — see
+    /// [`crate::context_cache::context_policy`]. `None` when the process has no
+    /// run to derive a class from, which is a state, not a default.
+    class: Option<crate::run_protocol::ProcessClass>,
 }
 
 /// Prompt tokens a runtime told us it reused from its cache, and prompt tokens
@@ -248,7 +260,38 @@ impl ProcessScope {
             egress_bytes: Arc::new(AtomicU64::new(0)),
             destinations: Arc::new(Mutex::new(DestinationLog::default())),
             context_reuse: Arc::new(ContextReuseTally::default()),
+            max_context_tokens: None,
+            class: None,
         }
+    }
+
+    /// The row's context budget, for a caller that has just read the row.
+    ///
+    /// A builder rather than a `new` parameter so the many scopes that have no
+    /// budget — which is all of them until one is configured — stay one call.
+    #[must_use]
+    pub fn with_context_budget(mut self, max_context_tokens: Option<u64>) -> Self {
+        self.max_context_tokens = max_context_tokens;
+        self
+    }
+
+    /// The prompt-token ceiling for one request, or `None` for no budget.
+    #[must_use]
+    pub fn max_context_tokens(&self) -> Option<u64> {
+        self.max_context_tokens
+    }
+
+    /// The scheduler class of this process's run, for a caller that has just
+    /// resolved it. A builder for [`Self::with_context_budget`]'s reason.
+    #[must_use]
+    pub fn with_class(mut self, class: Option<crate::run_protocol::ProcessClass>) -> Self {
+        self.class = class;
+        self
+    }
+
+    #[must_use]
+    pub fn class(&self) -> Option<crate::run_protocol::ProcessClass> {
+        self.class
     }
 
     #[must_use]

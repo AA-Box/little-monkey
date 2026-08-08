@@ -240,6 +240,28 @@ function ContextCachePanel({ view }: { view: ContextCacheView | undefined }) {
         )}
         {view.totalSlots != null && <span>Server slots: {view.totalSlots}</span>}
       </div>
+      {/* Both arms render, because "this runtime cannot share a prefix" is as
+          useful to know as that it can — and the union makes it impossible to
+          show either verdict without the sentence that justifies it. */}
+      <p className="mt-2 text-xs leading-5 text-muted">
+        <span className="font-medium text-foreground">
+          {view.prefixSharing.state === "supported"
+            ? "Prompt prefixes are shared between processes: "
+            : "Prompt prefixes are not shared between processes: "}
+        </span>
+        {view.prefixSharing.state === "supported"
+          ? view.prefixSharing.mechanism
+          : view.prefixSharing.reason}
+      </p>
+      {/* Only when a budget cannot be enforced. There is nothing to say when it
+          can — the enforcement is silent and correct — but "you can set a limit
+          here and it will do nothing" is exactly what a user must not discover
+          by setting one. */}
+      {view.contextBudget.state === "unenforceable" && (
+        <p className="mt-1 text-xs leading-5 text-warning">
+          A per-process context budget cannot be enforced on this runtime: {view.contextBudget.reason}
+        </p>
+      )}
       {view.notes.length > 0 && (
         <ul className="mt-3 list-disc space-y-1 pl-5 text-xs leading-5 text-muted">
           {view.notes.map((note) => (
