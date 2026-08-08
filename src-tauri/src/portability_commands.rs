@@ -927,19 +927,6 @@ pub fn portable_restore_apply(
     let (published, profile_counts, settings_pending) =
         publish_restore_at(&app_data_root(&app)?, request, None)?;
 
-    if let Err(error) = state
-        .stack_cache
-        .lock()
-        .map_err(|_| "Stack-cache lock poisoned".to_string())
-        .map(|mut cache| cache.clear())
-    {
-        let rollback = published.rollback();
-        return Err(match rollback {
-            Ok(_) => error,
-            Err(rollback) => format!("{error}; rollback also failed: {rollback}"),
-        });
-    }
-
     let sessions_payload =
         fs::read_to_string(restore_target(&published.base, RestoreFileKind::Sessions))
             .map_err(command_error)?;

@@ -208,9 +208,9 @@ pub mod triage;
 // cloud-model command and `m3_runtime_hub.rs`'s local-model staleness check.
 pub mod model_retirement;
 // `pub` so `monkey-cli`'s `Stacks` subcommand (RAG design doc, slice 4) can call
-// `stacks::reindex_impl`/`query_impl`/`query_stacks_v2_first` directly, the same
-// AppHandle-free-core reasoning as `checkpoints`/`rules`/`memory`. The registry
-// half it also needs now comes from `knowledge_core` instead.
+// `stacks::query_stacks` directly, the same AppHandle-free-core reasoning as
+// `checkpoints`/`rules`/`memory`. The registry half it also needs comes from
+// `knowledge_core`.
 pub mod stacks;
 // `pub` so `monkey-cli` (slice 4) can reuse `load_impl`/`PromptEntry` directly,
 // the same reasoning as `rules`/`checkpoints` above.
@@ -627,23 +627,6 @@ pub struct AppState {
     /// the same ledger through `RunLedger` directly; Tauri commands serialize
     /// desktop mutations through this mutex and assign audit metadata in Rust.
     pub run_ledger: std::sync::Mutex<Option<run_ledger::RunLedger>>,
-    /// Lazily-loaded (chunks + vectors) cache for `stacks_query`, keyed by
-    /// stack id, invalidated (removed) whenever a stack is reindexed or
-    /// deleted — see `stacks.rs::load_stack_cached`.
-    pub stack_cache:
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<stacks::LoadedStack>>>,
-    /// Cancellation handles for in-flight `stacks_reindex` calls, keyed by
-    /// stack id — mirrors `stream_cancels`/`tool_cancel` above, but a
-    /// `tokio_util::sync::CancellationToken` rather than a plain
-    /// `tokio::sync::Notify`: a `CancellationToken`'s cancelled state is
-    /// persisted, so a cancel request is never silently lost just because it
-    /// arrived before anything happened to be awaiting it (`Notify`'s
-    /// `notify_waiters()` has exactly that gap — see
-    /// `stacks::reindex_impl`'s doc comment for the failure mode this
-    /// avoids). See `stacks::stacks_cancel_index`.
-    pub index_cancels: std::sync::Mutex<
-        std::collections::HashMap<String, std::sync::Arc<tokio_util::sync::CancellationToken>>,
-    >,
     /// In-flight Human Approval Chain stages (ROADMAP.md, Phase 3) — see
     /// `approval_chains.rs`'s module doc. A separate state machine from
     /// `permissions` above, not an extension of it.
@@ -721,8 +704,6 @@ impl Default for AppState {
             artifacts: Default::default(),
             durable_artifacts: Default::default(),
             run_ledger: Default::default(),
-            stack_cache: Default::default(),
-            index_cancels: Default::default(),
             approval_chains: Default::default(),
             local_apps_config_lock: Default::default(),
             privacy_firewall_lock: Default::default(),
@@ -1235,10 +1216,7 @@ pub fn run() {
             stacks::stacks_rename,
             stacks::stacks_add_source,
             stacks::stacks_remove_source,
-            stacks::stacks_reindex,
-            stacks::stacks_cancel_index,
             stacks::stacks_query,
-            stacks::stacks_is_stale,
             stacks::tool_search_docs,
             knowledge_service::knowledge_v2_list_sources,
             knowledge_service::knowledge_v2_add_source,
@@ -1246,10 +1224,6 @@ pub fn run() {
             knowledge_service::knowledge_v2_remove_source,
             knowledge_service::knowledge_v2_refresh,
             knowledge_service::knowledge_v2_cancel_refresh,
-            // Shipped implemented, tested and *unregistered* — see
-            // `tests::every_tauri_command_is_reachable_from_the_invoke_handler`,
-            // which exists so the next one cannot repeat the trick.
-            knowledge_service::knowledge_v2_import_from_v1,
             knowledge_service::knowledge_v2_background_config_get,
             knowledge_service::knowledge_v2_background_config_save,
             knowledge_service::knowledge_v2_update_chunking,
@@ -1613,9 +1587,10 @@ mod tests {
     /// A `#[tauri::command]` that is never named in `run`'s
     /// `generate_handler!` list compiles, type-checks, and passes every unit
     /// test written against it — while being unreachable from the frontend,
-    /// because `invoke` resolves against that list alone. `knowledge_v2_import_from_v1`
-    /// spent its whole life in that state: fully implemented, 19 passing tests,
-    /// documented as done, and impossible for any user to run.
+    /// because `invoke` resolves against that list alone. The v1→v2 knowledge
+    /// import (since deleted along with v1) spent its whole life in that state:
+    /// fully implemented, 19 passing tests, documented as done, and impossible
+    /// for any user to run.
     ///
     /// # Why a source scan
     ///
