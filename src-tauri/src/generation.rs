@@ -24,7 +24,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -1845,6 +1845,99 @@ pub async fn cancel_job(client: &reqwest::Client, base_url: &str, job_id: &str) 
         .unwrap_or(false)
 }
 
+/// What the engine that is running right now says it can do.
+///
+/// Every field here used to be a list compiled into the frontend, which meant a
+/// new stable-diffusion.cpp release was unusable until somebody edited an array
+/// by hand. The engine builds all of them from its own enums —
+/// `sd_sample_method_name` over `SAMPLE_METHOD_COUNT`, `sd_scheduler_name` over
+/// `SCHEDULER_COUNT`, the upscaler directory rescanned per call — so asking it
+/// is the only way to be right about the build that is actually loaded.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EngineCapabilities {
+    pub samplers: Vec<String>,
+    /// Includes the `normal` alias the engine reports beside `discrete`.
+    pub schedulers: Vec<String>,
+    /// Built-ins plus whatever models were found in `--hires-upscalers-dir`.
+    pub upscalers: Vec<String>,
+    /// The feature flags for the mode this engine is in, verbatim:
+    /// `init_image`, `mask_image`, `control_image`, `ip_adapter_image`,
+    /// `ref_images`, `lora`, `vae_tiling`, `hires`, `cache`, `cancel_queued`,
+    /// `cancel_generating`. Not an enum, because a build newer than this one
+    /// naming a flag we have never heard of should still reach the UI.
+    pub features: BTreeMap<String, bool>,
+}
+
+/// Reads `[{"name": ...}, ...]`, which is how the engine reports its upscalers
+/// and LoRAs — unlike samplers and schedulers, which are bare strings.
+fn named_entries(body: &Value, key: &str) -> Vec<String> {
+    body.get(key)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn string_entries(body: &Value, key: &str) -> Vec<String> {
+    body.get(key)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn decode_capabilities(body: &Value) -> EngineCapabilities {
+    EngineCapabilities {
+        samplers: string_entries(body, "samplers"),
+        schedulers: string_entries(body, "schedulers"),
+        upscalers: named_entries(body, "upscalers"),
+        features: body
+            .get("features")
+            .and_then(Value::as_object)
+            .map(|flags| {
+                flags
+                    .iter()
+                    .filter_map(|(name, value)| value.as_bool().map(|flag| (name.clone(), flag)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Asks the running engine what it supports.
+///
+/// The same endpoint `ensure_ready` polls to decide the engine is up, so a
+/// successful answer here means the server is serving and holding weights.
+pub async fn fetch_capabilities(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<EngineCapabilities, String> {
+    let response = crate::egress::send(client.get(format!("{base_url}/sdcpp/v1/capabilities")))
+        .await
+        .map_err(|error| format!("Read engine capabilities: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Generation engine returned {} for its capabilities",
+            response.status()
+        ));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("Generation engine returned unreadable capabilities: {error}"))?;
+    Ok(decode_capabilities(&body))
+}
+
 // ---------------------------------------------------------------------------
 // Remote backends
 // ---------------------------------------------------------------------------
@@ -3371,5 +3464,43 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
         // sd-server-shaped is reached for.
         assert!(GenerationTask::TextToSpeech.is_speech());
         assert!(!GenerationTask::TextToVideo.is_speech());
+    }
+
+    /// The shape `/sdcpp/v1/capabilities` really answers with, trimmed to the
+    /// parts the app reads: samplers and schedulers are bare strings, upscalers
+    /// are objects, and the two are not interchangeable.
+    #[test]
+    fn capabilities_are_read_off_the_engines_own_lists() {
+        let body = json!({
+            "current_mode": "img_gen",
+            "samplers": ["euler", "euler_a", "brand_new_sampler"],
+            "schedulers": ["discrete", "normal", "karras"],
+            "upscalers": [{"name": "None"}, {"name": "Lanczos"}, {"name": "RealESRGAN_x4plus"}],
+            "loras": [{"name": "detail", "path": "/loras/detail.safetensors"}],
+            "features": {"mask_image": true, "control_image": false, "cancel_generating": false},
+        });
+        let capabilities = decode_capabilities(&body);
+        assert_eq!(
+            capabilities.samplers,
+            ["euler", "euler_a", "brand_new_sampler"]
+        );
+        assert_eq!(capabilities.schedulers, ["discrete", "normal", "karras"]);
+        // A model dropped in --hires-upscalers-dir arrives beside the built-ins.
+        assert_eq!(
+            capabilities.upscalers,
+            ["None", "Lanczos", "RealESRGAN_x4plus"]
+        );
+        assert_eq!(capabilities.features.get("mask_image"), Some(&true));
+        assert_eq!(capabilities.features.get("control_image"), Some(&false));
+        assert_eq!(capabilities.features.get("ip_adapter_image"), None);
+    }
+
+    /// An engine too old to report any of this must read as "said nothing",
+    /// not as "supports nothing" — the frontend falls back to its own lists on
+    /// an empty answer, and cannot tell the two apart itself.
+    #[test]
+    fn missing_capability_fields_decode_to_empty_rather_than_failing() {
+        let capabilities = decode_capabilities(&json!({"model": {"path": "/m.safetensors"}}));
+        assert_eq!(capabilities, EngineCapabilities::default());
     }
 }
