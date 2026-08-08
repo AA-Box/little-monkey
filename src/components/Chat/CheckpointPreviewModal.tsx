@@ -461,6 +461,13 @@ export function CheckpointPreviewModal({ sessionId, checkpoint, onClose, onChang
                           {effect.compensation.kind === "undo"
                             ? t("CheckpointPreview.willUndo", { action: effect.compensation.action })
                             : effect.compensation.reason}
+                          {/* Only the unfinished case is worth a line. "Committed"
+                              is the ordinary outcome, and "unobserved" is every
+                              checkpoint written before the commit phase — saying
+                              so on each of those would be noise, not information. */}
+                          {effect.status === "declared" && (
+                            <span className="text-muted"> {t("CheckpointPreview.effectUnconfirmed")}</span>
+                          )}
                         </li>
                       ))}
                     </ul>
