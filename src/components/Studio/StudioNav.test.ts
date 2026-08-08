@@ -21,7 +21,7 @@ describe("STUDIO_MODES", () => {
 
   it("lists every section once", () => {
     const ids = STUDIO_MODES.map((mode) => mode.id);
-    expect(ids).toEqual(["image", "video", "audio", "models"]);
+    expect(ids).toEqual(["image", "video", "audio", "models", "tools"]);
     expect(new Set(ids).size).toBe(ids.length);
   });
 });

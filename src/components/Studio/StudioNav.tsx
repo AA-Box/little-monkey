@@ -13,13 +13,15 @@
 import { SegmentedControl } from "../ui";
 import { useT } from "../../lib/i18n";
 
-/** Ordered as the row reads them: the three things to make, then the library
- *  they all draw from. */
+/** Ordered as the row reads them: the three things to make, then the two
+ *  libraries they draw from — the models that generate, and the tools that
+ *  operate on what came out. */
 export const STUDIO_MODES = [
   { id: "image", labelKey: "Studio.tab.image" },
   { id: "video", labelKey: "Studio.tab.video" },
   { id: "audio", labelKey: "Studio.tab.audio" },
   { id: "models", labelKey: "Studio.tab.models" },
+  { id: "tools", labelKey: "Studio.tab.tools" },
 ] as const;
 
 /** Derived from the list rather than declared beside it, so a mode cannot exist
