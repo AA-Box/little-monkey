@@ -412,6 +412,15 @@ pub struct CheckpointInfo {
     /// pruned gap in a session's chain (see that field's doc comment).
     #[serde(rename = "prevId")]
     pub prev_id: Option<String>,
+    /// The process this checkpoint is a frozen image of, when it is one.
+    ///
+    /// Exposed on the list rather than left to a per-id manifest read, because
+    /// the caller that needs it is looking for images it does not yet know the
+    /// ids of: after a restart nothing in memory remembers which turns were
+    /// parked, and the only durable record is on disk. `None` on every ordinary
+    /// turn checkpoint, which is nearly all of them.
+    #[serde(rename = "frozenProcessId")]
+    pub frozen_process_id: Option<String>,
 }
 
 impl CheckpointInfo {
@@ -428,6 +437,10 @@ impl CheckpointInfo {
             reverted: manifest.reverted,
             reapplyable,
             prev_id: manifest.prev_id.clone(),
+            frozen_process_id: manifest
+                .resume
+                .as_ref()
+                .map(|resume| resume.process_id.clone()),
         }
     }
 }
@@ -763,6 +776,79 @@ pub fn freeze_impl(base_dir: &Path, id: &str, resume: ResumeState) -> Result<(),
     }
     manifest.resume = Some(resume);
     write_manifest(&base_dir.join(id), &manifest)
+}
+
+/// Freezes a checkpoint whose turn is **still running** — the half that makes a
+/// restart survivable.
+///
+/// # Why [`freeze_impl`] could not do this
+///
+/// It reads the manifest, and a manifest only exists after `checkpoint_end`.
+/// So it can only ever freeze a turn that already finished, which is a turn
+/// with nothing left to resume. The process K13 wants to freeze is by definition
+/// mid-flight: its checkpoint is open, held in `AppState::checkpoints`, and
+/// nothing of it is on disk yet. A crash or a quit at that moment loses the
+/// image entirely — which is the one moment the image exists for.
+///
+/// So this writes the manifest early, from the open checkpoint, and **leaves the
+/// checkpoint open**. The turn keeps running and its later `checkpoint_end`
+/// overwrites what is written here — with `resume: None`, correctly: a turn that
+/// reached its own end has nothing to resume, and an entry-less one has its
+/// directory removed, taking the stale image with it.
+///
+/// Writing the entries recorded *so far* is deliberate rather than incidental:
+/// the image and the file snapshots have to describe the same instant, and a
+/// resume that restored files from a later instant than the conversation would
+/// be a state the process was never in.
+pub fn freeze_live_impl(
+    base_dir: &Path,
+    state: &AppState,
+    id: &str,
+    resume: ResumeState,
+) -> Result<(), String> {
+    validate_id(id)?;
+    let guard = state
+        .checkpoints
+        .lock()
+        .map_err(|_| "Checkpoint lock poisoned".to_string())?;
+    let Some(active) = guard.get(id) else {
+        // Not an error: the turn may have ended between the park and this call,
+        // and a finished turn is not a failed freeze. Same tolerance every other
+        // `record_*` here has for an id with no open checkpoint.
+        return Ok(());
+    };
+    // Refused for the same reason `freeze_impl` refuses: a second image would
+    // replace the first one's process id while the entries beneath it still
+    // describe the first, and a restore would resume one process into another's
+    // files.
+    if let Ok(existing) = read_manifest(base_dir, id) {
+        if let Some(frozen) = existing.resume {
+            return Err(format!(
+                "checkpoint {id} is already a freeze of process {}",
+                frozen.process_id
+            ));
+        }
+    }
+    let manifest = CheckpointManifest {
+        version: MANIFEST_VERSION,
+        created_at_ms: active.created_at_ms,
+        session_id: active.session_id.clone(),
+        anchor_index: active.anchor_index,
+        label: active.label.clone(),
+        shell_ran: active.shell_ran,
+        external_effects: active.external_effects.iter().copied().collect(),
+        committed_effects: Some(active.committed_effects.iter().copied().collect()),
+        reverted: false,
+        prev_id: active.prev_id.clone(),
+        entries: active.entries.clone(),
+        remembered_facts: active.remembered_facts.clone(),
+        resume: Some(resume),
+    };
+    // No `after/` snapshots, unlike `end_impl`. Those record what the turn
+    // *produced*, and this turn has not produced it yet — capturing them now
+    // would label a mid-turn state as the finished one. `checkpoint_end` fills
+    // them in when there is an answer to record.
+    write_manifest(&active.dir, &manifest)
 }
 
 /// Why an image cannot be restored, one reason per thing that went missing.
@@ -2075,6 +2161,51 @@ pub fn checkpoint_reapply(
     Ok(reapplied)
 }
 
+/// Freeze a **live** turn's checkpoint into a resumable image (roadmap K13).
+///
+/// Called at the moment a cooperative loop actually parks, which is the tool
+/// boundary the acceptance names. Everything about it is [`freeze_live_impl`];
+/// this is the command wrapper, holding the same revert lock `checkpoint_freeze`
+/// does so a freeze and a revert of one checkpoint cannot both rewrite its
+/// manifest with the last writer winning silently.
+#[tauri::command]
+pub fn checkpoint_freeze_live(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    resume: ResumeState,
+) -> Result<(), String> {
+    let _lock = acquire_revert_lock(state.inner(), &id)?;
+    freeze_live_impl(&checkpoints_base_dir(&app)?, state.inner(), &id, resume)
+}
+
+/// Drops checkpoint `id`'s resume image, leaving the checkpoint itself intact.
+///
+/// Called once a resume has actually re-entered the loop. Without it the image
+/// outlives the thing it describes: the next `freeze_live_impl` on the same
+/// checkpoint would be refused as a double freeze, and — worse — a later restart
+/// would offer to resume a turn that is already running.
+///
+/// A checkpoint that is not a freeze is left alone and reported as such rather
+/// than silently succeeding, because a caller clearing an image it never wrote
+/// has lost track of which checkpoint it is holding.
+#[tauri::command]
+pub fn checkpoint_clear_freeze(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<bool, String> {
+    let _lock = acquire_revert_lock(state.inner(), &id)?;
+    let base_dir = checkpoints_base_dir(&app)?;
+    validate_id(&id)?;
+    let mut manifest = read_manifest(&base_dir, &id)?;
+    if manifest.resume.take().is_none() {
+        return Ok(false);
+    }
+    write_manifest(&base_dir.join(&id), &manifest)?;
+    Ok(true)
+}
+
 /// Freeze a suspended process into checkpoint `id` (roadmap K13).
 ///
 /// The caller supplies the resume state because it is the only party holding all
@@ -2102,6 +2233,11 @@ pub fn checkpoint_freeze(
 pub struct RestoreReport {
     pub restorability: Restorability,
     pub determinism_caveats: Vec<String>,
+    /// Each blocker's explanation, in the same order, for the same reason the
+    /// caveats ship here: the reader who needs it is whoever has to fix the
+    /// missing thing, and `RestoreBlocker`'s codes are stable identifiers rather
+    /// than sentences. Empty when the image is resumable.
+    pub blocker_explanations: Vec<String>,
 }
 
 #[tauri::command]
@@ -2119,19 +2255,28 @@ pub fn checkpoint_restorability(
         .as_ref()
         .and_then(|resume| resume.workspace.as_ref())
         .is_none_or(|workspace| Path::new(workspace).is_dir());
+    let restorability = restorability(
+        &manifest,
+        &RestoreEnvironment {
+            resident_models: &resident_models,
+            live_approvals: &live_approvals,
+            workspace_exists,
+        },
+    );
+    let blocker_explanations = match &restorability {
+        Restorability::Resumable { .. } => Vec::new(),
+        Restorability::Blocked { blockers } => blockers
+            .iter()
+            .map(|blocker| blocker.explanation().to_string())
+            .collect(),
+    };
     Ok(RestoreReport {
-        restorability: restorability(
-            &manifest,
-            &RestoreEnvironment {
-                resident_models: &resident_models,
-                live_approvals: &live_approvals,
-                workspace_exists,
-            },
-        ),
+        restorability,
         determinism_caveats: DETERMINISM_CAVEATS
             .iter()
             .map(|c| (*c).to_string())
             .collect(),
+        blocker_explanations,
     })
 }
 
@@ -2421,6 +2566,100 @@ mod tests {
             matches!(twice, Err(ref message) if message.contains("already a freeze")),
             "{twice:?}"
         );
+    }
+
+    /// The case a restart actually presents: the turn never ended, so nothing
+    /// ever called `checkpoint_end` and no manifest was written by it.
+    ///
+    /// `freeze_impl` cannot serve this — it reads a manifest, and reading one is
+    /// exactly what a mid-flight checkpoint has no way to satisfy. A freeze that
+    /// only works after the turn finished is a freeze of a turn with nothing
+    /// left to resume.
+    #[test]
+    fn a_live_turns_image_reaches_disk_while_the_checkpoint_is_still_open() {
+        let state = AppState::default();
+        let base = TempDir::new("freeze-live");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("f.txt");
+        std::fs::write(&file, "v1").unwrap();
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "v2").unwrap();
+
+        // Nothing on disk yet: this is the state a crash would have found.
+        assert!(read_manifest(&base.path, &id).is_err());
+
+        freeze_live_impl(&base.path, &state, &id, resume_state()).expect("the live freeze lands");
+
+        let reloaded = read_manifest(&base.path, &id).expect("the image is readable");
+        assert_eq!(
+            reloaded.resume.as_ref().map(|r| r.process_id.as_str()),
+            Some("p-frozen")
+        );
+        assert_eq!(
+            reloaded.entries.len(),
+            1,
+            "the files recorded so far travel with the image — a resume that \
+             restored a later instant's files than the conversation would be a \
+             state the process was never in"
+        );
+        // Still open: the turn has not ended, and freezing must not end it.
+        assert!(state.checkpoints.lock().unwrap().contains_key(&id));
+
+        // Refused twice, for `freeze_impl`'s reason.
+        let twice = freeze_live_impl(&base.path, &state, &id, resume_state());
+        assert!(
+            matches!(twice, Err(ref message) if message.contains("already a freeze")),
+            "{twice:?}"
+        );
+
+        // And when the turn does finish, its own end overwrites the image with
+        // `resume: None` — a completed turn has nothing to resume, and an image
+        // left behind would offer to restart one that already ran to the end.
+        end_impl(&state, &id).unwrap();
+        assert!(read_manifest(&base.path, &id).unwrap().resume.is_none());
+    }
+
+    /// A turn that parked before touching a file still gets an image, and its
+    /// own end still cleans up after it.
+    ///
+    /// `end_impl` deletes an entry-less checkpoint's directory outright, which is
+    /// the right disposal for a stale image too — but only because the deletion
+    /// happens when the turn *finished*. A freeze written into that same
+    /// directory has to survive until then.
+    #[test]
+    fn a_freeze_with_no_files_yet_survives_until_the_turn_ends() {
+        let state = AppState::default();
+        let base = TempDir::new("freeze-empty");
+        let id = begin(&state, &base.path);
+
+        freeze_live_impl(&base.path, &state, &id, resume_state()).expect("the live freeze lands");
+        assert!(read_manifest(&base.path, &id).unwrap().resume.is_some());
+
+        end_impl(&state, &id).unwrap();
+        assert!(
+            read_manifest(&base.path, &id).is_err(),
+            "the turn ended with nothing recorded, so the directory and the image go with it"
+        );
+    }
+
+    /// Freezing a checkpoint that already ended is a no-op, not an error.
+    ///
+    /// The park and the freeze are two steps, and a turn can finish between
+    /// them — a stop delivered while the loop was parked, say. Reporting that as
+    /// a failure would make an ordinary race look like a broken freeze.
+    #[test]
+    fn freezing_a_turn_that_already_ended_reports_nothing_to_freeze() {
+        let state = AppState::default();
+        let base = TempDir::new("freeze-gone");
+        assert!(freeze_live_impl(
+            &base.path,
+            &state,
+            "00000000-0000-4000-8000-0000freeze09",
+            resume_state()
+        )
+        .is_ok());
     }
 
     /// Every blocker states a reason, and every caveat is real prose — an empty

@@ -29,6 +29,16 @@ vi.mock("./subagent", () => ({
   cancelSubagentRun: (id: string) => cancelSubagentRunMock(id),
 }));
 
+// Mocked because the real module pulls in the whole agent loop, and what this
+// suite decides is *which* arm a resume takes — not what re-entry does once it
+// is chosen. `frozenTurn.test.ts` owns that half.
+const resumeFrozenTurnMock = vi.fn<(record: ProcessRecord) => Promise<string>>(
+  async () => "resumed",
+);
+vi.mock("./frozenTurn", () => ({
+  resumeFrozenTurn: (record: ProcessRecord) => resumeFrozenTurnMock(record),
+}));
+
 const sideTaskMock = {
   cancel: vi.fn<(id: string) => void>(),
   pause: vi.fn<(id: string) => void>(),
@@ -93,6 +103,8 @@ beforeEach(() => {
   sideTaskMock.cancel.mockReset();
   sideTaskMock.pause.mockReset();
   sideTaskMock.resume.mockReset();
+  resumeFrozenTurnMock.mockReset();
+  resumeFrozenTurnMock.mockResolvedValue("resumed");
   clearRunCancellationRegistryForTests();
   clearPauseRegistryForTests();
 });
@@ -408,6 +420,11 @@ describe("cooperative pause delivery", () => {
     // be the acknowledgement. Treating "no intent + running" as nothing-pending
     // would leave the registry latched, and the loop would park at its next
     // checkpoint and never wake.
+    //
+    // Registered because a live turn is: `registerDurableController` puts every
+    // running chat turn in this registry, and its presence is what tells a
+    // resume there is a loop to wake rather than an image to come back from.
+    registerRunCancellation("ext-turn", () => {});
     setPauseRequested("ext-turn", true);
 
     const outcome = await deliverProcessSignal(
@@ -420,6 +437,7 @@ describe("cooperative pause delivery", () => {
   });
 
   it("clears the latch on a resume that lands after the loop parked", async () => {
+    registerRunCancellation("ext-turn", () => {});
     setPauseRequested("ext-turn", true);
 
     const outcome = await deliverProcessSignal(
@@ -429,6 +447,69 @@ describe("cooperative pause delivery", () => {
 
     expect(outcome).toBe("resumed");
     expect(isPauseRequested("ext-turn")).toBe(false);
+  });
+
+  /**
+   * The state a restart leaves behind, and what this arm used to get wrong.
+   *
+   * The row is `suspended`, so a resume is pending — but the loop that would
+   * honour it died with the process. Clearing an in-memory latch nobody holds
+   * and answering "resumed" was a lie twice over: nothing continued, and every
+   * two-second sweep said it had.
+   */
+  it("re-enters a chat turn from its image when no loop is registered", async () => {
+    const suspended = record({
+      kind: "chat_turn",
+      externalId: "ext-frozen",
+      state: "suspended",
+    });
+
+    const outcome = await deliverProcessSignal(suspended, MAIN);
+
+    expect(outcome).toBe("resumed");
+    expect(resumeFrozenTurnMock).toHaveBeenCalledWith(suspended);
+  });
+
+  /** A live loop is still woken in memory. Re-entering from an image would
+   * start a second turn over a conversation the first one is mid-way through. */
+  it("wakes a registered loop rather than re-entering from an image", async () => {
+    registerRunCancellation("ext-live", () => {});
+    setPauseRequested("ext-live", true);
+
+    const outcome = await deliverProcessSignal(
+      record({ kind: "chat_turn", externalId: "ext-live", state: "suspended" }),
+      MAIN,
+    );
+
+    expect(outcome).toBe("resumed");
+    expect(resumeFrozenTurnMock).not.toHaveBeenCalled();
+    expect(isPauseRequested("ext-live")).toBe(false);
+  });
+
+  /** Suspended before it ever froze, or a kind that has no checkpoint to freeze
+   * into. The latch is deliberately left alone so the next sweep — possibly in
+   * the window that does hold the loop — can still deliver it. */
+  it("reports no live target when there is no image to come back from", async () => {
+    resumeFrozenTurnMock.mockResolvedValue("no-image");
+
+    const outcome = await deliverProcessSignal(
+      record({ kind: "chat_turn", externalId: "ext-none", state: "suspended" }),
+      MAIN,
+    );
+
+    expect(outcome).toBe("no-live-target");
+  });
+
+  /** Only a chat turn writes an image: the freeze is the agent loop's own safe
+   * point, and a subagent or crew actor has no checkpoint to write one into. */
+  it("does not look for an image for a kind that never writes one", async () => {
+    const outcome = await deliverProcessSignal(
+      record({ kind: "subagent", externalId: "ext-sub", state: "suspended" }),
+      MAIN,
+    );
+
+    expect(outcome).toBe("no-live-target");
+    expect(resumeFrozenTurnMock).not.toHaveBeenCalled();
   });
 
   it("reports nothing pending for a cooperative kind with no latch either side", async () => {

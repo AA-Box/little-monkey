@@ -34,6 +34,7 @@ import {
   abortedPromise,
   attemptStream,
   CANCELLED_TOOL_RESULT,
+  describeUsageTarget,
   executeToolCall,
   isToolCallAllowed,
   PRESENT_PLAN_RESULT,
@@ -68,7 +69,7 @@ import { useStackStore, type StackQueryResult } from '../store/stackStore';
 import { useMcpStore } from '../store/mcpStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { admitProcess, exitProcess, exitStatusFor, linkProcessRun, markProcessRunning, reconcileProcess } from './processTable';
-import { honourPause, forgetPause } from './pauseRegistry';
+import { honourPause, forgetPause, isPauseRequested } from './pauseRegistry';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import {
   gatePrivacyWireMessages,
@@ -135,6 +136,23 @@ const DEFAULT_LLAMA_PORT = 8090;
  * a real (currently nonexistent, but defensively still hidden) system
  * message. */
 export const SWITCH_NOTE_PREFIX = '[Model switch]';
+
+/** Marks the notice a resumed turn writes — see {@link ResumedTurn}. Lives here
+ * rather than in `frozenTurn.ts` so the edge between the two modules runs one
+ * way: `frozenTurn` needs `runAgentTurn`, and a constant read during module
+ * initialization on the way back would be the half of a cycle that bites. */
+export const RESUME_NOTE_PREFIX = '[Resume]';
+
+/** A re-entry into a turn frozen at a tool boundary (roadmap K13), passed to
+ * {@link runAgentTurn} by `frozenTurn.ts` and by nothing else. */
+export interface ResumedTurn {
+  /** The image being continued. Already cleared by the caller — held here for
+   * the transcript notice and for anything that later wants to name it. */
+  resumedFromCheckpointId: string;
+  /** `checkpoint_restorability`'s statement of what a resume does *not*
+   * reproduce, written into the transcript beside the continuation. */
+  determinismCaveats: string[];
+}
 
 export function isSwitchNotice(message: ChatMessage): boolean {
   return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(SWITCH_NOTE_PREFIX);
@@ -1698,6 +1716,14 @@ export async function runAgentTurn(
   // own Rust-side prompt/tools and isn't part of this feature yet, same
   // stance as `availableSkills` above.
   ultracode = false,
+  // Set only by `frozenTurn.ts`: this call is not a new question, it is the
+  // continuation of a turn that was frozen at a tool boundary and is being
+  // re-entered from its image. It suppresses the user message this function
+  // otherwise appends — the conversation is already whole, and a blank one would
+  // be a turn the user never took — and writes the determinism caveats into the
+  // transcript, because whoever reads the continuation is the person who needs
+  // to know what a resume does not reproduce.
+  resume: ResumedTurn | null = null,
 ): Promise<void> {
   // Hard invariant: at most one turn per session, ever. Two turns streaming
   // into one transcript interleave their `updateLastMessage` patches and
@@ -1775,7 +1801,11 @@ export async function runAgentTurn(
     // that a requested write happened. Keep explicit mutation turns on the
     // in-process desktop loop, where the bounded corrective retry and
     // mutation-success guard below are enforced.
-    if (route === 'daemon' && !mutationRequired) {
+    // A resumed turn stays on the in-process loop whatever the route says: the
+    // image it is continuing was written by this loop's own checkpoint, and the
+    // daemon path composes its history Rust-side from a task string it was never
+    // given here.
+    if (route === 'daemon' && !mutationRequired && resume === null) {
       await runDaemonAgentTurn(sessionId, userText, attachments, controller.signal, turnId, skillInvocations);
     } else {
       await runTurnGuarded(
@@ -1788,6 +1818,7 @@ export async function runAgentTurn(
         availableSkills,
         ultracode,
         mutationRequired,
+        resume,
       );
     }
   } catch (error) {
@@ -2197,6 +2228,7 @@ async function runTurnGuarded(
   availableSkills: SlashSkill[] = [],
   ultracode = false,
   mutationRequired = false,
+  resume: ResumedTurn | null = null,
 ): Promise<void> {
   // The index this turn's user message will land at — captured before
   // `addMessage` so it can anchor a later "Rewind conversation" back to the
@@ -2207,7 +2239,20 @@ async function runTurnGuarded(
   // in the turn body does async file/image reads) — if there's at least one
   // image, it's promoted in place, right after, to a `ChatContentPart[]` so
   // the chat UI actually shows what was attached, not just what was typed.
-  useSessionStore.getState().addMessage(sessionId, { role: 'user', content: userText });
+  if (resume === null) {
+    useSessionStore.getState().addMessage(sessionId, { role: 'user', content: userText });
+  } else {
+    // The caveats are the whole reason `checkpoint_restorability` returns them
+    // rather than a doc holding them: a resumed turn is a fresh generation from
+    // the frozen point, not a replay of the one that was interrupted, and the
+    // transcript is where the person reading the continuation will be.
+    useSessionStore.getState().addMessage(sessionId, {
+      role: 'system',
+      content: [`${RESUME_NOTE_PREFIX} Resumed from a frozen image.`, ...resume.determinismCaveats].join(
+        '\n',
+      ),
+    });
+  }
 
   // Open a per-turn file checkpoint (see src-tauri/src/checkpoints.rs) so
   // every write_file/edit_file this turn makes can be reverted in one click.
@@ -2888,8 +2933,41 @@ async function runAgentTurnBody(
   // a "keep trying until it passes" loop.
   let verifyRound = 0;
 
+  /**
+   * The turn's safe point: freeze first if a suspend is latched, then park.
+   *
+   * This *is* the tool boundary K13's acceptance names. The previous round's
+   * tool calls and their permission prompts have all resolved by here, which is
+   * what makes the image coherent — and why it records no pending approvals
+   * rather than recording an empty list as a shortcut.
+   *
+   * The image is written before the wait, not after it. A process parked in
+   * memory is exactly the state a quit or a crash destroys, so an image written
+   * on the way out would be written at the one moment it is too late.
+   * Best-effort by construction: a freeze that fails leaves a turn that pauses
+   * and resumes in memory, which is what happened before it existed.
+   */
+  async function parkHere(): Promise<void> {
+    if (!signal) return;
+    const processId = chatTurnProcesses.get(turnId) ?? null;
+    if (isPauseRequested(turnId) && checkpointId !== null && processId !== null) {
+      await invoke('checkpoint_freeze_live', {
+        id: checkpointId,
+        resume: {
+          processId,
+          frozenAtMs: Date.now(),
+          model: describeUsageTarget(primaryTarget),
+          runtimeId: primaryTarget.kind,
+          workspace: primaryRoot(useWorkspaceStore.getState().roots)?.path ?? null,
+          pendingApprovals: [],
+        },
+      }).catch(() => undefined);
+    }
+    await honourPause(turnId, processId, signal);
+  }
+
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
-    if (signal) await honourPause(turnId, chatTurnProcesses.get(turnId) ?? null, signal);
+    if (signal) await parkHere();
     // Stop button fired while a tool call was executing (between model
     // round trips, where there's no stream to abort) — don't start another.
     if (signal?.aborted) return;
@@ -3384,7 +3462,7 @@ async function runAgentTurnBody(
       }
     }
 
-    if (signal) await honourPause(turnId, chatTurnProcesses.get(turnId) ?? null, signal);
+    if (signal) await parkHere();
     if (signal?.aborted) return;
 
     // Loop again: the model gets the tool results appended to its history.

@@ -242,6 +242,54 @@ describe("chat turn cooperative pause", () => {
     expect(isPauseRequested(TURN_ID)).toBe(false);
   });
 
+  /**
+   * Roadmap K13: parking in memory is exactly the state a quit destroys, so the
+   * image is written on the way *in* to the park rather than on the way out.
+   *
+   * Without this the freeze/restore half has nothing to restore from — the
+   * manifest only reaches disk at `checkpoint_end`, which a turn that never
+   * finished never calls.
+   */
+  it("writes a resumable image before it parks", async () => {
+    mocks.attemptStream.mockImplementation(async (...args: unknown[]) => stream(args, "ANSWERED"));
+
+    await deliver(suspendSignal(true));
+    const turn = runAgentTurn(SESSION_ID, "Explain this", [], undefined, TURN_ID);
+
+    await vi.waitFor(
+      () =>
+        expect(
+          mocks.invoke.mock.calls.some(([command]) => command === "checkpoint_freeze_live"),
+        ).toBe(true),
+      { timeout: 5000 },
+    );
+    const [, args] = mocks.invoke.mock.calls.find(
+      ([command]) => command === "checkpoint_freeze_live",
+    ) as [string, { id: string; resume: Record<string, unknown> }];
+    expect(args.id).toBe("checkpoint-1");
+    expect(args.resume.processId).toBe(PROCESS_ID);
+    // Parked at a round boundary, so the previous round's permission prompts
+    // have already resolved — the image records no outstanding approval because
+    // there is none, not as a shortcut.
+    expect(args.resume.pendingApprovals).toEqual([]);
+
+    await deliver(suspendSignal(false));
+    await turn;
+  });
+
+  /** A turn that never parks never freezes. The image exists for the moment a
+   * process is held in memory, and a turn that runs straight through is never in
+   * that state. */
+  it("writes no image when nothing asked it to pause", async () => {
+    mocks.attemptStream.mockImplementation(async (...args: unknown[]) => stream(args, "ANSWERED"));
+
+    await runAgentTurn(SESSION_ID, "Explain this", [], undefined, TURN_ID);
+
+    expect(mocks.invoke.mock.calls.map(([command]) => command)).not.toContain(
+      "checkpoint_freeze_live",
+    );
+  });
+
   it("holds at the end-of-round checkpoint instead of opening another model round", async () => {
     const readCall: ToolCall = {
       id: "read-1",
