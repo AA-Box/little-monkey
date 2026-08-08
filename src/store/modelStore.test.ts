@@ -110,6 +110,26 @@ describe("modelStore.start", () => {
   });
 });
 
+/** Without a context limit, `contextTrimmer.ts`'s `shouldTrim` returns false
+ *  for any history, so a cloud model never auto-compacts and the context ring
+ *  has no denominator. The provider's `/models` already carried the number. */
+describe("modelStore.useProviderModel", () => {
+  it("adopts the provider-reported context window, and clears it when there isn't one", async () => {
+    const { useUsageStore } = await import("./usageStore");
+    useModelStore.setState({
+      providerModels: {
+        openrouter: [{ id: "vendor/big", context_length: 1_000_000 }, { id: "vendor/silent" }],
+      },
+    });
+
+    useModelStore.getState().useProviderModel("openrouter", "vendor/big");
+    expect(useUsageStore.getState().contextLimit).toBe(1_000_000);
+
+    useModelStore.getState().useProviderModel("openrouter", "vendor/silent");
+    expect(useUsageStore.getState().contextLimit).toBeNull();
+  });
+});
+
 describe("modelStore model reference install", () => {
   const resolved: ResolvedModelReference = {
     source: "ollama",
