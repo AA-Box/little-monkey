@@ -110,6 +110,11 @@ pub enum ComponentSlot {
     /// Subject identity, the FLUX-family alternative to
     /// [`Self::PhotoMaker`].
     PulidWeights,
+    /// The YOLOv8 detector ADetailer re-renders around: faces, hands, whatever
+    /// the model was trained to find. Loaded at launch rather than per run
+    /// because `ad_model_path` is the one ADetailer field the server does not
+    /// read from the request body — the prompts beside it are per run.
+    AdModel,
     /// Speech only: the multimodal projector beside a TTS backbone. Belongs to
     /// a different engine than every slot above it.
     Mmproj,
@@ -142,6 +147,7 @@ impl ComponentSlot {
             Self::IpAdapter => "--ip-adapter",
             Self::PhotoMaker => "--photo-maker",
             Self::PulidWeights => "--pulid-weights",
+            Self::AdModel => "--ad-model",
             Self::Mmproj => "--mmproj",
             Self::Vocoder => "--model-vocoder",
         }
@@ -785,6 +791,15 @@ pub struct GenerationRequest {
     /// than letting the engine silently ignore it.
     #[serde(default)]
     pub mask_image_base64: Option<String>,
+    /// What ADetailer paints into each region its detector found. Empty
+    /// inherits the main prompt, which is the engine's own default, so this is
+    /// sent only when the user wrote something different.
+    #[serde(default)]
+    pub ad_prompt: Option<String>,
+    /// The negative prompt for those same regions. Inherits the main one when
+    /// absent, exactly as `ad_prompt` does.
+    #[serde(default)]
+    pub ad_negative_prompt: Option<String>,
     /// Base64 *pre-processed* control image — a depth map, a pose skeleton, a
     /// Canny edge map. Not a photograph: the engine applies no detector, so
     /// whatever is sent is taken as the structure to follow verbatim.
@@ -949,6 +964,21 @@ pub fn validate_conditioning(
                 spec.name
             ));
         }
+    }
+    // ADetailer fails the same silent way, but is not a conditioning *image* so
+    // it cannot ride the table above: its prompts are request fields while the
+    // detector they need is a launch flag, and an engine started without
+    // `--ad-model` has nothing to detect with and drops the prompts.
+    if (request.ad_prompt.is_some() || request.ad_negative_prompt.is_some())
+        && !spec
+            .components
+            .iter()
+            .any(|component| component.slot == ComponentSlot::AdModel)
+    {
+        return Err(format!(
+            "{} has no ADetailer detector, so its prompt would be ignored. Add one to the model or pick one for this run.",
+            spec.name
+        ));
     }
     Ok(())
 }
@@ -1220,6 +1250,12 @@ pub fn request_body(spec: &GenerationModelSpec, request: &GenerationRequest) -> 
     }
     if let Some(mask) = &request.mask_image_base64 {
         body["mask_image"] = json!(mask);
+    }
+    if let Some(prompt) = &request.ad_prompt {
+        body["ad_prompt"] = json!(prompt);
+    }
+    if let Some(prompt) = &request.ad_negative_prompt {
+        body["ad_negative_prompt"] = json!(prompt);
     }
     if let Some(control) = &request.control_image_base64 {
         body["control_image"] = json!(control);
@@ -2176,6 +2212,8 @@ pub fn validate_remote_request(
     normalized.component_overrides.clear();
     normalized.hires = None;
     normalized.mask_image_base64 = None;
+    normalized.ad_prompt = None;
+    normalized.ad_negative_prompt = None;
     normalized.control_image_base64 = None;
     normalized.control_strength = None;
     normalized.ip_adapter_image_base64 = None;
@@ -2306,6 +2344,8 @@ mod tests {
             task,
             prompt: "a lovely cat".to_string(),
             negative_prompt: String::new(),
+            ad_prompt: None,
+            ad_negative_prompt: None,
             width: 704,
             height: 1280,
             steps: 20,
@@ -2807,6 +2847,32 @@ mod tests {
 
         // Nothing sent, nothing to refuse, whatever is loaded.
         assert!(validate_conditioning(&plain, &image_request(GenerationTask::TextToImage)).is_ok());
+    }
+
+    /// An ADetailer prompt without a detector is the same silent failure as a
+    /// conditioning image without its weights: `ad_model_path` is the one
+    /// ADetailer field the server does not read from the request body, so an
+    /// engine launched without `--ad-model` accepts the prompt and re-details
+    /// nothing.
+    #[test]
+    fn an_adetailer_prompt_is_refused_without_a_detector() {
+        let plain = image_model();
+        let mut request = image_request(GenerationTask::TextToImage);
+        request.ad_prompt = Some("a sharp face".to_string());
+        assert!(validate_conditioning(&plain, &request).is_err());
+
+        let mut with_detector = plain.clone();
+        with_detector
+            .components
+            .push(local_component(ComponentSlot::AdModel, "face_yolov8n.gguf"));
+        assert!(validate_conditioning(&with_detector, &request).is_ok());
+
+        // The negative prompt reaches the detector through the same flag, so it
+        // is refused on its own too rather than only alongside a positive one.
+        let mut negative_only = image_request(GenerationTask::TextToImage);
+        negative_only.ad_negative_prompt = Some("blurry".to_string());
+        assert!(validate_conditioning(&plain, &negative_only).is_err());
+        assert!(validate_conditioning(&with_detector, &negative_only).is_ok());
     }
 
     /// `--ip-adapter` reads its reference through a CLIP vision tower and

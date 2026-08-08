@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::artifact_store::ArtifactStore;
 use crate::generation::{self, GenerationModelSpec, GenerationRequest, JobProgress};
 use crate::managed_runtime::{self, STABLE_DIFFUSION};
+use crate::studio_tools;
 use crate::AppState;
 
 const GALLERY_FILE: &str = "studio-gallery.json";
@@ -50,6 +51,10 @@ const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 /// A long clip on a constrained machine can legitimately sample for a long
 /// time; this exists so a wedged engine cannot poll forever.
 const JOB_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// One tool run, end to end. Unlike a generation this is a single synchronous
+/// request — there is no job to poll — so the deadline covers the operation
+/// itself and not just a round trip.
+const TOOL_RUN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A curated model plus everything the picker needs to decide what to show.
 #[derive(Clone, Debug, Serialize)]
@@ -1027,6 +1032,185 @@ pub async fn generation_capabilities(
 #[tauri::command]
 pub fn generation_unload_engine(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.generation_engine.stop()
+}
+
+// -------------------------------------------------------------------------
+// Studio tools — the sidecar tier
+// -------------------------------------------------------------------------
+
+/// Tools the user has added. Like the model registry, there is no built-in
+/// catalogue: this file is the whole library and it starts empty.
+const TOOLS_FILE: &str = "studio-tools.json";
+/// Nobody has a hundred tools; this only stops a scripted caller growing the
+/// file without bound, as `MAX_BACKENDS` does for remote endpoints.
+const MAX_TOOLS: usize = 64;
+
+#[tauri::command]
+pub fn studio_tools(app: AppHandle) -> Result<Vec<studio_tools::StudioTool>, String> {
+    read_state(&app, TOOLS_FILE)
+}
+
+/// Adds a tool to the library, or replaces the entry with the same id.
+///
+/// Replacing rather than refusing is what makes an upgrade work: installing a
+/// newer version of a managed tool through the component hub yields the same
+/// `componentId` at a new artifact path, and the caller adds it again.
+#[tauri::command]
+pub fn studio_tool_add(
+    app: AppHandle,
+    tool: studio_tools::StudioTool,
+) -> Result<Vec<studio_tools::StudioTool>, String> {
+    studio_tools::validate_tool(&tool)?;
+    // The pure validator deliberately does not touch the filesystem, so the
+    // "you picked a folder" and "you picked something that is gone" cases are
+    // caught here, where there is a real path to report.
+    if !Path::new(&tool.path).is_file() {
+        return Err(format!("There is no file at {}", tool.path));
+    }
+    let mut tools: Vec<studio_tools::StudioTool> = read_state(&app, TOOLS_FILE)?;
+    if let Some(existing) = tools.iter_mut().find(|entry| entry.id == tool.id) {
+        *existing = tool;
+    } else {
+        if tools.len() >= MAX_TOOLS {
+            return Err(format!("At most {MAX_TOOLS} tools can be added"));
+        }
+        tools.push(tool);
+    }
+    write_state(&app, TOOLS_FILE, &tools)?;
+    Ok(tools)
+}
+
+#[tauri::command]
+pub fn studio_tool_remove(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    tool_id: String,
+) -> Result<Vec<studio_tools::StudioTool>, String> {
+    let mut tools: Vec<studio_tools::StudioTool> = read_state(&app, TOOLS_FILE)?;
+    tools.retain(|tool| tool.id != tool_id);
+    write_state(&app, TOOLS_FILE, &tools)?;
+    // A removed tool must not keep running: its process outlives the library
+    // entry otherwise, holding its model in memory with no way to reach it.
+    if state.studio_tool.running_tool().as_deref() == Some(tool_id.as_str()) {
+        state.studio_tool.stop()?;
+    }
+    Ok(tools)
+}
+
+fn find_tool(app: &AppHandle, tool_id: &str) -> Result<studio_tools::StudioTool, String> {
+    read_state::<Vec<studio_tools::StudioTool>>(app, TOOLS_FILE)?
+        .into_iter()
+        .find(|tool| tool.id == tool_id)
+        .ok_or_else(|| format!("No tool named '{tool_id}' has been added"))
+}
+
+/// A client for the loopback tool sidecar. Two deadlines because the two calls
+/// are nothing alike: the manifest is a page of JSON, and a run is the whole
+/// operation plus its result.
+fn tool_client(timeout: Duration) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+/// Starts a tool if it is not already running and returns what it declares.
+///
+/// This is what makes a tool's UI appear: Studio draws its form from the
+/// manifest, so a tool ships its controls as data rather than as code.
+#[tauri::command]
+pub async fn studio_tool_manifest(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    tool_id: String,
+) -> Result<studio_tools::ToolManifest, String> {
+    let tool = find_tool(&app, &tool_id)?;
+    let client = tool_client(Duration::from_secs(30))?;
+    let (_, manifest) = state.studio_tool.ensure_ready(&tool, &client).await?;
+    Ok(manifest)
+}
+
+/// Runs one tool operation and files its result in the gallery.
+///
+/// The inputs are checked against the running tool's own manifest rather than
+/// against whatever the form last drew, so a tool that changed underneath the
+/// UI rejects the stale field instead of being handed it.
+#[tauri::command]
+pub async fn studio_tool_run(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    tool_id: String,
+    inputs: std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<Vec<GenerationEntry>, String> {
+    let tool = find_tool(&app, &tool_id)?;
+    let client = tool_client(Duration::from_secs(30))?;
+    let (base_url, manifest) = state.studio_tool.ensure_ready(&tool, &client).await?;
+    let body = studio_tools::validate_inputs(&manifest, &inputs)?;
+
+    let _ = app.emit(
+        "studio://progress",
+        GenerationProgressEvent::new(&tool_id, "running"),
+    );
+    let run_client = tool_client(TOOL_RUN_TIMEOUT)?;
+    let response = state.studio_tool.run(&base_url, &run_client, &body).await?;
+
+    let store = artifacts(&app)?;
+    let summary = studio_tools::run_summary(&manifest, &body);
+    // A tool run has no sampler, no seed and no dimensions, so the gallery
+    // entry carries zeros there rather than inventing values. The task records
+    // whether an image went in, which is the one thing about the run the
+    // gallery can meaningfully say.
+    let task = if manifest.inputs.iter().any(|input| {
+        input.kind == studio_tools::ToolInputKind::Image && body.contains_key(&input.key)
+    }) {
+        generation::GenerationTask::ImageToImage
+    } else {
+        generation::GenerationTask::TextToImage
+    };
+    let created_at_ms = now_ms();
+    let mut entries = Vec::with_capacity(response.media.len());
+    for (index, media) in response.media.iter().enumerate() {
+        let bytes = studio_tools::decode_media(media)?;
+        let blob = store.put(&bytes).map_err(|error| error.to_string())?;
+        entries.push(GenerationEntry {
+            entry_id: format!("studio-{}", Uuid::new_v4()),
+            artifact_id: blob.id,
+            model_id: format!("tool:{tool_id}"),
+            task,
+            prompt: summary.clone(),
+            negative_prompt: String::new(),
+            media_type: media.media_type.clone(),
+            size_bytes: blob.size,
+            width: 0,
+            height: 0,
+            steps: 0,
+            cfg_scale: 0.0,
+            seed: 0,
+            frame_count: 1,
+            fps: 1,
+            duration_ms: 0,
+            created_at_ms: created_at_ms + index as u64,
+        });
+    }
+
+    let mut gallery: Vec<GenerationEntry> = read_state(&app, GALLERY_FILE)?;
+    gallery.extend(entries.iter().cloned());
+    gallery.sort_by_key(|item| item.created_at_ms);
+    write_state(&app, GALLERY_FILE, &gallery)?;
+
+    if let Some(last) = entries.last() {
+        let _ = app.emit(
+            "studio://progress",
+            GenerationProgressEvent::new(&last.entry_id, "completed"),
+        );
+    }
+    Ok(entries)
+}
+
+/// Releases a tool's memory, as `generation_unload_engine` does the engine's.
+#[tauri::command]
+pub fn studio_tool_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.studio_tool.stop()
 }
 
 #[cfg(test)]

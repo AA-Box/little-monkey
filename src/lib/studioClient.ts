@@ -33,6 +33,9 @@ export type ComponentSlot =
   | "ip_adapter"
   | "photo_maker"
   | "pulid_weights"
+  /** The YOLOv8 detector ADetailer re-renders around. A launch flag, unlike the
+   *  ad prompts beside it, which are per-run request fields. */
+  | "ad_model"
   /** Speech only, and served by llama-tts rather than sd-server. */
   | "mmproj"
   | "vocoder";
@@ -311,6 +314,35 @@ export function formatLaunchArgs(args: string[]): string {
     .join(" ");
 }
 
+/** The value given to `flag` in an argument list, or null when it is absent.
+ *
+ *  A flag the user typed into the args field by hand and one a picker wrote are
+ *  the same thing on the launch line, so both read back through here rather than
+ *  the UI keeping a second copy that could disagree with what actually runs. */
+export function launchArgValue(args: string[], flag: string): string | null {
+  const at = args.indexOf(flag);
+  if (at < 0) return null;
+  const value = args[at + 1];
+  // A trailing flag with nothing after it, or one followed by another flag, has
+  // no value — treat it as absent rather than swallowing the next flag.
+  return value === undefined || value.startsWith("--") ? null : value;
+}
+
+/** `args` with `flag` set to `value`, replacing an existing one in place, or
+ *  removed entirely when `value` is null or blank. */
+export function setLaunchArg(args: string[], flag: string, value: string | null): string[] {
+  const at = args.indexOf(flag);
+  const trimmed = value?.trim() ?? "";
+  // Replacing in place rather than removing and appending keeps the order the
+  // user arranged, which is the whole reason the field stays editable by hand.
+  const without =
+    at < 0
+      ? [...args]
+      : [...args.slice(0, at), ...args.slice(at + (launchArgValue(args, flag) === null ? 1 : 2))];
+  if (!trimmed) return without;
+  return at < 0 ? [...without, flag, trimmed] : [...without.slice(0, at), flag, trimmed, ...without.slice(at)];
+}
+
 /** The slots the generation page offers a chooser for: everything the library
  *  has a part for. A denoiser is what the model *is*, so it is never one. */
 export function choosableSlots(parts: PartAsset[]): ComponentSlot[] {
@@ -354,6 +386,10 @@ export interface GenerationRequest {
   /** Single-channel mask over the init image: white is repainted, black is
    *  kept. This is inpainting, so it needs an init image to paint over. */
   maskImageBase64: string | null;
+  /** ADetailer's own prompts. Null inherits the main ones, which is the
+   *  engine's default — so they are sent only when deliberately different. */
+  adPrompt: string | null;
+  adNegativePrompt: string | null;
   /** A *pre-processed* control image — depth map, pose skeleton, edge map. The
    *  engine runs no detector, so a plain photograph is taken as structure. */
   controlImageBase64: string | null;
@@ -600,6 +636,7 @@ export const COMPONENT_SLOTS: { slot: ComponentSlot; flag: string }[] = [
   { slot: "ip_adapter", flag: "--ip-adapter" },
   { slot: "photo_maker", flag: "--photo-maker" },
   { slot: "pulid_weights", flag: "--pulid-weights" },
+  { slot: "ad_model", flag: "--ad-model" },
   { slot: "mmproj", flag: "--mmproj" },
   { slot: "vocoder", flag: "--model-vocoder" },
 ];
