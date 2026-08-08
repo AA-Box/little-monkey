@@ -115,7 +115,19 @@ pub struct CheckpointManifest {
     pub label: String,
     /// True if `tool_run_shell` executed during this turn — revert coverage
     /// is then only partial (shell side effects are not snapshotted).
+    ///
+    /// Kept as its own field rather than derived from `external_effects` on
+    /// read: it is the one signal every manifest ever written carries, and the
+    /// timeline, the summary and the preview all still read it by name.
     pub shell_ran: bool,
+    /// Every kind of effect this turn had outside the workspace files.
+    ///
+    /// `serde(default)` because a manifest written before this field existed
+    /// has none — and an empty set there means *unrecorded*, not *none*, which
+    /// is why [`external_effects_of`] reconstructs `Shell` from `shell_ran`
+    /// rather than trusting the empty vec.
+    #[serde(default)]
+    pub external_effects: Vec<ExternalEffectKind>,
     /// Set on revert so list/timeline UIs can show state and offer Re-apply.
     pub reverted: bool,
     /// Id of whatever was this session's newest surviving checkpoint at the
@@ -132,6 +144,97 @@ pub struct CheckpointManifest {
     pub entries: Vec<CheckpointEntry>,
 }
 
+/// A side effect a turn had outside the checkpointed workspace files.
+///
+/// A closed set with stable codes, for [`crate::run_scope::Unattributed`]'s
+/// reason: the code is what gets persisted in the manifest, so it has to
+/// outlive this enum's spelling.
+///
+/// # Why the backend records these at all, when the transcript already has them
+///
+/// `checkpointReconciliation.ts` derives the same kinds from the turn's own
+/// messages, and does it in finer detail. It also says, in its own module doc,
+/// why that is not enough: the manifest flag "survives even if the transcript's
+/// tool-call messages are later dropped by context compaction". That was true of
+/// `shell_ran` and of nothing else — so after a compaction, a turn that made a
+/// network call or invoked an MCP tool reverted with **no warning at all**,
+/// because the only surviving signal said `shell_ran: false` and every reader
+/// takes that to mean there is nothing outside the files.
+///
+/// Recording the kind when the effect happens is what makes the warning outlive
+/// the transcript. This is K14's "explicit, enumerated set", and the point of
+/// enumerating is [`ExternalEffectKind::compensator`]: the set is not a list of
+/// worries, it is a list of things with a stated undo or a stated reason there
+/// is none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalEffectKind {
+    /// `tool_run_shell` or a background shell ran an arbitrary command.
+    Shell,
+    /// An HTTP request left the machine (`web_fetch`, `web_search`).
+    Network,
+    /// An MCP server tool was invoked, which can do anything at all.
+    McpTool,
+    /// This app's own persistent memory store was written (`remember`).
+    Memory,
+}
+
+/// Whether reverting a checkpoint can undo an effect, and what does it.
+///
+/// The distinction K14 asks for: `needs_reconciliation` should be the answer
+/// for an enumerated set of effects that genuinely cannot be undone, not the
+/// default answer for everything that is not a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum Compensation {
+    /// Nothing in this app can undo it. The reason is enumerated rather than
+    /// generic, because "a shell command may have changed anything on this
+    /// machine" and "a message may already have been delivered" call for
+    /// different judgement from whoever reconciles.
+    None { reason: &'static str },
+}
+
+impl ExternalEffectKind {
+    /// The stable identity that gets persisted. Never reworded.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            ExternalEffectKind::Shell => "shell",
+            ExternalEffectKind::Network => "network",
+            ExternalEffectKind::McpTool => "mcp-tool",
+            ExternalEffectKind::Memory => "memory",
+        }
+    }
+
+    /// What, if anything, undoes this effect.
+    ///
+    /// Every arm is `None` today, and that is the honest state rather than an
+    /// oversight: this app has no compensator for any of these four. The type
+    /// exists as an enum with one variant so that adding a real one — K14 names
+    /// a Git worktree revert and closing an owned draft PR — is a new variant
+    /// and a compile error at every match, instead of a bool somebody forgets
+    /// to flip. Workspace files are absent from this enum entirely because they
+    /// *are* compensated, by the restore plan itself.
+    #[must_use]
+    pub fn compensator(self) -> Compensation {
+        match self {
+            ExternalEffectKind::Shell => Compensation::None {
+                reason: "a shell command can change anything on this machine, \
+                         and nothing here recorded what it changed",
+            },
+            ExternalEffectKind::Network => Compensation::None {
+                reason: "the request was already sent and cannot be un-sent",
+            },
+            ExternalEffectKind::McpTool => Compensation::None {
+                reason: "an MCP server's effects are outside this app entirely",
+            },
+            ExternalEffectKind::Memory => Compensation::None {
+                reason: "remembered facts are not part of the checkpointed workspace",
+            },
+        }
+    }
+}
+
 /// An open checkpoint for one in-flight turn. Lives in `AppState::checkpoints`
 /// keyed by its id until the turn's `checkpoint_end` removes it.
 pub struct ActiveCheckpoint {
@@ -143,9 +246,12 @@ pub struct ActiveCheckpoint {
     pub session_id: String,
     pub anchor_index: usize,
     pub label: String,
-    /// Flipped by `record_shell` (future slice) when `tool_run_shell` runs
-    /// during the turn. Always `false` until then.
+    /// Flipped by `record_shell` when `tool_run_shell` runs during the turn.
+    /// Always `false` until then.
     pub shell_ran: bool,
+    /// Every external effect kind recorded during the turn, deduplicated and
+    /// ordered so a manifest is byte-stable for the same set of effects.
+    pub external_effects: std::collections::BTreeSet<ExternalEffectKind>,
     /// Captured at `checkpoint_begin` time — see `CheckpointManifest::prev_id`.
     pub prev_id: Option<String>,
 }
@@ -373,6 +479,7 @@ pub fn begin_impl(
                 anchor_index,
                 label,
                 shell_ran: false,
+                external_effects: std::collections::BTreeSet::new(),
                 prev_id,
             },
         );
@@ -432,6 +539,23 @@ pub fn record_original(state: &AppState, id: Option<&str>, resolved: &Path) -> R
 /// shell side effects are never captured, so this only makes the manifest's
 /// `shell_ran` flag (and therefore the UI's revert-coverage caveat) honest.
 pub fn record_shell(state: &AppState, id: Option<&str>) -> Result<(), String> {
+    record_external_effect(state, id, ExternalEffectKind::Shell)
+}
+
+/// Records that this turn had an effect outside the checkpointed workspace.
+///
+/// A no-op without an id, and a no-op for an id with no open checkpoint —
+/// both are ordinary (a tool called outside a turn, or after `checkpoint_end`),
+/// not errors, which is the behaviour `record_shell` has always had.
+///
+/// Recorded when the effect happens rather than derived later, because the
+/// transcript this could otherwise be read from is compactable — see
+/// [`ExternalEffectKind`].
+pub fn record_external_effect(
+    state: &AppState,
+    id: Option<&str>,
+    kind: ExternalEffectKind,
+) -> Result<(), String> {
     let Some(id) = id else {
         return Ok(());
     };
@@ -444,8 +568,31 @@ pub fn record_shell(state: &AppState, id: Option<&str>) -> Result<(), String> {
         return Ok(());
     };
 
-    active.shell_ran = true;
+    active.external_effects.insert(kind);
+    // Kept in step rather than derived on read: every existing reader — the
+    // timeline, the summary, the preview — asks for `shell_ran` by name.
+    if kind == ExternalEffectKind::Shell {
+        active.shell_ran = true;
+    }
     Ok(())
+}
+
+/// Every external effect a manifest records, reconstructing what an older one
+/// could not say.
+///
+/// A manifest written before `external_effects` existed has an empty vec, and
+/// an empty vec there means **unrecorded**, not *none*. It does carry
+/// `shell_ran`, so that one kind is recovered; the others are simply absent
+/// from the record and this function does not invent them.
+#[must_use]
+fn external_effects_of(manifest: &CheckpointManifest) -> Vec<ExternalEffectKind> {
+    let mut effects = manifest.external_effects.clone();
+    if manifest.shell_ran && !effects.contains(&ExternalEffectKind::Shell) {
+        effects.push(ExternalEffectKind::Shell);
+    }
+    effects.sort();
+    effects.dedup();
+    effects
 }
 
 /// Parses a raw `manifest.json`, falling back from the versioned v2 struct
@@ -473,6 +620,10 @@ fn parse_manifest(raw: &str, dir: &Path, id: &str) -> Result<CheckpointManifest,
         anchor_index: 0,
         label: String::new(),
         shell_ran: false,
+        // A v1 manifest recorded no effects and had no way to. Left empty here
+        // and reconstructed by `external_effects_of`, which reads `shell_ran`
+        // so the one signal a v1 manifest *does* carry is not lost.
+        external_effects: Vec::new(),
         reverted: false,
         prev_id: None,
         entries,
@@ -563,6 +714,7 @@ pub fn end_impl(state: &AppState, id: &str) -> Result<CheckpointSummary, String>
         anchor_index: active.anchor_index,
         label: active.label.clone(),
         shell_ran: active.shell_ran,
+        external_effects: active.external_effects.iter().copied().collect(),
         reverted: false,
         prev_id: active.prev_id,
         entries: entries.clone(),
@@ -1186,14 +1338,62 @@ pub struct RestoreSimulation {
     pub id: String,
     pub already_reverted: bool,
     pub files: Vec<RestorePlanEntry>,
-    /// True when this turn ran a shell command — file restore will proceed
-    /// as planned below, but that external side effect is NOT reversed by
-    /// it and must be reconciled manually. This is the one external-effect
-    /// signal the backend itself can see (`record_shell`); the frontend's
-    /// `checkpointReconciliation.ts` adds finer-grained tool-level detail
-    /// (network calls, MCP tool calls) from the transcript, which isn't
-    /// visible from the checkpoint manifest alone.
+    /// True when this turn had at least one recorded effect that reverting
+    /// cannot undo.
+    ///
+    /// Derived from [`Self::uncompensated`] rather than from `shell_ran`
+    /// alone, which is what it used to be — so a turn that only made a network
+    /// call no longer reports `false` and reads as "nothing to reconcile".
     pub needs_reconciliation: bool,
+    /// Every recorded effect outside the workspace files, each with what
+    /// undoes it or the stated reason nothing does.
+    ///
+    /// This is K14's enumerated set. It is recorded in the manifest when the
+    /// effect happens, so — unlike `checkpointReconciliation.ts`'s
+    /// transcript-derived list, which is finer-grained but only survives while
+    /// the messages do — it is still here after a context compaction.
+    pub external_effects: Vec<ExternalEffectRecord>,
+}
+
+/// One recorded external effect and its compensation.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalEffectRecord {
+    pub kind: ExternalEffectKind,
+    pub compensation: Compensation,
+}
+
+impl RestoreSimulation {
+    /// The effects nothing can undo. Every one of them today — see
+    /// [`ExternalEffectKind::compensator`] — which is exactly why the type
+    /// says so per effect instead of the caller assuming it.
+    fn uncompensated(effects: &[ExternalEffectRecord]) -> bool {
+        effects
+            .iter()
+            .any(|effect| matches!(effect.compensation, Compensation::None { .. }))
+    }
+
+    fn from_effects(
+        id: String,
+        already_reverted: bool,
+        files: Vec<RestorePlanEntry>,
+        manifest: &CheckpointManifest,
+    ) -> Self {
+        let external_effects: Vec<ExternalEffectRecord> = external_effects_of(manifest)
+            .into_iter()
+            .map(|kind| ExternalEffectRecord {
+                kind,
+                compensation: kind.compensator(),
+            })
+            .collect();
+        RestoreSimulation {
+            id,
+            already_reverted,
+            files,
+            needs_reconciliation: Self::uncompensated(&external_effects),
+            external_effects,
+        }
+    }
 }
 
 /// Core simulate-restore logic, parameterized by base dir for testability.
@@ -1205,12 +1405,12 @@ pub fn simulate_restore_impl(base_dir: &Path, id: &str) -> Result<RestoreSimulat
     let manifest = read_manifest(base_dir, id)?;
 
     if manifest.reverted {
-        return Ok(RestoreSimulation {
-            id: id.to_string(),
-            already_reverted: true,
-            files: Vec::new(),
-            needs_reconciliation: manifest.shell_ran,
-        });
+        return Ok(RestoreSimulation::from_effects(
+            id.to_string(),
+            true,
+            Vec::new(),
+            &manifest,
+        ));
     }
 
     let files = manifest
@@ -1254,12 +1454,12 @@ pub fn simulate_restore_impl(base_dir: &Path, id: &str) -> Result<RestoreSimulat
         })
         .collect();
 
-    Ok(RestoreSimulation {
-        id: id.to_string(),
-        already_reverted: false,
+    Ok(RestoreSimulation::from_effects(
+        id.to_string(),
+        false,
         files,
-        needs_reconciliation: manifest.shell_ran,
-    })
+        &manifest,
+    ))
 }
 
 /// Simulates reverting checkpoint `id` without actually doing it — the
@@ -2780,6 +2980,92 @@ mod tests {
             plan.drifted,
             "live content no longer matches what this turn produced, so revert would also discard the later edit"
         );
+    }
+
+    /// The bug the enumerated set exists for: a turn whose only external
+    /// effect was a network call used to report "nothing to reconcile".
+    ///
+    /// `needs_reconciliation` was `manifest.shell_ran`, and the finer detail
+    /// lived only in the transcript — which `contextTrimmer.ts` is allowed to
+    /// drop. So after a compaction the rollback simulation, the one surface
+    /// that survives, actively said the revert was complete.
+    #[test]
+    fn a_non_shell_effect_is_enumerated_and_still_needs_reconciliation() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("f.txt");
+        std::fs::write(&file, "v1").unwrap();
+
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "v2").unwrap();
+        record_external_effect(&state, Some(&id), ExternalEffectKind::Network).unwrap();
+        record_external_effect(&state, Some(&id), ExternalEffectKind::McpTool).unwrap();
+        // Twice, to pin that the set deduplicates rather than growing per call.
+        record_external_effect(&state, Some(&id), ExternalEffectKind::Network).unwrap();
+        end_impl(&state, &id).unwrap();
+
+        let sim = simulate_restore_impl(&base.path, &id).unwrap();
+        assert!(
+            sim.needs_reconciliation,
+            "an already-sent request cannot be un-sent, whether or not a shell also ran"
+        );
+        assert_eq!(
+            sim.external_effects
+                .iter()
+                .map(|effect| effect.kind)
+                .collect::<Vec<_>>(),
+            vec![ExternalEffectKind::Network, ExternalEffectKind::McpTool],
+            "each kind appears once, in the enum's own order"
+        );
+        for effect in &sim.external_effects {
+            let Compensation::None { reason } = effect.compensation;
+            assert!(
+                !reason.is_empty(),
+                "an effect with no compensator must say why, not just that"
+            );
+        }
+        assert!(
+            !read_manifest(&base.path, &id).unwrap().shell_ran,
+            "no shell ran, and recording a network call must not claim one did"
+        );
+    }
+
+    /// A manifest written before the column existed still reports what it can.
+    #[test]
+    fn a_manifest_without_the_effect_list_recovers_shell_from_the_old_flag() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("f.txt");
+        std::fs::write(&file, "v1").unwrap();
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "v2").unwrap();
+        record_shell(&state, Some(&id)).unwrap();
+        end_impl(&state, &id).unwrap();
+
+        // Wind the manifest back to what a build before this change wrote: the
+        // flag, and no list.
+        let manifest_path = base.path.join(&id).join("manifest.json");
+        let raw = std::fs::read_to_string(&manifest_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        value.as_object_mut().unwrap().remove("external_effects");
+        std::fs::write(&manifest_path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        let sim = simulate_restore_impl(&base.path, &id).unwrap();
+        assert_eq!(
+            sim.external_effects
+                .iter()
+                .map(|effect| effect.kind)
+                .collect::<Vec<_>>(),
+            vec![ExternalEffectKind::Shell],
+            "the one signal an older manifest carries must still be reported"
+        );
+        assert!(sim.needs_reconciliation);
     }
 
     #[test]

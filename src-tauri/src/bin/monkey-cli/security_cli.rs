@@ -4,6 +4,7 @@ use clap::Subcommand;
 use little_monkey_lib::native_skills::{NativeSkillManager, SkillSource};
 use little_monkey_lib::run_ledger::{
     ChainVerification, RunLedger, StoredPermissionDecision, StoredSubsystemEvent, Subsystem,
+    ToolCallOrigin,
 };
 use little_monkey_lib::run_protocol::PermissionDecision;
 use little_monkey_lib::security_doctor::{
@@ -262,6 +263,21 @@ fn print_permission_trail(tool_call_id: &str, trail: &[StoredPermissionDecision]
         );
         if let Some(process_id) = &request.process_id {
             println!("  process: {process_id}");
+        }
+        // Printed only when the id does not name a real tool call. A trail
+        // reached by that id and then told the id is synthetic reads as a
+        // contradiction, so `caller` — the case where the id is exactly what
+        // was asked for — says nothing.
+        match request.tool_call_origin {
+            ToolCallOrigin::Caller => {}
+            ToolCallOrigin::Synthesized => println!(
+                "  tool call: none — this id was generated for a gated operation \
+                 that was not a tool call"
+            ),
+            ToolCallOrigin::Unknown => println!(
+                "  tool call: unrecorded — written before the origin was tracked, \
+                 so this id may or may not name a real tool call"
+            ),
         }
         println!(
             "  mode: {}, risk: {}",

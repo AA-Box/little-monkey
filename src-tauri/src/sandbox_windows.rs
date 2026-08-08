@@ -954,13 +954,66 @@ pub fn job_objects_are_enforceable() -> bool {
 /// AppContainer support is present on every supported Windows version, but
 /// creating a profile writes to the user's registry hive and group policy can
 /// refuse it. Creates a container and drops it, which deletes the profile again.
+///
+/// # Why this one is answered once and under a unique name
+///
+/// The two halves fix the same bug from both ends, and it was a real one:
+/// `security_doctor`'s isolation test compares the audit's finding against this
+/// probe, and on a parallel test run the two calls disagreed —
+/// `isolation.process_contained` against an expected `isolation.os_enforced`.
+///
+/// The cause is that a profile name is a **machine-global** resource and this
+/// probe used a fixed one. [`create_app_container`] recovers from
+/// `ERROR_ALREADY_EXISTS` by deleting the existing profile and retrying, which
+/// is right for a run whose predecessor died before its `Drop` — and wrong
+/// between two live probes, because each one deletes the other's profile and
+/// then the loser's `Drop` deletes the winner's. Whoever lost that race
+/// reported "no AppContainer" on a machine that has them.
+///
+/// So: a name unique to this process, so two Little Monkey instances probing at
+/// the same moment cannot collide; and a `OnceLock`, so within a process the
+/// registry is touched once and every caller afterwards gets the same answer.
+/// The memo is also what makes the answer *stable*, which is what the audit and
+/// the Sandbox panel are compared against — a probe that can return two values
+/// in one process is a disagreement waiting to be rendered.
 pub fn app_containers_are_enforceable() -> bool {
-    create_app_container("probe").is_ok()
+    static ENFORCEABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENFORCEABLE.get_or_init(|| {
+        // Not a constant: the tag is filtered to alphanumerics and truncated, so
+        // the pid keeps this out of the way of another instance's probe and of
+        // every real run, whose tag is a run id.
+        create_app_container(&format!("probe{}", std::process::id())).is_ok()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Concurrent callers must get the same answer.
+    ///
+    /// The test that would have caught the bug this memo exists for: a profile
+    /// name is machine-global, and `create_app_container` recovers from
+    /// `ERROR_ALREADY_EXISTS` by deleting and retrying — so two probes under one
+    /// fixed name deleted each other's profile and disagreed about whether this
+    /// machine has AppContainers at all. `security_doctor`'s isolation test hit
+    /// exactly that, comparing its own probe against the audit's.
+    ///
+    /// Threads rather than a loop, because a loop passes with or without the
+    /// memo. This is only a real check while the calls can overlap.
+    #[test]
+    fn concurrent_appcontainer_probes_agree() {
+        let answers: Vec<bool> = (0..8)
+            .map(|_| std::thread::spawn(app_containers_are_enforceable))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("the probe does not panic"))
+            .collect();
+        assert!(
+            answers.windows(2).all(|pair| pair[0] == pair[1]),
+            "the probe returned {answers:?} — a machine either has AppContainers or does not"
+        );
+    }
 
     /// A job must be creatable and fully configurable, because
     /// `execute_in_sandbox` fails the run when it is not.
