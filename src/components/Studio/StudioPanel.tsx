@@ -418,6 +418,8 @@ export function StudioPanel({ mode, railSlot }: Props) {
    *  multiplies the wait as well as the output. */
   const [batchCount, setBatchCount] = useState(1);
   const [initImage, setInitImage] = useState<string | null>(null);
+  const [adPrompt, setAdPrompt] = useState("");
+  const [adNegativePrompt, setAdNegativePrompt] = useState("");
   /** Inpainting: white is repainted, black is kept. Only ever set while an
    *  init image exists, because it is a mask *over* that image. */
   const [maskImage, setMaskImage] = useState<string | null>(null);
@@ -515,6 +517,19 @@ export function StudioPanel({ mode, railSlot }: Props) {
       capabilities,
     );
   }, [remote, selected, overrides, capabilities]);
+
+  // ADetailer re-renders each region its detector finds. The detector is a
+  // launch flag, so this asks the same question the conditioning memo does —
+  // the model's own slots plus anything picked for this run — but it is not a
+  // conditioning *image*, so it cannot ride that set.
+  const hasDetector = useMemo(
+    () =>
+      !remote &&
+      [...(selected?.components ?? []), ...overrides].some(
+        (component) => component.slot === "ad_model",
+      ),
+    [remote, selected, overrides],
+  );
 
   // Inpainting. Offered only for the still-image edit task — a mask over the
   // first frame of a clip describes one frame out of thirty-three — and only
@@ -809,6 +824,12 @@ export function StudioPanel({ mode, railSlot }: Props) {
         // chosen before switching model cannot follow the run somewhere they
         // mean nothing. The backend refuses them again on its own side.
         maskImageBase64: canMask && initImage ? maskImage : null,
+        // Blank inherits the main prompt inside the engine, so an untouched
+        // field is sent as null rather than as an empty string it would have
+        // to interpret.
+        adPrompt: hasDetector && adPrompt.trim() ? adPrompt.trim() : null,
+        adNegativePrompt:
+          hasDetector && adNegativePrompt.trim() ? adNegativePrompt.trim() : null,
         controlImageBase64: conditioning.has("control") ? controlImage : null,
         controlStrength: conditioning.has("control") && controlImage ? controlStrength : null,
         ipAdapterImageBase64: conditioning.has("ip_adapter") ? ipAdapterImage : null,
@@ -1421,6 +1442,25 @@ export function StudioPanel({ mode, railSlot }: Props) {
               <span className="text-xs text-muted">{t("Studio.mask.title")}</span>
               <MaskCanvas imageBase64={initImage} value={maskImage} onChange={setMaskImage} />
             </div>
+          )}
+
+          {hasDetector && (
+            <SettingsCard title={t("Studio.adetailer.title")} hint={t("Studio.adetailer.hint")}>
+              <input
+                className="w-full rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+                placeholder={t("Studio.adetailer.promptPlaceholder")}
+                aria-label={t("Studio.adetailer.prompt")}
+                value={adPrompt}
+                onChange={(event) => setAdPrompt(event.target.value)}
+              />
+              <input
+                className="w-full rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+                placeholder={t("Studio.adetailer.negativePlaceholder")}
+                aria-label={t("Studio.adetailer.negative")}
+                value={adNegativePrompt}
+                onChange={(event) => setAdNegativePrompt(event.target.value)}
+              />
+            </SettingsCard>
           )}
 
           {conditioning.has("control") && (

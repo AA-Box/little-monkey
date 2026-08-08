@@ -66,6 +66,13 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.frameGrid": "Frame grid",
   "Studio.add.grid4n1": "Round down to 4n+1 (Wan, most video)",
   "Studio.add.grid17k5": "Round up to 17k+5 (MiniMax H3)",
+  "Studio.adetailer.title": "Re-detail",
+  "Studio.adetailer.hint":
+    "The detector finds each face or hand and the model repaints that region on its own, at full resolution. Leave the prompts empty to reuse the ones above.",
+  "Studio.adetailer.prompt": "Re-detail prompt",
+  "Studio.adetailer.promptPlaceholder": "Same as the main prompt",
+  "Studio.adetailer.negative": "Re-detail negative prompt",
+  "Studio.adetailer.negativePlaceholder": "Same as the main negative prompt",
   "Studio.add.upscalersDir": "Upscalers folder",
   "Studio.add.upscalersDirHint":
     "ESRGAN and other upscale models found here join the upscaler list, alongside the built-in ones.",

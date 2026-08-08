@@ -33,6 +33,9 @@ export type ComponentSlot =
   | "ip_adapter"
   | "photo_maker"
   | "pulid_weights"
+  /** The YOLOv8 detector ADetailer re-renders around. A launch flag, unlike the
+   *  ad prompts beside it, which are per-run request fields. */
+  | "ad_model"
   /** Speech only, and served by llama-tts rather than sd-server. */
   | "mmproj"
   | "vocoder";
@@ -383,6 +386,10 @@ export interface GenerationRequest {
   /** Single-channel mask over the init image: white is repainted, black is
    *  kept. This is inpainting, so it needs an init image to paint over. */
   maskImageBase64: string | null;
+  /** ADetailer's own prompts. Null inherits the main ones, which is the
+   *  engine's default — so they are sent only when deliberately different. */
+  adPrompt: string | null;
+  adNegativePrompt: string | null;
   /** A *pre-processed* control image — depth map, pose skeleton, edge map. The
    *  engine runs no detector, so a plain photograph is taken as structure. */
   controlImageBase64: string | null;
@@ -629,6 +636,7 @@ export const COMPONENT_SLOTS: { slot: ComponentSlot; flag: string }[] = [
   { slot: "ip_adapter", flag: "--ip-adapter" },
   { slot: "photo_maker", flag: "--photo-maker" },
   { slot: "pulid_weights", flag: "--pulid-weights" },
+  { slot: "ad_model", flag: "--ad-model" },
   { slot: "mmproj", flag: "--mmproj" },
   { slot: "vocoder", flag: "--model-vocoder" },
 ];
