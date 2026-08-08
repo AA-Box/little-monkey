@@ -302,11 +302,10 @@ pub fn sandbox_enforcement() -> SandboxEnforcement {
             SandboxEnforcement::ProcessOnly
         }
     }
-    // Windows has containment but no filesystem boundary, so it answers with the
-    // middle state rather than either extreme. `Unavailable` would still be wrong
-    // here for the reason it is wrong on Linux: there is no separate binary to be
-    // missing, and a machine that cannot create a job object degrades to
-    // `ProcessOnly` rather than failing.
+    // `Unavailable` is wrong here for the reason it is wrong on Linux: there is no
+    // separate binary to be missing, and a machine that can create neither
+    // mechanism degrades to `ProcessOnly` rather than failing.
+    //
     // Two mechanisms, so three answers. An AppContainer is the filesystem
     // boundary and earns `OsEnforced` alongside Seatbelt and Landlock; a machine
     // that can only give us a job object gets `ProcessContained`; one that can
