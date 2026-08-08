@@ -4233,13 +4233,46 @@ had `delete_fact_impl`.
   longer reports as unreconcilable, and the preview shows what reverting will do
   instead of colouring it as a warning nothing can fix.
 
-**Remaining: the declare-then-commit half.** No tool yet declares an intent
-before acting. The three remaining effects still have no compensator, and the
-reasons are unchanged and still honest — a shell command can change anything, a
-sent request cannot be un-sent, an MCP server's effects are outside this app.
-The acceptance's other two named undos (a Git worktree revert, closing an owned
-draft PR) are reachable the same way this one was, and each is now a variant
-away rather than a redesign.
+**Shipped — declare then commit, and it separates two things the record used to
+say identically.** Every effect was already declared *before* its call and after
+the permission gate, deliberately: a request that is permitted and then times out
+may still have reached the network, so recording afterwards would lose exactly
+the effects worth warning about. The cost of that pessimism was that the record
+could not tell a cancelled call from a completed one — a `web_fetch` the user
+stopped before a single byte left the machine reverted with the same warning as
+one that posted a form.
+
+- **The commit phase is the success path, and only the success path.**
+  `commit_external_effect` runs where the call returned: after
+  `wait_with_output`, after the fetch resolved, after the MCP server answered,
+  after `add_fact_impl` returned the fact. An error or a timeout leaves the
+  declaration standing alone, which is the safe direction — "we did not see a
+  response" is not "the server saw nothing".
+- **Three states, not a `committed` bool.** `EffectStatus::Unobserved` is what a
+  checkpoint written before this change reports, because it carries no
+  completion signal either way. Collapsing it into "declared" would make every
+  historical turn's shell command read as abandoned — a downgrade invented by
+  the reader rather than recorded by the writer, the same mistake an empty
+  `external_effects` list would be if it were trusted to mean *none*.
+- **`Option<Vec<_>>` on the manifest, for that reason.** `None` is "nothing
+  observed this", `Some([])` is "this build watched, and nothing completed".
+  A new checkpoint always writes `Some`, even when empty.
+- **Committing declares.** The two lists are a subset relation by construction,
+  so no reader that iterates the declarations can miss a kind that only ever
+  reached the commit call.
+- **Status informs, it does not excuse.** `needs_reconciliation` is unchanged: a
+  declared-but-unfinished effect is still an effect that may have landed, and
+  the preview says so in its own words rather than quietly dropping the warning.
+
+**Remaining: the two named compensators.** The three effects other than memory
+still have none, and the reasons are unchanged and still honest — a shell
+command can change anything, a sent request cannot be un-sent, an MCP server's
+effects are outside this app. The acceptance's other two named undos (a Git
+worktree revert, closing an owned draft PR) are reachable the same way the memory
+one was, and each is a `Compensation` variant away rather than a redesign — but
+neither has a caller yet: no chat tool creates a worktree or opens a PR, so
+building the compensator first would be a compensator for an effect this app's
+turns cannot produce.
 
 ---
 

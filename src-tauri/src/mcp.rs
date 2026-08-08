@@ -1453,6 +1453,17 @@ pub async fn mcp_call_tool(
         },
     );
 
+    // The server answered, so its tool ran. A timeout leaves the declaration
+    // standing alone, which is the case this contract exists for: the server
+    // may well have finished the work and only the reply was lost.
+    if outcome.is_ok() {
+        crate::checkpoints::commit_external_effect(
+            state.inner(),
+            checkpoint_id.as_deref(),
+            crate::checkpoints::ExternalEffectKind::McpTool,
+        )?;
+    }
+
     outcome.map_err(ToolCallAttemptError::into_message)
 }
 

@@ -661,6 +661,15 @@ pub async fn tool_run_shell_background(
     }
     spawn_exit_watcher(app.clone(), process);
     emit_status(&app, view.clone(), native_pid);
+    // Committed at the spawn, not at the exit: this command is *meant* to
+    // outlive the call, so waiting for its exit code would leave every
+    // still-running background command looking like one that never started.
+    // What is being committed is that a process exists, which it does.
+    checkpoints::commit_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        checkpoints::ExternalEffectKind::Shell,
+    )?;
     Ok(view)
 }
 

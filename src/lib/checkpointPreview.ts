@@ -107,6 +107,13 @@ export interface ExternalEffectRecord {
    * change anything, a request cannot be un-sent, an MCP server is outside this
    * app. */
   compensation: { kind: 'none'; reason: string } | { kind: 'undo'; action: string };
+  /** How far the effect got through the declare-then-commit contract.
+   *
+   * `declared` is not "it failed" — the declaration is written before the call
+   * on purpose, so a permitted request that then timed out still counts. Only
+   * `committed` means the app watched it finish; `unobserved` is a checkpoint
+   * written before the commit phase existed and has no signal either way. */
+  status: 'committed' | 'declared' | 'unobserved';
 }
 
 export interface RestoreSimulation {
