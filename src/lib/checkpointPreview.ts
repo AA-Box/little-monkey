@@ -94,11 +94,29 @@ export interface RestorePlanEntry {
   drifted: boolean;
 }
 
+/** One external effect the backend recorded, and what undoes it. */
+export interface ExternalEffectRecord {
+  kind: 'shell' | 'network' | 'mcp-tool' | 'memory';
+  /** Only `none` exists today — this app has no compensator for any of the
+   * four kinds. A tagged object rather than a bool so adding a real undo (a
+   * Git worktree revert, closing an owned draft PR) is a new variant every
+   * reader must handle, not a flag somebody forgets to check. */
+  compensation: { kind: 'none'; reason: string };
+}
+
 export interface RestoreSimulation {
   id: string;
   alreadyReverted: boolean;
   files: RestorePlanEntry[];
+  /** True when any recorded effect has no compensator. Derived from
+   * `externalEffects`, not from `shellRan` — a turn that only made a network
+   * call used to report `false` here and read as "nothing to reconcile". */
   needsReconciliation: boolean;
+  /** Recorded in the manifest when each effect happened, so — unlike
+   * `classifyTurnToolCalls`'s transcript-derived list, which is finer-grained
+   * but only survives while the messages do — this is still here after a
+   * context compaction. */
+  externalEffects: ExternalEffectRecord[];
 }
 
 /** Fetches checkpoint `id`'s per-file diff/status preview. Read-only. */

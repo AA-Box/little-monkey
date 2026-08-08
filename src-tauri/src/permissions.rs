@@ -783,6 +783,27 @@ fn append_automatic_decision<R: tauri::Runtime>(
     Ok(())
 }
 
+/// The id to record for this request, and whether it names a real tool call.
+///
+/// `permission_decisions.tool_call_id` is `NOT NULL`, so a caller with no tool
+/// call in hand still needs a value. Recording *which* of those two happened is
+/// the point: a generated id is shaped like a real one and joins to nothing, so
+/// without the origin beside it a trail query comes back empty and cannot say
+/// whether the decision is missing — the bug K12's acceptance names — or whether
+/// the operation was never a tool call at all.
+///
+/// The generated id is unique per request rather than a fixed placeholder, so
+/// two unlinked decisions never collide onto one trail.
+fn tool_call_identity(tool_call_id: Option<&str>) -> (String, crate::run_ledger::ToolCallOrigin) {
+    match tool_call_id {
+        Some(id) => (id.to_string(), crate::run_ledger::ToolCallOrigin::Caller),
+        None => (
+            format!("tool-{}", uuid::Uuid::new_v4().simple()),
+            crate::run_ledger::ToolCallOrigin::Synthesized,
+        ),
+    }
+}
+
 /// Gate an operation, returning the `request_id` of the `permission_decisions`
 /// row it raised.
 ///
@@ -805,9 +826,7 @@ pub async fn request_permission<R: tauri::Runtime>(
     let request_id = uuid::Uuid::new_v4().to_string();
     let durable = durable_run_exists(app, state, turn)?;
     let run_id = turn.unwrap_or_default();
-    let normalized_tool_call_id = tool_call_id
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("tool-{}", uuid::Uuid::new_v4().simple()));
+    let (normalized_tool_call_id, tool_call_origin) = tool_call_identity(tool_call_id);
     let operation_sha256 = operation_digest(run_id, &normalized_tool_call_id, tool, &detail);
     let now = crate::run_commands::unix_time_ms()?;
     let expires_at_ms = now
@@ -841,6 +860,7 @@ pub async fn request_permission<R: tauri::Runtime>(
             .map(|process| process.process_id().to_string()),
         tool_name: tool.to_string(),
         tool_call_id: normalized_tool_call_id.clone(),
+        tool_call_origin,
         operation_sha256: operation_sha256.clone(),
         mode: mode.clone(),
         risk_level: protocol_risk(risk.as_ref()),
@@ -1497,6 +1517,22 @@ mod tests {
             },
         );
         rx
+    }
+
+    /// An absent tool call id is recorded as absent, not as a plausible one.
+    #[test]
+    fn an_unlinked_permission_gets_a_unique_id_marked_as_generated() {
+        let (id, origin) = tool_call_identity(Some("call_abc123"));
+        assert_eq!(id, "call_abc123", "a caller's id is recorded verbatim");
+        assert_eq!(origin, crate::run_ledger::ToolCallOrigin::Caller);
+
+        let (first, origin) = tool_call_identity(None);
+        assert_eq!(origin, crate::run_ledger::ToolCallOrigin::Synthesized);
+        let (second, _) = tool_call_identity(None);
+        assert_ne!(
+            first, second,
+            "two unlinked decisions must not collide onto one trail"
+        );
     }
 
     /// Stop withdrawing a prompt and a person refusing it are both "denied", and

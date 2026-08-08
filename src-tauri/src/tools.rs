@@ -1073,9 +1073,14 @@ fn cap_stream(raw: &[u8], cap: Option<usize>) -> (String, bool) {
 /// to save to and the tool call failed outright, even though the model had
 /// already told the user it remembered.
 ///
-/// `checkpoint_id` is deliberately NOT accepted here (unlike write/edit/
-/// run_shell): a remembered fact isn't a workspace file, so there is nothing
-/// for a per-turn checkpoint to snapshot or revert. `turn_id` is injected by
+/// `checkpoint_id` was deliberately NOT accepted here, on the grounds that a
+/// remembered fact isn't a workspace file so there is nothing for a per-turn
+/// checkpoint to snapshot or revert. The first half of that is still true and
+/// the conclusion no longer follows: the checkpoint does not snapshot this, but
+/// it does now *enumerate* it, because "nothing here can undo this" is the fact
+/// a rollback needs and the reason `ExternalEffectKind` exists. So the id is
+/// accepted and used for exactly one thing — recording that a memory write
+/// happened — and never to snapshot anything. `turn_id` is injected by
 /// the frontend agent loop (never model-supplied) purely to scope the
 /// permission prompt to the calling turn, exactly as it does for the other
 /// mutating tools.
@@ -1090,6 +1095,7 @@ pub async fn tool_remember(
     text: String,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<memory::Fact, String> {
     permissions::request_permission(
         &app,
@@ -1102,6 +1108,15 @@ pub async fn tool_remember(
         None,
     )
     .await?;
+
+    // Recorded, never snapshotted — see this command's doc comment. A memory
+    // write is outside the checkpointed workspace, so a revert cannot undo it
+    // and the enumerated set is where that is said.
+    checkpoints::record_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        checkpoints::ExternalEffectKind::Memory,
+    )?;
 
     let root = workspace::primary_root_canon(state.inner())
         .map(|p| p.to_string_lossy().to_string())
@@ -1712,6 +1727,7 @@ mod tests {
                 anchor_index: 0,
                 label: String::new(),
                 shell_ran: false,
+                external_effects: std::collections::BTreeSet::new(),
                 prev_id: None,
             },
         );
