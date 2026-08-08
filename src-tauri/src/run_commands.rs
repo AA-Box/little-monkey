@@ -480,12 +480,14 @@ fn drain_egress<R: tauri::Runtime>(
 ) {
     let bytes = process.take_egress();
     let destinations = process.take_destinations();
-    if bytes == 0 && destinations.is_empty() {
+    let reuse = process.take_context_reuse();
+    if bytes == 0 && destinations.is_empty() && reuse.is_empty() {
         return;
     }
     let Ok(now) = unix_time_ms() else {
         process.charge_egress(bytes);
         process.return_destinations(destinations);
+        process.return_context_reuse(reuse);
         return;
     };
     if bytes > 0 {
@@ -510,6 +512,22 @@ fn drain_egress<R: tauri::Runtime>(
             process.return_destinations(destinations);
             eprintln!(
                 "run egress: could not record {named} destinations for {}: {error}",
+                process.process_id()
+            );
+        }
+    }
+    // A third independent fact about the same turn, written like the other two:
+    // this one is about the model's prompt cache rather than the network, and
+    // losing the destinations is no reason to also lose the measurement.
+    if !reuse.is_empty() {
+        if let Err(error) = crate::process_commands::with_process_table(app, state, |table| {
+            table.add_context_reuse(process.process_id(), reuse, now as i64)
+        }) {
+            process.return_context_reuse(reuse);
+            eprintln!(
+                "run context reuse: could not record {} reused / {} evaluated tokens for {}: {error}",
+                reuse.reused_tokens,
+                reuse.evaluated_tokens,
                 process.process_id()
             );
         }
