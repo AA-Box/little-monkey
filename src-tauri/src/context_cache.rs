@@ -212,9 +212,12 @@ const LLAMA_CPP_MAX_RESPONSE_BYTES: usize = 512 * 1024;
 /// Best-effort live query of a managed `llama-server`'s `/props` and
 /// `/slots` endpoints. Never returns an error: any transport failure, non-2xx
 /// status, or unrecognized body simply leaves the corresponding fields
-/// `None`/empty, since a disabled `/slots` endpoint (the common case — it
-/// requires `--slots` and is off by default) is an expected, not exceptional,
-/// outcome.
+/// `None`/empty, since a `/slots` endpoint that does not answer is an expected,
+/// not exceptional, outcome — a server started with `--no-slots`, or one this app
+/// does not manage. (The doc here used to say `--slots` was off by default; it is
+/// *on* by default in the `llama.cpp` build
+/// [`crate::managed_runtime::MANAGED_LLAMA_VERSION`] pins, which was checked
+/// against that binary's own `--help` rather than assumed.)
 pub async fn fetch_llama_cpp_live_context_state(
     endpoint: &EndpointOrigin,
     transport: &dyn HttpTransport,
@@ -693,7 +696,7 @@ pub fn context_cache_notes(kind: ContextRuntimeKind, live: Option<&LlamaCppLiveC
                     notes.push("Live per-slot token usage and context-shift state read from llama-server's /slots endpoint.".to_string());
                 }
                 _ => notes.push(
-                    "llama-server's /slots endpoint is unavailable (commonly because it requires --slots), so live token-in-use and context-shift state are unknown, not zero.".to_string(),
+                    "llama-server's /slots endpoint did not answer (it is on by default in the version this app manages, so the likely causes are --no-slots or a server that is not reachable), leaving live token-in-use and context-shift state unknown, not zero.".to_string(),
                 ),
             }
             notes
@@ -1075,6 +1078,10 @@ mod tests {
         live.endpoints_reachable.push("/props".to_string());
         let notes = context_cache_notes(ContextRuntimeKind::LlamaCpp, Some(&live));
         assert!(notes[0].contains("confirmed"));
-        assert!(notes[1].contains("unavailable"));
+        assert!(notes[1].contains("did not answer"));
+        assert!(
+            notes[1].contains("unknown, not zero"),
+            "the unavailable branch must still refuse to read as a zero"
+        );
     }
 }

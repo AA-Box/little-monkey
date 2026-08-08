@@ -204,6 +204,35 @@ pub struct ProcessScope {
     process_id: Arc<str>,
     egress_bytes: Arc<AtomicU64>,
     destinations: Arc<Mutex<DestinationLog>>,
+    context_reuse: Arc<ContextReuseTally>,
+}
+
+/// Prompt tokens a runtime told us it reused from its cache, and prompt tokens
+/// it told us it evaluated, summed across this process's completions.
+///
+/// Two counters rather than a ratio because a ratio cannot be accumulated: the
+/// hit rate over a process is `reused / (reused + evaluated)` over the whole
+/// process, not the mean of each completion's own rate, which would weigh a
+/// ten-token turn the same as a ten-thousand-token one.
+#[derive(Debug, Default)]
+struct ContextReuseTally {
+    reused: AtomicU64,
+    evaluated: AtomicU64,
+}
+
+/// A drained [`ContextReuseTally`]. `reused` is the measured tokens saved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextReuse {
+    pub reused_tokens: u64,
+    pub evaluated_tokens: u64,
+}
+
+impl ContextReuse {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.reused_tokens == 0 && self.evaluated_tokens == 0
+    }
 }
 
 impl ProcessScope {
@@ -218,6 +247,7 @@ impl ProcessScope {
             process_id: Arc::from(process_id.into()),
             egress_bytes: Arc::new(AtomicU64::new(0)),
             destinations: Arc::new(Mutex::new(DestinationLog::default())),
+            context_reuse: Arc::new(ContextReuseTally::default()),
         }
     }
 
@@ -318,6 +348,37 @@ impl ProcessScope {
                 log.overflowed += requests;
             }
         }
+    }
+
+    /// Records one completion's measured prompt-cache split.
+    ///
+    /// Only ever called with figures a runtime actually reported. A runtime that
+    /// reports no reuse figure must not reach here with `reused = 0` — that would
+    /// make "this runtime does not measure reuse" indistinguishable from "this
+    /// runtime measured no reuse", and the ledger cannot tell them apart
+    /// afterwards.
+    pub fn note_context_reuse(&self, reused: u64, evaluated: u64) {
+        self.context_reuse
+            .reused
+            .fetch_add(reused, Ordering::Relaxed);
+        self.context_reuse
+            .evaluated
+            .fetch_add(evaluated, Ordering::Relaxed);
+    }
+
+    /// Takes everything noted since the last call, leaving zero behind — a drain
+    /// for [`Self::take_egress`]'s reason.
+    #[must_use]
+    pub fn take_context_reuse(&self) -> ContextReuse {
+        ContextReuse {
+            reused_tokens: self.context_reuse.reused.swap(0, Ordering::Relaxed),
+            evaluated_tokens: self.context_reuse.evaluated.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    /// Puts a drain back, for a caller whose write of it failed.
+    pub fn return_context_reuse(&self, reuse: ContextReuse) {
+        self.note_context_reuse(reuse.reused_tokens, reuse.evaluated_tokens);
     }
 }
 
@@ -673,6 +734,35 @@ mod tests {
             "a drained tally must not report the same bytes twice"
         );
         assert_eq!(charged.take_egress(), 0, "and the drain is shared too");
+    }
+
+    /// Two completions' measured splits sum into one tally, and the hit rate that
+    /// falls out is the whole process's — not the mean of the two rates, which
+    /// would weigh a 10-token turn the same as a 1000-token one.
+    #[test]
+    fn context_reuse_accumulates_over_completions_and_drains_once() {
+        let owner = ProcessScope::new("p-reuse");
+        let charged = owner.clone();
+        // A cold turn, then a warm one over the same prefix.
+        charged.note_context_reuse(0, 1_000);
+        charged.note_context_reuse(9, 1);
+
+        let drained = owner.take_context_reuse();
+        assert_eq!(drained.reused_tokens, 9);
+        assert_eq!(drained.evaluated_tokens, 1_001);
+        // The mean of the two turns' rates would be 45%; the process's own rate is
+        // 9/1010, which is the figure that says what the cache actually saved.
+        assert!(
+            owner.take_context_reuse().is_empty(),
+            "a drain is once only"
+        );
+
+        owner.return_context_reuse(drained);
+        assert_eq!(
+            owner.take_context_reuse(),
+            drained,
+            "a failed write puts the measurement back rather than losing it"
+        );
     }
 
     /// Repeat requests raise a count rather than adding a row, and the cap turns

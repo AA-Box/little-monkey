@@ -115,6 +115,20 @@ export interface ProcessEgressDestinations {
   dropped: number;
 }
 
+/**
+ * What a runtime reported about its own prompt cache for one process.
+ *
+ * Both terms, not a rate: the hit rate over a process is
+ * `reused / (reused + evaluated)` across the whole process, which is not the
+ * mean of each turn's rate — that would weigh a ten-token turn the same as a
+ * ten-thousand-token one.
+ */
+export interface ContextReuse {
+  /** The measured tokens saved: prompt the runtime did not have to evaluate. */
+  reusedTokens: number;
+  evaluatedTokens: number;
+}
+
 export interface ProcessUsageLedger {
   rows: ProcessUsageRow[];
   totals: ProcessUsageAggregate;
@@ -124,6 +138,39 @@ export interface ProcessUsageLedger {
    * {@link destinationsFor} rather than indexing it directly.
    */
   destinations: Record<string, ProcessEgressDestinations>;
+  /**
+   * Keyed by `processId`, and only for processes whose runtime reported a
+   * prompt-cache figure at all. Read it with {@link contextReuseFor}.
+   */
+  contextReuse: Record<string, ContextReuse>;
+}
+
+/**
+ * The measured prompt-cache reuse for one process, or `null` when its runtime
+ * reported none.
+ *
+ * `null` rather than a zeroed pair for {@link destinationsFor}'s reason, and it
+ * matters more here: Ollama and MLX report nothing, so a surface that rendered
+ * `0 / 0` as "0% hit rate" would be inventing a measurement for two of the three
+ * runtimes.
+ */
+export function contextReuseFor(
+  ledger: Pick<ProcessUsageLedger, "contextReuse"> | null,
+  processId: string,
+): ContextReuse | null {
+  const found = ledger?.contextReuse?.[processId];
+  if (!found) return null;
+  return found.reusedTokens + found.evaluatedTokens > 0 ? found : null;
+}
+
+/**
+ * The share of prompt tokens the runtime reused, or `null` when there were no
+ * prompt tokens to reuse — a rate with an empty denominator is not zero.
+ */
+export function contextHitRate(reuse: ContextReuse | null): number | null {
+  if (!reuse) return null;
+  const total = reuse.reusedTokens + reuse.evaluatedTokens;
+  return total > 0 ? reuse.reusedTokens / total : null;
 }
 
 /**

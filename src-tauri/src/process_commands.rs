@@ -653,6 +653,15 @@ pub struct ProcessUsageLedger {
     /// only this surface reads.
     pub destinations:
         std::collections::BTreeMap<String, crate::process_table::ProcessEgressDestinations>,
+    /// Each row's measured prompt-cache reuse, keyed by `processId` (roadmap
+    /// K11). Only the processes whose runtime reported a figure appear — see
+    /// `ProcessTable::context_reuse_for` on why absence is the answer for the
+    /// rest rather than a zero.
+    ///
+    /// Beside the rows for `destinations`' reason: two of the three runtimes
+    /// never populate it, so every other caller of `usage_rows` would be paying
+    /// for a query only this surface reads.
+    pub context_reuse: std::collections::BTreeMap<String, crate::run_scope::ContextReuse>,
 }
 
 /// What each process actually consumed, per process and in aggregate.
@@ -680,6 +689,7 @@ pub fn process_usage_ledger(
         let ids: Vec<String> = rows.iter().map(|row| row.process_id.clone()).collect();
         Ok(ProcessUsageLedger {
             destinations: table.egress_destinations_for(&ids)?,
+            context_reuse: table.context_reuse_for(&ids)?,
             totals: table.usage_totals(&filter)?,
             rows,
         })

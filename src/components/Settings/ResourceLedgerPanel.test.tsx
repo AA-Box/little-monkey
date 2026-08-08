@@ -113,6 +113,25 @@ describe("resource ledger rows", () => {
     expect(markup).toContain("0 B");
     expect(markup).not.toContain("unavailable — nothing fed the ledger a byte count");
   });
+
+  it("shows the runtime's measured prompt-cache reuse beside the tokens it came from", () => {
+    const markup = renderToStaticMarkup(
+      <UsageRow row={row} contextReuse={{ reusedTokens: 9, evaluatedTokens: 1_001 }} />,
+    );
+    expect(markup).toContain("Prompt cache, as the runtime measured it");
+    expect(markup).toContain("0.9% reused");
+    // The denominator is on screen too: a percentage nobody can check against a
+    // token count is not a measurement a reader can trust.
+    expect(markup).toContain("9 tokens saved, 1001 evaluated");
+  });
+
+  it("says nothing at all when the runtime reported no reuse figure", () => {
+    // Ollama and MLX report nothing. A 0% on this row would be this app claiming
+    // a measurement no runtime made.
+    const markup = renderToStaticMarkup(<UsageRow row={row} />);
+    expect(markup).not.toContain("Prompt cache");
+    expect(markup).not.toContain("reused");
+  });
 });
 
 describe("resource ledger totals", () => {

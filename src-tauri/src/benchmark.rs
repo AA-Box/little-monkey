@@ -660,6 +660,7 @@ mod tests {
             usage: CanonicalUsage {
                 input_tokens: 7,
                 output_tokens,
+                cached_input_tokens: None,
             },
         }
     }

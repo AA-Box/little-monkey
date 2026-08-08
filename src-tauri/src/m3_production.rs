@@ -1425,7 +1425,9 @@ impl OpenAiCompatibleM3InferenceEngine {
         )
         .await?;
         let value: Value = serde_json::from_slice(&bytes)?;
-        parse_openai_response(&value, request)
+        let response = parse_openai_response(&value, request)?;
+        note_measured_reuse(&response.usage);
+        Ok(response)
     }
 
     async fn stream_inner(
@@ -1924,7 +1926,7 @@ pub(crate) fn parse_openai_response(
             .and_then(Value::as_str)
             .unwrap_or("stop")
             .to_string(),
-        usage: parse_usage(value.get("usage")),
+        usage: parse_usage(value),
         created_at_seconds: value
             .get("created")
             .and_then(Value::as_u64)
@@ -1976,7 +1978,7 @@ fn parse_openai_embeddings_response(
     Ok(CanonicalEmbeddingResponse {
         model,
         data: items,
-        usage: parse_usage(value.get("usage")),
+        usage: parse_usage(value),
     })
 }
 
@@ -1988,17 +1990,75 @@ fn required_string<'a>(value: &'a Value, key: &str, label: &str) -> M3HubResult<
         .ok_or_else(|| M3HubError::Runtime(format!("{label} is missing")))
 }
 
-fn parse_usage(value: Option<&Value>) -> CanonicalUsage {
+/// Reads token accounting off a response (or a final stream chunk) root.
+///
+/// Takes the root rather than the `usage` object because the prompt-cache
+/// measurement does not always live inside `usage`: llama-server reports it as
+/// `timings.cache_n`, and on a streamed response it sends `timings` in the final
+/// chunk *without* a `usage` object at all. Reading only `usage` there would
+/// report a stream as having consumed zero tokens.
+fn parse_usage(root: &Value) -> CanonicalUsage {
+    let usage = root.get("usage");
+    let timings = root.get("timings");
+    // `cache_n` + `prompt_n` is llama-server's own decomposition of the prompt:
+    // reused from the cache, and actually evaluated. Their sum is the prompt
+    // length, which is why it can stand in for `prompt_tokens`.
+    let reused = timings
+        .and_then(|timings| timings.get("cache_n"))
+        .and_then(Value::as_u64);
+    let evaluated = timings
+        .and_then(|timings| timings.get("prompt_n"))
+        .and_then(Value::as_u64);
+    let input_tokens = usage
+        .and_then(|usage| usage.get("prompt_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| match (reused, evaluated) {
+            (Some(reused), Some(evaluated)) => Some(reused.saturating_add(evaluated)),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let output_tokens = usage
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            timings
+                .and_then(|timings| timings.get("predicted_n"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
+    let cached_input_tokens = reused
+        .or_else(|| {
+            usage
+                .and_then(|usage| usage.get("prompt_tokens_details"))
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        })
+        // A runtime cannot have reused more prompt than the prompt had. Clamping
+        // rather than trusting keeps one malformed response from producing a hit
+        // rate above 1 for every process it is later summed into.
+        .map(|reused| reused.min(input_tokens));
     CanonicalUsage {
-        input_tokens: value
-            .and_then(|value| value.get("prompt_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output_tokens: value
-            .and_then(|value| value.get("completion_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
     }
+}
+
+/// Charges one completion's measured prompt-cache split to the process that ran
+/// it (roadmap K11), when the runtime reported one and a process owns the scope.
+///
+/// A no-op in both of the cases that are not a measurement: a runtime that
+/// reports no reuse figure (`cached_input_tokens` is `None` — Ollama and MLX), and
+/// a completion outside any process scope. Neither writes a zero, because a zero
+/// in this column claims the runtime measured no reuse.
+fn note_measured_reuse(usage: &CanonicalUsage) {
+    let Some(reused) = usage.cached_input_tokens else {
+        return;
+    };
+    let Some(process) = crate::run_scope::current_process() else {
+        return;
+    };
+    process.note_context_reuse(reused, usage.input_tokens.saturating_sub(reused));
 }
 
 async fn read_bounded_response(
@@ -2058,10 +2118,7 @@ impl Default for OpenAiStreamState {
             text_index: None,
             tools: BTreeMap::new(),
             finish_reason: None,
-            usage: CanonicalUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-            },
+            usage: CanonicalUsage::default(),
             saw_done: false,
         }
     }
@@ -2129,8 +2186,11 @@ impl OpenAiStreamState {
         sink: &mut dyn M3CanonicalStreamSink,
     ) -> M3HubResult<()> {
         self.ensure_started(chunk, request, sink)?;
-        if chunk.get("usage").is_some() {
-            self.usage = parse_usage(chunk.get("usage"));
+        // `timings` as well as `usage`: llama-server puts its token accounting
+        // (including the prompt-cache measurement) only in `timings` on a
+        // streamed response, and sends it on the final chunk.
+        if chunk.get("usage").is_some() || chunk.get("timings").is_some() {
+            self.usage = parse_usage(chunk);
         }
         let Some(choice) = chunk
             .get("choices")
@@ -2290,6 +2350,7 @@ impl OpenAiStreamState {
             })
             .map_err(M3HubError::Runtime)?;
         }
+        note_measured_reuse(&self.usage);
         sink.emit(CanonicalStreamEvent::ResponseCompleted {
             response_id: self
                 .response_id
@@ -5091,6 +5152,152 @@ GPU1:
             matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("shell_exec") && message.contains("not offered")),
             "expected an unoffered-tool rejection, got {result:?}"
         );
+    }
+
+    // -- measured prompt-cache reuse (K11) ---------------------------------
+    //
+    // The `timings` bodies below are verbatim from llama-server b9637 — the
+    // version `managed_runtime::MANAGED_LLAMA_VERSION` pins — answering
+    // `POST /v1/chat/completions` for a repeated prompt prefix. They are copied
+    // rather than invented because the whole point of the column they feed is
+    // that the figures are the runtime's own.
+
+    /// llama-server always re-evaluates the last prompt token even when the rest
+    /// of the prefix was a cache hit, so a *measured* rate is 9/10 where an
+    /// app-side guess at "identical prefix" would have said 10/10. That one-token
+    /// difference is the reason this is read from the response at all.
+    #[test]
+    fn usage_reads_the_runtimes_own_prompt_cache_split() {
+        let usage = parse_usage(&json!({
+            "usage": {"completion_tokens": 8, "prompt_tokens": 10, "total_tokens": 18},
+            "timings": {"cache_n": 9, "prompt_n": 1, "predicted_n": 8}
+        }));
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.cached_input_tokens, Some(9));
+    }
+
+    /// A cold prompt reports a measured zero, which is a different fact from a
+    /// runtime that reports nothing — and must stay distinguishable from it.
+    #[test]
+    fn a_cold_prompt_reports_a_measured_zero_not_an_absence() {
+        let usage = parse_usage(&json!({
+            "usage": {"completion_tokens": 4, "prompt_tokens": 11},
+            "timings": {"cache_n": 0, "prompt_n": 11, "predicted_n": 4}
+        }));
+        assert_eq!(usage.cached_input_tokens, Some(0));
+    }
+
+    #[test]
+    fn a_runtime_that_reports_no_reuse_figure_leaves_it_unknown() {
+        let usage = parse_usage(&json!({
+            "usage": {"completion_tokens": 4, "prompt_tokens": 11}
+        }));
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(
+            usage.cached_input_tokens, None,
+            "no reported figure must not become a measured zero"
+        );
+    }
+
+    /// The OpenAI-shaped spelling of the same measurement, for a runtime that
+    /// reports `cached_tokens` without llama.cpp's `timings`.
+    #[test]
+    fn usage_falls_back_to_the_openai_cached_tokens_detail() {
+        let usage = parse_usage(&json!({
+            "usage": {
+                "completion_tokens": 4,
+                "prompt_tokens": 38,
+                "prompt_tokens_details": {"cached_tokens": 1}
+            }
+        }));
+        assert_eq!(usage.cached_input_tokens, Some(1));
+    }
+
+    /// A response claiming more reuse than it had prompt is malformed; clamping
+    /// keeps it from producing a hit rate above 1 once summed into a process.
+    #[test]
+    fn reuse_is_clamped_to_the_prompt_it_claims_to_have_reused() {
+        let usage = parse_usage(&json!({
+            "usage": {"completion_tokens": 1, "prompt_tokens": 5},
+            "timings": {"cache_n": 900, "prompt_n": 1, "predicted_n": 1}
+        }));
+        assert_eq!(usage.cached_input_tokens, Some(5));
+    }
+
+    /// llama-server always sends `timings` on the final chunk, and adds `usage`
+    /// only when the caller asked for `stream_options.include_usage`.
+    /// `openai_request_body` does ask, so this is the fallback rather than the
+    /// common path: it covers a caller that omits the option — this module's own
+    /// synthetic lines, or a third-party server that ignores it — and it is why the
+    /// reuse figure does not depend on an optional field.
+    #[test]
+    fn a_streamed_final_chunk_yields_usage_from_timings_alone() {
+        let request = request_with_tools(&[]);
+        let body = format!(
+            "{}{}",
+            sse_line(&json!({
+                "id":"resp-stream-timings","model":"local-model",
+                "choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]
+            })),
+            sse_line(&json!({
+                "choices":[{"index":0,"delta":{},"finish_reason":"length"}],
+                "timings":{"cache_n":37,"prompt_n":1,"predicted_n":3}
+            })),
+        );
+        let events = feed_openai_sse_bytes(&[body.as_bytes()], &request).expect("stream parses");
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                CanonicalStreamEvent::ResponseCompleted { usage, .. } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("a completed event");
+        assert_eq!(usage.input_tokens, 38, "cache_n + prompt_n is the prompt");
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.cached_input_tokens, Some(37));
+    }
+
+    /// The measurement reaches the process that ran the completion, and a runtime
+    /// that reported nothing charges nothing — the two cases the ledger column
+    /// exists to keep apart.
+    #[tokio::test]
+    async fn a_measured_split_is_charged_to_the_running_process_and_an_unknown_one_is_not() {
+        let process = crate::run_scope::ProcessScope::new("p-reuse-e2e");
+        crate::run_scope::scoped_with_process(
+            crate::run_scope::RunScope::run("run:reuse"),
+            process.clone(),
+            async {
+                note_measured_reuse(&CanonicalUsage {
+                    input_tokens: 10,
+                    output_tokens: 8,
+                    cached_input_tokens: Some(9),
+                });
+                note_measured_reuse(&CanonicalUsage {
+                    input_tokens: 500,
+                    output_tokens: 4,
+                    cached_input_tokens: None,
+                });
+            },
+        )
+        .await;
+        assert_eq!(
+            process.take_context_reuse(),
+            crate::run_scope::ContextReuse {
+                reused_tokens: 9,
+                evaluated_tokens: 1
+            },
+            "only the completion whose runtime measured the split is charged"
+        );
+
+        // And a completion outside any process scope charges nobody rather than
+        // the nearest row.
+        note_measured_reuse(&CanonicalUsage {
+            input_tokens: 10,
+            output_tokens: 1,
+            cached_input_tokens: Some(9),
+        });
+        assert!(process.take_context_reuse().is_empty());
     }
 
     #[test]
