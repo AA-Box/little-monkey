@@ -78,11 +78,137 @@ struct ResolvedAcpTurn {
 
 type SharedSessions = Arc<Mutex<HashMap<String, AcpSession>>>;
 
+/// ACP's writer to the unified subsystem event stream (roadmap K12).
+///
+/// # Why this is process-global rather than a threaded parameter
+///
+/// Every ACP response and notification leaves through one function, [`send`] —
+/// and that is the only place in this file where *all* outcomes are visible.
+/// The dispatch loop's arms each send their own response through their own error
+/// branches, so instrumenting the arms means one forgotten branch is one silent
+/// gap, which is exactly the failure the browser worker's funnel exists to
+/// avoid.
+///
+/// Threading an audit into `send` would mean touching its seventeen call sites
+/// plus `send_update`'s eight plus the spawned relay tasks that outlive the
+/// loop. A process-global is the honest shape instead: `monkey-cli acp` serves
+/// **one** stdio connection for its whole lifetime, so there is exactly one
+/// audit, set once before the loop and never replaced.
+///
+/// # Matching a response back to its method
+///
+/// A JSON-RPC response carries only the request `id`, not the method, so the
+/// loop records `id → method` when it dispatches and [`send`] consumes that
+/// entry when the response goes out. A notification (`session/update`) has a
+/// `method` and no `id`, so it never matches and is never recorded — the stream
+/// would otherwise be flooded by streaming updates that took no action.
+mod audit {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    use little_monkey_lib::run_ledger::{Subsystem, SubsystemOutcome};
+    use little_monkey_lib::subsystem_audit::{SubsystemAction, SubsystemAudit};
+    use serde_json::Value;
+
+    struct AcpAudit {
+        audit: SubsystemAudit,
+        /// The method each in-flight request id was dispatched for.
+        in_flight: Mutex<HashMap<String, String>>,
+    }
+
+    static ACP_AUDIT: OnceLock<AcpAudit> = OnceLock::new();
+
+    /// Install the audit for this process. Idempotent: a second call is ignored,
+    /// which keeps the tests below from fighting each other.
+    pub fn install(audit: SubsystemAudit) {
+        let _ = ACP_AUDIT.set(AcpAudit {
+            audit,
+            in_flight: Mutex::new(HashMap::new()),
+        });
+    }
+
+    /// Remember which method an id was dispatched for.
+    ///
+    /// `initialize` is deliberately not recorded by the caller — it is the
+    /// handshake every client sends before doing anything, the same class as
+    /// `GET /v1/models` on the HTTP side.
+    pub fn dispatched(id: &Value, method: &str) {
+        let Some(state) = ACP_AUDIT.get() else { return };
+        let Some(key) = id_key(id) else { return };
+        if let Ok(mut in_flight) = state.in_flight.lock() {
+            in_flight.insert(key, method.to_string());
+        }
+    }
+
+    /// Record the outcome if `message` is a response to a remembered request.
+    ///
+    /// Returns whether anything was recorded, which is what the tests assert on
+    /// rather than reaching into the map.
+    pub fn responded(message: &Value) -> bool {
+        let Some(state) = ACP_AUDIT.get() else {
+            return false;
+        };
+        let Some(key) = message.get("id").and_then(id_key) else {
+            return false;
+        };
+        let failed = message.get("error").is_some();
+        if !failed && message.get("result").is_none() {
+            // Neither arm of a JSON-RPC response: not a response at all.
+            return false;
+        }
+        let Some(method) = state
+            .in_flight
+            .lock()
+            .ok()
+            .and_then(|mut in_flight| in_flight.remove(&key))
+        else {
+            return false;
+        };
+        state.audit.record(SubsystemAction {
+            subsystem: Subsystem::Acp,
+            action: method,
+            // ACP sessions carry a run id internally, but the response itself
+            // does not name it; the ambient scope is the honest source.
+            turn_id: None,
+            // ACP's own permission mode is negotiated at `initialize` and
+            // enforced by the daemon turn this dispatches to, so no
+            // `request_permission` decision belongs to the RPC itself.
+            permission_request_id: None,
+            outcome: if failed {
+                SubsystemOutcome::Failed
+            } else {
+                SubsystemOutcome::Succeeded
+            },
+            detail: None,
+        });
+        true
+    }
+
+    /// JSON-RPC allows a string or a number id. Both are keyed by their JSON
+    /// spelling so `1` and `"1"` cannot collide.
+    fn id_key(id: &Value) -> Option<String> {
+        match id {
+            Value::String(value) => Some(format!("s:{value}")),
+            Value::Number(value) => Some(format!("n:{value}")),
+            _ => None,
+        }
+    }
+}
+
 pub async fn run(cli: &crate::Cli) -> Result<(), String> {
     recipe_target(cli)?;
     if cli.permission_mode == "bypass" {
         return Err("ACP forbids bypass permission mode".to_string());
     }
+
+    audit::install(match crate::app_data_dir() {
+        Some(data_dir) => {
+            little_monkey_lib::subsystem_audit::SubsystemAudit::in_data_dir(&data_dir)
+        }
+        None => little_monkey_lib::subsystem_audit::SubsystemAudit::disabled(
+            "ACP could not resolve the app data directory to find a ledger in",
+        ),
+    });
 
     let writer = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
     let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
@@ -120,6 +246,14 @@ pub async fn run(cli: &crate::Cli) -> Result<(), String> {
             }
         };
         let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+
+        // Remembered here, where the id and the method are both in hand;
+        // `send` turns it into an event when the response goes out. Skipping
+        // `initialize` is the same rule the HTTP side applies to
+        // `GET /v1/models`: a handshake every client sends before it acts.
+        if let (Some(id), true) = (id.as_ref(), method != "initialize") {
+            audit::dispatched(id, method);
+        }
 
         if method != "initialize" && !initialized {
             if let Some(id) = id {
@@ -1350,6 +1484,11 @@ async fn send_update(writer: &SharedWriter, session_id: &str, update: Value) -> 
 }
 
 async fn send(writer: &SharedWriter, message: Value) -> Result<(), String> {
+    // The one place every ACP response leaves through. Recorded before the
+    // write rather than after: a response that failed to reach stdout still
+    // happened, and losing the event to an I/O error would be the gap this
+    // choke point exists to close.
+    audit::responded(&message);
     let mut bytes = serde_json::to_vec(&message).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
     let mut stdout = writer.lock().await;
@@ -1466,6 +1605,59 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The choke point, pinned. `send` is the only place every ACP response
+    /// leaves through, so the pairing it does — response id back to the method
+    /// the loop dispatched — is what makes "no branch can be missed" true rather
+    /// than asserted.
+    #[test]
+    fn a_response_is_matched_back_to_the_method_that_was_dispatched() {
+        audit::install(
+            little_monkey_lib::subsystem_audit::SubsystemAudit::disabled("acp unit test"),
+        );
+
+        // A dispatched request, then its success response.
+        audit::dispatched(&json!(7), "session/new");
+        assert!(
+            audit::responded(&json!({"jsonrpc": "2.0", "id": 7, "result": {}})),
+            "the response must match the request it answers"
+        );
+        // The entry is consumed, so a duplicate response records nothing twice.
+        assert!(
+            !audit::responded(&json!({"jsonrpc": "2.0", "id": 7, "result": {}})),
+            "an id is answered once"
+        );
+
+        // An error response is still a response.
+        audit::dispatched(&json!("abc"), "session/prompt");
+        assert!(audit::responded(
+            &json!({"jsonrpc": "2.0", "id": "abc", "error": {"code": -32602, "message": "no"}})
+        ));
+
+        // A notification has a method and no id: never recorded, or the stream
+        // would drown in streaming `session/update` frames.
+        assert!(!audit::responded(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s"}
+        })));
+
+        // A response to something never dispatched — `initialize`, or a
+        // protocol-level error before dispatch — is not invented.
+        assert!(!audit::responded(
+            &json!({"jsonrpc": "2.0", "id": 99, "result": {}})
+        ));
+
+        // A string id and a numeric id with the same digits are different
+        // requests and must not collide.
+        audit::dispatched(&json!(1), "session/cancel");
+        assert!(!audit::responded(
+            &json!({"jsonrpc": "2.0", "id": "1", "result": {}})
+        ));
+        assert!(audit::responded(
+            &json!({"jsonrpc": "2.0", "id": 1, "result": {}})
+        ));
+    }
     use std::collections::BTreeSet;
     use std::time::Instant;
 
