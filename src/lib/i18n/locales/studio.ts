@@ -60,6 +60,8 @@ export const studioLocale: Record<string, string> = {
   "Studio.tools.run": "Run",
   "Studio.tools.running": "Running…",
   "Studio.tools.stop": "Release memory",
+  "Studio.tools.stopAll": "Release all {count}",
+  "Studio.tools.importCatalog": "Import a catalog",
   "Studio.tools.missing": "Fill in {fields} first",
   "Studio.tools.pickImage": "Choose an image",
   "Studio.tools.clearImage": "Remove this image",
