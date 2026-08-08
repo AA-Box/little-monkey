@@ -2787,6 +2787,64 @@ second Rust bypass of the Privacy Firewall, which no longer follows from the cli
 being bare: hardened defaults decide *where* a request may go, and say nothing about
 what is in its body.
 
+**Shipped — the ledger now records where *allowed* egress went, not only what was
+refused.** `denial_sink` answers "what was blocked and by which rule" and V8's
+`bytes_egressed` answers "how much got out". Neither answered **where**, so a run
+that was never denied anything left no record of its network activity at all —
+the half `denial_sink`'s own module doc names as still missing. Migration V14
+adds `egress_destinations`, keyed `(process_id, scheme, host, port)`, written
+from `egress::send`.
+
+- **The first migration to spend what V13 bought.** V14 is declared `Additive`,
+  so it does not raise the reader floor: a V13 binary opens a V14 database
+  unchanged and its writes stay correct, because `add_egress_bytes` touches
+  neither the new table nor the new column. Before V13 this table would have been
+  a one-way door for the whole run history, which is precisely why the equivalent
+  observability table went into a separate file instead.
+- **A counter table, and it does not claim to be tamper-evident.** Deliberately
+  not part of V9's or V12's hash chains. `requests` is incremented in place,
+  because the alternative — one immutable row per request — is a per-request
+  append to a serialized chain for the highest-frequency thing this app does. A
+  summary keyed by destination is bounded by how many distinct places a process
+  talked to, which does not grow with how much it said. The chained streams keep
+  their job: a decision (V11) and a subsystem action (V12) are events and are
+  chained; this is an aggregate beside them.
+- **Recorded at the choke point, after the guard.** One line in `egress::send`,
+  which every outbound request in the crate already passes through for byte
+  counting and the allowlist check. Placed after `check_run_allowlist` so it
+  records what was *allowed* and never doubles up with `denial_sink`; placed
+  before the send, because a request that was permitted and then failed to
+  connect still reached for that host. Both halves are pinned by one test.
+- **Accumulated in the scope, not written per request.** The destination log
+  rides on `ProcessScope` beside the byte counter and drains through the same
+  `drain_egress` the bytes already use. A lock is affordable here where the byte
+  counter could not afford one, and the reason is the rate: a body delivers
+  thousands of frames, but it is one request.
+- **The cap is counted, not silent.** `run_scope::MAX_DESTINATIONS` is 128 —
+  far above any ordinary run, and needed because a run that declares no allowlist
+  can be walked across arbitrarily many hosts by the content it fetches, so "one
+  row per distinct destination" is unbounded in the case that matters. Requests
+  past the cap land in `agent_processes.egress_destinations_dropped` and the panel
+  says so, for the same reason a partial total is never shown without its
+  coverage.
+- **A failed flush loses nothing and double-counts nothing.** The write is one
+  transaction, so a half-landed flush cannot happen; on failure the drain goes
+  back to the scope and is summed with whatever arrived meanwhile.
+- **Read all the way to the surface.** `process_usage_ledger` returns the
+  destinations for the page of processes it already selected — one batched query,
+  not one per row — and the Resource Ledger panel renders them per process. A
+  process the ledger recorded nothing for renders nothing at all, rather than an
+  empty list: "reached nowhere" and "this build recorded nothing" are the same
+  absence here, and an empty list on screen would claim the first.
+
+**Still missing: unattributed egress names no destinations.** Only the attributed
+case is recorded, which is the same split byte counting already makes — an
+unattributed byte has a reason to be charged to but no row to hang a destination
+list off, and `UNATTRIBUTED_EGRESS` is a fixed array of counters precisely so it
+never allocates per request. Upgrade path is a bounded global map behind the same
+cap, if "which hosts does the app itself reach outside a run" turns out to be a
+question anyone asks.
+
 **Blocks:** K17 — placing a run on a remote node is only safe if the run's
 egress travels with it.
 
