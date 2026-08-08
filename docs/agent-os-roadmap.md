@@ -3398,6 +3398,50 @@ a broken chain so a scripted check cannot pass by printing bad news.
   stream: `daemon_scheduler_decisions` and `remote_audit` in their own database
   files, and `egress_denials`, which records denials only — **an allowed egress
   produces no row anywhere** — and ring-buffers itself on every insert.
+- **A schema bump was a one-way door, and that is why the audit is scattered
+  across three databases.** `denial_sink.rs` says it outright: the ledger's
+  forward-only guard refused any database whose `MAX(version)` exceeded the
+  binary's, so shipping one observability table meant a user who rolls back —
+  which the in-app updater makes ordinary — gets a binary that cannot open its
+  own run history at all. Not a degraded feature: no runs, no events, no
+  approvals. That is the real reason `egress_denials` lives in its own file, and
+  it is the reason every future joinable store would have too.
+
+  **Migration V13 removes the premise.** `schema_migrations` gains
+  `min_reader_version`, and the guard compares against the newest *breaking*
+  migration rather than the newest migration. Most migrations here only add — a
+  table an older binary never queries, a nullable column its inserts omit — and
+  those are invisible to it. What genuinely breaks an older binary is a migration
+  that makes the database reject writes it used to accept.
+
+  - **V1–V8 are marked breaking without re-deriving each one, deliberately.**
+    They shipped under the old blanket rule, so calling them breaking preserves
+    exactly today's behaviour and claims nothing new. Claiming compatibility
+    wrongly is far worse than claiming it too little — it hands an older binary a
+    database it corrupts — so compatibility is asserted only where it was
+    checked.
+  - **V9 is genuinely breaking**, and this is the concrete case:
+    `run_events_chain_must_not_stop` aborts an insert whose `event_hash` is NULL
+    into an already-chained run, which is every insert a pre-V9 binary makes.
+  - **V10–V12 are additive**, each checked. V10's nullable `process_id` is
+    omitted by a V9 binary's inserts, and V9's hash contributes nothing for an
+    absent process id — the same property that let V10 ship without invalidating
+    V9's rows now lets a V9 binary keep writing. V11 and V12 add tables nothing
+    older queries.
+  - **V13 must require itself**, and the entry says so rather than glossing it: a
+    V12 binary applies the *old* blanket guard and refuses a V13 database no
+    matter what the column says. The fix cannot reach backwards; it stops the
+    bleeding from here on.
+
+  **`egress_denials` stays in its own file anyway, for a better reason than the
+  original one.** Its volume is attacker-influenced — a remote page causes
+  denials as fast as it can request subresources — and the ring buffer that
+  bounds them is a poor neighbour for a hash-chained, strictly append-only stream
+  that must never drop a row. Moving those rows in would mean either giving the
+  stream an eviction policy or letting a remote party grow it without limit.
+  What *does* belong in the ledger is the half that is still missing entirely —
+  an **allowed** egress produces no row anywhere — because its volume is the
+  app's own.
 - ~~**Per-event process identity does not exist.**~~ **Done** — migration V10 adds
   `run_events.process_id`, populated from the ambient `ProcessScope` (the D3
   `tokio::task_local!`) inside `append_event`. That is the single place all 46
