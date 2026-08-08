@@ -142,6 +142,57 @@ pub struct CheckpointManifest {
     #[serde(default)]
     pub prev_id: Option<String>,
     pub entries: Vec<CheckpointEntry>,
+    /// What a suspended process needs to resume after a restart (roadmap K13).
+    ///
+    /// `None` on every checkpoint that was not a freeze, which is nearly all of
+    /// them — a checkpoint is a turn's snapshot, and only a deliberate freeze
+    /// fills this. `serde(default)` for the same reason `external_effects` has
+    /// one: manifests written before this existed carry no resume state, and
+    /// absent must not read as "resumable with nothing to restore".
+    #[serde(default)]
+    pub resume: Option<ResumeState>,
+}
+
+/// The resumable half of a frozen process — the fields K13's acceptance names,
+/// and a note about the one it names that does not exist here.
+///
+/// # It references rather than copies
+///
+/// The conversation is already in the profile store, the workspace files are
+/// already in this checkpoint's own entries, and a pending approval is already a
+/// `permission_decisions` row. Copying any of them into the image would create a
+/// second copy that can disagree with the first, and the disagreement would only
+/// surface at restore — which is the moment it can least be dealt with. So this
+/// holds identifiers, and [`restorability`] is what checks they still resolve.
+///
+/// # Resource reservations, which the acceptance names and this omits
+///
+/// K13's list ends with "resource reservations". There are none to capture: a
+/// search for one finds `workflow_core`'s token-budget reservation and the
+/// daemon's delivery-payload reservation, neither of which is a K7 admission hold
+/// on memory or a device. A field here would therefore be empty in every image
+/// ever written, which reads as "this process reserved nothing" rather than "this
+/// system does not reserve". Stating the absence is the honest form; the field
+/// arrives when the thing it would name does.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeState {
+    /// The `agent_processes` row this image freezes.
+    pub process_id: String,
+    pub frozen_at_ms: u64,
+    /// The model this process was running against. A restore onto a host where
+    /// it is no longer resident is a refusal, not a silent substitution — the
+    /// replies after the swap would not be the replies before it.
+    pub model: Option<String>,
+    pub runtime_id: Option<String>,
+    /// The K10 namespace this process was working in, as a path. Checked for
+    /// existence on restore rather than recreated: a sandbox that is gone took
+    /// the process's uncommitted work with it, and making a fresh empty one
+    /// would resume into a workspace that silently lost it.
+    pub workspace: Option<String>,
+    /// `permission_decisions.request_id` for every approval outstanding at the
+    /// freeze. Ids, not copies of the decisions — see the type doc.
+    pub pending_approvals: Vec<String>,
 }
 
 /// A side effect a turn had outside the checkpointed workspace files.
@@ -577,6 +628,179 @@ pub fn record_external_effect(
     Ok(())
 }
 
+/// Writes the resume state onto an existing checkpoint, turning it into a
+/// freeze image (roadmap K13).
+///
+/// # Why this takes the state rather than gathering it
+///
+/// The four things K13 names live in four different places — the model in the
+/// runtime hub, the workspace in the sandbox, the approvals in the ledger — and
+/// this module is a filesystem store with none of those handles. Gathering them
+/// here would mean importing three subsystems into the one module that has
+/// stayed free of them. The caller already holds all four at the moment it
+/// decides to freeze.
+///
+/// # Freezing twice
+///
+/// Refused rather than overwritten. A second freeze of the same checkpoint would
+/// silently replace the first image's process id and approvals while the entries
+/// beneath it still describe the first turn, and a restore would then resume a
+/// process into another one's files.
+pub fn freeze_impl(base_dir: &Path, id: &str, resume: ResumeState) -> Result<(), String> {
+    validate_id(id)?;
+    let mut manifest = read_manifest(base_dir, id)?;
+    if let Some(existing) = manifest.resume.as_ref() {
+        return Err(format!(
+            "checkpoint {id} is already a freeze of process {}",
+            existing.process_id
+        ));
+    }
+    manifest.resume = Some(resume);
+    write_manifest(&base_dir.join(id), &manifest)
+}
+
+/// Why an image cannot be restored, one reason per thing that went missing.
+///
+/// A closed set with stable codes, for [`ExternalEffectKind`]'s reason.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestoreBlocker {
+    /// The manifest holds no resume state — it is an ordinary turn checkpoint,
+    /// not a freeze.
+    NotAFreeze,
+    /// The K10 workspace this process was running in no longer exists.
+    WorkspaceGone,
+    /// The model it was running against is not resident on this host.
+    ModelNotResident,
+    /// An approval outstanding at the freeze has since expired, so resuming
+    /// would continue past a permission nobody currently grants.
+    ApprovalExpired,
+}
+
+impl RestoreBlocker {
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            RestoreBlocker::NotAFreeze => "not-a-freeze",
+            RestoreBlocker::WorkspaceGone => "workspace-gone",
+            RestoreBlocker::ModelNotResident => "model-not-resident",
+            RestoreBlocker::ApprovalExpired => "approval-expired",
+        }
+    }
+
+    #[must_use]
+    pub fn explanation(self) -> &'static str {
+        match self {
+            RestoreBlocker::NotAFreeze => {
+                "This checkpoint is a turn snapshot rather than a frozen process, so there is no process state to resume."
+            }
+            RestoreBlocker::WorkspaceGone => {
+                "The workspace this process was running in no longer exists. Resuming into a fresh one would silently drop whatever it had not committed, so the restore is refused instead."
+            }
+            RestoreBlocker::ModelNotResident => {
+                "The model this process was running against is not loaded on this host. Resuming against a different one would continue the conversation in another model's voice, so the restore is refused instead."
+            }
+            RestoreBlocker::ApprovalExpired => {
+                "An approval this process was waiting on has expired. Resuming would carry on past a permission nobody currently grants, so the restore is refused and the approval must be asked for again."
+            }
+        }
+    }
+}
+
+/// Whether a frozen image can be resumed, as a tagged union.
+///
+/// Not `bool` plus a list, for [`crate::context_cache::PrefixSharing`]'s reason:
+/// a caller cannot offer a Resume button without holding the state that says it
+/// is safe, and cannot report a refusal without the blockers that caused it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum Restorability {
+    Resumable { process_id: String },
+    Blocked { blockers: Vec<RestoreBlocker> },
+}
+
+/// What the host can currently offer a restore, supplied by the caller because
+/// none of it is knowable from the manifest alone.
+#[derive(Debug, Clone, Default)]
+pub struct RestoreEnvironment<'a> {
+    /// Models resident right now.
+    pub resident_models: &'a [String],
+    /// `request_id`s whose approval is still valid — an outstanding approval
+    /// absent from this list has expired.
+    pub live_approvals: &'a [String],
+    /// Whether the recorded workspace path exists. Passed in rather than checked
+    /// here so this stays a pure function over facts the caller has already
+    /// gathered, testable without a filesystem.
+    pub workspace_exists: bool,
+}
+
+/// Every reason this image cannot be resumed, or the process it resumes.
+///
+/// Collects *all* blockers rather than returning the first: a user told the
+/// workspace is gone, who fixes that and is then told the model is not resident
+/// either, has been made to discover one refusal at a time.
+pub fn restorability(
+    manifest: &CheckpointManifest,
+    environment: &RestoreEnvironment<'_>,
+) -> Restorability {
+    let Some(resume) = manifest.resume.as_ref() else {
+        return Restorability::Blocked {
+            blockers: vec![RestoreBlocker::NotAFreeze],
+        };
+    };
+    let mut blockers = Vec::new();
+    if resume.workspace.is_some() && !environment.workspace_exists {
+        blockers.push(RestoreBlocker::WorkspaceGone);
+    }
+    if let Some(model) = resume.model.as_ref() {
+        if !environment
+            .resident_models
+            .iter()
+            .any(|entry| entry == model)
+        {
+            blockers.push(RestoreBlocker::ModelNotResident);
+        }
+    }
+    if resume.pending_approvals.iter().any(|request| {
+        !environment
+            .live_approvals
+            .iter()
+            .any(|live| live == request)
+    }) {
+        blockers.push(RestoreBlocker::ApprovalExpired);
+    }
+    if blockers.is_empty() {
+        Restorability::Resumable {
+            process_id: resume.process_id.clone(),
+        }
+    } else {
+        Restorability::Blocked { blockers }
+    }
+}
+
+/// What a resume does and does not reproduce (roadmap K13's "determinism
+/// statement about what is and is not reproducible").
+///
+/// Enumerated and shipped beside the restore rather than written in a doc,
+/// because the reader who needs it is the person deciding whether to trust a
+/// resumed run — and a claim of "resumed exactly" that nobody qualified is worse
+/// than no resume at all.
+///
+/// Every entry here is a thing that is **not** reproduced. There is deliberately
+/// no "reproduced" list to balance it: the conversation, the workspace files and
+/// the outstanding approvals are reproduced *because the restore refuses when
+/// they cannot be*, which [`restorability`] enforces. A second list asserting it
+/// would be prose restating a guard.
+pub const DETERMINISM_CAVEATS: &[&str] = &[
+    "Model sampling is not replayed. The same prompt against the same resident model can produce a different continuation, so a resumed turn is a fresh generation from the frozen point rather than a replay of one.",
+    "Prompt-cache state is not part of the image. The first turn after a resume re-evaluates its prompt, which costs time but changes no output.",
+    "Wall-clock time moved. Anything the conversation derived from the current date or elapsed time was true at the freeze and may not be now.",
+    "External effects that already happened stay happened. A shell command, a network call or an MCP tool invoked before the freeze is not undone by resuming, and is not re-run either.",
+    "Anything outside the recorded workspace is whatever it is now. Files elsewhere on disk, other processes, and remote state were not frozen and were free to change.",
+];
+
 /// Every external effect a manifest records, reconstructing what an older one
 /// could not say.
 ///
@@ -624,6 +848,9 @@ fn parse_manifest(raw: &str, dir: &Path, id: &str) -> Result<CheckpointManifest,
         // and reconstructed by `external_effects_of`, which reads `shell_ran`
         // so the one signal a v1 manifest *does* carry is not lost.
         external_effects: Vec::new(),
+        // A v1 manifest predates freezing entirely, so there is no resume state
+        // to recover — and `None` is what says so.
+        resume: None,
         reverted: false,
         prev_id: None,
         entries,
@@ -718,6 +945,9 @@ pub fn end_impl(state: &AppState, id: &str) -> Result<CheckpointSummary, String>
         reverted: false,
         prev_id: active.prev_id,
         entries: entries.clone(),
+        // An ordinary turn checkpoint, not a freeze. `freeze_process` is what
+        // fills this, and `restorability` refuses anything that has not been.
+        resume: None,
     };
     write_manifest(&active.dir, &manifest)?;
 
@@ -1607,9 +1837,251 @@ pub fn checkpoint_reapply(
     reapply_impl(&checkpoints_base_dir(&app)?, &id)
 }
 
+/// Freeze a suspended process into checkpoint `id` (roadmap K13).
+///
+/// The caller supplies the resume state because it is the only party holding all
+/// four pieces — see [`freeze_impl`]. Takes the revert lock for the same reason
+/// revert does: a freeze and a revert of the same checkpoint both rewrite its
+/// manifest, and the last writer would otherwise win silently.
+#[tauri::command]
+pub fn checkpoint_freeze(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    resume: ResumeState,
+) -> Result<(), String> {
+    let _lock = acquire_revert_lock(state.inner(), &id)?;
+    freeze_impl(&checkpoints_base_dir(&app)?, &id, resume)
+}
+
+/// Whether checkpoint `id` can be resumed here and now, and the determinism
+/// caveats that apply if it is.
+///
+/// The caveats travel with the verdict rather than sitting in a doc: the reader
+/// who needs them is whoever is deciding to press Resume.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreReport {
+    pub restorability: Restorability,
+    pub determinism_caveats: Vec<String>,
+}
+
+#[tauri::command]
+pub fn checkpoint_restorability(
+    app: tauri::AppHandle,
+    id: String,
+    resident_models: Vec<String>,
+    live_approvals: Vec<String>,
+) -> Result<RestoreReport, String> {
+    let manifest = read_manifest(&checkpoints_base_dir(&app)?, &id)?;
+    // Checked here rather than by the caller: the path is in the manifest, and a
+    // caller that had to look it up first could report a stale answer.
+    let workspace_exists = manifest
+        .resume
+        .as_ref()
+        .and_then(|resume| resume.workspace.as_ref())
+        .is_none_or(|workspace| Path::new(workspace).is_dir());
+    Ok(RestoreReport {
+        restorability: restorability(
+            &manifest,
+            &RestoreEnvironment {
+                resident_models: &resident_models,
+                live_approvals: &live_approvals,
+                workspace_exists,
+            },
+        ),
+        determinism_caveats: DETERMINISM_CAVEATS
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- K13 freeze image -------------------------------------------------
+
+    fn frozen(resume: Option<ResumeState>) -> CheckpointManifest {
+        CheckpointManifest {
+            version: MANIFEST_VERSION,
+            created_at_ms: 1,
+            session_id: "s-1".to_string(),
+            anchor_index: 0,
+            label: "freeze".to_string(),
+            shell_ran: false,
+            external_effects: Vec::new(),
+            reverted: false,
+            prev_id: None,
+            entries: Vec::new(),
+            resume,
+        }
+    }
+
+    fn resume_state() -> ResumeState {
+        ResumeState {
+            process_id: "p-frozen".to_string(),
+            frozen_at_ms: 10,
+            model: Some("llama-3.1-8b".to_string()),
+            runtime_id: Some("managed-llama".to_string()),
+            workspace: Some("/tmp/ws".to_string()),
+            pending_approvals: vec!["req-1".to_string()],
+        }
+    }
+
+    fn environment<'a>(
+        resident: &'a [String],
+        approvals: &'a [String],
+        workspace_exists: bool,
+    ) -> RestoreEnvironment<'a> {
+        RestoreEnvironment {
+            resident_models: resident,
+            live_approvals: approvals,
+            workspace_exists,
+        }
+    }
+
+    /// An ordinary turn checkpoint is not a freeze, and must not be offered as
+    /// one — the overwhelmingly common manifest takes this branch.
+    #[test]
+    fn a_turn_checkpoint_is_not_restorable_as_a_process() {
+        assert_eq!(
+            restorability(&frozen(None), &environment(&[], &[], true)),
+            Restorability::Blocked {
+                blockers: vec![RestoreBlocker::NotAFreeze]
+            }
+        );
+    }
+
+    #[test]
+    fn a_freeze_whose_world_is_intact_resumes() {
+        let resident = vec!["llama-3.1-8b".to_string()];
+        let approvals = vec!["req-1".to_string()];
+        assert_eq!(
+            restorability(
+                &frozen(Some(resume_state())),
+                &environment(&resident, &approvals, true)
+            ),
+            Restorability::Resumable {
+                process_id: "p-frozen".to_string()
+            }
+        );
+    }
+
+    /// Every blocker at once, not the first: a user who fixes the workspace and
+    /// is then told the model is missing has been made to discover the refusals
+    /// one at a time.
+    #[test]
+    fn a_refusal_names_every_reason_rather_than_the_first() {
+        let blocked = restorability(&frozen(Some(resume_state())), &environment(&[], &[], false));
+        let Restorability::Blocked { blockers } = blocked else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(
+            blockers,
+            vec![
+                RestoreBlocker::WorkspaceGone,
+                RestoreBlocker::ModelNotResident,
+                RestoreBlocker::ApprovalExpired,
+            ]
+        );
+    }
+
+    /// Resuming past an approval that has since expired would continue on a
+    /// permission nobody currently grants.
+    #[test]
+    fn an_expired_approval_alone_blocks_the_restore() {
+        let resident = vec!["llama-3.1-8b".to_string()];
+        assert_eq!(
+            restorability(
+                &frozen(Some(resume_state())),
+                &environment(&resident, &[], true)
+            ),
+            Restorability::Blocked {
+                blockers: vec![RestoreBlocker::ApprovalExpired]
+            }
+        );
+    }
+
+    /// A manifest written before freezing existed decodes with `resume: None`
+    /// rather than failing — and reads as "not a freeze", which it was not.
+    #[test]
+    fn an_older_manifest_decodes_as_not_a_freeze() {
+        let older = serde_json::json!({
+            "version": 2,
+            "created_at_ms": 1,
+            "session_id": "s-old",
+            "anchor_index": 0,
+            "label": "before freezing existed",
+            "shell_ran": false,
+            "reverted": false,
+            "entries": []
+        });
+        let manifest: CheckpointManifest =
+            serde_json::from_value(older).expect("an older manifest still decodes");
+        assert_eq!(manifest.resume, None);
+        assert!(matches!(
+            restorability(&manifest, &environment(&[], &[], true)),
+            Restorability::Blocked { .. }
+        ));
+    }
+
+    /// The whole point of K13: the image survives the process that wrote it.
+    /// Written to disk, read back by a different call, and still restorable.
+    #[test]
+    fn a_freeze_survives_on_disk_and_refuses_to_be_written_twice() {
+        let base = TempDir::new("freeze");
+        let id = "00000000-0000-4000-8000-0000freeze01";
+        let dir = base.path.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_manifest(&dir, &frozen(None)).unwrap();
+
+        freeze_impl(&base.path, id, resume_state()).expect("the freeze lands");
+
+        // Read back through the ordinary path — nothing in memory is carried
+        // over, which is what "resumed after a restart" actually requires.
+        let reloaded = read_manifest(&base.path, id).expect("the manifest reloads");
+        assert_eq!(
+            reloaded.resume.as_ref().map(|r| r.process_id.as_str()),
+            Some("p-frozen")
+        );
+        let resident = vec!["llama-3.1-8b".to_string()];
+        let approvals = vec!["req-1".to_string()];
+        assert_eq!(
+            restorability(&reloaded, &environment(&resident, &approvals, true)),
+            Restorability::Resumable {
+                process_id: "p-frozen".to_string()
+            }
+        );
+
+        // A second freeze would leave the image describing one process while the
+        // entries beneath it describe another turn.
+        let twice = freeze_impl(&base.path, id, resume_state());
+        assert!(
+            matches!(twice, Err(ref message) if message.contains("already a freeze")),
+            "{twice:?}"
+        );
+    }
+
+    /// Every blocker states a reason, and every caveat is real prose — an empty
+    /// one would make the determinism statement a claim of nothing.
+    #[test]
+    fn every_blocker_and_caveat_says_something() {
+        for blocker in [
+            RestoreBlocker::NotAFreeze,
+            RestoreBlocker::WorkspaceGone,
+            RestoreBlocker::ModelNotResident,
+            RestoreBlocker::ApprovalExpired,
+        ] {
+            assert!(!blocker.code().is_empty());
+            assert!(blocker.explanation().len() > 40, "{:?}", blocker);
+        }
+        assert!(!DETERMINISM_CAVEATS.is_empty());
+        for caveat in DETERMINISM_CAVEATS {
+            assert!(caveat.len() > 40, "{caveat}");
+        }
+    }
 
     struct TempDir {
         path: PathBuf,
