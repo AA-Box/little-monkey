@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  destinationsFor,
   measurementOf,
   renderMeasurement,
   renderTotal,
@@ -138,5 +139,31 @@ describe("resource ledger measurements", () => {
   it("flags a total that could not read every row", () => {
     expect(totalIsPartial(total({ measuredRows: 3, unavailableRows: 7 }))).toBe(true);
     expect(totalIsPartial(total({ measuredRows: 10, unavailableRows: 0 }))).toBe(false);
+  });
+});
+
+describe("egress destinations", () => {
+  const reached = {
+    destinations: [
+      { scheme: "https", host: "api.example.com", port: 443, requests: 5, firstSeenMs: 1, lastSeenMs: 2 },
+    ],
+    dropped: 0,
+  };
+
+  it("returns null for a process the ledger recorded nothing for", () => {
+    // The distinction this whole surface rests on: an absent key means nothing
+    // was recorded, which is not the same claim as "this process reached
+    // nowhere" — so the caller gets null and renders nothing at all.
+    expect(destinationsFor({ destinations: {} }, "p-1")).toBeNull();
+    expect(destinationsFor(null, "p-1")).toBeNull();
+    expect(destinationsFor({ destinations: { "p-1": { destinations: [], dropped: 0 } } }, "p-1")).toBeNull();
+  });
+
+  it("returns the record when anything at all was recorded, including only drops", () => {
+    expect(destinationsFor({ destinations: { "p-1": reached } }, "p-1")).toBe(reached);
+    // A process whose every destination fell past the cap still has something
+    // true to say, and hiding it would under-report the traffic entirely.
+    const onlyDropped = { destinations: [], dropped: 12 };
+    expect(destinationsFor({ destinations: { "p-1": onlyDropped } }, "p-1")).toBe(onlyDropped);
   });
 });

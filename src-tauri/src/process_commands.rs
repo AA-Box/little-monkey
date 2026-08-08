@@ -643,6 +643,16 @@ pub struct ProcessUsageArgs {
 pub struct ProcessUsageLedger {
     pub rows: Vec<crate::process_table::ProcessUsageRow>,
     pub totals: crate::process_table::ProcessUsageAggregate,
+    /// Where each row's allowed egress went, keyed by `processId`. Only the
+    /// processes that reached somewhere appear — see
+    /// `ProcessTable::egress_destinations_for`.
+    ///
+    /// Beside the rows rather than inside them because it is the one field here
+    /// that is a list per row: folding it in would make every other caller of
+    /// `usage_rows` — the daemon engine, the background shell — pay for a query
+    /// only this surface reads.
+    pub destinations:
+        std::collections::BTreeMap<String, crate::process_table::ProcessEgressDestinations>,
 }
 
 /// What each process actually consumed, per process and in aggregate.
@@ -666,9 +676,12 @@ pub fn process_usage_ledger(
         limit: args.limit,
     };
     with_process_table(&app, state.inner(), |table| {
+        let rows = table.usage_rows(&filter)?;
+        let ids: Vec<String> = rows.iter().map(|row| row.process_id.clone()).collect();
         Ok(ProcessUsageLedger {
-            rows: table.usage_rows(&filter)?,
+            destinations: table.egress_destinations_for(&ids)?,
             totals: table.usage_totals(&filter)?,
+            rows,
         })
     })
 }

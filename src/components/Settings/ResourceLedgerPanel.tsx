@@ -7,11 +7,13 @@ import { useT } from "../../lib/i18n";
 import { formatTimestamp } from "../../lib/format";
 import type { SchedulerDecision } from "../../lib/daemonClient";
 import {
+  destinationsFor,
   measurementOf,
   renderMeasurement,
   renderTotal,
   totalIsPartial,
   USAGE_FIELDS,
+  type ProcessEgressDestinations,
   type ProcessUsageAggregate,
   type ProcessUsageRow,
   type UsageFieldSpec,
@@ -77,7 +79,51 @@ function Measurement({ row, spec }: { row: ProcessUsageRow; spec: UsageFieldSpec
   );
 }
 
-export function UsageRow({ row }: { row: ProcessUsageRow }) {
+/**
+ * Where this process's allowed egress went.
+ *
+ * Renders nothing when nothing was recorded, rather than an empty list: the
+ * ledger cannot tell "reached nowhere" from "this build recorded nothing", and
+ * an empty list on screen would claim the first.
+ */
+export function DestinationList({ recorded }: { recorded: ProcessEgressDestinations | null }) {
+  const { t } = useT();
+  if (!recorded) return null;
+  return (
+    <div className="mt-2 border-t border-border pt-2">
+      <p className="text-[11px] text-faint">{t("ResourceLedgerPanel.destinationsLabel")}</p>
+      <ul className="mt-1 flex flex-wrap gap-x-3 gap-y-1">
+        {recorded.destinations.map((destination) => (
+          <li
+            key={`${destination.scheme}://${destination.host}:${destination.port}`}
+            className="font-mono text-[11px] text-foreground"
+          >
+            {destination.host}
+            <span className="text-faint">
+              {`:${destination.port} · `}
+              {t("ResourceLedgerPanel.destinationRequests", { count: destination.requests })}
+            </span>
+          </li>
+        ))}
+      </ul>
+      {/* Same rule as a partial total: the list is still real, but it is never
+          shown without the count it is missing. */}
+      {recorded.dropped > 0 && (
+        <p className="mt-1 text-[11px] leading-snug text-warning">
+          {t("ResourceLedgerPanel.destinationsDropped", { count: recorded.dropped })}
+        </p>
+      )}
+    </div>
+  );
+}
+
+export function UsageRow({
+  row,
+  destinations = null,
+}: {
+  row: ProcessUsageRow;
+  destinations?: ProcessEgressDestinations | null;
+}) {
   const { t } = useT();
   const unavailableCount = row.usage.unavailable.length;
   return (
@@ -102,6 +148,7 @@ export function UsageRow({ row }: { row: ProcessUsageRow }) {
           <Measurement key={spec.field} row={row} spec={spec} />
         ))}
       </div>
+      <DestinationList recorded={destinations} />
     </div>
   );
 }
@@ -221,6 +268,7 @@ export function ResourceLedgerPanel() {
 
   const rows = useResourceLedgerStore(useShallow((state) => state.rows));
   const totals = useResourceLedgerStore((state) => state.totals);
+  const destinations = useResourceLedgerStore(useShallow((state) => state.destinations));
   const closedOnly = useResourceLedgerStore((state) => state.closedOnly);
   const loadingLedger = useResourceLedgerStore((state) => state.loadingLedger);
   const ledgerError = useResourceLedgerStore((state) => state.ledgerError);
@@ -306,7 +354,7 @@ export function ResourceLedgerPanel() {
           )}
           <div className="flex flex-col gap-2">
             {rows.map((row) => (
-              <UsageRow key={row.processId} row={row} />
+              <UsageRow key={row.processId} row={row} destinations={destinationsFor({ destinations }, row.processId)} />
             ))}
           </div>
         </>

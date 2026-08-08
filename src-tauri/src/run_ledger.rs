@@ -194,9 +194,11 @@ const MIGRATION_V12: i64 = 12;
 const MIGRATION_V12_CHECKSUM: &str = "subsystem-events-v12-2026-08-07";
 const MIGRATION_V13: i64 = 13;
 const MIGRATION_V13_CHECKSUM: &str = "compatible-migrations-v13-2026-08-08";
+const MIGRATION_V14: i64 = 14;
+const MIGRATION_V14_CHECKSUM: &str = "egress-destinations-v14-2026-08-08";
 
 /// The newest schema this binary knows how to write.
-const SCHEMA_VERSION: i64 = MIGRATION_V13;
+const SCHEMA_VERSION: i64 = MIGRATION_V14;
 
 /// Whether a migration keeps older binaries able to open the database.
 ///
@@ -1723,6 +1725,14 @@ const MIGRATION_LADDER: &[(i64, &str, Compatibility)] = &[
         MIGRATION_V13_CHECKSUM,
         Compatibility::RequiresThisVersion,
     ),
+    // Additive, and the first migration to actually collect on what V13 bought:
+    // a new table plus a nullable column, both of which a V13 binary simply never
+    // looks at. Its writes stay correct — `add_egress_bytes` touches neither.
+    (
+        MIGRATION_V14,
+        MIGRATION_V14_CHECKSUM,
+        Compatibility::Additive,
+    ),
 ];
 
 /// The oldest binary that may open a database with `version` applied.
@@ -2104,6 +2114,44 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
+    let has_v14 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V14],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v14 {
+        // Probed separately, for V13's reason and one more of its own: SQLite
+        // cannot `ALTER TABLE ... DROP COLUMN` a column that carries a `CHECK`,
+        // so a database wound back to an earlier version — which is exactly what
+        // the upgrade tests below construct — can genuinely have the column
+        // without the table, or the table without the column.
+        let has_table = transaction
+            .prepare("SELECT 1 FROM egress_destinations LIMIT 0")
+            .is_ok();
+        if !has_table {
+            transaction.execute_batch(MIGRATION_V14_SQL)?;
+        }
+        let has_column = transaction
+            .prepare("SELECT egress_destinations_dropped FROM agent_processes LIMIT 0")
+            .is_ok();
+        if !has_column {
+            transaction.execute_batch(MIGRATION_V14_COLUMN_SQL)?;
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V14,
+                MIGRATION_V14_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V14)
+            ],
+        )?;
+    }
+
     // Every row's floor is (re)stated from the ladder, including the rows that
     // predate the column. Rewriting them all rather than only the new one keeps
     // the database's answer and the binary's answer the same by construction —
@@ -2115,7 +2163,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
-    transaction.execute_batch("PRAGMA user_version = 13;")?;
+    transaction.execute_batch("PRAGMA user_version = 14;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -2750,6 +2798,74 @@ END;
 /// no second source of truth to drift.
 const MIGRATION_V13_SQL: &str = r#"
 ALTER TABLE schema_migrations ADD COLUMN min_reader_version INTEGER NOT NULL DEFAULT 1;
+"#;
+
+/// Records who a process's *allowed* egress actually went to (roadmap K5, K12).
+///
+/// # The gap this closes
+///
+/// `denial_sink` writes down every refused request with the rule that refused
+/// it, and V8 gave `agent_processes` a `bytes_egressed` column. Between them
+/// they answer "what was blocked" and "how much got out" — and neither answers
+/// **where it went**. A run that was never denied anything produced no record of
+/// its network activity at all, which is the half `denial_sink`'s own module doc
+/// names as still missing.
+///
+/// # Why a counter table and not more events
+///
+/// This is deliberately *not* part of V9's or V12's hash chains, and calling it
+/// tamper-evident would be a lie, so it does not claim to be. The rows are
+/// mutable by construction: `requests` is incremented in place, because the
+/// alternative — one immutable row per request — is a per-request append to a
+/// serialized chain for the highest-frequency thing this app does. A summary
+/// keyed by destination is bounded by how many distinct places a process talked
+/// to, which is a small number that does not grow with how much it said.
+///
+/// The chained streams keep their job: a *decision* (V11) and a subsystem
+/// *action* (V12) are events and are chained. This is an aggregate beside them.
+///
+/// # `ON DELETE CASCADE`, where the rest of this schema uses `RESTRICT`
+///
+/// The difference is real rather than an inconsistency. `RESTRICT` protects rows
+/// that are records in their own right — a run, a parent process — from
+/// vanishing under something that references them. These rows are not their own
+/// record: they are a property *of* a process, meaningless without it, so a
+/// process that is ever pruned should take them with it rather than block on
+/// them.
+///
+/// # Why the overflow count sits on `agent_processes`
+///
+/// `run_scope::MAX_DESTINATIONS` caps how many distinct destinations one process
+/// names, because a run with no declared allowlist can be walked across
+/// arbitrarily many hosts by the content it fetches. The requests past that cap
+/// are still counted — a truncated list that does not say it is truncated reads
+/// as a complete one — and they belong on the process rather than in a sentinel
+/// row here, which would have to be excluded by every reader that ever joins
+/// this table.
+const MIGRATION_V14_SQL: &str = r#"
+CREATE TABLE egress_destinations (
+    process_id TEXT NOT NULL REFERENCES agent_processes(process_id) ON DELETE CASCADE,
+    scheme TEXT NOT NULL CHECK (length(scheme) > 0),
+    host TEXT NOT NULL CHECK (length(host) > 0),
+    port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+    requests INTEGER NOT NULL CHECK (requests > 0),
+    first_seen_ms INTEGER NOT NULL CHECK (first_seen_ms > 0),
+    last_seen_ms INTEGER NOT NULL CHECK (last_seen_ms >= first_seen_ms),
+    PRIMARY KEY (process_id, scheme, host, port)
+) STRICT;
+
+CREATE INDEX egress_destinations_host_idx ON egress_destinations(host, last_seen_ms DESC);
+"#;
+
+/// V14's second half — see [`MIGRATION_V14_SQL`] on why the count of dropped
+/// destinations lives on the process rather than in a sentinel row.
+///
+/// Separate from the table so each half can be applied behind its own probe.
+/// Nullable like every V8 measurement column and for the same rule: NULL is "no
+/// flush ever reported one", which is a different fact from a measured zero.
+const MIGRATION_V14_COLUMN_SQL: &str = r#"
+ALTER TABLE agent_processes ADD COLUMN egress_destinations_dropped INTEGER
+    CHECK (egress_destinations_dropped IS NULL OR egress_destinations_dropped >= 0);
 "#;
 
 /// Records every permission decision, including the ones no run can hold
@@ -5147,7 +5263,7 @@ mod tests {
                     .connection
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                13
+                14
             );
         }
 
@@ -5162,7 +5278,7 @@ mod tests {
                 .execute(
                     "INSERT INTO schema_migrations
                         (version, checksum, applied_at_ms, min_reader_version)
-                     VALUES (14, 'from-the-future-additive', 14, 13)",
+                     VALUES (15, 'from-the-future-additive', 15, 14)",
                     [],
                 )
                 .unwrap();
@@ -5176,7 +5292,7 @@ mod tests {
             let connection = Connection::open(&database.path).unwrap();
             connection
                 .execute(
-                    "UPDATE schema_migrations SET min_reader_version = 14 WHERE version = 14",
+                    "UPDATE schema_migrations SET min_reader_version = 15 WHERE version = 15",
                     [],
                 )
                 .unwrap();
@@ -5184,7 +5300,7 @@ mod tests {
         assert!(
             matches!(
                 RunLedger::open(&database.path),
-                Err(LedgerError::MigrationConflict { version: 14 })
+                Err(LedgerError::MigrationConflict { version: 15 })
             ),
             "a future migration that requires a newer binary must still refuse"
         );
@@ -5203,6 +5319,9 @@ mod tests {
         // V13 requires itself: a V12 binary applies the old blanket guard and
         // refuses regardless of what this column says.
         assert_eq!(min_reader_version_for(MIGRATION_V13), MIGRATION_V13);
+        // V14 is additive and therefore inherits V13's floor rather than raising
+        // it — the first migration to actually spend what V13 bought.
+        assert_eq!(min_reader_version_for(MIGRATION_V14), MIGRATION_V13);
         // And the pre-V9 ladder keeps exactly its old behaviour.
         assert_eq!(min_reader_version_for(MIGRATION_V8), MIGRATION_V8);
         assert_eq!(min_reader_version_for(MIGRATION_V1), MIGRATION_V1);
@@ -5250,13 +5369,13 @@ mod tests {
             let ledger = RunLedger::open(&database.path).unwrap();
             assert_eq!(
                 ledger.applied_migrations().unwrap(),
-                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
             );
         }
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
             "reopening must not re-apply or add a migration"
         );
 
@@ -5487,9 +5606,13 @@ mod tests {
             let connection = Connection::open(&database.path).unwrap();
             connection
                 .execute_batch(
+                    // `egress_destinations_dropped` is deliberately left in
+                    // place: SQLite cannot drop a column carrying a `CHECK`, so
+                    // this is the half-wound-back state V14's probes exist for.
                     "DROP TABLE permission_decisions;
                      DROP TABLE subsystem_events;
-                     DELETE FROM schema_migrations WHERE version IN (11, 12, 13);
+                     DROP TABLE egress_destinations;
+                     DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14);
                      PRAGMA user_version = 10;",
                 )
                 .unwrap();
@@ -5498,7 +5621,7 @@ mod tests {
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
             "opening a V10 database must apply every migration above it"
         );
         assert_eq!(
@@ -5506,7 +5629,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            13
+            14
         );
         // The table is back and empty: the upgrade adds the surface, it does not
         // invent rows for permissions nobody recorded at the time.
