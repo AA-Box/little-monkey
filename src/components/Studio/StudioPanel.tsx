@@ -175,8 +175,7 @@ function ConditioningImageField({
   const { t } = useT();
   const input = useRef<HTMLInputElement | null>(null);
   return (
-    <div className="grid gap-2 rounded-md border border-border p-2">
-      <span className="text-xs text-muted">{label}</span>
+    <SettingsCard title={label} hint={hint}>
       <div className="flex items-center gap-2">
         <input
           ref={input}
@@ -211,8 +210,7 @@ function ConditioningImageField({
           onChange={onStrength}
         />
       )}
-      <p className="text-[11px] text-faint">{hint}</p>
-    </div>
+    </SettingsCard>
   );
 }
 
@@ -240,8 +238,7 @@ function ReferenceImages({
   // rather than something the user has to take on trust.
   const canNumber = images.length > 1;
   return (
-    <div className="grid gap-2 rounded-md border border-border p-2">
-      <span className="text-xs text-muted">{t("Studio.reference.title")}</span>
+    <SettingsCard title={t("Studio.reference.title")} hint={t("Studio.reference.hint")}>
       <div className="flex flex-wrap items-center gap-2">
         {images.map((image, index) => (
           <span key={`${index}-${image.slice(0, 16)}`} className="relative">
@@ -303,14 +300,17 @@ function ReferenceImages({
           {t("Studio.reference.numbered")}
         </label>
       )}
-      <p className="text-[11px] text-faint">
-        {full
-          ? t("Studio.reference.full", { max: String(MAX_REF_IMAGES) })
-          : canNumber && numbered
-            ? t("Studio.reference.numberedHint")
-            : t("Studio.reference.hint")}
-      </p>
-    </div>
+      {/* Only the two stateful lines stay visible — that the list is full, or
+          what numbering did. The plain explanation is on the card's info icon,
+          where it is not re-read on every glance. */}
+      {full || (canNumber && numbered) ? (
+        <p className="text-[11px] text-faint">
+          {full
+            ? t("Studio.reference.full", { max: String(MAX_REF_IMAGES) })
+            : t("Studio.reference.numberedHint")}
+        </p>
+      ) : null}
+    </SettingsCard>
   );
 }
 
