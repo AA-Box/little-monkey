@@ -61,8 +61,8 @@ function provider(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   };
 }
 
-function providerModel(id: string): ProviderModelInfo {
-  return { id };
+function providerModel(id: string, vision?: boolean): ProviderModelInfo {
+  return vision === undefined ? { id } : { id, vision };
 }
 
 function inventoryInput(overrides: Partial<ModelTargetInventoryInput> = {}): ModelTargetInventoryInput {
@@ -180,6 +180,29 @@ describe("buildModelTargetInventory", () => {
     expect(inventory.targets[2]).not.toHaveProperty("effort");
     expect(inventory.targets[3]).not.toHaveProperty("effort");
     expect(inventory.targets.some((target) => target.displayName === "hidden")).toBe(false);
+  });
+
+  /** The vision chip is "unknown" only when the provider's model list said
+   *  nothing (OpenAI, custom endpoints). When it did say something — OpenRouter's
+   *  `input_modalities`, Anthropic's `image_input` — show that instead of
+   *  claiming the inventory doesn't report it. */
+  it("snapshots the provider's own vision answer when its model list carries one", () => {
+    const inventory = buildModelTargetInventory(
+      inventoryInput({
+        providers: [provider({ id: "openrouter", label: "OpenRouter", base_url: "https://openrouter.ai/api/v1" })],
+        providerModels: {
+          openrouter: [
+            providerModel("vendor/sees-images", true),
+            providerModel("vendor/text-only", false),
+            providerModel("vendor/unreported"),
+          ],
+        },
+      }),
+    );
+
+    const cloud = inventory.targets.filter((target) => target.kind === "provider");
+    expect(cloud.map((target) => target.capabilities.vision.state)).toEqual(["yes", "no", "unknown"]);
+    expect(cloud[0].capabilities.vision.evidence).toMatch(/OpenRouter/);
   });
 
   it("applies the migrated legacy fallback entry to Anthropic models only, below any per-model entry", () => {

@@ -279,7 +279,12 @@ function providerTarget(
     estimatedMemoryBytes: 0,
     capabilities: capabilities(
       capability("unknown", "The provider model inventory does not report tool-calling capability."),
-      capability("unknown", "The provider model inventory does not report vision capability."),
+      model.vision === undefined
+        ? capability("unknown", "The provider model inventory does not report vision capability.")
+        : capability(
+            model.vision ? "yes" : "no",
+            `${provider.label}'s model list reports image input=${model.vision}.`,
+          ),
     ),
     availability: availability(
       "available",
