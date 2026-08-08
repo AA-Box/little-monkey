@@ -1168,6 +1168,8 @@ pub fn run() {
             checkpoints::checkpoint_reapply,
             m3_commands::m3_context_policies,
             checkpoints::checkpoint_freeze,
+            checkpoints::checkpoint_freeze_live,
+            checkpoints::checkpoint_clear_freeze,
             checkpoints::checkpoint_restorability,
             checkpoints::checkpoint_list,
             checkpoints::checkpoint_preview,

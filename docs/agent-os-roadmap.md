@@ -3520,7 +3520,7 @@ quota clause is K4's and is untouched here.
 **Blocks:** K8 in practice — preempting and resuming runs is only affordable
 if their namespaces are cheap.
 
-## K11. Context memory manager *(partially built)*
+## K11. Context memory manager *(built)*
 
 **Today:** `context_cache.rs` is honest observability — configured vs. live
 context from a managed `llama.cpp` process's `/props`/`/slots`, headroom,
@@ -4091,7 +4091,7 @@ a broken chain so a scripted check cannot pass by printing bad news.
 
 **Blocks:** K21 — conformance needs evidence that cannot be quietly edited.
 
-## K13. Freeze and restore a live process
+## K13. Freeze and restore a live process *(built)*
 
 **Today:** checkpoints capture mutating turns with per-file diff, artifacts,
 screenshots, verification state, read-only compare of any two, and a rollback
@@ -4108,7 +4108,8 @@ is not reproducible.
 **Blocks:** K18.
 
 **Shipped — the durable image, its restore gate, and the determinism
-statement. Not the loop re-entry.**
+statement.** The loop re-entry that acts on all three is the entry below this
+one.
 
 The image is a **checkpoint**, not a new store. A checkpoint is already a
 durable, versioned manifest of a turn's conversation anchor and workspace files;
@@ -4151,14 +4152,62 @@ disagreement would surface at restore, the moment it can least be dealt with.
   reads as "this process reserved nothing" rather than "this system does not
   reserve". The field arrives when the thing it names does.
 
-**Remaining: the loop re-entry.** `freeze_impl` writes the image and
-`checkpoint_restorability` says whether it can be resumed, both reachable as
-commands. What no code yet does is *re-enter* a frozen turn — the suspend/resume
-path parks a live loop in `pauseRegistry`, which is process memory, so resuming
-after a restart needs the chat loop to start from an image instead of from a
-parked continuation. That is the half that makes K13 true end to end, and it is
-frontend work in `processSignalDelivery.ts`'s neighbourhood rather than anything
-this entry's storage half blocks.
+**Shipped — the loop re-entry, which closes K13. It also closes a lie the
+storage half left standing.**
+
+A chat turn suspended and then carried across a restart has a `suspended` process
+row and no loop behind it. `deliverPause`'s resume arm cleared an in-memory latch
+nobody was holding and answered `"resumed"` — so the two-second sweep reported a
+resume every tick, forever, while nothing continued. The Resume button in the
+Processes panel did the same. The image existed and nothing read it.
+
+- **`freeze_impl` could not have served this, and the reason is structural.** It
+  reads a manifest, and a manifest only exists after `checkpoint_end`. So it can
+  only freeze a turn that already finished — a turn with nothing left to resume.
+  A process worth freezing is by definition mid-flight: its checkpoint is open in
+  `AppState::checkpoints` and *nothing of it is on disk*, which is exactly the
+  state a quit destroys. `freeze_live_impl` writes the manifest early, from the
+  open checkpoint, and leaves the checkpoint open.
+- **The image is written on the way *into* the park, not out of it.** The agent
+  loop's own safe point — the tool boundary the acceptance names — freezes first
+  and parks second. Writing it on the way out would write it at the one moment it
+  is already too late.
+- **The entries recorded so far travel with it, and no `after/` snapshots do.**
+  The conversation and the files have to describe the same instant; restoring
+  files from a later one would be a state the process was never in. `after/`
+  records what a turn *produced*, and this turn has not produced it yet.
+- **The turn's own end overwrites the image with `resume: None`.** A turn that
+  reached its end has nothing to resume, and an entry-less one has its directory
+  removed — taking the stale image with it. Nothing sweeps; the existing
+  lifecycle already disposes of it.
+- **`pending_approvals` is empty, and that is a fact rather than a shortcut.** A
+  cooperative loop parks at a round boundary, after the previous round's tool
+  calls and their permission prompts have resolved. There is no outstanding
+  approval to record, so `ApprovalExpired` cannot fire on this path.
+- **Resident models is the one target the app would run right now**, not what is
+  installed. `ModelNotResident`'s own words are that resuming against a different
+  model "would continue the conversation in another model's voice" — so the
+  question is what the next round trip would actually reach.
+- **A resume starts a new turn and exits the frozen row.** Re-admitting the
+  original `externalId` would put two rows on one id, and the ledger's rule is
+  that a run claimed by two rows is claimed by neither. The image is the link,
+  which is what an image is for.
+- **The image is cleared before the loop starts, not after.** Cleared afterwards,
+  it would briefly describe a turn that is already running — and the next restart
+  would offer to resume it a second time.
+- **A refused restore is answered once and the row retired.** The blockers'
+  explanations go into the session's own transcript, because the person who
+  pressed Resume is the only one who can fix a missing workspace or load a model;
+  leaving the row suspended would append that same refusal every two seconds.
+- **The determinism caveats are written into the transcript beside the
+  continuation**, which is why `checkpoint_restorability` returns them rather
+  than a doc holding them: a resumed turn is a fresh generation from the frozen
+  point, not a replay of the one that was interrupted, and the transcript is
+  where the reader is.
+
+No UI was added. Suspend and Resume already existed in the Processes panel and
+already wrote durable intent; what changed is that the resume now reaches
+something.
 
 ## K14. Transactional external effects
 
