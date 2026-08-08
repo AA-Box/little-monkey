@@ -330,9 +330,91 @@ pub fn sandbox_enforcement() -> SandboxEnforcement {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CopyStats {
+    /// Every file placed in the sandbox, however its bytes got there.
+    ///
+    /// Deliberately still the total rather than "files copied the slow way":
+    /// callers and the ledger label have always read it as "how big is this
+    /// sandbox", and narrowing it now would silently change what an existing
+    /// record means.
     pub files_copied: u64,
     pub bytes_copied: u64,
     pub skipped: u64,
+    /// Of [`Self::files_copied`], how many were copy-on-write clones rather
+    /// than byte copies. Zero on a filesystem or platform that cannot clone —
+    /// see [`clone_file`].
+    pub files_cloned: u64,
+}
+
+impl CopyStats {
+    /// How the bytes got in, for a ledger label a human reads.
+    ///
+    /// Three states and not two, because "nothing was cloned" and "there was
+    /// nothing to clone" are different facts: an empty workspace must not read
+    /// as a filesystem that refused to clone.
+    #[must_use]
+    pub fn placement_mode(&self) -> &'static str {
+        match (self.files_copied, self.files_cloned) {
+            (0, _) => "no files",
+            (total, cloned) if cloned == total => "copy-on-write",
+            (_, 0) => "full copy",
+            _ => "copy-on-write where the filesystem allowed it",
+        }
+    }
+}
+
+/// Clones one file copy-on-write, or reports that this platform could not.
+///
+/// # Why per file rather than per tree
+///
+/// macOS `clonefile` can clone a whole directory in one call, and it is
+/// tempting. It would also clone the two things
+/// [`copy_workspace_into_sandbox`] exists to leave out — `.env` files and
+/// `node_modules`-shaped directories — and deleting them afterwards is a
+/// strictly worse version of never copying them: the window in which a secret
+/// exists inside the sandbox would be real, and a crash inside that window
+/// leaves it there. Keeping the walk and swapping only the per-file placement
+/// means the skip rules, the symlink handling and the resulting tree are
+/// unchanged by construction, which is what makes "byte-for-byte identical to
+/// the copy implementation" true rather than tested-and-hoped.
+///
+/// # Failure is never an error
+///
+/// Returns `false` for every refusal — a filesystem without copy-on-write, a
+/// cross-device destination, a destination that already exists — because each
+/// one means "copy it the ordinary way", not "fail the run". The caller falls
+/// back to `fs::copy`, so the only thing lost is the saving.
+#[cfg(target_os = "macos")]
+fn clone_file(src: &Path, dest: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (Ok(source), Ok(destination)) = (
+        CString::new(src.as_os_str().as_bytes()),
+        CString::new(dest.as_os_str().as_bytes()),
+    ) else {
+        // An interior NUL, which no path this walk produced can contain.
+        return false;
+    };
+    // SAFETY: both pointers are NUL-terminated C strings that outlive the call,
+    // and `clonefile` neither retains them nor writes through them.
+    unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) == 0 }
+}
+
+/// Every other platform copies, and says so rather than pretending.
+///
+/// Linux reflink (`FICLONE`, on btrfs and XFS) and Windows ReFS block cloning
+/// are both real and both deliberately absent: neither can be exercised on this
+/// project's machines, and an untested ioctl that silently degrades to a copy
+/// would look identical to this in every test while being harder to read.
+/// Overlayfs, which the roadmap names for Linux, needs mount privileges a
+/// desktop application does not have.
+///
+/// Hard-linking a staging tree is not a substitute on any platform and is not a
+/// deferral: a write through a hard link mutates the workspace file itself,
+/// which is the one thing an ephemeral sandbox exists to prevent.
+#[cfg(not(target_os = "macos"))]
+fn clone_file(_src: &Path, _dest: &Path) -> bool {
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -534,7 +616,17 @@ pub fn copy_workspace_into_sandbox(root: &Path, dest: &Path) -> io::Result<CopyS
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let bytes = fs::copy(path, &dest_path)?;
+        // Cloned where the filesystem allows it, copied where it does not. The
+        // resulting file is the same either way — `bytes_copied` stays the size
+        // of the tree, not the number of bytes the disk actually wrote, because
+        // it is read as "how big is this sandbox" and a clone does not make the
+        // sandbox smaller.
+        let bytes = if clone_file(path, &dest_path) {
+            stats.files_cloned += 1;
+            entry.metadata().map_err(io::Error::other)?.len()
+        } else {
+            fs::copy(path, &dest_path)?
+        };
         stats.files_copied += 1;
         stats.bytes_copied += bytes;
     }
@@ -1489,10 +1581,16 @@ async fn run_sandboxed_body(
         RunEvent::CheckpointLinked {
             checkpoint_id: format!("sandbox-copy-{run_id}"),
             kind: CheckpointKind::Workspace,
+            // The placement mode is part of the record, not decoration: two runs
+            // with the same file and byte counts can have cost wildly different
+            // amounts of disk, and the ledger is where that is answerable later.
             label: bounded(
                 &format!(
-                    "Ephemeral copy: {} file(s), {} byte(s)",
-                    stats.files_copied, stats.bytes_copied
+                    "Ephemeral copy: {} file(s), {} byte(s), {} ({} cloned)",
+                    stats.files_copied,
+                    stats.bytes_copied,
+                    stats.placement_mode(),
+                    stats.files_cloned
                 ),
                 1_024,
             ),
@@ -1942,6 +2040,150 @@ mod tests {
     }
 
     // --- copy_workspace_into_sandbox -----------------------------------
+
+    /// The acceptance clause this whole change has to earn: a cloned sandbox is
+    /// byte-for-byte the tree the copy implementation produced.
+    ///
+    /// Asserted against a copy made from the *same* fixture rather than against
+    /// a written-down expectation, so the two implementations are compared to
+    /// each other and not to somebody's idea of what they do. On a filesystem
+    /// that cannot clone, the two are the same code path and the test still
+    /// holds — it just stops proving anything new, which is why the clone count
+    /// is reported rather than asserted.
+    #[test]
+    fn a_cloned_sandbox_is_byte_for_byte_the_tree_a_copy_produces() {
+        let root = temp_dir("clone-src");
+        let cloned = temp_dir("clone-dest");
+
+        write(&root.join("src/main.rs"), "fn main() { println!(\"hi\"); }");
+        write(&root.join("src/nested/deep/file.txt"), "deep content");
+        write(&root.join("package.json"), "{\"name\":\"fixture\"}");
+        write(&root.join(".env"), "API_KEY=super-secret");
+        write(
+            &root.join("node_modules/pkg/index.js"),
+            "module.exports = {};",
+        );
+        // An empty file and a large-ish one: clonefile's edge is zero-length
+        // extents, and a multi-block file is the case a clone actually saves on.
+        write(&root.join("empty"), "");
+        write(&root.join("big.bin"), &"x".repeat(1_000_000));
+
+        let stats = copy_workspace_into_sandbox(&root, &cloned).expect("the sandbox is created");
+
+        // The same fixture through `fs::copy` alone, for comparison.
+        let copied = temp_dir("clone-reference");
+        for relative in [
+            "src/main.rs",
+            "src/nested/deep/file.txt",
+            "package.json",
+            "empty",
+            "big.bin",
+        ] {
+            let destination = copied.join(relative);
+            fs::create_dir_all(destination.parent().expect("a parent")).expect("create parent");
+            fs::copy(root.join(relative), &destination).expect("reference copy");
+        }
+
+        let listing = |base: &Path| {
+            let mut found: Vec<(String, Vec<u8>)> = walkdir::WalkDir::new(base)
+                .min_depth(1)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| {
+                    (
+                        entry
+                            .path()
+                            .strip_prefix(base)
+                            .expect("under the base")
+                            .to_string_lossy()
+                            .into_owned(),
+                        fs::read(entry.path()).expect("the file reads"),
+                    )
+                })
+                .collect();
+            found.sort();
+            found
+        };
+
+        assert_eq!(
+            listing(&cloned),
+            listing(&copied),
+            "a cloned sandbox must contain exactly the files a copy would, with exactly the same bytes"
+        );
+        assert_eq!(stats.files_copied, 5, "every non-skipped file is placed");
+        assert!(stats.files_cloned <= stats.files_copied);
+        // On macOS this is the assertion that the clone path is reached at all:
+        // every temp directory this test uses is on the APFS data volume, so a
+        // zero here means `clone_file` stopped working, not that the filesystem
+        // declined. Left as an inequality elsewhere, where copying is the only
+        // implemented path and asserting otherwise would fail honestly-written
+        // code.
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            stats.files_cloned, stats.files_copied,
+            "APFS clones every file, so a copy here means the clone path was skipped"
+        );
+        assert_eq!(
+            stats.placement_mode(),
+            if stats.files_cloned == stats.files_copied {
+                "copy-on-write"
+            } else if stats.files_cloned == 0 {
+                "full copy"
+            } else {
+                "copy-on-write where the filesystem allowed it"
+            },
+            "the ledger label must describe what actually happened"
+        );
+
+        // The saving is real only if the clone is independent: writing through
+        // the sandbox copy must not reach back into the workspace. This is the
+        // property a hard-linked staging tree would fail.
+        fs::write(cloned.join("src/main.rs"), "fn main() {}")
+            .expect("the sandbox file is writable");
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).expect("the original reads"),
+            "fn main() { println!(\"hi\"); }",
+            "a write inside the sandbox must never mutate the workspace"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&cloned);
+        let _ = fs::remove_dir_all(&copied);
+    }
+
+    /// An empty workspace must not read as a filesystem that refused to clone.
+    #[test]
+    fn placement_mode_separates_nothing_to_clone_from_nothing_cloned() {
+        assert_eq!(CopyStats::default().placement_mode(), "no files");
+        assert_eq!(
+            CopyStats {
+                files_copied: 3,
+                files_cloned: 0,
+                ..CopyStats::default()
+            }
+            .placement_mode(),
+            "full copy"
+        );
+        assert_eq!(
+            CopyStats {
+                files_copied: 3,
+                files_cloned: 3,
+                ..CopyStats::default()
+            }
+            .placement_mode(),
+            "copy-on-write"
+        );
+        assert_eq!(
+            CopyStats {
+                files_copied: 3,
+                files_cloned: 1,
+                ..CopyStats::default()
+            }
+            .placement_mode(),
+            "copy-on-write where the filesystem allowed it"
+        );
+    }
 
     #[test]
     fn copy_excludes_git_node_modules_target_and_secrets() {

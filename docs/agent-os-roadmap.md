@@ -3305,6 +3305,46 @@ identical outcomes verified against the copy implementation. Full copy remains
 the fallback when the filesystem cannot clone, and the mode used is recorded
 in the ledger.
 
+**Shipped — the macOS leg, copy-on-write per file, with the mode in the ledger.**
+`copy_workspace_into_sandbox` now clones each file through APFS `clonefile`
+where the filesystem allows it and copies it where it does not, so a sandbox on
+a large workspace costs metadata rather than bytes.
+
+- **Per file, not per tree, and that is the correctness argument rather than a
+  performance one.** `clonefile` can clone a whole directory in one call. It
+  would also clone the two things this function exists to leave out — `.env`
+  files and `node_modules`-shaped directories — and deleting them afterwards is
+  a strictly worse version of never copying them: the window in which a secret
+  exists inside the sandbox would be real, and a crash inside that window leaves
+  it there. Keeping the walk and swapping only the per-file placement means the
+  skip rules, the symlink handling and the resulting tree are unchanged **by
+  construction**, which is what makes the acceptance's "byte-for-byte identical
+  outcomes verified against the copy implementation" true rather than
+  tested-and-hoped. It is also tested: one test builds the same fixture both
+  ways and compares every path and every byte.
+- **A refusal is never an error.** No copy-on-write on this filesystem, a
+  cross-device destination, a destination that already exists — each means "copy
+  it the ordinary way", so full copy is the fallback at the granularity of a
+  single file rather than of the whole run.
+- **The mode is in the ledger**, on the `CheckpointLinked` event the sandbox
+  already appends, with the clone count beside the file and byte counts. Three
+  states and not two: an empty workspace reads as "no files", never as a
+  filesystem that refused to clone.
+- **A clone is independent, and the test says so.** Writing through the sandbox
+  copy must not reach back into the workspace. This is the property that rules
+  out the acceptance's own suggestion of a hard-linked staging tree on Windows:
+  a write through a hard link mutates the workspace file itself, which is the
+  one thing an ephemeral sandbox exists to prevent. It is not a deferral — it is
+  wrong for this use.
+
+**Remaining, and deliberately not guessed at.** Linux reflink (`FICLONE`, on
+btrfs and XFS) and Windows ReFS block cloning are both real and both absent:
+neither can be exercised on this project's machines, and an untested ioctl that
+silently degrades to a copy would look identical to the current code in every
+test while being harder to read. Overlayfs, which this acceptance names for
+Linux, needs mount privileges a desktop application does not have. The disk
+quota clause is K4's and is untouched here.
+
 **Blocks:** K8 in practice — preempting and resuming runs is only affordable
 if their namespaces are cheap.
 
