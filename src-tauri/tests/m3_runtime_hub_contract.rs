@@ -947,6 +947,7 @@ impl M3RuntimeDriver for MockRuntimeDriver {
                     usage: little_monkey_lib::compatibility_hub::CanonicalUsage {
                         input_tokens: 4,
                         output_tokens: 2,
+                        cached_input_tokens: None,
                     },
                     created_at_seconds: 20,
                 },
@@ -988,6 +989,7 @@ impl M3RuntimeDriver for MockRuntimeDriver {
                         usage: CanonicalUsage {
                             input_tokens: 4,
                             output_tokens: 1,
+                            cached_input_tokens: None,
                         },
                     })
                 })

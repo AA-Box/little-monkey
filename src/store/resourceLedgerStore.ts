@@ -4,6 +4,7 @@ import { errorMessage } from "../lib/errors";
 import { daemonDecisions, type SchedulerDecision } from "../lib/daemonClient";
 import {
   processUsageLedger,
+  type ContextReuse,
   type ProcessEgressDestinations,
   type ProcessUsageAggregate,
   type ProcessUsageRow,
@@ -37,6 +38,10 @@ interface ResourceLedgerStore {
   /** Where each row's allowed egress went, keyed by `processId`. Read through
    * `destinationsFor`, which treats a missing key and an empty record alike. */
   destinations: Record<string, ProcessEgressDestinations>;
+  /** Each row's measured prompt-cache reuse, keyed by `processId`. Read through
+   * `contextReuseFor`: a missing key means the runtime reported no figure, which
+   * is not the same as a hit rate of zero. */
+  contextReuse: Record<string, ContextReuse>;
   /** Whether the ledger read was scoped to exited processes. A live process has
    * no closed-out row, so its measurements are mostly unavailable-with-reason —
    * true information, but it buries the rows that have numbers. */
@@ -57,6 +62,7 @@ export const useResourceLedgerStore = create<ResourceLedgerStore>((set, get) => 
   rows: [],
   totals: null,
   destinations: {},
+  contextReuse: {},
   closedOnly: true,
   loadingLedger: false,
   ledgerError: null,
@@ -71,9 +77,16 @@ export const useResourceLedgerStore = create<ResourceLedgerStore>((set, get) => 
       const ledger = await processUsageLedger({ closedOnly: get().closedOnly, limit: ROW_LIMIT });
       // `null` outside Tauri (dev/browser profile): no backend, so no rows —
       // not an error, and not a reason to clear a previous read either.
-      // `destinations` defaults rather than being read blind: a mocked or
-      // older backend that omits it must leave the map empty, not undefined.
-      if (ledger) set({ rows: ledger.rows, totals: ledger.totals, destinations: ledger.destinations ?? {} });
+      // `destinations` and `contextReuse` default rather than being read blind:
+      // a mocked or older backend that omits either must leave the map empty,
+      // not undefined.
+      if (ledger)
+        set({
+          rows: ledger.rows,
+          totals: ledger.totals,
+          destinations: ledger.destinations ?? {},
+          contextReuse: ledger.contextReuse ?? {},
+        });
       set({ loadingLedger: false });
     } catch (error) {
       set({ loadingLedger: false, ledgerError: errorMessage(error) });

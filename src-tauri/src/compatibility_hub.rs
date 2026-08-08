@@ -241,11 +241,21 @@ pub struct CanonicalInferenceRequest {
     pub metadata: Value,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CanonicalUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// How many of `input_tokens` the runtime says it reused from its prompt
+    /// cache instead of evaluating — a *measurement* the runtime reported, not
+    /// a figure derived here.
+    ///
+    /// `None` is the whole point of the `Option`: a runtime that never reports
+    /// prompt-cache reuse (Ollama and MLX today) must not be recorded as
+    /// having reused nothing, because "unknown" and "zero" would then average
+    /// together into a hit rate that is neither.
+    #[serde(default)]
+    pub cached_input_tokens: Option<u64>,
 }
 
 /// Canonical, protocol-agnostic embeddings request — the `/v1/embeddings`
@@ -4663,6 +4673,7 @@ mod tests {
             usage: CanonicalUsage {
                 input_tokens: 6,
                 output_tokens: 0,
+                cached_input_tokens: None,
             },
         };
         let encoded = encode_embeddings_response(&response).expect("encode embeddings");
@@ -4752,6 +4763,7 @@ mod tests {
             usage: CanonicalUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                cached_input_tokens: None,
             },
             created_at_seconds: 1_700_000_000,
         };
@@ -4862,6 +4874,7 @@ mod tests {
             usage: CanonicalUsage {
                 input_tokens: 10,
                 output_tokens: 4,
+                cached_input_tokens: None,
             },
             created_at_seconds: 1_700_000_000,
         };
@@ -4944,6 +4957,7 @@ mod tests {
                 usage: CanonicalUsage {
                     input_tokens: 5,
                     output_tokens: 2,
+                    cached_input_tokens: None,
                 },
             },
         ];
