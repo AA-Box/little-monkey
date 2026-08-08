@@ -927,6 +927,13 @@ export async function attemptStream(
   let streamError: string | null = null;
   let contentStarted = false;
   let usage: AttemptResult['usage'];
+  // Time-to-first-token for K9's latency criterion (`modelRouting.ts`), the
+  // only latency signal this app will route on. Started immediately before
+  // the loop rather than at function entry: both stream generators are lazy,
+  // so nothing is sent until the first `next()` below, and starting the clock
+  // earlier would charge this target for the privacy gate and budget check.
+  let firstFragmentAtMs: number | null = null;
+  const startedAtMs = Date.now();
 
   const events: AsyncGenerator<StreamEvent> =
     target.kind === 'provider'
@@ -955,10 +962,12 @@ export async function attemptStream(
   try {
     for await (const event of events) {
       if (event.type === 'delta') {
+        firstFragmentAtMs ??= Date.now();
         contentStarted = true;
         content += event.content;
         onDelta?.(content);
       } else if (event.type === 'tool_call') {
+        firstFragmentAtMs ??= Date.now();
         contentStarted = true;
         toolCalls.push(event.toolCall);
       } else if (event.type === 'usage') {
@@ -979,6 +988,10 @@ export async function attemptStream(
           costUsd: isMeteredTarget(target)
             ? calculateUsageCostUsd(costState.rates[targetKey], usage)
             : 0,
+          // Null when `usage` arrived before any content did — an honest
+          // "not measured" rather than a 0 that would read as instant.
+          timeToFirstTokenMs:
+            firstFragmentAtMs === null ? null : firstFragmentAtMs - startedAtMs,
         });
         if (recordUsage) {
           useUsageStore.getState().setUsage(sessionId, usage);

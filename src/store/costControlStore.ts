@@ -21,6 +21,13 @@ export interface CostUsageEntry {
   usage: CostUsage;
   /** Null means the user has not configured a rate for this remote model. */
   costUsd: number | null;
+  /** Measured milliseconds from request start to this attempt's first content
+   * or tool-call fragment. Absent on entries written before this was recorded,
+   * and null when the `usage` event arrived before any fragment did — both
+   * mean "not measured", which is what `observedTimeToFirstTokenMs` (K9's
+   * latency criterion) treats them as. This is the only latency number the
+   * routing engine will act on; nothing here is vendor-published. */
+  timeToFirstTokenMs?: number | null;
 }
 
 export type CostBudgetEnforcement = "warn" | "pause";
@@ -144,6 +151,12 @@ function sanitizeEntry(value: unknown): CostUsageEntry | null {
     runId: candidate.runId,
     usage,
     costUsd: candidate.costUsd,
+    // A malformed or negative latency is dropped to null rather than
+    // rejecting the whole entry: the cost accounting it carries is still
+    // valid, and an unmeasured latency is already a supported state.
+    timeToFirstTokenMs: nonNegativeFinite(candidate.timeToFirstTokenMs)
+      ? candidate.timeToFirstTokenMs
+      : null,
   };
 }
 
