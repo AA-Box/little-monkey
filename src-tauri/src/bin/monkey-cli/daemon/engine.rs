@@ -1847,6 +1847,9 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                 max_memory_bytes: job.max_memory_bytes,
                 max_output_bytes: Some(job.max_log_bytes),
                 max_child_processes: None,
+                // A daemon job's recipe carries no context budget, and inventing
+                // one here would be a default nobody chose.
+                max_context_tokens: None,
             });
             // A non-terminal job never carries an exit, so this cannot be a
             // terminal projection — the terminal case is the sweep above.
@@ -4516,6 +4519,7 @@ pub(super) mod tests {
             max_memory_bytes,
             max_output_bytes,
             max_child_processes: _,
+            max_context_tokens: _,
         } = ProcessLimits::default();
         assert_eq!(max_wall_ms, None);
         assert_eq!(max_memory_bytes, None);

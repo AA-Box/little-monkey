@@ -253,6 +253,15 @@ function ContextCachePanel({ view }: { view: ContextCacheView | undefined }) {
           ? view.prefixSharing.mechanism
           : view.prefixSharing.reason}
       </p>
+      {/* Only when a budget cannot be enforced. There is nothing to say when it
+          can — the enforcement is silent and correct — but "you can set a limit
+          here and it will do nothing" is exactly what a user must not discover
+          by setting one. */}
+      {view.contextBudget.state === "unenforceable" && (
+        <p className="mt-1 text-xs leading-5 text-warning">
+          A per-process context budget cannot be enforced on this runtime: {view.contextBudget.reason}
+        </p>
+      )}
       {view.notes.length > 0 && (
         <ul className="mt-3 list-disc space-y-1 pl-5 text-xs leading-5 text-muted">
           {view.notes.map((note) => (

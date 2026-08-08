@@ -860,6 +860,19 @@ export type PrefixSharing =
   | { state: "supported"; mechanism: string }
   | { state: "unsupported"; reason: string };
 
+/**
+ * Whether a per-process context budget can be *enforced* against this runtime,
+ * which is a different question from whether one is set.
+ *
+ * Enforcement needs an exact prompt-token count before the request, so only a
+ * runtime that will tokenize on demand can have one. Tagged for
+ * {@link PrefixSharing}'s reason: a budget that cannot be enforced must never be
+ * shown as if it were.
+ */
+export type ContextBudgetEnforcement =
+  | { state: "enforceable" }
+  | { state: "unenforceable"; reason: string };
+
 export interface ContextCacheView {
   runtimeId: string;
   runtimeKind: ContextRuntimeKind;
@@ -870,6 +883,7 @@ export interface ContextCacheView {
   contextShiftDetected: boolean | null;
   totalSlots: number | null;
   prefixSharing: PrefixSharing;
+  contextBudget: ContextBudgetEnforcement;
   notes: string[];
   sampledAtMs: number;
 }

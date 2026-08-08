@@ -3493,36 +3493,56 @@ runtime on every response all along and simply thrown away. And
 which was true of an older `llama.cpp` — the pinned build enables it by default,
 checked against that binary's `--help` rather than assumed.
 
-**Remaining, and none of it is blocked:**
+**Remaining — one clause, and it is a decision rather than a build:**
 
 - **The policy half of the first clause.** What ships is the measurement; there
   is still no stated eviction or compaction policy per process class, and
   `ProcessClass` lives in the daemon scheduler while the ledger classifies by
   `kind`. Stating a policy per class first needs those two vocabularies joined,
-  which is a decision rather than a wiring job.
-- **The budget as a K4 limit.** `resolve_effective_context` clamps a *load*, not
-  a running process, so a per-process context budget is still discovered as a
-  failure — which is exactly what `classify_context_failure` exists to explain.
+  and choosing what each class should *do* when its context fills is a product
+  judgement, not something to infer from the code.
+**Shipped — the context budget as a K4 limit, enforced before the request.**
 
-  **The obstacle here was a token count, and it turns out not to be one.** This
-  app has no tokenizer; the only counter in the tree is `crewRunner.ts`'s
-  `length / 4`, and enforcing a *context* limit against an estimate would be
-  strictly worse than today's honest classification of the runtime's own refusal.
-  But llama-server answers `POST /tokenize` with the exact token list, and
-  `POST /apply-template` renders the exact prompt a completion would send — so an
-  exact pre-flight count is two loopback calls, measured at **0.5 ms** for
-  `/tokenize` against the pinned b9637. It is not an estimate and it is not
-  expensive.
+Migration V17 adds `max_context_tokens` to `agent_processes`, the fifth `max_*`
+column beside V5's four. `ProcessScope` carries it, and `m3_production` refuses
+an over-budget request before sending it.
 
-  What remains is therefore a build, not a question: a `max_context_tokens`
-  column, a pre-flight count, and the K4 machinery the wall budget already
-  established — the durable stop latch, a marked `signal_reason`, and the
-  `Cancelled` → `LimitExceeded` upgrade. Two things it should inherit from that
-  precedent: it ships **enforced and unset**, because picking the number is a
-  settings judgement rather than a default anyone can defend; and it **refuses
-  rather than silently compacting**, because a limit that quietly rewrites the
-  conversation is not a limit. Ollama and MLX expose no tokenize endpoint, so
-  they get the same honest `unsupported` [`PrefixSharing`] already gives them.
+- **The obstacle was a token count, and it turned out not to be one.** This app
+  has no tokenizer — the only counter in the tree is `crewRunner.ts`'s
+  `length / 4` — and enforcing a *context* limit against an estimate would refuse
+  real work for a made-up reason, strictly worse than today's honest
+  classification of the runtime's own refusal. But llama-server answers
+  `POST /apply-template` with the exact prompt a completion would send (template
+  included, and the template alone is tens of tokens) and `POST /tokenize` with
+  its exact tokens. Measured against the pinned b9637: `/tokenize` answered in
+  **0.5 ms** on loopback. The count is the runtime's own, and a pre-flight is
+  affordable per turn.
+- **"Enforced as a limit rather than discovered as a failure" is the assertion,
+  not the error text.** Discovering it means the prompt is evaluated, the runtime
+  refuses or shifts its context, and `classify_context_failure` explains what
+  already happened. Enforcing it means the request never leaves — so the test
+  asserts that `/v1/chat/completions` was never reached, and that the only paths
+  touched were the two pre-flight calls.
+- **Fail-closed, deliberately, and only where a budget exists.** A process with
+  no budget — every process today — returns before sending anything, so a limit
+  nobody set costs nothing, and a test pins that too. When a budget *is* set and
+  no count can be produced, the request is refused with that reason rather than
+  sent unchecked: "I set a limit and it silently did nothing" is the outcome this
+  direction exists to prevent. `ContextBudgetEnforcement` is the tagged union that
+  carries it, and the Runtime Hub prints the `unenforceable` reason.
+- **`> 0`, and `>` not `>=`.** V17's `CHECK` refuses a zero budget because no
+  request could satisfy one — the chat template alone is tokens, so a zero would
+  refuse every turn while reading like a configured limit. And a prompt landing
+  exactly *on* the budget fits, or the configured number would mean one less than
+  it says.
+- **It ships enforced and unset**, like the wall budget and for the reason
+  `processWallBudget.ts` records: `default_limits` returns `None` for every kind
+  and no admit call site passes one. Picking the number is a judgement about what
+  a conversation is *for* — too low silently ends long sessions that were working
+  — and that belongs to settings, not to a constant.
+- **It refuses rather than compacting.** Compaction exists in the chat path and
+  the user can invoke it; a limit that quietly rewrites the conversation instead
+  of reporting that it was reached is not a limit.
 
 **Shipped — read-only prefix sharing, and this clause was already satisfied by
 the runtime rather than missing.**

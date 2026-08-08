@@ -456,10 +456,24 @@ fn process_scope_for_run<R: tauri::Runtime>(
         })
     })
     .ok()?;
-    match rows.as_slice() {
-        [row] => Some(crate::run_scope::ProcessScope::new(row.process_id.clone())),
-        _ => None,
-    }
+    let [row] = rows.as_slice() else {
+        return None;
+    };
+    // A second read for the row's limits, which `usage_rows` does not select.
+    // Affordable because it happens once when the scope is entered, not once per
+    // request — and the budget has to travel with the identity for the same reason
+    // the byte counter does: the request path has no ledger handle.
+    //
+    // A read that fails leaves the budget `None`, which means the request path
+    // enforces nothing. That is the one fail-open here and it is deliberate: the
+    // alternative is refusing a turn because a *bookkeeping* read failed, and no
+    // budget is set on any process today anyway.
+    let budget =
+        crate::process_commands::with_process_table(app, state, |table| table.get(&row.process_id))
+            .ok()
+            .flatten()
+            .and_then(|record| record.limits.max_context_tokens);
+    Some(crate::run_scope::ProcessScope::new(row.process_id.clone()).with_context_budget(budget))
 }
 
 /// Moves everything counted so far onto the row, additively.
