@@ -50,16 +50,6 @@ export interface StackQueryResult {
   heading: string | null;
 }
 
-/** Payload of the `stacks://index-progress` event emitted by
- * `stacks.rs::reindex_impl`. */
-interface IndexProgressEvent {
-  stack_id: string;
-  files_done: number;
-  files_total: number;
-  chunks: number;
-  phase: string;
-}
-
 /** Status of the managed embeddings-only `llama-server` instance (port 8091)
  * — mirrors `LlamaStatus` in `modelStore.ts`, but for the separate
  * `AppState::embed_llama` process. */
@@ -87,19 +77,6 @@ export const CURATED_EMBEDDING_SPECS: Record<string, { dim: number; queryPrefix:
 
 interface StackStore {
   stacks: KnowledgeStack[];
-  /** Stack id -> latest `stacks://index-progress` event for it. Cleared when
-   * a `phase: "done"` event arrives isn't necessary — the panel just reads
-   * `phase` to decide whether to keep showing a progress bar. */
-  indexProgress: Record<string, IndexProgressEvent>;
-  /** Stack id -> error message from a failed reindex, cleared on the next
-   * successful (or newly-started) reindex of that stack. */
-  reindexError: Record<string, string>;
-  /** Stack id -> whether `stacks_is_stale` last reported a source file
-   * modified after `indexed_at` (RAG design doc slice 4). Only ever
-   * populated for indexed stacks — an unindexed stack simply has no entry
-   * here, since `KnowledgePanel.tsx` already shows "Not indexed yet" for
-   * those instead of a staleness badge. */
-  staleById: Record<string, boolean>;
 
   embedStatus: EmbedServerStatus;
   embedPort: number;
@@ -113,17 +90,7 @@ interface StackStore {
   rename: (id: string, name: string) => Promise<void>;
   addSource: (id: string, path: string, kind: SourceKind) => Promise<void>;
   removeSource: (id: string, path: string) => Promise<void>;
-  reindex: (id: string) => Promise<void>;
-  cancelIndex: (id: string) => Promise<void>;
   query: (stackIds: string[], query: string, k?: number) => Promise<StackQueryResult[]>;
-  /** Refreshes `staleById` for every currently-indexed stack in `stacks` by
-   * calling `stacks_is_stale` for each, in parallel. A per-stack failure
-   * (e.g. a source path no longer resolvable) is swallowed rather than
-   * failing the whole refresh — the badge just stays at its previous value
-   * for that stack. Kept separate from `refresh()` (rather than folded into
-   * it) so `refresh()`'s own call shape stays exactly "list, then done" —
-   * callers that want the badge call both, see `KnowledgePanel.tsx`. */
-  refreshStale: () => Promise<void>;
 
   refreshEmbedStatus: () => Promise<void>;
   startEmbedServer: (modelPath: string) => Promise<void>;
@@ -132,9 +99,6 @@ interface StackStore {
 
 export const useStackStore = create<StackStore>((set, get) => ({
   stacks: [],
-  indexProgress: {},
-  reindexError: {},
-  staleById: {},
 
   embedStatus: "stopped",
   embedPort: 8091,
@@ -154,11 +118,6 @@ export const useStackStore = create<StackStore>((set, get) => ({
 
   remove: async (id) => {
     await invoke("stacks_delete", { id });
-    set((state) => {
-      const { [id]: _discardProgress, ...restProgress } = state.indexProgress;
-      const { [id]: _discardError, ...restErrors } = state.reindexError;
-      return { indexProgress: restProgress, reindexError: restErrors };
-    });
     await get().refresh();
   },
 
@@ -177,56 +136,8 @@ export const useStackStore = create<StackStore>((set, get) => ({
     await get().refresh();
   },
 
-  reindex: async (id) => {
-    set((state) => {
-      const { [id]: _discard, ...rest } = state.reindexError;
-      return { reindexError: rest };
-    });
-    try {
-      await invoke("stacks_reindex", { id });
-      await get().refresh();
-      // A completed reindex bumps `indexed_at` past every source mtime, so
-      // the stale badge (`staleById`, only ever set by `refreshStale`) must
-      // be recomputed here too — otherwise it keeps showing "Needs reindex"
-      // next to the now-fresh `indexed_at` until the Settings modal happens
-      // to be closed and reopened (the only other place `refreshStale` runs,
-      // see `KnowledgePanel.tsx`'s mount effect).
-      await get().refreshStale();
-    } catch (err) {
-      const message = errorMessage(err);
-      set((state) => ({ reindexError: { ...state.reindexError, [id]: message } }));
-      throw err;
-    }
-  },
-
-  cancelIndex: async (id) => {
-    await invoke("stacks_cancel_index", { id });
-  },
-
   query: async (stackIds, query, k) => {
     return invoke<StackQueryResult[]>("stacks_query", { stackIds, query, k });
-  },
-
-  refreshStale: async () => {
-    const indexed = get().stacks.filter((s) => s.indexed_at != null);
-    const entries = await Promise.all(
-      indexed.map(async (stack): Promise<[string, boolean] | null> => {
-        try {
-          const stale = await invoke<boolean>("stacks_is_stale", { id: stack.id });
-          return [stack.id, stale];
-        } catch (error) {
-          console.error(`Failed to check staleness for stack ${stack.id}`, error);
-          return null;
-        }
-      }),
-    );
-    set((state) => {
-      const staleById = { ...state.staleById };
-      for (const entry of entries) {
-        if (entry) staleById[entry[0]] = entry[1];
-      }
-      return { staleById };
-    });
   },
 
   refreshEmbedStatus: async () => {
@@ -254,14 +165,6 @@ export const useStackStore = create<StackStore>((set, get) => ({
 // These backend events only exist under the Tauri shell — in plain-browser
 // dev (`vite` without it) `listen` itself throws, so don't subscribe at all.
 if (isTauri()) {
-  void listen<IndexProgressEvent>("stacks://index-progress", (event) => {
-    useStackStore.setState((state) => ({
-      indexProgress: { ...state.indexProgress, [event.payload.stack_id]: event.payload },
-    }));
-  }).catch((error) => {
-    console.error("Failed to listen for stacks://index-progress events", error);
-  });
-
   void listen<EmbedStatusEvent>("embed://status", (event) => {
     useStackStore.setState({
       embedStatus: event.payload.status,
