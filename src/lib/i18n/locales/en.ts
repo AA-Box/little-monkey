@@ -517,6 +517,7 @@ export const en: Record<string, string> = {
   "CheckpointPreview.effectKind.mcp-tool": "An MCP server tool was called",
   "CheckpointPreview.effectKind.memory": "A fact was remembered",
   "CheckpointPreview.willUndo": "reverting will {{action}}",
+  "CheckpointPreview.effectUnconfirmed": "(this app never saw it finish, so it may or may not have happened)",
   "CheckpointPreview.simulationAlreadyReverted": "This checkpoint has already been reverted — nothing further would change.",
   "CheckpointPreview.simulationNothingToDo": "Nothing recorded for this checkpoint yet.",
   "CheckpointPreview.restoreAction.restore": "Will restore",

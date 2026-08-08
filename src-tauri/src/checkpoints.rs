@@ -128,6 +128,23 @@ pub struct CheckpointManifest {
     /// rather than trusting the empty vec.
     #[serde(default)]
     pub external_effects: Vec<ExternalEffectKind>,
+    /// The kinds whose effect this app watched *finish* — K14's commit phase.
+    ///
+    /// `external_effects` is the declaration: written after the permission gate
+    /// and before the call, so an effect that was permitted and then failed is
+    /// still recorded, because "permitted and then errored" does not mean
+    /// "nothing left this machine". That deliberate over-recording is what this
+    /// field narrows: a kind in both lists definitely happened, a kind declared
+    /// and never committed may or may not have.
+    ///
+    /// `Option`, not a bare `Vec`, and for the same reason `external_effects` is
+    /// reconstructed rather than trusted when empty: `None` means this manifest
+    /// predates the commit phase, so nothing here observed anything, and an
+    /// empty list would otherwise read as "declared everything, completed
+    /// nothing" about a turn whose shell command certainly ran. See
+    /// [`EffectStatus`].
+    #[serde(default)]
+    pub committed_effects: Option<Vec<ExternalEffectKind>>,
     /// Set on revert so list/timeline UIs can show state and offer Re-apply.
     pub reverted: bool,
     /// Id of whatever was this session's newest surviving checkpoint at the
@@ -288,13 +305,14 @@ impl ExternalEffectKind {
 
     /// What, if anything, undoes this effect.
     ///
-    /// Every arm is `None` today, and that is the honest state rather than an
-    /// oversight: this app has no compensator for any of these four. The type
-    /// exists as an enum with one variant so that adding a real one — K14 names
-    /// a Git worktree revert and closing an owned draft PR — is a new variant
-    /// and a compile error at every match, instead of a bool somebody forgets
-    /// to flip. Workspace files are absent from this enum entirely because they
-    /// *are* compensated, by the restore plan itself.
+    /// One arm of the four has a real undo. The type was deliberately an enum
+    /// with a single `None` variant while that was true of none of them, and
+    /// adding [`Compensation::Undo`] was then a compile error at every match
+    /// rather than a bool somebody forgets to flip — which is the whole reason
+    /// the remaining two the acceptance names (a Git worktree revert, closing an
+    /// owned draft PR) are a variant away rather than a redesign. Workspace
+    /// files are absent from this enum entirely because they *are* compensated,
+    /// by the restore plan itself.
     #[must_use]
     pub fn compensator(self) -> Compensation {
         match self {
@@ -342,9 +360,12 @@ pub struct ActiveCheckpoint {
     /// Flipped by `record_shell` when `tool_run_shell` runs during the turn.
     /// Always `false` until then.
     pub shell_ran: bool,
-    /// Every external effect kind recorded during the turn, deduplicated and
+    /// Every external effect kind declared during the turn, deduplicated and
     /// ordered so a manifest is byte-stable for the same set of effects.
     pub external_effects: std::collections::BTreeSet<ExternalEffectKind>,
+    /// The subset of `external_effects` whose call was watched to completion —
+    /// see [`CheckpointManifest::committed_effects`].
+    pub committed_effects: std::collections::BTreeSet<ExternalEffectKind>,
     /// Captured at `checkpoint_begin` time — see `CheckpointManifest::prev_id`.
     pub prev_id: Option<String>,
 }
@@ -574,6 +595,7 @@ pub fn begin_impl(
                 label,
                 shell_ran: false,
                 external_effects: std::collections::BTreeSet::new(),
+                committed_effects: std::collections::BTreeSet::new(),
                 prev_id,
             },
         );
@@ -636,7 +658,8 @@ pub fn record_shell(state: &AppState, id: Option<&str>) -> Result<(), String> {
     record_external_effect(state, id, ExternalEffectKind::Shell)
 }
 
-/// Records that this turn had an effect outside the checkpointed workspace.
+/// Declares that this turn is *about to* have an effect outside the
+/// checkpointed workspace — the first half of K14's two-phase contract.
 ///
 /// A no-op without an id, and a no-op for an id with no open checkpoint —
 /// both are ordinary (a tool called outside a turn, or after `checkpoint_end`),
@@ -645,6 +668,16 @@ pub fn record_shell(state: &AppState, id: Option<&str>) -> Result<(), String> {
 /// Recorded when the effect happens rather than derived later, because the
 /// transcript this could otherwise be read from is compactable — see
 /// [`ExternalEffectKind`].
+///
+/// # Why declaring before, and committing separately
+///
+/// Every caller already declares *before* the call and after the permission
+/// gate, because a request that was permitted and then timed out may still have
+/// reached the network. That ordering is deliberately pessimistic, and on its
+/// own it cannot tell a cancelled call from a completed one — both leave the
+/// same record. [`commit_external_effect`] is what distinguishes them, and the
+/// pessimism stays the default: an effect that is declared and never committed
+/// is reported as *may have happened*, never as "didn't".
 pub fn record_external_effect(
     state: &AppState,
     id: Option<&str>,
@@ -667,6 +700,36 @@ pub fn record_external_effect(
     // timeline, the summary, the preview — asks for `shell_ran` by name.
     if kind == ExternalEffectKind::Shell {
         active.shell_ran = true;
+    }
+    Ok(())
+}
+
+/// Commits an effect this app watched finish — the second half of the contract.
+///
+/// Called only on the success path, so "committed" means *observed to complete*
+/// rather than *believed to have completed*. An error path deliberately leaves
+/// the declaration standing alone: a failed HTTP call may still have been
+/// delivered, and downgrading that to "nothing happened" is the one mistake this
+/// whole enumeration exists to avoid.
+///
+/// Declares as well as commits, so a caller that reaches here can never leave a
+/// committed effect that was never declared — the two lists stay a subset
+/// relation by construction rather than by discipline.
+pub fn commit_external_effect(
+    state: &AppState,
+    id: Option<&str>,
+    kind: ExternalEffectKind,
+) -> Result<(), String> {
+    record_external_effect(state, id, kind)?;
+    let Some(id) = id else {
+        return Ok(());
+    };
+    let mut guard = state
+        .checkpoints
+        .lock()
+        .map_err(|_| "Checkpoint lock poisoned".to_string())?;
+    if let Some(active) = guard.get_mut(id) {
+        active.committed_effects.insert(kind);
     }
     Ok(())
 }
@@ -925,6 +988,9 @@ fn parse_manifest(raw: &str, dir: &Path, id: &str) -> Result<CheckpointManifest,
         // and reconstructed by `external_effects_of`, which reads `shell_ran`
         // so the one signal a v1 manifest *does* carry is not lost.
         external_effects: Vec::new(),
+        // Nothing watched a v1 turn's calls finish, so there is no completion
+        // signal to report — `None`, not an empty list. See `EffectStatus`.
+        committed_effects: None,
         // A v1 manifest predates both freezing and fact recording, so neither is
         // recoverable — empty and `None` are what say so.
         remembered_facts: Vec::new(),
@@ -1020,6 +1086,9 @@ pub fn end_impl(state: &AppState, id: &str) -> Result<CheckpointSummary, String>
         label: active.label.clone(),
         shell_ran: active.shell_ran,
         external_effects: active.external_effects.iter().copied().collect(),
+        // `Some` even when empty: this code observes commits, so an empty list
+        // is a real "nothing completed", not the absence `None` stands for.
+        committed_effects: Some(active.committed_effects.iter().copied().collect()),
         reverted: false,
         prev_id: active.prev_id,
         entries: entries.clone(),
@@ -1664,12 +1733,34 @@ pub struct RestoreSimulation {
     pub external_effects: Vec<ExternalEffectRecord>,
 }
 
-/// One recorded external effect and its compensation.
+/// One recorded external effect, how far it got, and its compensation.
 #[derive(serde::Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalEffectRecord {
     pub kind: ExternalEffectKind,
+    pub status: EffectStatus,
     pub compensation: Compensation,
+}
+
+/// How far an effect got through K14's declare-then-commit contract.
+///
+/// Three states rather than a `committed: bool`, because "we watched it fail"
+/// and "nobody was watching" are different facts and only one of them is a
+/// reason to worry less. Collapsing them would make every checkpoint written
+/// before the commit phase look like a turn whose every call was abandoned.
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum EffectStatus {
+    /// Declared and then watched to completion. It definitely happened.
+    Committed,
+    /// Declared, and this app never saw it finish — cancelled, errored, or the
+    /// app went down mid-call. It may or may not have happened, and reverting
+    /// has to assume it did.
+    Declared,
+    /// Written before the commit phase existed, so there is no completion
+    /// signal either way. Reads exactly as this whole list read before K14's
+    /// second half: recorded, outcome unstated.
+    Unobserved,
 }
 
 impl RestoreSimulation {
@@ -1692,6 +1783,11 @@ impl RestoreSimulation {
             .into_iter()
             .map(|kind| ExternalEffectRecord {
                 kind,
+                status: match manifest.committed_effects.as_deref() {
+                    None => EffectStatus::Unobserved,
+                    Some(committed) if committed.contains(&kind) => EffectStatus::Committed,
+                    Some(_) => EffectStatus::Declared,
+                },
                 compensation: kind.compensator(),
             })
             .collect();
@@ -2055,6 +2151,7 @@ mod tests {
             label: "freeze".to_string(),
             shell_ran: false,
             external_effects: Vec::new(),
+            committed_effects: Some(Vec::new()),
             reverted: false,
             prev_id: None,
             entries: Vec::new(),
@@ -2190,6 +2287,7 @@ mod tests {
                 label: String::new(),
                 shell_ran: false,
                 external_effects: Default::default(),
+                committed_effects: Default::default(),
                 prev_id: None,
                 remembered_facts: Vec::new(),
             },
@@ -3771,6 +3869,117 @@ mod tests {
         );
     }
 
+    /// K14's second half: declaring is not the same claim as completing.
+    ///
+    /// Every declaration is written before the call, deliberately, so a request
+    /// that was permitted and then failed is still recorded. That means the list
+    /// alone cannot separate "the server ran this" from "we cancelled before it
+    /// could" — and reverting a turn wants to know which.
+    #[test]
+    fn an_effect_that_completed_is_distinguished_from_one_that_only_started() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        // A touched file, because `checkpoint_end` discards a checkpoint that
+        // recorded nothing — an effect alone does not keep one alive.
+        let file = ws.path.join("f.txt");
+        std::fs::write(&file, "v1").unwrap();
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "v2").unwrap();
+        // Network: declared and then watched to finish.
+        commit_external_effect(&state, Some(&id), ExternalEffectKind::Network).unwrap();
+        // MCP: declared, and the reply never came.
+        record_external_effect(&state, Some(&id), ExternalEffectKind::McpTool).unwrap();
+        end_impl(&state, &id).unwrap();
+
+        let sim = simulate_restore_impl(&base.path, &id).unwrap();
+        let status = |kind| {
+            sim.external_effects
+                .iter()
+                .find(|effect| effect.kind == kind)
+                .expect("effect recorded")
+                .status
+        };
+        assert_eq!(status(ExternalEffectKind::Network), EffectStatus::Committed);
+        assert_eq!(status(ExternalEffectKind::McpTool), EffectStatus::Declared);
+        assert!(
+            sim.needs_reconciliation,
+            "an unfinished call is still a call that may have landed — the status \
+             informs the reader, it does not excuse the effect"
+        );
+    }
+
+    /// Committing implies declaring, so the two lists cannot drift apart.
+    ///
+    /// A caller that only ever reaches the success path — one with nothing to
+    /// declare *before*, should such a tool ever exist — must not produce a
+    /// manifest whose committed set names a kind the effect list has never
+    /// heard of, because every reader iterates the declarations.
+    #[test]
+    fn committing_an_effect_records_it_even_if_nothing_declared_it_first() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("f.txt");
+        std::fs::write(&file, "v1").unwrap();
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "v2").unwrap();
+        commit_external_effect(&state, Some(&id), ExternalEffectKind::Shell).unwrap();
+        end_impl(&state, &id).unwrap();
+
+        let manifest = read_manifest(&base.path, &id).unwrap();
+        assert_eq!(manifest.external_effects, vec![ExternalEffectKind::Shell]);
+        assert_eq!(
+            manifest.committed_effects,
+            Some(vec![ExternalEffectKind::Shell])
+        );
+        assert!(
+            manifest.shell_ran,
+            "the flag every older reader asks for by name is kept in step by the \
+             declaration that committing performs"
+        );
+    }
+
+    /// A manifest from before the commit phase says nothing either way, and
+    /// that is not the same as saying nothing completed.
+    ///
+    /// Without the distinction, every checkpoint written before this change
+    /// would report its shell command as "started, never seen to finish" — a
+    /// downgrade invented by the reader rather than recorded by the writer.
+    #[test]
+    fn a_manifest_without_the_commit_phase_reports_an_unobserved_outcome() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("f.txt");
+        std::fs::write(&file, "v1").unwrap();
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "v2").unwrap();
+        commit_external_effect(&state, Some(&id), ExternalEffectKind::Shell).unwrap();
+        end_impl(&state, &id).unwrap();
+
+        let manifest_path = base.path.join(&id).join("manifest.json");
+        let raw = std::fs::read_to_string(&manifest_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        value.as_object_mut().unwrap().remove("committed_effects");
+        std::fs::write(&manifest_path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        let sim = simulate_restore_impl(&base.path, &id).unwrap();
+        assert_eq!(
+            sim.external_effects
+                .iter()
+                .map(|effect| effect.status)
+                .collect::<Vec<_>>(),
+            vec![EffectStatus::Unobserved]
+        );
+    }
+
     /// A manifest written before the column existed still reports what it can.
     #[test]
     fn a_manifest_without_the_effect_list_recovers_shell_from_the_old_flag() {
@@ -3878,6 +4087,19 @@ mod tests {
             serde_json::to_string(&RestoreAction::NoOp).unwrap(),
             "\"noOp\"",
             "the two-word Rust variant NoOp must serialize to camelCase noOp, not noop or no_op"
+        );
+
+        assert_eq!(
+            serde_json::to_string(&EffectStatus::Committed).unwrap(),
+            "\"committed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EffectStatus::Declared).unwrap(),
+            "\"declared\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EffectStatus::Unobserved).unwrap(),
+            "\"unobserved\""
         );
     }
 }

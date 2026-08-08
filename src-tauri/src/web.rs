@@ -1076,6 +1076,17 @@ pub async fn tool_web_fetch(
         }
     }
 
+    // Committed only when the call came back. A cancelled or errored one keeps
+    // the declaration above and nothing more: the request may already have been
+    // delivered, and "we didn't see a response" is not "the server saw nothing".
+    if outcome.is_ok() {
+        checkpoints::commit_external_effect(
+            state.inner(),
+            checkpoint_id.as_deref(),
+            checkpoints::ExternalEffectKind::Network,
+        )?;
+    }
+
     outcome
 }
 
@@ -1603,6 +1614,17 @@ pub async fn tool_web_search(
         {
             guard.remove(&cancel_key);
         }
+    }
+
+    // Committed only when the call came back. A cancelled or errored one keeps
+    // the declaration above and nothing more: the request may already have been
+    // delivered, and "we didn't see a response" is not "the server saw nothing".
+    if outcome.is_ok() {
+        checkpoints::commit_external_effect(
+            state.inner(),
+            checkpoint_id.as_deref(),
+            checkpoints::ExternalEffectKind::Network,
+        )?;
     }
 
     outcome
