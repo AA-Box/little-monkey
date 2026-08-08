@@ -4724,6 +4724,42 @@ GPU1:
         assert_eq!(text_body["messages"][0]["content"], Value::String("hello".to_string()));
     }
 
+    /// K11's read-only prefix sharing is the runtime's, and this app gets it by
+    /// not defeating it — so the guard is on the request body rather than on any
+    /// code of ours.
+    ///
+    /// Two fields would each silently cost the whole feature. `id_slot` pins the
+    /// request to one slot, which bypasses llama-server's "route to the slot whose
+    /// cached prefix matches best" selection — measured: pinning it dropped a
+    /// 454-token shared prefix from 451 tokens reused to zero. `cache_prompt:
+    /// false` turns prompt caching off outright. Neither failure shows up as an
+    /// error; the only symptom is a hit rate that quietly goes to nothing, which is
+    /// why this is asserted rather than left to review.
+    #[test]
+    fn the_request_body_never_defeats_the_runtimes_prefix_sharing() {
+        for stream in [false, true] {
+            let body = openai_request_body(&request("req-share", "local-model", stream), stream)
+                .expect("compose request");
+            let object = body.as_object().expect("a JSON object");
+            assert!(
+                !object.contains_key("id_slot"),
+                "pinning a slot bypasses llama-server's longest-prefix slot selection"
+            );
+            assert!(
+                !object.contains_key("slot_id"),
+                "the same pin under llama.cpp's older spelling"
+            );
+            // Absent is correct rather than `true`: `--cache-prompt` is on by
+            // default in the pinned build, so the body only has to avoid turning it
+            // off. What must never appear is the `false`.
+            assert_ne!(
+                object.get("cache_prompt"),
+                Some(&Value::Bool(false)),
+                "prompt caching off means no prefix to share at all"
+            );
+        }
+    }
+
     /// The MLX driver's flattened wire message has no native text slot for
     /// images either; `canonical_message_to_mlx` (m3_runtime_hub.rs) carries
     /// them in a dedicated `images` list instead. Exercised here (rather
