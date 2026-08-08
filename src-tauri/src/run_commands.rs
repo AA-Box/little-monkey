@@ -473,7 +473,22 @@ fn process_scope_for_run<R: tauri::Runtime>(
             .ok()
             .flatten()
             .and_then(|record| record.limits.max_context_tokens);
-    Some(crate::run_scope::ProcessScope::new(row.process_id.clone()).with_context_budget(budget))
+    // The class comes from the run's own frozen kind and priority — the same
+    // `classify` the scheduler uses, not a second opinion — so what happens when
+    // this process's context fills is decided by one rule for the whole app.
+    let class = with_ledger(app, state, |ledger| ledger.load_run(run_id))
+        .ok()
+        .flatten()
+        // Priority `0`: it lives on a *daemon job*, and a desktop run has none to
+        // declare. Zero is the neutral value rather than a stand-in — `classify`
+        // only reads priority to let a negative one demote, so a run that never
+        // declared one lands on its kind's class, which is the honest answer.
+        .map(|run| crate::run_protocol::classify(&run.spec.kind, 0));
+    Some(
+        crate::run_scope::ProcessScope::new(row.process_id.clone())
+            .with_context_budget(budget)
+            .with_class(class),
+    )
 }
 
 /// Moves everything counted so far onto the row, additively.

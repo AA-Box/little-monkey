@@ -3590,14 +3590,45 @@ runtime on every response all along and simply thrown away. And
 which was true of an older `llama.cpp` — the pinned build enables it by default,
 checked against that binary's `--help` rather than assumed.
 
-**Remaining — one clause, and it is a decision rather than a build:**
+**Shipped — the stated policy per process class, and one `ProcessClass`
+instead of two vocabularies.**
 
-- **The policy half of the first clause.** What ships is the measurement; there
-  is still no stated eviction or compaction policy per process class, and
-  `ProcessClass` lives in the daemon scheduler while the ledger classifies by
-  `kind`. Stating a policy per class first needs those two vocabularies joined,
-  and choosing what each class should *do* when its context fills is a product
-  judgement, not something to infer from the code.
+`ProcessClass` and `classify` moved from the daemon scheduler into
+`run_protocol`, beside the `RunKind` that decides a class. That is the join this
+clause needed, and it is a deletion rather than an addition: the desktop, the
+ledger and the scheduler now get the same answer from the same four-arm enum,
+where a second copy would have drifted. A process's class comes from its run's
+own frozen kind through the scheduler's own `classify` — never a second opinion.
+
+**The policy, and the argument for each arm.** Every one is read off that class's
+existing definition rather than chosen as a preference, which is the whole reason
+this is per class and not a global setting:
+
+| class | when the context fills | why |
+| --- | --- | --- |
+| Interactive | **compact** | "Something is blocked on the answer: a person at a desktop turn." Refusing throws away a conversation the person is in the middle of and can still see; compacting costs them the oldest detail. They are present to notice a bad summary, which is what nobody downstream of the other three can do. |
+| Batch | **compact** | "Submitted work that wants throughput." Finishing is what the class is for. But nobody is watching this turn either, so the compaction is recorded on the run rather than left silent. |
+| Background | **refuse** | "Opportunistic … the first thing asked to step aside." Work already first to yield should not spend a scarce window on a degraded answer, and stopping is cheap here in a way it is nowhere else. |
+| Maintenance | **refuse** | "May always be deferred, because the next occurrence will come around anyway." Its own definition is the argument: a compacted pass writes a worse result where a later whole one would have written a good one. |
+
+- **Two outcomes, not three.** Once the context is full the honest options are
+  continue with less of the conversation, or stop. The third — carry on and let
+  the runtime silently drop the oldest turns — is exactly what
+  `ContextFailureClass::CacheExhaustedContextShift` exists to *report*, and it is
+  what this policy replaces.
+- **The policy is what the budget's refusal *means*.** V17's pre-flight decides
+  *when* a request is over; the class decides what being over implies, and
+  `refusal_under` carries the rationale into the message so a caller can act
+  rather than only report. With no run to derive a class from, the refusal stays
+  bare rather than assuming a policy.
+- Reachable as `m3_context_policies`, which returns all four together: the policy
+  is only meaningful as a comparison, and one class alone reads like a global
+  setting.
+
+**Remaining: the compaction itself is still the chat path's.** The Rust side
+states the policy and carries it into the refusal; auto-compacting on a
+`Compact` class — rather than surfacing the refusal and letting the user compact
+— is frontend work, and the compaction it would call already exists.
 **Shipped — the context budget as a K4 limit, enforced before the request.**
 
 Migration V17 adds `max_context_tokens` to `agent_processes`, the fifth `max_*`
