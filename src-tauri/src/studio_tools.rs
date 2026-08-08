@@ -1224,16 +1224,25 @@ mod tests {
 
     #[test]
     fn a_tool_needs_an_absolute_path_and_a_sane_id() {
+        // Absoluteness is the platform's own answer, not a leading-slash test:
+        // `/opt/tools/face-swap` is absolute on Unix and *not* on Windows,
+        // which wants a drive prefix. The fixture follows the host so the rule
+        // is checked rather than the spelling.
+        let (absolute, relative) = if cfg!(windows) {
+            (r"C:\tools\face-swap.exe", r"tools\face-swap.exe")
+        } else {
+            ("/opt/tools/face-swap", "tools/face-swap")
+        };
         let good = StudioTool {
             id: "face-swap".to_string(),
             name: "Face Swap".to_string(),
-            path: "/opt/tools/face-swap".to_string(),
+            path: absolute.to_string(),
             version: Some("1.2.0".to_string()),
             managed: true,
         };
         assert!(validate_tool(&good).is_ok());
         assert!(validate_tool(&StudioTool {
-            path: "tools/face-swap".to_string(),
+            path: relative.to_string(),
             ..good.clone()
         })
         .is_err());
