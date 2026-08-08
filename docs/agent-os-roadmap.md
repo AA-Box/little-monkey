@@ -198,22 +198,47 @@ backend and confirmation denials keep their 403s.
 dependency, not effort". Both halves were wrong, and the bullet below replaces them: the
 wait was unnecessary, and what actually remains is a capability that has to be built.
 
-- **Token unification is not a calendar dependency, and the correction matters because
-  D2's identical-looking one turned out to be false.** This entry said the only safe path
-  was accept-both, deprecate, then delete "*a release later*", because
+- **Token unification is not a calendar dependency — and, on reading the two stores, is
+  not the right goal either.** This entry twice described the same plan: accept both,
+  deprecate the legacy mint flow, delete the legacy branch "*a release later*", because
   `mint_local_app_token` tokens are "already baked into published Local App HTML on users'
-  machines". Downloads across all three releases total 20 (see D2), so that population is
-  effectively empty and the schedule argument does not hold here either.
+  machines". The schedule half is dead for D2's reason (20 downloads across three releases;
+  see D2). The rest did not survive tracing the code.
 
-  **What blocks it is a missing capability, not a wait.** Legacy tokens are `lmk-` + 32 hex;
-  the pairing store's are `lmk-lan-` + 64 hex and shape-checked, so it rejects a legacy
-  token before any lookup — and the pairing store has **no local-app binding**, which is the
-  entire job `mint_local_app_token` does. Deleting the legacy branch therefore means
-  *building* scoped local-app tokens in the pairing store and rewriting how the legacy
-  listener authenticates, not deleting a fallback. Accept-both already shipped
-  (`http_policy.rs`'s migration limiter), so the remaining work is a security-sensitive auth
-  change that deserves its own review, and it is sequenced behind that rather than behind a
-  release.
+  **What is actually there.** Legacy tokens (`lmk-` + 32 hex, digests in `api_server.json`)
+  carry scopes, *backends*, expiry, and `bound_local_app_id` — the binding that makes a
+  published Local App's token able to run that one app and nothing else. Pairing tokens
+  (`lmk-lan-` + 64 hex, in `compatibility_hub.rs`) carry an `ApiScope` set plus device
+  identity, rotation, revocation, replay protection and audit history. **Each store holds
+  something the other has no concept of.** "Delete the legacy branch" therefore means
+  building backends, non-interactive minting and app binding *inside* the pairing store —
+  re-implementing one credential model in the other, for a system whose two credential
+  types serve genuinely different callers (an OpenAI-compatible client on loopback; a paired
+  device on the LAN). That is migration for its own sake, and it is a migration of
+  user-visible credentials whose plaintexts are unrecoverable.
+
+  **What D1 actually wanted is already true.** One socket, one dispatcher, one typed route
+  registry, and `classify_bearer_family` as the single point where a bearer is routed to its
+  owner. Two credential types behind one funnel is an ordinary design, not a duplication —
+  the same shape as session cookies beside API keys.
+
+  **What *was* duplication, and is now fixed.** `constant_time_eq` existed twice, in
+  `server.rs` and `compatibility_hub.rs`, byte-identical — a security primitive with two
+  copies, which is one copy that can be corrected while the other keeps the defect. It now
+  lives once in `http_policy.rs`, the module both listeners already share, and its two tests
+  moved with it: they had been sitting beside one copy, which is precisely the arrangement
+  that lets the second go untested. `server.rs` also carried the bearer→token scan twice
+  (`authenticate_credential` and `authenticate_local_app_token`), each with its own expiry
+  check; both now call one `find_live_token`, which answers `None` for an expired match so
+  neither caller *can* leak "existed but expired" through its 401. A scope or binding denial
+  after that still names its reason, which is the rule this item already settled: before
+  possession of a live credential is proven every failure must be indistinguishable, after
+  it is proven real reasons are safe.
+
+  **So the remaining item is retired rather than deferred.** If the legacy store is ever
+  removed it should be because user-issued API tokens are being redesigned, not to reach a
+  single-store count.
+
 - **Model-id resolution is mutually exclusive** — *decided, reverted once, now shipped.*
   `server.rs` treats any unknown non-empty model id as an Ollama tag; m3 404s unless the
   model is installed or an explicit runtime header is present.

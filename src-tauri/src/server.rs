@@ -167,6 +167,7 @@ use crate::http_model_sources::{
     OpenAiRuntimeCatalogSource, ProviderCredentialResolver, ProviderCredentialSource,
     StaticLoadedLlamaSnapshot,
 };
+use crate::http_policy::constant_time_eq;
 use crate::http_policy::{
     hold_admission_until_response_ends, BoxError, CappedBodyRejection, ResponseBody,
 };
@@ -458,35 +459,35 @@ fn sha256_hex(input: &str) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Constant-time comparison of two equal-length-when-valid hex digest
-/// strings, so a mismatched bearer token can't be brute-forced faster via
-/// early-exit timing differences.
+/// Finds the stored token whose digest matches `token`, or `None`.
 ///
-/// Note on *what* needs to be constant-time here: [`authenticate`] never
-/// compares the raw secret token byte-for-byte — it always hashes the
-/// incoming bearer first (`sha256_hex`) and compares *digests*. A digest
-/// compare's timing genuinely doesn't leak anything useful about the
-/// pre-image: SHA-256's avalanche effect means an attacker who learns "the
-/// first byte of the stored digest matches" gains no information about which
-/// tokens might hash to it (finding one is exactly as hard as finding any
-/// other preimage). So a naive `==` on the digests would already be safe in
-/// practice. This function exists anyway because (a) it's essentially free —
-/// two 64-byte compares — and (b) it keeps the invariant "every credential
-/// compare in this file is constant-time" trivially true by inspection,
-/// which is worth more than the few nanoseconds it costs, especially since a
-/// future change here is exactly the kind of thing that's easy to get wrong
-/// under review pressure. What would matter for real is if this ever
-/// compared *unhashed* tokens directly — it must not start doing that.
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let (a_bytes, b_bytes) = (a.as_bytes(), b.as_bytes());
-    if a_bytes.len() != b_bytes.len() {
-        return false;
+/// The one place this file turns a bearer into a [`TokenEntry`]. Both callers —
+/// [`authenticate_credential`] and [`authenticate_local_app_token`] — used to
+/// carry their own copy of this scan, and a copy is what lets an expiry check or
+/// a constant-time compare be fixed in one and not the other.
+///
+/// **An expired match answers `None`, not the entry**, which is what keeps the
+/// two callers' generic 401s honest: neither can distinguish "this token existed
+/// but expired" from "this token never existed", because neither is told. What a
+/// caller may still do *after* this returns `Some` is refuse for a real reason —
+/// possession of a live credential has been proven by then, so a scope or
+/// binding denial is safe to name.
+///
+/// On timing: nothing here compares a raw secret. The incoming bearer is hashed
+/// first and only digests are compared, and a digest compare's timing leaks
+/// nothing useful about the pre-image — SHA-256's avalanche means learning "the
+/// first byte matched" gives an attacker no purchase on which tokens hash to it.
+/// [`constant_time_eq`] is used anyway because it is essentially free and keeps
+/// "every credential compare in this file is constant-time" true by inspection.
+fn find_live_token<'a>(tokens: &'a [StoredToken], token: &str) -> Option<&'a StoredToken> {
+    let digest = sha256_hex(token);
+    let stored = tokens
+        .iter()
+        .find(|stored| constant_time_eq(digest.as_bytes(), stored.sha256.as_bytes()))?;
+    match stored.expires_at {
+        Some(expires_at) if now_ms() >= expires_at => None,
+        _ => Some(stored),
     }
-    let mut diff = 0u8;
-    for (x, y) in a_bytes.iter().zip(b_bytes.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 // ---------------------------------------------------------------------
@@ -1202,36 +1203,21 @@ fn authenticate_credential(
         ));
     };
 
-    let digest = sha256_hex(token);
-    for stored in &deps.tokens {
-        if constant_time_eq(&digest, &stored.sha256) {
-            // An expired match falls through to the exact same generic
-            // "incorrect API key" error below (via `break`, not a distinct
-            // early `return Err(...)`) rather than a dedicated "token
-            // expired" response — deliberately, so a caller can't use the
-            // response to distinguish "this token existed but expired" from
-            // "this token never existed at all", the same steady-state
-            // "an authentication failure must not describe why via the
-            // response" this file already holds for the wrong-token case.
-            if let Some(expires_at) = stored.expires_at {
-                if now_ms() >= expires_at {
-                    break;
-                }
-            }
-            return Ok(Some(TokenAuth {
-                id: stored.id.clone(),
-                scopes: stored.scopes.clone(),
-                backends: stored.backends.clone(),
-                bound_local_app_id: stored.bound_local_app_id.clone(),
-            }));
-        }
-    }
-
-    Err(error_response(
-        StatusCode::UNAUTHORIZED,
-        "Incorrect API key provided. Find the current one in Little Monkey's Settings > API Server.",
-        "invalid_api_key",
-    ))
+    // An expired token reaches the same generic error as an unknown one, because
+    // `find_live_token` answers `None` for both — see its doc comment.
+    let Some(stored) = find_live_token(&deps.tokens, token) else {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "Incorrect API key provided. Find the current one in Little Monkey's Settings > API Server.",
+            "invalid_api_key",
+        ));
+    };
+    Ok(Some(TokenAuth {
+        id: stored.id.clone(),
+        scopes: stored.scopes.clone(),
+        backends: stored.backends.clone(),
+        bound_local_app_id: stored.bound_local_app_id.clone(),
+    }))
 }
 
 fn debit_legacy_auth(
@@ -1962,34 +1948,28 @@ fn authenticate_local_app_token(
             "invalid_api_key",
         ));
     };
-    let digest = sha256_hex(token);
-    for stored in &deps.tokens {
-        if constant_time_eq(&digest, &stored.sha256) {
-            if let Some(expires_at) = stored.expires_at {
-                if now_ms() >= expires_at {
-                    break;
-                }
-            }
-            if !stored.scopes.contains(&Scope::LocalAppRun)
-                || stored.bound_local_app_id.as_deref() != Some(app_id)
-            {
-                return Err(forbidden_response(
-                    "This token isn't scoped to run this Local App.",
-                ));
-            }
-            return Ok(TokenAuth {
-                id: stored.id.clone(),
-                scopes: stored.scopes.clone(),
-                backends: stored.backends.clone(),
-                bound_local_app_id: stored.bound_local_app_id.clone(),
-            });
-        }
+    let Some(stored) = find_live_token(&deps.tokens, token) else {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "Incorrect API key provided for this Local App.",
+            "invalid_api_key",
+        ));
+    };
+    // Safe to name a real reason: the digest matched an unexpired token, so the
+    // caller has already proven possession of a live credential.
+    if !stored.scopes.contains(&Scope::LocalAppRun)
+        || stored.bound_local_app_id.as_deref() != Some(app_id)
+    {
+        return Err(forbidden_response(
+            "This token isn't scoped to run this Local App.",
+        ));
     }
-    Err(error_response(
-        StatusCode::UNAUTHORIZED,
-        "Incorrect API key provided for this Local App.",
-        "invalid_api_key",
-    ))
+    Ok(TokenAuth {
+        id: stored.id.clone(),
+        scopes: stored.scopes.clone(),
+        backends: stored.backends.clone(),
+        bound_local_app_id: stored.bound_local_app_id.clone(),
+    })
 }
 
 /// `GET /local-apps/{id}` / `GET /local-apps/{id}/{rel_path}` — serves the
@@ -5630,40 +5610,12 @@ mod tests {
     }
 
     #[test]
-    fn sha256_hex_is_deterministic_and_constant_time_eq_agrees() {
+    fn sha256_hex_is_deterministic() {
         let digest1 = sha256_hex("lmk-abc");
         let digest2 = sha256_hex("lmk-abc");
         let digest3 = sha256_hex("lmk-different");
         assert_eq!(digest1, digest2);
-        assert!(constant_time_eq(&digest1, &digest2));
-        assert!(!constant_time_eq(&digest1, &digest3));
-        assert!(!constant_time_eq("short", &digest1));
-    }
-
-    /// Substantiates the reasoning in `constant_time_eq`'s doc comment: the
-    /// function must reject a mismatch regardless of *where* in the digest
-    /// the difference falls (a naive early-exit `==` would behave
-    /// identically in terms of *correctness* here — this only pins down
-    /// that behavior, since real timing can't be asserted in a unit test).
-    #[test]
-    fn constant_time_eq_rejects_mismatches_at_every_position() {
-        let base = sha256_hex("lmk-fixed-value");
-        let mut first_byte_flipped = base.clone();
-        first_byte_flipped.replace_range(0..1, if &base[0..1] == "0" { "1" } else { "0" });
-        let mut last_byte_flipped = base.clone();
-        let last = base.len() - 1;
-        last_byte_flipped.replace_range(
-            last..last + 1,
-            if &base[last..last + 1] == "0" {
-                "1"
-            } else {
-                "0"
-            },
-        );
-
-        assert!(!constant_time_eq(&base, &first_byte_flipped));
-        assert!(!constant_time_eq(&base, &last_byte_flipped));
-        assert!(constant_time_eq(&base, &base.clone()));
+        assert_ne!(digest1, digest3);
     }
 
     #[tokio::test]
