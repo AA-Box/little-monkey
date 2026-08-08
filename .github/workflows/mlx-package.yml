@@ -44,6 +44,12 @@ jobs:
       # which here would mean handing the signing key to whatever it points at.
       # CodeQL flags exactly this (code-scanning alert 28). Bump deliberately.
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          # Same pin as ci.yml and release.yml. Required, not optional: this
+          # repo's package.json has no `packageManager` field, so with no
+          # `version` the action has nothing to read and exits with "No pnpm
+          # version is specified" before installing anything.
+          version: 9
 
       - run: pnpm install --frozen-lockfile
 
