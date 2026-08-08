@@ -186,6 +186,16 @@ export interface ProviderConfig {
 /** Mirrors the Rust `ProviderModelInfo` struct exactly. */
 export interface ProviderModelInfo {
   id: string;
+  /** The provider's own image-input answer, absent when its `/models` doesn't
+   * carry one (the Rust side skips the field rather than sending `null`) — see
+   * `lib/visionModels.ts`, which prefers this over its name-pattern guess. */
+  vision?: boolean;
+  /** The model's context window, when the provider publishes one — becomes
+   * `usageStore`'s `contextLimit` in `useProviderModel` below. */
+  context_length?: number;
+  /** Whether the provider says the model accepts tools. OpenRouter answers;
+   * nobody else does yet, so this is usually absent. */
+  tool_calling?: boolean;
 }
 
 /**
@@ -781,6 +791,13 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       activeProviderModel: modelId,
       lastModelForProvider: { ...state.lastModelForProvider, [providerId]: modelId },
     }));
+    // Already in hand from the last `/models` refresh, so unlike the Ollama
+    // path this needs no lookup. A provider that publishes no context window
+    // leaves this null, which is what `contextTrimmer.ts` reads as "no budget
+    // to aim for" — the same state every cloud model was stuck in before.
+    const contextLength = get().providerModels[providerId]?.find((model) => model.id === modelId)
+      ?.context_length;
+    useUsageStore.getState().setContextLimit(contextLength ?? null);
   },
 
   effortByTarget: readInitialEffortByTarget(),
