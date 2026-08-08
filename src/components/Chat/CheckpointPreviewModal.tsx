@@ -445,12 +445,22 @@ export function CheckpointPreviewModal({ sessionId, checkpoint, onClose, onChang
                   {simulation.externalEffects.length > 0 && (
                     <ul className="mt-2 flex flex-col gap-1 border-t border-border pt-2">
                       {simulation.externalEffects.map((effect) => (
-                        <li key={effect.kind} className="text-[11px] leading-snug text-warning">
+                        <li
+                          key={effect.kind}
+                          /* An effect with a real undo is not a warning. Colouring
+                             it the same as the ones nothing can reverse is what
+                             would make the warnings stop being read. */
+                          className={`text-[11px] leading-snug ${
+                            effect.compensation.kind === "undo" ? "text-muted" : "text-warning"
+                          }`}
+                        >
                           <span className="font-medium">
                             {t(`CheckpointPreview.effectKind.${effect.kind}`)}
                           </span>
                           {" — "}
-                          {effect.compensation.reason}
+                          {effect.compensation.kind === "undo"
+                            ? t("CheckpointPreview.willUndo", { action: effect.compensation.action })
+                            : effect.compensation.reason}
                         </li>
                       ))}
                     </ul>

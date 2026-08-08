@@ -4193,11 +4193,53 @@ reverted with no warning at all** — and not merely a missing one: a
   the other three kinds stay absent. Pinned by a test that strips the field back
   out of a real manifest.
 
-**Remaining:** the two-phase declare/commit contract itself. What exists now is
-the enumeration and its honest coverage, which is the half that makes
-`needs_reconciliation` mean something. No tool yet declares an intent before
-acting, and no compensating action is registered because none exists to
-register.
+**Shipped — the first real compensating action, and the enum was built for
+exactly this.**
+
+`Compensation` was an enum with one variant so that adding a real undo would be
+"a new variant and a compile error at every match, instead of a flag somebody
+forgets to flip". That is what happened: adding `Undo { action }` broke one
+`let`-binding, which is the whole return on having made it a type.
+
+**Memory is the one of the four this app can genuinely take back**, and the old
+reason for saying otherwise was a non-sequitur worth naming. It read "remembered
+facts are not part of the checkpointed workspace" — still true, and never the
+question. Not being *snapshotted* is not the same as not being *undoable*, and
+conflating the two left the arm reading as unrecoverable when the app already
+had `delete_fact_impl`.
+
+- **The checkpoint records which facts, not just that some.** `tool_remember`
+  notes the id and text the store actually assigned, after the write —
+  `add_fact_impl` returns the *pre-existing* fact on duplicate text, so an id
+  guessed beforehand could name a fact that was never created. Recording is
+  deduplicated by id for the same reason.
+- **The text is kept beside the id**, for the reason `redo/` keeps a file's
+  post-turn bytes: revert deletes the fact, and without the text a reapply could
+  not put it back. An undo that cannot itself be undone is data loss with a
+  friendly name.
+- **The compensator runs off the recorded list, not off the effect kind.** A
+  manifest that knows a fact was remembered but not *which* one deletes nothing,
+  because an empty list there means unrecorded rather than none — the same rule
+  `external_effects` already follows. A manifest written before this existed
+  therefore compensates nothing and says so, rather than deleting a guess.
+- **A fact already gone is not an error.** The user may have pressed Forget on it
+  themselves, and reporting that as a failed revert would send them chasing a
+  problem they had already fixed.
+- **`needs_reconciliation` narrowed on its own.** It is derived from
+  `Compensation::None`, so an effect gaining an undo drops out of it with no
+  second place to update — which is what the acceptance means by the flag
+  becoming "the exception for the enumerated set, not the default answer for
+  everything external". A turn whose only external effect was a `remember` no
+  longer reports as unreconcilable, and the preview shows what reverting will do
+  instead of colouring it as a warning nothing can fix.
+
+**Remaining: the declare-then-commit half.** No tool yet declares an intent
+before acting. The three remaining effects still have no compensator, and the
+reasons are unchanged and still honest — a shell command can change anything, a
+sent request cannot be un-sent, an MCP server's effects are outside this app.
+The acceptance's other two named undos (a Git worktree revert, closing an owned
+draft PR) are reachable the same way this one was, and each is now a variant
+away rather than a redesign.
 
 ---
 
