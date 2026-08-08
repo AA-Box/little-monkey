@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { ArchiveRestore, Download, Info, PackagePlus, RefreshCw, ShieldCheck } from "lucide-react";
 import { Button, StatusPill, type PillTone } from "../../ui";
 import type {
@@ -191,6 +191,73 @@ function RegistryEntryCard({ entry }: { entry: M3ComponentCatalogEntry }) {
   );
 }
 
+/** One registry row's identity. Two entries are the same known version when
+ *  all three match — the same key `RegistryEntryCard` is listed by. */
+function entryKey(entry: M3ComponentCatalogEntry): string {
+  return `${entry.componentId}:${entry.version}:${entry.sha256}`;
+}
+
+/**
+ * Folds an imported catalog into the registry the app already holds.
+ *
+ * A merge rather than a replace: `m3_component_replace_registry_entries` swaps
+ * the whole file atomically, so importing an MLX catalog over a registry that
+ * already lists a llama.cpp build would otherwise delete it. Imported entries
+ * win on a key collision, which is how a publisher corrects a bad URL or note
+ * for a version already registered.
+ */
+export function mergeRegistryEntries(
+  existing: M3ComponentCatalogEntry[],
+  imported: M3ComponentCatalogEntry[],
+): M3ComponentCatalogEntry[] {
+  const merged = new Map(existing.map((entry) => [entryKey(entry), entry]));
+  for (const entry of imported) merged.set(entryKey(entry), entry);
+  return [...merged.values()];
+}
+
+/**
+ * Reads a published catalog file into entries.
+ *
+ * Only the shape is checked here, and only enough to tell "this is not a
+ * catalog" from "this catalog is invalid": the backend re-validates every field
+ * and is the authority on digests, URLs and channels. Duplicating that would be
+ * two rulesets to keep in step.
+ */
+export function parseCatalogText(text: string): M3ComponentCatalogEntry[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return raise("That file is not valid JSON.");
+  }
+  // A catalog is a bare array. The registry file the app writes wraps entries in
+  // `{schemaVersion, entries}`, so accept that shape too — it is what someone
+  // re-importing a backup of their own registry will have.
+  const entries = Array.isArray(parsed)
+    ? parsed
+    : (parsed as { entries?: unknown })?.entries;
+  if (!Array.isArray(entries)) {
+    return raise("That file has no catalog entries in it.");
+  }
+  if (
+    !entries.every(
+      (entry) =>
+        !!entry &&
+        typeof entry === "object" &&
+        typeof (entry as M3ComponentCatalogEntry).componentId === "string" &&
+        typeof (entry as M3ComponentCatalogEntry).version === "string" &&
+        typeof (entry as M3ComponentCatalogEntry).sha256 === "string",
+    )
+  ) {
+    return raise("That file is not a component catalog.");
+  }
+  return entries as M3ComponentCatalogEntry[];
+}
+
+function raise(message: string): never {
+  throw new Error(message);
+}
+
 export function RuntimeHubComponents() {
   const installedComponents = useRuntimeHubStore((state) => state.installedComponents);
   const componentRegistry = useRuntimeHubStore((state) => state.componentRegistry);
@@ -198,7 +265,24 @@ export function RuntimeHubComponents() {
   const refreshComponents = useRuntimeHubStore((state) => state.refreshComponents);
   const refreshing = useRuntimeHubStore((state) => state.busy.components);
   const error = useRuntimeHubStore((state) => state.errors.components);
+  const replaceComponentRegistry = useRuntimeHubStore((state) => state.replaceComponentRegistry);
   const [showInstalledOnly, setShowInstalledOnly] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  const [importing, setImporting] = useState(false);
+  const catalogInput = useRef<HTMLInputElement | null>(null);
+
+  const importCatalog = async (file: File) => {
+    setImportError(null);
+    setImporting(true);
+    try {
+      const imported = parseCatalogText(await file.text());
+      await replaceComponentRegistry(mergeRegistryEntries(componentRegistry, imported));
+    } catch (reason) {
+      setImportError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setImporting(false);
+    }
+  };
 
   const checksByComponentId = new Map(componentUpdateChecks.map((check) => [check.componentId, check]));
   const notYetInstalled = componentRegistry.filter(
@@ -238,8 +322,37 @@ export function RuntimeHubComponents() {
       <section className="flex flex-col gap-3" aria-labelledby="component-registry-heading">
         <SectionHeading
           title="Known component versions"
-          description="A local, operator-editable registry of known versions — not a live upstream binary CDN. Populate it with source URLs and sha256 digests you have independently verified."
+          description="A local, operator-editable registry of known versions — not a live upstream binary CDN. Populate it with source URLs and sha256 digests you have independently verified, or import a catalog file published alongside a component."
+          action={
+            <>
+              <input
+                ref={catalogInput}
+                type="file"
+                accept="application/json,.json"
+                className="hidden"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) void importCatalog(file);
+                  // Cleared so re-importing the same file still fires a change.
+                  event.target.value = "";
+                }}
+              />
+              <BusyButton
+                type="button"
+                busy={importing}
+                onClick={() => catalogInput.current?.click()}
+              >
+                <PackagePlus size={15} aria-hidden="true" /> Import catalog
+              </BusyButton>
+            </>
+          }
         />
+        <ErrorNotice message={importError} />
+        <p className="text-xs text-muted">
+          Importing adds a catalog&apos;s versions to this registry; it does not download or
+          install anything. Every entry is still digest-verified at install time, and a signed
+          component is still checked against its pinned publisher key.
+        </p>
         <label className="flex min-h-11 w-fit cursor-pointer items-center gap-2 text-xs text-muted">
           <input
             type="checkbox"
