@@ -3500,13 +3500,67 @@ checked against that binary's `--help` rather than assumed.
   `ProcessClass` lives in the daemon scheduler while the ledger classifies by
   `kind`. Stating a policy per class first needs those two vocabularies joined,
   which is a decision rather than a wiring job.
-- **Read-only prefix sharing.** llama-server's own `--slot-save-path` and
-  `--cache-reuse` are the runtime support this clause wants; neither is wired,
-  and nothing yet establishes that two of this app's processes ever hold the
-  same prefix against one resident model.
 - **The budget as a K4 limit.** `resolve_effective_context` clamps a *load*, not
   a running process, so a per-process context budget is still discovered as a
   failure — which is exactly what `classify_context_failure` exists to explain.
+
+  **The obstacle here was a token count, and it turns out not to be one.** This
+  app has no tokenizer; the only counter in the tree is `crewRunner.ts`'s
+  `length / 4`, and enforcing a *context* limit against an estimate would be
+  strictly worse than today's honest classification of the runtime's own refusal.
+  But llama-server answers `POST /tokenize` with the exact token list, and
+  `POST /apply-template` renders the exact prompt a completion would send — so an
+  exact pre-flight count is two loopback calls, measured at **0.5 ms** for
+  `/tokenize` against the pinned b9637. It is not an estimate and it is not
+  expensive.
+
+  What remains is therefore a build, not a question: a `max_context_tokens`
+  column, a pre-flight count, and the K4 machinery the wall budget already
+  established — the durable stop latch, a marked `signal_reason`, and the
+  `Cancelled` → `LimitExceeded` upgrade. Two things it should inherit from that
+  precedent: it ships **enforced and unset**, because picking the number is a
+  settings judgement rather than a default anyone can defend; and it **refuses
+  rather than silently compacting**, because a limit that quietly rewrites the
+  conversation is not a limit. Ollama and MLX expose no tokenize endpoint, so
+  they get the same honest `unsupported` [`PrefixSharing`] already gives them.
+
+**Shipped — read-only prefix sharing, and this clause was already satisfied by
+the runtime rather than missing.**
+
+The plan for this clause was to wire `--slot-save-path` or `--cache-reuse`. That
+was based on a wrong picture of what the pinned runtime does, and running it
+settled the question:
+
+- With **no** `--parallel` argument — which is what `llama_args` passes today —
+  b9637 resolves `n_parallel` to `auto`, reporting `total_slots = 4` with a
+  unified KV cache. The app was never limited to one sequence.
+- It routes each request to the slot whose cached prefix matches best — "selected
+  slot by LCP similarity, sim_best = 0.993" in its own log — and
+  `--cache-idle-slots` saves an idle slot's KV into a server-wide RAM pool
+  (`--cache-ram`, 8192 MiB by default).
+- **Measured:** two different conversations sharing a 454-token prefix. The
+  second reused **451 of 456** prompt tokens, on a slot the first had warmed. The
+  sharing is read-only by construction — no KV is copied between sequences; the
+  *request* is routed to where the prefix already lives.
+
+So there was nothing to build, and one thing to protect. **The app gets this by
+not doing two things**, and either would cost the whole feature with nothing
+failing: pinning `id_slot`, and sending `cache_prompt: false`. A test on
+`openai_request_body` asserts both absences, in streaming and non-streaming form.
+
+That guard is not hypothetical. The first probe of this pinned `id_slot` and
+measured **zero** reuse of the same 454-token prefix — which read as "the runtime
+cannot share across slots" until it turned out to be the pin defeating the
+router. `--cache-reuse` stays at its default 0: it shifts KV to reuse a prefix
+that changed in the *middle*, which is a different (and behaviour-changing)
+feature from the one this clause asks for.
+
+`PrefixSharing` is a tagged union for `RenderedMeasurement`'s reason — a caller
+cannot render "supported" without the mechanism, or "unsupported" without the
+reason. Ollama is `unsupported` because its API exposes no slot or prompt-cache
+surface at all, so whatever its server does internally this app cannot observe or
+claim it; MLX because it keeps no prompt cache between requests. Neither is
+"unimplemented" dressed up as a refusal.
 
 ## K12. Tamper-evident unified event log *(partially built)*
 
