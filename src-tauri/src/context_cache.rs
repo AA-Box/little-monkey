@@ -705,6 +705,27 @@ impl ContextPolicy {
         matches!(self, ContextPolicy::Compact { .. })
     }
 
+    /// The error code a refused request carries, so a client can act on the
+    /// policy instead of parsing the sentence that explains it.
+    ///
+    /// The only consumer of a context budget is an API client on this app's own
+    /// OpenAI-compatible server (the budget guards `dispatch_api`, not the
+    /// desktop chat loop), and that client owns the conversation this app is
+    /// refusing. It is the only party that *can* compact. So the policy has to
+    /// reach it as something machine-readable, and `error.code` is where an API
+    /// client already looks — see [`crate::m3_http_server`]'s error envelope.
+    ///
+    /// Encodes the *policy*, not merely "budget exceeded": which class chose it
+    /// is a fact only this app has, and leaving the client to guess would put
+    /// the argument in two places and let them disagree.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            ContextPolicy::Compact { .. } => "context_budget_compact",
+            ContextPolicy::Refuse { .. } => "context_budget_refuse",
+        }
+    }
+
     #[must_use]
     pub fn rationale(&self) -> &'static str {
         match self {
@@ -1361,6 +1382,20 @@ mod tests {
                 .refusal_under(Some(context_policy(ProcessClass::Interactive))),
             None
         );
+    }
+
+    /// The code says which policy, not merely that a budget was hit — an API
+    /// client that must decide between compacting and stopping gets the answer
+    /// without parsing the sentence that argues for it.
+    #[test]
+    fn the_policys_error_code_distinguishes_compacting_from_stopping() {
+        use crate::run_protocol::ProcessClass;
+        for class in [ProcessClass::Interactive, ProcessClass::Batch] {
+            assert_eq!(context_policy(class).code(), "context_budget_compact");
+        }
+        for class in [ProcessClass::Background, ProcessClass::Maintenance] {
+            assert_eq!(context_policy(class).code(), "context_budget_refuse");
+        }
     }
 
     /// No budget is the common case and is not a refusal, and a prompt landing

@@ -1399,11 +1399,15 @@ impl OpenAiCompatibleM3InferenceEngine {
                 let policy = crate::run_scope::current_process()
                     .and_then(|process| process.class())
                     .map(crate::context_cache::context_policy);
-                Err(M3HubError::Runtime(
-                    verdict
+                Err(M3HubError::ContextBudget {
+                    // No class, no policy: the bare code says a budget was hit
+                    // and stops there, rather than defaulting to one of the two
+                    // answers and telling a client to act on a guess.
+                    code: policy.map_or("context_budget", |policy| policy.code()),
+                    message: verdict
                         .refusal_under(policy)
                         .unwrap_or_else(|| "context budget exceeded".to_string()),
-                ))
+                })
             }
         }
     }
@@ -4307,7 +4311,15 @@ mod tests {
         .await;
 
         let message = match result {
-            Err(M3HubError::Runtime(message)) => message,
+            // Its own variant, not `Runtime`: nothing on this side failed, and a
+            // client needs to tell "your prompt is too long" from "our runtime
+            // broke" — they are a 413 and a 502 and call for opposite responses.
+            Err(M3HubError::ContextBudget { code, message }) => {
+                // No class on this scope, so no policy — and the code says that
+                // rather than defaulting to one of the two answers.
+                assert_eq!(code, "context_budget");
+                message
+            }
             other => panic!("expected a budget refusal, got {other:?}"),
         };
         assert!(
@@ -4321,6 +4333,54 @@ mod tests {
             "the completion must never have been sent"
         );
         server.abort();
+    }
+
+    /// The class travels with the process, so the refusal a client receives
+    /// carries the policy that class chose.
+    ///
+    /// Without this the code is the bare `context_budget`, which tells a client
+    /// a limit was hit and nothing about whether shortening the conversation is
+    /// the intended response — and for `Background` and `Maintenance` it is not:
+    /// their stated policy is to stop rather than continue on a summary.
+    #[tokio::test]
+    async fn a_refusal_carries_the_policy_of_the_class_running_it() {
+        for (class, expected) in [
+            (
+                crate::run_protocol::ProcessClass::Interactive,
+                "context_budget_compact",
+            ),
+            (
+                crate::run_protocol::ProcessClass::Maintenance,
+                "context_budget_refuse",
+            ),
+        ] {
+            let (endpoint, _seen, server) = spawn_budget_fixture(9_000).await;
+            let engine =
+                OpenAiCompatibleM3InferenceEngine::new(&endpoint).expect("production engine");
+            let context = M3OperationContext::new(10_000);
+
+            let process = crate::run_scope::ProcessScope::new("p-budget-class")
+                .with_context_budget(Some(8_192))
+                .with_class(Some(class));
+            let result = crate::run_scope::scoped_with_process(
+                crate::run_scope::RunScope::run("run:budget-class"),
+                process,
+                engine.complete(&request("over", "local-model", false), &context),
+            )
+            .await;
+
+            match result {
+                Err(M3HubError::ContextBudget { code, message }) => {
+                    assert_eq!(code, expected, "{class:?}");
+                    assert!(
+                        message.contains(crate::context_cache::context_policy(class).rationale()),
+                        "the rationale a person reads must travel with the code a client matches: {message}"
+                    );
+                }
+                other => panic!("expected a budget refusal for {class:?}, got {other:?}"),
+            }
+            server.abort();
+        }
     }
 
     /// The common path: no budget, so not even the two pre-flight calls happen.

@@ -3625,10 +3625,36 @@ this is per class and not a global setting:
   is only meaningful as a comparison, and one class alone reads like a global
   setting.
 
-**Remaining: the compaction itself is still the chat path's.** The Rust side
-states the policy and carries it into the refusal; auto-compacting on a
-`Compact` class — rather than surfacing the refusal and letting the user compact
-— is frontend work, and the compaction it would call already exists.
+**Shipped — the policy reaches whoever can act on it, and the refusal stopped
+claiming to be a runtime failure.** An earlier draft of this line said
+auto-compacting on a `Compact` class was frontend work "and the compaction it
+would call already exists". Both halves turned out to be wrong, and tracing it
+is what produced the actual answer:
+
+- **The desktop chat loop never sees this refusal.** The budget guards
+  `M3RuntimeHub::dispatch_api` — this app's own OpenAI-compatible server. A chat
+  turn streams through `providers.rs` under `RunScope::Unattributed`, with no
+  process row attached and therefore no budget to exceed.
+- **The loop that *is* budgeted has nothing to compact.** A crew actor's history
+  is one user message plus its own tool round trips, and
+  `applyContextCompaction` refuses to touch a history with fewer than two user
+  turns — deliberately, since trimming a single ongoing turn destroys the only
+  context the model has. A compaction retry there would have been dead code.
+- **So the party that can compact is the API client**, which owns the
+  conversation this app is declining to forward. What it needs is not a
+  compaction it cannot be given, but the policy in a form it can branch on.
+
+`ContextPolicy::code()` is that form — `context_budget_compact` /
+`context_budget_refuse`, or a bare `context_budget` when the process has no run
+to derive a class from, which says *a limit was hit* and refuses to guess at the
+rest. It rides in `error.code`, where an API client already looks.
+
+**And the status code was wrong in a way that mattered.** The refusal was an
+`M3HubError::Runtime`, which renders as **502** — a client reading that has been
+told the upstream broke, and the correct response to a 502 is to retry the
+identical request. Retrying is the one thing that cannot work here. It is now
+its own error variant and a **413**, which asks for the shortening that actually
+helps. Nothing on this side failed: the request was never forwarded.
 **Shipped — the context budget as a K4 limit, enforced before the request.**
 
 Migration V17 adds `max_context_tokens` to `agent_processes`, the fifth `max_*`

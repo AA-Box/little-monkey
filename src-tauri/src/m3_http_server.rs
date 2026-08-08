@@ -513,6 +513,13 @@ fn hub_error_response(error: M3HubError) -> Response<ResponseBody> {
         M3HubError::Transport(_) | M3HubError::Runtime(_) => {
             (StatusCode::BAD_GATEWAY, "runtime_error")
         }
+        // 413, not the 502 this used to fall into as a `Runtime`: nothing on
+        // this side failed. The prompt is larger than the budget set for the
+        // process serving it, the request was never forwarded, and shortening it
+        // is the client's move — which is exactly what 413 asks for. The code
+        // carries the class's policy so a client knows whether shortening is
+        // even the right response, or whether this work is meant to stop.
+        M3HubError::ContextBudget { code, .. } => (StatusCode::PAYLOAD_TOO_LARGE, *code),
         M3HubError::State(_) | M3HubError::Io { .. } | M3HubError::LockPoisoned => {
             (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
         }
@@ -2854,6 +2861,46 @@ mod tests {
             std::str::from_utf8(&bytes).expect("utf-8 body"),
             r#"{"error":{"code":"request_too_large","message":"Request body exceeds the 4-byte limit","type":"little_monkey_m3_error"}}"#
         );
+    }
+
+    /// An over-budget prompt is the client's request, not this app's failure.
+    ///
+    /// It used to arrive as `M3HubError::Runtime`, which renders as a 502 — a
+    /// client reading that has been told the upstream broke, and its correct
+    /// response to a 502 is to retry the identical request. Retrying is the one
+    /// thing that cannot work here. 413 asks for the shortening that actually
+    /// helps, and the code says whether shortening is even the intended move or
+    /// whether this class of work is meant to stop instead.
+    #[tokio::test]
+    async fn an_over_budget_prompt_answers_413_with_the_classs_policy() {
+        for (code, expected) in [
+            ("context_budget_compact", "context_budget_compact"),
+            ("context_budget_refuse", "context_budget_refuse"),
+            ("context_budget", "context_budget"),
+        ] {
+            let response = hub_error_response(M3HubError::ContextBudget {
+                code,
+                message: "This request's prompt is 9000 tokens, over the 8192-token budget."
+                    .to_string(),
+            });
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect budget refusal body")
+                .to_bytes();
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("JSON error envelope");
+            assert_eq!(body["error"]["code"], expected);
+            // The message is the refusal itself, unprefixed: every other variant
+            // renders as "runtime: …"/"transport: …", and this one is already a
+            // complete sentence written for whoever has to act on it.
+            assert_eq!(
+                body["error"]["message"],
+                "This request's prompt is 9000 tokens, over the 8192-token budget."
+            );
+        }
     }
 
     #[tokio::test]
