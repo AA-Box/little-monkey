@@ -3752,6 +3752,57 @@ explicit, enumerated set where none does. `needs_reconciliation` becomes the
 exception for the enumerated set, not the default answer for everything
 external.
 
+**Shipped — the enumerated set, and it closes a live bug rather than only naming
+a shape.** `RestoreSimulation.needs_reconciliation` was `manifest.shell_ran`,
+full stop. Every finer external effect — a network call, an MCP tool, a
+`remember` — was derived on the frontend from the turn's own transcript
+messages, and `checkpointReconciliation.ts`'s own module doc says why that is
+not enough: the manifest flag "survives even if the transcript's tool-call
+messages are later dropped by context compaction". That was true of `shell_ran`
+and of nothing else. **So after a compaction, a turn that made a network call
+reverted with no warning at all** — and not merely a missing one: a
+`needs_reconciliation: false` reads as "nothing outside the files".
+
+- **Recorded when the effect happens, not derived afterwards.** A closed
+  `ExternalEffectKind` — `shell`, `network`, `mcp-tool`, `memory` — written into
+  the manifest by `record_external_effect` at the moment the tool runs, so it
+  outlives the transcript it could otherwise be read from. `record_shell` is now
+  one caller of it.
+- **`Compensation` is an enum with one variant, on purpose.** Every kind is
+  `None { reason }` today, and that is the honest state rather than an
+  oversight: this app has no compensator for any of the four. Making it a type
+  rather than a bool means adding a real one — the acceptance names a Git
+  worktree revert and closing an owned draft PR — is a new variant and a compile
+  error at every match, instead of a flag somebody forgets to flip. Workspace
+  files are absent from the enum entirely because they *are* compensated, by the
+  restore plan itself.
+- **The reason is per kind, not generic.** "A shell command can change anything
+  on this machine" and "the request was already sent and cannot be un-sent" call
+  for different judgement from whoever reconciles, so the preview shows each
+  effect's own reason instead of one caveat covering all of them.
+- **One choke point on the frontend.** `turnEngine.ts` injected `checkpoint_id`
+  for the three mutating tools; it now also injects it for anything
+  `classifyExternalTool` recognises — the same classifier the transcript path
+  already used. `web_fetch`, `web_search`, `mcp_call_tool` and `remember` accept
+  it and record.
+- **`remember`'s refusal of `checkpoint_id` was corrected in place rather than
+  reversed silently.** Its doc argued that a remembered fact is not a workspace
+  file, so there is nothing to snapshot or revert. The first half is still true
+  and the conclusion no longer follows: the checkpoint does not snapshot it, but
+  it does now enumerate it, because "nothing here can undo this" is exactly the
+  fact a rollback needs.
+- **An older manifest reports what it can and does not invent the rest.** An
+  empty effect list on a manifest written before the field existed means
+  *unrecorded*, not *none*, so `shell_ran` is reconstructed into the list while
+  the other three kinds stay absent. Pinned by a test that strips the field back
+  out of a real manifest.
+
+**Remaining:** the two-phase declare/commit contract itself. What exists now is
+the enumeration and its honest coverage, which is the half that makes
+`needs_reconciliation` mean something. No tool yet declares an intent before
+acting, and no compensating action is registered because none exists to
+register.
+
 ---
 
 # Phase 4 — Devices and nodes

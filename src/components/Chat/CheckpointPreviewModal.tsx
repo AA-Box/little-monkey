@@ -439,6 +439,22 @@ export function CheckpointPreviewModal({ sessionId, checkpoint, onClose, onChang
                       ))}
                     </ul>
                   )}
+                  {/* The recorded effects, which outlive the transcript the
+                      warning above is derived from. Each carries the reason
+                      nothing undoes it, rather than one generic caveat. */}
+                  {simulation.externalEffects.length > 0 && (
+                    <ul className="mt-2 flex flex-col gap-1 border-t border-border pt-2">
+                      {simulation.externalEffects.map((effect) => (
+                        <li key={effect.kind} className="text-[11px] leading-snug text-warning">
+                          <span className="font-medium">
+                            {t(`CheckpointPreview.effectKind.${effect.kind}`)}
+                          </span>
+                          {" — "}
+                          {effect.compensation.reason}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </section>
               )}
             </div>
