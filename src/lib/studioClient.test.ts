@@ -11,10 +11,17 @@ import { describe, expect, it } from "vitest";
 
 import {
   availableConditioning,
+  engineSupports,
   CONDITIONING_SLOTS,
   COMPONENT_SLOTS,
   type ComponentSlot,
+  type EngineCapabilities,
 } from "./studioClient";
+
+/** A running engine reporting exactly these flags and nothing else. */
+function reporting(features: Record<string, boolean>): EngineCapabilities {
+  return { samplers: [], schedulers: [], upscalers: [], features };
+}
 
 describe("availableConditioning", () => {
   it("unlocks an image only when the weights that read it are loaded", () => {
@@ -38,6 +45,36 @@ describe("availableConditioning", () => {
     expect(availableConditioning(["control_net"]).has("ip_adapter")).toBe(false);
     expect(availableConditioning(["control_net", "ip_adapter", "photo_maker"])).toEqual(
       new Set(["control", "ip_adapter", "reference"]),
+    );
+  });
+});
+
+describe("the engine's own feature flags", () => {
+  it("offers everything while no engine is running", () => {
+    // The pickers and inputs have to populate before the first launch, which
+    // is the only state a fresh install is ever in.
+    expect(engineSupports(null, "mask_image")).toBe(true);
+    expect(availableConditioning(["control_net"], null)).toEqual(new Set(["control"]));
+  });
+
+  it("hides an input the running engine says it does not take", () => {
+    const old = reporting({ init_image: true, control_image: false });
+    expect(engineSupports(old, "mask_image")).toBe(false);
+    // The weights are loaded and the engine still will not read them, which is
+    // the whole reason this is a second gate rather than a nicer error.
+    expect(availableConditioning(["control_net", "ip_adapter"], old)).toEqual(new Set());
+  });
+
+  it("still requires the weights when the engine supports the field", () => {
+    const current = reporting({
+      mask_image: true,
+      control_image: true,
+      ip_adapter_image: true,
+      ref_images: true,
+    });
+    expect(availableConditioning(["checkpoint"], current)).toEqual(new Set());
+    expect(availableConditioning(["checkpoint", "photo_maker"], current)).toEqual(
+      new Set(["reference"]),
     );
   });
 });

@@ -3503,15 +3503,18 @@ mod tests {
             // 1.5s on a loopback `/health` probe whose body is never read at all,
             // only `status()`. Nothing to truncate.
             ("diagnostics.rs", 1),
-            // 120s on Studio's job client and 10s on its cancel, both loopback to
-            // the `sd-server` child. The generation itself is not under either:
-            // the API is submit-and-poll, so a deadline here only ever covers one
-            // round trip, and the run is bounded by `JOB_TIMEOUT` (2h) in the
-            // polling loop. The largest body is the terminal poll, which carries
-            // the finished media base64 inside the JSON under `MAX_MEDIA_BYTES`
+            // 120s on Studio's job client, 10s on its cancel and 10s on its
+            // capabilities read, all loopback to the `sd-server` child. The
+            // generation itself is not under any of them: the API is
+            // submit-and-poll, so a deadline here only ever covers one round
+            // trip, and the run is bounded by `JOB_TIMEOUT` (2h) in the polling
+            // loop. The largest body is the terminal poll, which carries the
+            // finished media base64 inside the JSON under `MAX_MEDIA_BYTES`
             // (256 MiB) — 2.8 MB/s across a loopback socket, and fully buffered
             // by `json()`, so there is no stream for the deadline to truncate.
-            ("generation_commands.rs", 2),
+            // The capabilities body is the smallest of the three: a few KB of
+            // sampler and scheduler names, likewise buffered by `json()`.
+            ("generation_commands.rs", 3),
             // 1800s on the hosted image API, and it is (B): the body is
             // `MAX_IMAGE_BYTES` (32 MiB) of base64 inside a JSON object — 18 KB/s —
             // and the deadline also covers the provider's own render time, which is
