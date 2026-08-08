@@ -13,6 +13,12 @@ describe("isVisionCapableProviderModel", () => {
       ["claude-3-5-haiku-20241022", true],
       ["claude-3-7-sonnet-20250219", true],
       ["claude-sonnet-4-20250514", true],
+      ["claude-sonnet-4-5-20250929", true],
+      ["claude-haiku-4-5-20251001", true],
+      ["claude-opus-4-8", true],
+      ["claude-opus-5", true],
+      ["claude-sonnet-5", true],
+      ["claude-fable-5", true],
       ["claude-2.1", false],
       ["claude-instant-1.2", false],
     ] as const) {

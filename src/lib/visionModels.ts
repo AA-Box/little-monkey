@@ -23,8 +23,9 @@ const VISION_PATTERNS: RegExp[] = [
   /^o[134](-|$)/,
   // Covers claude-3-*, claude-3-5-*, claude-3-7-* — the `-5`/`-7` sits between the 3 and the name.
   /claude-3(-\d)?-(opus|sonnet|haiku)/,
-  /claude-(opus|sonnet|haiku)-4/,
-  /claude-4/,
+  // Name-first ids, any generation: claude-sonnet-4, claude-haiku-4-5, claude-opus-5, claude-fable-5.
+  /claude-(opus|sonnet|haiku|fable|mythos)-\d/,
+  /claude-[4-9]\b/,
   /gemini/,
   /pixtral/,
   /llava/,
