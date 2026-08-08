@@ -1553,6 +1553,12 @@ struct EngineProcess {
     /// The command line it was launched with, port aside. Reuse is keyed on
     /// this, so an edited model gets a fresh engine.
     signature: Option<Vec<String>>,
+    /// Whether this instance has answered once, so it is serving rather than
+    /// still loading weights. Anything that only *reads* from the engine has to
+    /// wait for this: a probe abandoned mid-load leaves its handler thread
+    /// blocked, which is what `ensure_ready` waits out its whole deadline on one
+    /// request to avoid.
+    ready: bool,
     /// Tail of the engine's stderr, drained by a reader thread so the pipe can
     /// never fill and block the child.
     stderr_tail: Option<Arc<Mutex<String>>>,
@@ -1570,6 +1576,21 @@ impl GenerationEngineState {
         self.inner
             .lock()
             .ok()
+            .and_then(|state| state.port)
+            .map(|port| format!("http://127.0.0.1:{port}"))
+    }
+
+    /// [`base_url`](Self::base_url), but only once the engine has answered.
+    ///
+    /// For callers that merely ask the engine something rather than driving a
+    /// run: an instance that is still loading a 20 GB model accepts the
+    /// connection and holds it, so probing it with a short deadline burns a
+    /// worker thread for nothing.
+    pub fn ready_base_url(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .ok()
+            .filter(|state| state.ready)
             .and_then(|state| state.port)
             .map(|port| format!("http://127.0.0.1:{port}"))
     }
@@ -1607,6 +1628,7 @@ impl GenerationEngineState {
         state.model_id = None;
         state.signature = None;
         state.port = None;
+        state.ready = false;
         // Keep the tail: `ensure_ready` stops a failed launch before reporting,
         // and dropping it here would throw away the only useful diagnosis.
         Ok(())
@@ -1754,6 +1776,11 @@ impl GenerationEngineState {
                     if let Some(failure) = self.child_exited()? {
                         self.stop()?;
                         return Err(failure);
+                    }
+                    // It has answered once, so everything else may now ask it
+                    // things without waiting out a load it cannot see.
+                    if let Ok(mut state) = self.inner.lock() {
+                        state.ready = true;
                     }
                     return Ok(base_url);
                 }
@@ -3493,6 +3520,33 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
         assert_eq!(capabilities.features.get("mask_image"), Some(&true));
         assert_eq!(capabilities.features.get("control_image"), Some(&false));
         assert_eq!(capabilities.features.get("ip_adapter_image"), None);
+    }
+
+    /// An engine that is up but still loading has an address and must not be
+    /// asked anything at it: the read would sit on one of its worker threads
+    /// for the whole load, which is the drain `ensure_ready` goes out of its way
+    /// to avoid. Only the run path, which waits, gets the address before then.
+    #[test]
+    fn an_engine_that_has_not_answered_yet_is_not_offered_to_readers() {
+        let engine = GenerationEngineState {
+            inner: Mutex::new(EngineProcess {
+                port: Some(51_234),
+                ..EngineProcess::default()
+            }),
+        };
+        assert_eq!(engine.base_url().as_deref(), Some("http://127.0.0.1:51234"));
+        assert!(engine.ready_base_url().is_none());
+
+        engine.inner.lock().unwrap().ready = true;
+        assert_eq!(
+            engine.ready_base_url().as_deref(),
+            Some("http://127.0.0.1:51234")
+        );
+
+        // Stopping takes the address back from both.
+        engine.stop().unwrap();
+        assert!(engine.base_url().is_none());
+        assert!(engine.ready_base_url().is_none());
     }
 
     /// An engine too old to report any of this must read as "said nothing",

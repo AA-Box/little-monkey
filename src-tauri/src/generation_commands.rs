@@ -1006,9 +1006,11 @@ pub fn generation_media_data_url(
 pub async fn generation_capabilities(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<generation::EngineCapabilities>, String> {
-    // Launched on a fresh port each time, so the address comes from the
-    // running instance rather than a constant.
-    let Some(base_url) = state.generation_engine.base_url() else {
+    // Launched on a fresh port each time, so the address comes from the running
+    // instance rather than a constant — and only once that instance has
+    // answered, because a short-deadline probe against an engine still loading
+    // weights burns one of its worker threads and helps nobody.
+    let Some(base_url) = state.generation_engine.ready_base_url() else {
         return Ok(None);
     };
     let client = reqwest::Client::builder()
