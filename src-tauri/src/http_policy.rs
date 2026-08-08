@@ -154,6 +154,29 @@ struct TokenRateWindow {
     input_bytes: u64,
 }
 
+/// Compares two byte strings in time that does not depend on where they first
+/// differ.
+///
+/// One implementation, in the module both listeners already share, because this
+/// is a security primitive and two copies is one copy that can be fixed while
+/// the other keeps the bug. `server.rs` and `compatibility_hub.rs` each had a
+/// byte-identical private version; they now both call this.
+///
+/// Every caller compares fixed-length SHA-256 hex digests, so the length-based
+/// early return leaks nothing a caller could not compute itself. What would
+/// matter for real is if this ever compared *unhashed* tokens directly — it must
+/// not start doing that.
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0_u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
 /// In-memory migration limiter for legacy `lmk-*` tokens.
 ///
 /// Pairing tokens keep their durable limiter in `LanAccessController`; legacy
@@ -520,6 +543,49 @@ pub(crate) fn unix_time_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use sha2::Digest as _;
+
+    /// Moved here with the primitive it pins. It lived in `server.rs` next to
+    /// that file's private copy, which is exactly the arrangement that lets a
+    /// second copy go untested.
+    #[test]
+    fn constant_time_eq_matches_equal_digests_and_rejects_unequal_ones() {
+        let digest = |input: &str| format!("{:x}", sha2::Sha256::digest(input.as_bytes()));
+        let base = digest("lmk-abc");
+        assert!(constant_time_eq(base.as_bytes(), digest("lmk-abc").as_bytes()));
+        assert!(!constant_time_eq(
+            base.as_bytes(),
+            digest("lmk-different").as_bytes()
+        ));
+        assert!(!constant_time_eq(b"short", base.as_bytes()));
+    }
+
+    /// The function must reject a mismatch regardless of *where* the difference
+    /// falls. A naive early-exit `==` would be identical in correctness here —
+    /// this pins the behaviour, since real timing cannot be asserted in a unit
+    /// test.
+    #[test]
+    fn constant_time_eq_rejects_mismatches_at_every_position() {
+        let base = format!("{:x}", sha2::Sha256::digest(b"lmk-fixed-value"));
+        let flip = |index: usize| {
+            let mut flipped = base.clone();
+            let replacement = if &base[index..index + 1] == "0" {
+                "1"
+            } else {
+                "0"
+            };
+            flipped.replace_range(index..index + 1, replacement);
+            flipped
+        };
+
+        assert!(!constant_time_eq(base.as_bytes(), flip(0).as_bytes()));
+        assert!(!constant_time_eq(
+            base.as_bytes(),
+            flip(base.len() - 1).as_bytes()
+        ));
+        assert!(constant_time_eq(base.as_bytes(), base.as_bytes()));
+    }
+
     use std::convert::Infallible;
 
     use futures_util::stream;
