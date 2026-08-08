@@ -16,6 +16,7 @@ import { streamChat } from './llamaClient';
 import type { ChatMessage, StreamEvent, ToolCall, ToolDef } from './llamaClient';
 import { streamProviderChat } from './providerClient';
 import { formatMcpCallToolResult, resolveMcpToolName, type McpCallToolResult, type McpToolRegistry } from './mcpTools';
+import { classifyExternalTool } from './checkpointReconciliation';
 import { recordRequest } from './rateLimitTracker';
 import { useUsageStore } from '../store/usageStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
@@ -259,11 +260,18 @@ const RESERVED_ARGS: ReadonlyArray<{ key: string; resolve: (ctx: ReservedArgCont
   // added at all, not even as an explicit `null`.
   { key: 'agent_label', resolve: (ctx) => (MUTATING_TOOLS.has(ctx.name) ? ctx.agentLabel : undefined) },
   // Pins a pre-mutation backup to the right turn's own checkpoint — the
-  // split pane may hold its own concurrent one. `run_shell` doesn't snapshot
-  // anything but still gets the id so `record_shell` can flag `shell_ran`.
+  // split pane may hold its own concurrent one. The mutating tools need it to
+  // snapshot; the external-effect tools need it for a different reason and get
+  // it too, since `checkpoints.rs`'s `record_external_effect` is what makes a
+  // network/MCP/memory effect survive context compaction. Without the id those
+  // effects exist only in the transcript, and `contextTrimmer.ts` can drop that
+  // — after which a rollback reported nothing to reconcile.
   {
     key: 'checkpoint_id',
-    resolve: (ctx) => (MUTATING_TOOLS.has(ctx.name) && ctx.checkpointId !== null ? ctx.checkpointId : undefined),
+    resolve: (ctx) =>
+      (MUTATING_TOOLS.has(ctx.name) || classifyExternalTool(ctx.name) !== null) && ctx.checkpointId !== null
+        ? ctx.checkpointId
+        : undefined,
   },
   // Scopes permission prompts and shell/fetch cancellation to THIS turn —
   // Stop in one pane must never touch the other pane's command or prompt.

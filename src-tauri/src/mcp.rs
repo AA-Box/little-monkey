@@ -1314,6 +1314,9 @@ pub fn mcp_remove_http_token(server_id: String) -> Result<(), String> {
 /// sent to the server via [`call_tool_with_cancel_impl`]), not just the
 /// client abandoning its own wait for a response the server keeps executing
 /// regardless.
+// Each parameter is an IPC field the frontend sends by name, so folding them
+// into a struct would change the tool-call contract rather than simplify it.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command(rename_all = "snake_case")]
 pub async fn mcp_call_tool(
     app: tauri::AppHandle,
@@ -1323,6 +1326,7 @@ pub async fn mcp_call_tool(
     arguments: serde_json::Value,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<CallToolResult, String> {
     validate_id(&server_id)?;
 
@@ -1369,6 +1373,16 @@ pub async fn mcp_call_tool(
             crate::run_ledger::SubsystemOutcome::Denied,
         );
     })?;
+
+    // After the gate, so a refused call records nothing, and before dispatch,
+    // because a call that was permitted and then timed out may still have had
+    // its effect on the server — an MCP tool this app cannot undo is exactly
+    // the case the enumerated set exists for.
+    crate::checkpoints::record_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        crate::checkpoints::ExternalEffectKind::McpTool,
+    )?;
 
     let timeout = Duration::from_secs(entry.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
 

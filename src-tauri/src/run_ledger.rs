@@ -196,9 +196,11 @@ const MIGRATION_V13: i64 = 13;
 const MIGRATION_V13_CHECKSUM: &str = "compatible-migrations-v13-2026-08-08";
 const MIGRATION_V14: i64 = 14;
 const MIGRATION_V14_CHECKSUM: &str = "egress-destinations-v14-2026-08-08";
+const MIGRATION_V15: i64 = 15;
+const MIGRATION_V15_CHECKSUM: &str = "tool-call-origin-v15-2026-08-08";
 
 /// The newest schema this binary knows how to write.
-const SCHEMA_VERSION: i64 = MIGRATION_V14;
+const SCHEMA_VERSION: i64 = MIGRATION_V15;
 
 /// Whether a migration keeps older binaries able to open the database.
 ///
@@ -428,6 +430,54 @@ pub struct StoredApproval {
     pub decided_by: Option<ClientIdentity>,
 }
 
+/// Whether a decision's `tool_call_id` names a real tool call.
+///
+/// The same distinction [`PermissionAttribution`] draws for the run, drawn for
+/// the tool call, and for the same reason. `tool_call_id` is `NOT NULL`, so a
+/// caller with no tool call in hand — deleting a model from Settings, running a
+/// local app definition over HTTP — had one **invented** for it. That id is
+/// shaped exactly like a real one and joins to nothing, so the acceptance's own
+/// question ("produce the decision that authorized this tool call") silently
+/// returned nothing for a reason the log did not record: not "no decision", but
+/// "this decision was never about a tool call at all".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolCallOrigin {
+    /// The caller supplied the id, so it joins to a real tool call.
+    Caller,
+    /// There was no tool call and the id was generated to fill the column.
+    /// Nothing joins to it, and that is the fact worth recording.
+    Synthesized,
+    /// Written before this column existed. Kept distinct from the two above for
+    /// [`PermissionAttribution::Unknown`]'s reason: "we never recorded it" must
+    /// not read as "we recorded that it was real".
+    Unknown,
+}
+
+impl ToolCallOrigin {
+    /// The stable identity that gets persisted — what the CHECK constraint
+    /// lists. Never reworded.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            ToolCallOrigin::Caller => "caller",
+            ToolCallOrigin::Synthesized => "synthesized",
+            ToolCallOrigin::Unknown => "unknown",
+        }
+    }
+
+    fn parse(value: &str) -> LedgerResult<Self> {
+        match value {
+            "caller" => Ok(ToolCallOrigin::Caller),
+            "synthesized" => Ok(ToolCallOrigin::Synthesized),
+            "unknown" => Ok(ToolCallOrigin::Unknown),
+            other => Err(LedgerError::Corrupt(format!(
+                "unknown tool call origin '{other}'"
+            ))),
+        }
+    }
+}
+
 /// What a permission decision belongs to.
 ///
 /// The two arms of [`crate::run_scope::RunScope`] plus the two states a scope
@@ -511,6 +561,9 @@ pub struct PermissionRequestRecord {
     pub process_id: Option<String>,
     pub tool_name: String,
     pub tool_call_id: String,
+    /// Whether [`Self::tool_call_id`] joins to anything. Read it before
+    /// concluding a tool call had no decision — see [`ToolCallOrigin`].
+    pub tool_call_origin: ToolCallOrigin,
     pub operation_sha256: String,
     /// The permission mode in force, after any turn-scoped override. Recorded
     /// because "why did this not prompt" is unanswerable without it.
@@ -1287,8 +1340,9 @@ impl RunLedger {
         self.connection.execute(
             "INSERT INTO permission_decisions (
                 request_id, run_id, attribution, process_id, tool_name, tool_call_id,
-                operation_sha256, mode, risk_level, risk_floored, requested_at_ms, expires_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                tool_call_origin, operation_sha256, mode, risk_level, risk_floored,
+                requested_at_ms, expires_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 record.request_id,
                 record.run_id,
@@ -1296,6 +1350,7 @@ impl RunLedger {
                 record.process_id,
                 record.tool_name,
                 record.tool_call_id,
+                record.tool_call_origin.code(),
                 record.operation_sha256,
                 record.mode,
                 record.risk_level.as_ref().map(enum_token).transpose()?,
@@ -1733,6 +1788,15 @@ const MIGRATION_LADDER: &[(i64, &str, Compatibility)] = &[
         MIGRATION_V14_CHECKSUM,
         Compatibility::Additive,
     ),
+    // Additive: one nullable-in-effect column with a default. A V14 binary
+    // never selects it, and its inserts leave it at the `'unknown'` default —
+    // which is exactly what those rows are, since that binary did not record
+    // where the id came from.
+    (
+        MIGRATION_V15,
+        MIGRATION_V15_CHECKSUM,
+        Compatibility::Additive,
+    ),
 ];
 
 /// The oldest binary that may open a database with `version` applied.
@@ -2152,6 +2216,36 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
+    let has_v15 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V15],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v15 {
+        // Probed like V13's and V14's, and for the same reason: SQLite cannot
+        // drop a column carrying a `CHECK`, so a database wound back to an
+        // earlier version keeps it.
+        let has_column = transaction
+            .prepare("SELECT tool_call_origin FROM permission_decisions LIMIT 0")
+            .is_ok();
+        if !has_column {
+            transaction.execute_batch(MIGRATION_V15_SQL)?;
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V15,
+                MIGRATION_V15_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V15)
+            ],
+        )?;
+    }
+
     // Every row's floor is (re)stated from the ladder, including the rows that
     // predate the column. Rewriting them all rather than only the new one keeps
     // the database's answer and the binary's answer the same by construction —
@@ -2163,7 +2257,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
-    transaction.execute_batch("PRAGMA user_version = 14;")?;
+    transaction.execute_batch("PRAGMA user_version = 15;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -2866,6 +2960,29 @@ CREATE INDEX egress_destinations_host_idx ON egress_destinations(host, last_seen
 const MIGRATION_V14_COLUMN_SQL: &str = r#"
 ALTER TABLE agent_processes ADD COLUMN egress_destinations_dropped INTEGER
     CHECK (egress_destinations_dropped IS NULL OR egress_destinations_dropped >= 0);
+"#;
+
+/// Records whether a decision's `tool_call_id` names a real tool call (K12).
+///
+/// `tool_call_id` is `NOT NULL`, so `permissions::request_permission` invents
+/// one for a caller that has none — a Settings model deletion, a local app run
+/// over HTTP. The invented id is shaped exactly like a real one, so
+/// `permission_decisions_tool_call_idx` holds entries that join to nothing and
+/// look like they should. This column is the difference, and it is the same
+/// distinction the `attribution` column already draws for the run: absence with
+/// a stated reason rather than a plausible-looking value.
+///
+/// The default is `'unknown'` rather than `'caller'`, and that is the whole
+/// care in this migration. Every row written before this column existed had its
+/// origin unrecorded; defaulting them to `'caller'` would assert something
+/// nobody checked, about precisely the rows most likely to be synthesized. The
+/// ids could be pattern-matched — the synthesized ones are `tool-` plus a simple
+/// UUID — but a heuristic that mislabels one real tool call is worse than an
+/// honest `'unknown'`, and this backfill would be unreviewable either way.
+const MIGRATION_V15_SQL: &str = r#"
+ALTER TABLE permission_decisions ADD COLUMN tool_call_origin TEXT NOT NULL
+    DEFAULT 'unknown'
+    CHECK (tool_call_origin IN ('caller', 'synthesized', 'unknown'));
 "#;
 
 /// Records every permission decision, including the ones no run can hold
@@ -3942,7 +4059,8 @@ fn decode_subsystem_event(row: SubsystemEventRow) -> LedgerResult<StoredSubsyste
 /// cannot drift out of order with [`permission_decision_columns`].
 const PERMISSION_DECISION_SELECT: &str = "SELECT request_id, run_id, attribution, process_id, \
      tool_name, tool_call_id, operation_sha256, mode, risk_level, risk_floored, \
-     requested_at_ms, expires_at_ms, decision, decided_by, decided_at_ms \
+     requested_at_ms, expires_at_ms, decision, decided_by, decided_at_ms, \
+     tool_call_origin \
      FROM permission_decisions";
 
 /// A `permission_decisions` row exactly as SQLite hands it over. Kept separate
@@ -3965,6 +4083,7 @@ struct PermissionDecisionRow {
     decision: Option<String>,
     decided_by: Option<String>,
     decided_at_ms: Option<i64>,
+    tool_call_origin: String,
 }
 
 fn permission_decision_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<PermissionDecisionRow> {
@@ -3984,6 +4103,7 @@ fn permission_decision_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<Perm
         decision: row.get(12)?,
         decided_by: row.get(13)?,
         decided_at_ms: row.get(14)?,
+        tool_call_origin: row.get(15)?,
     })
 }
 
@@ -3998,6 +4118,7 @@ fn decode_permission_decision(
             process_id: row.process_id,
             tool_name: row.tool_name,
             tool_call_id: row.tool_call_id,
+            tool_call_origin: ToolCallOrigin::parse(&row.tool_call_origin)?,
             operation_sha256: row.operation_sha256,
             mode: row.mode,
             risk_level: row
@@ -5263,7 +5384,7 @@ mod tests {
                     .connection
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                14
+                15
             );
         }
 
@@ -5278,7 +5399,7 @@ mod tests {
                 .execute(
                     "INSERT INTO schema_migrations
                         (version, checksum, applied_at_ms, min_reader_version)
-                     VALUES (15, 'from-the-future-additive', 15, 14)",
+                     VALUES (16, 'from-the-future-additive', 16, 15)",
                     [],
                 )
                 .unwrap();
@@ -5292,7 +5413,7 @@ mod tests {
             let connection = Connection::open(&database.path).unwrap();
             connection
                 .execute(
-                    "UPDATE schema_migrations SET min_reader_version = 15 WHERE version = 15",
+                    "UPDATE schema_migrations SET min_reader_version = 16 WHERE version = 16",
                     [],
                 )
                 .unwrap();
@@ -5300,7 +5421,7 @@ mod tests {
         assert!(
             matches!(
                 RunLedger::open(&database.path),
-                Err(LedgerError::MigrationConflict { version: 15 })
+                Err(LedgerError::MigrationConflict { version: 16 })
             ),
             "a future migration that requires a newer binary must still refuse"
         );
@@ -5322,6 +5443,7 @@ mod tests {
         // V14 is additive and therefore inherits V13's floor rather than raising
         // it — the first migration to actually spend what V13 bought.
         assert_eq!(min_reader_version_for(MIGRATION_V14), MIGRATION_V13);
+        assert_eq!(min_reader_version_for(MIGRATION_V15), MIGRATION_V13);
         // And the pre-V9 ladder keeps exactly its old behaviour.
         assert_eq!(min_reader_version_for(MIGRATION_V8), MIGRATION_V8);
         assert_eq!(min_reader_version_for(MIGRATION_V1), MIGRATION_V1);
@@ -5369,13 +5491,13 @@ mod tests {
             let ledger = RunLedger::open(&database.path).unwrap();
             assert_eq!(
                 ledger.applied_migrations().unwrap(),
-                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
             );
         }
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             "reopening must not re-apply or add a migration"
         );
 
@@ -5574,6 +5696,7 @@ mod tests {
             process_id: None,
             tool_name: "delete_model".to_string(),
             tool_call_id: "tool-77".to_string(),
+            tool_call_origin: ToolCallOrigin::Caller,
             operation_sha256: "a".repeat(64),
             mode: "manual".to_string(),
             risk_level: Some(RiskLevel::High),
@@ -5612,7 +5735,7 @@ mod tests {
                     "DROP TABLE permission_decisions;
                      DROP TABLE subsystem_events;
                      DROP TABLE egress_destinations;
-                     DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14);
+                     DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14, 15);
                      PRAGMA user_version = 10;",
                 )
                 .unwrap();
@@ -5621,7 +5744,7 @@ mod tests {
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             "opening a V10 database must apply every migration above it"
         );
         assert_eq!(
@@ -5629,7 +5752,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            14
+            15
         );
         // The table is back and empty: the upgrade adds the surface, it does not
         // invent rows for permissions nobody recorded at the time.
@@ -5722,6 +5845,70 @@ mod tests {
             assert_eq!(stored.request.attribution, *attribution);
             assert_eq!(stored.decision, None, "an open request has no decision yet");
         }
+    }
+
+    /// A generated tool call id must be distinguishable from a real one.
+    ///
+    /// This is the bug the column exists for. `tool_call_id` is `NOT NULL`, so a
+    /// gated operation that is not a tool call — deleting a model from Settings
+    /// — still gets an id, shaped exactly like a real one and joining to
+    /// nothing. Without the origin beside it, a trail query returns nothing and
+    /// the reader cannot tell "no decision was recorded" (the bug K12 names)
+    /// from "this was never a tool call" (not a bug at all).
+    #[test]
+    fn a_synthesized_tool_call_id_says_so_and_a_real_one_stays_silent() {
+        let database = TempDb::new("tool-call-origin");
+        let ledger = RunLedger::open(&database.path).unwrap();
+
+        for (request_id, origin) in [
+            ("req-real", ToolCallOrigin::Caller),
+            ("req-generated", ToolCallOrigin::Synthesized),
+        ] {
+            let mut record = permission_request(request_id, PermissionAttribution::Unknown);
+            record.tool_call_id = format!("tool-{request_id}");
+            record.tool_call_origin = origin;
+            ledger.record_permission_request(&record).unwrap();
+
+            let stored = ledger
+                .load_permission_decision(request_id)
+                .unwrap()
+                .expect("just written");
+            assert_eq!(stored.request.tool_call_origin, origin);
+        }
+
+        // A row written before the column existed keeps the third state rather
+        // than being asserted into one of the other two.
+        ledger
+            .connection
+            .execute(
+                "INSERT INTO permission_decisions
+                    (request_id, run_id, attribution, tool_name, tool_call_id,
+                     operation_sha256, mode, risk_floored, requested_at_ms, expires_at_ms)
+                 VALUES ('req-legacy', NULL, 'unknown', 't', 'tool-legacy', ?1, 'manual', 0, 1, 2)",
+                params!["a".repeat(64)],
+            )
+            .unwrap();
+        assert_eq!(
+            ledger
+                .load_permission_decision("req-legacy")
+                .unwrap()
+                .expect("the legacy row reads")
+                .request
+                .tool_call_origin,
+            ToolCallOrigin::Unknown,
+            "a row that predates the column must not claim its id was the caller's"
+        );
+
+        // The CHECK is the enforcement, not the enum: a writer that bypasses
+        // `ToolCallOrigin::code` cannot invent a fourth state.
+        assert!(ledger
+            .connection
+            .execute(
+                "UPDATE permission_decisions SET tool_call_origin = 'probably-real'
+                  WHERE request_id = 'req-legacy'",
+                [],
+            )
+            .is_err());
     }
 
     /// A decision is final. Answering twice — a replayed IPC message, a second
