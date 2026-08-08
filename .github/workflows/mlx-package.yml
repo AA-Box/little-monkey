@@ -96,10 +96,12 @@ jobs:
           '
           cat packaging/mlx/mlx-catalog.json
 
-      # The catalog is the feed: a client configures this URL as a component
-      # source and sees every published version. It is deliberately not
-      # signed — it only carries a URL and a digest, and a package it points
-      # at still has to satisfy the pinned publisher key before it installs.
+      # The catalog names the archive and its digest. The app has no HTTP
+      # component source — the Runtime Hub's registry is local — so this is
+      # downloaded and imported through Components → Import catalog rather than
+      # subscribed to by URL. It is deliberately not signed: it only carries a
+      # URL and a digest, and the package it points at still has to satisfy the
+      # pinned publisher key before it installs.
       - name: Publish the catalog
         env:
           GH_TOKEN: ${{ github.token }}
@@ -107,5 +109,28 @@ jobs:
           set -euo pipefail
           gh release create mlx-catalog packaging/mlx/mlx-catalog.json \
             --title "MLX catalog" \
-            --notes "Component catalog for the MLX runtime. Add as a source in the Runtime Hub." \
+            --notes "Component catalog for the MLX runtime. Download this file, then import it in the Runtime Hub under Components → Import catalog." \
             || gh release upload mlx-catalog packaging/mlx/mlx-catalog.json --clobber
+
+      # Both URLs in one place, because the pair is what a user needs and the
+      # catalog's own release page does not mention the archive's.
+      - name: Summarize
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MLX_DOWNLOAD_URL: ${{ env.MLX_DOWNLOAD_URL }}
+        run: |
+          set -euo pipefail
+          CATALOG_URL=$(gh release view mlx-catalog --json assets \
+            --jq '.assets[] | select(.name == "mlx-catalog.json") | .url')
+          {
+            echo "### MLX package published"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Archive | $MLX_DOWNLOAD_URL |"
+            echo "| Catalog | $CATALOG_URL |"
+            echo
+            echo "Install: download the catalog, then Runtime Hub → Components → **Import catalog**."
+            echo "The archive is only installable if it verifies against the release key pinned in"
+            echo '`MLX_RELEASE_PUBLIC_KEY_HEX` (src-tauri/src/m3_production.rs).'
+          } >> "$GITHUB_STEP_SUMMARY"

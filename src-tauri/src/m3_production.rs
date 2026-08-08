@@ -1170,8 +1170,38 @@ pub fn component_registry_entries(root: &Path) -> M3HubResult<Vec<M3ComponentCat
         ));
     }
     // Constructing the source is the canonical validation for every entry.
-    StaticM3ComponentSource::new(COMPONENT_REGISTRY_SOURCE_ID, registry.entries.clone())?;
-    Ok(registry.entries)
+    let entries = adopt_into_registry(registry.entries);
+    StaticM3ComponentSource::new(COMPONENT_REGISTRY_SOURCE_ID, entries.clone())?;
+    Ok(entries)
+}
+
+/// Restamps every entry as belonging to the local registry.
+///
+/// A catalog file is written by whoever published the component and carries
+/// *their* `sourceId` — the MLX release workflow, for one, publishes
+/// `little-monkey-mlx`. The local registry is a single source whose id is
+/// [`COMPONENT_REGISTRY_SOURCE_ID`], and `StaticM3ComponentSource::new` refuses
+/// any entry claiming a different one. Without this, importing a published
+/// catalog fails with "entry source differs from the configured source" and the
+/// component is uninstallable — which is what happened to every catalog this
+/// project has ever published.
+///
+/// Rewriting rather than rejecting is right because the field is the
+/// publisher's claim about where the entry came from, and once it is in this
+/// file the answer is "the local registry" no matter who wrote it. Nothing else
+/// reads `source_id`: identity is `component_id`, and a version is keyed on
+/// version/digest/URL. The digest and the publisher-key check that actually
+/// establish trust are untouched.
+fn adopt_into_registry(
+    entries: Vec<M3ComponentCatalogEntry>,
+) -> Vec<M3ComponentCatalogEntry> {
+    entries
+        .into_iter()
+        .map(|mut entry| {
+            entry.source_id = COMPONENT_REGISTRY_SOURCE_ID.to_string();
+            entry
+        })
+        .collect()
 }
 
 fn component_sources_from_entries(
@@ -1197,6 +1227,11 @@ pub fn replace_component_registry_entries(
     hub: &M3ComponentHub,
     entries: Vec<M3ComponentCatalogEntry>,
 ) -> M3HubResult<Vec<M3ComponentCatalogEntry>> {
+    // Restamped before validation, so a catalog published by someone else
+    // imports instead of being refused over a field this registry owns. The
+    // persisted file, the in-memory source and the value returned to the caller
+    // are all the restamped set, so none of the three can disagree.
+    let entries = adopt_into_registry(entries);
     let sources = component_sources_from_entries(&entries)?;
     let document = ProductionComponentRegistry {
         schema_version: COMPONENT_REGISTRY_SCHEMA_VERSION,
@@ -3853,6 +3888,7 @@ mod tests {
     use crate::compatibility_hub::{
         CanonicalToolDefinition, CompatibilityProtocol, COMPATIBILITY_SCHEMA_VERSION,
     };
+    use crate::m3_runtime_hub::{M3ComponentChannel, M3ComponentKind};
     use http_body_util::{BodyExt, Full};
     use hyper::body::{Bytes, Incoming};
     use hyper::service::service_fn;
@@ -5118,5 +5154,52 @@ GPU1:
             events.last(),
             Some(CanonicalStreamEvent::ResponseCompleted { .. })
         ));
+    }
+    /// The MLX release workflow publishes a catalog whose entries carry its own
+    /// `sourceId` (`little-monkey-mlx`), and the local registry is a single
+    /// source named `local` whose constructor refuses any entry claiming
+    /// another. Before this was restamped on ingest, importing a published
+    /// catalog failed with "entry source differs from the configured source" —
+    /// so every catalog this project has ever published was uninstallable.
+    #[test]
+    fn a_catalog_published_by_someone_else_is_adopted_into_the_local_registry() {
+        let published = M3ComponentCatalogEntry {
+            schema_version: 1,
+            source_id: "little-monkey-mlx".to_string(),
+            component_id: "mlx-runtime-apple-silicon".to_string(),
+            kind: M3ComponentKind::MlxRuntime,
+            display_name: "MLX runtime (Apple silicon)".to_string(),
+            accelerator: None,
+            version: "0.28.4".to_string(),
+            channel: M3ComponentChannel::Beta,
+            download_url: "https://github.com/AA-Box/little-monkey/releases/download/mlx-runtime-0.28.4/mlx-runtime-0.28.4.tar.gz".to_string(),
+            sha256: "a".repeat(64),
+            size_bytes: 314_572_800,
+            published_at_ms: 1_754_000_000_000,
+            compatibility_note: Some("Requires Apple silicon.".to_string()),
+            metadata: BTreeMap::new(),
+        };
+
+        // The exact rejection this fixes: a foreign source id, unchanged.
+        assert!(
+            StaticM3ComponentSource::new(
+                COMPONENT_REGISTRY_SOURCE_ID,
+                vec![published.clone()]
+            )
+            .is_err(),
+            "the foreign source id must still be what the source constructor refuses"
+        );
+
+        let adopted = adopt_into_registry(vec![published.clone()]);
+        assert_eq!(adopted[0].source_id, COMPONENT_REGISTRY_SOURCE_ID);
+        assert!(component_sources_from_entries(&adopted).is_ok());
+
+        // Nothing else about the entry moves: the digest, URL and version are
+        // what establish trust and identity downstream.
+        assert_eq!(adopted[0].sha256, published.sha256);
+        assert_eq!(adopted[0].download_url, published.download_url);
+        assert_eq!(adopted[0].version, published.version);
+        assert_eq!(adopted[0].component_id, published.component_id);
+        assert_eq!(adopted[0].kind, published.kind);
     }
 }
