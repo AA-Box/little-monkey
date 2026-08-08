@@ -997,6 +997,31 @@ pub fn generation_media_data_url(
     ))
 }
 
+/// What the engine running right now says it supports.
+///
+/// `None` when nothing is running, which is the normal state before the first
+/// generation: the pickers fall back to their compiled-in lists rather than
+/// standing empty until a model is loaded.
+#[tauri::command]
+pub async fn generation_capabilities(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<generation::EngineCapabilities>, String> {
+    // Launched on a fresh port each time, so the address comes from the running
+    // instance rather than a constant — and only once that instance has
+    // answered, because a short-deadline probe against an engine still loading
+    // weights burns one of its worker threads and helps nobody.
+    let Some(base_url) = state.generation_engine.ready_base_url() else {
+        return Ok(None);
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+    generation::fetch_capabilities(&client, &base_url)
+        .await
+        .map(Some)
+}
+
 /// Releases the engine's memory. The loaded weight set is tens of gigabytes,
 /// so Studio never keeps it warm once the user is done.
 #[tauri::command]

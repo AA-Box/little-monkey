@@ -40,6 +40,8 @@ import {
   SCHEDULERS,
   studioClient,
   UPSCALERS,
+  engineSupports,
+  type EngineCapabilities,
   type GenerationEngineStatus,
   type GenerationEntry,
   type GenerationModel,
@@ -351,6 +353,9 @@ export function StudioPanel() {
   const { t } = useT();
   const [mode, setMode] = useState<StudioMode>("image");
   const [status, setStatus] = useState<GenerationEngineStatus | null>(null);
+  /** What the running engine says it supports. Null until one has run — the
+   *  pickers fall back to the compiled-in lists until then. */
+  const [capabilities, setCapabilities] = useState<EngineCapabilities | null>(null);
   const [models, setModels] = useState<GenerationModel[]>([]);
   const [backends, setBackends] = useState<RemoteBackend[]>([]);
   const [addingBackend, setAddingBackend] = useState(false);
@@ -450,11 +455,32 @@ export function StudioPanel() {
   // would promise something the backend is never sent.
   const conditioning = useMemo(() => {
     if (remote || !selected) return new Set<ConditioningImage>();
-    return availableConditioning([
-      ...selected.components.map((component) => component.slot),
-      ...overrides.map((override) => override.slot),
-    ]);
-  }, [remote, selected, overrides]);
+    return availableConditioning(
+      [
+        ...selected.components.map((component) => component.slot),
+        ...overrides.map((override) => override.slot),
+      ],
+      // The second gate, and an independent one: weights decide whether the
+      // model can read the image, the engine's own flags decide whether this
+      // build accepts the field at all.
+      capabilities,
+    );
+  }, [remote, selected, overrides, capabilities]);
+
+  // Inpainting. Offered only for the still-image edit task — a mask over the
+  // first frame of a clip describes one frame out of thirty-three — and only
+  // where the engine takes a `mask_image` at all, so an older build is never
+  // sent a field it rejects.
+  const canMask =
+    task === "image_to_image" && !remote && engineSupports(capabilities, "mask_image");
+
+  // The lists the pickers offer: the running engine's own, falling back to the
+  // pinned build's while nothing is running. An engine answering with an empty
+  // list is treated as not having answered — an empty sampler picker is never
+  // the right thing to show.
+  const samplers = capabilities?.samplers.length ? capabilities.samplers : SAMPLERS;
+  const schedulers = capabilities?.schedulers.length ? capabilities.schedulers : SCHEDULERS;
+  const upscalers = capabilities?.upscalers.length ? capabilities.upscalers : UPSCALERS;
 
   // One chooser per slot the library has a part for. Not per slot the *model*
   // has: a checkpoint that needs a separate VAE does not name one, so keying
@@ -471,13 +497,17 @@ export function StudioPanel() {
 
   const refresh = useCallback(async () => {
     try {
-      const [engine, library, entries, assets, loose, remotes] = await Promise.all([
+      const [engine, library, entries, assets, loose, remotes, reported] = await Promise.all([
         studioClient.engineStatus(),
         studioClient.models(),
         studioClient.gallery(),
         studioClient.loras(),
         studioClient.parts(),
         studioClient.backends(),
+        // An engine that is up but not answering must not take the whole panel
+        // down with it: the lists have a fallback, so a failed ask is the same
+        // as no engine at all.
+        studioClient.capabilities().catch(() => null),
       ]);
       // A backend's models join the library list rather than sitting beside it:
       // the picker, the task filter and the run path then need no notion of a
@@ -485,6 +515,7 @@ export function StudioPanel() {
       // for the selection — asks the id.
       const list = [...library, ...backendModels(remotes)];
       setStatus(engine);
+      setCapabilities(reported);
       setBackends(remotes);
       setModels(list);
       setGallery([...entries].reverse());
@@ -728,7 +759,7 @@ export function StudioPanel() {
         // offered, so a mask painted before switching task and a control image
         // chosen before switching model cannot follow the run somewhere they
         // mean nothing. The backend refuses them again on its own side.
-        maskImageBase64: task === "image_to_image" && initImage ? maskImage : null,
+        maskImageBase64: canMask && initImage ? maskImage : null,
         controlImageBase64: conditioning.has("control") ? controlImage : null,
         controlStrength: conditioning.has("control") && controlImage ? controlStrength : null,
         ipAdapterImageBase64: conditioning.has("ip_adapter") ? ipAdapterImage : null,
@@ -1348,10 +1379,7 @@ export function StudioPanel() {
             </div>
           )}
 
-          {/* Inpainting. Offered only for the still-image edit task: a mask
-              over the first frame of a clip would describe one frame out of
-              thirty-three, which is not what anyone means by it. */}
-          {task === "image_to_image" && initImage && !remote && (
+          {canMask && initImage && (
             <div className="grid gap-2">
               <span className="text-xs text-muted">{t("Studio.mask.title")}</span>
               <MaskCanvas imageBase64={initImage} value={maskImage} onChange={setMaskImage} />
@@ -1490,9 +1518,9 @@ export function StudioPanel() {
                 >
                   {/* A model may name a sampler this build does not list; keep
                       it selectable rather than silently switching it. */}
-                  {(SAMPLERS.includes(settings.sampler)
-                    ? SAMPLERS
-                    : [settings.sampler, ...SAMPLERS]
+                  {(samplers.includes(settings.sampler)
+                    ? samplers
+                    : [settings.sampler, ...samplers]
                   ).map((entry) => (
                     <option key={entry} value={entry}>
                       {entry}
@@ -1577,7 +1605,7 @@ export function StudioPanel() {
                       onChange={(scheduler) => setSettings({ ...settings, scheduler })}
                     >
                       <option value="">{t("Studio.engineDefault")}</option>
-                      {SCHEDULERS.map((entry) => (
+                      {schedulers.map((entry) => (
                         <option key={entry} value={entry}>
                           {entry}
                         </option>
@@ -1650,7 +1678,7 @@ export function StudioPanel() {
                         }
                       />
                       <datalist id="studio-upscalers">
-                        {UPSCALERS.map((entry) => (
+                        {upscalers.map((entry) => (
                           <option key={entry} value={entry} />
                         ))}
                       </datalist>
