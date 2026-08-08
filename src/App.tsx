@@ -287,6 +287,10 @@ function App() {
    *  Survives switching to Chat and back, which the old in-panel tabs did not:
    *  the panel is lazy and unmounts. */
   const [studioMode, setStudioMode] = useState<StudioMode>("image");
+  /** The sidebar node `StudioPanel` portals its settings rail into. State
+   *  rather than a ref so the panel re-renders once the node exists — a plain
+   *  ref would still be null on the render that mounts the lazy panel. */
+  const [studioRail, setStudioRail] = useState<HTMLDivElement | null>(null);
   /** Studio needs a native engine that not every host can run — no upstream
    *  build for Linux arm64, and the Linux x86_64 build needs a newer glibc
    *  than some supported distributions ship. Where it cannot run, the section
@@ -990,7 +994,12 @@ function App() {
           strip stays empty as a drag region and clears the macOS traffic
           lights. Workspace folder picking now lives in the WorkspaceBar
           above the chat input (see ChatWindow). */}
-      <aside className="app-session-sidebar flex shrink-0 flex-col border-r border-border bg-surface">
+      {/* `data-section` widens the column in Studio, where it carries the run
+          settings rather than a list of session titles (see index.css). */}
+      <aside
+        data-section={section}
+        className="app-session-sidebar flex shrink-0 flex-col border-r border-border bg-surface"
+      >
         <div data-tauri-drag-region className="h-11 shrink-0" />
         {/* Section switcher. Below the drag strip rather than inside it, so
             clicking a segment never starts a window drag. Hidden entirely
@@ -1014,9 +1023,18 @@ function App() {
         <div className="relative min-h-0 flex-1">
           <div className="h-full overflow-y-auto [overscroll-behavior:contain]">
             {/* Studio has no sessions, so the chat list would switch nothing
-                there. Its own sections take the column instead. */}
+                there. Its sections and their settings take the column instead. */}
             {section === "studio" ? (
-              <StudioNav active={studioMode} onChange={setStudioMode} />
+              <div className="grid content-start gap-3 px-2 pb-4">
+                <StudioNav active={studioMode} onChange={setStudioMode} />
+                {/* Where `StudioPanel` portals its settings rail. The panel owns
+                    that state — around twenty pieces of per-run choice — so it
+                    keeps rendering the controls and is only told where to put
+                    them. Lifting all of it up here, or into a store, to move a
+                    subtree across the layout would be a far larger change than
+                    handing over a node. */}
+                <div ref={setStudioRail} />
+              </div>
             ) : (
               <ChatSessionList />
             )}
@@ -1100,7 +1118,7 @@ function App() {
         >
           <Suspense fallback={<LazyPanelFallback />}>
             {section === "studio" ? (
-              <StudioPanel mode={studioMode} />
+              <StudioPanel mode={studioMode} railSlot={studioRail} />
             ) : globalSearchOpen ? (
               <GlobalSearch
                 onClose={() => closeFeaturePanel("global-search")}

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import {
   ChevronDown,
@@ -21,6 +22,7 @@ import { AddModelForm } from "./AddModelForm";
 import { LoraStack } from "./LoraStack";
 import { MaskCanvas } from "./MaskCanvas";
 import { ModelFiles } from "./ModelFiles";
+import { SettingsCard } from "./SettingsCard";
 import type { StudioMode } from "./StudioNav";
 import { useT } from "../../lib/i18n";
 import { describeWeightFile } from "../../lib/weightFileHints";
@@ -389,9 +391,12 @@ interface Props {
   /** Which section is showing. Owned by `App`, because the control that
    *  switches it is the sidebar nav rather than anything in here. */
   mode: StudioMode;
+  /** Sidebar node to render the settings rail into. Null until the sidebar has
+   *  mounted, and in Chat, where there is no rail to show. */
+  railSlot: HTMLElement | null;
 }
 
-export function StudioPanel({ mode }: Props) {
+export function StudioPanel({ mode, railSlot }: Props) {
   const { t } = useT();
   const [status, setStatus] = useState<GenerationEngineStatus | null>(null);
   /** What the running engine says it supports. Null until one has run — the
@@ -1296,10 +1301,24 @@ export function StudioPanel({ mode }: Props) {
           )}
         </div>
       </section>
-      ) : (
-        <section className="mb-3">
-          <label className="grid gap-1 text-[11px] text-muted">
-            {t("Studio.models")}
+      ) : null}
+
+      {/* The canvas keeps the prompt, the button and the result together where
+          the work happens. The rail of controls that used to sit beside it is
+          portalled into the sidebar below, so this gets the full width. */}
+      {mode !== "models" && (
+      <div className="flex min-h-0 flex-1 gap-4 overflow-hidden p-1">
+        {/* The rail renders into the sidebar rather than here. It stays part of
+            this component — every control below reads state this component owns
+            — and only its DOM position moves.
+            `[&>*]:min-w-0`: a grid item's default minimum is its own
+            min-content, so one wide control anywhere in the rail would size the
+            whole column to itself and every box would overflow together. */}
+        {railSlot ? createPortal(
+        <div className="grid content-start gap-3 [&>*]:min-w-0">
+          {/* Outside the `selected` guard below: with nothing chosen this is the
+              one control that has to be reachable, or there is no way to choose. */}
+          <SettingsCard title={t("Studio.models")}>
             {/* A native popup is drawn by the platform and sized to its widest
                 option, never to the control, so this one is ours. */}
             <Listbox
@@ -1319,27 +1338,10 @@ export function StudioPanel({ mode }: Props) {
                   .join(" · "),
               }))}
             />
-          </label>
-        </section>
-      )}
+          </SettingsCard>
 
-      {/* The shape every local generation tool settles on: a narrow rail of
-          controls that scrolls on its own, and a canvas that keeps the prompt,
-          the button and the result together where the work happens. */}
-      {mode !== "models" && (
-      <div className="flex min-h-0 flex-1 gap-4 overflow-hidden p-1">
-        {/* `overflow-y: auto` computes overflow-x to auto as well, so the rail
-            clips sideways too and its controls need room for a focus ring. */}
-        {selected && (
-        // `pr-3` is not decoration. A macOS overlay scrollbar reserves no
-        // space, so it is drawn *on top of* whatever reaches the right edge —
-        // which is why the size hint and every number stepper looked sliced
-        // off. `scrollbar-gutter` covers the other setting, where the bar is
-        // solid and takes width instead.
-        // `[&>*]:min-w-0` is the other half: a grid item's default minimum is
-        // its own min-content, so one wide control anywhere in the rail sizes
-        // the whole column to itself and every box overflows together.
-        <aside className="grid w-80 shrink-0 content-start gap-3 overflow-y-auto pb-4 pl-1 pr-3 [scrollbar-gutter:stable] [&>*]:min-w-0">
+          {selected && (
+          <>
           <div className="flex flex-wrap gap-1.5">
             {selected.tasks
               .filter((entry) => tasksFor(mode).includes(entry))
@@ -1816,13 +1818,14 @@ export function StudioPanel({ mode }: Props) {
               </div>
             </details>
           )}
-
-        </aside>
-        )}
+          </>
+          )}
+        </div>,
+        railSlot,
+        ) : null}
 
         {/* `min-w-0`: a flex item's floor is its content, so without this a
-            wide result pushes the whole row past the pane and the rail is what
-            gets cut off the left of it. */}
+            wide result pushes the whole row past the pane. */}
         <section className="flex min-h-0 min-w-0 flex-1 flex-col gap-2">
           {/* Each button sits with the field it belongs to and stretches to
               its height, so the row reads as one control rather than two. */}
