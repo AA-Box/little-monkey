@@ -1392,11 +1392,19 @@ impl OpenAiCompatibleM3InferenceEngine {
             .await?;
         match crate::context_cache::check_context_budget(prompt_tokens, Some(budget)) {
             crate::context_cache::ContextBudgetVerdict::Within => Ok(()),
-            verdict => Err(M3HubError::Runtime(
-                verdict
-                    .refusal()
-                    .unwrap_or_else(|| "context budget exceeded".to_string()),
-            )),
+            verdict => {
+                // The class's policy decides what being over the budget *means*:
+                // compact and carry on, or stop. Carrying it in the refusal is
+                // what lets a caller act rather than only report.
+                let policy = crate::run_scope::current_process()
+                    .and_then(|process| process.class())
+                    .map(crate::context_cache::context_policy);
+                Err(M3HubError::Runtime(
+                    verdict
+                        .refusal_under(policy)
+                        .unwrap_or_else(|| "context budget exceeded".to_string()),
+                ))
+            }
         }
     }
 

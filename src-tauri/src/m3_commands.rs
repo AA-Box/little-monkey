@@ -1022,6 +1022,35 @@ async fn context_cache_state_impl(
     })
 }
 
+/// The stated eviction/compaction policy for every process class (roadmap K11).
+///
+/// All four at once rather than one per query: the policy is only meaningful as
+/// a comparison — "interactive compacts, maintenance stops" is the fact, and one
+/// class in isolation reads like a global setting.
+#[tauri::command]
+pub fn m3_context_policies() -> Vec<ContextPolicyEntry> {
+    use crate::run_protocol::ProcessClass;
+    [
+        ProcessClass::Interactive,
+        ProcessClass::Batch,
+        ProcessClass::Background,
+        ProcessClass::Maintenance,
+    ]
+    .into_iter()
+    .map(|class| ContextPolicyEntry {
+        class: class.token(),
+        policy: crate::context_cache::context_policy(class),
+    })
+    .collect()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPolicyEntry {
+    pub class: &'static str,
+    pub policy: crate::context_cache::ContextPolicy,
+}
+
 #[tauri::command]
 pub async fn m3_context_cache_state(
     state: tauri::State<'_, M3CommandState>,

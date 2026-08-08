@@ -257,6 +257,95 @@ impl ClientIdentity {
     }
 }
 
+/// The four named classes, best-served first.
+///
+/// Not a synonym for the `priority` integer. Priority is a number any producer
+/// can pick; a class is derived from the frozen `RunKind` in the run spec, which
+/// is decided at submission by the code path that submitted it and cannot be
+/// re-asserted later. That is what makes "interactive" mean something: a desktop
+/// turn frozen through `daemon_desktop_turn` is `RunKind::Interactive` because
+/// `task.rs` writes that when `recipe.desktop_turn` is present, and a
+/// `monkey daemon run <recipe>` batch migration is `RunKind::Workflow` because
+/// it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProcessClass {
+    /// Something is blocked on the answer: a person at a desktop turn, an ACP
+    /// peer holding a stdio connection, a browser session, a remote controller.
+    Interactive,
+    /// Submitted work that wants throughput. Nobody is waiting on any individual
+    /// turn, but the whole batch finishing sooner is worth something.
+    Batch,
+    /// Opportunistic. Runs when there is room, and is the first thing asked to
+    /// step aside.
+    Background,
+    /// Housekeeping on a schedule. May always be deferred, because the next
+    /// occurrence will come around anyway.
+    Maintenance,
+}
+
+impl ProcessClass {
+    /// Sort rank, lowest first. `Interactive` is 0.
+    pub const fn rank(self) -> u32 {
+        match self {
+            Self::Interactive => 0,
+            Self::Batch => 1,
+            Self::Background => 2,
+            Self::Maintenance => 3,
+        }
+    }
+
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Batch => "batch",
+            Self::Background => "background",
+            Self::Maintenance => "maintenance",
+        }
+    }
+
+    /// This class promoted `steps` levels toward `Interactive`, saturating there.
+    pub const fn promoted(self, steps: u32) -> Self {
+        match self.rank().saturating_sub(steps) {
+            0 => Self::Interactive,
+            1 => Self::Batch,
+            2 => Self::Background,
+            _ => Self::Maintenance,
+        }
+    }
+}
+
+/// The declared class of a run, from its frozen kind and its declared priority.
+///
+/// The kind decides the class. Priority does **not** promote — that direction is
+/// deliberately closed, because a producer that could promote itself by passing
+/// `--priority 9` would make `interactive` mean "whoever asked loudest" within a
+/// day. Priority orders work *inside* a class, which is what a number is good
+/// for.
+///
+/// A negative priority is the one thing a caller may say about its own class,
+/// and it can only demote: the enqueuer explicitly asked to be behind everything
+/// else, so it lands in `Background` (never `Maintenance` — that is reserved for
+/// work the daemon itself scheduled, which is a different claim).
+pub fn classify(kind: &RunKind, priority: i32) -> ProcessClass {
+    let declared = match kind {
+        RunKind::Interactive | RunKind::Acp | RunKind::Browser | RunKind::RemoteDesktopControl => {
+            ProcessClass::Interactive
+        }
+        RunKind::Workflow
+        | RunKind::ComparisonBranch
+        | RunKind::ComparisonSynthesis
+        | RunKind::CrewMember
+        | RunKind::CrewCoordinator
+        | RunKind::Sandboxed => ProcessClass::Batch,
+        RunKind::Background => ProcessClass::Background,
+        RunKind::Scheduled => ProcessClass::Maintenance,
+    };
+    if priority < 0 && declared.rank() < ProcessClass::Background.rank() {
+        return ProcessClass::Background;
+    }
+    declared
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunKind {
