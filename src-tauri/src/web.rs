@@ -40,7 +40,7 @@ use tokio::sync::Notify;
 use url::Url;
 
 use crate::egress::{EgressDenial, EgressRule};
-use crate::{permissions, AppState};
+use crate::{checkpoints, permissions, AppState};
 
 /// Total request timeout (connect through full body read) for `tool_web_fetch`.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1004,6 +1004,9 @@ async fn fetch_within_scope(
 /// `rename_all = "snake_case"`: matches every other tool command, so the
 /// model's snake_case tool-call arguments (`max_chars`, `start_index`) and the
 /// agent loop's injected `turn_id` are accepted without translation.
+// Each parameter is an IPC field the frontend sends by name, so folding them
+// into a struct would change the tool-call contract rather than simplify it.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command(rename_all = "snake_case")]
 pub async fn tool_web_fetch(
     app: tauri::AppHandle,
@@ -1013,6 +1016,7 @@ pub async fn tool_web_fetch(
     start_index: Option<usize>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<FetchResult, String> {
     permissions::request_permission(
         &app,
@@ -1025,6 +1029,16 @@ pub async fn tool_web_fetch(
         None,
     )
     .await?;
+
+    // After the gate, so a refused request records nothing, and before the
+    // request, because a call that was permitted and then failed may still
+    // have reached the network — the same ordering `egress::send` uses for
+    // the destination it records.
+    checkpoints::record_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        checkpoints::ExternalEffectKind::Network,
+    )?;
 
     let settings = load_settings_impl(&settings_file_path(&app)?)?;
 
@@ -1522,6 +1536,7 @@ pub async fn tool_web_search(
     count: Option<usize>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<Vec<SearchResult>, String> {
     permissions::request_permission(
         &app,
@@ -1534,6 +1549,16 @@ pub async fn tool_web_search(
         None,
     )
     .await?;
+
+    // After the gate, so a refused request records nothing, and before the
+    // request, because a call that was permitted and then failed may still
+    // have reached the network — the same ordering `egress::send` uses for
+    // the destination it records.
+    checkpoints::record_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        checkpoints::ExternalEffectKind::Network,
+    )?;
 
     let settings = load_settings_impl(&settings_file_path(&app)?)?;
     let brave_key = if settings.search_provider == SearchProvider::Brave {
