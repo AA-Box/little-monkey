@@ -734,6 +734,9 @@ pub async fn generation_run(
                 &read_state::<Vec<generation::PartAsset>>(&app, PARTS_FILE)?,
                 &validated.component_overrides,
             )?;
+            // After the overrides, because a ControlNet or IP-Adapter can be
+            // chosen for this run rather than belonging to the model entry.
+            generation::validate_conditioning(&spec, &validated)?;
             let media = if validated.task.is_speech() {
                 let _ = app.emit(
                     "studio://progress",

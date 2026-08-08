@@ -45,6 +45,10 @@ const MAX_INIT_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 /// LoRAs per generation. The engine accepts an unbounded list; this exists so
 /// one request cannot make the engine open an arbitrary number of files.
 const MAX_LORAS: usize = 32;
+/// Reference images per generation. Each one is decoded and held in memory
+/// beside the others, so the bound is on the whole set rather than only on the
+/// size of any single image.
+const MAX_REF_IMAGES: usize = 8;
 /// A 15 s 2K clip with audio stays far under this; it exists so a runaway
 /// server response can never be buffered without bound.
 const MAX_MEDIA_BYTES: usize = 256 * 1024 * 1024;
@@ -79,10 +83,33 @@ pub enum ComponentSlot {
     /// A large language model used as the text encoder (Qwen3-VL for MiniMax
     /// H3, Qwen2.5-VL for Qwen Image, Mistral for FLUX.2).
     Llm,
+    /// The vision tower beside an [`Self::Llm`] text encoder, for the
+    /// architectures whose LLM reads an image as well as the prompt.
+    LlmVision,
+    /// A second, unconditional diffusion model some distilled architectures
+    /// pair with the main one.
+    UncondDiffusionModel,
+    /// LTXAV's embeddings connectors.
+    EmbeddingsConnectors,
+    /// AnimateDiff's motion module, which is what turns an SD 1.5 checkpoint
+    /// into a video model.
+    MotionModule,
     Vae,
     /// Models that generate synchronized audio decode it through its own VAE.
     AudioVae,
     Taesd,
+    /// Structural conditioning: the run supplies a pre-processed control image
+    /// (a depth map, a pose skeleton, an edge map) and the sampler is held to
+    /// it. Loading this is what makes `control_image` mean anything.
+    ControlNet,
+    /// Reference-image conditioning. `--ip-adapter` requires
+    /// [`Self::ClipVision`] alongside it — see [`validate_model_spec`].
+    IpAdapter,
+    /// Subject identity from reference photographs (PhotoMaker).
+    PhotoMaker,
+    /// Subject identity, the FLUX-family alternative to
+    /// [`Self::PhotoMaker`].
+    PulidWeights,
     /// Speech only: the multimodal projector beside a TTS backbone. Belongs to
     /// a different engine than every slot above it.
     Mmproj,
@@ -104,11 +131,32 @@ impl ComponentSlot {
             Self::ClipVision => "--clip_vision",
             Self::T5xxl => "--t5xxl",
             Self::Llm => "--llm",
+            Self::LlmVision => "--llm_vision",
+            Self::UncondDiffusionModel => "--uncond-diffusion-model",
+            Self::EmbeddingsConnectors => "--embeddings-connectors",
+            Self::MotionModule => "--motion-module",
             Self::Vae => "--vae",
             Self::AudioVae => "--audio-vae",
             Self::Taesd => "--taesd",
+            Self::ControlNet => "--control-net",
+            Self::IpAdapter => "--ip-adapter",
+            Self::PhotoMaker => "--photo-maker",
+            Self::PulidWeights => "--pulid-weights",
             Self::Mmproj => "--mmproj",
             Self::Vocoder => "--model-vocoder",
+        }
+    }
+
+    /// Whether filling this slot enables a per-run conditioning image rather
+    /// than contributing to the model itself. The generation form asks this to
+    /// decide which conditioning inputs to offer, and [`validate_request`] asks
+    /// it to refuse an image the loaded engine would silently discard.
+    pub fn conditioning_image(self) -> Option<ConditioningImage> {
+        match self {
+            Self::ControlNet => Some(ConditioningImage::Control),
+            Self::IpAdapter => Some(ConditioningImage::IpAdapter),
+            Self::PhotoMaker | Self::PulidWeights => Some(ConditioningImage::Reference),
+            _ => None,
         }
     }
 
@@ -118,6 +166,20 @@ impl ComponentSlot {
     pub fn is_speech_only(self) -> bool {
         matches!(self, Self::Mmproj | Self::Vocoder)
     }
+}
+
+/// Which per-run image a loaded conditioning slot unlocks. Named rather than
+/// boolean because the three are not interchangeable: the engine reads them
+/// from three different request fields with three different meanings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditioningImage {
+    /// `control_image`: structure to follow.
+    Control,
+    /// `ip_adapter_image`: style/content to borrow.
+    IpAdapter,
+    /// `ref_images`: subjects to keep consistent.
+    Reference,
 }
 
 /// One downloadable weight file filling one slot.
@@ -473,6 +535,15 @@ pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
     {
         return Err("A model needs a sampling method".to_string());
     }
+    // The engine's own constraint: an IP-Adapter reads its reference image
+    // through a CLIP vision tower, and `--ip-adapter` without `--clip_vision`
+    // fails inside `sd-server` at load. Caught here so the model is rejected
+    // while it is being added rather than the first time it is run.
+    let slots: BTreeSet<ComponentSlot> =
+        spec.components.iter().map(|component| component.slot).collect();
+    if slots.contains(&ComponentSlot::IpAdapter) && !slots.contains(&ComponentSlot::ClipVision) {
+        return Err("An IP-Adapter also needs a CLIP vision encoder".to_string());
+    }
     for argument in &spec.extra_launch_args {
         if argument.trim().is_empty() || argument.len() > 256 {
             return Err("Engine arguments must be short and non-empty".to_string());
@@ -708,6 +779,34 @@ pub struct GenerationRequest {
     /// Base64 PNG/JPEG starting frame, required by the image-driven tasks.
     #[serde(default)]
     pub init_image_base64: Option<String>,
+    /// Base64 single-channel mask over [`Self::init_image_base64`]: white is
+    /// repainted, black is kept. This is inpainting — it is meaningless without
+    /// an init image to mask, and [`validate_request`] enforces that rather
+    /// than letting the engine silently ignore it.
+    #[serde(default)]
+    pub mask_image_base64: Option<String>,
+    /// Base64 *pre-processed* control image — a depth map, a pose skeleton, a
+    /// Canny edge map. Not a photograph: the engine applies no detector, so
+    /// whatever is sent is taken as the structure to follow verbatim.
+    #[serde(default)]
+    pub control_image_base64: Option<String>,
+    /// How strongly the control image binds. `None` leaves the engine default.
+    #[serde(default)]
+    pub control_strength: Option<f64>,
+    /// Base64 reference image whose style/content is borrowed.
+    #[serde(default)]
+    pub ip_adapter_image_base64: Option<String>,
+    /// How strongly the IP-Adapter image applies. `None` leaves the default.
+    #[serde(default)]
+    pub ip_adapter_strength: Option<f64>,
+    /// Base64 reference images for the identity- and edit-conditioned
+    /// architectures (PhotoMaker, PuLID, Kontext, Qwen-Edit).
+    #[serde(default)]
+    pub ref_images_base64: Vec<String>,
+    /// Whether each reference image gets its own index rather than sharing
+    /// one. Architecture-specific; the engine's own default is `false`.
+    #[serde(default)]
+    pub increase_ref_index: bool,
     /// LoRAs to apply, in order. Any model can take any number.
     #[serde(default)]
     pub loras: Vec<LoraSelection>,
@@ -799,6 +898,59 @@ pub fn apply_component_overrides(
         }
     }
     Ok(effective)
+}
+
+/// Refuses a conditioning image the loaded engine has no weights to read it
+/// with.
+///
+/// Separate from [`validate_request`] because it is the only check that needs
+/// the *effective* spec: a ControlNet can arrive from the model entry or from a
+/// per-run component override, and overrides are resolved after the request is
+/// validated. Called by the run command once both are known.
+///
+/// This matters more than a normal input check. `sd-server` accepts
+/// `control_image` whether or not `--control-net` was passed and simply ignores
+/// it when it was not, so the failure is a perfectly ordinary-looking image
+/// that took three minutes to sample and followed none of the structure it was
+/// given — with nothing anywhere saying why.
+pub fn validate_conditioning(
+    spec: &GenerationModelSpec,
+    request: &GenerationRequest,
+) -> Result<(), String> {
+    let available: BTreeSet<ConditioningImage> = spec
+        .components
+        .iter()
+        .filter_map(|component| component.slot.conditioning_image())
+        .collect();
+    let required = [
+        (
+            request.control_image_base64.is_some(),
+            ConditioningImage::Control,
+            "a control image",
+            "ControlNet",
+        ),
+        (
+            request.ip_adapter_image_base64.is_some(),
+            ConditioningImage::IpAdapter,
+            "a reference image",
+            "IP-Adapter",
+        ),
+        (
+            !request.ref_images_base64.is_empty(),
+            ConditioningImage::Reference,
+            "reference images",
+            "PhotoMaker or PuLID",
+        ),
+    ];
+    for (sent, kind, what, weights) in required {
+        if sent && !available.contains(&kind) {
+            return Err(format!(
+                "{} has no {weights} weights, so {what} would be ignored. Add one to the model or pick one for this run.",
+                spec.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `-1` means "whatever the model was trained with", which is the only sane
@@ -916,6 +1068,49 @@ pub fn validate_request(
         _ => {}
     }
 
+    // A mask names which pixels of the source image to repaint, so without one
+    // there is nothing for it to address. The engine would take the pair and
+    // ignore the mask, which reads as "inpainting is broken" rather than as the
+    // request being incomplete.
+    if request.mask_image_base64.is_some() && request.init_image_base64.is_none() {
+        return Err("A mask needs a source image to paint over".to_string());
+    }
+    for (label, image) in [
+        ("Mask", &request.mask_image_base64),
+        ("Control image", &request.control_image_base64),
+        ("Reference image", &request.ip_adapter_image_base64),
+    ] {
+        if image
+            .as_ref()
+            .is_some_and(|encoded| encoded.len() > MAX_INIT_IMAGE_BYTES)
+        {
+            return Err(format!("{label} exceeds its size limit"));
+        }
+    }
+    if request.ref_images_base64.len() > MAX_REF_IMAGES {
+        return Err(format!(
+            "At most {MAX_REF_IMAGES} reference images can be used at once"
+        ));
+    }
+    for image in &request.ref_images_base64 {
+        if image.trim().is_empty() {
+            return Err("A reference image is empty".to_string());
+        }
+        if image.len() > MAX_INIT_IMAGE_BYTES {
+            return Err("Reference image exceeds its size limit".to_string());
+        }
+    }
+    for (label, strength) in [
+        ("Control strength", request.control_strength),
+        ("Reference strength", request.ip_adapter_strength),
+    ] {
+        if let Some(strength) = strength {
+            if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+                return Err(format!("{label} must be between 0 and 1"));
+            }
+        }
+    }
+
     if request.loras.len() > MAX_LORAS {
         return Err(format!("At most {MAX_LORAS} LoRAs can be applied at once"));
     }
@@ -1022,6 +1217,28 @@ pub fn request_body(spec: &GenerationModelSpec, request: &GenerationRequest) -> 
     }
     if let Some(image) = &request.init_image_base64 {
         body["init_image"] = json!(image);
+    }
+    if let Some(mask) = &request.mask_image_base64 {
+        body["mask_image"] = json!(mask);
+    }
+    if let Some(control) = &request.control_image_base64 {
+        body["control_image"] = json!(control);
+    }
+    if let Some(strength) = request.control_strength {
+        body["control_strength"] = json!(strength);
+    }
+    if let Some(reference) = &request.ip_adapter_image_base64 {
+        body["ip_adapter_image"] = json!(reference);
+    }
+    if let Some(strength) = request.ip_adapter_strength {
+        body["ip_adapter_strength"] = json!(strength);
+    }
+    if !request.ref_images_base64.is_empty() {
+        body["ref_images"] = json!(request.ref_images_base64);
+        // Only sent alongside the images it describes: on its own it would ask
+        // an engine build that predates the field for something new on every
+        // ordinary run.
+        body["increase_ref_index"] = json!(request.increase_ref_index);
     }
     if request.task.is_video() {
         body["video_frames"] = json!(request.video_frames);
@@ -1828,12 +2045,23 @@ pub fn validate_remote_request(
     normalized.fps = 1;
     normalized.video_frames = 1;
     // Nothing below reaches a remote engine: LoRAs are local files, component
-    // overrides name local weight slots, and hires is an `sd-server` pass. They
-    // are dropped rather than rejected so switching the picker from a library
-    // model to a backend does not invalidate the controls already set.
+    // overrides name local weight slots, hires is an `sd-server` pass, and the
+    // conditioning images are `sd-server` request fields that neither the
+    // ComfyUI workflow encoder nor the OpenAI-compatible one emits. They are
+    // dropped rather than rejected so switching the picker from a library model
+    // to a backend does not invalidate the controls already set — but they are
+    // dropped *here*, so a run can never appear to be conditioned by an image
+    // the backend was never sent.
     normalized.loras.clear();
     normalized.component_overrides.clear();
     normalized.hires = None;
+    normalized.mask_image_base64 = None;
+    normalized.control_image_base64 = None;
+    normalized.control_strength = None;
+    normalized.ip_adapter_image_base64 = None;
+    normalized.ip_adapter_strength = None;
+    normalized.ref_images_base64.clear();
+    normalized.increase_ref_index = false;
     Ok(normalized)
 }
 
@@ -1975,6 +2203,13 @@ mod tests {
             speaker_file: None,
             language: None,
             init_image_base64: None,
+            mask_image_base64: None,
+            control_image_base64: None,
+            control_strength: None,
+            ip_adapter_image_base64: None,
+            ip_adapter_strength: None,
+            ref_images_base64: Vec::new(),
+            increase_ref_index: false,
             loras: Vec::new(),
             component_overrides: Vec::new(),
         }
@@ -2320,6 +2555,233 @@ mod tests {
         // A model that declares no flow shift must leave the field absent
         // rather than pinning a value the backend would otherwise choose.
         assert!(body["sample_params"].get("flow_shift").is_none());
+    }
+
+    fn image_model() -> GenerationModelSpec {
+        let mut spec = model(
+            "sdxl-mine",
+            vec![GenerationTask::TextToImage, GenerationTask::ImageToImage],
+            FrameGrid::DownTo4nPlus1,
+        );
+        spec.components[0].slot = ComponentSlot::Checkpoint;
+        spec
+    }
+
+    fn image_request(task: GenerationTask) -> GenerationRequest {
+        let mut request = video_request(task);
+        request.model_id = "sdxl-mine".to_string();
+        request.width = 1024;
+        request.height = 1024;
+        request
+    }
+
+    fn local_component(slot: ComponentSlot, name: &str) -> ModelComponent {
+        ModelComponent {
+            slot,
+            source: ComponentSource::LocalFile {
+                path: absolute(&["weights", name]),
+            },
+            size_bytes: 1,
+        }
+    }
+
+    /// Inpainting, ControlNet and the reference-image conditioners all reach
+    /// the engine as extra fields on the ordinary request, so the check is that
+    /// each one is carried verbatim and that none of them appears when it was
+    /// not asked for — an engine build predating a field must not be sent it on
+    /// every ordinary run.
+    #[test]
+    fn conditioning_images_reach_the_request_body_only_when_supplied() {
+        let sdxl = image_model();
+        let mut request = image_request(GenerationTask::ImageToImage);
+        request.init_image_base64 = Some("aW5pdA==".to_string());
+        request.mask_image_base64 = Some("bWFzaw==".to_string());
+        request.control_image_base64 = Some("Y29udHJvbA==".to_string());
+        request.control_strength = Some(0.65);
+        request.ip_adapter_image_base64 = Some("cmVm".to_string());
+        request.ip_adapter_strength = Some(0.4);
+        request.ref_images_base64 = vec!["b25l".to_string(), "dHdv".to_string()];
+        request.increase_ref_index = true;
+
+        let normalized = validate_request(&sdxl, &request).unwrap();
+        let body = request_body(&sdxl, &normalized);
+        assert_eq!(body["mask_image"], json!("bWFzaw=="));
+        assert_eq!(body["control_image"], json!("Y29udHJvbA=="));
+        assert_eq!(body["control_strength"], json!(0.65));
+        assert_eq!(body["ip_adapter_image"], json!("cmVm"));
+        assert_eq!(body["ip_adapter_strength"], json!(0.4));
+        assert_eq!(body["ref_images"], json!(["b25l", "dHdv"]));
+        assert_eq!(body["increase_ref_index"], json!(true));
+
+        let plain = request_body(&sdxl, &image_request(GenerationTask::TextToImage));
+        for absent in [
+            "mask_image",
+            "control_image",
+            "control_strength",
+            "ip_adapter_image",
+            "ip_adapter_strength",
+            "ref_images",
+            "increase_ref_index",
+        ] {
+            assert!(plain.get(absent).is_none(), "{absent} was sent unasked");
+        }
+    }
+
+    #[test]
+    fn conditioning_inputs_are_bounded_and_a_mask_needs_something_to_mask() {
+        let sdxl = image_model();
+
+        // The engine takes the pair and ignores the mask, so this has to be
+        // caught here or inpainting silently degrades to plain img2img.
+        let mut orphan_mask = image_request(GenerationTask::TextToImage);
+        orphan_mask.mask_image_base64 = Some("bWFzaw==".to_string());
+        assert!(validate_request(&sdxl, &orphan_mask).is_err());
+
+        let mut wild_strength = image_request(GenerationTask::TextToImage);
+        wild_strength.control_strength = Some(1.5);
+        assert!(validate_request(&sdxl, &wild_strength).is_err());
+        wild_strength.control_strength = Some(f64::NAN);
+        assert!(validate_request(&sdxl, &wild_strength).is_err());
+
+        let mut too_many_refs = image_request(GenerationTask::TextToImage);
+        too_many_refs.ref_images_base64 = vec!["b25l".to_string(); MAX_REF_IMAGES + 1];
+        assert!(validate_request(&sdxl, &too_many_refs).is_err());
+
+        let mut huge = image_request(GenerationTask::TextToImage);
+        huge.control_image_base64 = Some("A".repeat(MAX_INIT_IMAGE_BYTES + 1));
+        assert!(validate_request(&sdxl, &huge).is_err());
+    }
+
+    /// `sd-server` accepts `control_image` with no `--control-net` loaded and
+    /// quietly ignores it, so the only symptom would be a three-minute render
+    /// that followed none of the structure it was given.
+    #[test]
+    fn a_conditioning_image_is_refused_when_its_weights_are_not_loaded() {
+        let plain = image_model();
+        let mut request = image_request(GenerationTask::TextToImage);
+        request.control_image_base64 = Some("Y29udHJvbA==".to_string());
+        assert!(validate_conditioning(&plain, &request).is_err());
+
+        let mut with_control_net = plain.clone();
+        with_control_net.components.push(local_component(
+            ComponentSlot::ControlNet,
+            "canny.safetensors",
+        ));
+        assert!(validate_conditioning(&with_control_net, &request).is_ok());
+
+        // A ControlNet does not stand in for an IP-Adapter: the three fields
+        // are read by three different sets of weights.
+        let mut reference = image_request(GenerationTask::TextToImage);
+        reference.ip_adapter_image_base64 = Some("cmVm".to_string());
+        assert!(validate_conditioning(&with_control_net, &reference).is_err());
+
+        let mut identities = image_request(GenerationTask::TextToImage);
+        identities.ref_images_base64 = vec!["b25l".to_string()];
+        assert!(validate_conditioning(&with_control_net, &identities).is_err());
+        let mut with_photo_maker = plain.clone();
+        with_photo_maker.components.push(local_component(
+            ComponentSlot::PhotoMaker,
+            "photomaker.safetensors",
+        ));
+        assert!(validate_conditioning(&with_photo_maker, &identities).is_ok());
+
+        // Nothing sent, nothing to refuse, whatever is loaded.
+        assert!(validate_conditioning(&plain, &image_request(GenerationTask::TextToImage)).is_ok());
+    }
+
+    /// `--ip-adapter` reads its reference through a CLIP vision tower and
+    /// `sd-server` fails at load without one, so the model is rejected while it
+    /// is being added rather than the first time it is run.
+    #[test]
+    fn an_ip_adapter_model_must_also_carry_a_clip_vision_encoder() {
+        let mut spec = image_model();
+        spec.components.push(local_component(
+            ComponentSlot::IpAdapter,
+            "ip-adapter.safetensors",
+        ));
+        assert!(validate_model_spec(&spec).is_err());
+
+        spec.components.push(local_component(
+            ComponentSlot::ClipVision,
+            "clip-vision.safetensors",
+        ));
+        assert!(validate_model_spec(&spec).is_ok());
+    }
+
+    /// A remote backend is sent a workflow or an OpenAI-compatible body, and
+    /// neither encoder emits any of these fields. Dropping them here is what
+    /// keeps a run from looking conditioned by an image the backend never saw.
+    #[test]
+    fn conditioning_never_survives_the_hop_to_a_remote_backend() {
+        let backend = RemoteBackend {
+            id: "comfy".to_string(),
+            label: "My ComfyUI".to_string(),
+            kind: RemoteBackendKind::ComfyUi,
+            base_url: "http://127.0.0.1:8188".to_string(),
+            provider_id: None,
+            workflow_template: None,
+            supports_editing: false,
+            models: vec!["sd_xl_base_1.0.safetensors".to_string()],
+        };
+        let mut request = image_request(GenerationTask::TextToImage);
+        request.mask_image_base64 = Some("bWFzaw==".to_string());
+        request.control_image_base64 = Some("Y29udHJvbA==".to_string());
+        request.control_strength = Some(0.5);
+        request.ip_adapter_image_base64 = Some("cmVm".to_string());
+        request.ip_adapter_strength = Some(0.5);
+        request.ref_images_base64 = vec!["b25l".to_string()];
+        request.increase_ref_index = true;
+
+        let normalized = validate_remote_request(&backend, &request).unwrap();
+        assert!(normalized.mask_image_base64.is_none());
+        assert!(normalized.control_image_base64.is_none());
+        assert!(normalized.control_strength.is_none());
+        assert!(normalized.ip_adapter_image_base64.is_none());
+        assert!(normalized.ip_adapter_strength.is_none());
+        assert!(normalized.ref_images_base64.is_empty());
+        assert!(!normalized.increase_ref_index);
+    }
+
+    /// Every new slot is a flag `sd-server` actually accepts; a typo here is an
+    /// engine that refuses to launch, which is why the mapping is asserted
+    /// rather than trusted.
+    #[test]
+    fn the_conditioning_and_exotic_slots_map_to_real_engine_flags() {
+        for (slot, flag) in [
+            (ComponentSlot::ControlNet, "--control-net"),
+            (ComponentSlot::IpAdapter, "--ip-adapter"),
+            (ComponentSlot::PhotoMaker, "--photo-maker"),
+            (ComponentSlot::PulidWeights, "--pulid-weights"),
+            (ComponentSlot::LlmVision, "--llm_vision"),
+            (ComponentSlot::UncondDiffusionModel, "--uncond-diffusion-model"),
+            (ComponentSlot::EmbeddingsConnectors, "--embeddings-connectors"),
+            (ComponentSlot::MotionModule, "--motion-module"),
+        ] {
+            assert_eq!(slot.flag(), flag);
+            // None of them belongs to `llama-tts`, so all of them reach the
+            // `sd-server` command line rather than being skipped.
+            assert!(!slot.is_speech_only(), "{slot:?} was skipped as speech-only");
+        }
+
+        // Only the three that unlock a per-run image say so.
+        assert_eq!(
+            ComponentSlot::ControlNet.conditioning_image(),
+            Some(ConditioningImage::Control)
+        );
+        assert_eq!(
+            ComponentSlot::IpAdapter.conditioning_image(),
+            Some(ConditioningImage::IpAdapter)
+        );
+        assert_eq!(
+            ComponentSlot::PhotoMaker.conditioning_image(),
+            Some(ConditioningImage::Reference)
+        );
+        assert_eq!(
+            ComponentSlot::PulidWeights.conditioning_image(),
+            Some(ConditioningImage::Reference)
+        );
+        assert_eq!(ComponentSlot::Vae.conditioning_image(), None);
+        assert_eq!(ComponentSlot::MotionModule.conditioning_image(), None);
     }
 
     /// The engine ignores prompt-embedded `<lora:...>` tags on purpose, so the
