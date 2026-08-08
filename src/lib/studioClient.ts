@@ -57,10 +57,41 @@ export const CONDITIONING_SLOTS: Partial<Record<ComponentSlot, ConditioningImage
  *  each is decoded and held in memory beside the others. */
 export const MAX_REF_IMAGES = 8;
 
-/** Which conditioning images this set of filled slots unlocks. */
-export function availableConditioning(slots: ComponentSlot[]): Set<ConditioningImage> {
+/** The engine's own feature flag behind each conditioning image. Two gates
+ *  guard the same input for different reasons: the weight slot decides whether
+ *  the loaded model can read the image at all, the flag decides whether this
+ *  build of the engine accepts the field. */
+const CONDITIONING_FEATURES: Record<ConditioningImage, string> = {
+  control: "control_image",
+  ip_adapter: "ip_adapter_image",
+  reference: "ref_images",
+};
+
+/** Whether the running engine accepts a per-run field.
+ *
+ *  With no engine running there is nothing to ask, so everything is offered and
+ *  the backend has the last word — the alternative is a panel whose inputs all
+ *  appear only after the first generation. A running engine that does not name
+ *  the flag is taken at its word: an older build that never heard of
+ *  `mask_image` rejects the whole request when one is sent. */
+export function engineSupports(
+  capabilities: EngineCapabilities | null,
+  feature: string,
+): boolean {
+  return capabilities === null || capabilities.features[feature] === true;
+}
+
+/** Which conditioning images this set of filled slots unlocks, narrowed to the
+ *  ones the running engine still accepts. */
+export function availableConditioning(
+  slots: ComponentSlot[],
+  capabilities: EngineCapabilities | null = null,
+): Set<ConditioningImage> {
   return new Set(
-    slots.map((slot) => CONDITIONING_SLOTS[slot]).filter((kind): kind is ConditioningImage => !!kind),
+    slots
+      .map((slot) => CONDITIONING_SLOTS[slot])
+      .filter((kind): kind is ConditioningImage => !!kind)
+      .filter((kind) => engineSupports(capabilities, CONDITIONING_FEATURES[kind])),
   );
 }
 
@@ -171,6 +202,21 @@ export interface GenerationEntry {
   fps: number;
   durationMs: number;
   createdAtMs: number;
+}
+
+/** What the engine that is running right now reports about itself, read off
+ *  `GET /sdcpp/v1/capabilities`. The lists below it — SAMPLERS, SCHEDULERS,
+ *  UPSCALERS — are only the fallback for before it has ever launched: the
+ *  engine builds these from its own enums, so a stable-diffusion.cpp release
+ *  that adds a sampler is usable the moment it is installed. */
+export interface EngineCapabilities {
+  samplers: string[];
+  schedulers: string[];
+  upscalers: string[];
+  /** `init_image`, `mask_image`, `control_image`, `ip_adapter_image`,
+   *  `ref_images`, `lora`, `hires`, `cancel_queued`… verbatim from the engine,
+   *  so a flag this app has never heard of still arrives. */
+  features: Record<string, boolean>;
 }
 
 export interface GenerationEngineStatus {
@@ -358,6 +404,9 @@ export interface GenerationProgressPayload {
 
 export const studioClient = {
   engineStatus: () => invoke<GenerationEngineStatus>("generation_engine_status"),
+  /** Null when no engine is running, which is every moment before the first
+   *  generation — the caller falls back to the compiled-in lists. */
+  capabilities: () => invoke<EngineCapabilities | null>("generation_capabilities"),
   models: () => invoke<GenerationModel[]>("generation_models"),
   addModel: (spec: GenerationModelSpec) =>
     invoke<GenerationModelSpec[]>("generation_add_model", { spec }),
@@ -507,7 +556,8 @@ export const ALL_TASKS: GenerationTask[] = [
  *  one, and the request is rejected rather than clamped above this. */
 export const MAX_BATCH_COUNT = 8;
 
-/** Samplers the engine accepts, in the order it reports them. */
+/** Samplers the pinned engine accepts, in the order it reports them. Used only
+ *  until a running engine can be asked — see [EngineCapabilities]. */
 export const SAMPLERS = [
   "euler",
   "euler_a",
@@ -532,7 +582,8 @@ export const SAMPLERS = [
   "lms",
 ];
 
-/** Sigma schedules the engine accepts, in the order it reports them. */
+/** Sigma schedules the pinned engine accepts, in the order it reports them.
+ *  The fallback for [EngineCapabilities.schedulers]. */
 export const SCHEDULERS = [
   "discrete",
   "normal",
@@ -553,10 +604,12 @@ export const SCHEDULERS = [
   "beta",
 ];
 
-/** The engine's built-in upscalers. Offered as suggestions rather than a
- *  closed list: a model dropped in the directory passed to
+/** The engine's built-in upscalers, as the fallback for
+ *  [EngineCapabilities.upscalers] — which is the same list plus whatever the
+ *  engine found on disk. Offered as suggestions rather than a closed list
+ *  either way: a model dropped in the directory passed to
  *  `--hires-upscalers-dir` joins them under its own name, which is how an
- *  R-ESRGAN becomes selectable. */
+ *  R-ESRGAN becomes selectable before the engine has ever run. */
 export const UPSCALERS = [
   "Latent",
   "Latent (nearest)",
