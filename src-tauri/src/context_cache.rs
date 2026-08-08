@@ -682,6 +682,81 @@ pub enum PrefixSharing {
     Unsupported { reason: &'static str },
 }
 
+/// What a process class does when its context fills (roadmap K11).
+///
+/// Two outcomes, because there are only two honest ones once the context is
+/// full: keep going with less of the conversation, or stop. A third — carry on
+/// and let the runtime silently drop the oldest turns — is what
+/// `ContextFailureClass::CacheExhaustedContextShift` exists to *report*, and it
+/// is the outcome this policy exists to replace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "action")]
+pub enum ContextPolicy {
+    /// Summarize the oldest turns and continue. The conversation survives with
+    /// less detail.
+    Compact { rationale: &'static str },
+    /// Stop, and say so. The work does not continue in a degraded form.
+    Refuse { rationale: &'static str },
+}
+
+impl ContextPolicy {
+    #[must_use]
+    pub fn compacts(&self) -> bool {
+        matches!(self, ContextPolicy::Compact { .. })
+    }
+
+    #[must_use]
+    pub fn rationale(&self) -> &'static str {
+        match self {
+            ContextPolicy::Compact { rationale } | ContextPolicy::Refuse { rationale } => rationale,
+        }
+    }
+}
+
+/// The stated policy per class.
+///
+/// **Every arm is argued from that class's own definition in
+/// [`crate::run_protocol::ProcessClass`], not from a preference.** The classes
+/// already say who is waiting and what a deferral costs, and those two facts
+/// decide the answer — which is the whole reason the policy is per class rather
+/// than a global setting.
+pub fn context_policy(class: crate::run_protocol::ProcessClass) -> ContextPolicy {
+    use crate::run_protocol::ProcessClass;
+    match class {
+        // "Something is blocked on the answer: a person at a desktop turn."
+        // Refusing throws away a conversation the person is in the middle of and
+        // can still see on screen; compacting costs them the oldest detail. The
+        // person is present to notice a bad summary and to say so, which is
+        // exactly what nobody downstream of the other three classes can do.
+        ProcessClass::Interactive => ContextPolicy::Compact {
+            rationale: "Someone is waiting on this turn and can see the conversation, so it continues with the oldest exchanges summarized rather than ending. Compaction loses detail, and it is visible when it does.",
+        },
+        // "Submitted work that wants throughput. Nobody is waiting on any
+        // individual turn." Nobody is watching either, and that is the point: a
+        // batch job that quietly compacts produces a result whose degradation
+        // nobody sees until it is acted on. It still compacts rather than
+        // failing a long batch outright — throughput is what the class is for —
+        // but the compaction is a recorded fact about the run, not a silent one.
+        ProcessClass::Batch => ContextPolicy::Compact {
+            rationale: "Finishing the batch is what this class is for, so it continues with the oldest exchanges summarized — and the compaction is recorded on the run, because nobody is watching this turn to notice the result got thinner.",
+        },
+        // "Opportunistic. Runs when there is room, and is the first thing asked
+        // to step aside." A process that is already the first to yield should
+        // not spend a scarce context window on a degraded answer. Stopping is
+        // cheap here in a way it is nowhere else.
+        ProcessClass::Background => ContextPolicy::Refuse {
+            rationale: "Nothing is waiting on this, and it is already the first work asked to step aside. It stops rather than continuing on a summary, because a degraded background answer costs more to trust than it costs to run again.",
+        },
+        // "May always be deferred, because the next occurrence will come around
+        // anyway." The class's own definition is the argument: a compacted
+        // maintenance pass would write a worse result into a place a later,
+        // whole one would have written a good one.
+        ProcessClass::Maintenance => ContextPolicy::Refuse {
+            rationale: "This is scheduled housekeeping, and the next occurrence comes around anyway. It stops rather than writing a result derived from a summary, which a later whole run would have done properly.",
+        },
+    }
+}
+
 /// Whether a per-process context budget can be *enforced* against this runtime,
 /// which is a different question from whether one is set.
 ///
@@ -747,6 +822,23 @@ pub fn check_context_budget(prompt_tokens: u64, budget: Option<u64>) -> ContextB
 }
 
 impl ContextBudgetVerdict {
+    /// The refusal, with the class's stated policy appended when the class is
+    /// known (roadmap K11).
+    ///
+    /// The policy is what turns a bare "over budget" into an actionable answer:
+    /// a class that compacts is being told to compact and retry, and one that
+    /// refuses is being told this is the end of the work. `None` for the class
+    /// means the process has no run to derive one from, and the refusal stays the
+    /// bare one rather than assuming a policy.
+    #[must_use]
+    pub fn refusal_under(&self, policy: Option<ContextPolicy>) -> Option<String> {
+        let refusal = self.refusal()?;
+        Some(match policy {
+            Some(policy) => format!("{refusal} {}", policy.rationale()),
+            None => refusal,
+        })
+    }
+
     /// The refusal a user sees. Names both numbers and what to do, because this
     /// is a limit the user configured and can raise.
     #[must_use]
@@ -1214,6 +1306,61 @@ mod tests {
         let notes = context_cache_notes(ContextRuntimeKind::Mlx, None);
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("does not expose"));
+    }
+
+    /// The policy per class, argued from each class's own definition. Interactive
+    /// and Batch have someone or something that wants the work *finished*;
+    /// Background and Maintenance are both defined as deferrable, and the
+    /// Maintenance doc says outright that "the next occurrence will come around
+    /// anyway".
+    #[test]
+    fn the_policy_follows_each_classs_own_definition() {
+        use crate::run_protocol::ProcessClass;
+        assert!(context_policy(ProcessClass::Interactive).compacts());
+        assert!(context_policy(ProcessClass::Batch).compacts());
+        assert!(!context_policy(ProcessClass::Background).compacts());
+        assert!(!context_policy(ProcessClass::Maintenance).compacts());
+        // Both arms carry prose. A policy with an empty rationale is a preference
+        // wearing a type.
+        for class in [
+            ProcessClass::Interactive,
+            ProcessClass::Batch,
+            ProcessClass::Background,
+            ProcessClass::Maintenance,
+        ] {
+            assert!(
+                context_policy(class).rationale().len() > 40,
+                "{class:?} states no rationale"
+            );
+        }
+    }
+
+    /// The refusal carries the policy so a caller can act on it, and stays bare
+    /// when the class is unknown rather than assuming one.
+    #[test]
+    fn a_refusal_carries_the_policy_only_when_the_class_is_known() {
+        use crate::run_protocol::ProcessClass;
+        let verdict = check_context_budget(9_000, Some(8_192));
+        let bare = verdict.refusal_under(None).expect("a refusal");
+        assert!(bare.contains("9000"));
+        assert!(!bare.contains("summarized"));
+
+        let interactive = verdict
+            .refusal_under(Some(context_policy(ProcessClass::Interactive)))
+            .expect("a refusal");
+        assert!(interactive.contains("summarized"), "{interactive}");
+
+        let maintenance = verdict
+            .refusal_under(Some(context_policy(ProcessClass::Maintenance)))
+            .expect("a refusal");
+        assert!(maintenance.contains("next occurrence"), "{maintenance}");
+
+        // A verdict that is not a refusal has nothing to say under any policy.
+        assert_eq!(
+            ContextBudgetVerdict::Within
+                .refusal_under(Some(context_policy(ProcessClass::Interactive))),
+            None
+        );
     }
 
     /// No budget is the common case and is not a refusal, and a prompt landing
