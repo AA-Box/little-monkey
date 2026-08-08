@@ -21,16 +21,24 @@ have no entry here.
 
 ---
 
-## 1. Policy-driven model routing
+## 1. Policy-driven model routing *(partially built)*
 
-**Today:** a single hardcoded fallback toggle. Provider failover follows a
-fixed sequence; there is no user-defined policy of any kind.
+**Shipped:** named routing policies authored in **Settings → Automation →
+Dispatch policies**, evaluated top to bottom (the list order *is* the
+precedence), each scoped by task class and constrained by a cost-rate ceiling,
+a measured-latency target, data sensitivity, a tool requirement, and an ordered
+list of preferred models. A matched policy also supplies the turn's failover
+order, replacing the fixed provider sequence. Which policy chose a turn's
+target and why appears as a transcript note and in the panel, alongside every
+rejected model and the reason it lost. Policies only ever select among models
+already configured, and routing runs before the Privacy Firewall, which still
+overrides it.
 
-**Acceptance:** a user can author named routing policies (by task class,
-cost ceiling, latency target, data sensitivity, or tool requirements),
-inspect which policy chose a given turn's target and why, and reorder or
-disable policies without editing code. A policy can never widen a permission
-or bypass the Privacy Firewall.
+**Remaining:** subagent task classes (blocked on lifting target resolution out
+of `agentLoop.ts` — see K9 in [docs/agent-os-roadmap.md](docs/agent-os-roadmap.md)
+for why the import direction forbids it today), routing to managed llama.cpp
+rather than only Ollama for local-only policies, and recording the decision in
+the durable run ledger so "why this target" survives a restart.
 
 ## 2. Real benchmarking *(built)*
 

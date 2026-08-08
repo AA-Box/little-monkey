@@ -84,8 +84,17 @@ import { extractArtifacts } from './artifacts';
 import { useArtifactStore } from '../store/artifactStore';
 import {
   buildModelTargetInventory,
+  type ModelTargetInventory,
   type ModelTargetSnapshot,
 } from './modelTargets';
+import {
+  observedTimeToFirstTokenMs,
+  routeRequest,
+  type RoutingCandidate,
+  type RoutingDecision,
+  type RoutingTaskClass,
+} from './modelRouting';
+import { useRoutingPolicyStore } from '../store/routingPolicyStore';
 import { beginDurableRun, type DurableRunRecorder } from './durableRun';
 import { daemonCancel } from './daemonClient';
 import { requestRunCancellation } from './runProtocol';
@@ -1081,7 +1090,16 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
   const privacyWorkspaceId =
     primaryRoot(useWorkspaceStore.getState().roots)?.path ?? 'global';
   const privacyWireCache: PrivacyWireCache = new Map();
-  let target = await resolveTarget();
+  // Summarization is its own K9 task class: it is bulk, throwaway work that a
+  // user may well want on a cheaper or local model than the conversation
+  // itself. It offers no tools and never carries an image. Not applied to the
+  // global active target — compacting a chat must not change what the next
+  // real turn runs on.
+  let target = routeFromActive(await resolveTarget(), {
+    taskClass: 'summarize',
+    requiresVision: false,
+    requiresTools: false,
+  }).target;
   const result = await applyContextCompaction(history, {
     strategy: settings.contextTrimStrategy,
     contextLimit: useUsageStore.getState().contextLimit,
@@ -1161,9 +1179,12 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
 /** Exported so `issueToPrRunner.ts` can build the `target` field
  * `beginDurableRun` needs for its own headless run, the same reuse reasoning
  * as `resolveTarget` above. */
-export function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot | null {
+/** The live target inventory — the same set the model picker offers. Shared by
+ * `snapshotForResolvedTarget` and the K9 routing candidates below so a target
+ * routing can choose is by construction one the user already configured. */
+function currentTargetInventory(): ModelTargetInventory {
   const state = useModelStore.getState();
-  const inventory = buildModelTargetInventory({
+  return buildModelTargetInventory({
     installed: state.installed,
     active: state.active,
     llamaStatus: state.llamaStatus,
@@ -1173,6 +1194,10 @@ export function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSn
     providerModels: state.providerModels,
     effortByTarget: state.effortByTarget,
   });
+}
+
+export function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot | null {
+  const inventory = currentTargetInventory();
   if (target.kind === 'local') {
     return inventory.targets.find((candidate) => candidate.kind === 'local') ?? null;
   }
@@ -1342,6 +1367,138 @@ function findVisionCandidate(): ResolvedTarget | null {
   if (visionOllama) return { kind: 'ollama', baseUrl: 'http://127.0.0.1:11434', model: visionOllama.name };
 
   return null;
+}
+
+/** Prefix identifying a synthetic dispatch-policy notice (K9 — see
+ * `modelRouting.ts`). Reuses `SWITCH_NOTE_PREFIX` rather than minting a fourth
+ * prefix: a routed target IS a model switch as far as the transcript and
+ * `MessageList`'s rendering are concerned, and the sentence names the policy
+ * that caused it. */
+export const ROUTING_NOTE_PREFIX = SWITCH_NOTE_PREFIX;
+
+/** Turns one inventory snapshot into a routing candidate.
+ *
+ * Vision goes through `resolvedTargetSupportsVision` — the same predicate the
+ * turn itself uses — rather than the snapshot's own field, which is `unknown`
+ * for every provider model (`modelTargets.ts::providerTarget`) while
+ * `visionModels.ts` name patterns plus the user's overrides are what the rest
+ * of the loop actually believes. Deciding it any other way could route an
+ * image to a model `stripImagesForTextOnlyTarget` then strips it for.
+ */
+function routingCandidate(snapshot: ModelTargetSnapshot): RoutingCandidate {
+  const rates = useCostControlStore.getState().rates[snapshot.key];
+  const entries = useCostControlStore.getState().entries;
+  const isLocal = snapshot.kind === 'ollama' ? snapshot.isCloud !== true : snapshot.kind === 'local';
+  const vision = resolvedTargetSupportsVision(
+    snapshot.kind === 'provider'
+      ? { kind: 'provider', providerId: snapshot.providerId, model: snapshot.model }
+      : snapshot.kind === 'ollama'
+        ? { kind: 'ollama', baseUrl: snapshot.baseUrl, model: snapshot.model }
+        : { kind: 'local', baseUrl: '', modelLabel: snapshot.displayName },
+  );
+  return {
+    key: snapshot.key,
+    label: `${snapshot.label} · ${snapshot.displayName}`,
+    isLocal,
+    available: snapshot.availability.status === 'available',
+    toolCalling: snapshot.capabilities.toolCalling.state,
+    vision: vision ? 'yes' : 'no',
+    // A target that costs nothing to run has a rate of zero, not an unknown
+    // one — otherwise every cost ceiling would exclude local models, which is
+    // the opposite of what a cost-conscious policy wants.
+    inputPerMillionUsd: isLocal ? 0 : rates?.inputPerMillionUsd ?? null,
+    outputPerMillionUsd: isLocal ? 0 : rates?.outputPerMillionUsd ?? null,
+    observedTimeToFirstTokenMs: observedTimeToFirstTokenMs(entries, snapshot.key),
+  };
+}
+
+/** Converts an inventory snapshot back into a streamable target.
+ *
+ * ponytail: managed llama.cpp is deliberately not routable — the same
+ * reasoning `buildFailoverChain` and `findLocalOnlyTarget` already document
+ * (making it the active target is not something an automatic switch has a
+ * basis to do unattended), so it is excluded from candidates below and
+ * `local_only` policies are served by non-cloud Ollama exactly as the Privacy
+ * Firewall's own local fallback is. Upgrade path if it is ever wanted: teach
+ * `applyTargetSwitch` the `local` kind and drop the filter.
+ */
+function resolvedFromSnapshot(snapshot: ModelTargetSnapshot): ResolvedTarget | null {
+  if (snapshot.kind === 'provider') {
+    return { kind: 'provider', providerId: snapshot.providerId, model: snapshot.model };
+  }
+  if (snapshot.kind === 'ollama') {
+    return { kind: 'ollama', baseUrl: snapshot.baseUrl, model: snapshot.model };
+  }
+  return null;
+}
+
+export interface RoutingContext {
+  taskClass: RoutingTaskClass;
+  /** True when this turn has an image attached — a hard constraint, never a
+   * policy preference. */
+  requiresVision: boolean;
+  /** True when this surface offers tools to the model. */
+  requiresTools: boolean;
+}
+
+export interface RoutedTarget {
+  /** The target to run. Equal to the `active` argument when no policy applied. */
+  target: ResolvedTarget;
+  decision: RoutingDecision;
+  /** The policy's ordered attempt sequence, chosen target first. Empty when no
+   * policy applied, so the caller keeps its existing failover behavior. */
+  sequence: ResolvedTarget[];
+}
+
+/**
+ * K9 dispatch policy: decides which configured model executes this piece of
+ * work, starting from the target that would have run without any policy.
+ *
+ * Synchronous, and deliberately does **not** apply the choice to global model
+ * state — the caller does that, because a chat turn's routed target should
+ * stick (session affinity, via `applyTargetSwitch`) while a subagent's must
+ * never move the model the user is chatting with.
+ *
+ * Ordering, which is the part that keeps a policy from widening anything:
+ * every caller routes *before* its Privacy Firewall gate, so the routed
+ * target is gated exactly like a hand-picked one and the firewall's own
+ * switch-to-local still overrides a policy. Nothing here reads or writes a
+ * permission mode, a workspace root, or an egress rule.
+ */
+export function routeFromActive(active: ResolvedTarget, context: RoutingContext): RoutedTarget {
+  const policies = useRoutingPolicyStore.getState().policies;
+  const activeKey = snapshotForResolvedTarget(active)?.key ?? null;
+  const snapshots = new Map<string, ModelTargetSnapshot>();
+  const candidates: RoutingCandidate[] = [];
+  for (const snapshot of currentTargetInventory().targets) {
+    if (resolvedFromSnapshot(snapshot) === null && snapshot.key !== activeKey) continue;
+    snapshots.set(snapshot.key, snapshot);
+    candidates.push(routingCandidate(snapshot));
+  }
+
+  const decision = routeRequest(policies, candidates, context, activeKey);
+  useRoutingPolicyStore.getState().recordDecision(decision);
+
+  const sequence: ResolvedTarget[] = [];
+  for (const key of decision.sequence) {
+    // The active target keeps its already-resolved form (it may be managed
+    // llama.cpp, which has no snapshot conversion) rather than being rebuilt.
+    if (key === activeKey) {
+      sequence.push(active);
+      continue;
+    }
+    const snapshot = snapshots.get(key);
+    const resolved = snapshot ? resolvedFromSnapshot(snapshot) : null;
+    if (resolved) sequence.push(resolved);
+  }
+
+  return { target: sequence[0] ?? active, decision, sequence };
+}
+
+/** `routeFromActive` starting from whatever target is currently selected —
+ * the entry point for every surface that dispatches the user's active model.  */
+export async function routeTarget(context: RoutingContext): Promise<RoutedTarget> {
+  return routeFromActive(await resolveTarget(), context);
 }
 
 /** An explicit attachment (from the "+" attach menu), as opposed to a text-derived "@"-mention. */
@@ -1736,7 +1893,21 @@ async function runDaemonAgentTurn(
     const candidate = findVisionCandidate();
     if (candidate) applyTargetSwitch(candidate);
   }
-  let resolvedTarget = await resolveTarget();
+  // Same K9 dispatch policy as the local turn path, and in the same position:
+  // after the vision auto-switch, before the Privacy Firewall gate below.
+  const routed = routeFromActive(await resolveTarget(), {
+    taskClass: 'chat',
+    requiresVision: images.length > 0,
+    requiresTools: true,
+  });
+  let resolvedTarget = routed.target;
+  if (routed.decision.changedFromActive) {
+    applyTargetSwitch(resolvedTarget);
+    store.addMessage(sessionId, {
+      role: 'system',
+      content: `${ROUTING_NOTE_PREFIX} ${routed.decision.reason}`,
+    });
+  }
   let targetSnapshot = snapshotForResolvedTarget(resolvedTarget);
   if (!targetSnapshot) {
     throw new Error('The selected model target could not be frozen for the resident runner.');
@@ -2209,7 +2380,21 @@ async function runAgentTurnBody(
   // once per turn and only advanced (never rebuilt) on a pre-first-token
   // failure, so a target that succeeds stays in use for every subsequent
   // tool round trip within this same turn.
-  let primaryTarget = await resolveTarget();
+  //
+  // K9 dispatch policy runs here: after the vision auto-switch (so a policy
+  // sees the target the user would actually have run) and before the Privacy
+  // Firewall gate below (so the firewall still owns the final say over a
+  // routed target, including its own switch-to-local).
+  const routed = await routeTarget({
+    taskClass: 'chat',
+    requiresVision: requireVision,
+    requiresTools: true,
+  });
+  let primaryTarget = routed.target;
+  if (routed.decision.changedFromActive) {
+    applyTargetSwitch(primaryTarget);
+    addMessage({ role: 'system', content: `${ROUTING_NOTE_PREFIX} ${routed.decision.reason}` });
+  }
 
   // Distinct from the block above: that one is about a NEW image attached
   // THIS turn; this one is an OLDER image already sitting in history from a
@@ -2294,20 +2479,34 @@ async function runAgentTurnBody(
 
   const initialProviderTarget =
     primaryTarget.kind === 'provider' ? primaryTarget : null;
-  let sequence: ResolvedTarget[] =
-    settings.autoFailoverEnabled && initialProviderTarget
-      ? [
-          initialProviderTarget,
-          ...buildFailoverChain(requireVision).filter(
-            (candidate) =>
-              !(
-                candidate.kind === 'provider'
-                && candidate.providerId === initialProviderTarget.providerId
-                && candidate.model === initialProviderTarget.model
-              ),
+  // A matched K9 policy supplies this turn's attempt order, replacing the
+  // fixed provider chain — "failover follows a fixed sequence" was the other
+  // half of what K9 owed. Ignored when the Privacy Firewall redirected this
+  // turn (it reassigns `primaryTarget` above, and its decision outranks any
+  // policy), and still gated on the same `autoFailoverEnabled` toggle, so
+  // turning failover off means one attempt whether a policy matched or not.
+  const policySequence =
+    primaryTarget === routed.target && routed.sequence.length > 0 ? routed.sequence : null;
+  let sequence: ResolvedTarget[];
+  if (!settings.autoFailoverEnabled) {
+    sequence = [primaryTarget];
+  } else if (policySequence) {
+    sequence = policySequence;
+  } else if (initialProviderTarget) {
+    sequence = [
+      initialProviderTarget,
+      ...buildFailoverChain(requireVision).filter(
+        (candidate) =>
+          !(
+            candidate.kind === 'provider'
+            && candidate.providerId === initialProviderTarget.providerId
+            && candidate.model === initialProviderTarget.model
           ),
-        ]
-      : [primaryTarget];
+      ),
+    ];
+  } else {
+    sequence = [primaryTarget];
+  }
   let sequenceIndex = 0;
   let target = sequence[0];
 

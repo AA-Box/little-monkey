@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Plus, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronUp, Plus, Trash2 } from "lucide-react";
 import { Button, StatusPill } from "../ui";
 import {
   MAX_CHECKPOINT_RETENTION,
@@ -19,6 +19,13 @@ import { useCliInstallStore } from "../../store/cliInstallStore";
 import { providerModelKey } from "../../lib/visionModels";
 import { useT } from "../../lib/i18n";
 import { errorMessage } from "../../lib/errors";
+import {
+  ROUTING_TASK_CLASSES,
+  type RoutingPolicy,
+  type RoutingTaskClass,
+} from "../../lib/modelRouting";
+import { buildModelTargetInventory } from "../../lib/modelTargets";
+import { useRoutingPolicyStore } from "../../store/routingPolicyStore";
 
 /** No shared toggle-switch component exists in `ui/` yet — this one is small and specific enough to keep local rather than promote prematurely. */
 function Toggle({
@@ -532,6 +539,298 @@ function CliInstallSection() {
   );
 }
 
+/** Numeric policy field: empty input means "no ceiling", which is a real,
+ * distinct state from zero — a `0` ceiling would exclude every paid model. */
+function CeilingInput({
+  value,
+  onChange,
+  placeholder,
+  step,
+}: {
+  value: number | null;
+  onChange: (value: number | null) => void;
+  placeholder: string;
+  step?: string;
+}) {
+  return (
+    <input
+      type="number"
+      min={0}
+      step={step ?? "0.01"}
+      value={value === null ? "" : value}
+      placeholder={placeholder}
+      onChange={(event) => {
+        const parsed = Number(event.target.value);
+        onChange(
+          event.target.value === "" || !Number.isFinite(parsed) || parsed <= 0 ? null : parsed,
+        );
+      }}
+      className="h-8 w-28 rounded-md border border-border bg-surface px-2 text-right text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+    />
+  );
+}
+
+/**
+ * K9 (docs/agent-os-roadmap.md) — authoring surface for dispatch policies.
+ *
+ * The list order is the evaluation order (`matchPolicy` takes the first
+ * enabled policy covering a task class), which is why the reorder buttons are
+ * the whole precedence story and no priority field exists to disagree with
+ * what is on screen. Every policy is created disabled, so authoring one can
+ * never change where a turn goes until the user says so.
+ */
+function DispatchPolicySection() {
+  const { t } = useT();
+  const policies = useRoutingPolicyStore((s) => s.policies);
+  const addPolicy = useRoutingPolicyStore((s) => s.addPolicy);
+  const updatePolicy = useRoutingPolicyStore((s) => s.updatePolicy);
+  const removePolicy = useRoutingPolicyStore((s) => s.removePolicy);
+  const movePolicy = useRoutingPolicyStore((s) => s.movePolicy);
+  const lastDecision = useRoutingPolicyStore((s) => s.lastDecision);
+
+  const installed = useModelStore((s) => s.installed);
+  const active = useModelStore((s) => s.active);
+  const llamaStatus = useModelStore((s) => s.llamaStatus);
+  const ollamaModels = useModelStore((s) => s.ollamaModels);
+  const ollamaReachable = useModelStore((s) => s.ollamaReachable);
+  const providers = useModelStore((s) => s.providers);
+  const providerModels = useModelStore((s) => s.providerModels);
+
+  // The same inventory dispatch itself routes over, so a key offered here is
+  // by construction a target a policy can actually reach.
+  const targets = useMemo(
+    () =>
+      buildModelTargetInventory({
+        installed,
+        active,
+        llamaStatus,
+        ollamaModels,
+        ollamaReachable,
+        providers,
+        providerModels,
+      }).targets,
+    [installed, active, llamaStatus, ollamaModels, ollamaReachable, providers, providerModels],
+  );
+  const labelFor = (key: string) =>
+    targets.find((target) => target.key === key)
+      ? `${targets.find((target) => target.key === key)!.label} · ${targets.find((target) => target.key === key)!.displayName}`
+      : key;
+
+  const toggleTaskClass = (policy: RoutingPolicy, taskClass: RoutingTaskClass) => {
+    const next = policy.taskClasses.includes(taskClass)
+      ? policy.taskClasses.filter((entry) => entry !== taskClass)
+      : [...policy.taskClasses, taskClass];
+    updatePolicy(policy.id, { taskClasses: next });
+  };
+
+  return (
+    <section>
+      <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">
+        {t("AutomationPanel.dispatchPolicyHeading")}
+      </h3>
+      <p className="mb-2 text-xs text-muted">{t("AutomationPanel.dispatchPolicyIntro")}</p>
+
+      {lastDecision && (
+        <div className="mb-2 rounded-lg border border-border bg-background p-3 text-xs">
+          <span className="font-semibold text-foreground">
+            {t("AutomationPanel.dispatchLastDecisionLabel")}
+          </span>{" "}
+          <span className="text-muted">{lastDecision.reason}</span>
+          {lastDecision.rejected.length > 0 && (
+            <ul className="mt-1.5 flex flex-col gap-0.5 text-faint">
+              {lastDecision.rejected.map((rejection) => (
+                <li key={rejection.key}>
+                  {labelFor(rejection.key)} — {rejection.reason}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      <div className="flex flex-col gap-2">
+        {policies.map((policy, index) => (
+          <div key={policy.id} className="rounded-lg border border-border bg-background p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                value={policy.name}
+                onChange={(event) => updatePolicy(policy.id, { name: event.target.value })}
+                className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+              />
+              <StatusPill tone={policy.enabled ? "success" : "neutral"}>
+                {policy.enabled
+                  ? t("AutomationPanel.dispatchEnabledBadge")
+                  : t("AutomationPanel.dispatchDisabledBadge")}
+              </StatusPill>
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => updatePolicy(policy.id, { enabled: !policy.enabled })}
+              >
+                {policy.enabled
+                  ? t("AutomationPanel.dispatchDisableButton")
+                  : t("AutomationPanel.dispatchEnableButton")}
+              </Button>
+              <button
+                type="button"
+                aria-label={t("AutomationPanel.dispatchMoveUpLabel")}
+                disabled={index === 0}
+                onClick={() => movePolicy(policy.id, -1)}
+                className="cursor-pointer text-faint hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <ChevronUp className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                aria-label={t("AutomationPanel.dispatchMoveDownLabel")}
+                disabled={index === policies.length - 1}
+                onClick={() => movePolicy(policy.id, 1)}
+                className="cursor-pointer text-faint hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <ChevronDown className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                aria-label={t("AutomationPanel.dispatchRemoveLabel")}
+                onClick={() => removePolicy(policy.id)}
+                className="cursor-pointer text-faint hover:text-danger"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+              <span className="text-muted">{t("AutomationPanel.dispatchAppliesToLabel")}</span>
+              {ROUTING_TASK_CLASSES.map((taskClass) => (
+                <button
+                  key={taskClass}
+                  type="button"
+                  onClick={() => toggleTaskClass(policy, taskClass)}
+                  className={`cursor-pointer rounded-md border px-2 py-1 ${
+                    policy.taskClasses.includes(taskClass)
+                      ? "border-accent text-foreground"
+                      : "border-border text-faint"
+                  }`}
+                >
+                  {t(`AutomationPanel.dispatchTaskClass_${taskClass}`)}
+                </button>
+              ))}
+              {policy.taskClasses.length === 0 && (
+                <span className="text-faint">{t("AutomationPanel.dispatchEveryClassNote")}</span>
+              )}
+            </div>
+
+            <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3 text-xs">
+              <label className="flex items-center justify-between gap-2">
+                <span className="text-muted">{t("AutomationPanel.dispatchSensitivityLabel")}</span>
+                <select
+                  value={policy.sensitivity}
+                  onChange={(event) =>
+                    updatePolicy(policy.id, {
+                      sensitivity: event.target.value === "local_only" ? "local_only" : "any",
+                    })
+                  }
+                  className="h-8 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+                >
+                  <option value="any">{t("AutomationPanel.dispatchSensitivityAny")}</option>
+                  <option value="local_only">
+                    {t("AutomationPanel.dispatchSensitivityLocalOnly")}
+                  </option>
+                </select>
+              </label>
+              <label className="flex items-center justify-between gap-2">
+                <span className="text-muted">{t("AutomationPanel.dispatchRequiresToolsLabel")}</span>
+                <input
+                  type="checkbox"
+                  checked={policy.requiresTools}
+                  onChange={(event) =>
+                    updatePolicy(policy.id, { requiresTools: event.target.checked })
+                  }
+                  className="h-4 w-4 accent-accent"
+                />
+              </label>
+              <label className="flex items-center justify-between gap-2">
+                <span className="text-muted">{t("AutomationPanel.dispatchMaxInputLabel")}</span>
+                <CeilingInput
+                  value={policy.maxInputPerMillionUsd}
+                  onChange={(value) => updatePolicy(policy.id, { maxInputPerMillionUsd: value })}
+                  placeholder={t("AutomationPanel.dispatchNoCeilingPlaceholder")}
+                />
+              </label>
+              <label className="flex items-center justify-between gap-2">
+                <span className="text-muted">{t("AutomationPanel.dispatchMaxOutputLabel")}</span>
+                <CeilingInput
+                  value={policy.maxOutputPerMillionUsd}
+                  onChange={(value) => updatePolicy(policy.id, { maxOutputPerMillionUsd: value })}
+                  placeholder={t("AutomationPanel.dispatchNoCeilingPlaceholder")}
+                />
+              </label>
+              <label className="flex items-center justify-between gap-2">
+                <span className="text-muted">{t("AutomationPanel.dispatchMaxTtftLabel")}</span>
+                <CeilingInput
+                  value={policy.maxTimeToFirstTokenMs}
+                  step="50"
+                  onChange={(value) => updatePolicy(policy.id, { maxTimeToFirstTokenMs: value })}
+                  placeholder={t("AutomationPanel.dispatchNoCeilingPlaceholder")}
+                />
+              </label>
+              <p className="text-faint">{t("AutomationPanel.dispatchMeasuredLatencyNote")}</p>
+            </div>
+
+            <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3 text-xs">
+              <span className="text-muted">{t("AutomationPanel.dispatchPreferredLabel")}</span>
+              <select
+                value=""
+                onChange={(event) => {
+                  if (!event.target.value) return;
+                  updatePolicy(policy.id, {
+                    preferredTargetKeys: [...policy.preferredTargetKeys, event.target.value],
+                  });
+                }}
+                className="h-8 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+              >
+                <option value="">{t("AutomationPanel.dispatchAddPreferredOption")}</option>
+                {targets
+                  .filter((target) => !policy.preferredTargetKeys.includes(target.key))
+                  .map((target) => (
+                    <option key={target.key} value={target.key}>
+                      {target.label} · {target.displayName}
+                    </option>
+                  ))}
+              </select>
+              {policy.preferredTargetKeys.map((key, keyIndex) => (
+                <div key={key} className="flex items-center justify-between gap-2">
+                  <span className="truncate text-muted">
+                    {keyIndex + 1}. {labelFor(key)}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updatePolicy(policy.id, {
+                        preferredTargetKeys: policy.preferredTargetKeys.filter(
+                          (entry) => entry !== key,
+                        ),
+                      })
+                    }
+                    className="cursor-pointer text-faint hover:text-danger"
+                  >
+                    {t("AutomationPanel.clearButton")}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <Button size="sm" variant="secondary" className="mt-2" onClick={() => addPolicy()}>
+        <Plus className="h-3.5 w-3.5" />
+        {t("AutomationPanel.dispatchAddPolicyButton")}
+      </Button>
+    </section>
+  );
+}
+
 /**
  * Settings tab for the client-side reliability behaviors this app ported
  * from the idea of a server-side multi-provider gateway: auto-failover,
@@ -944,6 +1243,7 @@ export function AutomationPanel() {
         </div>
       </section>
 
+      <DispatchPolicySection />
       <WebSettingsSection />
       <CliInstallSection />
     </div>
