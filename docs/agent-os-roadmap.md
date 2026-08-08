@@ -3693,6 +3693,32 @@ a broken chain so a scripted check cannot pass by printing bad news.
   `ToolStarted` still carries no reference to its authorizing decision. The join
   now exists in the other direction — `permission_decisions.tool_call_id` — so
   what remains is a pointer on the tool event itself.
+- **Correction to the line above: that reverse join was quietly answering the
+  wrong question for some rows, and V15 is the fix.** Found by reading
+  `request_permission` rather than by reading this file again.
+  `permission_decisions.tool_call_id` is `NOT NULL`, so a caller with no tool
+  call in hand had one **invented** — `format!("tool-{uuid}")`. Two production
+  call sites pass `None` outright (deleting a model from Settings, running a
+  local app definition over HTTP) and every other site passes an `Option` that
+  can be `None` at runtime. The generated id is shaped exactly like a real one
+  and joins to nothing, so `monkey security permission-trail <id>` returned
+  "no permission decision was ever recorded" — the bug this acceptance names —
+  for decisions that were recorded correctly and simply were not about a tool
+  call.
+
+  V15 adds `tool_call_origin`, a closed set of `caller` / `synthesized` /
+  `unknown`. It is the same distinction the `attribution` column already draws
+  for the run, drawn for the tool call: absence with a stated reason instead of
+  a plausible-looking value. `unknown` is the default rather than `caller`,
+  which is the one piece of care in the migration — every row written before the
+  column existed had its origin unrecorded, and defaulting them to `caller`
+  would assert something nobody checked about precisely the rows most likely to
+  be synthesized. The ids *could* be pattern-matched, and a heuristic that
+  mislabels one real tool call is worse than an honest `unknown`.
+
+  Additive, so it costs a rollback nothing. `permission-trail` prints the
+  distinction only when there is one — a trail reached *by* an id and then told
+  the id is synthetic reads as a contradiction, so `caller` says nothing.
 
 **Blocks:** K21 — conformance needs evidence that cannot be quietly edited.
 
