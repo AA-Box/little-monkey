@@ -24,6 +24,7 @@ import { MaskCanvas } from "./MaskCanvas";
 import { ModelFiles } from "./ModelFiles";
 import { SettingsCard } from "./SettingsCard";
 import type { StudioMode } from "./StudioNav";
+import { ToolPanel } from "./ToolPanel";
 import { useT } from "../../lib/i18n";
 import { describeWeightFile } from "../../lib/weightFileHints";
 import {
@@ -369,16 +370,16 @@ function componentNames(model: GenerationModel): string[] {
   return model.components.map(componentFileName);
 }
 
-/** Which tasks each section covers. The models section makes nothing, so it
- *  has no entry and its model list is never filtered. */
-const MODE_TASKS: Record<Exclude<StudioMode, "models">, GenerationTask[]> = {
+/** Which tasks each section covers. The two library sections generate
+ *  nothing, so neither has an entry and neither filters the model list. */
+const MODE_TASKS: Record<Exclude<StudioMode, "models" | "tools">, GenerationTask[]> = {
   image: ["text_to_image", "image_to_image"],
   video: ["text_to_video", "image_to_video"],
   audio: ["text_to_speech"],
 };
 
 const tasksFor = (mode: StudioMode): GenerationTask[] =>
-  mode === "models" ? [] : MODE_TASKS[mode];
+  mode === "models" || mode === "tools" ? [] : MODE_TASKS[mode];
 
 /** Studio talks to the engine over Tauri commands, which only exist inside the
  *  desktop window. In a plain browser tab every call throws a bare TypeError
@@ -955,6 +956,12 @@ export function StudioPanel({ mode, railSlot }: Props) {
     prompt.trim().length > 0 &&
     !busy &&
     (!needsInitImage(task) || !!initImage);
+
+  // Tools share nothing with generation — no model, no prompt, no sampler —
+  // so the section is its own panel rather than another branch threaded
+  // through this one. After every hook above it, so the hook order is the same
+  // whichever section is showing.
+  if (mode === "tools") return <ToolPanel railSlot={railSlot} />;
 
   return (
     <div

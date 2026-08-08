@@ -6459,6 +6459,13 @@ pub enum M3ComponentKind {
     CudaSupport,
     RocmSupport,
     VulkanSupport,
+    /// A Studio sidecar tool: face swap, a detector, a segmenter. Not an
+    /// inference runtime at all — it is a separate program speaking
+    /// [`crate::studio_tools`]' HTTP contract, published by this project and
+    /// fetched through the same digest-checked, versioned, rollback-capable
+    /// path as every other component so a tool is never less verified than a
+    /// runtime is.
+    StudioTool,
 }
 
 /// Stable channel never auto-upgrades: it always tracks new verified
@@ -8495,6 +8502,7 @@ mod tests {
             M3ComponentKind::CudaSupport,
             M3ComponentKind::RocmSupport,
             M3ComponentKind::VulkanSupport,
+            M3ComponentKind::StudioTool,
         ] {
             assert!(
                 component_kind_runs_here(kind),

@@ -27,6 +27,46 @@ export const studioLocale: Record<string, string> = {
   "Studio.video.title": "Video",
   "Studio.video.subtitle": "Generate video on this machine. No account, no upload.",
   "Studio.models": "Models",
+
+  // Tools — the sidecar tier. A tool is a separate program, not a model and
+  // not part of the engine, and the copy says so: what the user installs here
+  // runs beside the app rather than inside it.
+  "Studio.tab.tools": "Tools",
+  "Studio.tools.title": "Tools",
+  "Studio.tools.subtitle":
+    "Extra operations that are not generation — face swap, detectors, segmenters. Each runs as its own program beside the app, never as code inside it.",
+  "Studio.tools.library": "Installed",
+  "Studio.tools.available": "Available",
+  "Studio.tools.empty":
+    "No tools installed. Install a published one below, or point at a binary you already have.",
+  "Studio.tools.noneAvailable":
+    "No tools are published for this app version yet.",
+  "Studio.tools.install": "Install",
+  "Studio.tools.installing": "Installing…",
+  "Studio.tools.installed": "Installed",
+  "Studio.tools.remove": "Remove this tool",
+  "Studio.tools.addLocal": "Add your own binary",
+  "Studio.tools.addLocalHint":
+    "A program that speaks the tool contract on 127.0.0.1. Nothing checks these bytes for you — only add one you built or trust.",
+  "Studio.tools.managed": "Verified",
+  "Studio.tools.managedHint":
+    "Downloaded through the Runtime Hub and checked against a published SHA-256 before it was activated.",
+  "Studio.tools.unmanaged": "Your own",
+  "Studio.tools.unmanagedHint":
+    "A binary you pointed at yourself. It was not downloaded or digest-checked by the app.",
+  "Studio.tools.select": "Choose a tool to see what it does.",
+  "Studio.tools.starting": "Starting the tool…",
+  "Studio.tools.settings": "Settings",
+  "Studio.tools.run": "Run",
+  "Studio.tools.running": "Running…",
+  "Studio.tools.stop": "Release memory",
+  "Studio.tools.missing": "Fill in {fields} first",
+  "Studio.tools.pickImage": "Choose an image",
+  "Studio.tools.clearImage": "Remove this image",
+  "Studio.tools.fromGallery": "Use the newest result",
+  "Studio.tools.results": "Results",
+  "Studio.tools.version": "Version {version}",
+
   "Studio.noneForTab": "No model in your library can do this yet",
   "Studio.notDownloaded": "not downloaded",
   "Studio.browserOnly.title": "Studio runs in the desktop app",
