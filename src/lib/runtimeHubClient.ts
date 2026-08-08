@@ -278,7 +278,11 @@ export type M3ComponentKind =
   | "metal_support"
   | "cuda_support"
   | "rocm_support"
-  | "vulkan_support";
+  | "vulkan_support"
+  /** A Studio sidecar tool — a face swapper, a detector, a segmenter. Not an
+   *  inference runtime, but installed through this same verified path so a
+   *  tool is never less checked than a runtime is. */
+  | "studio_tool";
 
 export type M3ComponentChannel = "stable" | "beta" | "pinned";
 

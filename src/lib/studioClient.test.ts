@@ -18,6 +18,8 @@ import {
   COMPONENT_SLOTS,
   type ComponentSlot,
   type EngineCapabilities,
+  launchArgValue,
+  setLaunchArg,
 } from "./studioClient";
 
 /** A running engine reporting exactly these flags and nothing else. */
@@ -162,5 +164,33 @@ describe("formatLaunchArgs", () => {
     expect(formatLaunchArgs(["--diffusion-fa", "--threads", "8"])).toBe(
       "--diffusion-fa --threads 8",
     );
+  });
+});
+
+describe("setLaunchArg", () => {
+  it("adds, replaces in place, and removes", () => {
+    const added = setLaunchArg([], "--embd-dir", "/tmp/embeds");
+    expect(added).toEqual(["--embd-dir", "/tmp/embeds"]);
+    // In place: the user's own ordering survives a re-pick.
+    const args = ["--threads", "8", "--embd-dir", "/old", "--vae-tiling"];
+    expect(setLaunchArg(args, "--embd-dir", "/new")).toEqual([
+      "--threads", "8", "--embd-dir", "/new", "--vae-tiling",
+    ]);
+    expect(setLaunchArg(args, "--embd-dir", null)).toEqual(["--threads", "8", "--vae-tiling"]);
+    // Blank is removal, not an empty value the engine would choke on.
+    expect(setLaunchArg(args, "--embd-dir", "   ")).toEqual(["--threads", "8", "--vae-tiling"]);
+  });
+
+  it("does not eat the next flag when one has no value", () => {
+    expect(launchArgValue(["--vae-tiling", "--threads", "8"], "--vae-tiling")).toBeNull();
+    expect(setLaunchArg(["--vae-tiling", "--threads", "8"], "--vae-tiling", null)).toEqual([
+      "--threads", "8",
+    ]);
+  });
+
+  it("round-trips a path with spaces through the args field", () => {
+    const args = setLaunchArg([], "--embd-dir", "/Users/me/My Embeddings");
+    expect(parseLaunchArgs(formatLaunchArgs(args))).toEqual(args);
+    expect(launchArgValue(args, "--embd-dir")).toBe("/Users/me/My Embeddings");
   });
 });
