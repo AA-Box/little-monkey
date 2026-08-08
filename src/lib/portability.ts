@@ -765,12 +765,7 @@ export async function importPortableOutcome(outcome: PortableReadOutcome, mode: 
   // succeeds. These assignments cannot schedule a second persistence pass.
   applyPortableSessionImportPlan(sessionPlan);
   applyPortablePromptImportPlan(promptPlan);
-  useStackStore.setState({
-    stacks: command.stacks,
-    indexProgress: {},
-    reindexError: {},
-    staleById: {},
-  });
+  useStackStore.setState({ stacks: command.stacks });
   if (settings && applyPortableSettings(settings) && command.settingsPending) {
     await acknowledgePortableSettings(command.transactionId);
   }

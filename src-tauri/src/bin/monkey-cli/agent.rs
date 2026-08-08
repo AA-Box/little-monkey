@@ -1055,7 +1055,7 @@ async fn execute_tool_call(
         // here). `stacks_cli::search_docs` resolves the model's `stack` name
         // argument through the same `knowledge_core::resolve_search_stack_ids`
         // the desktop app's Tauri command uses, over the same
-        // `stacks::query_stacks_v2_first` ranking, so this and the GUI's
+        // `stacks::query_stacks` ranking, so this and the GUI's
         // `search_docs` produce identically shaped results for the same
         // stack/query. That last clause used to be false: this path called v1's
         // `query_impl` directly and so never consulted Knowledge 2.0, meaning an
@@ -1065,7 +1065,7 @@ async fn execute_tool_call(
             let query = args["query"].as_str().unwrap_or_default().to_string();
             let stack = args["stack"].as_str().map(str::to_string);
             let max_results = args["max_results"].as_u64().map(|v| v as u32);
-            stacks_cli::search_docs(state, query, stack, max_results, attached_stacks)
+            stacks_cli::search_docs(query, stack, max_results, attached_stacks)
                 .await
                 .and_then(|results| serde_json::to_value(results).map_err(|e| e.to_string()))
         }

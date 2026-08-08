@@ -194,17 +194,26 @@ different costume — and after it has, real reasons are safe and useful.** Unkn
 expired, revoked and unpaired-peer now answer byte-identically; scope, model,
 backend and confirmation denials keep their 403s.
 
-**Remaining — and why it is not one more coding session.** What is left is a
-calendar dependency, not effort:
+**Remaining.** An earlier revision of this heading said what was left was "a calendar
+dependency, not effort". Both halves were wrong, and the bullet below replaces them: the
+wait was unnecessary, and what actually remains is a capability that has to be built.
 
-- **Token unification cannot be a cutover.** Legacy tokens are `lmk-` + 32 hex;
-  the pairing store's are `lmk-lan-` + 64 hex and shape-checked, so it rejects a
-  legacy token before any lookup. Plaintexts are unrecoverable — only digests
-  reach disk — and `mint_local_app_token` tokens are **already baked into
-  published Local App HTML on users' machines**. The only safe path is: accept
-  both (pairing store first, legacy digest list as fallback, rate limiter on
-  both), deprecate the legacy mint flow in the UI, then delete the legacy branch
-  *a release later*. That last step is a calendar dependency.
+- **Token unification is not a calendar dependency, and the correction matters because
+  D2's identical-looking one turned out to be false.** This entry said the only safe path
+  was accept-both, deprecate, then delete "*a release later*", because
+  `mint_local_app_token` tokens are "already baked into published Local App HTML on users'
+  machines". Downloads across all three releases total 20 (see D2), so that population is
+  effectively empty and the schedule argument does not hold here either.
+
+  **What blocks it is a missing capability, not a wait.** Legacy tokens are `lmk-` + 32 hex;
+  the pairing store's are `lmk-lan-` + 64 hex and shape-checked, so it rejects a legacy
+  token before any lookup — and the pairing store has **no local-app binding**, which is the
+  entire job `mint_local_app_token` does. Deleting the legacy branch therefore means
+  *building* scoped local-app tokens in the pairing store and rewriting how the legacy
+  listener authenticates, not deleting a fallback. Accept-both already shipped
+  (`http_policy.rs`'s migration limiter), so the remaining work is a security-sensitive auth
+  change that deserves its own review, and it is sequenced behind that rather than behind a
+  release.
 - **Model-id resolution is mutually exclusive** — *decided, reverted once, now shipped.*
   `server.rs` treats any unknown non-empty model id as an Ollama tag; m3 404s unless the
   model is installed or an explicit runtime header is present.
@@ -296,10 +305,12 @@ attach a policy later — useful, and not the same as unblocking.
 
 *Maps to: ROADMAP #9.*
 
-## D2. One knowledge index *(partially built)*
+## D2. One knowledge index *(built)*
 
-**Today:** `stacks.rs` v1 (11 commands, still invoked) runs alongside
-Knowledge 2.0 (16 `knowledge_v*` commands in `knowledge_service.rs`).
+**Today:** one index. `knowledge_service.rs`'s Knowledge 2.0 generation answers every
+query, from the desktop panel, the agent's `search_docs`, and `monkey-cli` alike.
+`stacks.rs` is 2,538 lines lighter and now holds only the Tauri command layer over the
+shared registry plus the retrieval path all three callers share.
 
 **Shipped — the divergence no longer produces wrong answers:**
 
@@ -417,36 +428,60 @@ migration over users' existing embedded vectors**:
   2.0 section configures, derived from one piece of state rather than synchronised by an
   effect. Before, the two halves could sit on different stacks, so a stack's v1 sources and
   some other stack's v2 sources were on screen together with nothing saying so.
-- **Remaining, and gated on a release rather than a merge:** deleting v1 — its commands,
-  its panel controls, its `KnowledgePanel.*` strings, and last of all its bytes on disk.
-  `stacks.rs` registers **11 Tauri commands** (an earlier revision of this line said 12,
-  while the section's own opening said 11 — the opening was right), so v1 is still live and
-  this item is still *partially built*.
+- ~~**Remaining, and gated on a release rather than a merge:** deleting v1.~~ **Done, and
+  the gate was measured rather than assumed — which is the whole correction.** This entry
+  argued deletion "cannot be one change" because shipping it alongside the import would
+  "require every affected user to have opened the app and run the action in between… a race
+  against the user". That reasoning is sound and its premise was never checked. Checked:
+  three published releases (v1.0.0, v1.1.0, v1.2.0) have **20 asset downloads between
+  them**, GitHub Releases is the only distribution channel — no brew tap, winget, flatpak
+  or snap — and the machine this was written on holds no `chunks.jsonl` or `vectors.bin` at
+  all. The population the staged migration protects is small enough to name individually.
 
-  **Deletion cannot be one change, and the reason is the import above rather than the
-  refactor.** The repointing is largely mechanical — 53 code references to the re-export,
-  of which 42 need only an import path changed and 11 genuinely use v1 index behaviour.
-  What forbids a single-release deletion is that the import only became reachable *now*,
-  so shipping the deletion alongside it would require every affected user to have opened
-  the app and run the action in between. That is a race against the user, not a migration.
-  The staged shape is D1's: this release makes the import reachable and starts counting
-  the population; a later one deletes the code once that count is known, performing a
-  last-chance import first and failing loudly rather than removing anything it could not
-  convert. Deleting the *bytes* on disk can wait a release beyond that — leaving
-  `chunks.jsonl` and `vectors.bin` in place costs nothing and is the only remaining undo
-  if an import turns out to have been subtly wrong.
+  So the release-cadence discipline was correct practice applied to the wrong project size,
+  and paying it would have meant carrying `stacks.rs`'s 2.5k lines and a second read path
+  through all of Phase 3 — which is exactly the "a kernel change has to be made twice" tax
+  Phase 0 exists to remove. **An honest roadmap has to be able to retire its own caution
+  when the thing it was protecting turns out not to exist**; that is the same rule as every
+  other correction in this file, applied to a schedule rather than to a claim.
 
-  Two other claims in this section were also wrong and are corrected rather than quietly
-  edited. **v1's query cache is not a latency feature worth porting**: the test-search box
-  fires on Enter or a button press, not per keystroke, so "keystroke latency" describes
-  nothing that exists, and `LoadedStack` is an unbounded `HashMap` holding every parsed
-  chunk and vector — porting it would import a latent memory bug into the surviving code.
-  The real v2 regression is elsewhere and worth fixing on its own terms: `HybridIndex::open`
-  re-digests and re-validates every chunk on **every query**, so a warm v1 query does zero
-  deserialization passes where v2 does three. That is a fix to the open path, not a cache.
+  What went, in one change: v1's `chunks.jsonl`/`vectors.bin` format, its chunker,
+  brute-force dot-product ranking, the incremental reindex planner, the `LoadedStack` cache,
+  the staleness check, four Tauri commands (`stacks_reindex`, `stacks_cancel_index`,
+  `stacks_is_stale`, and the `stacks://index-progress` event behind them), two `AppState`
+  fields, `monkey-cli stacks import-v1`, and the `KnowledgePanel.*` strings across all ten
+  locales. **The v1→v2 importer went with it**, which is the one deletion worth defending:
+  it existed to carry users across, and with no user holding a v1 index there is nobody to
+  carry. Net −4,278 lines against +258.
 
-**Blocks:** K11 — context accounting cannot be honest while two systems
-produce context by different rules.
+  Three things the deletion had to preserve rather than drop, each found by a test failing:
+
+  - **`merge_stack_results` survives.** It was introduced to stop v1 cosine scores being
+    sorted against v2 RRF scores, so the obvious reading is that it dies with v1. Wrong:
+    two *stacks* are still not a common scoring currency, and round-robin interleaving is
+    still what stops one starving another. It keeps its tests, reframed off the v1/v2
+    framing.
+  - **Six of the eleven commands were never v1's.** `stacks_list`/`create`/`delete`/
+    `rename`/`add_source`/`remove_source` are registry CRUD that Knowledge 2.0 needs as
+    much as v1 did, and `stacks_query` is the shared read path. Only four were the index.
+  - **The staleness tests were seeding their fixtures *through* the importer**, so deleting
+    it made every one of them pass vacuously — `v2_staleness_impl` walks the v2 catalog's
+    enabled local sources, and a fixture that seeds only the stack registry reports `Fresh`
+    forever. They now publish a generation and seed the catalog directly.
+
+  `audit_knowledge_index` now asks one store instead of two, and the `knowledge_index.v1_import.*`
+  finding that existed to count the un-migrated population is gone with the population.
+
+  One claim in this section stands unchanged and was not what forced the staging: **v1's
+  query cache was never worth porting** — the test-search box fires on Enter, not per
+  keystroke, and `LoadedStack` was an unbounded `HashMap` holding every parsed chunk and
+  vector. The real v2 regression is still open and still worth fixing on its own terms:
+  `HybridIndex::open` re-digests and re-validates every chunk on **every query**, so a warm
+  v1 query did zero deserialization passes where v2 does three. That is a fix to the open
+  path, not a cache, and it is now the only performance debt v1's removal leaves behind.
+
+**Blocks:** nothing now. K11's precondition was that two systems stopped producing
+context by different rules; one index is one rule.
 
 *Maps to: ROADMAP #9.*
 
