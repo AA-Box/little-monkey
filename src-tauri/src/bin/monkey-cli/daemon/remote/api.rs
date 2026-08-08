@@ -92,6 +92,15 @@ pub struct RemoteApi {
     /// `None` (bare unit tests) answers those routes with a clear 501-style
     /// error instead of pretending to queue anything.
     mobile_chat: Option<Arc<dyn MobileChatQueue>>,
+    /// Where remote requests land in the unified subsystem event stream
+    /// (roadmap K12).
+    ///
+    /// The remote node already keeps its own `remote_audit` table, but that
+    /// table lives in its own database with no join to the run stream — which is
+    /// the gap K12 names. This records the same requests where everything else
+    /// can be read alongside them; it does not replace `remote_audit`, which
+    /// holds the protocol-level denial detail this stream deliberately does not.
+    audit: little_monkey_lib::subsystem_audit::SubsystemAudit,
 }
 
 impl Clone for RemoteApi {
@@ -103,6 +112,7 @@ impl Clone for RemoteApi {
             secrets: Arc::clone(&self.secrets),
             desktop: self.desktop.clone(),
             mobile_chat: self.mobile_chat.clone(),
+            audit: self.audit.clone(),
         }
     }
 }
@@ -115,6 +125,7 @@ impl RemoteApi {
         mobile_chat: Arc<dyn MobileChatQueue>,
     ) -> Result<Self, String> {
         let store = RemoteStore::open(&paths.root)?;
+        let audit = audit_for(&paths);
         Ok(Self {
             paths,
             host,
@@ -122,6 +133,7 @@ impl RemoteApi {
             secrets: Arc::new(KeyringRemoteSecrets),
             desktop: Some(desktop),
             mobile_chat: Some(mobile_chat),
+            audit,
         })
     }
 
@@ -132,6 +144,7 @@ impl RemoteApi {
         store: RemoteStore,
         secrets: Arc<dyn RemoteSecretStore>,
     ) -> Self {
+        let audit = audit_for(&paths);
         Self {
             paths,
             host,
@@ -139,6 +152,7 @@ impl RemoteApi {
             secrets,
             desktop: None,
             mobile_chat: None,
+            audit,
         }
     }
 
@@ -150,7 +164,52 @@ impl RemoteApi {
         self
     }
 
+    /// Answer one remote request and record it.
+    ///
+    /// Every path through the API returns an `ApiResponse`, so this wrapper is a
+    /// real choke point — unlike ACP's dispatch loop, no id-to-method
+    /// bookkeeping is needed, because the request and its response are in scope
+    /// together. `handle_request` below is the original body, unchanged.
     pub fn handle(&self, request: ApiRequest, now_ms: u64) -> ApiResponse {
+        // Captured before the body is consumed. The query string is dropped: it
+        // can carry run and session ids, and `detail_json` is covered by the
+        // hash chain and therefore permanent.
+        let action = format!(
+            "{} {}",
+            request.method,
+            request
+                .path_and_query
+                .split('?')
+                .next()
+                .unwrap_or(&request.path_and_query)
+        );
+        let device_id = request
+            .auth
+            .as_ref()
+            .map(|headers| headers.device_id.clone());
+        let response = self.handle_request(request, now_ms);
+        self.audit
+            .record(little_monkey_lib::subsystem_audit::SubsystemAction {
+                subsystem: little_monkey_lib::run_ledger::Subsystem::Remote,
+                action,
+                // A remote request is not a run — `run_scope::Unattributed`'s
+                // `InboundRequest` is exactly this case — so the ambient scope is
+                // the only honest source.
+                turn_id: None,
+                // Remote requests are signed, not permission-gated: authenticity
+                // is proven by `verify_request`, not by a `request_permission`
+                // decision, so there is none to point at.
+                permission_request_id: None,
+                outcome: little_monkey_lib::subsystem_audit::outcome_for_status(response.status),
+                // The device is which paired client acted, which is the question
+                // a reader of this row actually has. Never the body or the
+                // signature.
+                detail: device_id.map(|id| serde_json::json!({ "deviceId": id })),
+            });
+        response
+    }
+
+    fn handle_request(&self, request: ApiRequest, now_ms: u64) -> ApiResponse {
         if request.body.len() > MAX_REMOTE_BODY_BYTES {
             return ApiResponse::error(413, "Remote request body exceeds 1 MiB");
         }
@@ -253,12 +312,7 @@ impl RemoteApi {
                 ..
             }
         );
-        let response = self.dispatch_authorized(
-            &request,
-            &device,
-            &request_sha256,
-            now_ms,
-        );
+        let response = self.dispatch_authorized(&request, &device, &request_sha256, now_ms);
         if let Ok(mut store) = self.store.lock() {
             let _ = store.complete_command(
                 &headers.device_id,
@@ -895,7 +949,10 @@ impl RemoteApi {
     }
 
     fn mobile_sessions(&self) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let sessions = self.locked_store()?.mobile_session_summaries().map_err(internal)?;
+        let sessions = self
+            .locked_store()?
+            .mobile_session_summaries()
+            .map_err(internal)?;
         Ok((
             200,
             serde_json::json!({
@@ -1011,14 +1068,22 @@ impl RemoteApi {
             let (role, text, final_state) = if let Some(reason) = failed {
                 (
                     "system",
-                    format!("The node could not answer this message: {}", bounded_text(&reason, 2_048)),
+                    format!(
+                        "The node could not answer this message: {}",
+                        bounded_text(&reason, 2_048)
+                    ),
                     "failed",
                 )
             } else if cancelled && assistant_text.trim().is_empty() {
-                ("system", "This message's run was cancelled on the node.".to_string(), "failed")
+                (
+                    "system",
+                    "This message's run was cancelled on the node.".to_string(),
+                    "failed",
+                )
             } else {
                 let text = if assistant_text.trim().is_empty() {
-                    completed_summary.unwrap_or_else(|| "(The run completed without any output.)".to_string())
+                    completed_summary
+                        .unwrap_or_else(|| "(The run completed without any output.)".to_string())
                 } else {
                     assistant_text
                 };
@@ -1072,7 +1137,10 @@ impl RemoteApi {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
-            return Err((400, "Mobile session id must be 1-128 URL-safe characters".to_string()));
+            return Err((
+                400,
+                "Mobile session id must be 1-128 URL-safe characters".to_string(),
+            ));
         }
         // The message id doubles as the idempotent queue key: derived from
         // the signed request digest, so an at-least-once retry of the SAME
@@ -1121,7 +1189,10 @@ impl RemoteApi {
         let service = little_monkey_lib::m4_runtime::production_workflow_service(&app_data)
             .map_err(internal)?;
         let definitions = service.list().map_err(internal)?;
-        let last_runs = self.locked_store()?.mobile_workflow_last_runs().map_err(internal)?;
+        let last_runs = self
+            .locked_store()?
+            .mobile_workflow_last_runs()
+            .map_err(internal)?;
         Ok((
             200,
             serde_json::json!({
@@ -1225,12 +1296,17 @@ impl RemoteApi {
             .filter(|value| {
                 !value.is_empty()
                     && value.len() <= 128
-                    && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
             })
             .ok_or((400, "Capture requires a URL-safe 'capture_id'".to_string()))?;
         let kind = field("kind")
             .filter(|value| matches!(*value, "text" | "image" | "file" | "voice"))
-            .ok_or((400, "Capture 'kind' must be text, image, file, or voice".to_string()))?;
+            .ok_or((
+                400,
+                "Capture 'kind' must be text, image, file, or voice".to_string(),
+            ))?;
         let title = field("title")
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -1263,17 +1339,24 @@ impl RemoteApi {
             }
             if let Some(size) = declared_size {
                 if size != bytes.len() as u64 {
-                    return Err((400, "Capture size_bytes does not match the uploaded bytes".to_string()));
+                    return Err((
+                        400,
+                        "Capture size_bytes does not match the uploaded bytes".to_string(),
+                    ));
                 }
             }
             let captures_dir = self.paths.root.join("mobile-captures");
-            std::fs::create_dir_all(&captures_dir)
-                .map_err(|error| internal(format!("Could not create capture directory: {error}")))?;
+            std::fs::create_dir_all(&captures_dir).map_err(|error| {
+                internal(format!("Could not create capture directory: {error}"))
+            })?;
             std::fs::write(captures_dir.join(capture_id), &bytes)
                 .map_err(|error| internal(format!("Could not persist capture payload: {error}")))?;
             stored_size = Some(bytes.len() as u64);
         } else if text.is_none() {
-            return Err((400, "Capture needs either 'text' or 'content_base64'".to_string()));
+            return Err((
+                400,
+                "Capture needs either 'text' or 'content_base64'".to_string(),
+            ));
         }
 
         self.locked_store()?
@@ -1305,9 +1388,10 @@ impl RemoteApi {
         device_id: &str,
         now_ms: u64,
     ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let killer = self.desktop.as_ref().map(|desktop| {
-            Arc::clone(desktop) as Arc<dyn super::store::DesktopSessionKiller>
-        });
+        let killer = self
+            .desktop
+            .as_ref()
+            .map(|desktop| Arc::clone(desktop) as Arc<dyn super::store::DesktopSessionKiller>);
         self.locked_store()?
             .revoke_device(
                 device_id,
@@ -1365,7 +1449,10 @@ fn require_capability(
     if effective.contains(&capability) {
         Ok(())
     } else {
-        Err((403, format!("Device capability '{capability:?}' is not granted")))
+        Err((
+            403,
+            format!("Device capability '{capability:?}' is not granted"),
+        ))
     }
 }
 
@@ -1430,6 +1517,19 @@ fn parse_query(query: &str) -> Result<std::collections::BTreeMap<String, String>
         }
     }
     Ok(output)
+}
+
+/// The remote node's ledger sits beside its daemon database, under the same app
+/// data directory `DaemonPaths` derives everything else from.
+fn audit_for(paths: &DaemonPaths) -> little_monkey_lib::subsystem_audit::SubsystemAudit {
+    match paths.ledger_db.parent() {
+        Some(app_data_dir) => {
+            little_monkey_lib::subsystem_audit::SubsystemAudit::in_data_dir(app_data_dir)
+        }
+        None => little_monkey_lib::subsystem_audit::SubsystemAudit::disabled(
+            "the daemon ledger path has no app-data parent to record beside",
+        ),
+    }
 }
 
 fn internal(error: impl std::fmt::Display) -> (u16, String) {
@@ -1536,6 +1636,46 @@ mod tests {
                 max_event_count: 1_000,
             },
         }
+    }
+
+    /// `handle` wraps every path, so an unauthenticated request — the one that
+    /// never reaches a route at all — is still an event. That is the property
+    /// the wrapper buys over instrumenting routes: there is no branch to miss.
+    #[test]
+    fn an_unauthenticated_remote_request_is_still_recorded_as_denied() {
+        let (root, api, _secrets, _device, _key) = fixture();
+
+        let response = api.handle(
+            ApiRequest {
+                method: "GET".to_string(),
+                path_and_query: "/v1/remote/runs?limit=5".to_string(),
+                body: Vec::new(),
+                auth: None,
+            },
+            2_000,
+        );
+        assert_eq!(response.status, 401, "no signed auth means refused");
+
+        let ledger =
+            little_monkey_lib::run_ledger::RunLedger::open(DaemonPaths::under(&root).ledger_db)
+                .unwrap();
+        let events = ledger.recent_subsystem_events(None, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].subsystem,
+            little_monkey_lib::run_ledger::Subsystem::Remote
+        );
+        assert_eq!(
+            events[0].action, "GET /v1/remote/runs",
+            "the query string is dropped: it carries ids and the row is permanent"
+        );
+        assert_eq!(
+            events[0].outcome,
+            little_monkey_lib::run_ledger::SubsystemOutcome::Denied,
+            "a refusal is not a failure — a reader counting failures must not count it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn fixture() -> (PathBuf, RemoteApi, Arc<FakeSecrets>, String, Vec<u8>) {
@@ -1976,10 +2116,18 @@ mod tests {
         let api = api.with_mobile_chat(Arc::new(FakeChatQueue::default()));
         for (index, (method, path, body)) in [
             ("GET", "/v1/remote/mobile/sessions", &b""[..]),
-            ("POST", "/v1/remote/mobile/sessions/s1/messages", br#"{"text":"hi"}"#),
+            (
+                "POST",
+                "/v1/remote/mobile/sessions/s1/messages",
+                br#"{"text":"hi"}"#,
+            ),
             ("GET", "/v1/remote/mobile/workflows", b""),
             ("POST", "/v1/remote/mobile/workflows/wf/runs", b"{}"),
-            ("POST", "/v1/remote/mobile/captures", br#"{"capture_id":"c1","kind":"text","title":"t","text":"x"}"#),
+            (
+                "POST",
+                "/v1/remote/mobile/captures",
+                br#"{"capture_id":"c1","kind":"text","title":"t","text":"x"}"#,
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -1996,7 +2144,10 @@ mod tests {
                 ),
                 2_000 + index as u64,
             );
-            assert_eq!(response.status, 403, "{method} {path} should be capability-denied");
+            assert_eq!(
+                response.status, 403,
+                "{method} {path} should be capability-denied"
+            );
         }
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2051,7 +2202,12 @@ mod tests {
             ),
             2_000,
         );
-        assert_eq!(post.status, 201, "body: {:?}", String::from_utf8_lossy(&post.body));
+        assert_eq!(
+            post.status,
+            201,
+            "body: {:?}",
+            String::from_utf8_lossy(&post.body)
+        );
         assert_eq!(queue.queued.lock().unwrap().len(), 1);
         assert_eq!(queue.queued.lock().unwrap()[0].1, "what is queued?");
 
@@ -2070,14 +2226,26 @@ mod tests {
         assert_eq!(get.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&get.body).unwrap();
         let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 1, "only the user turn exists until the run is terminal");
+        assert_eq!(
+            messages.len(),
+            1,
+            "only the user turn exists until the run is terminal"
+        );
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["text"], "what is queued?");
         assert_eq!(messages[0]["task_state"], "queued");
 
         // The session list is derived from the same rows.
         let sessions = api.handle(
-            signed(&device, &secret, 3, "cmd-sessions", "GET", "/v1/remote/mobile/sessions", b""),
+            signed(
+                &device,
+                &secret,
+                3,
+                "cmd-sessions",
+                "GET",
+                "/v1/remote/mobile/sessions",
+                b"",
+            ),
             2_002,
         );
         assert_eq!(sessions.status, 200);
@@ -2115,7 +2283,10 @@ mod tests {
                     secrets.as_ref(),
                 )
                 .unwrap();
-            (accepted.device_id, accepted.device_secret.as_bytes().to_vec())
+            (
+                accepted.device_id,
+                accepted.device_secret.as_bytes().to_vec(),
+            )
         };
         let payload = STANDARD.encode(b"hello");
         let body = format!(
