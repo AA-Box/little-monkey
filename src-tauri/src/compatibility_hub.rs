@@ -25,6 +25,8 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
+use crate::http_policy::constant_time_eq;
+
 pub const COMPATIBILITY_SCHEMA_VERSION: u32 = 1;
 pub const CONFORMANCE_MANIFEST_VERSION: u32 = 1;
 pub const LAN_SECURITY_STATE_VERSION: u32 = 1;
@@ -4268,17 +4270,6 @@ fn canonicalize_json(value: &mut Value) {
         }
         _ => {}
     }
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut difference = 0_u8;
-    for (left, right) in left.iter().zip(right) {
-        difference |= left ^ right;
-    }
-    difference == 0
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
