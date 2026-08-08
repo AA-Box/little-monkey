@@ -3343,16 +3343,113 @@ have outlived the change that widened the candidate window.
 
 **Blocks:** nothing now.
 
-## K9. Dispatch policy (model routing)
-
-**Today:** one hardcoded fallback toggle; provider failover follows a fixed
-sequence.
+## K9. Dispatch policy (model routing) *(built for chat and summarization; subagent classes and a durable record owed)*
 
 **Acceptance:** ROADMAP #1 — user-authored named routing policies by task
 class, cost ceiling, latency target, data sensitivity, or tool requirement;
 per-turn inspection of which policy chose the target and why; reorder and
 disable without editing code. A policy can never widen a permission, bypass
 the Privacy Firewall, or widen a run's egress policy (K5).
+
+**Shipped.** `modelRouting.ts` is the engine and is pure — candidates, the
+active target and the turn's own hard requirements are all arguments, so the
+whole decision is testable without a provider or a model.
+`routingPolicyStore.ts` persists the authored list, `routeFromActive` /
+`routeTarget` in `agentLoop.ts` is the one place that reads live stores, and
+**Settings → Automation → Dispatch policies** authors, reorders, enables and
+deletes them. All five criteria the acceptance names are real: task class, a
+cost ceiling, a latency target, data sensitivity, and a tool requirement.
+
+Two of them needed a decision about what the number even means, and both
+decisions are narrower than the acceptance line sounds:
+
+- **The cost ceiling is a *rate* ceiling** (USD per million input or output
+  tokens, against the rates the user entered themselves in
+  `costControlStore.rates`), not a per-turn cost ceiling. A turn's token count
+  is not known before the turn runs, so "max $ per turn" could only have been
+  enforced against a guess — and this file's own rule is that no number is
+  displayed or acted on that was not measured.
+- **The latency target needed a measurement that did not exist.** Nothing
+  recorded per-target first-token latency: `benchmark.rs` measures TTFT for
+  *local* runtimes only, and no cloud target had a number at all. So
+  `attemptStream` now records milliseconds-to-first-fragment onto the
+  per-request entry `costControlStore` was already writing (one optional
+  field, no new store, no new retention rule), and
+  `observedTimeToFirstTokenMs` takes the **median** of a target's recent
+  samples — one cold start or one rate-limited retry would otherwise
+  disqualify a target that normally meets its ceiling.
+
+**"Provider failover follows a fixed sequence" is also answered**, which was
+the other half of the old "Today". A matched policy supplies the whole ordered
+attempt sequence, so it replaces `buildFailoverChain` for that turn rather than
+being overruled on the second attempt. It is still gated on the same
+`autoFailoverEnabled` toggle, and it is ignored when the Privacy Firewall
+redirected the turn.
+
+**Why it cannot widen anything, structurally rather than by intention:**
+
+- **It selects, it never invents.** Every key it can return came in as a
+  candidate, and candidates are built from `buildModelTargetInventory` — the
+  same inventory the model picker shows. A policy cannot name a provider the
+  user has not configured or reach a model their own credentials do not cover.
+- **Routing strictly precedes the Privacy Firewall gate** at all three call
+  sites, so a routed target is gated exactly like a hand-picked one and the
+  firewall's own switch-to-local still overrides a policy. The engine takes no
+  permission, privacy or egress input at all — there is nothing in it to widen.
+- **A policy cannot break a turn.** One that matches but excludes everything
+  keeps the active target and says so in the decision reason. Routing is
+  allowed to be unhelpful; it is not allowed to leave a turn with nowhere to
+  run.
+
+**Two defects found while building it, both recorded because the shape of each
+is the interesting part:**
+
+- **The default configuration had undefined ranking order.** The candidate
+  comparator mapped an unknown rate or latency to `POSITIVE_INFINITY` and then
+  *subtracted*, and `Infinity - Infinity` is `NaN` — a comparator returning
+  `NaN` means "unordered", so `sort` was free to do anything. This was not an
+  edge case: a fresh profile has no rates and no latency samples for anything,
+  so the common path was the broken one. It compares rather than subtracts now.
+  A determinism test over a two-way tie is what caught it, which is the only
+  form of assertion that could have.
+- **"Requires tools" would have matched nothing.** `modelTargets.ts` records
+  `unknown` tool-calling and vision for *every* provider model, so a filter
+  written as `!== "yes"` excludes all of them — a criterion the user could
+  enable and silently never route with. Only an explicit `"no"` excludes now:
+  unknown means the request is attempted and the provider answers, which is
+  what happens with no policy at all. Vision is resolved through
+  `resolvedTargetSupportsVision` — the same predicate the turn itself uses —
+  rather than the snapshot's `unknown`, so a policy cannot route an image to a
+  model `stripImagesForTextOnlyTarget` then strips it for.
+
+**Per-turn inspection** is a `[Model switch]`-prefixed transcript note naming
+the policy and why that target won, plus the last decision (including every
+rejected candidate and its reason) in the Settings panel. The note fires only
+when the choice actually moves off the active target — an enabled policy that
+the current model already satisfies is a no-op, not an announcement every turn.
+
+**Remaining.**
+
+- **Subagents do not route, and the reason is a layering rule rather than
+  effort.** They dispatch through `subagent.ts::resolveSubagentTarget`, and
+  that module must not import `agentLoop.ts` — `turnEngine.ts` imports
+  `subagent.ts`, so the edge would be a cycle, which is a rule that module
+  states explicitly and keeps a duplicated helper to honour. Per-profile
+  subagent models are already covered by
+  `settingsStore.subagentProfileModels` (`explore`/`code`, provider targets
+  only), so nothing is unreachable today; folding them into policies means
+  lifting target resolution out of `agentLoop.ts` into its own module first.
+  That is a refactor, and it is what the two missing task classes cost.
+- **Inspection is not durable.** The decision lives in the transcript and in
+  session state, not in the run ledger, so "which policy chose this run's
+  target" is not answerable after a restart the way K12's events are. The
+  frozen `ModelTargetSnapshot` on the durable run already records *what* ran;
+  what is missing is *why*.
+- **Managed llama.cpp is not a routable target.** `applyTargetSwitch` has no
+  `local` arm, for the reason `buildFailoverChain` and `findLocalOnlyTarget`
+  already document — making it the active target is not something an automatic
+  switch has a basis to do unattended. So `local_only` policies are served by
+  non-cloud Ollama, exactly as the Privacy Firewall's own local fallback is.
 
 **Note:** in OS terms K8 decides *when* a process runs and K9 decides *which
 device* executes it. They are separable and K8 is the harder half. Shipping
