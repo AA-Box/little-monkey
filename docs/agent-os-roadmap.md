@@ -3377,27 +3377,111 @@ a broken chain so a scripted check cannot pass by printing bad news.
   than a reason to record nothing. `browser_list` is skipped under the same rule
   as `GET /v1/models` — a read of local state that takes no action.
 
-  **A finding the stream surfaced rather than fixed:** no browser command goes
-  through `request_permission`. Navigating to an arbitrary URL, clicking, and
-  typing text into a page are ungated today, so every browser row records
-  `permission_request_id = NULL` — which the acceptance calls a bug, and which is
-  now visible as data instead of an assumption. Gating them is a behaviour change
-  to the permission path and wants its own review.
+  ~~**A finding the stream surfaced rather than fixed:** browser actions are
+  ungated, which the acceptance calls a bug.~~ **That claim was written here and
+  it overstated the gap — correcting it before somebody builds a prompt nobody
+  needs.** It is true that no browser command calls `request_permission`, and
+  true that every browser row therefore records `permission_request_id = NULL`.
+  It is *not* true that this is the acceptance's bug. That clause is about a
+  **tool call** whose authorizing decision cannot be produced from the log, and
+  every browser path is user-initiated or user-configured: `BrowserWorkbench`,
+  `VisualEditModePanel`, `BrowserVerificationPanel`, and workflow replay, which
+  the user starts. No agent tool reaches them — `tools.rs` has no browser entry,
+  and `BrowserWorkerAdapter` (the workflow-side entry, capability-gated by
+  `WorkflowNodeKind::Browser`'s declared `EffectClass`) has no production caller
+  at all.
+
+  A per-action prompt for a button the user just clicked is the wrong feature, in
+  the same way `browser_list` needs no gate. So `NULL` here is the correct value
+  and not a missing one. What *is* worth saying: user-configured synthetic
+  monitors navigate on a timer with nobody at the keyboard, and the policy that
+  covers that is K5's per-run egress allowlist, not the permission prompt.
 
   Detail columns stay narrow on purpose: HTTP records the status and nothing
   else, browser records the session id and never a URL, selector or typed text.
   `detail_json` is covered by the hash chain and therefore permanent, and typed
   text is exactly where a password would be.
 
-  **Still to write to it:** ACP and the remote node. Both are JSON-RPC/HTTP
-  dispatch loops whose arms each send their own response, so there is no single
-  place holding the outcome — instrumenting the arms by hand is precisely the
-  miss-a-branch failure the browser helper exists to avoid. The honest fix is an
-  id→method map at their shared `send` choke point, which is its own change.
-  Separate stores also still hold gating-relevant records with no join to either
-  stream: `daemon_scheduler_decisions` and `remote_audit` in their own database
+  **ACP writes to it now, through the choke point rather than the arms.** Every
+  ACP response leaves through one `send`, so that is where the event is recorded
+  — the dispatch loop's arms each have their own error branches, and
+  instrumenting arms is how one branch stays silent forever. A JSON-RPC response
+  carries only the request `id`, so the loop remembers `id → method` when it
+  dispatches and `send` consumes it; a `session/update` notification has a method
+  and no id, never matches, and never floods the stream. `initialize` is skipped
+  under the same rule as `GET /v1/models`.
+
+  The audit is process-global there, deliberately: `monkey-cli acp` serves one
+  stdio connection for its whole lifetime, so there is exactly one, and threading
+  it through seventeen `send` call sites plus the spawned relay tasks that
+  outlive the loop would buy nothing.
+
+  **The remote node writes to it too, and it needed no id bookkeeping.** Unlike
+  ACP, every path through `RemoteApi` returns one `ApiResponse` from one
+  `handle`, so wrapping that is already a choke point with the request and its
+  response in scope together. An unauthenticated request — the one that never
+  reaches a route at all — is therefore still an event, which is the property the
+  wrapper buys over instrumenting routes.
+
+  This does **not** replace `remote_audit`. That table holds the protocol-level
+  denial detail this stream deliberately does not; what was missing was a row
+  readable alongside everything else, and that is what the join now gives.
+
+  One consequence worth noting: `server.rs` and `RemoteApi` both answer HTTP, so
+  the status-to-outcome rule moved into `subsystem_audit::outcome_for_status`.
+  Two copies would have drifted, and the drift would stay invisible until
+  somebody counted failures and got refusals.
+
+  **Every subsystem the acceptance names now writes to the stream** — desktop and
+  daemon through `run_events`, and HTTP, MCP, browser, ACP and the remote node
+  through `subsystem_events`. Separate stores still hold gating-relevant records
+  with no join to either stream: `daemon_scheduler_decisions` and `remote_audit` in their own database
   files, and `egress_denials`, which records denials only — **an allowed egress
   produces no row anywhere** — and ring-buffers itself on every insert.
+- **A schema bump was a one-way door, and that is why the audit is scattered
+  across three databases.** `denial_sink.rs` says it outright: the ledger's
+  forward-only guard refused any database whose `MAX(version)` exceeded the
+  binary's, so shipping one observability table meant a user who rolls back —
+  which the in-app updater makes ordinary — gets a binary that cannot open its
+  own run history at all. Not a degraded feature: no runs, no events, no
+  approvals. That is the real reason `egress_denials` lives in its own file, and
+  it is the reason every future joinable store would have too.
+
+  **Migration V13 removes the premise.** `schema_migrations` gains
+  `min_reader_version`, and the guard compares against the newest *breaking*
+  migration rather than the newest migration. Most migrations here only add — a
+  table an older binary never queries, a nullable column its inserts omit — and
+  those are invisible to it. What genuinely breaks an older binary is a migration
+  that makes the database reject writes it used to accept.
+
+  - **V1–V8 are marked breaking without re-deriving each one, deliberately.**
+    They shipped under the old blanket rule, so calling them breaking preserves
+    exactly today's behaviour and claims nothing new. Claiming compatibility
+    wrongly is far worse than claiming it too little — it hands an older binary a
+    database it corrupts — so compatibility is asserted only where it was
+    checked.
+  - **V9 is genuinely breaking**, and this is the concrete case:
+    `run_events_chain_must_not_stop` aborts an insert whose `event_hash` is NULL
+    into an already-chained run, which is every insert a pre-V9 binary makes.
+  - **V10–V12 are additive**, each checked. V10's nullable `process_id` is
+    omitted by a V9 binary's inserts, and V9's hash contributes nothing for an
+    absent process id — the same property that let V10 ship without invalidating
+    V9's rows now lets a V9 binary keep writing. V11 and V12 add tables nothing
+    older queries.
+  - **V13 must require itself**, and the entry says so rather than glossing it: a
+    V12 binary applies the *old* blanket guard and refuses a V13 database no
+    matter what the column says. The fix cannot reach backwards; it stops the
+    bleeding from here on.
+
+  **`egress_denials` stays in its own file anyway, for a better reason than the
+  original one.** Its volume is attacker-influenced — a remote page causes
+  denials as fast as it can request subresources — and the ring buffer that
+  bounds them is a poor neighbour for a hash-chained, strictly append-only stream
+  that must never drop a row. Moving those rows in would mean either giving the
+  stream an eviction policy or letting a remote party grow it without limit.
+  What *does* belong in the ledger is the half that is still missing entirely —
+  an **allowed** egress produces no row anywhere — because its volume is the
+  app's own.
 - ~~**Per-event process identity does not exist.**~~ **Done** — migration V10 adds
   `run_events.process_id`, populated from the ambient `ProcessScope` (the D3
   `tokio::task_local!`) inside `append_event`. That is the single place all 46
