@@ -849,6 +849,17 @@ export interface ConfiguredContext {
 
 export type ContextRuntimeKind = "ollama" | "llama_cpp" | "mlx";
 
+/**
+ * Whether two of this app's processes on one resident model can reuse each
+ * other's cached prompt prefix.
+ *
+ * A tagged union, not a boolean: "supported" is unrenderable without the
+ * mechanism that makes it true, and "unsupported" without the reason it is not.
+ */
+export type PrefixSharing =
+  | { state: "supported"; mechanism: string }
+  | { state: "unsupported"; reason: string };
+
 export interface ContextCacheView {
   runtimeId: string;
   runtimeKind: ContextRuntimeKind;
@@ -858,6 +869,7 @@ export interface ContextCacheView {
   contextHeadroomTokens: number | null;
   contextShiftDetected: boolean | null;
   totalSlots: number | null;
+  prefixSharing: PrefixSharing;
   notes: string[];
   sampledAtMs: number;
 }

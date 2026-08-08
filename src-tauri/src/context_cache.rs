@@ -656,8 +656,68 @@ pub struct ContextCacheView {
     pub context_headroom_tokens: Option<u32>,
     pub context_shift_detected: Option<bool>,
     pub total_slots: Option<u32>,
+    /// Whether two of this app's processes on one resident model can reuse each
+    /// other's prompt prefix (roadmap K11).
+    pub prefix_sharing: PrefixSharing,
     pub notes: Vec<String>,
     pub sampled_at_ms: u64,
+}
+
+/// Whether a runtime lets two processes on one resident model reuse each
+/// other's cached prompt prefix, read-only.
+///
+/// A tagged union rather than a `bool` with prose beside it, for the reason
+/// `RenderedMeasurement` and `ChainVerification` are: a caller cannot render
+/// "supported" without also having the mechanism that makes it true, and cannot
+/// render "unsupported" without the reason. Both arms carry `&'static str`
+/// because both are settled facts about a pinned runtime, not per-sample
+/// observations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum PrefixSharing {
+    Supported { mechanism: &'static str },
+    Unsupported { reason: &'static str },
+}
+
+/// What each runtime actually does about prefix sharing.
+///
+/// # llama.cpp does this already, and the app's job is not to break it
+///
+/// Verified against the build [`crate::managed_runtime::MANAGED_LLAMA_VERSION`]
+/// pins, by running it: with no `--parallel` argument — which is what
+/// `runtime_adapter::llama_args` passes — b9637 resolves `n_parallel` to `auto`
+/// and reports `total_slots = 4` with a unified KV cache, and it routes each
+/// request to the slot whose cached prefix matches best ("selected slot by LCP
+/// similarity" in its own log), while `--cache-idle-slots` saves an idle slot's
+/// KV into a server-wide RAM cache. Two different conversations sharing a
+/// 454-token prefix were measured at 451 of 456 prompt tokens reused on the
+/// second, on a slot the first had warmed.
+///
+/// So the sharing is the runtime's, it is read-only (no KV is copied between
+/// sequences — the *request* is routed to where the prefix already is), and this
+/// app gets it by **not** doing two things: pinning `id_slot`, and disabling
+/// `cache_prompt`. `openai_request_body` does neither, and a test asserts that,
+/// because either one would silently cost the whole feature with nothing failing.
+///
+/// A first probe of this pinned `id_slot` and saw zero reuse, which looked like
+/// "the runtime cannot share across slots". It was the pin itself defeating the
+/// router — worth recording, since that is exactly the mistake the guard exists
+/// to prevent.
+pub fn prefix_sharing(kind: ContextRuntimeKind) -> PrefixSharing {
+    match kind {
+        ContextRuntimeKind::LlamaCpp => PrefixSharing::Supported {
+            mechanism: "llama-server routes each request to the slot whose cached prompt prefix matches it best, and saves an idle slot's cache into a server-wide pool, so a second conversation that starts with the same prefix reuses it instead of re-evaluating it. Nothing is copied between sequences and no request can read another's tokens.",
+        },
+        // Not "we did not implement it" — Ollama's HTTP API exposes neither slots
+        // nor prompt-cache state, so there is nothing here to observe or steer.
+        // Whatever its server does internally, this app cannot claim it.
+        ContextRuntimeKind::Ollama => PrefixSharing::Unsupported {
+            reason: "Ollama's API exposes no slot or prompt-cache surface, so this app cannot observe or influence whether two of its processes reuse a prompt prefix, and will not claim reuse it cannot see.",
+        },
+        ContextRuntimeKind::Mlx => PrefixSharing::Unsupported {
+            reason: "The MLX runtime in this build keeps no prompt cache between requests, so every request evaluates its whole prompt and there is no prefix to share.",
+        },
+    }
 }
 
 /// Setting-key candidates to try, in priority order, per runtime kind — the
@@ -1070,6 +1130,65 @@ mod tests {
         let notes = context_cache_notes(ContextRuntimeKind::Mlx, None);
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("does not expose"));
+    }
+
+    /// Every runtime resolves to one arm or the other, and neither arm can be
+    /// rendered without the prose that justifies it — an `unsupported` with no
+    /// reason is the shape this union exists to make unconstructible.
+    #[test]
+    fn every_runtime_states_its_prefix_sharing_with_a_reason() {
+        for kind in [
+            ContextRuntimeKind::LlamaCpp,
+            ContextRuntimeKind::Ollama,
+            ContextRuntimeKind::Mlx,
+        ] {
+            match prefix_sharing(kind) {
+                PrefixSharing::Supported { mechanism } => assert!(
+                    !mechanism.trim().is_empty(),
+                    "{kind:?} claims support without naming the mechanism"
+                ),
+                PrefixSharing::Unsupported { reason } => {
+                    assert!(
+                        !reason.trim().is_empty(),
+                        "{kind:?} refuses without a reason"
+                    )
+                }
+            }
+        }
+        // The one runtime this app can actually observe is the one that supports
+        // it; the other two are honest refusals, not unimplemented work.
+        assert!(matches!(
+            prefix_sharing(ContextRuntimeKind::LlamaCpp),
+            PrefixSharing::Supported { .. }
+        ));
+        assert!(matches!(
+            prefix_sharing(ContextRuntimeKind::Ollama),
+            PrefixSharing::Unsupported { .. }
+        ));
+        assert!(matches!(
+            prefix_sharing(ContextRuntimeKind::Mlx),
+            PrefixSharing::Unsupported { .. }
+        ));
+    }
+
+    /// The wire shape the UI switches on. A bare boolean would let a caller show
+    /// "supported" with no mechanism beside it.
+    #[test]
+    fn prefix_sharing_serializes_as_a_tagged_union() {
+        let json =
+            serde_json::to_value(prefix_sharing(ContextRuntimeKind::Mlx)).expect("serialize");
+        assert_eq!(json["state"], "unsupported");
+        assert!(json["reason"]
+            .as_str()
+            .expect("a reason")
+            .contains("no prompt cache"));
+        let json =
+            serde_json::to_value(prefix_sharing(ContextRuntimeKind::LlamaCpp)).expect("serialize");
+        assert_eq!(json["state"], "supported");
+        assert!(
+            json.get("reason").is_none(),
+            "the supported arm carries no reason field"
+        );
     }
 
     #[test]

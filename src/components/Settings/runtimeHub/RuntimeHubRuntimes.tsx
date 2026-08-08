@@ -240,6 +240,19 @@ function ContextCachePanel({ view }: { view: ContextCacheView | undefined }) {
         )}
         {view.totalSlots != null && <span>Server slots: {view.totalSlots}</span>}
       </div>
+      {/* Both arms render, because "this runtime cannot share a prefix" is as
+          useful to know as that it can — and the union makes it impossible to
+          show either verdict without the sentence that justifies it. */}
+      <p className="mt-2 text-xs leading-5 text-muted">
+        <span className="font-medium text-foreground">
+          {view.prefixSharing.state === "supported"
+            ? "Prompt prefixes are shared between processes: "
+            : "Prompt prefixes are not shared between processes: "}
+        </span>
+        {view.prefixSharing.state === "supported"
+          ? view.prefixSharing.mechanism
+          : view.prefixSharing.reason}
+      </p>
       {view.notes.length > 0 && (
         <ul className="mt-3 list-disc space-y-1 pl-5 text-xs leading-5 text-muted">
           {view.notes.map((note) => (

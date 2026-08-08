@@ -82,6 +82,7 @@ function contextCacheView(overrides: Partial<ContextCacheView> = {}): ContextCac
     contextHeadroomTokens: null,
     contextShiftDetected: null,
     totalSlots: null,
+    prefixSharing: { state: "supported", mechanism: "llama-server routes to the best-matching slot." },
     notes: [],
     sampledAtMs: 1,
     ...overrides,
