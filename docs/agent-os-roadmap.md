@@ -4050,6 +4050,59 @@ is not reproducible.
 
 **Blocks:** K18.
 
+**Shipped — the durable image, its restore gate, and the determinism
+statement. Not the loop re-entry.**
+
+The image is a **checkpoint**, not a new store. A checkpoint is already a
+durable, versioned manifest of a turn's conversation anchor and workspace files;
+`resume` is one more `serde(default)` section on it holding what a checkpoint
+does not already have. Inventing a second store would have meant a second copy
+of the conversation and the files that could disagree with the first — and the
+disagreement would surface at restore, the moment it can least be dealt with.
+
+- **It references rather than copies.** The conversation is in the profile
+  store, the files are in the checkpoint's own entries, an approval is a
+  `permission_decisions` row. `resume` holds the process id, the model and
+  runtime, the K10 workspace path, and the outstanding `request_id`s.
+  `restorability` is what checks they still resolve.
+- **A restore refuses rather than substituting.** A missing workspace took the
+  process's uncommitted work with it, so resuming into a fresh one would silently
+  lose it. A model that is no longer resident would continue the conversation in
+  another model's voice. An approval that has expired would carry on past a
+  permission nobody currently grants. Each is a named `RestoreBlocker` with its
+  reason, and `Restorability` is a tagged union so a caller cannot offer Resume
+  without holding the state that says it is safe.
+- **Every blocker at once, not the first.** A user told the workspace is gone,
+  who fixes it and is then told the model is missing, has been made to discover
+  the refusals one at a time.
+- **Freezing twice is refused.** A second freeze would replace the image's
+  process id and approvals while the entries beneath it still describe the first
+  turn, so a restore would resume one process into another's files.
+- **The determinism statement ships beside the verdict**, not in a doc, because
+  the reader who needs it is whoever is deciding to press Resume.
+  `DETERMINISM_CAVEATS` enumerates only what is *not* reproduced — sampling, the
+  prompt cache, wall-clock time, external effects already taken, and everything
+  outside the recorded workspace. There is deliberately no balancing "reproduced"
+  list: the conversation, the files and the approvals are reproduced *because the
+  restore refuses when they cannot be*, and a second list asserting it would be
+  prose restating a guard.
+- **"Resource reservations" is in the acceptance and not in the image, on
+  purpose.** There is no per-process resource reservation to capture: searching
+  for one finds `workflow_core`'s token-budget reservation and the daemon's
+  delivery-payload reservation, neither of which is a K7 admission hold on memory
+  or a device. A field for it would be empty in every image ever written, which
+  reads as "this process reserved nothing" rather than "this system does not
+  reserve". The field arrives when the thing it names does.
+
+**Remaining: the loop re-entry.** `freeze_impl` writes the image and
+`checkpoint_restorability` says whether it can be resumed, both reachable as
+commands. What no code yet does is *re-enter* a frozen turn — the suspend/resume
+path parks a live loop in `pauseRegistry`, which is process memory, so resuming
+after a restart needs the chat loop to start from an image instead of from a
+parked continuation. That is the half that makes K13 true end to end, and it is
+frontend work in `processSignalDelivery.ts`'s neighbourhood rather than anything
+this entry's storage half blocks.
+
 ## K14. Transactional external effects
 
 **Today:** the rollback simulation distinguishes file, artifact,

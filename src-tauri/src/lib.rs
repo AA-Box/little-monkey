@@ -1166,6 +1166,8 @@ pub fn run() {
             checkpoints::checkpoint_end,
             checkpoints::checkpoint_revert,
             checkpoints::checkpoint_reapply,
+            checkpoints::checkpoint_freeze,
+            checkpoints::checkpoint_restorability,
             checkpoints::checkpoint_list,
             checkpoints::checkpoint_preview,
             checkpoints::checkpoint_compare,
