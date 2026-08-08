@@ -1132,7 +1132,19 @@ pub async fn tool_remember(
         .memory_lock
         .lock()
         .map_err(|_| "Memory lock poisoned".to_string())?;
-    memory::add_fact_impl(&path, &root, &text, "agent", turn_id.as_deref())
+    let fact = memory::add_fact_impl(&path, &root, &text, "agent", turn_id.as_deref())?;
+    // Recorded *after* the add, with the id the store actually assigned — an id
+    // guessed before the write could name a fact that was never created, and
+    // `add_fact_impl` returns the pre-existing fact when the text is a duplicate.
+    checkpoints::record_remembered_fact(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        checkpoints::RememberedFact {
+            id: fact.id.clone(),
+            text: fact.text.clone(),
+        },
+    )?;
+    Ok(fact)
 }
 
 /// Read one bundled file from an installed native skill's folder — the
@@ -1720,6 +1732,7 @@ mod tests {
         state.checkpoints.lock().unwrap().insert(
             "test-checkpoint".to_string(),
             checkpoints::ActiveCheckpoint {
+                remembered_facts: Vec::new(),
                 dir: checkpoint_dir,
                 entries: Vec::new(),
                 created_at_ms: 0,
