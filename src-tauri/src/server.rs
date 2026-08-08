@@ -2316,14 +2316,7 @@ fn record_http_request(deps: &ServerDeps, method: &Method, path: &str, status: S
 /// must not be counting refusals. A pure function so the mapping is testable —
 /// asserting it inline in the caller would only restate it.
 fn http_outcome(status: StatusCode) -> crate::run_ledger::SubsystemOutcome {
-    use crate::run_ledger::SubsystemOutcome;
-    if status.is_success() {
-        SubsystemOutcome::Succeeded
-    } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-        SubsystemOutcome::Denied
-    } else {
-        SubsystemOutcome::Failed
-    }
+    crate::subsystem_audit::outcome_for_status(status.as_u16())
 }
 
 /// The action string for a request worth recording, or `None` to skip it.
