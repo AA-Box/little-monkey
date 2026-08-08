@@ -1347,6 +1347,32 @@ impl Charge {
             }
         }
     }
+
+    /// Notes where an allowed request went, so the ledger records destinations
+    /// and not only volume.
+    ///
+    /// Only the attributed case is recorded, and that is the same split
+    /// [`Self::add`] makes: an unattributed byte has a *reason* to be charged to
+    /// but no row to hang a destination list off. `UNATTRIBUTED_EGRESS` is a
+    /// fixed array of counters precisely because it must not allocate per
+    /// request; a per-reason destination map would be a global lock on the hot
+    /// path, which is what `run_scope` put the counter in the scope to avoid.
+    ///
+    /// ponytail: so unattributed egress still reports volume by reason and no
+    /// destinations. Upgrade path is a bounded global map behind the same cap, if
+    /// "which hosts does the app itself reach outside a run" turns out to be a
+    /// question anyone asks.
+    fn note_destination(&self, url: &Url) {
+        let Charge::Process(process) = self else {
+            return;
+        };
+        // Both are absent for the same kind of url — one with no authority, like
+        // `data:` — and neither names a destination on its own.
+        let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+            return;
+        };
+        process.note_destination(url.scheme(), &host.to_ascii_lowercase(), port);
+    }
 }
 
 /// A body that counts what passes through it and passes it straight on.
@@ -1462,6 +1488,12 @@ pub async fn send(request: reqwest::RequestBuilder) -> reqwest::Result<reqwest::
     if let Err(denial) = check_run_allowlist(built.url()) {
         return Err(refusal_error(denial).await);
     }
+    // After the guard, so this records what was *allowed* and never doubles up
+    // with `denial_sink`'s record of what was not. Before the send rather than
+    // after it, because a request that was permitted and then failed to connect
+    // still reached for that host, and a destination list that omitted it would
+    // be answering a different question than the one it is asked.
+    charge.note_destination(built.url());
     if let Some(body) = built.body_mut().take() {
         // An in-memory body is counted by its length and left alone, so it stays
         // replayable across a redirect; only a streaming body is wrapped, which
@@ -2448,6 +2480,75 @@ mod tests {
                 process.take_egress(),
                 SENT as u64,
                 "the count must be the bytes the peer actually wrote"
+            );
+        }
+
+        /// A request that got out names where it went, and a refused one does not.
+        ///
+        /// Both halves in one test on purpose: the value of the destination list
+        /// is that it says what was *allowed*, so a denial leaking into it would
+        /// make it answer a different question than the one it is asked.
+        // The guard has to span the awaits: it is what serializes this test's
+        // global policy source against every other test's, and releasing it
+        // before the request is sent is the same as not taking it.
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn an_allowed_request_names_its_destination_and_a_refused_one_does_not() {
+            let _guard = crate::denial_sink::test_lock();
+            let host = FakeHost::start(vec![ok_body("first"), ok_body("second")]);
+            let client = hardened().build().expect("client builds");
+            let process = run_scope::ProcessScope::new("p-turn-destinations");
+            let target = Url::parse(&host.origin).expect("the fake host has a url");
+            let port = target.port_or_known_default().expect("http has a default");
+
+            run_scope::scoped_with_process(RunScope::run("run:destinations"), process.clone(), {
+                let client = client.clone();
+                let origin = host.origin.clone();
+                async move {
+                    for _ in 0..2 {
+                        send(client.get(&origin)).await.expect("the peer answers");
+                    }
+                }
+            })
+            .await;
+
+            let drain = process.take_destinations();
+            assert_eq!(
+                drain.seen,
+                vec![(
+                    run_scope::Destination {
+                        scheme: "http".to_string(),
+                        host: target.host_str().expect("the url has a host").to_string(),
+                        port,
+                    },
+                    2,
+                )],
+                "two requests to one host are one destination with a count of two"
+            );
+            assert_eq!(drain.overflowed, 0);
+
+            // A second run, under a policy that permits nothing this url is.
+            // Not the fake host: it is loopback, which `is_loopback_target`
+            // exempts ahead of the policy, so a refusal there is unreachable.
+            let refused = run_scope::ProcessScope::new("p-turn-refused");
+            let allowlist = crate::run_protocol::EgressAllowlist {
+                hosts: vec!["nowhere.example.com".to_string()],
+                ports: vec![443],
+                protocols: vec!["https".to_string()],
+            };
+            install_run_policy_source(move |_| {
+                RunEgressPolicy::Declared(Arc::new(allowlist.clone()))
+            });
+            run_scope::scoped_with_process(RunScope::run("run:refused"), refused.clone(), async {
+                send(client.get("https://api.example.com/v1"))
+                    .await
+                    .expect_err("the allowlist refuses this host");
+            })
+            .await;
+            clear_run_policy_source();
+            assert!(
+                refused.take_destinations().is_empty(),
+                "a refusal belongs to `denial_sink`, not to the allowed-destination list"
             );
         }
 

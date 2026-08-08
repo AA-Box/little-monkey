@@ -31,6 +31,7 @@
 //!    exit status, mirroring how `runs` binds `terminal_sequence` to a terminal
 //!    status.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Mutex;
 
@@ -1762,6 +1763,148 @@ impl<'a> ProcessTable<'a> {
         Ok(())
     }
 
+    /// Record who this process's allowed egress went to.
+    ///
+    /// Additive in the same sense as [`Self::add_egress_bytes`] and for the same
+    /// reason: a drain carries the requests since the last flush, not a running
+    /// total, so a destination already named has its count raised rather than
+    /// replaced.
+    ///
+    /// # Why one transaction
+    ///
+    /// A drain is consumed — [`crate::run_scope::ProcessScope::take_destinations`]
+    /// empties the log — so a flush that half-succeeded would leave the caller
+    /// unable to retry: putting the drain back would double-count the rows that
+    /// did land. All-or-nothing makes the retry safe, which is what
+    /// [`crate::run_scope::ProcessScope::return_destinations`] relies on.
+    pub fn add_egress_destinations(
+        &self,
+        process_id: &str,
+        drain: &crate::run_scope::DestinationDrain,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        if drain.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        // Checked first and inside the transaction: the foreign key would catch an
+        // unknown process anyway, but as a constraint violation rather than as the
+        // `NotFound` every other writer here reports.
+        let updated = transaction.execute(
+            "UPDATE agent_processes
+                SET egress_destinations_dropped =
+                        COALESCE(egress_destinations_dropped, 0) + ?2,
+                    updated_at_ms = ?3
+              WHERE process_id = ?1",
+            params![process_id, drain.overflowed as i64, now_ms],
+        )?;
+        if updated == 0 {
+            return Err(ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            });
+        }
+        for (destination, requests) in &drain.seen {
+            transaction.execute(
+                "INSERT INTO egress_destinations
+                     (process_id, scheme, host, port, requests, first_seen_ms, last_seen_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT(process_id, scheme, host, port) DO UPDATE SET
+                     requests = requests + excluded.requests,
+                     last_seen_ms = MAX(last_seen_ms, excluded.last_seen_ms)",
+                params![
+                    process_id,
+                    destination.scheme,
+                    destination.host,
+                    i64::from(destination.port),
+                    *requests as i64,
+                    now_ms,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Where each of these processes' allowed egress went.
+    ///
+    /// Takes a set rather than one id because the caller that wants this — the
+    /// resource ledger surface — is showing a page of processes at once, and a
+    /// query per row is the shape that makes a list view slow for no reason.
+    ///
+    /// A process with no recorded destinations is absent from the map rather
+    /// than present with an empty list: "nothing was recorded" and "this process
+    /// reached nowhere" are the same fact here, and inventing an entry for every
+    /// id asked about would make the map's size say nothing.
+    ///
+    /// Destinations are ordered by traffic so the noisiest is first, with host,
+    /// port and scheme as tiebreaks so the order is total rather than merely
+    /// mostly-determined.
+    pub fn egress_destinations_for(
+        &self,
+        process_ids: &[String],
+    ) -> ProcessTableResult<BTreeMap<String, ProcessEgressDestinations>> {
+        let mut found: BTreeMap<String, ProcessEgressDestinations> = BTreeMap::new();
+        if process_ids.is_empty() {
+            return Ok(found);
+        }
+        let placeholders = vec!["?"; process_ids.len()].join(", ");
+        let bindings: Vec<&dyn rusqlite::ToSql> = process_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT process_id, scheme, host, port, requests, first_seen_ms, last_seen_ms
+               FROM egress_destinations
+              WHERE process_id IN ({placeholders})
+              ORDER BY requests DESC, host ASC, port ASC, scheme ASC"
+        ))?;
+        let rows = statement
+            .query_map(bindings.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    EgressDestinationRow {
+                        scheme: row.get(1)?,
+                        host: row.get(2)?,
+                        // The `CHECK` keeps this in range, so a value that is not
+                        // is a corrupted database rather than a case to model.
+                        port: u16::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                        requests: row.get::<_, i64>(4)? as u64,
+                        first_seen_ms: row.get(5)?,
+                        last_seen_ms: row.get(6)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (process_id, destination) in rows {
+            found
+                .entry(process_id)
+                .or_default()
+                .destinations
+                .push(destination);
+        }
+
+        // The dropped count is a second query rather than a join: it lives on
+        // `agent_processes`, and a process can have dropped destinations while
+        // naming none at all — a join would lose exactly that row.
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT process_id, egress_destinations_dropped
+               FROM agent_processes
+              WHERE process_id IN ({placeholders})
+                AND egress_destinations_dropped IS NOT NULL
+                AND egress_destinations_dropped > 0"
+        ))?;
+        let dropped = statement
+            .query_map(bindings.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (process_id, count) in dropped {
+            found.entry(process_id).or_default().dropped = count;
+        }
+        Ok(found)
+    }
+
     /// Ask a process for a signal, durably.
     ///
     /// Records intent; does not deliver it. Delivery is the owning kind's job,
@@ -2410,6 +2553,35 @@ pub struct ProcessUsageRow {
     pub usage: ProcessUsage,
 }
 
+/// One process's egress destinations, and what the cap cost.
+///
+/// `dropped` is beside the list rather than folded into it because a truncated
+/// list that does not say it is truncated reads as a complete one — see
+/// `run_scope::MAX_DESTINATIONS` for why there is a cap at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessEgressDestinations {
+    pub destinations: Vec<EgressDestinationRow>,
+    /// Requests to destinations past the cap: counted, not named. Zero means the
+    /// list above is complete.
+    pub dropped: u64,
+}
+
+/// One destination a process's allowed egress reached.
+///
+/// A summary rather than an event — see `MIGRATION_V14_SQL` on why this is not
+/// part of a hash chain and does not claim to be tamper-evident.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressDestinationRow {
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+    pub requests: u64,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+}
+
 /// One field's total across a set of ledger rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -3016,6 +3188,103 @@ mod tests {
                 .to_string()
                 .contains("must state its unmeasured fields"),
             "got {error}"
+        );
+    }
+
+    /// Destinations accumulate across flushes rather than each flush replacing
+    /// the last, which is what makes the drain-and-write cycle safe to repeat.
+    #[test]
+    fn egress_destinations_accumulate_across_flushes_and_keep_their_first_sighting() {
+        use crate::run_scope::{Destination, DestinationDrain};
+
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::ChatTurn, "turn-destinations");
+
+        let destination = |host: &str| Destination {
+            scheme: "https".to_string(),
+            host: host.to_string(),
+            port: 443,
+        };
+        table
+            .add_egress_destinations(
+                &record.process_id,
+                &DestinationDrain {
+                    seen: vec![(destination("api.example.com"), 2)],
+                    overflowed: 0,
+                },
+                T0 + 1,
+            )
+            .expect("the first flush lands");
+        table
+            .add_egress_destinations(
+                &record.process_id,
+                &DestinationDrain {
+                    seen: vec![
+                        (destination("api.example.com"), 3),
+                        (destination("cdn.example.com"), 1),
+                    ],
+                    overflowed: 7,
+                },
+                T0 + 5,
+            )
+            .expect("the second flush lands");
+
+        let found = table
+            .egress_destinations_for(&[record.process_id.clone(), "p-untouched".to_string()])
+            .expect("the destinations read back");
+        assert_eq!(
+            found.keys().collect::<Vec<_>>(),
+            vec![&record.process_id],
+            "a process with nothing recorded is absent, not present and empty"
+        );
+        let recorded = &found[&record.process_id];
+        let rows = &recorded.destinations;
+        assert_eq!(rows.len(), 2, "one row per destination, not per flush");
+        assert_eq!(rows[0].host, "api.example.com", "busiest destination first");
+        assert_eq!(rows[0].requests, 5, "the two flushes are summed");
+        assert_eq!(
+            (rows[0].first_seen_ms, rows[0].last_seen_ms),
+            (T0 + 1, T0 + 5),
+            "the first sighting is kept and only the last one moves"
+        );
+        assert_eq!(rows[1].requests, 1);
+        assert_eq!(
+            recorded.dropped, 7,
+            "requests past the cap are recorded on the process, not lost"
+        );
+    }
+
+    /// An unknown process is refused the same way every other writer here
+    /// refuses one, and leaves nothing behind.
+    #[test]
+    fn egress_destinations_for_an_unknown_process_are_refused_whole() {
+        use crate::run_scope::{Destination, DestinationDrain};
+
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let outcome = table.add_egress_destinations(
+            "p-does-not-exist",
+            &DestinationDrain {
+                seen: vec![(
+                    Destination {
+                        scheme: "https".to_string(),
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                    },
+                    1,
+                )],
+                overflowed: 0,
+            },
+            T0 + 1,
+        );
+        assert!(matches!(outcome, Err(ProcessTableError::NotFound { .. })));
+        assert!(
+            table
+                .egress_destinations_for(&["p-does-not-exist".to_string()])
+                .expect("the read succeeds")
+                .is_empty(),
+            "a refused flush must not leave a partial write behind"
         );
     }
 

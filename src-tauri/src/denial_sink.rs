@@ -60,9 +60,12 @@
 //! policy or letting a remote party grow it without limit; neither is
 //! acceptable, and the separate file is the honest place for a bounded log.
 //!
-//! What the ledger *should* gain is the other half — an **allowed** egress
-//! produces no row anywhere today — and that belongs in the ledger precisely
-//! because its volume is the app's own, not a remote party's.
+//! The ledger has since gained the other half. `run_ledger`'s migration V14 adds
+//! `egress_destinations`, so an **allowed** egress is recorded too — in the
+//! ledger, precisely because its volume is the app's own rather than a remote
+//! party's, and as a counter keyed by destination rather than a row per request,
+//! so it stays bounded by how many places a process talked to. That table is a
+//! summary and says so; this file remains the record of what was *refused*.
 //!
 //! # Why a new refusal kind needs no migration
 //!

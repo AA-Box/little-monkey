@@ -92,9 +92,54 @@ export interface ProcessUsageAggregate {
   gpuResidentBytes: ProcessUsageTotal;
 }
 
+/** One host a process's *allowed* egress reached, and how often. */
+export interface EgressDestination {
+  scheme: string;
+  host: string;
+  port: number;
+  requests: number;
+  firstSeenMs: number;
+  lastSeenMs: number;
+}
+
+/**
+ * Where one process's egress went.
+ *
+ * `dropped` is the count of requests to destinations past the recorder's cap
+ * (`run_scope::MAX_DESTINATIONS`). It is shown rather than hidden because a
+ * truncated list that does not say it is truncated reads as a complete one —
+ * the same rule the unavailable-measurement branches follow.
+ */
+export interface ProcessEgressDestinations {
+  destinations: EgressDestination[];
+  dropped: number;
+}
+
 export interface ProcessUsageLedger {
   rows: ProcessUsageRow[];
   totals: ProcessUsageAggregate;
+  /**
+   * Keyed by `processId`, and only for processes that reached somewhere — a
+   * missing key means nothing was recorded, which is why callers read it with
+   * {@link destinationsFor} rather than indexing it directly.
+   */
+  destinations: Record<string, ProcessEgressDestinations>;
+}
+
+/**
+ * The destinations recorded for one process, or `null` when none were.
+ *
+ * `null` rather than an empty list on purpose: "this process reached nowhere"
+ * and "this build recorded nothing" are the same absence here, and a surface
+ * that rendered an empty list would be claiming the first.
+ */
+export function destinationsFor(
+  ledger: Pick<ProcessUsageLedger, "destinations"> | null,
+  processId: string,
+): ProcessEgressDestinations | null {
+  const found = ledger?.destinations?.[processId];
+  if (!found) return null;
+  return found.destinations.length > 0 || found.dropped > 0 ? found : null;
 }
 
 export interface ProcessUsageFilter {

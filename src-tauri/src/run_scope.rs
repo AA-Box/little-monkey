@@ -60,10 +60,11 @@
 //! finished. Work continuing in a spawned task must re-enter the scope itself. A
 //! test below pins this so that nobody has to discover it from a blank column.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// Why a piece of work legitimately belongs to no run.
 ///
@@ -202,6 +203,7 @@ impl RunScope {
 pub struct ProcessScope {
     process_id: Arc<str>,
     egress_bytes: Arc<AtomicU64>,
+    destinations: Arc<Mutex<DestinationLog>>,
 }
 
 impl ProcessScope {
@@ -215,6 +217,7 @@ impl ProcessScope {
         ProcessScope {
             process_id: Arc::from(process_id.into()),
             egress_bytes: Arc::new(AtomicU64::new(0)),
+            destinations: Arc::new(Mutex::new(DestinationLog::default())),
         }
     }
 
@@ -241,6 +244,130 @@ impl ProcessScope {
     #[must_use]
     pub fn take_egress(&self) -> u64 {
         self.egress_bytes.swap(0, Ordering::Relaxed)
+    }
+
+    /// Notes that this process sent one request to `scheme://host:port`.
+    ///
+    /// Called once per request rather than once per frame, which is what makes a
+    /// lock affordable here where [`Self::charge_egress`] could not afford one:
+    /// a body delivers thousands of frames, but it is one request.
+    ///
+    /// `host` is expected lowercased by the caller, the same convention
+    /// [`crate::egress::allowlist_host_matches`] uses, so nothing folds twice.
+    pub fn note_destination(&self, scheme: &str, host: &str, port: u16) {
+        let mut log = self
+            .destinations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let key = Destination {
+            scheme: scheme.to_string(),
+            host: host.to_string(),
+            port,
+        };
+        if let Some(requests) = log.seen.get_mut(&key) {
+            *requests += 1;
+            return;
+        }
+        if log.seen.len() >= MAX_DESTINATIONS {
+            // Counted, never silently dropped: a reader that sees a truncated
+            // list must be able to tell it is truncated, and by how much.
+            log.overflowed += 1;
+            return;
+        }
+        log.seen.insert(key, 1);
+    }
+
+    /// Takes everything noted since the last call, leaving the log empty.
+    ///
+    /// A drain for [`Self::take_egress`]'s reason: the writer is additive, so a
+    /// read that left the counts behind would write them again next flush.
+    #[must_use]
+    pub fn take_destinations(&self) -> DestinationDrain {
+        let mut log = self
+            .destinations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        DestinationDrain {
+            seen: std::mem::take(&mut log.seen).into_iter().collect(),
+            overflowed: std::mem::replace(&mut log.overflowed, 0),
+        }
+    }
+
+    /// Puts a drain back, for a caller whose write of it failed.
+    ///
+    /// Additive like [`Self::note_destination`], so a flush that fails delays
+    /// its counts to the next drain instead of destroying them. A destination
+    /// that arrived while the write was in flight keeps its count; the two are
+    /// summed rather than one replacing the other.
+    ///
+    /// The cap is re-applied, so returning a full drain cannot grow the log past
+    /// [`MAX_DESTINATIONS`] — the excess becomes overflow, which is what it would
+    /// have been had the write never been attempted.
+    pub fn return_destinations(&self, drain: DestinationDrain) {
+        let mut log = self
+            .destinations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        log.overflowed += drain.overflowed;
+        for (destination, requests) in drain.seen {
+            if let Some(existing) = log.seen.get_mut(&destination) {
+                *existing += requests;
+            } else if log.seen.len() < MAX_DESTINATIONS {
+                log.seen.insert(destination, requests);
+            } else {
+                log.overflowed += requests;
+            }
+        }
+    }
+}
+
+/// The most distinct destinations one process's egress record will hold.
+///
+/// A ceiling is needed because the count is not purely the app's own: a run that
+/// declares no allowlist can be walked across arbitrarily many hosts by the
+/// content it fetches, so "one row per distinct destination" is unbounded in the
+/// case that matters. 128 is far above what any ordinary run reaches — a chat
+/// turn talks to one provider — and requests past it are still counted, just not
+/// individually named.
+pub const MAX_DESTINATIONS: usize = 128;
+
+/// One host a process sent a request to.
+///
+/// Port is `port_or_known_default`'s answer rather than the url's literal port,
+/// so `https://example.com` and `https://example.com:443` are one destination
+/// rather than two.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Destination {
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// What a scope accumulates between flushes.
+#[derive(Debug, Default)]
+struct DestinationLog {
+    /// Ordered so a drain is deterministic, which is what lets a test assert on
+    /// it without sorting first.
+    seen: BTreeMap<Destination, u64>,
+    overflowed: u64,
+}
+
+/// A flush's worth of destinations.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DestinationDrain {
+    /// Each destination and how many requests went to it, in [`Destination`]
+    /// order.
+    pub seen: Vec<(Destination, u64)>,
+    /// Requests to destinations past [`MAX_DESTINATIONS`], which are counted but
+    /// not named.
+    pub overflowed: u64,
+}
+
+impl DestinationDrain {
+    /// Whether there is nothing here to write down.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty() && self.overflowed == 0
     }
 }
 
@@ -546,6 +673,71 @@ mod tests {
             "a drained tally must not report the same bytes twice"
         );
         assert_eq!(charged.take_egress(), 0, "and the drain is shared too");
+    }
+
+    /// Repeat requests raise a count rather than adding a row, and the cap turns
+    /// the rest into a number instead of dropping them.
+    #[test]
+    fn destinations_dedupe_and_the_overflow_past_the_cap_is_counted() {
+        let scope = ProcessScope::new("p-turn-2");
+        scope.note_destination("https", "api.example.com", 443);
+        scope.note_destination("https", "api.example.com", 443);
+        // Same host, different port: a different destination, not the same one.
+        scope.note_destination("https", "api.example.com", 8443);
+
+        // Two slots are already taken, so the last two of these do not fit — and
+        // then one more on top, for three requests past the cap in total.
+        for index in 0..MAX_DESTINATIONS {
+            scope.note_destination("https", &format!("host-{index}.example.com"), 443);
+        }
+        scope.note_destination("https", "one-too-many.example.com", 443);
+
+        let drain = scope.take_destinations();
+        assert_eq!(drain.seen.len(), MAX_DESTINATIONS, "the cap is the ceiling");
+        assert_eq!(
+            drain
+                .seen
+                .iter()
+                .find(|(destination, _)| destination.host == "api.example.com"
+                    && destination.port == 443)
+                .map(|(_, requests)| *requests),
+            Some(2),
+            "a repeat request raises the count on the destination it already has"
+        );
+        assert_eq!(
+            drain.overflowed, 3,
+            "requests past the cap are counted, never silently dropped"
+        );
+        assert!(
+            scope.take_destinations().is_empty(),
+            "a drained log must not report the same requests twice"
+        );
+    }
+
+    /// A failed write can hand the drain back without losing or double-counting.
+    #[test]
+    fn returning_a_drain_sums_with_what_arrived_meanwhile() {
+        let scope = ProcessScope::new("p-turn-3");
+        scope.note_destination("https", "api.example.com", 443);
+        let drain = scope.take_destinations();
+
+        // The request that arrived while the (failed) write was in flight.
+        scope.note_destination("https", "api.example.com", 443);
+        scope.return_destinations(drain);
+
+        let recovered = scope.take_destinations();
+        assert_eq!(
+            recovered.seen,
+            vec![(
+                Destination {
+                    scheme: "https".to_string(),
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                },
+                2,
+            )],
+            "the returned count and the new one are summed, not one replacing the other"
+        );
     }
 
     /// `tokio::spawn` does not inherit the scope, and this pins it rather than
