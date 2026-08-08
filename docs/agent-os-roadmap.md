@@ -3304,9 +3304,42 @@ scheduler backpressure and the per-listener `RequestAdmission` bound are differe
 things and stay distinguishable: `503`/`server_busy` means requests in flight,
 `429` + `Retry-After` means the work queue behind them.
 
-**Remaining:** no cascade preemption (one victim per tick), and `ready_jobs` still
-takes slot availability into account for dispatch even though the candidate window
-no longer does.
+**Shipped — cascade preemption, and the reason it was deferred did not survive
+being written down.** `preemption_victim` returned at most one job and required
+that job's claim to cover the whole shortfall by itself, so two `background`
+jobs that would together have freed enough freed nothing and the claimant sat
+behind a pair it could have displaced. Its own `ponytail:` comment named the
+upgrade path — "return a `Vec` from this function" — and named the blocker as a
+missing cost model for "how much work is being parked".
+
+That blocker dissolves with one guard. Victims are accumulated in the existing
+preference order and the set is returned **only if it actually covers the
+shortfall**; a set that would fall short is discarded whole and nobody is
+suspended. So the failure the cost model was wanted for — parking real work and
+still not admitting the claimant — cannot happen, and what remains is the same
+judgement the single-victim rule already made, applied more than once.
+
+- **`preemption_victim` is gone rather than kept beside the new form.** The set
+  version returns exactly that one job when one job covers it, so keeping both
+  would have been two rules that can disagree about who goes first. The
+  eligibility test and the ordering are now one `eligible` and one `preference`,
+  shared by construction.
+- **Greedy in preference order**, which is also what keeps the set small: lowest
+  class first, then largest claim, so the biggest contributors are consumed
+  before the small ones are reached.
+- **The hold reason names each suspended job** rather than counting them —
+  "suspended 2 jobs" is not something an operator can act on.
+- Zero shortfall suspends nobody, and the accumulation saturates rather than
+  wrapping, since a total that overflowed would silently stop covering a
+  shortfall it had already exceeded.
+
+**Correction: the second half of the old "Remaining" above described something
+that is not in the code.** `ready_jobs` takes no slot availability into account
+and has no parameter that could carry it — `schedule` calls
+`ready_jobs(self.config.max_queue)`, the whole queue. Free slots bound
+*admissions* further down the same pass, which is not the same thing and is
+correct: a pass must not admit more than there is room for. The claim appears to
+have outlived the change that widened the candidate window.
 
 **Blocks:** nothing now.
 

@@ -327,47 +327,86 @@ impl Running {
     }
 }
 
-/// Who should step aside so `claimant` can start, if anyone should.
+/// Everyone who should step aside so `claimant` can start, if anyone should.
 ///
-/// Only a **strictly lower** class is ever preempted. Equal classes never
-/// preempt each other: two interactive turns fighting over one device would
-/// suspend and resume each other forever and finish neither, and a scheduler
-/// whose worst case is livelock is worse than one that makes the second turn
-/// wait.
+/// The cascading form the single-victim rule could not express: two `background`
+/// jobs that together free enough used to free nothing, so a claimant was held
+/// behind a pair it could have displaced.
 ///
-/// Among the eligible, the victim is the one whose own claim on the short
-/// resource covers the shortfall by itself, preferring the lowest class, then the
-/// largest claim, then the *most recently started* job — the long-running one
-/// keeps its progress, which is the difference between preemption and just
-/// undoing work.
+/// # Why parking a set is not riskier than parking one
 ///
-/// ponytail: single-victim only. Two `background` jobs that would together free
-/// enough are not both suspended, so a claimant can be held behind a pair it
-/// could have displaced. Cascading preemption needs a cost model for "how much
-/// work is being parked" that nothing here measures yet; the upgrade path is to
-/// return a `Vec` from this function and leave every caller unchanged in shape.
-pub fn preemption_victim(
+/// The objection to cascading was that it needs a cost model for "how much work
+/// is being parked", which nothing here measures. It does not, because of the
+/// guard: victims are accumulated in preference order and the set is returned
+/// **only if it actually covers the shortfall**. A set that would fall short is
+/// discarded whole and nobody is suspended, so the failure this was worried
+/// about — parking real work and still not admitting the claimant — cannot
+/// happen. What remains is the same judgement the single-victim rule already
+/// makes, applied more than once.
+///
+/// Greedy in [`preference`] order, so it takes the lowest class first, then the
+/// largest claim — which is also what keeps the set small, since the biggest
+/// contributors are consumed first. The remaining judgement, "is parking three
+/// background jobs worse than making one interactive turn wait", is the same one
+/// answered for a single victim.
+///
+/// Returns empty when no set covers the shortfall, when nothing is eligible, or
+/// when `shortfall_bytes` is zero — the last because a claimant that needs
+/// nothing must not suspend anyone.
+pub fn preemption_victims(
     claimant: ProcessClass,
     resource: Resource,
     shortfall_bytes: u64,
     running: &[Running],
-) -> Option<&Running> {
+) -> Vec<&Running> {
+    if shortfall_bytes == 0 {
+        return Vec::new();
+    }
+    let mut ordered: Vec<&Running> = eligible(claimant, running).collect();
+    ordered.sort_by(|left, right| preference(left, right, resource));
+
+    let mut freed = 0u64;
+    let mut chosen = Vec::new();
+    for victim in ordered {
+        // Saturating because these are measured claims summed across jobs; a
+        // total that overflowed would wrap to a small number and silently stop
+        // covering the shortfall it had already exceeded.
+        freed = freed.saturating_add(victim.claim(resource));
+        chosen.push(victim);
+        if freed >= shortfall_bytes {
+            return chosen;
+        }
+    }
+    // Everything eligible together is still not enough. Suspending any of it
+    // would park work for nothing, so nobody is chosen.
+    Vec::new()
+}
+
+/// Who may be preempted at all: a strictly lower class that has not already
+/// been parked.
+///
+/// Only a **strictly lower** class is ever preempted, for the reason the callers
+/// above give: equal classes preempting each other is livelock.
+fn eligible(claimant: ProcessClass, running: &[Running]) -> impl Iterator<Item = &Running> {
     running
         .iter()
-        .filter(|victim| {
-            !victim.preempted
-                && victim.class.rank() > claimant.rank()
-                && victim.claim(resource) >= shortfall_bytes
-        })
-        .min_by(|left, right| {
-            right
-                .class
-                .rank()
-                .cmp(&left.class.rank())
-                .then(right.claim(resource).cmp(&left.claim(resource)))
-                .then(right.started_at_ms.cmp(&left.started_at_ms))
-                .then(left.job_id.cmp(&right.job_id))
-        })
+        .filter(move |victim| !victim.preempted && victim.class.rank() > claimant.rank())
+}
+
+/// Which of two eligible jobs should be preempted first.
+///
+/// Lowest class, then largest claim, then the *most recently started* — the
+/// long-running job keeps its progress, which is the difference between
+/// preemption and just undoing work. `job_id` last, so the order is total and a
+/// tick's decision is reproducible.
+fn preference(left: &Running, right: &Running, resource: Resource) -> std::cmp::Ordering {
+    right
+        .class
+        .rank()
+        .cmp(&left.class.rank())
+        .then(right.claim(resource).cmp(&left.claim(resource)))
+        .then(right.started_at_ms.cmp(&left.started_at_ms))
+        .then(left.job_id.cmp(&right.job_id))
 }
 
 /// How long a preempted job must stay suspended before the scheduler will
@@ -831,17 +870,17 @@ mod tests {
             running("peer", ProcessClass::Interactive, 8_000),
             running("lower", ProcessClass::Background, 8_000),
         ];
-        let victim = preemption_victim(
-            ProcessClass::Interactive,
-            Resource::Ram,
-            4_000,
-            &running,
+        let victims = preemption_victims(ProcessClass::Interactive, Resource::Ram, 4_000, &running);
+        assert_eq!(
+            victims
+                .iter()
+                .map(|entry| entry.job_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lower"]
         );
-        assert_eq!(victim.map(|entry| entry.job_id.as_str()), Some("lower"));
 
         assert!(
-            preemption_victim(ProcessClass::Background, Resource::Ram, 4_000, &running)
-                .is_none(),
+            preemption_victims(ProcessClass::Background, Resource::Ram, 4_000, &running).is_empty(),
             "a background claimant may not preempt an interactive peer"
         );
     }
@@ -851,9 +890,7 @@ mod tests {
     #[test]
     fn an_equal_class_is_never_a_victim() {
         let running = vec![running("peer", ProcessClass::Batch, 16_000)];
-        assert!(
-            preemption_victim(ProcessClass::Batch, Resource::Ram, 1_000, &running).is_none()
-        );
+        assert!(preemption_victims(ProcessClass::Batch, Resource::Ram, 1_000, &running).is_empty());
     }
 
     #[test]
@@ -869,16 +906,82 @@ mod tests {
                 ..running("oldest", ProcessClass::Maintenance, 9_000)
             },
         ];
-        let victim =
-            preemption_victim(ProcessClass::Batch, Resource::Ram, 8_000, &running).unwrap();
+        let victims = preemption_victims(ProcessClass::Batch, Resource::Ram, 8_000, &running);
         assert_eq!(
-            victim.job_id, "newest",
-            "the long-running job keeps its progress"
+            victims
+                .iter()
+                .map(|v| v.job_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newest"],
+            "one job covers it alone, so the long-running one keeps its progress"
         );
 
         assert!(
-            preemption_victim(ProcessClass::Batch, Resource::Ram, 20_000, &running).is_none(),
-            "no single victim covers it, and cascading preemption is out of scope"
+            preemption_victims(ProcessClass::Batch, Resource::Ram, 20_000, &running).is_empty(),
+            "19_000 across everything eligible still does not cover 20_000"
+        );
+    }
+
+    /// The case the single-victim rule could not express: a pair that together
+    /// covers the shortfall used to free nothing.
+    #[test]
+    fn a_set_of_victims_is_taken_in_preference_order_and_stops_once_it_covers() {
+        let running = vec![
+            Running {
+                started_at_ms: 5_000,
+                ..running("newest", ProcessClass::Maintenance, 9_000)
+            },
+            Running {
+                started_at_ms: 2_000,
+                ..running("oldest", ProcessClass::Maintenance, 9_000)
+            },
+            running("small", ProcessClass::Maintenance, 1_000),
+        ];
+
+        // 9_000 alone is short; 9_000 + 9_000 is not.
+        let victims: Vec<&str> =
+            preemption_victims(ProcessClass::Batch, Resource::Ram, 15_000, &running)
+                .iter()
+                .map(|victim| victim.job_id.as_str())
+                .collect();
+        assert_eq!(
+            victims,
+            vec!["newest", "oldest"],
+            "largest claims first, newest before oldest, and it stops as soon as it covers"
+        );
+
+        assert_eq!(
+            preemption_victims(ProcessClass::Batch, Resource::Ram, 8_000, &running)
+                .iter()
+                .map(|victim| victim.job_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newest"],
+            "one job that covers it on its own is still one job"
+        );
+    }
+
+    /// The guard that makes cascading safe without a cost model: a set that
+    /// would fall short parks nobody.
+    #[test]
+    fn victims_are_not_parked_when_even_all_of_them_would_not_cover_the_shortfall() {
+        let running = vec![
+            running("a", ProcessClass::Background, 4_000),
+            running("b", ProcessClass::Background, 4_000),
+        ];
+        assert!(
+            preemption_victims(ProcessClass::Interactive, Resource::Ram, 20_000, &running)
+                .is_empty(),
+            "suspending work that still would not admit the claimant is pure loss"
+        );
+        // And the same rule for a claimant that needs nothing at all.
+        assert!(
+            preemption_victims(ProcessClass::Interactive, Resource::Ram, 0, &running).is_empty(),
+            "a claimant with no shortfall must not suspend anyone"
+        );
+        // Equal class is never eligible, cascading or not.
+        assert!(
+            preemption_victims(ProcessClass::Background, Resource::Ram, 4_000, &running).is_empty(),
+            "equal classes preempting each other is the livelock this rules out"
         );
     }
 
@@ -889,8 +992,8 @@ mod tests {
             ..running("parked", ProcessClass::Background, 9_000)
         }];
         assert!(
-            preemption_victim(ProcessClass::Interactive, Resource::Ram, 1_000, &running)
-                .is_none()
+            preemption_victims(ProcessClass::Interactive, Resource::Ram, 1_000, &running)
+                .is_empty()
         );
     }
 
