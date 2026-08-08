@@ -998,6 +998,15 @@ pub async fn tool_run_shell(
     }
 
     let output = outcome?;
+    // The command was watched to exit. A timeout or a Stop leaves only the
+    // declaration above, which is the right way round: a killed `sh -c` had
+    // already run for as long as it ran, and the preview says "may have" rather
+    // than reporting nothing.
+    checkpoints::commit_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        checkpoints::ExternalEffectKind::Shell,
+    )?;
     // Both streams were unbounded from the child's pipes all the way into the
     // model's context. Of the app's command-running paths this was the only
     // uncapped one, and the only one whose output a model reads directly:
@@ -1132,7 +1141,27 @@ pub async fn tool_remember(
         .memory_lock
         .lock()
         .map_err(|_| "Memory lock poisoned".to_string())?;
-    memory::add_fact_impl(&path, &root, &text, "agent", turn_id.as_deref())
+    let fact = memory::add_fact_impl(&path, &root, &text, "agent", turn_id.as_deref())?;
+    // Recorded *after* the add, with the id the store actually assigned — an id
+    // guessed before the write could name a fact that was never created, and
+    // `add_fact_impl` returns the pre-existing fact when the text is a duplicate.
+    checkpoints::record_remembered_fact(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        checkpoints::RememberedFact {
+            id: fact.id.clone(),
+            text: fact.text.clone(),
+        },
+    )?;
+    // The write returned, so the fact is in the store. This is the one kind
+    // whose commit is also its compensator's precondition: `remembered_facts`
+    // is what revert deletes, and both are filled by the same success path.
+    checkpoints::commit_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        checkpoints::ExternalEffectKind::Memory,
+    )?;
+    Ok(fact)
 }
 
 /// Read one bundled file from an installed native skill's folder — the
@@ -1720,6 +1749,7 @@ mod tests {
         state.checkpoints.lock().unwrap().insert(
             "test-checkpoint".to_string(),
             checkpoints::ActiveCheckpoint {
+                remembered_facts: Vec::new(),
                 dir: checkpoint_dir,
                 entries: Vec::new(),
                 created_at_ms: 0,
@@ -1728,6 +1758,7 @@ mod tests {
                 label: String::new(),
                 shell_ran: false,
                 external_effects: std::collections::BTreeSet::new(),
+                committed_effects: std::collections::BTreeSet::new(),
                 prev_id: None,
             },
         );

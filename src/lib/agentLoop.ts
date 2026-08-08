@@ -34,6 +34,7 @@ import {
   abortedPromise,
   attemptStream,
   CANCELLED_TOOL_RESULT,
+  describeUsageTarget,
   executeToolCall,
   isToolCallAllowed,
   PRESENT_PLAN_RESULT,
@@ -68,7 +69,7 @@ import { useStackStore, type StackQueryResult } from '../store/stackStore';
 import { useMcpStore } from '../store/mcpStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { admitProcess, exitProcess, exitStatusFor, linkProcessRun, markProcessRunning, reconcileProcess } from './processTable';
-import { honourPause, forgetPause } from './pauseRegistry';
+import { honourPause, forgetPause, isPauseRequested } from './pauseRegistry';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import {
   gatePrivacyWireMessages,
@@ -84,8 +85,17 @@ import { extractArtifacts } from './artifacts';
 import { useArtifactStore } from '../store/artifactStore';
 import {
   buildModelTargetInventory,
+  type ModelTargetInventory,
   type ModelTargetSnapshot,
 } from './modelTargets';
+import {
+  observedTimeToFirstTokenMs,
+  routeRequest,
+  type RoutingCandidate,
+  type RoutingDecision,
+  type RoutingTaskClass,
+} from './modelRouting';
+import { useRoutingPolicyStore } from '../store/routingPolicyStore';
 import { beginDurableRun, type DurableRunRecorder } from './durableRun';
 import { daemonCancel } from './daemonClient';
 import { requestRunCancellation } from './runProtocol';
@@ -126,6 +136,23 @@ const DEFAULT_LLAMA_PORT = 8090;
  * a real (currently nonexistent, but defensively still hidden) system
  * message. */
 export const SWITCH_NOTE_PREFIX = '[Model switch]';
+
+/** Marks the notice a resumed turn writes — see {@link ResumedTurn}. Lives here
+ * rather than in `frozenTurn.ts` so the edge between the two modules runs one
+ * way: `frozenTurn` needs `runAgentTurn`, and a constant read during module
+ * initialization on the way back would be the half of a cycle that bites. */
+export const RESUME_NOTE_PREFIX = '[Resume]';
+
+/** A re-entry into a turn frozen at a tool boundary (roadmap K13), passed to
+ * {@link runAgentTurn} by `frozenTurn.ts` and by nothing else. */
+export interface ResumedTurn {
+  /** The image being continued. Already cleared by the caller — held here for
+   * the transcript notice and for anything that later wants to name it. */
+  resumedFromCheckpointId: string;
+  /** `checkpoint_restorability`'s statement of what a resume does *not*
+   * reproduce, written into the transcript beside the continuation. */
+  determinismCaveats: string[];
+}
 
 export function isSwitchNotice(message: ChatMessage): boolean {
   return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(SWITCH_NOTE_PREFIX);
@@ -1081,7 +1108,16 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
   const privacyWorkspaceId =
     primaryRoot(useWorkspaceStore.getState().roots)?.path ?? 'global';
   const privacyWireCache: PrivacyWireCache = new Map();
-  let target = await resolveTarget();
+  // Summarization is its own K9 task class: it is bulk, throwaway work that a
+  // user may well want on a cheaper or local model than the conversation
+  // itself. It offers no tools and never carries an image. Not applied to the
+  // global active target — compacting a chat must not change what the next
+  // real turn runs on.
+  let target = routeFromActive(await resolveTarget(), {
+    taskClass: 'summarize',
+    requiresVision: false,
+    requiresTools: false,
+  }).target;
   const result = await applyContextCompaction(history, {
     strategy: settings.contextTrimStrategy,
     contextLimit: useUsageStore.getState().contextLimit,
@@ -1161,9 +1197,12 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
 /** Exported so `issueToPrRunner.ts` can build the `target` field
  * `beginDurableRun` needs for its own headless run, the same reuse reasoning
  * as `resolveTarget` above. */
-export function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot | null {
+/** The live target inventory — the same set the model picker offers. Shared by
+ * `snapshotForResolvedTarget` and the K9 routing candidates below so a target
+ * routing can choose is by construction one the user already configured. */
+function currentTargetInventory(): ModelTargetInventory {
   const state = useModelStore.getState();
-  const inventory = buildModelTargetInventory({
+  return buildModelTargetInventory({
     installed: state.installed,
     active: state.active,
     llamaStatus: state.llamaStatus,
@@ -1173,6 +1212,10 @@ export function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSn
     providerModels: state.providerModels,
     effortByTarget: state.effortByTarget,
   });
+}
+
+export function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot | null {
+  const inventory = currentTargetInventory();
   if (target.kind === 'local') {
     return inventory.targets.find((candidate) => candidate.kind === 'local') ?? null;
   }
@@ -1342,6 +1385,138 @@ function findVisionCandidate(): ResolvedTarget | null {
   if (visionOllama) return { kind: 'ollama', baseUrl: 'http://127.0.0.1:11434', model: visionOllama.name };
 
   return null;
+}
+
+/** Prefix identifying a synthetic dispatch-policy notice (K9 — see
+ * `modelRouting.ts`). Reuses `SWITCH_NOTE_PREFIX` rather than minting a fourth
+ * prefix: a routed target IS a model switch as far as the transcript and
+ * `MessageList`'s rendering are concerned, and the sentence names the policy
+ * that caused it. */
+export const ROUTING_NOTE_PREFIX = SWITCH_NOTE_PREFIX;
+
+/** Turns one inventory snapshot into a routing candidate.
+ *
+ * Vision goes through `resolvedTargetSupportsVision` — the same predicate the
+ * turn itself uses — rather than the snapshot's own field, which is `unknown`
+ * for every provider model (`modelTargets.ts::providerTarget`) while
+ * `visionModels.ts` name patterns plus the user's overrides are what the rest
+ * of the loop actually believes. Deciding it any other way could route an
+ * image to a model `stripImagesForTextOnlyTarget` then strips it for.
+ */
+function routingCandidate(snapshot: ModelTargetSnapshot): RoutingCandidate {
+  const rates = useCostControlStore.getState().rates[snapshot.key];
+  const entries = useCostControlStore.getState().entries;
+  const isLocal = snapshot.kind === 'ollama' ? snapshot.isCloud !== true : snapshot.kind === 'local';
+  const vision = resolvedTargetSupportsVision(
+    snapshot.kind === 'provider'
+      ? { kind: 'provider', providerId: snapshot.providerId, model: snapshot.model }
+      : snapshot.kind === 'ollama'
+        ? { kind: 'ollama', baseUrl: snapshot.baseUrl, model: snapshot.model }
+        : { kind: 'local', baseUrl: '', modelLabel: snapshot.displayName },
+  );
+  return {
+    key: snapshot.key,
+    label: `${snapshot.label} · ${snapshot.displayName}`,
+    isLocal,
+    available: snapshot.availability.status === 'available',
+    toolCalling: snapshot.capabilities.toolCalling.state,
+    vision: vision ? 'yes' : 'no',
+    // A target that costs nothing to run has a rate of zero, not an unknown
+    // one — otherwise every cost ceiling would exclude local models, which is
+    // the opposite of what a cost-conscious policy wants.
+    inputPerMillionUsd: isLocal ? 0 : rates?.inputPerMillionUsd ?? null,
+    outputPerMillionUsd: isLocal ? 0 : rates?.outputPerMillionUsd ?? null,
+    observedTimeToFirstTokenMs: observedTimeToFirstTokenMs(entries, snapshot.key),
+  };
+}
+
+/** Converts an inventory snapshot back into a streamable target.
+ *
+ * ponytail: managed llama.cpp is deliberately not routable — the same
+ * reasoning `buildFailoverChain` and `findLocalOnlyTarget` already document
+ * (making it the active target is not something an automatic switch has a
+ * basis to do unattended), so it is excluded from candidates below and
+ * `local_only` policies are served by non-cloud Ollama exactly as the Privacy
+ * Firewall's own local fallback is. Upgrade path if it is ever wanted: teach
+ * `applyTargetSwitch` the `local` kind and drop the filter.
+ */
+function resolvedFromSnapshot(snapshot: ModelTargetSnapshot): ResolvedTarget | null {
+  if (snapshot.kind === 'provider') {
+    return { kind: 'provider', providerId: snapshot.providerId, model: snapshot.model };
+  }
+  if (snapshot.kind === 'ollama') {
+    return { kind: 'ollama', baseUrl: snapshot.baseUrl, model: snapshot.model };
+  }
+  return null;
+}
+
+export interface RoutingContext {
+  taskClass: RoutingTaskClass;
+  /** True when this turn has an image attached — a hard constraint, never a
+   * policy preference. */
+  requiresVision: boolean;
+  /** True when this surface offers tools to the model. */
+  requiresTools: boolean;
+}
+
+export interface RoutedTarget {
+  /** The target to run. Equal to the `active` argument when no policy applied. */
+  target: ResolvedTarget;
+  decision: RoutingDecision;
+  /** The policy's ordered attempt sequence, chosen target first. Empty when no
+   * policy applied, so the caller keeps its existing failover behavior. */
+  sequence: ResolvedTarget[];
+}
+
+/**
+ * K9 dispatch policy: decides which configured model executes this piece of
+ * work, starting from the target that would have run without any policy.
+ *
+ * Synchronous, and deliberately does **not** apply the choice to global model
+ * state — the caller does that, because a chat turn's routed target should
+ * stick (session affinity, via `applyTargetSwitch`) while a subagent's must
+ * never move the model the user is chatting with.
+ *
+ * Ordering, which is the part that keeps a policy from widening anything:
+ * every caller routes *before* its Privacy Firewall gate, so the routed
+ * target is gated exactly like a hand-picked one and the firewall's own
+ * switch-to-local still overrides a policy. Nothing here reads or writes a
+ * permission mode, a workspace root, or an egress rule.
+ */
+export function routeFromActive(active: ResolvedTarget, context: RoutingContext): RoutedTarget {
+  const policies = useRoutingPolicyStore.getState().policies;
+  const activeKey = snapshotForResolvedTarget(active)?.key ?? null;
+  const snapshots = new Map<string, ModelTargetSnapshot>();
+  const candidates: RoutingCandidate[] = [];
+  for (const snapshot of currentTargetInventory().targets) {
+    if (resolvedFromSnapshot(snapshot) === null && snapshot.key !== activeKey) continue;
+    snapshots.set(snapshot.key, snapshot);
+    candidates.push(routingCandidate(snapshot));
+  }
+
+  const decision = routeRequest(policies, candidates, context, activeKey);
+  useRoutingPolicyStore.getState().recordDecision(decision);
+
+  const sequence: ResolvedTarget[] = [];
+  for (const key of decision.sequence) {
+    // The active target keeps its already-resolved form (it may be managed
+    // llama.cpp, which has no snapshot conversion) rather than being rebuilt.
+    if (key === activeKey) {
+      sequence.push(active);
+      continue;
+    }
+    const snapshot = snapshots.get(key);
+    const resolved = snapshot ? resolvedFromSnapshot(snapshot) : null;
+    if (resolved) sequence.push(resolved);
+  }
+
+  return { target: sequence[0] ?? active, decision, sequence };
+}
+
+/** `routeFromActive` starting from whatever target is currently selected —
+ * the entry point for every surface that dispatches the user's active model.  */
+export async function routeTarget(context: RoutingContext): Promise<RoutedTarget> {
+  return routeFromActive(await resolveTarget(), context);
 }
 
 /** An explicit attachment (from the "+" attach menu), as opposed to a text-derived "@"-mention. */
@@ -1541,6 +1716,14 @@ export async function runAgentTurn(
   // own Rust-side prompt/tools and isn't part of this feature yet, same
   // stance as `availableSkills` above.
   ultracode = false,
+  // Set only by `frozenTurn.ts`: this call is not a new question, it is the
+  // continuation of a turn that was frozen at a tool boundary and is being
+  // re-entered from its image. It suppresses the user message this function
+  // otherwise appends — the conversation is already whole, and a blank one would
+  // be a turn the user never took — and writes the determinism caveats into the
+  // transcript, because whoever reads the continuation is the person who needs
+  // to know what a resume does not reproduce.
+  resume: ResumedTurn | null = null,
 ): Promise<void> {
   // Hard invariant: at most one turn per session, ever. Two turns streaming
   // into one transcript interleave their `updateLastMessage` patches and
@@ -1618,7 +1801,11 @@ export async function runAgentTurn(
     // that a requested write happened. Keep explicit mutation turns on the
     // in-process desktop loop, where the bounded corrective retry and
     // mutation-success guard below are enforced.
-    if (route === 'daemon' && !mutationRequired) {
+    // A resumed turn stays on the in-process loop whatever the route says: the
+    // image it is continuing was written by this loop's own checkpoint, and the
+    // daemon path composes its history Rust-side from a task string it was never
+    // given here.
+    if (route === 'daemon' && !mutationRequired && resume === null) {
       await runDaemonAgentTurn(sessionId, userText, attachments, controller.signal, turnId, skillInvocations);
     } else {
       await runTurnGuarded(
@@ -1631,6 +1818,7 @@ export async function runAgentTurn(
         availableSkills,
         ultracode,
         mutationRequired,
+        resume,
       );
     }
   } catch (error) {
@@ -1736,7 +1924,21 @@ async function runDaemonAgentTurn(
     const candidate = findVisionCandidate();
     if (candidate) applyTargetSwitch(candidate);
   }
-  let resolvedTarget = await resolveTarget();
+  // Same K9 dispatch policy as the local turn path, and in the same position:
+  // after the vision auto-switch, before the Privacy Firewall gate below.
+  const routed = routeFromActive(await resolveTarget(), {
+    taskClass: 'chat',
+    requiresVision: images.length > 0,
+    requiresTools: true,
+  });
+  let resolvedTarget = routed.target;
+  if (routed.decision.changedFromActive) {
+    applyTargetSwitch(resolvedTarget);
+    store.addMessage(sessionId, {
+      role: 'system',
+      content: `${ROUTING_NOTE_PREFIX} ${routed.decision.reason}`,
+    });
+  }
   let targetSnapshot = snapshotForResolvedTarget(resolvedTarget);
   if (!targetSnapshot) {
     throw new Error('The selected model target could not be frozen for the resident runner.');
@@ -2026,6 +2228,7 @@ async function runTurnGuarded(
   availableSkills: SlashSkill[] = [],
   ultracode = false,
   mutationRequired = false,
+  resume: ResumedTurn | null = null,
 ): Promise<void> {
   // The index this turn's user message will land at — captured before
   // `addMessage` so it can anchor a later "Rewind conversation" back to the
@@ -2036,7 +2239,20 @@ async function runTurnGuarded(
   // in the turn body does async file/image reads) — if there's at least one
   // image, it's promoted in place, right after, to a `ChatContentPart[]` so
   // the chat UI actually shows what was attached, not just what was typed.
-  useSessionStore.getState().addMessage(sessionId, { role: 'user', content: userText });
+  if (resume === null) {
+    useSessionStore.getState().addMessage(sessionId, { role: 'user', content: userText });
+  } else {
+    // The caveats are the whole reason `checkpoint_restorability` returns them
+    // rather than a doc holding them: a resumed turn is a fresh generation from
+    // the frozen point, not a replay of the one that was interrupted, and the
+    // transcript is where the person reading the continuation will be.
+    useSessionStore.getState().addMessage(sessionId, {
+      role: 'system',
+      content: [`${RESUME_NOTE_PREFIX} Resumed from a frozen image.`, ...resume.determinismCaveats].join(
+        '\n',
+      ),
+    });
+  }
 
   // Open a per-turn file checkpoint (see src-tauri/src/checkpoints.rs) so
   // every write_file/edit_file this turn makes can be reverted in one click.
@@ -2209,7 +2425,21 @@ async function runAgentTurnBody(
   // once per turn and only advanced (never rebuilt) on a pre-first-token
   // failure, so a target that succeeds stays in use for every subsequent
   // tool round trip within this same turn.
-  let primaryTarget = await resolveTarget();
+  //
+  // K9 dispatch policy runs here: after the vision auto-switch (so a policy
+  // sees the target the user would actually have run) and before the Privacy
+  // Firewall gate below (so the firewall still owns the final say over a
+  // routed target, including its own switch-to-local).
+  const routed = await routeTarget({
+    taskClass: 'chat',
+    requiresVision: requireVision,
+    requiresTools: true,
+  });
+  let primaryTarget = routed.target;
+  if (routed.decision.changedFromActive) {
+    applyTargetSwitch(primaryTarget);
+    addMessage({ role: 'system', content: `${ROUTING_NOTE_PREFIX} ${routed.decision.reason}` });
+  }
 
   // Distinct from the block above: that one is about a NEW image attached
   // THIS turn; this one is an OLDER image already sitting in history from a
@@ -2294,20 +2524,34 @@ async function runAgentTurnBody(
 
   const initialProviderTarget =
     primaryTarget.kind === 'provider' ? primaryTarget : null;
-  let sequence: ResolvedTarget[] =
-    settings.autoFailoverEnabled && initialProviderTarget
-      ? [
-          initialProviderTarget,
-          ...buildFailoverChain(requireVision).filter(
-            (candidate) =>
-              !(
-                candidate.kind === 'provider'
-                && candidate.providerId === initialProviderTarget.providerId
-                && candidate.model === initialProviderTarget.model
-              ),
+  // A matched K9 policy supplies this turn's attempt order, replacing the
+  // fixed provider chain — "failover follows a fixed sequence" was the other
+  // half of what K9 owed. Ignored when the Privacy Firewall redirected this
+  // turn (it reassigns `primaryTarget` above, and its decision outranks any
+  // policy), and still gated on the same `autoFailoverEnabled` toggle, so
+  // turning failover off means one attempt whether a policy matched or not.
+  const policySequence =
+    primaryTarget === routed.target && routed.sequence.length > 0 ? routed.sequence : null;
+  let sequence: ResolvedTarget[];
+  if (!settings.autoFailoverEnabled) {
+    sequence = [primaryTarget];
+  } else if (policySequence) {
+    sequence = policySequence;
+  } else if (initialProviderTarget) {
+    sequence = [
+      initialProviderTarget,
+      ...buildFailoverChain(requireVision).filter(
+        (candidate) =>
+          !(
+            candidate.kind === 'provider'
+            && candidate.providerId === initialProviderTarget.providerId
+            && candidate.model === initialProviderTarget.model
           ),
-        ]
-      : [primaryTarget];
+      ),
+    ];
+  } else {
+    sequence = [primaryTarget];
+  }
   let sequenceIndex = 0;
   let target = sequence[0];
 
@@ -2689,8 +2933,41 @@ async function runAgentTurnBody(
   // a "keep trying until it passes" loop.
   let verifyRound = 0;
 
+  /**
+   * The turn's safe point: freeze first if a suspend is latched, then park.
+   *
+   * This *is* the tool boundary K13's acceptance names. The previous round's
+   * tool calls and their permission prompts have all resolved by here, which is
+   * what makes the image coherent — and why it records no pending approvals
+   * rather than recording an empty list as a shortcut.
+   *
+   * The image is written before the wait, not after it. A process parked in
+   * memory is exactly the state a quit or a crash destroys, so an image written
+   * on the way out would be written at the one moment it is too late.
+   * Best-effort by construction: a freeze that fails leaves a turn that pauses
+   * and resumes in memory, which is what happened before it existed.
+   */
+  async function parkHere(): Promise<void> {
+    if (!signal) return;
+    const processId = chatTurnProcesses.get(turnId) ?? null;
+    if (isPauseRequested(turnId) && checkpointId !== null && processId !== null) {
+      await invoke('checkpoint_freeze_live', {
+        id: checkpointId,
+        resume: {
+          processId,
+          frozenAtMs: Date.now(),
+          model: describeUsageTarget(primaryTarget),
+          runtimeId: primaryTarget.kind,
+          workspace: primaryRoot(useWorkspaceStore.getState().roots)?.path ?? null,
+          pendingApprovals: [],
+        },
+      }).catch(() => undefined);
+    }
+    await honourPause(turnId, processId, signal);
+  }
+
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
-    if (signal) await honourPause(turnId, chatTurnProcesses.get(turnId) ?? null, signal);
+    if (signal) await parkHere();
     // Stop button fired while a tool call was executing (between model
     // round trips, where there's no stream to abort) — don't start another.
     if (signal?.aborted) return;
@@ -3185,7 +3462,7 @@ async function runAgentTurnBody(
       }
     }
 
-    if (signal) await honourPause(turnId, chatTurnProcesses.get(turnId) ?? null, signal);
+    if (signal) await parkHere();
     if (signal?.aborted) return;
 
     // Loop again: the model gets the tool results appended to its history.

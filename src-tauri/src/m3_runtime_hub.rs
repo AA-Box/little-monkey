@@ -118,6 +118,19 @@ pub enum M3HubError {
     },
     Transport(String),
     Runtime(String),
+    /// A request refused for exceeding the running process's context budget,
+    /// carrying the process class's stated policy (roadmap K11).
+    ///
+    /// Its own variant rather than a `Runtime(String)`, because the two answers
+    /// differ where it matters: `Runtime` means this app's runtime failed and
+    /// maps to a 502, while an over-budget prompt is a request the client sent
+    /// that this app declined to forward — nothing failed, and the client is the
+    /// only party that can shorten it. `code` is `ContextPolicy::code()`, or a
+    /// bare `context_budget` when the process has no run to derive a class from.
+    ContextBudget {
+        code: &'static str,
+        message: String,
+    },
     Compatibility(String),
     State(String),
     Io {
@@ -161,6 +174,9 @@ impl fmt::Display for M3HubError {
             ),
             Self::Transport(message) => write!(formatter, "transport: {message}"),
             Self::Runtime(message) => write!(formatter, "runtime: {message}"),
+            // No prefix: this one is written for the person reading it and is
+            // already a complete sentence naming both numbers and what to do.
+            Self::ContextBudget { message, .. } => write!(formatter, "{message}"),
             Self::Compatibility(message) => write!(formatter, "compatibility: {message}"),
             Self::State(message) => write!(formatter, "state: {message}"),
             Self::Io {

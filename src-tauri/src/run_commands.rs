@@ -456,10 +456,39 @@ fn process_scope_for_run<R: tauri::Runtime>(
         })
     })
     .ok()?;
-    match rows.as_slice() {
-        [row] => Some(crate::run_scope::ProcessScope::new(row.process_id.clone())),
-        _ => None,
-    }
+    let [row] = rows.as_slice() else {
+        return None;
+    };
+    // A second read for the row's limits, which `usage_rows` does not select.
+    // Affordable because it happens once when the scope is entered, not once per
+    // request — and the budget has to travel with the identity for the same reason
+    // the byte counter does: the request path has no ledger handle.
+    //
+    // A read that fails leaves the budget `None`, which means the request path
+    // enforces nothing. That is the one fail-open here and it is deliberate: the
+    // alternative is refusing a turn because a *bookkeeping* read failed, and no
+    // budget is set on any process today anyway.
+    let budget =
+        crate::process_commands::with_process_table(app, state, |table| table.get(&row.process_id))
+            .ok()
+            .flatten()
+            .and_then(|record| record.limits.max_context_tokens);
+    // The class comes from the run's own frozen kind and priority — the same
+    // `classify` the scheduler uses, not a second opinion — so what happens when
+    // this process's context fills is decided by one rule for the whole app.
+    let class = with_ledger(app, state, |ledger| ledger.load_run(run_id))
+        .ok()
+        .flatten()
+        // Priority `0`: it lives on a *daemon job*, and a desktop run has none to
+        // declare. Zero is the neutral value rather than a stand-in — `classify`
+        // only reads priority to let a negative one demote, so a run that never
+        // declared one lands on its kind's class, which is the honest answer.
+        .map(|run| crate::run_protocol::classify(&run.spec.kind, 0));
+    Some(
+        crate::run_scope::ProcessScope::new(row.process_id.clone())
+            .with_context_budget(budget)
+            .with_class(class),
+    )
 }
 
 /// Moves everything counted so far onto the row, additively.
