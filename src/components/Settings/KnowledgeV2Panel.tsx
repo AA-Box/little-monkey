@@ -137,8 +137,6 @@ export function KnowledgeV2Panel({
   const updateSource = useKnowledgeV2Store((state) => state.updateSource);
   const removeSource = useKnowledgeV2Store((state) => state.removeSource);
   const refreshStack = useKnowledgeV2Store((state) => state.refreshStack);
-  const importFromV1 = useKnowledgeV2Store((state) => state.importFromV1);
-  const v1Imports = useKnowledgeV2Store((state) => state.v1Imports);
   const cancelRefresh = useKnowledgeV2Store((state) => state.cancelRefresh);
   const updateChunking = useKnowledgeV2Store((state) => state.updateChunking);
   const backgroundConfig = useKnowledgeV2Store((state) => state.backgroundConfig);
@@ -170,7 +168,6 @@ export function KnowledgeV2Panel({
   const [webdavUsername, setWebdavUsername] = useState("");
   const [webdavPassword, setWebdavPassword] = useState("");
   const [busy, setBusy] = useState(false);
-  const [importing, setImporting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [expandedSource, setExpandedSource] = useState<string | null>(null);
   const [backgroundInterval, setBackgroundInterval] = useState(60);
@@ -241,17 +238,6 @@ export function KnowledgeV2Panel({
   const activeProgress = stackId ? progress[stackId] : undefined;
   const indexing = activeProgress != null && activeProgress.phase !== "done";
   const report = stackId ? reports[stackId] : undefined;
-  const v1Import = stackId ? v1Imports[stackId] : undefined;
-  // A stack that v1 indexed and v2 never touched. `indexed_at` alone can't say
-  // which pipeline set it (`stacks::mark_v2_indexed_impl` sets it too), so the
-  // second half of the test is "the v2 catalog holds no source for this stack" —
-  // an active generation always has sources behind it, and a successful import
-  // seeds them, so this offer clears itself once taken. It is only the offer:
-  // `knowledge_v2_import_from_v1` re-checks for an active generation under the
-  // catalog lock and refuses there, which is the authoritative answer.
-  const canImportFromV1 =
-    selectedStack != null && selectedStack.indexed_at != null && stackSources.length === 0;
-
   const resetForm = () => {
     setAdding(false);
     setLabel("");
@@ -441,49 +427,6 @@ export function KnowledgeV2Panel({
               </span>
             )}
           </div>
-
-          {canImportFromV1 && (
-            <div className="mt-3 rounded-md border border-accent/30 bg-accent/5 p-3">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div className="flex min-w-0 items-start gap-2">
-                  <DatabaseZap size={15} className="mt-0.5 shrink-0 text-accent" />
-                  <div>
-                    <p className="text-xs font-medium text-foreground">{t("KnowledgeV2Panel.v1ImportTitle")}</p>
-                    <p className="mt-1 text-[11px] leading-4 text-muted">{t("KnowledgeV2Panel.v1ImportBody")}</p>
-                  </div>
-                </div>
-                <Button
-                  variant="primary"
-                  size="sm"
-                  disabled={importing}
-                  onClick={() => {
-                    setImporting(true);
-                    void importFromV1(stackId)
-                      // Already recorded in `errors[stackId]`, rendered below.
-                      .catch(() => {})
-                      .finally(() => setImporting(false));
-                  }}
-                >
-                  {importing ? <Loader2 size={13} className="animate-spin" /> : <DatabaseZap size={13} />}
-                  {importing ? t("KnowledgeV2Panel.v1ImportBusy") : t("KnowledgeV2Panel.v1ImportButton")}
-                </Button>
-              </div>
-            </div>
-          )}
-
-          {v1Import && (
-            <p className="mt-2 rounded-md border border-success/30 bg-success/5 p-2 text-xs text-success">
-              {t("KnowledgeV2Panel.v1ImportDone", {
-                chunks: v1Import.chunkCount,
-                objects: v1Import.objectCount,
-              })}
-              {v1Import.warnings.map((warning) => (
-                <span key={warning} className="mt-1 block text-[11px] text-muted">
-                  {warning}
-                </span>
-              ))}
-            </p>
-          )}
 
           <div className="mt-3 rounded-md border border-border bg-surface p-3">
             <div className="flex flex-wrap items-start justify-between gap-3">
