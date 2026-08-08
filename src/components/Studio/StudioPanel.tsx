@@ -1493,6 +1493,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
           {/* Every one of these is a per-run choice, not a property of the
               model — the library entry only supplies the starting values. */}
           {settings && !isSpeechTask(task) && (
+            <>
             <details open className="rounded border border-border p-3">
               <summary className="cursor-pointer text-xs font-medium">
                 {t("Studio.settings")}
@@ -1610,26 +1611,6 @@ export function StudioPanel({ mode, railSlot }: Props) {
                   onChange={(strength) => setSettings({ ...settings, strength })}
                 />
               )}
-
-              <label className="grid gap-1 text-[11px] text-muted">
-                {t("Studio.seed")}
-                <span className="flex items-center gap-2">
-                  <input
-                    className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
-                    placeholder={t("Studio.seedPlaceholder")}
-                    value={seed}
-                    inputMode="numeric"
-                    onChange={(event) => setSeed(event.target.value.replace(/[^\d-]/g, ""))}
-                  />
-                  <IconButton
-                    size="sm"
-                    aria-label={t("Studio.seedShuffle")}
-                    onClick={() => setSeed(String(Math.floor(Math.random() * 2_147_483_647)))}
-                  >
-                    <Shuffle size={12} />
-                  </IconButton>
-                </span>
-              </label>
 
               <details className="grid gap-2" hidden={remote}>
                 <summary className="cursor-pointer text-[11px] text-muted">
@@ -1756,6 +1737,30 @@ export function StudioPanel({ mode, railSlot }: Props) {
               </div>
               </div>
             </details>
+
+            {/* Its own card: the seed is the one setting people reach for
+                between runs — reroll, or paste one back to reproduce a result —
+                so it does not belong buried under the sampler. */}
+            <SettingsCard title={t("Studio.seed")}>
+              <span className="flex items-center gap-2">
+                <input
+                  className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
+                  placeholder={t("Studio.seedPlaceholder")}
+                  aria-label={t("Studio.seed")}
+                  value={seed}
+                  inputMode="numeric"
+                  onChange={(event) => setSeed(event.target.value.replace(/[^\d-]/g, ""))}
+                />
+                <IconButton
+                  size="sm"
+                  aria-label={t("Studio.seedShuffle")}
+                  onClick={() => setSeed(String(Math.floor(Math.random() * 2_147_483_647)))}
+                >
+                  <Shuffle size={12} />
+                </IconButton>
+              </span>
+            </SettingsCard>
+            </>
           )}
 
           {!isSpeechTask(task) && !remote && (
