@@ -659,6 +659,9 @@ pub struct ContextCacheView {
     /// Whether two of this app's processes on one resident model can reuse each
     /// other's prompt prefix (roadmap K11).
     pub prefix_sharing: PrefixSharing,
+    /// Whether a per-process context budget can be enforced against this runtime
+    /// — a different question from whether one is set (roadmap K11).
+    pub context_budget: ContextBudgetEnforcement,
     pub notes: Vec<String>,
     pub sampled_at_ms: u64,
 }
@@ -677,6 +680,87 @@ pub struct ContextCacheView {
 pub enum PrefixSharing {
     Supported { mechanism: &'static str },
     Unsupported { reason: &'static str },
+}
+
+/// Whether a per-process context budget can be *enforced* against this runtime,
+/// which is a different question from whether one is set.
+///
+/// Enforcement needs an exact prompt-token count before the request, and only a
+/// runtime that will tokenize on demand can give one. A tagged union for
+/// [`PrefixSharing`]'s reason: a budget that cannot be enforced must never be
+/// displayed as if it were, and the caller has to hold the reason to say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum ContextBudgetEnforcement {
+    /// The runtime counts tokens exactly, so a budget is checked before sending.
+    Enforceable,
+    /// It does not, and this says why. A budget set on such a process is reported
+    /// as unenforceable rather than silently ignored — and never estimated, since
+    /// an estimated limit refuses real work for a made-up reason.
+    Unenforceable { reason: &'static str },
+}
+
+pub fn context_budget_enforcement(kind: ContextRuntimeKind) -> ContextBudgetEnforcement {
+    match kind {
+        // `POST /tokenize` returns the exact token list, and `POST /apply-template`
+        // renders the exact prompt a completion would send, so the count is the
+        // runtime's own rather than a heuristic over string length. Both were
+        // measured against the pinned build; `/tokenize` answered in 0.5 ms on
+        // loopback, which is why a pre-flight is affordable per turn.
+        ContextRuntimeKind::LlamaCpp => ContextBudgetEnforcement::Enforceable,
+        ContextRuntimeKind::Ollama => ContextBudgetEnforcement::Unenforceable {
+            reason: "Ollama's API exposes no tokenizer, so this app cannot count a prompt exactly before sending it. A budget would have to be enforced against a guess at the token count, which would refuse real work for a made-up reason.",
+        },
+        ContextRuntimeKind::Mlx => ContextBudgetEnforcement::Unenforceable {
+            reason: "The MLX runtime in this build exposes no tokenize endpoint, so a prompt cannot be counted before it is sent.",
+        },
+    }
+}
+
+/// Whether one request fits the process's prompt-token budget.
+///
+/// Pure, and separate from the counting so the decision is testable without a
+/// runtime. `None` for `budget` is the overwhelmingly common case — no budget is
+/// set — and it is `Within`, not a refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextBudgetVerdict {
+    Within,
+    /// The prompt is over. Carries both numbers because a refusal a user cannot
+    /// check against is indistinguishable from a bug.
+    Exceeded {
+        prompt_tokens: u64,
+        budget: u64,
+    },
+}
+
+/// `>` and not `>=`: a prompt of exactly the budget fits. A budget is a ceiling
+/// on the prompt, and refusing the request that lands exactly on it would make
+/// the configured number mean one less than it says.
+pub fn check_context_budget(prompt_tokens: u64, budget: Option<u64>) -> ContextBudgetVerdict {
+    match budget {
+        Some(budget) if prompt_tokens > budget => ContextBudgetVerdict::Exceeded {
+            prompt_tokens,
+            budget,
+        },
+        _ => ContextBudgetVerdict::Within,
+    }
+}
+
+impl ContextBudgetVerdict {
+    /// The refusal a user sees. Names both numbers and what to do, because this
+    /// is a limit the user configured and can raise.
+    #[must_use]
+    pub fn refusal(&self) -> Option<String> {
+        match self {
+            ContextBudgetVerdict::Within => None,
+            ContextBudgetVerdict::Exceeded {
+                prompt_tokens,
+                budget,
+            } => Some(format!(
+                "This request's prompt is {prompt_tokens} tokens, over the {budget}-token context budget set for this process. It was refused before being sent, so nothing was generated and no context was dropped. Raise the budget, shorten the conversation, or start a new one."
+            )),
+        }
+    }
 }
 
 /// What each runtime actually does about prefix sharing.
@@ -1130,6 +1214,70 @@ mod tests {
         let notes = context_cache_notes(ContextRuntimeKind::Mlx, None);
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("does not expose"));
+    }
+
+    /// No budget is the common case and is not a refusal, and a prompt landing
+    /// exactly on the budget fits — `>` not `>=`, or the configured number would
+    /// mean one less than it says.
+    #[test]
+    fn a_context_budget_refuses_only_what_is_over_it() {
+        assert_eq!(
+            check_context_budget(9_000, None),
+            ContextBudgetVerdict::Within
+        );
+        assert_eq!(
+            check_context_budget(0, Some(8_192)),
+            ContextBudgetVerdict::Within
+        );
+        assert_eq!(
+            check_context_budget(8_192, Some(8_192)),
+            ContextBudgetVerdict::Within,
+            "a prompt exactly on the budget fits"
+        );
+        assert_eq!(
+            check_context_budget(8_193, Some(8_192)),
+            ContextBudgetVerdict::Exceeded {
+                prompt_tokens: 8_193,
+                budget: 8_192
+            }
+        );
+    }
+
+    /// A refusal a user cannot check against is indistinguishable from a bug, so
+    /// both numbers are in it — and it says nothing was generated, because the
+    /// whole point is that the request never left.
+    #[test]
+    fn the_refusal_names_both_numbers_and_what_happened() {
+        assert_eq!(ContextBudgetVerdict::Within.refusal(), None);
+        let refusal = check_context_budget(9_000, Some(8_192))
+            .refusal()
+            .expect("an exceeded verdict refuses");
+        assert!(refusal.contains("9000"));
+        assert!(refusal.contains("8192"));
+        assert!(refusal.contains("refused before being sent"));
+    }
+
+    /// Only a runtime that will tokenize can have a budget enforced against it,
+    /// and the other two say why rather than accepting one and ignoring it.
+    #[test]
+    fn only_a_runtime_that_tokenizes_can_enforce_a_budget() {
+        assert_eq!(
+            context_budget_enforcement(ContextRuntimeKind::LlamaCpp),
+            ContextBudgetEnforcement::Enforceable
+        );
+        for kind in [ContextRuntimeKind::Ollama, ContextRuntimeKind::Mlx] {
+            match context_budget_enforcement(kind) {
+                ContextBudgetEnforcement::Unenforceable { reason } => {
+                    assert!(
+                        !reason.trim().is_empty(),
+                        "{kind:?} refuses without a reason"
+                    )
+                }
+                ContextBudgetEnforcement::Enforceable => {
+                    panic!("{kind:?} has no tokenizer and must not claim enforcement")
+                }
+            }
+        }
     }
 
     /// Every runtime resolves to one arm or the other, and neither arm can be

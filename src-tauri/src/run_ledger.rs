@@ -200,9 +200,11 @@ const MIGRATION_V15: i64 = 15;
 const MIGRATION_V15_CHECKSUM: &str = "tool-call-origin-v15-2026-08-08";
 const MIGRATION_V16: i64 = 16;
 const MIGRATION_V16_CHECKSUM: &str = "context-reuse-v16-2026-08-08";
+const MIGRATION_V17: i64 = 17;
+const MIGRATION_V17_CHECKSUM: &str = "context-budget-v17-2026-08-08";
 
 /// The newest schema this binary knows how to write.
-const SCHEMA_VERSION: i64 = MIGRATION_V16;
+const SCHEMA_VERSION: i64 = MIGRATION_V17;
 
 /// Whether a migration keeps older binaries able to open the database.
 ///
@@ -1807,6 +1809,14 @@ const MIGRATION_LADDER: &[(i64, &str, Compatibility)] = &[
         MIGRATION_V16_CHECKSUM,
         Compatibility::Additive,
     ),
+    // Additive: one nullable limit column beside the four `max_*` columns V5
+    // installed. A V16 binary never selects it and never sets it, which reads
+    // correctly as "that binary enforced no context budget".
+    (
+        MIGRATION_V17,
+        MIGRATION_V17_CHECKSUM,
+        Compatibility::Additive,
+    ),
 ];
 
 /// The oldest binary that may open a database with `version` applied.
@@ -2288,6 +2298,35 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
                 MIGRATION_V16_CHECKSUM,
                 now_ms_i64()?,
                 min_reader_version_for(MIGRATION_V16)
+            ],
+        )?;
+    }
+
+    let has_v17 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V17],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v17 {
+        // Probed like V16's: the `CHECK` is what stops SQLite dropping it, so a
+        // database wound back below V17 keeps the column.
+        let has_column = transaction
+            .prepare("SELECT max_context_tokens FROM agent_processes LIMIT 0")
+            .is_ok();
+        if !has_column {
+            transaction.execute_batch(MIGRATION_V17_SQL)?;
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V17,
+                MIGRATION_V17_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V17)
             ],
         )?;
     }
@@ -3057,6 +3096,22 @@ ALTER TABLE permission_decisions ADD COLUMN tool_call_origin TEXT NOT NULL
 const MIGRATION_V16_REUSED_SQL: &str = r#"
 ALTER TABLE agent_processes ADD COLUMN context_tokens_reused INTEGER
     CHECK (context_tokens_reused IS NULL OR context_tokens_reused >= 0);
+"#;
+
+/// The prompt-token ceiling a process may send in one request (roadmap K11).
+///
+/// The fifth `max_*` column, beside the four V5 installed, and it follows their
+/// rule: `NULL` is "no budget", not "a budget of zero". A process with no budget
+/// is the default and the only state any caller writes today — see
+/// `ProcessLimits::max_context_tokens` on why this ships enforced and unset.
+///
+/// `> 0` rather than `>= 0` because a zero-token budget cannot be satisfied by
+/// any request at all, including an empty one: the chat template alone is
+/// tokens. A row claiming it would refuse every turn while reading like a
+/// configured limit, which is the failure the `CHECK` exists to make impossible.
+const MIGRATION_V17_SQL: &str = r#"
+ALTER TABLE agent_processes ADD COLUMN max_context_tokens INTEGER
+    CHECK (max_context_tokens IS NULL OR max_context_tokens > 0);
 "#;
 
 /// V16's other half — the prompt tokens the runtime said it actually evaluated,
@@ -5483,7 +5538,7 @@ mod tests {
                 .execute(
                     "INSERT INTO schema_migrations
                         (version, checksum, applied_at_ms, min_reader_version)
-                     VALUES (17, 'from-the-future-additive', 17, 16)",
+                     VALUES (18, 'from-the-future-additive', 18, 17)",
                     [],
                 )
                 .unwrap();
@@ -5497,7 +5552,7 @@ mod tests {
             let connection = Connection::open(&database.path).unwrap();
             connection
                 .execute(
-                    "UPDATE schema_migrations SET min_reader_version = 17 WHERE version = 17",
+                    "UPDATE schema_migrations SET min_reader_version = 18 WHERE version = 18",
                     [],
                 )
                 .unwrap();
@@ -5505,7 +5560,7 @@ mod tests {
         assert!(
             matches!(
                 RunLedger::open(&database.path),
-                Err(LedgerError::MigrationConflict { version: 17 })
+                Err(LedgerError::MigrationConflict { version: 18 })
             ),
             "a future migration that requires a newer binary must still refuse"
         );
@@ -5575,13 +5630,13 @@ mod tests {
             let ledger = RunLedger::open(&database.path).unwrap();
             assert_eq!(
                 ledger.applied_migrations().unwrap(),
-                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
             );
         }
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
             "reopening must not re-apply or add a migration"
         );
 
@@ -5813,14 +5868,15 @@ mod tests {
             let connection = Connection::open(&database.path).unwrap();
             connection
                 .execute_batch(
-                    // `egress_destinations_dropped` and V16's two token columns
-                    // are deliberately left in place: SQLite cannot drop a column
-                    // carrying a `CHECK`, so this is the half-wound-back state
-                    // V14's and V16's probes exist for.
+                    // `egress_destinations_dropped`, V16's two token columns and
+                    // V17's budget column are deliberately left in place: SQLite
+                    // cannot drop a column carrying a `CHECK`, so this is the
+                    // half-wound-back state V14's, V16's and V17's probes exist
+                    // for.
                     "DROP TABLE permission_decisions;
                      DROP TABLE subsystem_events;
                      DROP TABLE egress_destinations;
-                     DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14, 15, 16);
+                     DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14, 15, 16, 17);
                      PRAGMA user_version = 10;",
                 )
                 .unwrap();
@@ -5829,7 +5885,7 @@ mod tests {
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
             "opening a V10 database must apply every migration above it"
         );
         assert_eq!(

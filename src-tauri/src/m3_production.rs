@@ -1349,6 +1349,142 @@ impl OpenAiCompatibleM3InferenceEngine {
         }
     }
 
+    /// Refuses the request before it is sent when its prompt is over the process's
+    /// context budget (roadmap K11).
+    ///
+    /// # Why before, and why an exact count
+    ///
+    /// The acceptance asks for a budget "enforced as a limit rather than
+    /// discovered as a failure". Discovering it means the runtime evaluates the
+    /// prompt, refuses or shifts its context, and `classify_context_failure`
+    /// explains what already happened. Enforcing it means the request never
+    /// leaves.
+    ///
+    /// That needs the exact prompt length, which only the runtime can give:
+    /// `POST /apply-template` renders the exact string a completion would send
+    /// (template included — the template alone is tens of tokens), and
+    /// `POST /tokenize` returns its exact tokens. This app has no tokenizer, and
+    /// enforcing a limit against an estimate would refuse real work for a made-up
+    /// reason.
+    ///
+    /// # Fail-closed, and why that is the honest direction here
+    ///
+    /// A process with no budget — every process today — returns immediately,
+    /// having sent nothing. Only when a budget *is* set do the two pre-flight
+    /// calls happen, and if either cannot produce a count the request is refused
+    /// with that reason rather than sent unchecked. A runtime without a tokenizer
+    /// (Ollama, MLX) therefore reports that the budget cannot be enforced instead
+    /// of quietly not enforcing it — "I set a limit and it silently did nothing"
+    /// is the failure this direction exists to prevent.
+    async fn enforce_context_budget(
+        &self,
+        body: &Value,
+        cancellation: &CancellationToken,
+        context: &M3OperationContext,
+    ) -> M3HubResult<()> {
+        let Some(budget) =
+            crate::run_scope::current_process().and_then(|process| process.max_context_tokens())
+        else {
+            return Ok(());
+        };
+        let prompt_tokens = self
+            .count_prompt_tokens(body, cancellation, context)
+            .await?;
+        match crate::context_cache::check_context_budget(prompt_tokens, Some(budget)) {
+            crate::context_cache::ContextBudgetVerdict::Within => Ok(()),
+            verdict => Err(M3HubError::Runtime(
+                verdict
+                    .refusal()
+                    .unwrap_or_else(|| "context budget exceeded".to_string()),
+            )),
+        }
+    }
+
+    /// The exact prompt-token count for `body`, from the runtime itself.
+    ///
+    /// Two loopback calls, measured at well under a millisecond each against the
+    /// pinned build — affordable per turn, and only paid when a budget is set.
+    /// Both are `POST`s the OpenAI-compatible surface does not define, so a
+    /// non-2xx here means "this runtime has no tokenizer", which is reported as
+    /// an unenforceable budget rather than swallowed.
+    async fn count_prompt_tokens(
+        &self,
+        body: &Value,
+        cancellation: &CancellationToken,
+        context: &M3OperationContext,
+    ) -> M3HubResult<u64> {
+        let messages = body.get("messages").cloned().unwrap_or(Value::Null);
+        let rendered = self
+            .post_json(
+                "/apply-template",
+                &json!({ "messages": messages }),
+                cancellation,
+                context,
+            )
+            .await?;
+        // llama-server answers with the rendered string under `prompt`.
+        let prompt = rendered.get("prompt").and_then(Value::as_str).ok_or_else(|| {
+            M3HubError::Runtime(
+                "this runtime did not render a prompt, so the context budget set for this process cannot be enforced against it".to_string(),
+            )
+        })?;
+        let tokenized = self
+            .post_json(
+                "/tokenize",
+                &json!({ "content": prompt }),
+                cancellation,
+                context,
+            )
+            .await?;
+        let tokens = tokenized.get("tokens").and_then(Value::as_array).ok_or_else(|| {
+            M3HubError::Runtime(
+                "this runtime did not return a token count, so the context budget set for this process cannot be enforced against it".to_string(),
+            )
+        })?;
+        Ok(tokens.len() as u64)
+    }
+
+    /// One bounded loopback `POST`, for the two pre-flight endpoints.
+    async fn post_json(
+        &self,
+        path: &str,
+        body: &Value,
+        cancellation: &CancellationToken,
+        context: &M3OperationContext,
+    ) -> M3HubResult<Value> {
+        let url = self.endpoint.url(path).map_err(runtime_error)?;
+        let encoded = serde_json::to_vec(body)?;
+        let operation = async {
+            tokio::select! {
+                _ = context.cancellation.cancelled() => Err(M3HubError::Cancelled { operation: format!("local {path} request") }),
+                _ = cancellation.cancelled() => Err(M3HubError::Cancelled { operation: format!("local {path} request") }),
+                response = crate::egress::send(self.client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").body(encoded)) => {
+                    response.map_err(|error| M3HubError::Transport(error.to_string()))
+                }
+            }
+        };
+        let response = tokio::time::timeout(Duration::from_millis(context.timeout_ms), operation)
+            .await
+            .map_err(|_| M3HubError::Timeout {
+                operation: format!("local {path} request"),
+                timeout_ms: context.timeout_ms,
+            })??;
+        if !response.status().is_success() {
+            return Err(M3HubError::Runtime(format!(
+                "this runtime has no {path} endpoint (HTTP {}), so the context budget set for this process cannot be enforced against it",
+                response.status()
+            )));
+        }
+        let bytes = read_bounded_response(
+            response,
+            MAX_INFERENCE_RESPONSE_BYTES,
+            cancellation,
+            context,
+        )
+        .await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     async fn send(
         &self,
         request: &CanonicalInferenceRequest,
@@ -1357,6 +1493,8 @@ impl OpenAiCompatibleM3InferenceEngine {
         context: &M3OperationContext,
     ) -> M3HubResult<reqwest::Response> {
         let body = openai_request_body(request, stream)?;
+        self.enforce_context_budget(&body, cancellation, context)
+            .await?;
         let encoded = serde_json::to_vec(&body)?;
         if encoded.len() > MAX_INFERENCE_REQUEST_BYTES {
             return Err(M3HubError::Runtime(
@@ -4082,6 +4220,171 @@ mod tests {
             }
         });
         (format!("http://{address}"), slow_started, task)
+    }
+
+    /// A fixture that routes by path and records every path it was asked for, so
+    /// a test can assert what was *not* sent.
+    ///
+    /// `/tokenize` answers with `token_count` tokens regardless of content: the
+    /// count is the fixture's whole job here, and the real tokenizer's fidelity is
+    /// llama.cpp's business rather than something this app can test.
+    async fn spawn_budget_fixture(
+        token_count: usize,
+    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let recorder = recorder.clone();
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(move |request: Request<Incoming>| {
+                                let recorder = recorder.clone();
+                                async move {
+                                    let path = request.uri().path().to_string();
+                                    recorder.lock().expect("record path").push(path.clone());
+                                    let _ = request.into_body().collect().await;
+                                    let body = match path.as_str() {
+                                        "/apply-template" => json!({"prompt": "<rendered prompt>"}),
+                                        "/tokenize" => {
+                                            json!({"tokens": vec![0_u32; token_count]})
+                                        }
+                                        _ => json!({
+                                            "id":"chatcmpl-budget","created":123,"model":"local-model",
+                                            "choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
+                                            "usage":{"prompt_tokens":2,"completion_tokens":1}
+                                        }),
+                                    };
+                                    Ok::<_, Infallible>(
+                                        Response::builder()
+                                            .header("content-type", "application/json")
+                                            .body(Full::new(Bytes::from(body.to_string())))
+                                            .expect("fixture response"),
+                                    )
+                                }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        (format!("http://{address}"), seen, task)
+    }
+
+    /// The acceptance's actual words: enforced as a limit, not discovered as a
+    /// failure. So the assertion that matters is not the error text — it is that
+    /// `/v1/chat/completions` was never reached.
+    #[tokio::test]
+    async fn an_over_budget_prompt_is_refused_before_the_request_is_sent() {
+        let (endpoint, seen, server) = spawn_budget_fixture(9_000).await;
+        let engine = OpenAiCompatibleM3InferenceEngine::new(&endpoint).expect("production engine");
+        let context = M3OperationContext::new(10_000);
+
+        let process =
+            crate::run_scope::ProcessScope::new("p-budget").with_context_budget(Some(8_192));
+        let result = crate::run_scope::scoped_with_process(
+            crate::run_scope::RunScope::run("run:budget"),
+            process,
+            engine.complete(&request("over", "local-model", false), &context),
+        )
+        .await;
+
+        let message = match result {
+            Err(M3HubError::Runtime(message)) => message,
+            other => panic!("expected a budget refusal, got {other:?}"),
+        };
+        assert!(
+            message.contains("9000") && message.contains("8192"),
+            "{message}"
+        );
+        let paths = seen.lock().expect("read paths").clone();
+        assert_eq!(
+            paths,
+            vec!["/apply-template".to_string(), "/tokenize".to_string()],
+            "the completion must never have been sent"
+        );
+        server.abort();
+    }
+
+    /// The common path: no budget, so not even the two pre-flight calls happen.
+    /// A limit nobody set must cost nothing at all.
+    #[tokio::test]
+    async fn a_process_with_no_budget_pays_for_no_pre_flight() {
+        let (endpoint, seen, server) = spawn_budget_fixture(9_000).await;
+        let engine = OpenAiCompatibleM3InferenceEngine::new(&endpoint).expect("production engine");
+        let context = M3OperationContext::new(10_000);
+        let process = crate::run_scope::ProcessScope::new("p-no-budget");
+        crate::run_scope::scoped_with_process(
+            crate::run_scope::RunScope::run("run:no-budget"),
+            process,
+            engine.complete(&request("under", "local-model", false), &context),
+        )
+        .await
+        .expect("a process with no budget completes");
+        assert_eq!(
+            seen.lock().expect("read paths").clone(),
+            vec!["/v1/chat/completions".to_string()],
+            "no budget means no pre-flight"
+        );
+        server.abort();
+    }
+
+    /// A runtime with no tokenizer refuses the request and says the budget cannot
+    /// be enforced, rather than sending it unchecked. "I set a limit and it
+    /// silently did nothing" is the outcome this direction exists to prevent.
+    #[tokio::test]
+    async fn a_runtime_without_a_tokenizer_refuses_rather_than_ignoring_the_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(|request: Request<Incoming>| async move {
+                                let _ = request.into_body().collect().await;
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(404)
+                                        .body(Full::new(Bytes::from("not found")))
+                                        .expect("fixture response"),
+                                )
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        let engine = OpenAiCompatibleM3InferenceEngine::new(&format!("http://{address}"))
+            .expect("production engine");
+        let process =
+            crate::run_scope::ProcessScope::new("p-no-tokenizer").with_context_budget(Some(8_192));
+        let result = crate::run_scope::scoped_with_process(
+            crate::run_scope::RunScope::run("run:no-tokenizer"),
+            process,
+            engine.complete(
+                &request("untokenizable", "local-model", false),
+                &M3OperationContext::new(10_000),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("cannot be enforced")),
+            "expected an unenforceable-budget refusal, got {result:?}"
+        );
+        server.abort();
     }
 
     #[tokio::test]
