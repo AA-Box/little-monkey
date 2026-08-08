@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import type { M3ComponentCatalogEntry, M3InstalledComponent } from "../../../lib/runtimeHubClient";
-import { describeRegistryAction } from "./RuntimeHubComponents";
+import {
+  describeRegistryAction,
+  mergeRegistryEntries,
+  parseCatalogText,
+} from "./RuntimeHubComponents";
 
 function registryEntry(overrides: Partial<M3ComponentCatalogEntry> = {}): M3ComponentCatalogEntry {
   return {
@@ -71,5 +75,62 @@ describe("Runtime Hub component registry actions", () => {
   it("does not confuse unrelated component ids", () => {
     const installed = installedComponent({ componentId: "tokenizer-bpe" });
     expect(describeRegistryAction(registryEntry(), [installed])).toBe("install");
+  });
+});
+
+/**
+ * Importing a published component catalog into the local registry.
+ *
+ * The backend swaps the whole registry file atomically, so the merge here is
+ * what stops importing one publisher's catalog from deleting every other
+ * component the operator had registered.
+ */
+describe("mergeRegistryEntries", () => {
+  it("keeps components the imported catalog says nothing about", () => {
+    const llama = registryEntry();
+    const mlx = registryEntry({
+      componentId: "mlx-runtime-apple-silicon",
+      kind: "mlx_runtime",
+      sourceId: "little-monkey-mlx",
+      version: "0.28.4",
+    });
+    const merged = mergeRegistryEntries([llama], [mlx]);
+    expect(merged).toHaveLength(2);
+    expect(merged.map((item) => item.componentId)).toContain("llama-cpp-server-metal");
+  });
+
+  it("lets an import correct an entry it already registered", () => {
+    const stale = registryEntry({ downloadUrl: "https://components.example.test/wrong" });
+    const fixed = registryEntry({ downloadUrl: "https://components.example.test/right" });
+    const merged = mergeRegistryEntries([stale], [fixed]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0].downloadUrl).toBe("https://components.example.test/right");
+  });
+
+  it("treats a new version of the same component as an addition, not a replacement", () => {
+    const older = registryEntry({ version: "b4000", sha256: "d".repeat(64) });
+    const merged = mergeRegistryEntries([older], [registryEntry()]);
+    expect(merged.map((item) => item.version).sort()).toEqual(["b4000", "b4100"]);
+  });
+});
+
+describe("parseCatalogText", () => {
+  it("reads the bare array a published catalog is", () => {
+    expect(parseCatalogText(JSON.stringify([registryEntry()]))).toHaveLength(1);
+  });
+
+  it("also reads back the wrapped shape the app writes its own registry in", () => {
+    const wrapped = JSON.stringify({ schemaVersion: 1, entries: [registryEntry()] });
+    expect(parseCatalogText(wrapped)).toHaveLength(1);
+  });
+
+  it("says which kind of wrong file it was given", () => {
+    expect(() => parseCatalogText("not json at all")).toThrow(/not valid JSON/);
+    expect(() => parseCatalogText(JSON.stringify({ hello: "world" }))).toThrow(
+      /no catalog entries/,
+    );
+    expect(() => parseCatalogText(JSON.stringify([{ hello: "world" }]))).toThrow(
+      /not a component catalog/,
+    );
   });
 });
