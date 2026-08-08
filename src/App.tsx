@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Activity, Columns2, FileDiff, FolderTree, GitPullRequest, Globe2, ListTodo, Maximize2, Minimize2, PanelRight, Plus, SquareTerminal, X } from "lucide-react";
 
 import ChatSessionList from "./components/Chat/ChatSessionList";
+import { StudioNav, type StudioMode } from "./components/Studio/StudioNav";
 import ChatWindow from "./components/Chat/ChatWindow";
 import { PrivacyFirewallGate } from "./components/Chat/PrivacyFirewallGate";
 import { AppMenu } from "./components/AppMenu";
@@ -281,6 +282,11 @@ function App() {
    *  here before — sessions, code, the feature panels; Studio is image and
    *  video generation, which shares none of that state. */
   const [section, setSection] = useState<"chat" | "studio">("chat");
+  /** Studio's own section, held here rather than inside `StudioPanel` because
+   *  the nav that switches it lives in the sidebar, which is this component's.
+   *  Survives switching to Chat and back, which the old in-panel tabs did not:
+   *  the panel is lazy and unmounts. */
+  const [studioMode, setStudioMode] = useState<StudioMode>("image");
   /** Studio needs a native engine that not every host can run — no upstream
    *  build for Linux arm64, and the Linux x86_64 build needs a newer glibc
    *  than some supported distributions ship. Where it cannot run, the section
@@ -1007,7 +1013,13 @@ function App() {
             pushing the list up when an update lands mid-scroll. */}
         <div className="relative min-h-0 flex-1">
           <div className="h-full overflow-y-auto [overscroll-behavior:contain]">
-            <ChatSessionList />
+            {/* Studio has no sessions, so the chat list would switch nothing
+                there. Its own sections take the column instead. */}
+            {section === "studio" ? (
+              <StudioNav active={studioMode} onChange={setStudioMode} />
+            ) : (
+              <ChatSessionList />
+            )}
           </div>
           <UpdateCard />
         </div>
@@ -1088,7 +1100,7 @@ function App() {
         >
           <Suspense fallback={<LazyPanelFallback />}>
             {section === "studio" ? (
-              <StudioPanel />
+              <StudioPanel mode={studioMode} />
             ) : globalSearchOpen ? (
               <GlobalSearch
                 onClose={() => closeFeaturePanel("global-search")}

@@ -15,12 +15,13 @@ import {
   Wand2,
 } from "lucide-react";
 
-import { Button, IconButton, Listbox, StatusPill, Tabs } from "../ui";
+import { Button, IconButton, Listbox, StatusPill } from "../ui";
 import { AddBackendForm } from "./AddBackendForm";
 import { AddModelForm } from "./AddModelForm";
 import { LoraStack } from "./LoraStack";
 import { MaskCanvas } from "./MaskCanvas";
 import { ModelFiles } from "./ModelFiles";
+import type { StudioMode } from "./StudioNav";
 import { useT } from "../../lib/i18n";
 import { describeWeightFile } from "../../lib/weightFileHints";
 import {
@@ -366,9 +367,7 @@ function componentNames(model: GenerationModel): string[] {
   return model.components.map(componentFileName);
 }
 
-export type StudioMode = "models" | "image" | "video" | "audio";
-
-/** Which tasks each making-tab covers. The models tab makes nothing, so it
+/** Which tasks each section covers. The models section makes nothing, so it
  *  has no entry and its model list is never filtered. */
 const MODE_TASKS: Record<Exclude<StudioMode, "models">, GenerationTask[]> = {
   image: ["text_to_image", "image_to_image"],
@@ -386,9 +385,14 @@ const tasksFor = (mode: StudioMode): GenerationTask[] =>
 const IN_DESKTOP_APP =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-export function StudioPanel() {
+interface Props {
+  /** Which section is showing. Owned by `App`, because the control that
+   *  switches it is the sidebar nav rather than anything in here. */
+  mode: StudioMode;
+}
+
+export function StudioPanel({ mode }: Props) {
   const { t } = useT();
-  const [mode, setMode] = useState<StudioMode>("image");
   const [status, setStatus] = useState<GenerationEngineStatus | null>(null);
   /** What the running engine says it supports. Null until one has run — the
    *  pickers fall back to the compiled-in lists until then. */
@@ -932,17 +936,7 @@ export function StudioPanel() {
         mode === "models" ? "overflow-y-auto" : "overflow-hidden"
       }`}
     >
-      <Tabs
-        active={mode}
-        onChange={(next) => setMode(next as StudioMode)}
-        tabs={[
-          { id: "image", label: t("Studio.tab.image") },
-          { id: "video", label: t("Studio.tab.video") },
-          { id: "audio", label: t("Studio.tab.audio") },
-          { id: "models", label: t("Studio.tab.models") },
-        ]}
-      />
-      <header className="mb-4 mt-3">
+      <header className="mb-4">
         <h1 className="text-sm font-medium">{t(`Studio.${mode}.title`)}</h1>
         <p className="mt-1 text-xs text-muted">{t(`Studio.${mode}.subtitle`)}</p>
       </header>
