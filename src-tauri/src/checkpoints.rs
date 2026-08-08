@@ -142,6 +142,20 @@ pub struct CheckpointManifest {
     #[serde(default)]
     pub prev_id: Option<String>,
     pub entries: Vec<CheckpointEntry>,
+    /// Facts `tool_remember` added during this turn, so reverting can take them
+    /// back (roadmap K14's first real compensator).
+    ///
+    /// The text is kept beside the id for the reason `redo/` keeps a file's
+    /// post-turn bytes: revert deletes the fact, and without the text a reapply
+    /// could not put it back. An undo that loses data on the way is not an undo.
+    ///
+    /// `serde(default)` — an older manifest recorded none, and empty there means
+    /// *unrecorded*, exactly as it does for `external_effects`. That is why the
+    /// compensator runs off this list rather than off `ExternalEffectKind::Memory`
+    /// being present: a manifest that knows a fact was remembered but not which
+    /// one must not delete a guess.
+    #[serde(default)]
+    pub remembered_facts: Vec<RememberedFact>,
     /// What a suspended process needs to resume after a restart (roadmap K13).
     ///
     /// `None` on every checkpoint that was not a freeze, which is nearly all of
@@ -151,6 +165,14 @@ pub struct CheckpointManifest {
     /// absent must not read as "resumable with nothing to restore".
     #[serde(default)]
     pub resume: Option<ResumeState>,
+}
+
+/// One fact a turn remembered, enough to take it back and to put it back.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RememberedFact {
+    pub id: String,
+    pub text: String,
 }
 
 /// The resumable half of a frozen process — the fields K13's acceptance names,
@@ -243,6 +265,13 @@ pub enum Compensation {
     /// machine" and "a message may already have been delivered" call for
     /// different judgement from whoever reconciles.
     None { reason: &'static str },
+    /// A real undo this app owns end to end, named in the imperative so the
+    /// preview can say what pressing revert will actually do.
+    ///
+    /// The first of these, and the point of the enum having been a type from the
+    /// start: adding it is a compile error at every match rather than a flag
+    /// somebody forgets to flip.
+    Undo { action: &'static str },
 }
 
 impl ExternalEffectKind {
@@ -279,8 +308,19 @@ impl ExternalEffectKind {
             ExternalEffectKind::McpTool => Compensation::None {
                 reason: "an MCP server's effects are outside this app entirely",
             },
-            ExternalEffectKind::Memory => Compensation::None {
-                reason: "remembered facts are not part of the checkpointed workspace",
+            // The one effect of the four this app can genuinely take back. A
+            // remembered fact is this app's own record, `Fact::source_turn_id`
+            // already names the turn that added it, and `delete_fact_impl`
+            // already removes one — so reverting the turn can remove exactly the
+            // facts that turn added, and nothing else.
+            //
+            // The old reason said remembered facts "are not part of the
+            // checkpointed workspace". That is still true and was never the
+            // question: not being snapshotted is not the same as not being
+            // undoable, and conflating the two is what left this arm reading as
+            // unrecoverable when it is not.
+            ExternalEffectKind::Memory => Compensation::Undo {
+                action: "forget the facts this turn remembered",
             },
         }
     }
@@ -297,6 +337,8 @@ pub struct ActiveCheckpoint {
     pub session_id: String,
     pub anchor_index: usize,
     pub label: String,
+    /// Facts this turn has remembered so far, in call order.
+    pub remembered_facts: Vec<RememberedFact>,
     /// Flipped by `record_shell` when `tool_run_shell` runs during the turn.
     /// Always `false` until then.
     pub shell_ran: bool,
@@ -523,6 +565,7 @@ pub fn begin_impl(
         .insert(
             id.clone(),
             ActiveCheckpoint {
+                remembered_facts: Vec::new(),
                 dir,
                 entries: Vec::new(),
                 created_at_ms: now_ms(),
@@ -801,6 +844,40 @@ pub const DETERMINISM_CAVEATS: &[&str] = &[
     "Anything outside the recorded workspace is whatever it is now. Files elsewhere on disk, other processes, and remote state were not frozen and were free to change.",
 ];
 
+/// Notes a fact `tool_remember` just added, so reverting this turn can forget it.
+///
+/// Silently a no-op without a checkpoint id, like [`record_external_effect`]: a
+/// `remember` outside a checkpointed turn has nothing to be reverted *by*, and
+/// refusing it would break remembering in exactly the sessions that never
+/// checkpoint.
+pub fn record_remembered_fact(
+    state: &AppState,
+    id: Option<&str>,
+    fact: RememberedFact,
+) -> Result<(), String> {
+    let Some(id) = id else {
+        return Ok(());
+    };
+    let mut guard = state
+        .checkpoints
+        .lock()
+        .map_err(|_| "Checkpoint lock poisoned".to_string())?;
+    let Some(active) = guard.get_mut(id) else {
+        return Ok(());
+    };
+    // Deduplicated by id: `add_fact_impl` returns the *existing* fact when the
+    // text already matches one, so remembering the same thing twice in a turn
+    // must not queue two deletions of one fact.
+    if !active
+        .remembered_facts
+        .iter()
+        .any(|held| held.id == fact.id)
+    {
+        active.remembered_facts.push(fact);
+    }
+    Ok(())
+}
+
 /// Every external effect a manifest records, reconstructing what an older one
 /// could not say.
 ///
@@ -848,8 +925,9 @@ fn parse_manifest(raw: &str, dir: &Path, id: &str) -> Result<CheckpointManifest,
         // and reconstructed by `external_effects_of`, which reads `shell_ran`
         // so the one signal a v1 manifest *does* carry is not lost.
         external_effects: Vec::new(),
-        // A v1 manifest predates freezing entirely, so there is no resume state
-        // to recover — and `None` is what says so.
+        // A v1 manifest predates both freezing and fact recording, so neither is
+        // recoverable — empty and `None` are what say so.
+        remembered_facts: Vec::new(),
         resume: None,
         reverted: false,
         prev_id: None,
@@ -945,6 +1023,7 @@ pub fn end_impl(state: &AppState, id: &str) -> Result<CheckpointSummary, String>
         reverted: false,
         prev_id: active.prev_id,
         entries: entries.clone(),
+        remembered_facts: active.remembered_facts.clone(),
         // An ordinary turn checkpoint, not a freeze. `freeze_process` is what
         // fills this, and `restorability` refuses anything that has not been.
         resume: None,
@@ -1821,7 +1900,45 @@ pub fn checkpoint_revert(
     id: String,
 ) -> Result<u32, String> {
     let _lock = acquire_revert_lock(state.inner(), &id)?;
-    revert_impl(&checkpoints_base_dir(&app)?, &id)
+    let base_dir = checkpoints_base_dir(&app)?;
+    // Read before the revert, because `revert_impl` rewrites the manifest.
+    let remembered = read_manifest(&base_dir, &id)
+        .map(|manifest| manifest.remembered_facts)
+        .unwrap_or_default();
+    let reverted = revert_impl(&base_dir, &id)?;
+    forget_remembered(&app, state.inner(), &remembered)?;
+    Ok(reverted)
+}
+
+/// Runs the Memory compensator: deletes exactly the facts this turn added.
+///
+/// Ordered after the file revert so a failure to reach the memory store cannot
+/// leave the files half-restored — the files are the part a user notices, and
+/// this is additive bookkeeping on top.
+///
+/// A fact already gone is not an error. The user may have pressed Forget on it
+/// themselves, and re-reporting that as a failed revert would make them chase a
+/// problem they already fixed.
+fn forget_remembered(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    remembered: &[RememberedFact],
+) -> Result<(), String> {
+    if remembered.is_empty() {
+        return Ok(());
+    }
+    let root = crate::workspace::primary_root_canon(state)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|_| crate::memory::GLOBAL_SCOPE_KEY.to_string());
+    let path = crate::memory::memories_file_path(app)?;
+    let _lock = state
+        .memory_lock
+        .lock()
+        .map_err(|_| "Memory lock poisoned".to_string())?;
+    for fact in remembered {
+        let _ = crate::memory::delete_fact_impl(&path, &root, &fact.id);
+    }
+    Ok(())
 }
 
 /// Undo a previous revert of checkpoint `id`: plays its `redo/` backups back
@@ -1834,7 +1951,32 @@ pub fn checkpoint_reapply(
     id: String,
 ) -> Result<u32, String> {
     let _lock = acquire_revert_lock(state.inner(), &id)?;
-    reapply_impl(&checkpoints_base_dir(&app)?, &id)
+    let base_dir = checkpoints_base_dir(&app)?;
+    let remembered = read_manifest(&base_dir, &id)
+        .map(|manifest| manifest.remembered_facts)
+        .unwrap_or_default();
+    let reapplied = reapply_impl(&base_dir, &id)?;
+    // The other half of the compensator, and the reason the manifest keeps each
+    // fact's text: revert deleted them, so reapply has to be able to put them
+    // back. An undo that cannot be undone is data loss with a friendly name.
+    if !remembered.is_empty() {
+        let root = crate::workspace::primary_root_canon(state.inner())
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| crate::memory::GLOBAL_SCOPE_KEY.to_string());
+        let path = crate::memory::memories_file_path(&app)?;
+        let _memory_lock = state
+            .memory_lock
+            .lock()
+            .map_err(|_| "Memory lock poisoned".to_string())?;
+        for fact in &remembered {
+            // `add_fact_impl` short-circuits on identical text, so a fact the
+            // user restored by hand is not duplicated. The new id differs from
+            // the recorded one, which is why a second revert re-reads the
+            // manifest rather than trusting ids to stay stable.
+            let _ = crate::memory::add_fact_impl(&path, &root, &fact.text, "agent", None);
+        }
+    }
+    Ok(reapplied)
 }
 
 /// Freeze a suspended process into checkpoint `id` (roadmap K13).
@@ -1905,6 +2047,7 @@ mod tests {
 
     fn frozen(resume: Option<ResumeState>) -> CheckpointManifest {
         CheckpointManifest {
+            remembered_facts: Vec::new(),
             version: MANIFEST_VERSION,
             created_at_ms: 1,
             session_id: "s-1".to_string(),
@@ -2025,6 +2168,124 @@ mod tests {
             restorability(&manifest, &environment(&[], &[], true)),
             Restorability::Blocked { .. }
         ));
+    }
+
+    // -- K14's first real compensator --------------------------------------
+
+    /// Recording is deduplicated by id, because `add_fact_impl` returns the
+    /// *existing* fact when the text already matches one — remembering the same
+    /// thing twice in a turn must not queue two deletions of the one fact.
+    #[test]
+    fn remembering_the_same_fact_twice_records_it_once() {
+        let state = AppState::default();
+        let id = "00000000-0000-4000-8000-00000recall1";
+        state.checkpoints.lock().unwrap().insert(
+            id.to_string(),
+            ActiveCheckpoint {
+                dir: PathBuf::from("/tmp/unused"),
+                entries: Vec::new(),
+                created_at_ms: 1,
+                session_id: "s".to_string(),
+                anchor_index: 0,
+                label: String::new(),
+                shell_ran: false,
+                external_effects: Default::default(),
+                prev_id: None,
+                remembered_facts: Vec::new(),
+            },
+        );
+        let fact = RememberedFact {
+            id: "f-1".to_string(),
+            text: "the API lives on port 8080".to_string(),
+        };
+        record_remembered_fact(&state, Some(id), fact.clone()).unwrap();
+        record_remembered_fact(&state, Some(id), fact.clone()).unwrap();
+        record_remembered_fact(
+            &state,
+            Some(id),
+            RememberedFact {
+                id: "f-2".to_string(),
+                text: "and the worker on 8081".to_string(),
+            },
+        )
+        .unwrap();
+        let guard = state.checkpoints.lock().unwrap();
+        let held = &guard.get(id).unwrap().remembered_facts;
+        assert_eq!(
+            held.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["f-1", "f-2"]
+        );
+
+        // No checkpoint, and an unknown one, are both no-ops rather than errors:
+        // a `remember` outside a checkpointed turn has nothing to be reverted by.
+        drop(guard);
+        record_remembered_fact(&state, None, fact.clone()).unwrap();
+        record_remembered_fact(&state, Some("nope"), fact).unwrap();
+    }
+
+    /// Memory is the one effect of the four this app can take back, and the
+    /// compensator says what pressing revert will do rather than only that it
+    /// can. The other three still refuse, each with its own reason.
+    #[test]
+    fn memory_is_compensated_and_the_other_three_still_are_not() {
+        assert!(matches!(
+            ExternalEffectKind::Memory.compensator(),
+            Compensation::Undo { .. }
+        ));
+        for kind in [
+            ExternalEffectKind::Shell,
+            ExternalEffectKind::Network,
+            ExternalEffectKind::McpTool,
+        ] {
+            let Compensation::None { reason } = kind.compensator() else {
+                panic!("{kind:?} has no undo in this app and must not claim one");
+            };
+            assert!(reason.len() > 20, "{kind:?} refuses without a reason");
+        }
+    }
+
+    /// The text is kept beside the id so a reapply can put the fact back. A
+    /// manifest that recorded only ids would make revert a one-way door.
+    #[test]
+    fn a_remembered_fact_survives_the_manifest_round_trip_with_its_text() {
+        let base = TempDir::new("remember");
+        let id = "00000000-0000-4000-8000-00000recall2";
+        let dir = base.path.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = frozen(None);
+        manifest.remembered_facts = vec![RememberedFact {
+            id: "f-1".to_string(),
+            text: "the API lives on port 8080".to_string(),
+        }];
+        write_manifest(&dir, &manifest).unwrap();
+
+        let reloaded = read_manifest(&base.path, id).unwrap();
+        assert_eq!(reloaded.remembered_facts, manifest.remembered_facts);
+    }
+
+    /// An older manifest recorded no facts, and empty there means *unrecorded*
+    /// rather than *none* — which is why the compensator runs off this list and
+    /// not off `ExternalEffectKind::Memory` being present. A manifest that knows
+    /// a fact was remembered but not which one must delete nothing.
+    #[test]
+    fn an_older_manifest_records_no_facts_and_so_deletes_none() {
+        let older = serde_json::json!({
+            "version": 2,
+            "created_at_ms": 1,
+            "session_id": "s-old",
+            "anchor_index": 0,
+            "label": "before fact recording existed",
+            "shell_ran": false,
+            "external_effects": ["memory"],
+            "reverted": false,
+            "entries": []
+        });
+        let manifest: CheckpointManifest = serde_json::from_value(older).unwrap();
+        assert!(manifest.remembered_facts.is_empty());
+        assert!(
+            external_effects_of(&manifest).contains(&ExternalEffectKind::Memory),
+            "the effect is still known — only the specific facts are not"
+        );
     }
 
     /// The whole point of K13: the image survives the process that wrote it.
@@ -3493,11 +3754,16 @@ mod tests {
             "each kind appears once, in the enum's own order"
         );
         for effect in &sim.external_effects {
-            let Compensation::None { reason } = effect.compensation;
-            assert!(
-                !reason.is_empty(),
-                "an effect with no compensator must say why, not just that"
-            );
+            match effect.compensation {
+                Compensation::None { reason } => assert!(
+                    !reason.is_empty(),
+                    "an effect with no compensator must say why, not just that"
+                ),
+                Compensation::Undo { action } => assert!(
+                    !action.is_empty(),
+                    "a compensator must name what reverting will do"
+                ),
+            }
         }
         assert!(
             !read_manifest(&base.path, &id).unwrap().shell_ran,

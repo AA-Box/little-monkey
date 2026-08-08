@@ -97,11 +97,16 @@ export interface RestorePlanEntry {
 /** One external effect the backend recorded, and what undoes it. */
 export interface ExternalEffectRecord {
   kind: 'shell' | 'network' | 'mcp-tool' | 'memory';
-  /** Only `none` exists today — this app has no compensator for any of the
-   * four kinds. A tagged object rather than a bool so adding a real undo (a
-   * Git worktree revert, closing an owned draft PR) is a new variant every
-   * reader must handle, not a flag somebody forgets to check. */
-  compensation: { kind: 'none'; reason: string };
+  /** A tagged object rather than a bool, which is what made adding the first
+   * real undo a compile error at every reader instead of a flag somebody
+   * forgets to check.
+   *
+   * `undo` exists for `memory`: a remembered fact is this app's own record, and
+   * reverting the turn forgets exactly the facts that turn added. The other
+   * three are still `none`, each with its own reason — a shell command can
+   * change anything, a request cannot be un-sent, an MCP server is outside this
+   * app. */
+  compensation: { kind: 'none'; reason: string } | { kind: 'undo'; action: string };
 }
 
 export interface RestoreSimulation {
