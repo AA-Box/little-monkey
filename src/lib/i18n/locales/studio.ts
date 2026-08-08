@@ -66,9 +66,18 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.frameGrid": "Frame grid",
   "Studio.add.grid4n1": "Round down to 4n+1 (Wan, most video)",
   "Studio.add.grid17k5": "Round up to 17k+5 (MiniMax H3)",
+  "Studio.add.upscalersDir": "Upscalers folder",
+  "Studio.add.upscalersDirHint":
+    "ESRGAN and other upscale models found here join the upscaler list, alongside the built-in ones.",
+  "Studio.add.embeddingsDir": "Embeddings folder",
+  "Studio.add.embeddingsDirHint":
+    "Textual-inversion embeddings found here can be named in a prompt.",
+  "Studio.add.chooseFolder": "Choose folder…",
+  "Studio.add.clearFolder": "Clear folder",
+  "Studio.add.noFolder": "None",
   "Studio.add.engineArgs": "Extra engine arguments",
   "Studio.add.engineArgsHint":
-    "Passed to the engine as typed — no shell, so quote any path with spaces. This is how flags without their own field are reached: --hires-upscalers-dir, --embd-dir, --vae-format, --model-args.",
+    "Passed to the engine as typed — no shell, so quote any path with spaces. This is how flags without their own field are reached: --vae-format, --model-args.",
   "Studio.add.save": "Add to library",
   "Studio.lora.title": "LoRAs",
   "Studio.lora.add": "Add LoRA",
