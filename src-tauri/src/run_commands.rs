@@ -479,21 +479,40 @@ fn drain_egress<R: tauri::Runtime>(
     process: &crate::run_scope::ProcessScope,
 ) {
     let bytes = process.take_egress();
-    if bytes == 0 {
+    let destinations = process.take_destinations();
+    if bytes == 0 && destinations.is_empty() {
         return;
     }
     let Ok(now) = unix_time_ms() else {
         process.charge_egress(bytes);
+        process.return_destinations(destinations);
         return;
     };
-    if let Err(error) = crate::process_commands::with_process_table(app, state, |table| {
-        table.add_egress_bytes(process.process_id(), bytes, now as i64)
-    }) {
-        process.charge_egress(bytes);
-        eprintln!(
-            "run egress: could not record {bytes} bytes for {}: {error}",
-            process.process_id()
-        );
+    if bytes > 0 {
+        if let Err(error) = crate::process_commands::with_process_table(app, state, |table| {
+            table.add_egress_bytes(process.process_id(), bytes, now as i64)
+        }) {
+            process.charge_egress(bytes);
+            eprintln!(
+                "run egress: could not record {bytes} bytes for {}: {error}",
+                process.process_id()
+            );
+        }
+    }
+    // Written separately from the bytes, and a failure of one does not discard
+    // the other: they are two different facts about the same traffic, and losing
+    // the volume is no reason to also lose the destinations.
+    if !destinations.is_empty() {
+        if let Err(error) = crate::process_commands::with_process_table(app, state, |table| {
+            table.add_egress_destinations(process.process_id(), &destinations, now as i64)
+        }) {
+            let named = destinations.seen.len();
+            process.return_destinations(destinations);
+            eprintln!(
+                "run egress: could not record {named} destinations for {}: {error}",
+                process.process_id()
+            );
+        }
     }
 }
 
