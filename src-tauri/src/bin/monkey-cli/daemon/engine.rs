@@ -1127,19 +1127,27 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                         // delivers the signal and releases the claim — so this
                         // candidate is still held now, and its hold reason says
                         // what it is waiting for rather than just "memory".
-                        let victim = scheduler::preemption_victim(
+                        // A set rather than one job: two `background` jobs that
+                        // together free enough used to free nothing, so a
+                        // claimant sat behind a pair it could have displaced.
+                        // The set is empty unless it actually covers the
+                        // shortfall, so this cannot park work for nothing.
+                        let victims: Vec<String> = scheduler::preemption_victims(
                             candidate.effective_class(now),
                             resource,
                             shortfall_bytes,
                             &running,
                         )
-                        .map(|victim| victim.job_id.clone());
+                        .into_iter()
+                        .map(|victim| victim.job_id.clone())
+                        .collect();
                         let mut reason = format!(
                             "needs {} more {} than is free",
                             admission::describe_bytes(shortfall_bytes),
                             resource.label()
                         );
-                        if let Some(victim_id) = victim {
+                        let mut suspended: Vec<String> = Vec::new();
+                        for victim_id in victims {
                             if self.preempt(
                                 &victim_id,
                                 &candidate,
@@ -1148,17 +1156,25 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                                 shortfall_bytes,
                                 snapshot,
                             )? {
-                                reason =
-                                    format!("{reason}; suspended '{victim_id}' to make room");
-                                if let Some(entry) = running
-                                    .iter_mut()
-                                    .find(|entry| entry.job_id == victim_id)
+                                if let Some(entry) =
+                                    running.iter_mut().find(|entry| entry.job_id == victim_id)
                                 {
                                     // Nothing left to give, so it cannot be
                                     // chosen again in this same pass.
                                     entry.preempted = true;
                                 }
+                                suspended.push(victim_id);
                             }
+                        }
+                        if !suspended.is_empty() {
+                            // Named individually rather than counted: "suspended
+                            // 2 jobs" is not something an operator can act on.
+                            let names = suspended
+                                .iter()
+                                .map(|id| format!("'{id}'"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            reason = format!("{reason}; suspended {names} to make room");
                         }
                         // Stays `queued`. This is the case that used to be an
                         // admission, and then a thrash.
