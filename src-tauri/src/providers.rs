@@ -123,6 +123,16 @@ pub struct ProviderModelInfo {
     /// optional: every `{ id }` literal in the existing tests stays valid.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
+    /// The model's context window, when the provider publishes one. Drives
+    /// `usageStore`'s `contextLimit`, which is what `contextTrimmer.ts`'s
+    /// `shouldTrim` needs before it will compact anything — a cloud model
+    /// without this never auto-trims. Same skip/optional treatment as
+    /// `vision`, and likewise for `tool_calling`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    /// Whether the provider says this model accepts tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calling: Option<bool>,
 }
 
 /// Minimal shape of an OpenAI-style `GET /models` response — same defensive,
@@ -143,6 +153,15 @@ struct RawModelEntry {
     /// Anthropic: `capabilities.image_input.supported`.
     #[serde(default)]
     capabilities: Option<RawCapabilities>,
+    /// OpenRouter's context window.
+    #[serde(default)]
+    context_length: Option<u64>,
+    /// Anthropic's, under a different name.
+    #[serde(default)]
+    max_input_tokens: Option<u64>,
+    /// OpenRouter: `supported_parameters: ["tools", "tool_choice", ...]`.
+    #[serde(default)]
+    supported_parameters: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -181,6 +200,19 @@ impl RawModelEntry {
             .as_ref()
             .and_then(|a| a.input_modalities.as_ref())
             .map(|modalities| modalities.iter().any(|m| m == "image"))
+    }
+
+    /// The context window under whichever name the provider gave it.
+    fn context_length(&self) -> Option<u64> {
+        self.context_length.or(self.max_input_tokens)
+    }
+
+    /// Only OpenRouter answers this one — Anthropic's `capabilities` tree has
+    /// no tool-use entry, so its models stay unknown rather than guessed at.
+    fn tool_calling(&self) -> Option<bool> {
+        self.supported_parameters
+            .as_ref()
+            .map(|params| params.iter().any(|p| p == "tools"))
     }
 }
 
@@ -475,7 +507,14 @@ pub async fn fetch_models(
         .into_iter()
         .filter_map(|entry| {
             let vision = entry.vision();
-            entry.id.map(|id| ProviderModelInfo { id, vision })
+            let context_length = entry.context_length();
+            let tool_calling = entry.tool_calling();
+            entry.id.map(|id| ProviderModelInfo {
+                id,
+                vision,
+                context_length,
+                tool_calling,
+            })
         })
         .collect();
     models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -999,6 +1038,38 @@ mod tests {
         assert_eq!(
             vision,
             vec![Some(true), Some(false), Some(true), Some(false), None]
+        );
+    }
+
+    /// Context window and tool support, under each provider's own field name.
+    /// The OpenAI-shaped entry answers neither, which is what leaves those
+    /// capabilities "unknown" in the UI rather than guessed at.
+    #[test]
+    fn model_entries_report_context_length_and_tool_calling() {
+        let parsed: RawModelsResponse = serde_json::from_str(
+            r#"{"data": [
+                {"id": "anthropic/claude-opus-5", "context_length": 1000000,
+                 "supported_parameters": ["max_tokens", "tools", "tool_choice"]},
+                {"id": "vendor/no-tools", "context_length": 8192,
+                 "supported_parameters": ["max_tokens"]},
+                {"id": "claude-opus-5", "max_input_tokens": 1000000},
+                {"id": "gpt-4o", "object": "model", "owned_by": "openai"}
+            ]}"#,
+        )
+        .expect("the fixture is a valid /models response");
+        let read: Vec<(Option<u64>, Option<bool>)> = parsed
+            .data
+            .iter()
+            .map(|entry| (entry.context_length(), entry.tool_calling()))
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                (Some(1_000_000), Some(true)),
+                (Some(8192), Some(false)),
+                (Some(1_000_000), None),
+                (None, None),
+            ]
         );
     }
 
