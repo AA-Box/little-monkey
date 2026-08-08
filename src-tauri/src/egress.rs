@@ -3514,7 +3514,20 @@ mod tests {
             // by `json()`, so there is no stream for the deadline to truncate.
             // The capabilities body is the smallest of the three: a few KB of
             // sampler and scheduler names, likewise buffered by `json()`.
-            ("generation_commands.rs", 3),
+            //
+            // The fourth is `tool_client`, shared by both calls to a Studio tool
+            // sidecar — also loopback, to a child this process spawned on a port
+            // it reserved. 30s for the manifest, a page of JSON under
+            // `MAX_MANIFEST_BYTES` (256 KiB). `TOOL_RUN_TIMEOUT` (300s) for a
+            // run, and that one is (C): the tool contract is synchronous, so the
+            // deadline is a ceiling on the *operation* — a face swap, a
+            // segmentation — and not on transfer. Deliberately synchronous: these
+            // take seconds, and a submit-and-poll protocol to avoid a deadline
+            // nobody hits is protocol for its own sake. Neither body can outrun
+            // its deadline unnoticed — both are read by `studio_tools::read_capped`,
+            // which enforces its ceiling on a running total rather than trusting
+            // `Content-Length`.
+            ("generation_commands.rs", 4),
             // 1800s on the hosted image API, and it is (B): the body is
             // `MAX_IMAGE_BYTES` (32 MiB) of base64 inside a JSON object — 18 KB/s —
             // and the deadline also covers the provider's own render time, which is

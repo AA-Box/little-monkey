@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import {
   ChevronDown,
@@ -15,12 +16,15 @@ import {
   Wand2,
 } from "lucide-react";
 
-import { Button, IconButton, Listbox, StatusPill, Tabs } from "../ui";
+import { Button, IconButton, Listbox, StatusPill } from "../ui";
 import { AddBackendForm } from "./AddBackendForm";
 import { AddModelForm } from "./AddModelForm";
 import { LoraStack } from "./LoraStack";
 import { MaskCanvas } from "./MaskCanvas";
 import { ModelFiles } from "./ModelFiles";
+import { SettingsCard } from "./SettingsCard";
+import type { StudioMode } from "./StudioNav";
+import { ToolPanel } from "./ToolPanel";
 import { useT } from "../../lib/i18n";
 import { describeWeightFile } from "../../lib/weightFileHints";
 import {
@@ -172,8 +176,7 @@ function ConditioningImageField({
   const { t } = useT();
   const input = useRef<HTMLInputElement | null>(null);
   return (
-    <div className="grid gap-2 rounded-md border border-border p-2">
-      <span className="text-xs text-muted">{label}</span>
+    <SettingsCard title={label} hint={hint}>
       <div className="flex items-center gap-2">
         <input
           ref={input}
@@ -208,8 +211,7 @@ function ConditioningImageField({
           onChange={onStrength}
         />
       )}
-      <p className="text-[11px] text-faint">{hint}</p>
-    </div>
+    </SettingsCard>
   );
 }
 
@@ -237,8 +239,7 @@ function ReferenceImages({
   // rather than something the user has to take on trust.
   const canNumber = images.length > 1;
   return (
-    <div className="grid gap-2 rounded-md border border-border p-2">
-      <span className="text-xs text-muted">{t("Studio.reference.title")}</span>
+    <SettingsCard title={t("Studio.reference.title")} hint={t("Studio.reference.hint")}>
       <div className="flex flex-wrap items-center gap-2">
         {images.map((image, index) => (
           <span key={`${index}-${image.slice(0, 16)}`} className="relative">
@@ -300,14 +301,17 @@ function ReferenceImages({
           {t("Studio.reference.numbered")}
         </label>
       )}
-      <p className="text-[11px] text-faint">
-        {full
-          ? t("Studio.reference.full", { max: String(MAX_REF_IMAGES) })
-          : canNumber && numbered
-            ? t("Studio.reference.numberedHint")
-            : t("Studio.reference.hint")}
-      </p>
-    </div>
+      {/* Only the two stateful lines stay visible — that the list is full, or
+          what numbering did. The plain explanation is on the card's info icon,
+          where it is not re-read on every glance. */}
+      {full || (canNumber && numbered) ? (
+        <p className="text-[11px] text-faint">
+          {full
+            ? t("Studio.reference.full", { max: String(MAX_REF_IMAGES) })
+            : t("Studio.reference.numberedHint")}
+        </p>
+      ) : null}
+    </SettingsCard>
   );
 }
 
@@ -366,18 +370,16 @@ function componentNames(model: GenerationModel): string[] {
   return model.components.map(componentFileName);
 }
 
-export type StudioMode = "models" | "image" | "video" | "audio";
-
-/** Which tasks each making-tab covers. The models tab makes nothing, so it
- *  has no entry and its model list is never filtered. */
-const MODE_TASKS: Record<Exclude<StudioMode, "models">, GenerationTask[]> = {
+/** Which tasks each section covers. The two library sections generate
+ *  nothing, so neither has an entry and neither filters the model list. */
+const MODE_TASKS: Record<Exclude<StudioMode, "models" | "tools">, GenerationTask[]> = {
   image: ["text_to_image", "image_to_image"],
   video: ["text_to_video", "image_to_video"],
   audio: ["text_to_speech"],
 };
 
 const tasksFor = (mode: StudioMode): GenerationTask[] =>
-  mode === "models" ? [] : MODE_TASKS[mode];
+  mode === "models" || mode === "tools" ? [] : MODE_TASKS[mode];
 
 /** Studio talks to the engine over Tauri commands, which only exist inside the
  *  desktop window. In a plain browser tab every call throws a bare TypeError
@@ -386,9 +388,17 @@ const tasksFor = (mode: StudioMode): GenerationTask[] =>
 const IN_DESKTOP_APP =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-export function StudioPanel() {
+interface Props {
+  /** Which section is showing. Owned by `App`, because the control that
+   *  switches it is the sidebar nav rather than anything in here. */
+  mode: StudioMode;
+  /** Sidebar node to render the settings rail into. Null until the sidebar has
+   *  mounted, and in Chat, where there is no rail to show. */
+  railSlot: HTMLElement | null;
+}
+
+export function StudioPanel({ mode, railSlot }: Props) {
   const { t } = useT();
-  const [mode, setMode] = useState<StudioMode>("image");
   const [status, setStatus] = useState<GenerationEngineStatus | null>(null);
   /** What the running engine says it supports. Null until one has run — the
    *  pickers fall back to the compiled-in lists until then. */
@@ -409,6 +419,8 @@ export function StudioPanel() {
    *  multiplies the wait as well as the output. */
   const [batchCount, setBatchCount] = useState(1);
   const [initImage, setInitImage] = useState<string | null>(null);
+  const [adPrompt, setAdPrompt] = useState("");
+  const [adNegativePrompt, setAdNegativePrompt] = useState("");
   /** Inpainting: white is repainted, black is kept. Only ever set while an
    *  init image exists, because it is a mask *over* that image. */
   const [maskImage, setMaskImage] = useState<string | null>(null);
@@ -506,6 +518,19 @@ export function StudioPanel() {
       capabilities,
     );
   }, [remote, selected, overrides, capabilities]);
+
+  // ADetailer re-renders each region its detector finds. The detector is a
+  // launch flag, so this asks the same question the conditioning memo does —
+  // the model's own slots plus anything picked for this run — but it is not a
+  // conditioning *image*, so it cannot ride that set.
+  const hasDetector = useMemo(
+    () =>
+      !remote &&
+      [...(selected?.components ?? []), ...overrides].some(
+        (component) => component.slot === "ad_model",
+      ),
+    [remote, selected, overrides],
+  );
 
   // Inpainting. Offered only for the still-image edit task — a mask over the
   // first frame of a clip describes one frame out of thirty-three — and only
@@ -800,6 +825,12 @@ export function StudioPanel() {
         // chosen before switching model cannot follow the run somewhere they
         // mean nothing. The backend refuses them again on its own side.
         maskImageBase64: canMask && initImage ? maskImage : null,
+        // Blank inherits the main prompt inside the engine, so an untouched
+        // field is sent as null rather than as an empty string it would have
+        // to interpret.
+        adPrompt: hasDetector && adPrompt.trim() ? adPrompt.trim() : null,
+        adNegativePrompt:
+          hasDetector && adNegativePrompt.trim() ? adNegativePrompt.trim() : null,
         controlImageBase64: conditioning.has("control") ? controlImage : null,
         controlStrength: conditioning.has("control") && controlImage ? controlStrength : null,
         ipAdapterImageBase64: conditioning.has("ip_adapter") ? ipAdapterImage : null,
@@ -926,23 +957,19 @@ export function StudioPanel() {
     !busy &&
     (!needsInitImage(task) || !!initImage);
 
+  // Tools share nothing with generation — no model, no prompt, no sampler —
+  // so the section is its own panel rather than another branch threaded
+  // through this one. After every hook above it, so the hook order is the same
+  // whichever section is showing.
+  if (mode === "tools") return <ToolPanel railSlot={railSlot} />;
+
   return (
     <div
       className={`flex min-h-0 flex-1 flex-col p-4 ${
         mode === "models" ? "overflow-y-auto" : "overflow-hidden"
       }`}
     >
-      <Tabs
-        active={mode}
-        onChange={(next) => setMode(next as StudioMode)}
-        tabs={[
-          { id: "image", label: t("Studio.tab.image") },
-          { id: "video", label: t("Studio.tab.video") },
-          { id: "audio", label: t("Studio.tab.audio") },
-          { id: "models", label: t("Studio.tab.models") },
-        ]}
-      />
-      <header className="mb-4 mt-3">
+      <header className="mb-4">
         <h1 className="text-sm font-medium">{t(`Studio.${mode}.title`)}</h1>
         <p className="mt-1 text-xs text-muted">{t(`Studio.${mode}.subtitle`)}</p>
       </header>
@@ -1302,10 +1329,24 @@ export function StudioPanel() {
           )}
         </div>
       </section>
-      ) : (
-        <section className="mb-3">
-          <label className="grid gap-1 text-[11px] text-muted">
-            {t("Studio.models")}
+      ) : null}
+
+      {/* The canvas keeps the prompt, the button and the result together where
+          the work happens. The rail of controls that used to sit beside it is
+          portalled into the sidebar below, so this gets the full width. */}
+      {mode !== "models" && (
+      <div className="flex min-h-0 flex-1 gap-4 overflow-hidden p-1">
+        {/* The rail renders into the sidebar rather than here. It stays part of
+            this component — every control below reads state this component owns
+            — and only its DOM position moves.
+            `[&>*]:min-w-0`: a grid item's default minimum is its own
+            min-content, so one wide control anywhere in the rail would size the
+            whole column to itself and every box would overflow together. */}
+        {railSlot ? createPortal(
+        <div className="grid content-start gap-3 [&>*]:min-w-0">
+          {/* Outside the `selected` guard below: with nothing chosen this is the
+              one control that has to be reachable, or there is no way to choose. */}
+          <SettingsCard title={t("Studio.models")}>
             {/* A native popup is drawn by the platform and sized to its widest
                 option, never to the control, so this one is ours. */}
             <Listbox
@@ -1325,27 +1366,10 @@ export function StudioPanel() {
                   .join(" · "),
               }))}
             />
-          </label>
-        </section>
-      )}
+          </SettingsCard>
 
-      {/* The shape every local generation tool settles on: a narrow rail of
-          controls that scrolls on its own, and a canvas that keeps the prompt,
-          the button and the result together where the work happens. */}
-      {mode !== "models" && (
-      <div className="flex min-h-0 flex-1 gap-4 overflow-hidden p-1">
-        {/* `overflow-y: auto` computes overflow-x to auto as well, so the rail
-            clips sideways too and its controls need room for a focus ring. */}
-        {selected && (
-        // `pr-3` is not decoration. A macOS overlay scrollbar reserves no
-        // space, so it is drawn *on top of* whatever reaches the right edge —
-        // which is why the size hint and every number stepper looked sliced
-        // off. `scrollbar-gutter` covers the other setting, where the bar is
-        // solid and takes width instead.
-        // `[&>*]:min-w-0` is the other half: a grid item's default minimum is
-        // its own min-content, so one wide control anywhere in the rail sizes
-        // the whole column to itself and every box overflows together.
-        <aside className="grid w-80 shrink-0 content-start gap-3 overflow-y-auto pb-4 pl-1 pr-3 [scrollbar-gutter:stable] [&>*]:min-w-0">
+          {selected && (
+          <>
           <div className="flex flex-wrap gap-1.5">
             {selected.tasks
               .filter((entry) => tasksFor(mode).includes(entry))
@@ -1427,6 +1451,25 @@ export function StudioPanel() {
             </div>
           )}
 
+          {hasDetector && (
+            <SettingsCard title={t("Studio.adetailer.title")} hint={t("Studio.adetailer.hint")}>
+              <input
+                className="w-full rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+                placeholder={t("Studio.adetailer.promptPlaceholder")}
+                aria-label={t("Studio.adetailer.prompt")}
+                value={adPrompt}
+                onChange={(event) => setAdPrompt(event.target.value)}
+              />
+              <input
+                className="w-full rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+                placeholder={t("Studio.adetailer.negativePlaceholder")}
+                aria-label={t("Studio.adetailer.negative")}
+                value={adNegativePrompt}
+                onChange={(event) => setAdNegativePrompt(event.target.value)}
+              />
+            </SettingsCard>
+          )}
+
           {conditioning.has("control") && (
             <ConditioningImageField
               label={t("Studio.control.title")}
@@ -1497,6 +1540,7 @@ export function StudioPanel() {
           {/* Every one of these is a per-run choice, not a property of the
               model — the library entry only supplies the starting values. */}
           {settings && !isSpeechTask(task) && (
+            <>
             <details open className="rounded border border-border p-3">
               <summary className="cursor-pointer text-xs font-medium">
                 {t("Studio.settings")}
@@ -1614,26 +1658,6 @@ export function StudioPanel() {
                   onChange={(strength) => setSettings({ ...settings, strength })}
                 />
               )}
-
-              <label className="grid gap-1 text-[11px] text-muted">
-                {t("Studio.seed")}
-                <span className="flex items-center gap-2">
-                  <input
-                    className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
-                    placeholder={t("Studio.seedPlaceholder")}
-                    value={seed}
-                    inputMode="numeric"
-                    onChange={(event) => setSeed(event.target.value.replace(/[^\d-]/g, ""))}
-                  />
-                  <IconButton
-                    size="sm"
-                    aria-label={t("Studio.seedShuffle")}
-                    onClick={() => setSeed(String(Math.floor(Math.random() * 2_147_483_647)))}
-                  >
-                    <Shuffle size={12} />
-                  </IconButton>
-                </span>
-              </label>
 
               <details className="grid gap-2" hidden={remote}>
                 <summary className="cursor-pointer text-[11px] text-muted">
@@ -1760,6 +1784,30 @@ export function StudioPanel() {
               </div>
               </div>
             </details>
+
+            {/* Its own card: the seed is the one setting people reach for
+                between runs — reroll, or paste one back to reproduce a result —
+                so it does not belong buried under the sampler. */}
+            <SettingsCard title={t("Studio.seed")}>
+              <span className="flex items-center gap-2">
+                <input
+                  className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
+                  placeholder={t("Studio.seedPlaceholder")}
+                  aria-label={t("Studio.seed")}
+                  value={seed}
+                  inputMode="numeric"
+                  onChange={(event) => setSeed(event.target.value.replace(/[^\d-]/g, ""))}
+                />
+                <IconButton
+                  size="sm"
+                  aria-label={t("Studio.seedShuffle")}
+                  onClick={() => setSeed(String(Math.floor(Math.random() * 2_147_483_647)))}
+                >
+                  <Shuffle size={12} />
+                </IconButton>
+              </span>
+            </SettingsCard>
+            </>
           )}
 
           {!isSpeechTask(task) && !remote && (
@@ -1822,13 +1870,14 @@ export function StudioPanel() {
               </div>
             </details>
           )}
-
-        </aside>
-        )}
+          </>
+          )}
+        </div>,
+        railSlot,
+        ) : null}
 
         {/* `min-w-0`: a flex item's floor is its content, so without this a
-            wide result pushes the whole row past the pane and the rail is what
-            gets cut off the left of it. */}
+            wide result pushes the whole row past the pane. */}
         <section className="flex min-h-0 min-w-0 flex-1 flex-col gap-2">
           {/* Each button sits with the field it belongs to and stretches to
               its height, so the row reads as one control rather than two. */}
