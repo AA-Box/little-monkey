@@ -3377,25 +3377,65 @@ a broken chain so a scripted check cannot pass by printing bad news.
   than a reason to record nothing. `browser_list` is skipped under the same rule
   as `GET /v1/models` — a read of local state that takes no action.
 
-  **A finding the stream surfaced rather than fixed:** no browser command goes
-  through `request_permission`. Navigating to an arbitrary URL, clicking, and
-  typing text into a page are ungated today, so every browser row records
-  `permission_request_id = NULL` — which the acceptance calls a bug, and which is
-  now visible as data instead of an assumption. Gating them is a behaviour change
-  to the permission path and wants its own review.
+  ~~**A finding the stream surfaced rather than fixed:** browser actions are
+  ungated, which the acceptance calls a bug.~~ **That claim was written here and
+  it overstated the gap — correcting it before somebody builds a prompt nobody
+  needs.** It is true that no browser command calls `request_permission`, and
+  true that every browser row therefore records `permission_request_id = NULL`.
+  It is *not* true that this is the acceptance's bug. That clause is about a
+  **tool call** whose authorizing decision cannot be produced from the log, and
+  every browser path is user-initiated or user-configured: `BrowserWorkbench`,
+  `VisualEditModePanel`, `BrowserVerificationPanel`, and workflow replay, which
+  the user starts. No agent tool reaches them — `tools.rs` has no browser entry,
+  and `BrowserWorkerAdapter` (the workflow-side entry, capability-gated by
+  `WorkflowNodeKind::Browser`'s declared `EffectClass`) has no production caller
+  at all.
+
+  A per-action prompt for a button the user just clicked is the wrong feature, in
+  the same way `browser_list` needs no gate. So `NULL` here is the correct value
+  and not a missing one. What *is* worth saying: user-configured synthetic
+  monitors navigate on a timer with nobody at the keyboard, and the policy that
+  covers that is K5's per-run egress allowlist, not the permission prompt.
 
   Detail columns stay narrow on purpose: HTTP records the status and nothing
   else, browser records the session id and never a URL, selector or typed text.
   `detail_json` is covered by the hash chain and therefore permanent, and typed
   text is exactly where a password would be.
 
-  **Still to write to it:** ACP and the remote node. Both are JSON-RPC/HTTP
-  dispatch loops whose arms each send their own response, so there is no single
-  place holding the outcome — instrumenting the arms by hand is precisely the
-  miss-a-branch failure the browser helper exists to avoid. The honest fix is an
-  id→method map at their shared `send` choke point, which is its own change.
-  Separate stores also still hold gating-relevant records with no join to either
-  stream: `daemon_scheduler_decisions` and `remote_audit` in their own database
+  **ACP writes to it now, through the choke point rather than the arms.** Every
+  ACP response leaves through one `send`, so that is where the event is recorded
+  — the dispatch loop's arms each have their own error branches, and
+  instrumenting arms is how one branch stays silent forever. A JSON-RPC response
+  carries only the request `id`, so the loop remembers `id → method` when it
+  dispatches and `send` consumes it; a `session/update` notification has a method
+  and no id, never matches, and never floods the stream. `initialize` is skipped
+  under the same rule as `GET /v1/models`.
+
+  The audit is process-global there, deliberately: `monkey-cli acp` serves one
+  stdio connection for its whole lifetime, so there is exactly one, and threading
+  it through seventeen `send` call sites plus the spawned relay tasks that
+  outlive the loop would buy nothing.
+
+  **The remote node writes to it too, and it needed no id bookkeeping.** Unlike
+  ACP, every path through `RemoteApi` returns one `ApiResponse` from one
+  `handle`, so wrapping that is already a choke point with the request and its
+  response in scope together. An unauthenticated request — the one that never
+  reaches a route at all — is therefore still an event, which is the property the
+  wrapper buys over instrumenting routes.
+
+  This does **not** replace `remote_audit`. That table holds the protocol-level
+  denial detail this stream deliberately does not; what was missing was a row
+  readable alongside everything else, and that is what the join now gives.
+
+  One consequence worth noting: `server.rs` and `RemoteApi` both answer HTTP, so
+  the status-to-outcome rule moved into `subsystem_audit::outcome_for_status`.
+  Two copies would have drifted, and the drift would stay invisible until
+  somebody counted failures and got refusals.
+
+  **Every subsystem the acceptance names now writes to the stream** — desktop and
+  daemon through `run_events`, and HTTP, MCP, browser, ACP and the remote node
+  through `subsystem_events`. Separate stores still hold gating-relevant records
+  with no join to either stream: `daemon_scheduler_decisions` and `remote_audit` in their own database
   files, and `egress_denials`, which records denials only — **an allowed egress
   produces no row anywhere** — and ring-buffers itself on every insert.
 - **A schema bump was a one-way door, and that is why the audit is scattered
