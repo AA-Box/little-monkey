@@ -219,21 +219,45 @@ function ReferenceImages({
   images,
   onAdd,
   onRemove,
+  numbered,
+  onNumberedChange,
 }: {
   images: string[];
   onAdd: (file: File) => void;
   onRemove: (index: number) => void;
+  numbered: boolean;
+  onNumberedChange: (numbered: boolean) => void;
 }) {
   const { t } = useT();
   const input = useRef<HTMLInputElement | null>(null);
   const full = images.length >= MAX_REF_IMAGES;
+  // One reference has nothing to be told apart from, so the control only earns
+  // its space once there are two. The badges are the point of showing it: they
+  // are the numbers the prompt refers to, so the setting's effect is visible
+  // rather than something the user has to take on trust.
+  const canNumber = images.length > 1;
   return (
     <div className="grid gap-2 rounded-md border border-border p-2">
       <span className="text-xs text-muted">{t("Studio.reference.title")}</span>
       <div className="flex flex-wrap items-center gap-2">
         {images.map((image, index) => (
           <span key={`${index}-${image.slice(0, 16)}`} className="relative">
-            <Thumbnail base64={image} alt={t("Studio.reference.title")} />
+            <Thumbnail
+              base64={image}
+              alt={
+                canNumber && numbered
+                  ? t("Studio.reference.numberedAlt", { index: String(index + 1) })
+                  : t("Studio.reference.title")
+              }
+            />
+            {canNumber && numbered && (
+              <span
+                aria-hidden="true"
+                className="absolute -bottom-1 -left-1 flex h-4 min-w-4 items-center justify-center rounded-full border border-border bg-surface-2 px-1 font-mono text-[10px] font-medium text-foreground"
+              >
+                {index + 1}
+              </span>
+            )}
             <IconButton
               size="sm"
               className="absolute -right-1 -top-1"
@@ -265,10 +289,23 @@ function ReferenceImages({
           {t("Studio.reference.add")}
         </Button>
       </div>
+      {canNumber && (
+        <label className="flex min-h-11 items-center gap-2 text-xs text-muted">
+          <input
+            type="checkbox"
+            checked={numbered}
+            onChange={(event) => onNumberedChange(event.target.checked)}
+            className="h-4 w-4 rounded border-border accent-[var(--color-accent)]"
+          />
+          {t("Studio.reference.numbered")}
+        </label>
+      )}
       <p className="text-[11px] text-faint">
         {full
           ? t("Studio.reference.full", { max: String(MAX_REF_IMAGES) })
-          : t("Studio.reference.hint")}
+          : canNumber && numbered
+            ? t("Studio.reference.numberedHint")
+            : t("Studio.reference.hint")}
       </p>
     </div>
   );
@@ -384,6 +421,9 @@ export function StudioPanel() {
   const [ipAdapterStrength, setIpAdapterStrength] = useState(1);
   /** Subjects to keep consistent, for the identity-conditioned architectures. */
   const [refImages, setRefImages] = useState<string[]>([]);
+  /** Whether each reference gets its own index, so a prompt can address them
+   *  individually ("the jacket from image 2"). Only meaningful past one. */
+  const [numberRefImages, setNumberRefImages] = useState(false);
   const [speakerFile, setSpeakerFile] = useState("");
   const [language, setLanguage] = useState("");
   const [loras, setLoras] = useState<LoraSelection[]>([]);
@@ -766,9 +806,10 @@ export function StudioPanel() {
         ipAdapterStrength:
           conditioning.has("ip_adapter") && ipAdapterImage ? ipAdapterStrength : null,
         refImagesBase64: conditioning.has("reference") ? refImages : [],
-        // Architecture-specific and not worth a control of its own until a
-        // model needs it; the engine's own default is what this matches.
-        increaseRefIndex: false,
+        // Only meaningful when there is more than one reference to tell apart,
+        // which is also the only time the control is shown.
+        increaseRefIndex:
+          conditioning.has("reference") && refImages.length > 1 && numberRefImages,
         // Blank rows are a half-typed path, not a LoRA the user meant.
         loras: loras.filter((lora) => lora.path.trim().length > 0),
         componentOverrides: overrides,
@@ -1425,6 +1466,8 @@ export function StudioPanel() {
               onRemove={(index) =>
                 setRefImages((current) => current.filter((_, at) => at !== index))
               }
+              numbered={numberRefImages}
+              onNumberedChange={setNumberRefImages}
             />
           )}
 
