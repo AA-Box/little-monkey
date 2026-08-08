@@ -20,12 +20,49 @@ export type ComponentSlot =
   | "clip_vision"
   | "t5xxl"
   | "llm"
+  | "llm_vision"
+  | "uncond_diffusion_model"
+  | "embeddings_connectors"
+  | "motion_module"
   | "vae"
   | "audio_vae"
   | "taesd"
+  /** The three conditioning slots: filling one is what makes the matching
+   *  per-run image mean anything to the engine. See CONDITIONING_SLOTS. */
+  | "control_net"
+  | "ip_adapter"
+  | "photo_maker"
+  | "pulid_weights"
   /** Speech only, and served by llama-tts rather than sd-server. */
   | "mmproj"
   | "vocoder";
+
+/** Which per-run conditioning image a loaded slot unlocks. Mirrors
+ *  `ConditioningImage` in generation.rs — the engine reads the three from three
+ *  different request fields, so they are not interchangeable. */
+export type ConditioningImage = "control" | "ip_adapter" | "reference";
+
+/** The slot → conditioning-image mapping, mirroring
+ *  `ComponentSlot::conditioning_image`. The generation form reads this to
+ *  decide which conditioning inputs a model can actually use; the backend
+ *  re-checks it, so this only governs what is offered. */
+export const CONDITIONING_SLOTS: Partial<Record<ComponentSlot, ConditioningImage>> = {
+  control_net: "control",
+  ip_adapter: "ip_adapter",
+  photo_maker: "reference",
+  pulid_weights: "reference",
+};
+
+/** Reference images one run may carry. Mirrors the backend's own ceiling —
+ *  each is decoded and held in memory beside the others. */
+export const MAX_REF_IMAGES = 8;
+
+/** Which conditioning images this set of filled slots unlocks. */
+export function availableConditioning(slots: ComponentSlot[]): Set<ConditioningImage> {
+  return new Set(
+    slots.map((slot) => CONDITIONING_SLOTS[slot]).filter((kind): kind is ConditioningImage => !!kind),
+  );
+}
 
 /** Where a component's bytes come from. A file the user already has is a
  *  first-class source, referenced where it lies and never fetched. */
@@ -207,6 +244,20 @@ export interface GenerationRequest {
   /** Speech only: ISO 639-1 code. Null leaves the model's own default. */
   language: string | null;
   initImageBase64: string | null;
+  /** Single-channel mask over the init image: white is repainted, black is
+   *  kept. This is inpainting, so it needs an init image to paint over. */
+  maskImageBase64: string | null;
+  /** A *pre-processed* control image — depth map, pose skeleton, edge map. The
+   *  engine runs no detector, so a plain photograph is taken as structure. */
+  controlImageBase64: string | null;
+  /** How strongly the control image binds. Null leaves the engine default. */
+  controlStrength: number | null;
+  /** A reference image whose style/content is borrowed. */
+  ipAdapterImageBase64: string | null;
+  ipAdapterStrength: number | null;
+  /** Reference images for the identity- and edit-conditioned architectures. */
+  refImagesBase64: string[];
+  increaseRefIndex: boolean;
   loras: LoraSelection[];
   componentOverrides: ComponentOverride[];
 }
@@ -428,9 +479,17 @@ export const COMPONENT_SLOTS: { slot: ComponentSlot; flag: string }[] = [
   { slot: "clip_vision", flag: "--clip_vision" },
   { slot: "t5xxl", flag: "--t5xxl" },
   { slot: "llm", flag: "--llm" },
+  { slot: "llm_vision", flag: "--llm_vision" },
+  { slot: "uncond_diffusion_model", flag: "--uncond-diffusion-model" },
+  { slot: "embeddings_connectors", flag: "--embeddings-connectors" },
+  { slot: "motion_module", flag: "--motion-module" },
   { slot: "vae", flag: "--vae" },
   { slot: "audio_vae", flag: "--audio-vae" },
   { slot: "taesd", flag: "--taesd" },
+  { slot: "control_net", flag: "--control-net" },
+  { slot: "ip_adapter", flag: "--ip-adapter" },
+  { slot: "photo_maker", flag: "--photo-maker" },
+  { slot: "pulid_weights", flag: "--pulid-weights" },
   { slot: "mmproj", flag: "--mmproj" },
   { slot: "vocoder", flag: "--model-vocoder" },
 ];
