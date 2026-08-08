@@ -7,12 +7,15 @@ import { useT } from "../../lib/i18n";
 import { formatTimestamp } from "../../lib/format";
 import type { SchedulerDecision } from "../../lib/daemonClient";
 import {
+  contextHitRate,
+  contextReuseFor,
   destinationsFor,
   measurementOf,
   renderMeasurement,
   renderTotal,
   totalIsPartial,
   USAGE_FIELDS,
+  type ContextReuse,
   type ProcessEgressDestinations,
   type ProcessUsageAggregate,
   type ProcessUsageRow,
@@ -117,12 +120,44 @@ export function DestinationList({ recorded }: { recorded: ProcessEgressDestinati
   );
 }
 
+/**
+ * What the runtime's prompt cache actually saved this process (roadmap K11).
+ *
+ * Renders nothing when the runtime reported no figure, for `DestinationList`'s
+ * reason and one sharper: Ollama and MLX report nothing at all, so a "0% hit
+ * rate" here would be a measurement this app invented for two of its three
+ * runtimes. The percentage is shown beside the token count it came from, because
+ * a rate without its denominator cannot be checked.
+ */
+export function ContextReuseSummary({ reuse }: { reuse: ContextReuse | null }) {
+  const { t } = useT();
+  const rate = contextHitRate(reuse);
+  if (!reuse || rate === null) return null;
+  return (
+    <div className="mt-2 border-t border-border pt-2">
+      <p className="text-[11px] text-faint">{t("ResourceLedgerPanel.contextReuseLabel")}</p>
+      <p className="mt-0.5 font-mono text-xs text-foreground">
+        {t("ResourceLedgerPanel.contextReuseHitRate", { percent: (rate * 100).toFixed(1) })}
+        <span className="text-faint">
+          {" · "}
+          {t("ResourceLedgerPanel.contextReuseTokens", {
+            reused: reuse.reusedTokens,
+            evaluated: reuse.evaluatedTokens,
+          })}
+        </span>
+      </p>
+    </div>
+  );
+}
+
 export function UsageRow({
   row,
   destinations = null,
+  contextReuse = null,
 }: {
   row: ProcessUsageRow;
   destinations?: ProcessEgressDestinations | null;
+  contextReuse?: ContextReuse | null;
 }) {
   const { t } = useT();
   const unavailableCount = row.usage.unavailable.length;
@@ -149,6 +184,7 @@ export function UsageRow({
         ))}
       </div>
       <DestinationList recorded={destinations} />
+      <ContextReuseSummary reuse={contextReuse} />
     </div>
   );
 }
@@ -269,6 +305,7 @@ export function ResourceLedgerPanel() {
   const rows = useResourceLedgerStore(useShallow((state) => state.rows));
   const totals = useResourceLedgerStore((state) => state.totals);
   const destinations = useResourceLedgerStore(useShallow((state) => state.destinations));
+  const contextReuse = useResourceLedgerStore(useShallow((state) => state.contextReuse));
   const closedOnly = useResourceLedgerStore((state) => state.closedOnly);
   const loadingLedger = useResourceLedgerStore((state) => state.loadingLedger);
   const ledgerError = useResourceLedgerStore((state) => state.ledgerError);
@@ -354,7 +391,12 @@ export function ResourceLedgerPanel() {
           )}
           <div className="flex flex-col gap-2">
             {rows.map((row) => (
-              <UsageRow key={row.processId} row={row} destinations={destinationsFor({ destinations }, row.processId)} />
+              <UsageRow
+                key={row.processId}
+                row={row}
+                destinations={destinationsFor({ destinations }, row.processId)}
+                contextReuse={contextReuseFor({ contextReuse }, row.processId)}
+              />
             ))}
           </div>
         </>

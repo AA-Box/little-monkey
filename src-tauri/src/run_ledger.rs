@@ -198,9 +198,11 @@ const MIGRATION_V14: i64 = 14;
 const MIGRATION_V14_CHECKSUM: &str = "egress-destinations-v14-2026-08-08";
 const MIGRATION_V15: i64 = 15;
 const MIGRATION_V15_CHECKSUM: &str = "tool-call-origin-v15-2026-08-08";
+const MIGRATION_V16: i64 = 16;
+const MIGRATION_V16_CHECKSUM: &str = "context-reuse-v16-2026-08-08";
 
 /// The newest schema this binary knows how to write.
-const SCHEMA_VERSION: i64 = MIGRATION_V15;
+const SCHEMA_VERSION: i64 = MIGRATION_V16;
 
 /// Whether a migration keeps older binaries able to open the database.
 ///
@@ -1797,6 +1799,14 @@ const MIGRATION_LADDER: &[(i64, &str, Compatibility)] = &[
         MIGRATION_V15_CHECKSUM,
         Compatibility::Additive,
     ),
+    // Additive: two nullable measurement columns, in the same family as V8's and
+    // read by nothing older. A V15 binary keeps writing every other column
+    // correctly and simply leaves these NULL, which is what they mean.
+    (
+        MIGRATION_V16,
+        MIGRATION_V16_CHECKSUM,
+        Compatibility::Additive,
+    ),
 ];
 
 /// The oldest binary that may open a database with `version` applied.
@@ -2246,6 +2256,42 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
+    let has_v16 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V16],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v16 {
+        // Probed like V14's and V15's: the `CHECK` on each column is what stops
+        // SQLite from dropping it, so a database wound back below V16 keeps them.
+        // Probed one at a time because a wind-back can leave either alone.
+        let has_reused = transaction
+            .prepare("SELECT context_tokens_reused FROM agent_processes LIMIT 0")
+            .is_ok();
+        if !has_reused {
+            transaction.execute_batch(MIGRATION_V16_REUSED_SQL)?;
+        }
+        let has_evaluated = transaction
+            .prepare("SELECT context_tokens_evaluated FROM agent_processes LIMIT 0")
+            .is_ok();
+        if !has_evaluated {
+            transaction.execute_batch(MIGRATION_V16_EVALUATED_SQL)?;
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V16,
+                MIGRATION_V16_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V16)
+            ],
+        )?;
+    }
+
     // Every row's floor is (re)stated from the ladder, including the rows that
     // predate the column. Rewriting them all rather than only the new one keeps
     // the database's answer and the binary's answer the same by construction —
@@ -2257,7 +2303,10 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
-    transaction.execute_batch("PRAGMA user_version = 15;")?;
+    // Derived rather than written out, because a literal here is a second place
+    // the ladder head lives and the two drifted apart silently: `PRAGMA` takes no
+    // bound parameter, which is the only reason this is a `format!`.
+    transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     transaction.commit()?;
     Ok(())
 }
@@ -2983,6 +3032,40 @@ const MIGRATION_V15_SQL: &str = r#"
 ALTER TABLE permission_decisions ADD COLUMN tool_call_origin TEXT NOT NULL
     DEFAULT 'unknown'
     CHECK (tool_call_origin IN ('caller', 'synthesized', 'unknown'));
+"#;
+
+/// Prompt tokens a runtime reported it reused from its own prompt cache instead
+/// of evaluating them, summed over this process's completions (roadmap K11).
+///
+/// **This is a measurement, and the column exists so that it cannot quietly stop
+/// being one.** K11 asks for a hit rate and a tokens-saved figure that are
+/// measured rather than estimated, and the only party that can measure either is
+/// the runtime: llama-server reports the split as `timings.cache_n` and
+/// `timings.prompt_n`, and an app-side estimate would just be
+/// "how much of this prompt looks like the last one", which is a guess about the
+/// contents of a cache it cannot see.
+///
+/// Nullable, like every V8 measurement column and for the same rule that governs
+/// them: NULL is "no completion under this process ever reported reuse", which is
+/// a different fact from a measured zero. Ollama and MLX report nothing here, so
+/// their processes stay NULL rather than being recorded as having reused nothing
+/// — a zero would sum into a denominator and pull a real hit rate down with it.
+///
+/// Two columns rather than a stored ratio: a ratio cannot be accumulated
+/// additively, and `add_context_reuse` is additive like every other flush at this
+/// boundary.
+const MIGRATION_V16_REUSED_SQL: &str = r#"
+ALTER TABLE agent_processes ADD COLUMN context_tokens_reused INTEGER
+    CHECK (context_tokens_reused IS NULL OR context_tokens_reused >= 0);
+"#;
+
+/// V16's other half — the prompt tokens the runtime said it actually evaluated,
+/// which is the rest of the hit rate's denominator.
+///
+/// Applied behind its own probe for [`MIGRATION_V16_REUSED_SQL`]'s reason.
+const MIGRATION_V16_EVALUATED_SQL: &str = r#"
+ALTER TABLE agent_processes ADD COLUMN context_tokens_evaluated INTEGER
+    CHECK (context_tokens_evaluated IS NULL OR context_tokens_evaluated >= 0);
 "#;
 
 /// Records every permission decision, including the ones no run can hold
@@ -5377,14 +5460,15 @@ mod tests {
                     "{column} must be nullable: NULL means unmeasured"
                 );
             }
-            // The ladder head, not V8's own number — bump this with every new
-            // migration, alongside the `PRAGMA user_version` the applier sets.
+            // The ladder head, not V8's own number, and read from the ladder
+            // rather than written out: the applier derives the pragma from
+            // `SCHEMA_VERSION` too, so neither side needs bumping by hand.
             assert_eq!(
                 ledger
                     .connection
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                15
+                SCHEMA_VERSION
             );
         }
 
@@ -5399,7 +5483,7 @@ mod tests {
                 .execute(
                     "INSERT INTO schema_migrations
                         (version, checksum, applied_at_ms, min_reader_version)
-                     VALUES (16, 'from-the-future-additive', 16, 15)",
+                     VALUES (17, 'from-the-future-additive', 17, 16)",
                     [],
                 )
                 .unwrap();
@@ -5413,7 +5497,7 @@ mod tests {
             let connection = Connection::open(&database.path).unwrap();
             connection
                 .execute(
-                    "UPDATE schema_migrations SET min_reader_version = 16 WHERE version = 16",
+                    "UPDATE schema_migrations SET min_reader_version = 17 WHERE version = 17",
                     [],
                 )
                 .unwrap();
@@ -5421,7 +5505,7 @@ mod tests {
         assert!(
             matches!(
                 RunLedger::open(&database.path),
-                Err(LedgerError::MigrationConflict { version: 16 })
+                Err(LedgerError::MigrationConflict { version: 17 })
             ),
             "a future migration that requires a newer binary must still refuse"
         );
@@ -5491,13 +5575,13 @@ mod tests {
             let ledger = RunLedger::open(&database.path).unwrap();
             assert_eq!(
                 ledger.applied_migrations().unwrap(),
-                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
             );
         }
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             "reopening must not re-apply or add a migration"
         );
 
@@ -5729,13 +5813,14 @@ mod tests {
             let connection = Connection::open(&database.path).unwrap();
             connection
                 .execute_batch(
-                    // `egress_destinations_dropped` is deliberately left in
-                    // place: SQLite cannot drop a column carrying a `CHECK`, so
-                    // this is the half-wound-back state V14's probes exist for.
+                    // `egress_destinations_dropped` and V16's two token columns
+                    // are deliberately left in place: SQLite cannot drop a column
+                    // carrying a `CHECK`, so this is the half-wound-back state
+                    // V14's and V16's probes exist for.
                     "DROP TABLE permission_decisions;
                      DROP TABLE subsystem_events;
                      DROP TABLE egress_destinations;
-                     DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14, 15);
+                     DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14, 15, 16);
                      PRAGMA user_version = 10;",
                 )
                 .unwrap();
@@ -5744,7 +5829,7 @@ mod tests {
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             "opening a V10 database must apply every migration above it"
         );
         assert_eq!(
@@ -5752,7 +5837,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            15
+            SCHEMA_VERSION
         );
         // The table is back and empty: the upgrade adds the surface, it does not
         // invent rows for permissions nobody recorded at the time.

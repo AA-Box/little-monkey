@@ -331,6 +331,7 @@ impl M3RuntimeDriver for MockRuntimeDriver {
                 usage: CanonicalUsage {
                     input_tokens: 8,
                     output_tokens: 3,
+                    cached_input_tokens: None,
                 },
                 created_at_seconds: 1_700_000_000,
             })
@@ -371,6 +372,7 @@ impl M3RuntimeDriver for MockRuntimeDriver {
                 usage: CanonicalUsage {
                     input_tokens: 8,
                     output_tokens: 1,
+                    cached_input_tokens: None,
                 },
             })
             .map_err(M3HubError::Runtime)
@@ -429,6 +431,7 @@ impl M3RuntimeDriver for MockRuntimeDriver {
                 usage: CanonicalUsage {
                     input_tokens: request.input.iter().map(|text| text.len() as u64).sum(),
                     output_tokens: 0,
+                    cached_input_tokens: None,
                 },
             })
         })

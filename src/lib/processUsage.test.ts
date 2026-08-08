@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  contextHitRate,
+  contextReuseFor,
   destinationsFor,
   measurementOf,
   renderMeasurement,
@@ -165,5 +167,32 @@ describe("egress destinations", () => {
     // true to say, and hiding it would under-report the traffic entirely.
     const onlyDropped = { destinations: [], dropped: 12 };
     expect(destinationsFor({ destinations: { "p-1": onlyDropped } }, "p-1")).toBe(onlyDropped);
+  });
+});
+
+describe("measured prompt-cache reuse", () => {
+  it("reports no rate for a runtime that reported no figure", () => {
+    // Ollama and MLX report nothing, so these three cases must all read as "not
+    // measured" rather than as a 0% hit rate — the one claim this app must never
+    // make on a runtime's behalf.
+    expect(contextReuseFor({ contextReuse: {} }, "p-1")).toBeNull();
+    expect(contextReuseFor(null, "p-1")).toBeNull();
+    expect(
+      contextReuseFor({ contextReuse: { "p-1": { reusedTokens: 0, evaluatedTokens: 0 } } }, "p-1"),
+    ).toBeNull();
+    expect(contextHitRate(null)).toBeNull();
+    expect(contextHitRate({ reusedTokens: 0, evaluatedTokens: 0 })).toBeNull();
+  });
+
+  it("reports a measured zero as a rate, because that is a measurement", () => {
+    const cold = { reusedTokens: 0, evaluatedTokens: 1_000 };
+    expect(contextReuseFor({ contextReuse: { "p-1": cold } }, "p-1")).toBe(cold);
+    expect(contextHitRate(cold)).toBe(0);
+  });
+
+  it("weighs the rate by tokens rather than by turn", () => {
+    // A 1000-token cold turn and a 10-token warm one: the process reused 9 of
+    // 1010 prompt tokens. Averaging the two turns' own rates would say 45%.
+    expect(contextHitRate({ reusedTokens: 9, evaluatedTokens: 1_001 })).toBeCloseTo(9 / 1010);
   });
 });

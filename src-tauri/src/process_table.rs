@@ -1763,6 +1763,42 @@ impl<'a> ProcessTable<'a> {
         Ok(())
     }
 
+    /// Add one flush of measured prompt-cache reuse to this process (K11).
+    ///
+    /// Additive for [`Self::add_egress_bytes`]'s reason — a drain carries the
+    /// tokens since the last flush — and the first call is likewise what turns
+    /// both columns from "no runtime under this process reported reuse" into a
+    /// measurement. Both are written together because a hit rate needs both terms:
+    /// a reused count with no denominator is not a rate.
+    pub fn add_context_reuse(
+        &self,
+        process_id: &str,
+        reuse: crate::run_scope::ContextReuse,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        let updated = self.connection.execute(
+            "UPDATE agent_processes
+                SET context_tokens_reused =
+                        COALESCE(context_tokens_reused, 0) + ?2,
+                    context_tokens_evaluated =
+                        COALESCE(context_tokens_evaluated, 0) + ?3,
+                    updated_at_ms = ?4
+              WHERE process_id = ?1",
+            params![
+                process_id,
+                reuse.reused_tokens as i64,
+                reuse.evaluated_tokens as i64,
+                now_ms
+            ],
+        )?;
+        if updated == 0 {
+            return Err(ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Record who this process's allowed egress went to.
     ///
     /// Additive in the same sense as [`Self::add_egress_bytes`] and for the same
@@ -1902,6 +1938,53 @@ impl<'a> ProcessTable<'a> {
         for (process_id, count) in dropped {
             found.entry(process_id).or_default().dropped = count;
         }
+        Ok(found)
+    }
+
+    /// The measured prompt-cache reuse of each of `process_ids` that has any.
+    ///
+    /// A process absent from the map reported no reuse figure at all — an Ollama
+    /// or MLX turn, or a process that ran no completion. That is why absence is
+    /// the answer rather than a zeroed entry: a zero would say the runtime
+    /// measured no reuse, and nothing measured anything.
+    ///
+    /// Read separately rather than folded into [`MeasuredUsage`] for the same
+    /// reason `egress_destinations_dropped` is: `MeasuredUsage`'s every-gap-has-a-
+    /// reason invariant is checked on write by every writer of a row, and a
+    /// measurement only two of three runtimes can produce would make every
+    /// close-out carry a note about a runtime it never used.
+    pub fn context_reuse_for(
+        &self,
+        process_ids: &[String],
+    ) -> ProcessTableResult<BTreeMap<String, crate::run_scope::ContextReuse>> {
+        let mut found = BTreeMap::new();
+        if process_ids.is_empty() {
+            return Ok(found);
+        }
+        let placeholders = vec!["?"; process_ids.len()].join(", ");
+        let bindings: Vec<&dyn rusqlite::ToSql> = process_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT process_id, context_tokens_reused, context_tokens_evaluated
+               FROM agent_processes
+              WHERE process_id IN ({placeholders})
+                AND context_tokens_reused IS NOT NULL
+                AND context_tokens_evaluated IS NOT NULL"
+        ))?;
+        let rows = statement
+            .query_map(bindings.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    crate::run_scope::ContextReuse {
+                        reused_tokens: row.get::<_, i64>(1)?.max(0) as u64,
+                        evaluated_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        found.extend(rows);
         Ok(found)
     }
 
@@ -3286,6 +3369,60 @@ mod tests {
                 .is_empty(),
             "a refused flush must not leave a partial write behind"
         );
+    }
+
+    /// Two flushes sum, and a process no runtime reported reuse for stays absent
+    /// rather than reading back as a measured zero.
+    #[test]
+    fn context_reuse_sums_across_flushes_and_absence_is_not_a_zero() {
+        use crate::run_scope::ContextReuse;
+
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let measured = admit(&table, ProcessKind::ChatTurn, "turn-measured");
+        let silent = admit(&table, ProcessKind::ChatTurn, "turn-ollama");
+
+        table
+            .add_context_reuse(
+                &measured.process_id,
+                ContextReuse {
+                    reused_tokens: 0,
+                    evaluated_tokens: 1_000,
+                },
+                T0 + 1,
+            )
+            .expect("the cold turn's flush lands");
+        table
+            .add_context_reuse(
+                &measured.process_id,
+                ContextReuse {
+                    reused_tokens: 9,
+                    evaluated_tokens: 1,
+                },
+                T0 + 2,
+            )
+            .expect("the warm turn's flush lands");
+
+        let found = table
+            .context_reuse_for(&[measured.process_id.clone(), silent.process_id.clone()])
+            .expect("the measurements read back");
+        assert_eq!(
+            found.keys().collect::<Vec<_>>(),
+            vec![&measured.process_id],
+            "a process whose runtime reported no reuse figure is absent, not zero"
+        );
+        assert_eq!(
+            found[&measured.process_id],
+            ContextReuse {
+                reused_tokens: 9,
+                evaluated_tokens: 1_001
+            },
+            "the flushes are summed, not replaced"
+        );
+        assert!(matches!(
+            table.add_context_reuse("p-does-not-exist", ContextReuse::default(), T0 + 3),
+            Err(ProcessTableError::NotFound { .. })
+        ));
     }
 
     /// Peak resident size is unreadable once a pid is gone, so the value that

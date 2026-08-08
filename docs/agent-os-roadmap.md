@@ -3423,14 +3423,14 @@ quota clause is K4's and is untouched here.
 **Blocks:** K8 in practice — preempting and resuming runs is only affordable
 if their namespaces are cheap.
 
-## K11. Context memory manager
+## K11. Context memory manager *(partially built)*
 
 **Today:** `context_cache.rs` is honest observability — configured vs. live
 context from a managed `llama.cpp` process's `/props`/`/slots`, headroom,
 a safe effective-context preview, and a five-way classification of long-context
 failures. Compaction exists in the chat path. What does not exist is
-*management*: no eviction policy, no measured reuse, no sharing of an
-identical prompt prefix between two processes using the same resident model.
+*management*: no eviction policy, no sharing of an identical prompt prefix
+between two processes using the same resident model.
 
 **Acceptance:** a stated eviction and compaction policy per process class,
 with measured cache hit rate and measured tokens saved (not estimated);
@@ -3441,6 +3441,72 @@ a failure.
 
 **Blocks:** nothing hard — but without it "context" is the one resource the
 system does not manage, and it is the resource agents consume most.
+
+**Shipped — the measurement, and it is the runtime's rather than this app's.**
+Migration V16 adds `context_tokens_reused` and `context_tokens_evaluated` to
+`agent_processes`, fed from `timings.cache_n` / `timings.prompt_n` on every
+completion, drained onto the row beside the egress counters, and rendered per
+process in the resource ledger panel.
+
+- **"Measured, not estimated" is the whole constraint, and it rules out the
+  obvious implementation.** The app cannot see inside the runtime's KV cache, so
+  an app-side hit rate would be "how much of this prompt looks like the last
+  one" — a guess about a cache it has no handle on. Checked against the pinned
+  `llama.cpp` (`MANAGED_LLAMA_VERSION`, b9637) with a real 8B model: a repeated
+  prefix reports `cache_n = 9, prompt_n = 1` where the guess says 10 of 10,
+  because llama-server always re-evaluates the last prompt token. The
+  fixtures in the tests are that binary's own response bodies, copied rather
+  than composed.
+- **A streamed response reports it in a second place, and the fallback is not a
+  bug fix.** llama-server always puts token accounting in `timings` on the final
+  SSE chunk, and adds a `usage` object only when the caller asked for
+  `stream_options.include_usage`. This app does ask, so the pre-existing stream
+  path's counts were right — an earlier draft of this entry claimed it reported
+  every streamed completion as zero tokens, which was measured against a request
+  that omitted that option rather than against the one the app sends. Reading
+  `timings` as well is what makes the reuse figure available without depending on
+  an optional field, and it covers the callers that do omit it —
+  `chat_template_lab`'s synthetic lines, and any third-party OpenAI-compatible
+  server that ignores `include_usage`.
+- **`None` and `0` are different columns' worth of difference.** Ollama and MLX
+  report no reuse figure, so their processes stay NULL rather than being
+  credited with a measured zero — a zero would enter a denominator and pull a
+  real hit rate down with it. `CanonicalUsage::cached_input_tokens` is an
+  `Option` for that reason, `contextReuseFor` returns `null`, and the panel
+  renders nothing at all rather than "0%".
+- **Two counters, never a stored ratio.** A rate cannot be accumulated: the
+  mean of each turn's own rate weighs a ten-token turn the same as a
+  thousand-token one. `9 / 1010` over a process and "45% average" are different
+  numbers about the same two turns, and only the first says what the cache
+  saved.
+- **A measured verification, not just a fixture one.** A real two-turn
+  conversation against that binary reused 75 of 91 prompt tokens on turn two —
+  an 82.4% hit rate and 75 tokens saved — and
+  `usage.prompt_tokens_details.cached_tokens` agreed with `timings.cache_n`,
+  which is what makes the OpenAI-shaped fallback safe for a runtime that reports
+  only that.
+
+Two corrections to this entry's own text came out of the work. It claimed "no
+measured reuse" as a *gap in the app*; the figures were being reported by the
+runtime on every response all along and simply thrown away. And
+`context_cache.rs` said `/slots` "requires `--slots` and is off by default",
+which was true of an older `llama.cpp` — the pinned build enables it by default,
+checked against that binary's `--help` rather than assumed.
+
+**Remaining, and none of it is blocked:**
+
+- **The policy half of the first clause.** What ships is the measurement; there
+  is still no stated eviction or compaction policy per process class, and
+  `ProcessClass` lives in the daemon scheduler while the ledger classifies by
+  `kind`. Stating a policy per class first needs those two vocabularies joined,
+  which is a decision rather than a wiring job.
+- **Read-only prefix sharing.** llama-server's own `--slot-save-path` and
+  `--cache-reuse` are the runtime support this clause wants; neither is wired,
+  and nothing yet establishes that two of this app's processes ever hold the
+  same prefix against one resident model.
+- **The budget as a K4 limit.** `resolve_effective_context` clamps a *load*, not
+  a running process, so a per-process context budget is still discovered as a
+  failure — which is exactly what `classify_context_failure` exists to explain.
 
 ## K12. Tamper-evident unified event log *(partially built)*
 

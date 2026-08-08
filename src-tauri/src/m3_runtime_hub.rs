@@ -4803,6 +4803,9 @@ impl<'a> MlxCanonicalSink<'a> {
                 usage: CanonicalUsage {
                     input_tokens: summary.input_tokens,
                     output_tokens: summary.output_tokens,
+                    // MLX reports no prompt-cache reuse, so `None` — see
+                    // `CanonicalUsage::cached_input_tokens` on why not zero.
+                    cached_input_tokens: None,
                 },
             })
             .map_err(stream_sink_error)?;
@@ -4888,6 +4891,7 @@ impl MlxStreamSink for MlxCanonicalSink<'_> {
                         usage: CanonicalUsage {
                             input_tokens,
                             output_tokens,
+                            cached_input_tokens: None,
                         },
                     })?;
                 self.completed = true;
@@ -7717,6 +7721,7 @@ mod tests {
                 usage: CanonicalUsage {
                     input_tokens: 1,
                     output_tokens: 1,
+                    cached_input_tokens: None,
                 },
             })
             .map_err(M3HubError::Runtime)?;
