@@ -61,8 +61,8 @@ function provider(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   };
 }
 
-function providerModel(id: string): ProviderModelInfo {
-  return { id };
+function providerModel(id: string, reported: Partial<ProviderModelInfo> = {}): ProviderModelInfo {
+  return { id, ...reported };
 }
 
 function inventoryInput(overrides: Partial<ModelTargetInventoryInput> = {}): ModelTargetInventoryInput {
@@ -180,6 +180,36 @@ describe("buildModelTargetInventory", () => {
     expect(inventory.targets[2]).not.toHaveProperty("effort");
     expect(inventory.targets[3]).not.toHaveProperty("effort");
     expect(inventory.targets.some((target) => target.displayName === "hidden")).toBe(false);
+  });
+
+  /** Both capability chips are "unknown" only when the provider's model list
+   *  said nothing (OpenAI, custom endpoints). When it did say something —
+   *  OpenRouter's `input_modalities`/`supported_parameters`, Anthropic's
+   *  `image_input` — show that instead of claiming the inventory doesn't
+   *  report it. */
+  it("snapshots the provider's own capability answers when its model list carries them", () => {
+    const inventory = buildModelTargetInventory(
+      inventoryInput({
+        providers: [provider({ id: "openrouter", label: "OpenRouter", base_url: "https://openrouter.ai/api/v1" })],
+        providerModels: {
+          openrouter: [
+            providerModel("vendor/sees-images", { vision: true, tool_calling: true }),
+            providerModel("vendor/text-only", { vision: false, tool_calling: false }),
+            providerModel("vendor/unreported"),
+          ],
+        },
+      }),
+    );
+
+    const cloud = inventory.targets.filter((target) => target.kind === "provider");
+    expect(cloud.map((target) => target.capabilities.vision.state)).toEqual(["yes", "no", "unknown"]);
+    expect(cloud.map((target) => target.capabilities.toolCalling.state)).toEqual([
+      "yes",
+      "no",
+      "unknown",
+    ]);
+    expect(cloud[0].capabilities.vision.evidence).toMatch(/OpenRouter/);
+    expect(cloud[0].capabilities.toolCalling.evidence).toMatch(/OpenRouter/);
   });
 
   it("applies the migrated legacy fallback entry to Anthropic models only, below any per-model entry", () => {
