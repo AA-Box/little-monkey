@@ -32,17 +32,30 @@ import type { CapabilityState } from "./modelTargets";
  * not to an invented taxonomy — a class nothing dispatches under would be a
  * criterion the user could set and never observe.
  *
- * Subagents are deliberately absent. They dispatch through
- * `subagent.ts::resolveSubagentTarget`, and that module must not import
- * `agentLoop.ts` (`turnEngine.ts` imports `subagent.ts`, so the edge would be
- * a cycle — a rule that module states explicitly and keeps a duplicated helper
- * to honour). Per-profile subagent models are already covered by
- * `settingsStore.subagentProfileModels`; folding them into policies means
- * lifting target resolution out of `agentLoop.ts` into its own module first,
- * which is a refactor rather than part of this feature. */
-export type RoutingTaskClass = "chat" | "summarize";
+ * Subagents are here as two classes rather than one, because the two profiles
+ * are different work: `explore` reads and reports, `code` mutates a workspace,
+ * and a user who wants a cheap model for the first and a careful one for the
+ * second cannot say so with a single "subagent" class. They dispatch through
+ * `subagent.ts::resolveSubagentTarget`, which reads `targetRouting.ts` — the
+ * module target resolution was lifted into precisely so that a subagent could
+ * route without `subagent.ts` importing `agentLoop.ts` and closing a cycle
+ * through `turnEngine.ts`.
+ *
+ * `settingsStore.subagentProfileModels` still wins where it is set: it is an
+ * explicit per-profile choice the user made, and a policy is a rule about work
+ * the user did not pin. */
+export type RoutingTaskClass =
+  | "chat"
+  | "summarize"
+  | "subagent_explore"
+  | "subagent_code";
 
-export const ROUTING_TASK_CLASSES: readonly RoutingTaskClass[] = ["chat", "summarize"];
+export const ROUTING_TASK_CLASSES: readonly RoutingTaskClass[] = [
+  "chat",
+  "summarize",
+  "subagent_explore",
+  "subagent_code",
+];
 
 /** A policy's data-sensitivity constraint. `local_only` restricts candidates
  * to targets that execute on this machine, which is a *narrowing* of where

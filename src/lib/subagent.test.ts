@@ -12,6 +12,32 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeM
 // covers the `executeToolCall` `task`-branch delegation contract itself.
 const attemptStreamMock = vi.fn();
 const executeToolCallMock = vi.fn();
+// The routing engine itself is `modelRouting.test.ts`'s subject. What is under
+// test here is which of the two inputs `subagent.ts` chooses between — a target
+// the user pinned to this profile, or the policy's answer — and the task class
+// it asks under.
+const unrouted = (...args: unknown[]) => ({
+  target: args[0],
+  decision: {
+    taskClass: "subagent_explore",
+    policyId: null as string | null,
+    policyName: null as string | null,
+    chosenKey: null as string | null,
+    changedFromActive: false,
+    sequence: [] as string[],
+    rejected: [] as unknown[],
+    reason: "No policy covers this task class.",
+  },
+  sequence: [args[0]],
+});
+// Defaulted at construction, not only in the K9 describe below: every other
+// suite in this file runs through `resolveSubagentTarget` too, and an
+// implementation-less mock would return `undefined` for all of them.
+const routeFromActiveMock = vi.fn(unrouted);
+vi.mock("./targetRouting", () => ({
+  routeFromActive: (...args: unknown[]) => routeFromActiveMock(...args),
+}));
+
 vi.mock("./turnEngine", () => ({
   attemptStream: (...args: unknown[]) => attemptStreamMock(...args),
   executeToolCall: (...args: unknown[]) => executeToolCallMock(...args),
@@ -494,6 +520,93 @@ describe("runSubagentTask / per-subagent usage accounting (slice 4)", () => {
 // Slice 4: optional per-profile model override — `resolveSubagentTarget`
 // (private to subagent.ts) is exercised indirectly here through what target
 // actually reaches `attemptStream`.
+
+/**
+ * Roadmap K9: subagents were the one dispatch surface no policy could reach.
+ *
+ * Not for want of a feature — `subagent.ts` cannot import `agentLoop.ts`
+ * (`turnEngine.ts` imports this module, so the edge closes a cycle) and target
+ * resolution lived there. It now lives in `targetRouting.ts`, which has no such
+ * edge.
+ */
+describe("runSubagentTask / K9 dispatch policy", () => {
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    routeFromActiveMock.mockReset();
+    routeFromActiveMock.mockImplementation(unrouted);
+    useSettingsStore.setState({ subagentProfileModels: {} });
+  });
+
+  /** Two classes rather than one: `explore` reads and reports, `code` mutates a
+   * workspace, and a user who wants a cheap model for the first and a careful
+   * one for the second cannot say so with a single "subagent" class. */
+  it.each([
+    ["explore", "subagent_explore"],
+    ["code", "subagent_code"],
+  ] as const)("routes a %s subagent under its own task class", async (profile, taskClass) => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile }));
+
+    expect(routeFromActiveMock.mock.calls[0][1]).toMatchObject({
+      taskClass,
+      // Facts about this surface, not per-run guesses: a subagent's history is
+      // built from a text description, and `toolsForProfile` always offers it
+      // tools.
+      requiresVision: false,
+      requiresTools: true,
+    });
+  });
+
+  it("runs the target a policy chose", async () => {
+    const routed: ResolvedTarget = { kind: "provider", providerId: "openrouter", model: "policy-model" };
+    routeFromActiveMock.mockReturnValue({
+      target: routed,
+      decision: { taskClass: "subagent_explore", policyId: "p-1", policyName: "Cheap explorers", chosenKey: "k", changedFromActive: true, sequence: [], rejected: [], reason: "Cheap explorers chose it." } as const,
+      sequence: [routed],
+    });
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "explore" }));
+
+    expect(attemptStreamMock.mock.calls[0][0]).toEqual(routed);
+  });
+
+  /** A pinned model is a choice the user already made. A policy that silently
+   * overrode it would make the setting a suggestion. */
+  it("never consults a policy when the profile's model is pinned", async () => {
+    useSettingsStore.getState().setSubagentProfileModel("explore", { providerId: "openrouter", model: "pinned" });
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "explore" }));
+
+    expect(routeFromActiveMock).not.toHaveBeenCalled();
+    expect(attemptStreamMock.mock.calls[0][0]).toEqual({ kind: "provider", providerId: "openrouter", model: "pinned" });
+  });
+
+  /** The decision reaches the parent's run, because a subagent has none of its
+   * own — which is what makes "why did this run here" answerable after a
+   * restart rather than only from the transcript. */
+  it("reports its decision to the caller, pinned or routed", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    const onRoutingDecision = vi.fn();
+
+    await runSubagentTask(baseParams({ profile: "explore", onRoutingDecision }));
+    expect(onRoutingDecision.mock.calls[0][0]).toMatchObject({ taskClass: "subagent_explore" });
+
+    onRoutingDecision.mockReset();
+    useSettingsStore.getState().setSubagentProfileModel("code", { providerId: "openrouter", model: "pinned" });
+    await runSubagentTask(baseParams({ profile: "code", taskId: "child-turn-2", onRoutingDecision }));
+
+    // A pinned target still produces a decision, and its reason says a policy
+    // was never consulted — an absent event could not be told from a missing
+    // one.
+    expect(onRoutingDecision.mock.calls[0][0]).toMatchObject({ taskClass: "subagent_code", policyId: null });
+    expect(onRoutingDecision.mock.calls[0][0].reason).toContain("Pinned");
+  });
+});
+
 describe("runSubagentTask / per-profile model override (slice 4)", () => {
   beforeEach(() => {
     attemptStreamMock.mockReset();
