@@ -1016,6 +1016,7 @@ async fn context_cache_state_impl(
         context_shift_detected,
         total_slots,
         prefix_sharing: context_cache::prefix_sharing(kind),
+        context_budget: context_cache::context_budget_enforcement(kind),
         notes,
         sampled_at_ms: context_cache_sampled_at_ms(),
     })
