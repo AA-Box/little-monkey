@@ -192,6 +192,35 @@ const MIGRATION_V11: i64 = 11;
 const MIGRATION_V11_CHECKSUM: &str = "permission-decisions-v11-2026-08-07";
 const MIGRATION_V12: i64 = 12;
 const MIGRATION_V12_CHECKSUM: &str = "subsystem-events-v12-2026-08-07";
+const MIGRATION_V13: i64 = 13;
+const MIGRATION_V13_CHECKSUM: &str = "compatible-migrations-v13-2026-08-08";
+
+/// The newest schema this binary knows how to write.
+const SCHEMA_VERSION: i64 = MIGRATION_V13;
+
+/// Whether a migration keeps older binaries able to open the database.
+///
+/// This is the fact the forward-only guard was missing, and the reason
+/// `denial_sink.rs` is a separate database file at all — see its module doc,
+/// which spells out that a schema bump is "a one-way door for the whole ledger"
+/// because a user who rolls back to the previous build gets a binary that cannot
+/// open its own run history. That was true, and it pushed an observability table
+/// out into a second file to avoid it.
+///
+/// It does not have to be true. Most migrations here only *add* — a table an
+/// older binary never queries, a nullable column its inserts omit. Those are
+/// invisible to it. What genuinely breaks an older binary is a migration that
+/// makes the database **reject writes it used to accept**, which in practice
+/// means a trigger or constraint over a table that binary already writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compatibility {
+    /// An older binary can still open and write this database. The floor is
+    /// inherited from the last breaking migration.
+    Additive,
+    /// This migration rejects writes an older binary would make, so that binary
+    /// must not open the database at all.
+    RequiresThisVersion,
+}
 
 /// The result of recomputing a run's event chain.
 ///
@@ -1602,6 +1631,138 @@ fn configure_connection(connection: &Connection) -> LedgerResult<()> {
     Ok(())
 }
 
+/// Every migration, with the checksum that pins its SQL and whether it keeps
+/// older binaries able to open the database.
+///
+/// **V1–V8 are marked breaking without re-deriving each one, and that is
+/// deliberate.** They already shipped under the old blanket rule, so calling
+/// them breaking preserves exactly today's behaviour and claims nothing new.
+/// Claiming compatibility wrongly is far worse than claiming it too little: it
+/// would hand an older binary a database it corrupts. Compatibility is asserted
+/// only where it has been checked.
+///
+/// V9 is genuinely breaking. `run_events_chain_must_not_stop` aborts an insert
+/// whose `event_hash` is NULL into a run that is already chained — which is
+/// every insert a pre-V9 binary makes.
+///
+/// V10–V12 are additive, and each was checked:
+///
+/// - **V10** adds a nullable `run_events.process_id` and a partial index. A V9
+///   binary's inserts omit it, and V9's hash deliberately contributes nothing
+///   for an absent process id, so rows it writes still verify.
+/// - **V11** adds `permission_decisions`, a table no older binary queries, and
+///   triggers that fire only on it.
+/// - **V12** adds `subsystem_events` on the same terms.
+///
+/// V13 must require itself: a V12 binary applies the *old* blanket guard, so it
+/// refuses a V13 database no matter what this column says. The fix cannot reach
+/// backwards — it stops the bleeding from here on.
+const MIGRATION_LADDER: &[(i64, &str, Compatibility)] = &[
+    (
+        MIGRATION_V1,
+        MIGRATION_V1_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
+    (
+        MIGRATION_V2,
+        MIGRATION_V2_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
+    (
+        MIGRATION_V3,
+        MIGRATION_V3_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
+    (
+        MIGRATION_V4,
+        MIGRATION_V4_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
+    (
+        MIGRATION_V5,
+        MIGRATION_V5_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
+    (
+        MIGRATION_V6,
+        MIGRATION_V6_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
+    (
+        MIGRATION_V7,
+        MIGRATION_V7_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
+    (
+        MIGRATION_V8,
+        MIGRATION_V8_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
+    (
+        MIGRATION_V9,
+        MIGRATION_V9_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
+    (
+        MIGRATION_V10,
+        MIGRATION_V10_CHECKSUM,
+        Compatibility::Additive,
+    ),
+    (
+        MIGRATION_V11,
+        MIGRATION_V11_CHECKSUM,
+        Compatibility::Additive,
+    ),
+    (
+        MIGRATION_V12,
+        MIGRATION_V12_CHECKSUM,
+        Compatibility::Additive,
+    ),
+    (
+        MIGRATION_V13,
+        MIGRATION_V13_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
+];
+
+/// The oldest binary that may open a database with `version` applied.
+///
+/// An additive migration inherits the floor from the last breaking one before
+/// it; a breaking migration raises the floor to itself.
+fn min_reader_version_for(version: i64) -> i64 {
+    let mut floor = MIGRATION_V1;
+    for (candidate, _, compatibility) in MIGRATION_LADDER {
+        if *candidate > version {
+            break;
+        }
+        if matches!(compatibility, Compatibility::RequiresThisVersion) {
+            floor = *candidate;
+        }
+    }
+    floor
+}
+
+/// What the database itself says the oldest safe reader is.
+///
+/// `None` for a database with no migrations yet. A pre-V13 database has no
+/// column to answer with, so its `MAX(version)` is the answer — which is exactly
+/// the old rule, and the honest one for rows written before the floor existed.
+fn required_reader_version(connection: &Connection) -> LedgerResult<Option<i64>> {
+    let has_column = connection
+        .prepare("SELECT min_reader_version FROM schema_migrations LIMIT 0")
+        .is_ok();
+    let column = if has_column {
+        "MAX(min_reader_version)"
+    } else {
+        "MAX(version)"
+    };
+    Ok(connection.query_row(
+        &format!("SELECT {column} FROM schema_migrations"),
+        [],
+        |row| row.get::<_, Option<i64>>(0),
+    )?)
+}
+
 fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -1611,40 +1772,35 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
          ) STRICT;",
     )?;
 
-    if let Some(version) =
-        connection.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
-            row.get::<_, Option<i64>>(0)
-        })?
-    {
-        if version > MIGRATION_V12 {
-            return Err(LedgerError::MigrationConflict { version });
+    // Forward-only, but only as far as compatibility actually demands.
+    //
+    // The old rule was `MAX(version) > this binary's version -> refuse`, which
+    // treated every schema bump as a one-way door: roll back one build and the
+    // run history is unopenable. `MIGRATION_LADDER` records which migrations
+    // genuinely reject an older binary's writes, so the floor is the newest
+    // *breaking* version rather than the newest version, and an additive
+    // migration costs a rollback nothing.
+    //
+    // Read from the database rather than recomputed here on purpose: a database
+    // written by a future build carries its own floor, and that is the only
+    // number that can say whether this binary may touch it.
+    if let Some(required) = required_reader_version(connection)? {
+        if required > SCHEMA_VERSION {
+            return Err(LedgerError::MigrationConflict { version: required });
         }
     }
 
-    for (version, expected) in [
-        (MIGRATION_V1, MIGRATION_V1_CHECKSUM),
-        (MIGRATION_V2, MIGRATION_V2_CHECKSUM),
-        (MIGRATION_V3, MIGRATION_V3_CHECKSUM),
-        (MIGRATION_V4, MIGRATION_V4_CHECKSUM),
-        (MIGRATION_V5, MIGRATION_V5_CHECKSUM),
-        (MIGRATION_V6, MIGRATION_V6_CHECKSUM),
-        (MIGRATION_V7, MIGRATION_V7_CHECKSUM),
-        (MIGRATION_V8, MIGRATION_V8_CHECKSUM),
-        (MIGRATION_V9, MIGRATION_V9_CHECKSUM),
-        (MIGRATION_V10, MIGRATION_V10_CHECKSUM),
-        (MIGRATION_V11, MIGRATION_V11_CHECKSUM),
-        (MIGRATION_V12, MIGRATION_V12_CHECKSUM),
-    ] {
+    for (version, expected, _) in MIGRATION_LADDER {
         if let Some(checksum) = connection
             .query_row(
                 "SELECT checksum FROM schema_migrations WHERE version = ?1",
-                [version],
+                [*version],
                 |row| row.get::<_, String>(0),
             )
             .optional()?
         {
-            if checksum != expected {
-                return Err(LedgerError::MigrationConflict { version });
+            if checksum != *expected {
+                return Err(LedgerError::MigrationConflict { version: *version });
             }
         }
     }
@@ -1918,7 +2074,48 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
-    transaction.execute_batch("PRAGMA user_version = 12;")?;
+    let has_v13 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V13],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v13 {
+        // SQLite has no `ADD COLUMN IF NOT EXISTS`, and the column can outlive
+        // its migration row if a database is ever repaired by hand — so ask
+        // rather than assume, instead of failing an open on a duplicate column.
+        let has_column = transaction
+            .prepare("SELECT min_reader_version FROM schema_migrations LIMIT 0")
+            .is_ok();
+        if !has_column {
+            transaction.execute_batch(MIGRATION_V13_SQL)?;
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V13,
+                MIGRATION_V13_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V13)
+            ],
+        )?;
+    }
+
+    // Every row's floor is (re)stated from the ladder, including the rows that
+    // predate the column. Rewriting them all rather than only the new one keeps
+    // the database's answer and the binary's answer the same by construction —
+    // a row left at the `DEFAULT 1` would claim a compatibility nobody checked.
+    for (version, _, _) in MIGRATION_LADDER {
+        transaction.execute(
+            "UPDATE schema_migrations SET min_reader_version = ?2 WHERE version = ?1",
+            params![*version, min_reader_version_for(*version)],
+        )?;
+    }
+
+    transaction.execute_batch("PRAGMA user_version = 13;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -2542,6 +2739,17 @@ WHEN NEW.state = 'exited' AND NEW.usage_unavailable_json IS NULL
 BEGIN
     SELECT RAISE(ABORT, 'an exited agent process must state its unmeasured fields');
 END;
+"#;
+
+/// Teaches the ledger which of its own migrations an older binary can live with
+/// (roadmap K12, and the reason `denial_sink.rs` is a separate file).
+///
+/// The column is `NOT NULL` with a default so the `ALTER` succeeds on a
+/// populated table; every existing row is then rewritten from
+/// [`min_reader_version_for`], which is the same table the guard reads. There is
+/// no second source of truth to drift.
+const MIGRATION_V13_SQL: &str = r#"
+ALTER TABLE schema_migrations ADD COLUMN min_reader_version INTEGER NOT NULL DEFAULT 1;
 "#;
 
 /// Records every permission decision, including the ones no run can hold
@@ -4939,28 +5147,100 @@ mod tests {
                     .connection
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                12
+                13
             );
         }
 
-        // Forward-only: a database written by a newer build is refused rather
-        // than downgraded, the same guard every earlier version gets. The version
-        // used here must stay one *above* the ladder head, or this asserts the
-        // checksum mismatch instead of the forward-only guard.
+        // A database written by a newer build is refused only when that build
+        // said so. This is the whole point of V13: a future migration that only
+        // *adds* costs a rollback nothing, and one that rejects this binary's
+        // writes still shuts the door. The version used here must stay one
+        // *above* the ladder head, or this asserts the checksum mismatch instead.
         {
             let connection = Connection::open(&database.path).unwrap();
             connection
                 .execute(
-                    "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
-                     VALUES (13, 'from-the-future', 1)",
+                    "INSERT INTO schema_migrations
+                        (version, checksum, applied_at_ms, min_reader_version)
+                     VALUES (14, 'from-the-future-additive', 14, 13)",
                     [],
                 )
                 .unwrap();
         }
-        assert!(matches!(
-            RunLedger::open(&database.path),
-            Err(LedgerError::MigrationConflict { version: 13 })
-        ));
+        assert!(
+            RunLedger::open(&database.path).is_ok(),
+            "a future migration that declares this binary still safe must open"
+        );
+
+        {
+            let connection = Connection::open(&database.path).unwrap();
+            connection
+                .execute(
+                    "UPDATE schema_migrations SET min_reader_version = 14 WHERE version = 14",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(
+            matches!(
+                RunLedger::open(&database.path),
+                Err(LedgerError::MigrationConflict { version: 14 })
+            ),
+            "a future migration that requires a newer binary must still refuse"
+        );
+    }
+
+    /// The floor is derived from the ladder, so it cannot drift from the
+    /// compatibility each migration declares.
+    #[test]
+    fn the_reader_floor_is_the_newest_breaking_migration_not_the_newest_one() {
+        // V9 is the last breaking migration before the additive run, so
+        // everything from V10 to V12 inherits V9's floor.
+        assert_eq!(min_reader_version_for(MIGRATION_V9), MIGRATION_V9);
+        assert_eq!(min_reader_version_for(MIGRATION_V10), MIGRATION_V9);
+        assert_eq!(min_reader_version_for(MIGRATION_V11), MIGRATION_V9);
+        assert_eq!(min_reader_version_for(MIGRATION_V12), MIGRATION_V9);
+        // V13 requires itself: a V12 binary applies the old blanket guard and
+        // refuses regardless of what this column says.
+        assert_eq!(min_reader_version_for(MIGRATION_V13), MIGRATION_V13);
+        // And the pre-V9 ladder keeps exactly its old behaviour.
+        assert_eq!(min_reader_version_for(MIGRATION_V8), MIGRATION_V8);
+        assert_eq!(min_reader_version_for(MIGRATION_V1), MIGRATION_V1);
+
+        // The floor never exceeds the version asking for it, or a freshly
+        // migrated database could not be opened by the binary that wrote it.
+        for (version, _, _) in MIGRATION_LADDER {
+            assert!(
+                min_reader_version_for(*version) <= *version,
+                "migration {version} claims a floor above itself"
+            );
+        }
+    }
+
+    /// A database this binary just wrote must record a floor this binary meets —
+    /// the round trip the guard actually performs on every open.
+    #[test]
+    fn a_freshly_migrated_database_records_a_floor_this_binary_meets() {
+        let database = TempDb::new("reader-floor");
+        let ledger = RunLedger::open(&database.path).unwrap();
+        let required = required_reader_version(&ledger.connection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(required, MIGRATION_V13);
+        assert!(required <= SCHEMA_VERSION);
+
+        // No row may be left at the `DEFAULT 1` the ALTER used: that would claim
+        // a compatibility nobody checked.
+        let unstated: i64 = ledger
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations
+                 WHERE min_reader_version != ?1 AND min_reader_version = 1 AND version > 1",
+                [MIGRATION_V1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unstated, 0, "every row states a floor from the ladder");
     }
 
     #[test]
@@ -4970,13 +5250,13 @@ mod tests {
             let ledger = RunLedger::open(&database.path).unwrap();
             assert_eq!(
                 ledger.applied_migrations().unwrap(),
-                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
             );
         }
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
             "reopening must not re-apply or add a migration"
         );
 
@@ -5209,7 +5489,7 @@ mod tests {
                 .execute_batch(
                     "DROP TABLE permission_decisions;
                      DROP TABLE subsystem_events;
-                     DELETE FROM schema_migrations WHERE version IN (11, 12);
+                     DELETE FROM schema_migrations WHERE version IN (11, 12, 13);
                      PRAGMA user_version = 10;",
                 )
                 .unwrap();
@@ -5218,7 +5498,7 @@ mod tests {
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
             "opening a V10 database must apply every migration above it"
         );
         assert_eq!(
@@ -5226,7 +5506,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            12
+            13
         );
         // The table is back and empty: the upgrade adds the surface, it does not
         // invent rows for permissions nobody recorded at the time.
