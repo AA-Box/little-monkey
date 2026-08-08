@@ -21,7 +21,8 @@ const VISION_PATTERNS: RegExp[] = [
   /gpt-5/,
   /chatgpt-4o/,
   /^o[134](-|$)/,
-  /claude-3-(opus|sonnet|haiku)/,
+  // Covers claude-3-*, claude-3-5-*, claude-3-7-* — the `-5`/`-7` sits between the 3 and the name.
+  /claude-3(-\d)?-(opus|sonnet|haiku)/,
   /claude-(opus|sonnet|haiku)-4/,
   /claude-4/,
   /gemini/,
