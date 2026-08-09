@@ -173,6 +173,13 @@ jobs:
             - **macOS** — `.dmg` (`aarch64` for Apple silicon, `x64` for Intel)
             - **Windows** — `-setup.exe` or `_en-US.msi` (`arm64` or `x64`)
             - **Linux** — `.AppImage`, `.deb`, or `.rpm` (`aarch64`/`arm64` or `amd64`/`x86_64`)
+
+            Linux installers ship a detached signature. To check one:
+
+            ```
+            gpg --import little-monkey-release-key.asc
+            gpg --verify <installer>.asc <installer>
+            ```
           generateReleaseNotes: true
           # Draft only while the matrix runs. Six jobs write to one release, so
           # publishing here would expose a release carrying whichever platform
@@ -183,6 +190,47 @@ jobs:
           # Attaches the signed `latest.json` the updater endpoint points at.
           # No-op when the signing secrets are missing (nothing to describe).
           includeUpdaterJson: true
+
+      # The updater signature above only covers the .AppImage the in-app
+      # updater downloads. Someone who grabs a .deb or .rpm from the releases
+      # page has nothing to verify against, and Linux has no Gatekeeper to
+      # verify it for them — so publish a detached GPG signature next to every
+      # Linux installer, plus the public key to check them with.
+      - name: GPG-sign the Linux installers
+        if: startsWith(matrix.platform, 'ubuntu')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          # Same contract as the updater secrets above: no key configured means
+          # the release still ships, just unsigned. The `secrets` context is not
+          # readable from a step-level `if`, so the guard lives here.
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "GPG_PRIVATE_KEY unset — skipping installer signatures"
+            exit 0
+          fi
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          KEY_ID="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/ {print $5; exit}')"
+          BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle"
+          VERSION="$(jq -r .version src-tauri/tauri.conf.json)"
+
+          # `find -print0` rather than a glob: no installer for a given format
+          # is a normal outcome (the rpm bundler is skipped on some runners),
+          # and an unmatched glob under `set -u` would fail the release.
+          { find "$BUNDLE/deb" "$BUNDLE/rpm" "$BUNDLE/appimage" \
+              -maxdepth 1 -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
+              -print0 2>/dev/null || true; } | while IFS= read -r -d '' installer; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+              --local-user "$KEY_ID" --armor --detach-sign "$installer"
+            gh release upload "$VERSION" "$installer.asc" --clobber
+          done
+
+          # Both Linux jobs upload the same key; --clobber makes the second a
+          # no-op rather than a collision.
+          gpg --armor --export "$KEY_ID" > little-monkey-release-key.asc
+          gh release upload "$VERSION" little-monkey-release-key.asc --clobber
 
   # Installs what the matrix just built, on the platform it was built for
   # (roadmap K22). Between `release` and `publish` deliberately: a release that
