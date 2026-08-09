@@ -2361,6 +2361,57 @@ mod tests {
         let _ = fs::remove_dir_all(&real_workspace);
     }
 
+    /// The Windows arm of [`execute_in_sandbox`] must return what the child
+    /// printed.
+    ///
+    /// The test above is this one's counterpart and is `cfg`-gated away from
+    /// Windows, which left the entire Windows arm of `execute_in_sandbox` with no
+    /// end-to-end assertion of any kind. `sandbox_windows`' own tests cover
+    /// `run_confined`, so the untested part is exactly this caller: the working
+    /// directory it picks, the environment `allowlisted_env` builds, and the
+    /// order in which it creates directories and asks for the grant.
+    ///
+    /// Deliberately the most trivial command that can prove the path end to end.
+    /// A boundary assertion belongs in the boundary test; what this one answers is
+    /// narrower and has to stay answerable when that test is red — does anything
+    /// the child prints reach the caller at all.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn a_windows_sandboxed_run_returns_what_the_child_printed() {
+        let sandbox_root = temp_dir("win-exec-output");
+        let workspace_dir = sandbox_root.join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("create sandbox workspace");
+        let real_workspace = temp_dir("win-exec-output-real");
+        let profile_path = sandbox_root.join("unused.sb");
+
+        let outcome = execute_in_sandbox(
+            &sandbox_root,
+            &workspace_dir,
+            &real_workspace,
+            &profile_path,
+            "echo marker",
+            Duration::from_secs(30),
+            false,
+            &[],
+        )
+        .await
+        .expect("the sandbox launches");
+
+        assert!(
+            String::from_utf8_lossy(&outcome.stdout).contains("marker"),
+            "a sandboxed Windows run lost the child's output, which `sandbox_windows` \
+             proves `run_confined` does not do — so the loss is in this caller: \
+             isolation={:?} exit={:?} stdout={:?} stderr={:?}",
+            outcome.isolation,
+            outcome.exit_code,
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+
+        let _ = fs::remove_dir_all(&sandbox_root);
+        let _ = fs::remove_dir_all(&real_workspace);
+    }
+
     // --- build_seatbelt_profile ------------------------------------------
 
     #[test]
