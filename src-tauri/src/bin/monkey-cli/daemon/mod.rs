@@ -823,13 +823,15 @@ impl DaemonPlacementQueue {
 
 /// The recipe target this node will execute a placed spec through.
 ///
-/// `ManagedLlama` is refused, and the reason is structural rather than a
-/// missing feature flag: `monkey-cli`'s own recipe target has no managed-runtime
-/// variant at all (`task::snapshot_target` maps `local_url` to a `Provider`
-/// snapshot), so this node has no way to run one however the spec is phrased.
-/// Saying so is better than accepting the placement and failing it at spawn.
+/// A `ManagedLlama` placement is resolved against **this node's** runtime hub,
+/// never against the spec's `model_path`: that path is a location on the
+/// submitter's disk and means nothing here. The model id is the portable half,
+/// so a node that has the same model installed can run the placement and one
+/// that has not refuses it by name — which is the answer an operator can act on,
+/// unlike a spawn failure later.
 fn placed_recipe_target(
     target: &little_monkey_lib::run_protocol::ModelTargetSnapshot,
+    app_data: &Path,
 ) -> Result<little_monkey_lib::recipes::RecipeTarget, String> {
     use little_monkey_lib::run_protocol::ModelTargetSnapshot;
     match target {
@@ -843,6 +845,7 @@ fn placed_recipe_target(
             model: Some(model.clone()),
             ollama: None,
             local_url: None,
+            managed_model: None,
         }),
         ModelTargetSnapshot::Ollama { model, .. } => {
             Ok(little_monkey_lib::recipes::RecipeTarget {
@@ -850,11 +853,28 @@ fn placed_recipe_target(
                 model: None,
                 ollama: Some(model.clone()),
                 local_url: None,
+                managed_model: None,
             })
         }
-        ModelTargetSnapshot::ManagedLlama { model_id, .. } => Err(format!(
-            "this node cannot execute a placement targeting the managed local runtime ('{model_id}'); place it against a provider or an Ollama model"
-        )),
+        ModelTargetSnapshot::ManagedLlama { model_id, .. } => {
+            if little_monkey_lib::m3_runtime_hub::installed_model_artifact(app_data, model_id)
+                .is_none()
+            {
+                return Err(format!(
+                    "this node has no managed model '{model_id}' installed; install it here or place the run on a node that advertises it"
+                ));
+            }
+            Ok(little_monkey_lib::recipes::RecipeTarget {
+                provider: None,
+                model: None,
+                ollama: None,
+                local_url: None,
+                // The origin deliberately is not named here: the managed runtime
+                // is started on a fresh loopback port when the run starts, so
+                // any port written now would be wrong by then.
+                managed_model: Some(model_id.clone()),
+            })
+        }
     }
 }
 
@@ -905,7 +925,8 @@ fn placed_recipe(
     spec.validate().map_err(|error| error.to_string())?;
     let snapshot = little_monkey_lib::node_placement::PlacedRunSnapshot::from_spec(spec);
     snapshot.validate()?;
-    let target = placed_recipe_target(&spec.target)?;
+    let app_data = crate::app_data_dir().ok_or("Could not resolve app data directory")?;
+    let target = placed_recipe_target(&spec.target, &app_data)?;
     let permission_mode = placed_permission_mode(&spec.permission_policy.mode)?;
 
     // The workspace is checked against this machine's filesystem before
@@ -1530,6 +1551,8 @@ fn event_type(event: &RunEvent) -> &'static str {
         RunEvent::Failed { .. } => "failed",
         RunEvent::Cancelled { .. } => "cancelled",
         RunEvent::NeedsReconciliation { .. } => "needs_reconciliation",
+        RunEvent::MigrationDeparted { .. } => "migration_departed",
+        RunEvent::MigrationArrived { .. } => "migration_arrived",
     }
 }
 
@@ -2794,22 +2817,29 @@ mod tests {
     fn a_placement_this_node_cannot_execute_is_refused_with_the_reason() {
         use little_monkey_lib::run_protocol::{ModelTargetSnapshot, PermissionMode};
 
-        // The managed local runtime has no recipe target at all — `task.rs`
-        // maps `local_url` to a *provider* snapshot — so there is no phrasing
-        // of the spec that would make this runnable here.
+        // A managed placement is resolved against THIS node's hub inventory,
+        // never against the spec's `model_path` — that path is a location on
+        // the submitter's disk. An empty app-data root has the model installed
+        // nowhere, so the refusal names the model rather than the path.
+        let empty_app_data =
+            std::env::temp_dir().join(format!("little-monkey-no-hub-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&empty_app_data).unwrap();
         let managed = ModelTargetSnapshot::ManagedLlama {
             target_id: "t".into(),
             label: "l".into(),
             model_id: "qwen3-8b".into(),
+            // Deliberately a path that exists nowhere: if this were ever
+            // consulted the refusal below would not fire.
             model_path: "/models/qwen3-8b.gguf".into(),
             capabilities: crate::task::cli_capabilities(),
             estimated_memory_bytes: None,
         };
-        let refusal = placed_recipe_target(&managed).unwrap_err();
+        let refusal = placed_recipe_target(&managed, &empty_app_data).unwrap_err();
         assert!(
-            refusal.contains("qwen3-8b") && refusal.contains("managed local runtime"),
-            "the refusal must name the target it cannot run: {refusal}"
+            refusal.contains("qwen3-8b") && refusal.contains("no managed model"),
+            "the refusal must name the model this node has not got: {refusal}"
         );
+        let _ = std::fs::remove_dir_all(&empty_app_data);
 
         // Provider and Ollama both convert, and the provider *credential* is
         // never part of it: only the identity travels.
@@ -2822,7 +2852,7 @@ mod tests {
             credential_ref_id: "credential:anthropic".into(),
             capabilities: crate::task::cli_capabilities(),
         };
-        let converted = placed_recipe_target(&provider).unwrap();
+        let converted = placed_recipe_target(&provider, &empty_app_data).unwrap();
         assert_eq!(converted.provider.as_deref(), Some("anthropic"));
         assert_eq!(converted.model.as_deref(), Some("claude"));
         converted

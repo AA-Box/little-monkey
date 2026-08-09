@@ -1238,7 +1238,7 @@ async fn run_model(
                 Ok(installed) => installed,
                 Err(error) => fail(&error),
             };
-            let session = match managed_model_cli::start_server(client, &installed, context_tokens)
+            let session = match managed_model_cli::start_server(client, &installed.local_path, context_tokens)
                 .await
             {
                 Ok(session) => session,
