@@ -1559,55 +1559,60 @@ export function StudioPanel({ mode, railSlot }: Props) {
 
           {canMask && initImage && (
             <SettingsCard title={t("Studio.outpaint.title")} hint={t("Studio.outpaint.hint")}>
-              {/* Two groups, each of which refuses to wrap inside itself: a
-                  narrow panel breaks between the sizes and the arrows rather
-                  than leaving one arrow stranded on a line of its own. */}
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-                <div className="flex items-center gap-1.5">
-                  {OUTPAINT_STEPS.map((step) => (
-                    <Button
-                      key={step}
-                      size="sm"
-                      variant={outpaintStep === step ? "primary" : "secondary"}
-                      onClick={() => setOutpaintStep(step)}
-                    >
-                      {step}
-                    </Button>
-                  ))}
-                  <span className="text-[11px] text-faint">px</span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  {OUTPAINT_SIDES.map(({ side, labelKey, icon: Icon }) => (
-                    <IconButton
-                      key={side}
-                      size="sm"
-                      aria-label={t(labelKey)}
-                      title={t(labelKey)}
-                      disabled={extending}
-                      onClick={() => void extend(side)}
-                    >
-                      <Icon size={13} />
-                    </IconButton>
-                  ))}
-                  <IconButton
-                    size="sm"
-                    aria-label={t("Studio.outpaint.undo")}
-                    title={t("Studio.outpaint.undo")}
-                    disabled={extending || outpaintHistory.length === 0}
-                    onClick={() => stepExtension("undo")}
+              {/* One row, always. Nine controls only fit this panel if
+                  something gives, and it is the size buttons: they hold two or
+                  three digits, so padding can go, while an icon narrower than
+                  its glyph is a target too small to hit. Hence `flex-1 min-w-0`
+                  on the sizes and `shrink-0` on the icons — measured to hold
+                  down to a 288px card, below which the digits clip rather than
+                  spill over their neighbours. The unit moved into the card's
+                  hint: a row this tight has no room for a word that never
+                  changes. */}
+              <div className="flex items-center gap-1">
+                {OUTPAINT_STEPS.map((step) => (
+                  <Button
+                    key={step}
+                    size="xs"
+                    className="min-w-0 flex-1 overflow-hidden"
+                    variant={outpaintStep === step ? "primary" : "secondary"}
+                    onClick={() => setOutpaintStep(step)}
                   >
-                    <Undo2 size={13} />
-                  </IconButton>
+                    {step}
+                  </Button>
+                ))}
+                {OUTPAINT_SIDES.map(({ side, labelKey, icon: Icon }) => (
                   <IconButton
-                    size="sm"
-                    aria-label={t("Studio.outpaint.redo")}
-                    title={t("Studio.outpaint.redo")}
-                    disabled={extending || outpaintFuture.length === 0}
-                    onClick={() => stepExtension("redo")}
+                    key={side}
+                    size="xs"
+                    className="shrink-0"
+                    aria-label={t(labelKey)}
+                    title={t(labelKey)}
+                    disabled={extending}
+                    onClick={() => void extend(side)}
                   >
-                    <Redo2 size={13} />
+                    <Icon size={13} />
                   </IconButton>
-                </div>
+                ))}
+                <IconButton
+                  size="xs"
+                  className="shrink-0"
+                  aria-label={t("Studio.outpaint.undo")}
+                  title={t("Studio.outpaint.undo")}
+                  disabled={extending || outpaintHistory.length === 0}
+                  onClick={() => stepExtension("undo")}
+                >
+                  <Undo2 size={13} />
+                </IconButton>
+                <IconButton
+                  size="xs"
+                  className="shrink-0"
+                  aria-label={t("Studio.outpaint.redo")}
+                  title={t("Studio.outpaint.redo")}
+                  disabled={extending || outpaintFuture.length === 0}
+                  onClick={() => stepExtension("redo")}
+                >
+                  <Redo2 size={13} />
+                </IconButton>
               </div>
             </SettingsCard>
           )}
