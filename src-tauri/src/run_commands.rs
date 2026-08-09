@@ -116,48 +116,34 @@ pub(crate) fn desktop_identity<R: tauri::Runtime>(
 
 /// The single place the host opens the shared profile/run database.
 ///
-/// # Why tests get their own directory
+/// # Why a test never opens the real one
 ///
-/// Under `cargo test` this resolves to a per-process temp directory instead of
-/// the real app data dir. `tauri::test::mock_app()` has no bundle identifier,
-/// so its `app_data_dir()` is the bare platform app-data root
-/// (`~/Library/Application Support` on macOS) — one file shared by every
-/// checkout, worktree, and branch on the machine. Any branch carrying a newer
-/// migration that ran its tests first leaves a `schema_migrations` row this
-/// binary refuses to open (`apply_migrations`' "newer than this binary" guard,
-/// correctly, for a real user database), and from then on every test that
-/// records a permission request fails on a developer machine while passing on
-/// a clean CI runner. Isolating the path keeps that guard intact and makes the
-/// database this process opens always one this binary created.
+/// There is no test fork here, and deliberately so: under `cargo test` the
+/// handle this receives belongs to a `crate::test_support::mock_app`, whose
+/// `app_data_dir()` is already a temp directory private to that one mock app,
+/// so the same line resolves the real database in production and an isolated
+/// one in a test.
+///
+/// It used to fork, to a directory shared by every test in the process, and
+/// that was only ever half a fix. The stock `tauri::test::mock_app()` resolves
+/// the bare platform app-data root (`~/Library/Application Support` on macOS)
+/// — one file shared by every checkout, worktree, and branch on the machine,
+/// where any branch carrying a newer migration leaves a `schema_migrations`
+/// row this binary correctly refuses to open. Per-process fixed that; it did
+/// not fix tests within one process, which run on parallel threads, each mock
+/// app opening its own connection to that one file, until two writers collided
+/// and one failed with `SQLITE_BUSY` ("database is locked"). Per-mock-app
+/// isolation fixes both, for everything that resolves an app-data path rather
+/// than for the ledger alone. See `test_support`'s module docs.
 fn open_ledger<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<RunLedger, String> {
-    #[cfg(test)]
-    let data_dir = test_ledger_dir();
-    #[cfg(not(test))]
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|error| format!("Failed to resolve app data dir: {error}"))?;
-    #[cfg(test)]
-    let _ = app;
 
     std::fs::create_dir_all(&data_dir)
         .map_err(|error| format!("Failed to create app data dir: {error}"))?;
     RunLedger::open(data_dir.join(DATABASE_FILE)).map_err(|error| error.to_string())
-}
-
-/// Created once per test process and wiped on first use, so a run never
-/// inherits the database a previous run of this binary (or of a differently
-/// migrated one) left behind.
-#[cfg(test)]
-fn test_ledger_dir() -> std::path::PathBuf {
-    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| {
-        let dir =
-            std::env::temp_dir().join(format!("little_monkey_test_ledger_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    })
-    .clone()
 }
 
 pub(crate) fn with_ledger<R: tauri::Runtime, T>(
@@ -915,27 +901,29 @@ mod tests {
         assert_eq!(run_protocol_version(), RUN_PROTOCOL_SCHEMA_VERSION);
     }
 
-    /// Pins the isolation `open_ledger` exists for. Without it every test in
-    /// this binary opens the machine-global app-data database — the same file
-    /// every other checkout and branch on the machine opens — and one branch
-    /// with a newer migration turns every permission-recording test red here
-    /// while CI's clean runners stay green.
+    /// Pins the isolation every test in this binary depends on. Without it a
+    /// test opens the machine-global app-data database — the same file every
+    /// other checkout and branch on the machine opens, so one branch with a
+    /// newer migration turns every permission-recording test red here while
+    /// CI's clean runners stay green — and, worse, the same file as every
+    /// *other test in this process*, which run in parallel and collide on it
+    /// with "database is locked".
     #[test]
     fn the_ledger_a_test_opens_is_never_the_real_app_data_database() {
-        let app = tauri::test::mock_app();
+        let app = crate::test_support::mock_app();
         let handle = app.handle().clone();
-        let real_app_data = handle
+        let dir = handle
             .path()
             .app_data_dir()
             .expect("mock app resolves an app data dir");
 
-        let dir = test_ledger_dir();
         assert!(
             dir.starts_with(std::env::temp_dir()),
             "test ledger must live under the temp dir, got {dir:?}"
         );
         assert_ne!(
-            dir, real_app_data,
+            Some(&dir),
+            crate::app_paths::data_dir().as_ref(),
             "test ledger must not be the real app data dir"
         );
 
@@ -944,6 +932,17 @@ mod tests {
         assert!(
             dir.join(DATABASE_FILE).exists(),
             "the ledger was opened somewhere other than the isolated dir"
+        );
+
+        // The parallel-collision half: a second test's ledger is a different
+        // file, so two of them writing at once never contend.
+        let other = crate::test_support::mock_app();
+        let other_state = AppState::default();
+        with_ledger(other.handle(), &other_state, |_| Ok(())).expect("opening a second ledger");
+        assert_ne!(
+            other.path().app_data_dir().expect("an app data dir"),
+            dir,
+            "two mock apps shared one ledger"
         );
     }
 
@@ -1119,7 +1118,7 @@ mod tests {
             let state = AppState::default();
             *state.run_ledger.lock().unwrap() =
                 Some(RunLedger::open_in_memory().expect("an in-memory ledger opens"));
-            let app = tauri::test::mock_app().handle().clone();
+            let app = crate::test_support::mock_app().handle().clone();
             // Managed, not held on the side, because the installed source resolves the
             // state through the handle exactly as it does in production.
             app.manage(state);
@@ -1225,13 +1224,13 @@ mod tests {
             origin
         }
 
-        /// A mock app whose ledger is in memory, so nothing here resolves a real
-        /// app-data directory on disk.
+        /// A mock app whose ledger is in memory, so nothing here touches
+        /// disk at all.
         fn ledgered_app() -> (tauri::AppHandle<tauri::test::MockRuntime>, AppState) {
             let state = AppState::default();
             *state.run_ledger.lock().unwrap() =
                 Some(RunLedger::open_in_memory().expect("an in-memory ledger opens"));
-            (tauri::test::mock_app().handle().clone(), state)
+            (crate::test_support::mock_app().handle().clone(), state)
         }
 
         /// A `runs` row and a process row that claims it.

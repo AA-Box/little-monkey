@@ -753,11 +753,11 @@ mod tests {
     #[tokio::test]
     async fn a_deny_at_the_first_stage_never_reaches_the_second_stage() {
         let state = std::sync::Arc::new(AppState::default());
-        // Pre-seed an in-memory ledger so `with_ledger` never resolves
-        // `mock_app()`'s real (unscoped) app-data directory on disk — see
-        // this module's own tests for why that matters.
+        // Pre-seed an in-memory ledger: this test needs no durable rows,
+        // and an in-memory one keeps it off disk entirely. (The mock app's
+        // app-data directory is per-test either way — see `test_support`.)
         *state.run_ledger.lock().unwrap() = Some(RunLedger::open_in_memory().unwrap());
-        let handle = tauri::test::mock_app().handle().clone();
+        let handle = crate::test_support::mock_app().handle().clone();
         let tmpl = template("deny-first", vec![stage("Stage 1", 5), stage("Stage 2", 5)]);
 
         let task_state = state.clone();
@@ -800,11 +800,11 @@ mod tests {
     #[tokio::test]
     async fn allowing_every_stage_approves_the_whole_chain_in_order() {
         let state = std::sync::Arc::new(AppState::default());
-        // Pre-seed an in-memory ledger so `with_ledger` never resolves
-        // `mock_app()`'s real (unscoped) app-data directory on disk — see
-        // this module's own tests for why that matters.
+        // Pre-seed an in-memory ledger: this test needs no durable rows,
+        // and an in-memory one keeps it off disk entirely. (The mock app's
+        // app-data directory is per-test either way — see `test_support`.)
         *state.run_ledger.lock().unwrap() = Some(RunLedger::open_in_memory().unwrap());
-        let handle = tauri::test::mock_app().handle().clone();
+        let handle = crate::test_support::mock_app().handle().clone();
         let tmpl = template("allow-both", vec![stage("Stage 1", 5), stage("Stage 2", 5)]);
 
         let task_state = state.clone();
@@ -843,11 +843,11 @@ mod tests {
     #[tokio::test]
     async fn an_unanswered_stage_expires_and_rejects_the_chain() {
         let state = std::sync::Arc::new(AppState::default());
-        // Pre-seed an in-memory ledger so `with_ledger` never resolves
-        // `mock_app()`'s real (unscoped) app-data directory on disk — see
-        // this module's own tests for why that matters.
+        // Pre-seed an in-memory ledger: this test needs no durable rows,
+        // and an in-memory one keeps it off disk entirely. (The mock app's
+        // app-data directory is per-test either way — see `test_support`.)
         *state.run_ledger.lock().unwrap() = Some(RunLedger::open_in_memory().unwrap());
-        let handle = tauri::test::mock_app().handle().clone();
+        let handle = crate::test_support::mock_app().handle().clone();
         let tmpl = template("times-out", vec![stage("Stage 1", 0), stage("Stage 2", 5)]);
 
         let result = run_approval_chain(&handle, &state, &tmpl, "d".repeat(64), "do it".to_string())
@@ -866,11 +866,11 @@ mod tests {
     #[tokio::test]
     async fn escalation_re_emits_the_same_stage_before_its_timeout() {
         let state = std::sync::Arc::new(AppState::default());
-        // Pre-seed an in-memory ledger so `with_ledger` never resolves
-        // `mock_app()`'s real (unscoped) app-data directory on disk — see
-        // this module's own tests for why that matters.
+        // Pre-seed an in-memory ledger: this test needs no durable rows,
+        // and an in-memory one keeps it off disk entirely. (The mock app's
+        // app-data directory is per-test either way — see `test_support`.)
         *state.run_ledger.lock().unwrap() = Some(RunLedger::open_in_memory().unwrap());
-        let handle = tauri::test::mock_app().handle().clone();
+        let handle = crate::test_support::mock_app().handle().clone();
         let tmpl = template(
             "escalates",
             vec![ChainStage {
