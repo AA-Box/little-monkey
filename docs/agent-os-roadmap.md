@@ -4956,10 +4956,13 @@ hand-written; a deprecation policy with a stated support window; an
 introspection endpoint that reports the contract version a running instance
 implements; and a CI check that fails on an unversioned breaking change.
 
-**Blocks:** K21. K20's hard gate ships against `AGENT_CONTRACT_VERSION`, a
-number this crate declares; what K19 still owes is the published, generated
-schema set that number refers to, which is what a third party would build
-against.
+**Blocks:** nothing now. K21's conformance suite consumes this directly: its
+attestation carries `contract::manifest()` verbatim rather than deriving a
+second route table, and `contract.abi_version` reads `GET /v1/contract` as a
+client would and fails when the two published surfaces of one instance
+disagree about the version, the manifest digest, or the support window. K20's
+hard gate still ships against `AGENT_CONTRACT_VERSION`, a number this crate
+declares alongside the schema set that documents it.
 
 ## K20. Package dependency resolution *(built)*
 
@@ -5032,9 +5035,9 @@ either — the store only moves a package forward — so a requirement that coul
 only be met by an older version than the one installed is reported as
 unsatisfiable rather than quietly rolling back.
 
-## K21. Conformance suite
+## K21. Conformance suite *(built)*
 
-**Today:** the M3 compatibility harness spins up the real server and
+**Was:** the M3 compatibility harness spins up the real server and
 exercises every advertised route, and Runtime Hub → Compatibility shows a
 live per-route/per-backend/per-model status derived from the same capability
 state that gates real requests. That certifies *this* implementation. There is
@@ -5048,19 +5051,134 @@ against the live pipeline rather than a mirror of it, reports which optional
 sections an implementation skipped, and a "compatible" claim means a named
 suite revision passed.
 
-**Blocks:** the word "OS" in the strongest sense — an OS is a specification
-other people implement against, not a single binary.
+**Shipped.** `docs/conformance-suite.md` is the specification; `conformance.rs`
+is the catalog, the attestation, the runner and the verdict rules; and
+`monkey-cli conformance --base-url … --token …` is the thing a third party
+actually runs. Exit `0` means compatible with the named revision, `1` means
+not — the CI contract. The same run is in the desktop app under Runtime Hub →
+Compatibility, and over IPC as `run_conformance_suite`. All three call one
+function, so there is no second implementation that could disagree.
+
+- **It runs against the live pipeline because it has no other way in.** The
+  runner is a `reqwest` client and a base URL. It never constructs a hub, never
+  imports a handler, and never opens the ledger — the only thing it can do is
+  send requests to whatever is listening. `tests/conformance_suite.rs` starts
+  the real `run_cli_server_with_m3_hub_and_endpoints` accept loop over a real
+  run ledger in a temp data directory and calls the same `run_suite` the CLI
+  calls; the only fakes are the two loopback *runtimes*, following
+  `legacy_route_compatibility.rs`'s convention, because no model process exists
+  in CI and the boundary being mocked is a model rather than the HTTP, auth,
+  routing or ledger layers being graded.
+
+- **`GET /v1/conformance` is the attestation, and it is loopback-only.** A
+  node publishes what it implements — the route table, the denied-capability
+  list, whether it requires a token, which optional sections it claims — plus
+  the live evidence a run checks those claims against: the isolation mechanism
+  this machine can actually apply (a probe, not a `cfg!`), the limits it
+  enforces, and the current head of its subsystem chain. The route is
+  `RouteFamily::LegacyHost`, so `owner_for` refuses it on a LAN exposure
+  without a second check having to remember to; a LAN caller gets
+  `Denied(LoopbackOnly(Conformance))`. The attestation carries isolation
+  posture and chain hashes, and nothing about a conformance run needs to be
+  readable from the network.
+
+- **The four sections, and why exactly one is required.** `contract` (K19) is
+  required: an implementation that cannot answer for its own route surface is
+  not implementing the contract at all. `isolation` (K3), `limits` (K4/K5) and
+  `ledger` (K12) are optional because they name guarantees a node may honestly
+  not offer — a runtime driver inside someone else's process has no sandbox of
+  its own to attest, and a listener with no ledger has nothing to prove
+  append-only about.
+
+- **Three ways a section can fail to run, kept apart.** `skipped` (the node did
+  not claim it, or the caller did not select it) never counts against a node,
+  and is named in `skippedOptionalSections` in both output formats. `failed` is
+  a check that ran and disagreed. `incomplete` is the state that exists because
+  of the failure mode this whole item is about: every check that ran passed,
+  *because most of them never ran*. A required section that is incomplete is
+  not compatible. A node with no models loaded lands there — the two inference
+  checks skip — and reports "not compatible", because a compatibility claim
+  that never exercised inference is not one.
+
+- **`ledger.append_only` is checked over the wire, not asserted.** Take the
+  chain head; perform an action the node records; ask for the links after the
+  head you saw. The first must name your head as its predecessor and each link
+  must name the one before it, so a rewrite between the two reads is visible to
+  a caller who holds nothing but two HTTP responses. Reading the attestation is
+  itself a recorded action — deliberately not filtered out the way `GET
+  /v1/models` is, and the reason is written at the handler: asking a node to
+  vouch for itself is the request that precedes a claim about the machine, and
+  it is the one recorded action the suite can perform against *any* node,
+  including one with no model. Hashes only ever leave the ledger; `detail_json`
+  can hold the user's own text and is covered by the chain, so it is permanent.
+
+- **A kernel without a boundary is a skip, not a failure.** `sandbox_enforcement()`
+  is a probe, so a Linux kernel built without Landlock, or a container whose
+  policy blocks the syscall, answers `ProcessOnly` — and such a node does not
+  *claim* the isolation section. It reports a named skip. Claiming it and then
+  failing `isolation.mechanism` would report a Landlock-less kernel as a defect
+  in the software running on it, which is the wrong finding. Where the section
+  does run, `isolation.denied_surfaces` probes every path in the node's own
+  denied-capability list and requires 404 from each — indistinguishable from
+  unknown, so the surface is not even enumerable.
+
+- **`limits.oversized_body` requires 413 specifically**, not "any 4xx". A 400
+  would be a refusal of the *content*, and a client could not tell a too-large
+  body from a malformed one. Making that check possible meant the 32 MiB cap —
+  which had been declared twice, once per listener — moving to
+  `http_policy::MAX_REQUEST_BODY_BYTES`, since a value a client is told and a
+  value a listener enforces must be one constant.
+
+- **The contract it grades is K19's, not a second copy of it.** The attestation
+  carries `contract::manifest()` verbatim — the generated one, read from
+  `ROUTES` and the tool definitions the running code dispatches from — because
+  a conformance attestation that re-derived the route table would be exactly
+  the believable-but-wrong artifact K19 exists to prevent. On top of that,
+  `contract.abi_version` fetches `GET /v1/contract` the way a client
+  negotiating an ABI would and compares it against the attestation: version,
+  manifest digest and support window. One instance publishing two surfaces that
+  disagree about which ABI it implements is a defect a client discovers the
+  hard way, and no check that reads only one of them can see it. Adding
+  `/v1/conformance` to `ROUTES` moved the generated manifest, so K19's gate
+  refused the commit until `CONTRACT_VERSION` went to 1.1.0 and the baseline
+  was republished — which is the gate working, on the first outside change to
+  land after it shipped.
+
+**Blocks:** nothing. There is a specification, a runnable suite behind it, a
+claim that names a revision, and a versioned ABI underneath it that the suite
+checks an instance against. An OS is a specification other people implement
+against; this is now the thing they run to find out whether they did.
 
 ## K22. Verified boot and updater
 
 **Today:** the in-app updater ships on all three desktop platforms and releases
-publish themselves once every matrix target has uploaded; rollback, a manual
-check control, a visible failed check, and Linux coverage beyond the AppImage
-are still missing. Signing is macOS-only. Managed runtime components install
-with digest verification and macOS notarization codesigning, and installed
-models carry content-addressed, digest-verified manifests that never trust a
-corrupt local copy for reuse. Ten locales are each missing ~650 of 1,726 keys.
-No dependency scanning, SBOM, accessibility CI, or penetration test.
+publish themselves once every matrix target has uploaded. Rollback exists on
+every platform (`update_rollback.rs`: one snapshot of the install taken before
+an update replaces it, restored by a detached script that waits for this
+process to exit), and Settings → Updates & integrity carries the manual check,
+the last check time, and the failure a background check keeps quiet. A Linux
+install the updater cannot replace — anything that is not an AppImage — is
+reported as such rather than failing silently. **The startup self-integrity
+check is in** (`self_integrity.rs`): the app's own code signature plus every
+file of every managed runtime against the trusted manifest digest compiled into
+the binary, computed once per process and consulted by every path that resolves
+a native binary (`llama.rs`, the Studio image/video and speech engines,
+`monkey-cli`). A mismatch refuses to load them; "cannot verify" — an unsigned
+source build, a developer runtime override, a tree staged with no trusted
+digest — is reported honestly and does not refuse, because treating absence of
+evidence as evidence of tampering would make the app unrunnable from source.
+Managed runtime components install with digest verification and macOS
+notarization codesigning, and installed models carry content-addressed,
+digest-verified manifests that never trust a corrupt local copy for reuse. CI
+runs dependency review plus Rust/npm advisory audits and publishes a CycloneDX
+SBOM, attached to each release as an asset.
+
+**Still open:** signing beyond macOS (Windows needs a code-signing certificate
+this project does not have; Linux has no OS-level binary signature to verify,
+which is why the integrity check reports the runtime digests as the whole of
+the evidence there), clean-machine install/upgrade tests, an accessibility
+audit in CI, a release penetration test, and the ~650 keys each of ten locales
+is missing.
 
 **Acceptance:** ROADMAP #8 in full, plus a startup self-integrity check that
 verifies the app's own binary signature and the digests of every managed

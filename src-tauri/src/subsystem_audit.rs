@@ -89,6 +89,16 @@ pub fn outcome_for_status(status: u16) -> SubsystemOutcome {
     }
 }
 
+/// The subsystem chain's linkage, with no event contents at all.
+/// See [`SubsystemAudit::chain_evidence`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainEvidence {
+    pub verification: crate::run_ledger::ChainVerification,
+    pub head: Option<crate::run_ledger::ChainLink>,
+    pub links_after: Vec<crate::run_ledger::ChainLink>,
+}
+
 /// Where a subsystem's events go.
 #[derive(Clone)]
 pub struct SubsystemAudit {
@@ -159,6 +169,60 @@ impl SubsystemAudit {
             AuditTarget::Desktop(_) => "recording to the app's run ledger".to_string(),
             AuditTarget::Ledger { path, .. } => format!("recording to {}", path.display()),
             AuditTarget::Disabled(reason) => format!("NOT recording — {reason}"),
+        }
+    }
+
+    /// Read the subsystem chain's linkage: its verification state, its head,
+    /// and the links after `after_sequence` (roadmap K21).
+    ///
+    /// `Ok(None)` means this context is [`disabled`](Self::disabled) — the same
+    /// distinction the rest of this module keeps, so a conformance run reports
+    /// "this node exposes no ledger evidence" rather than "the ledger is
+    /// empty". Hashes only, never contents: `detail_json` may hold the user's
+    /// own text and is covered by the chain, so it is permanent.
+    ///
+    /// Unlike [`record`](Self::record), a failure here is returned. Nothing is
+    /// riding on it — no action has already succeeded that a refusal would
+    /// retroactively spoil — and a conformance claim built on a swallowed read
+    /// error would be worthless.
+    pub fn chain_evidence(
+        &self,
+        after_sequence: u64,
+        limit: u32,
+    ) -> Result<Option<ChainEvidence>, String> {
+        // ponytail: `verify_subsystem_chain` walks the whole stream. That is
+        // the point — a partial verification is not one — and this runs once
+        // per attestation read, not per request.
+        let read = |ledger: &RunLedger| -> Result<ChainEvidence, String> {
+            Ok(ChainEvidence {
+                verification: ledger
+                    .verify_subsystem_chain()
+                    .map_err(|error| error.to_string())?,
+                head: ledger
+                    .subsystem_chain_head()
+                    .map_err(|error| error.to_string())?,
+                links_after: ledger
+                    .subsystem_chain_links(after_sequence, limit)
+                    .map_err(|error| error.to_string())?,
+            })
+        };
+        match &self.target {
+            AuditTarget::Disabled(_) => Ok(None),
+            AuditTarget::Desktop(app) => {
+                use tauri::Manager as _;
+                let state = app.state::<AppState>();
+                crate::run_commands::with_ledger(app, state.inner(), |ledger| Ok(read(ledger)))?
+                    .map(Some)
+            }
+            AuditTarget::Ledger { path, opened } => {
+                let mut slot = opened
+                    .lock()
+                    .map_err(|_| "Subsystem audit ledger lock was poisoned".to_string())?;
+                if slot.is_none() {
+                    *slot = Some(RunLedger::open(path).map_err(|error| error.to_string())?);
+                }
+                read(slot.as_ref().expect("ledger initialized")).map(Some)
+            }
         }
     }
 
