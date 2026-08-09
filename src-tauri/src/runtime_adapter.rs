@@ -655,7 +655,7 @@ pub enum RuntimeKind {
     LlamaCpp,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum AcceleratorKind {
     Cpu,
@@ -673,6 +673,26 @@ pub enum AcceleratorKind {
     /// now ask [`execution_support`] about it and get a sentence instead of
     /// finding nothing.
     AppleNeuralEngine,
+}
+
+impl AcceleratorKind {
+    /// Operator-facing name, for a refusal that has to say which pool fell short.
+    ///
+    /// Separate from the serde representation on purpose: that one is a stable
+    /// wire token and must never be reworded, and this one exists to be read by a
+    /// person in a log line.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            AcceleratorKind::Cpu => "CPU",
+            AcceleratorKind::Metal => "Metal",
+            AcceleratorKind::Cuda => "CUDA",
+            AcceleratorKind::Rocm => "ROCm",
+            AcceleratorKind::Vulkan => "Vulkan",
+            AcceleratorKind::DirectMl => "DirectML",
+            AcceleratorKind::AppleNeuralEngine => "Apple Neural Engine",
+        }
+    }
 }
 
 /// Whether anything in this app actually runs work on a backend, or it is

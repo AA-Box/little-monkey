@@ -4547,14 +4547,14 @@ added when a tool that produces the effect exists.
 
 # Phase 4 — Devices and nodes
 
-## K15. Multi-GPU as schedulable devices
+## K15. Multi-GPU as schedulable devices *(built)*
 
 **Today:** a single `gpu_layers` count. Hybrid and multi-GPU hardware is
 detected by the Hardware Compatibility Matrix and never used as more than one
 device.
 
-**Shipped — per-device memory, the split it makes possible, and the refusal when
-a runtime cannot take it. Not yet the per-device admission reservation.**
+**Shipped — per-device memory, the split it makes possible, the refusal when a
+runtime cannot take it, and the per-device admission reservation.**
 
 The entry read as a missing feature. It was also a live bug, and finding it is
 what set the shape of the fix: `parse_nvidia_smi` **summed** each card's memory
@@ -4584,12 +4584,44 @@ carried memory but had summed the devices away.
   several and dies at load time with an out-of-memory error that names nothing
   about the cause.
 
-**Remaining: "each device is a schedulable resource K7 reserves against
-independently."** `daemon/admission.rs`'s `Resource` is `Ram | Vram` and the
-reservation row has two byte columns, so a second job is still admitted against
-an aggregate the first job may have exhausted on one card. That is a daemon
-schema change on top of this one, and it is the half that needs multi-GPU
-hardware to be worth trusting.
+**Shipped — "each device is a schedulable resource K7 reserves against
+independently."** `Resource` was `Ram | Vram`, so a second job was admitted
+against an aggregate the first may have exhausted on one card: two 24 GB cards
+read as one 48 GB pool, two 20 GB models were both admitted, and the second died
+at load time with an out-of-memory error naming nothing about the cause. That is
+the same shape as the detection bug above, one layer down.
+
+- **`Resource::Accelerator(DeviceId)`.** A shortfall names the card, and the
+  `DeviceId` carries the runtime's own ordinal — what `--main-gpu` and a position
+  in `--tensor-split` mean, not an index into any local vector. `index: None` is
+  kept as a case for a machine that advertised accelerator memory without
+  enumerating a device, on the same grounds `DeviceSplit::budget_bytes` gives:
+  inventing device 0 would make a reservation no runtime flag could honour.
+- **Claims are per device and are never summed.** `Fit::Fits` carries a
+  `Vec<DeviceClaim>` alongside the pooled `MemoryRequirement`, distributed by the
+  plan's own `DeviceSplit` — `SingleDevice` puts it on one card, `Across` splits
+  it by the same weights `--tensor-split` will receive, each rounded **up** so the
+  busiest card is never under-booked.
+- **`Never` measures against the largest single device**, so a model no one card
+  can hold is refused rather than started, even when the cards sum to more than
+  it needs.
+- **Reservations are rows, not columns.** `daemon_job_device_reservations` (V4),
+  because a column holds one device and a split model holds several. Grouped
+  `MAX` within a resident model then `SUM` across models, which is what a card
+  actually has to hold — two turns against one loaded model still pay once.
+- **Every release path covers them.** `release_reservation` deletes the device
+  rows in the same transaction as it clears the columns, and both `finish_active`
+  (the clean exit) and `reconcile_interrupted` (the crash funnel) reach it;
+  `sweep_stale_reservations` takes them too.
+- **Preemption follows the device.** `Running::claim` answers a device shortfall
+  from that device's bytes and not from the pooled figure. Otherwise a job holding
+  8 GB on card 0 would look able to relieve card 1, the victim set would pass the
+  covers-the-shortfall guard, and real work would be parked while the claimant
+  stayed held — the exact outcome the set-based rule exists to rule out.
+
+What still needs multi-GPU hardware is *confidence*, not code: the arithmetic is
+asserted against enumerated two-card fixtures, and nothing here has been watched
+against two real cards.
 
 **Acceptance:** ROADMAP #7 — an explicit per-device split chosen from the real
 hardware snapshot, the offload planner accounting for each device's own
