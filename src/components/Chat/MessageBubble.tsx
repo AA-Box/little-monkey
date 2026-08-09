@@ -7,7 +7,9 @@ import { textContent, type ChatContentPart, type ChatMessage } from "../../lib/l
 import { detectFenceKind, fingerprintArtifact, type ArtifactRef } from "../../lib/artifacts";
 import { isWorkspaceImageSrc } from "../../lib/imageGeneration";
 import WorkspaceImagePreview from "./WorkspaceImagePreview";
+import MessageActions from "./MessageActions";
 import { useArtifactStore } from "../../store/artifactStore";
+import { useSessionStore } from "../../store/sessionStore";
 // Lazy: `CodeBlock` pulls in `react-syntax-highlighter`'s Prism bundle, the
 // same heavy dependency `ArtifactPane.tsx` keeps out of the main entry chunk
 // via `lazyComponents.tsx` — see `CodeBlock.tsx`'s doc comment.
@@ -348,38 +350,55 @@ function AssistantMessage({
   content,
   sessionId,
   index,
+  at,
+  chapter,
   translationControls,
   onStartSideTask,
 }: {
   content: string;
   sessionId: string;
   index: number;
+  at?: number;
+  chapter?: string;
   translationControls?: ReactNode;
   onStartSideTask?: () => void;
 }) {
   const { t } = useT();
   const components = buildAssistantMarkdownComponents(sessionId, index, t);
+  const pinned = chapter !== undefined;
   return (
     <div className="group w-full min-w-0">
       <div className={PROSE_CLASSES}>
         <ReactMarkdown components={components}>{content}</ReactMarkdown>
       </div>
-      {(translationControls || onStartSideTask) && (
-        <div className="mt-1 flex items-center gap-0.5">
-          {translationControls}
-          {onStartSideTask && (
-            <button
-              type="button"
-              onClick={onStartSideTask}
-              aria-label="Start side task from this message"
-              title="Start side task from this message"
-              className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
-            >
-              <Split size={13} />
-            </button>
-          )}
+      <div className="mt-1 flex items-center gap-0.5">
+        {translationControls}
+        {/* A pinned answer keeps its footer visible: the filled bookmark is
+            the only place the chapter's own state shows on the message. */}
+        <div
+          className={`flex items-center gap-0.5 transition-opacity duration-150 ${pinned ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"}`}
+        >
+          <MessageActions
+            text={content}
+            at={at}
+            chapter={chapter}
+            onToggleChapter={(title) =>
+              useSessionStore.getState().updateMessageAt(sessionId, index, { chapter: title })
+            }
+          />
         </div>
-      )}
+        {onStartSideTask && (
+          <button
+            type="button"
+            onClick={onStartSideTask}
+            aria-label="Start side task from this message"
+            title="Start side task from this message"
+            className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
+          >
+            <Split size={13} />
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -622,6 +641,8 @@ function MessageBubble({
         content={displayedTranslation?.translatedText ?? textContent(message.content)}
         sessionId={sessionId}
         index={index}
+        at={message.at}
+        chapter={message.chapter}
         translationControls={controls}
         onStartSideTask={startSideTask}
       />

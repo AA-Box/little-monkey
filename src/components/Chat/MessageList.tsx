@@ -2,6 +2,7 @@ import { memo, useEffect, useId, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { reapplyCheckpoint, revertCheckpoint } from "../../lib/checkpointCompensation";
 import {
+  Bookmark,
   BookmarkX,
   BookOpen,
   Bot,
@@ -1146,7 +1147,7 @@ export default function MessageList({
           {items.map((item) => {
             if (item.kind === "bubble") {
               const editable = item.message.role === "user" && onEditUserMessage;
-              return (
+              const bubble = (
                 <MessageBubble
                   key={item.key}
                   message={item.message}
@@ -1158,6 +1159,23 @@ export default function MessageList({
                   preferredTranslationLocale={preferredTranslationLocale}
                   onStartSideTask={onStartSideTask}
                 />
+              );
+              // A message pinned as a chapter (see `MessageActions.tsx`)
+              // carries its own divider, so a long transcript reads as
+              // labelled sections instead of one undifferentiated scroll.
+              if (item.message.chapter === undefined) return bubble;
+              return (
+                <div key={item.key} className="flex flex-col gap-6">
+                  <div className="flex items-center gap-2 text-faint">
+                    <span className="h-px flex-1 bg-border" />
+                    <span className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide">
+                      <Bookmark size={11} />
+                      {item.message.chapter}
+                    </span>
+                    <span className="h-px flex-1 bg-border" />
+                  </div>
+                  {bubble}
+                </div>
               );
             }
             if (item.kind === "activity") {
