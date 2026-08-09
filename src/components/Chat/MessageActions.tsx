@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Bookmark, BookmarkCheck, Check, Copy, Square, Volume2 } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
+import { Check, Copy, Pin, PinOff, Square, Volume2 } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
 import { chapterTitle, formatMessageTime, formatMessageTimestamp } from "./messageChapters";
@@ -11,6 +11,55 @@ const CLOCK_TICK_MS = 60_000;
 
 const ACTION_CLASSES =
   "flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:text-foreground";
+
+/**
+ * The label that names what an action does, shown above it on hover or
+ * keyboard focus. CSS-only (a named `group/action` toggling `hidden`), the
+ * same technique `EffortSelector.tsx` uses for its hover card — no state, no
+ * timers, and no dependency on the browser's own slow, unstyled `title`
+ * bubble, which these buttons deliberately no longer set (two tooltips for
+ * one icon reads as a bug).
+ */
+function Tooltip({ text }: { text: string }) {
+  return (
+    <span
+      role="tooltip"
+      className="pointer-events-none absolute bottom-full left-1/2 z-30 mb-1 hidden -translate-x-1/2 whitespace-nowrap rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground shadow-lg group-hover/action:block group-focus-within/action:block"
+    >
+      {text}
+    </span>
+  );
+}
+
+function ActionButton({
+  label,
+  pressed,
+  onClick,
+  children,
+}: {
+  /** Names the action — both the tooltip's text and the button's a11y name. */
+  label: string;
+  /** Toggle state for the actions that have one (pinned, speaking); omitted
+   * for the plain ones, which then expose no `aria-pressed` at all. */
+  pressed?: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <span className="group/action relative">
+      <button
+        type="button"
+        onClick={onClick}
+        aria-label={label}
+        aria-pressed={pressed}
+        className={`${ACTION_CLASSES} ${pressed ? "text-accent hover:text-accent" : ""}`}
+      >
+        {children}
+      </button>
+      <Tooltip text={label} />
+    </span>
+  );
+}
 
 /** Whether this WebView exposes the Web Speech API. Checked once at module
  * load — the capability never appears mid-session, and a build target
@@ -92,50 +141,36 @@ export default function MessageActions({
 
   return (
     <>
-      <button
-        type="button"
+      <ActionButton
+        label={copied ? t("MessageBubble.copiedLabel") : t("MessageBubble.copyMessage")}
         onClick={() => void handleCopy()}
-        aria-label={copied ? t("MessageBubble.copiedLabel") : t("MessageBubble.copyMessage")}
-        title={copied ? t("MessageBubble.copiedLabel") : t("MessageBubble.copyMessage")}
-        className={ACTION_CLASSES}
       >
         {copied ? <Check size={13} /> : <Copy size={13} />}
-      </button>
+      </ActionButton>
 
       {onToggleChapter && (
-        <button
-          type="button"
+        <ActionButton
+          label={pinLabel}
+          pressed={pinned}
           onClick={() => onToggleChapter(pinned ? undefined : chapterTitle(text))}
-          aria-label={pinLabel}
-          aria-pressed={pinned}
-          title={pinLabel}
-          className={`${ACTION_CLASSES} ${pinned ? "text-accent hover:text-accent" : ""}`}
         >
-          {pinned ? <BookmarkCheck size={13} /> : <Bookmark size={13} />}
-        </button>
+          {pinned ? <PinOff size={13} /> : <Pin size={13} />}
+        </ActionButton>
       )}
 
       {speech && (
-        <button
-          type="button"
-          onClick={handleSpeak}
-          aria-label={speakLabel}
-          aria-pressed={speaking}
-          title={speakLabel}
-          className={`${ACTION_CLASSES} ${speaking ? "text-accent hover:text-accent" : ""}`}
-        >
+        <ActionButton label={speakLabel} pressed={speaking} onClick={handleSpeak}>
           {speaking ? <Square size={13} /> : <Volume2 size={13} />}
-        </button>
+        </ActionButton>
       )}
 
       {at !== undefined && (
-        <time
-          dateTime={new Date(at).toISOString()}
-          title={formatMessageTimestamp(at)}
-          className="px-1 text-[11px] text-faint"
-        >
-          {formatMessageTime(at, now)}
-        </time>
+        <span className="group/action relative">
+          <time dateTime={new Date(at).toISOString()} className="px-1 text-[11px] text-faint">
+            {formatMessageTime(at, now)}
+          </time>
+          <Tooltip text={formatMessageTimestamp(at)} />
+        </span>
       )}
     </>
   );

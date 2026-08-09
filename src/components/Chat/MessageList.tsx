@@ -2,7 +2,6 @@ import { memo, useEffect, useId, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { reapplyCheckpoint, revertCheckpoint } from "../../lib/checkpointCompensation";
 import {
-  Bookmark,
   BookmarkX,
   BookOpen,
   Bot,
@@ -18,6 +17,7 @@ import {
   ListChecks,
   LoaderCircle,
   MessageSquareX,
+  Pin,
   Plug,
   RefreshCw,
   Search,
@@ -1169,7 +1169,7 @@ export default function MessageList({
                   <div className="flex items-center gap-2 text-faint">
                     <span className="h-px flex-1 bg-border" />
                     <span className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide">
-                      <Bookmark size={11} />
+                      <Pin size={11} />
                       {item.message.chapter}
                     </span>
                     <span className="h-px flex-1 bg-border" />
