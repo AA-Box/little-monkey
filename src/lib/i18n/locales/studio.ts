@@ -39,6 +39,17 @@ export const studioLocale: Record<string, string> = {
   "Studio.promptWeighting":
     "Weight a word with (word:1.3) to strengthen it, or (word:0.6) to weaken it. 1.0 is neutral.",
 
+  // Outpainting. Presented as extending rather than as a canvas, because that
+  // is what the buttons do: each press grows one side and asks the model to
+  // fill it.
+  "Studio.outpaint.title": "Extend the picture",
+  "Studio.outpaint.hint":
+    "Grows the image on one side and fills the new space to match. Press again to keep going. The seam is blended by letting the model repaint a thin strip of the existing picture.",
+  "Studio.outpaint.left": "Extend to the left",
+  "Studio.outpaint.right": "Extend to the right",
+  "Studio.outpaint.up": "Extend upwards",
+  "Studio.outpaint.down": "Extend downwards",
+
   "Studio.preprocess.label": "Turn this photo into a hint map",
   "Studio.preprocess.placeholder": "Leave as it is",
   "Studio.preprocess.canny": "Edges (Canny)",

@@ -2,6 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import {
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
   ChevronDown,
   Download,
   Loader2,
@@ -28,6 +32,7 @@ import { ToolPanel } from "./ToolPanel";
 import { useT } from "../../lib/i18n";
 import { describeWeightFile } from "../../lib/weightFileHints";
 import { PREPROCESSORS, runPreprocessor, type Preprocessor } from "../../lib/preprocess";
+import { NO_MARGINS, runOutpaint, type Margins } from "../../lib/outpaint";
 import {
   componentFileName,
   editTaskFor,
@@ -402,6 +407,18 @@ const MODE_TASKS: Record<Exclude<StudioMode, "models" | "tools">, GenerationTask
   audio: ["text_to_speech"],
 };
 
+/** How far one press extends. Multiples of 64 so a picture that was already a
+ *  valid size stays one — the engine works in 64-pixel blocks, and an odd
+ *  margin would have it resize the result behind the user's back. */
+const OUTPAINT_STEPS = [64, 128, 256] as const;
+
+const OUTPAINT_SIDES = [
+  { side: "left", labelKey: "Studio.outpaint.left", icon: ArrowLeft },
+  { side: "right", labelKey: "Studio.outpaint.right", icon: ArrowRight },
+  { side: "top", labelKey: "Studio.outpaint.up", icon: ArrowUp },
+  { side: "bottom", labelKey: "Studio.outpaint.down", icon: ArrowDown },
+] as const satisfies readonly { side: keyof Margins; labelKey: string; icon: unknown }[];
+
 const tasksFor = (mode: StudioMode): GenerationTask[] =>
   mode === "models" || mode === "tools" ? [] : MODE_TASKS[mode];
 
@@ -448,6 +465,8 @@ export function StudioPanel({ mode, railSlot }: Props) {
   /** Inpainting: white is repainted, black is kept. Only ever set while an
    *  init image exists, because it is a mask *over* that image. */
   const [maskImage, setMaskImage] = useState<string | null>(null);
+  const [outpaintStep, setOutpaintStep] = useState<number>(OUTPAINT_STEPS[1]);
+  const [extending, setExtending] = useState(false);
   /** Structure to follow — already a depth map, pose skeleton or edge map. The
    *  engine runs no detector, so a plain photo is followed as if it were one. */
   const [controlImage, setControlImage] = useState<string | null>(null);
@@ -817,6 +836,34 @@ export function StudioPanel({ mode, railSlot }: Props) {
       if (comma >= 0) receive(result.slice(comma + 1));
     };
     reader.readAsDataURL(file);
+  };
+
+  /** Extends the source image on one side and marks the new ground for the
+   *  model to fill.
+   *
+   *  Outpainting is inpainting on a bigger canvas, so this replaces the source,
+   *  supplies the mask, and moves the requested size to match — all three, or
+   *  the engine is handed a mask that does not line up with what it is given.
+   *  Repeat to keep going, which is what dragging a frame outward amounts to. */
+  const extend = async (side: keyof Margins) => {
+    if (!initImage) return;
+    setExtending(true);
+    setError(null);
+    try {
+      const result = await runOutpaint(initImage, { ...NO_MARGINS, [side]: outpaintStep });
+      setInitImage(result.initImageBase64);
+      setMaskImage(result.maskImageBase64);
+      // Null only before a model is chosen, and the button that got here is
+      // not reachable then — so leaving it null is right rather than
+      // fabricating a settings object out of two dimensions.
+      setSettings((current) =>
+        current ? { ...current, width: result.width, height: result.height } : current,
+      );
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setExtending(false);
+    }
   };
 
   /** Dropping the source image drops the mask with it: a mask addresses that
@@ -1484,6 +1531,36 @@ export function StudioPanel({ mode, railSlot }: Props) {
                 </>
               )}
             </div>
+          )}
+
+          {canMask && initImage && (
+            <SettingsCard title={t("Studio.outpaint.title")} hint={t("Studio.outpaint.hint")}>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {OUTPAINT_STEPS.map((step) => (
+                  <Button
+                    key={step}
+                    size="sm"
+                    variant={outpaintStep === step ? "primary" : "secondary"}
+                    onClick={() => setOutpaintStep(step)}
+                  >
+                    {step}
+                  </Button>
+                ))}
+                <span className="mx-1 text-[11px] text-faint">px</span>
+                {OUTPAINT_SIDES.map(({ side, labelKey, icon: Icon }) => (
+                  <IconButton
+                    key={side}
+                    size="sm"
+                    aria-label={t(labelKey)}
+                    title={t(labelKey)}
+                    disabled={extending}
+                    onClick={() => void extend(side)}
+                  >
+                    <Icon size={13} />
+                  </IconButton>
+                ))}
+              </div>
+            </SettingsCard>
           )}
 
           {canMask && initImage && (
