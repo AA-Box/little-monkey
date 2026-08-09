@@ -2942,8 +2942,33 @@ mod tests {
                 "must-stay-secret"
             );
         }
-        assert!(expected_home.join("probe").is_file());
-        assert!(expected_tmp.join("probe").is_file());
+        // The in-container guards (74/75) already proved the writes succeeded.
+        // These assert the separate claim that the host still sees them after the
+        // container is gone — true on the other two platforms, so when it fails
+        // here, say what is on disk rather than only that something is not.
+        let listing = |dir: &Path| match fs::read_dir(dir) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", "),
+            Err(error) => format!("<unreadable: {error}>"),
+        };
+        assert!(
+            expected_home.join("probe").is_file(),
+            "the container wrote a probe under {} and exited 0, but the host cannot \
+             see it afterwards; home contains [{}], tmp contains [{}]",
+            expected_home.display(),
+            listing(&expected_home),
+            listing(&expected_tmp)
+        );
+        assert!(
+            expected_tmp.join("probe").is_file(),
+            "the container wrote a probe under {} and exited 0, but the host cannot \
+             see it afterwards; tmp contains [{}]",
+            expected_tmp.display(),
+            listing(&expected_tmp)
+        );
 
         let _ = fs::remove_dir_all(&sandbox_root);
         let _ = fs::remove_dir_all(&real_workspace);
