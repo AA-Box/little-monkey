@@ -60,7 +60,7 @@ import {
 import { isCompactionMarker } from "../../lib/contextTrimmer";
 import { isBtwNotice, isCommandNotice, parseCommandNotice, type CommandNotice } from "../../lib/slashCommands";
 import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore } from "../../store/sessionStore";
-import { selectTurnStatus, useTurnStatusStore, type TurnStatus } from "../../store/turnStatusStore";
+import { liveTurnTokens, selectTurnStatus, useTurnStatusStore, type TurnStatus } from "../../store/turnStatusStore";
 import { formatCompactTokens, formatElapsed } from "../../lib/taskFormat";
 import { useCheckpointStore } from "../../store/checkpointStore";
 import { useRulesStore } from "../../store/rulesStore";
@@ -1026,6 +1026,7 @@ function TurnStatusLine({ status }: { status: TurnStatus }) {
 
   const elapsedMs = Date.now() - status.startedAt;
   const silentMs = Date.now() - status.lastEventAt;
+  const { tokens, estimated } = liveTurnTokens(status);
   const word = status.activity
     ? `${liveActivityLabel(status.activity)}…`
     : t(silentMs >= STILL_THINKING_AFTER_MS ? "MessageList.turnStatusStillThinking" : "MessageList.turnStatusThinking");
@@ -1038,10 +1039,17 @@ function TurnStatusLine({ status }: { status: TurnStatus }) {
         ✳
       </span>
       <span className="font-mono">{formatElapsed(elapsedMs)}</span>
-      {status.totalTokens > 0 && (
+      {tokens > 0 && (
         <>
           <span>·</span>
-          <span className="font-mono">{t("MessageList.turnStatusTokens", { count: formatCompactTokens(status.totalTokens) })}</span>
+          {/* `~` while part of the number is estimated from streamed text —
+              it firms up to the exact count the moment the attempt reports
+              its usage. */}
+          <span className="font-mono">
+            {t("MessageList.turnStatusTokens", {
+              count: `${estimated ? "~" : ""}${formatCompactTokens(tokens)}`,
+            })}
+          </span>
         </>
       )}
       <span>·</span>
