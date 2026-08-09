@@ -38,6 +38,10 @@ export interface SubagentRun {
    * Background-tasks drawer groups same-`groupId` runs into one card, the
    * panel counterpart of the chat's `SubagentGroupCard`. */
   groupId?: string;
+  /** Set when this run is one agent of a `workflow` tool call (the owning
+   * `WorkflowRun.runId`) — the Background-tasks drawer renders it inside
+   * that workflow's card and excludes it from the plain agent list. */
+  workflowRunId?: string;
   description: string;
   profile: "explore" | "code";
   status: SubagentStatus;
@@ -81,7 +85,7 @@ interface SubagentStoreState {
   runs: Record<string, SubagentRun>;
   /** Registers a new run as `'running'` with an empty activity log — called
    * once by `runSubagentTask` right before it starts the child's loop. */
-  start: (params: { sessionId: string; taskId: string; cancelId: string; groupId?: string; description: string; profile: "explore" | "code" }) => void;
+  start: (params: { sessionId: string; taskId: string; cancelId: string; groupId?: string; workflowRunId?: string; description: string; profile: "explore" | "code" }) => void;
   /** Updates `lastActivity` and bumps `toolCallCount` by one — called once
    * per child tool call `runSubagentTask` is about to execute. No-ops if
    * `taskId` was never `start`-ed (defensive; should not happen). */
@@ -110,11 +114,11 @@ interface SubagentStoreState {
 export const useSubagentStore = create<SubagentStoreState>((set) => ({
   runs: {},
 
-  start: ({ sessionId, taskId, cancelId, groupId, description, profile }) => {
+  start: ({ sessionId, taskId, cancelId, groupId, workflowRunId, description, profile }) => {
     set((state) => ({
       runs: {
         ...state.runs,
-        [taskId]: { sessionId, taskId, cancelId, groupId, description, profile, status: "running", startedAt: Date.now(), lastActivity: "", toolCallCount: 0, usage: undefined, liveMessages: [] },
+        [taskId]: { sessionId, taskId, cancelId, groupId, workflowRunId, description, profile, status: "running", startedAt: Date.now(), lastActivity: "", toolCallCount: 0, usage: undefined, liveMessages: [] },
       },
     }));
   },

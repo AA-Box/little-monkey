@@ -70,6 +70,7 @@ import GeneratedImageCard from "./GeneratedImageCard";
 import PlanCard from "./PlanCard";
 import SubagentRow from "./SubagentRow";
 import SubagentGroupCard, { type SubagentGroupTask } from "./SubagentGroupCard";
+import WorkflowChatCard from "./WorkflowChatCard";
 import { CheckpointPreviewModal } from "./CheckpointPreviewModal";
 import { useT } from "../../lib/i18n";
 import { StepCopyButton, ToolStepRow, TOOL_STEP_LIST_CLASSES } from "./ToolStepRow";
@@ -128,6 +129,7 @@ type TimelineItem =
   | { kind: "activity"; key: string; calls: ActivityCall[]; prompt: string }
   | { kind: "subagent"; key: string; taskId: string; args: string; result?: string }
   | { kind: "subagentGroup"; key: string; tasks: SubagentGroupTask[] }
+  | { kind: "workflow"; key: string; runId: string; args: string; result?: string }
   | { kind: "notice"; key: string; text: string }
   | { kind: "command"; key: string; notice: CommandNotice }
   | { kind: "checkpoint"; key: string; notice: CheckpointNotice; messageIndex: number }
@@ -196,6 +198,16 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
             calls: entry.calls,
             prompt: latestUserPrompt,
           });
+          continue;
+        }
+
+        if (entry.kind === "workflows") {
+          // One card per `workflow` call — a round issuing several distinct
+          // named workflows should read as several named cards, unlike the
+          // interchangeable agents of a task group.
+          for (const call of entry.calls) {
+            items.push({ kind: "workflow", key: `workflow-${call.id}`, runId: call.id, args: call.args, result: call.result });
+          }
           continue;
         }
 
@@ -1218,6 +1230,18 @@ export default function MessageList({
             if (item.kind === "subagent") {
               return (
                 <SubagentRow key={item.key} sessionId={sessionId} taskId={item.taskId} args={item.args} result={item.result} />
+              );
+            }
+            if (item.kind === "workflow") {
+              return (
+                <WorkflowChatCard
+                  key={item.key}
+                  sessionId={sessionId}
+                  runId={item.runId}
+                  args={item.args}
+                  result={item.result}
+                  onOpenPanel={onOpenBackgroundTasks}
+                />
               );
             }
             if (item.kind === "subagentGroup") {
