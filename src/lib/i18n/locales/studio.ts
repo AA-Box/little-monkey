@@ -28,6 +28,23 @@ export const studioLocale: Record<string, string> = {
   "Studio.video.subtitle": "Generate video on this machine. No account, no upload.",
   "Studio.models": "Models",
 
+  // Control-image preprocessors. ControlNet wants a hint map, not a
+  // photograph; before this the user had to make one elsewhere.
+  // The prompt fields had no label at all — a placeholder is not one, because
+  // it vanishes on the first keystroke.
+  "Studio.prompt": "Prompt",
+  "Studio.negativePrompt": "Negative prompt",
+  "Studio.speechText": "Text to speak",
+  // Weighting is parsed by the engine itself, not by this app.
+  "Studio.promptWeighting":
+    "Weight a word with (word:1.3) to strengthen it, or (word:0.6) to weaken it. 1.0 is neutral.",
+
+  "Studio.preprocess.label": "Turn this photo into a hint map",
+  "Studio.preprocess.placeholder": "Leave as it is",
+  "Studio.preprocess.canny": "Edges (Canny)",
+  "Studio.preprocess.grayscale": "Greyscale",
+  "Studio.preprocess.invert": "Invert",
+
   // Tools — the sidecar tier. A tool is a separate program, not a model and
   // not part of the engine, and the copy says so: what the user installs here
   // runs beside the app rather than inside it.
