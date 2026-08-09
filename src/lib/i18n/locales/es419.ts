@@ -1122,6 +1122,7 @@ export const es419: Record<string, string> = {
   "BackgroundTasksPanel.agentStatusCancelled": "Cancelado",
   "BackgroundTasksPanel.agentGroupTitle": "{{count}} agentes",
   "BackgroundTasksPanel.workflowKindLabel": "Flujo de trabajo",
+  "BackgroundTasksPanel.phaseQueued": "En cola",
   "BackgroundTasksPanel.stopAllAriaLabel": "Detener todos los agentes en ejecución",
   "BackgroundTasksPanel.tableAgentHeader": "Agente",
   "BackgroundTasksPanel.tableTokensHeader": "Tokens",

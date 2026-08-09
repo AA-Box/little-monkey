@@ -325,12 +325,12 @@ describe("toolsForSettings", () => {
 
   it("appends the task tool when subagentsEnabled is true, after every other filtering", () => {
     const result = toolsForSettings(tools, true, true, true);
-    expect(result.map((t) => t.function.name)).toEqual(["write_file", "remember", "run_shell", "task"]);
+    expect(result.map((t) => t.function.name)).toEqual(["write_file", "remember", "run_shell", "task", "workflow"]);
   });
 
   it("still appends task even when memoryEnabled/webToolsEnabled filtered other tools out", () => {
     const result = toolsForSettings(tools, false, true, true);
-    expect(result.map((t) => t.function.name)).toEqual(["write_file", "run_shell", "task"]);
+    expect(result.map((t) => t.function.name)).toEqual(["write_file", "run_shell", "task", "workflow"]);
   });
 
   it("does not append the skill or read_skill_resource tools when their flags are false (or omitted) — a user who hasn't opted in should never see the schema", () => {
@@ -352,7 +352,7 @@ describe("toolsForSettings", () => {
 
   it("appends task, skill, and read_skill_resource together when all three are enabled", () => {
     const result = toolsForSettings(tools, true, true, true, true, true);
-    expect(result.map((t) => t.function.name)).toEqual(["write_file", "remember", "run_shell", "task", "skill", "read_skill_resource"]);
+    expect(result.map((t) => t.function.name)).toEqual(["write_file", "remember", "run_shell", "task", "workflow", "skill", "read_skill_resource"]);
   });
 });
 

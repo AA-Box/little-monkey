@@ -145,6 +145,13 @@ export interface ChatSession {
    * exactly as they did before. Same wire-payload rule as `subagentRuns`:
    * NEVER read when building a turn's wire history. */
   subagentRunMeta?: Record<string, SubagentRunMeta>;
+  /** Finish-time snapshots of `workflow` tool runs (name/phases/status/
+   * timing), keyed by the originating `workflow` tool_call id — what keeps
+   * the Background-tasks drawer's workflow cards rendering after a restart
+   * wipes `workflowStore`. The agents' own stats live in `subagentRunMeta`
+   * exactly like any other subagent run. Same wire-payload rule: NEVER read
+   * when building a turn's wire history. */
+  workflowRunMeta?: Record<string, WorkflowRunMeta>;
   /** Original-preserving translations produced by an explicitly selected
    * model target. Records are append/replace by source digest rather than
    * overwriting `messages`, so exporting, retrying, or switching back to the
@@ -167,12 +174,26 @@ export interface SubagentRunMeta {
   /** Parallel-round group id — see `SubagentRun.groupId`. Persisted so the
    * Background-tasks drawer keeps grouping restored runs after a restart. */
   groupId?: string;
+  /** Owning workflow run id — see `SubagentRun.workflowRunId`. */
+  workflowRunId?: string;
   description: string;
   profile: "explore" | "code";
   startedAt: number;
   finishedAt: number;
   toolCallCount: number;
   usage?: UsageInfo;
+}
+
+/** The shape `runWorkflow`'s finish helper snapshots — everything the
+ * drawer's workflow card needs that the per-agent `SubagentRunMeta` entries
+ * can't provide (name, description, phase structure, run-level status). */
+export interface WorkflowRunMeta {
+  name: string;
+  description: string;
+  status: "done" | "error" | "cancelled";
+  startedAt: number;
+  finishedAt: number;
+  phases: { title: string; agents: { taskId: string; description: string }[] }[];
 }
 
 export interface MessageTranslation {
@@ -443,6 +464,12 @@ export interface SessionStore {
    * though `subagentStore`'s own copy is transient. No-ops if `sessionId`
    * no longer exists (deleted mid-run). */
   setSubagentRun: (sessionId: string, taskId: string, messages: ChatMessage[], meta?: SubagentRunMeta) => void;
+  /** Persists one workflow run's finish-time snapshot — see
+   * `ChatSession.workflowRunMeta`. Called once by `runWorkflow`'s `finish`. */
+  setWorkflowRun: (sessionId: string, runId: string, meta: WorkflowRunMeta) => void;
+  /** Empties `sessionId`'s `workflowRunMeta` — the drawer's "Clear" button,
+   * alongside `clearSubagentRunMeta`. */
+  clearWorkflowRunMeta: (sessionId: string) => void;
   /** Empties `sessionId`'s `subagentRunMeta` — the Background-tasks
    * drawer's "Clear" removing restored Finished entries permanently.
    * Deliberately leaves `subagentRuns` (the transcripts) alone: inline
@@ -657,6 +684,7 @@ function cloneSessionAsFork(source: ChatSession): ChatSession {
     docChatMode: source.docChatMode,
     subagentRuns: cloneSubagentRuns(source.subagentRuns),
     subagentRunMeta: source.subagentRunMeta ? structuredClone(source.subagentRunMeta) : {},
+    workflowRunMeta: source.workflowRunMeta ? structuredClone(source.workflowRunMeta) : {},
     messageTranslations: cloneMessageTranslations(source.messageTranslations),
     threadTranslations: cloneThreadTranslations(source.threadTranslations),
     displayTranslationLocale: source.displayTranslationLocale ?? null,
@@ -693,6 +721,7 @@ function cloneComparisonBranch(source: ChatSession, groupId: string, index: numb
     docChatMode: source.docChatMode,
     subagentRuns: cloneSubagentRuns(source.subagentRuns),
     subagentRunMeta: source.subagentRunMeta ? structuredClone(source.subagentRunMeta) : {},
+    workflowRunMeta: source.workflowRunMeta ? structuredClone(source.workflowRunMeta) : {},
     messageTranslations: cloneMessageTranslations(source.messageTranslations),
     threadTranslations: cloneThreadTranslations(source.threadTranslations),
     displayTranslationLocale: source.displayTranslationLocale ?? null,
@@ -720,6 +749,7 @@ function clonePromotedBranch(source: ChatSession): ChatSession {
     docChatMode: source.docChatMode,
     subagentRuns: cloneSubagentRuns(source.subagentRuns),
     subagentRunMeta: source.subagentRunMeta ? structuredClone(source.subagentRunMeta) : {},
+    workflowRunMeta: source.workflowRunMeta ? structuredClone(source.workflowRunMeta) : {},
     messageTranslations: cloneMessageTranslations(source.messageTranslations),
     threadTranslations: cloneThreadTranslations(source.threadTranslations),
     displayTranslationLocale: source.displayTranslationLocale ?? null,
@@ -2230,6 +2260,28 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
             }
           : s
       );
+      persist(sessions, state.activeSessionId, state.groups);
+      return { sessions };
+    });
+  },
+
+  setWorkflowRun: (sessionId, runId, meta) => {
+    set((state) => {
+      const target = state.sessions.find((s) => s.id === sessionId);
+      if (!target) return state;
+      const sessions = state.sessions.map((s) =>
+        s.id === sessionId ? { ...s, workflowRunMeta: { ...s.workflowRunMeta, [runId]: meta } } : s
+      );
+      persist(sessions, state.activeSessionId, state.groups);
+      return { sessions };
+    });
+  },
+
+  clearWorkflowRunMeta: (sessionId) => {
+    set((state) => {
+      const target = state.sessions.find((s) => s.id === sessionId);
+      if (!target || !target.workflowRunMeta || Object.keys(target.workflowRunMeta).length === 0) return state;
+      const sessions = state.sessions.map((s) => (s.id === sessionId ? { ...s, workflowRunMeta: {} } : s));
       persist(sessions, state.activeSessionId, state.groups);
       return { sessions };
     });

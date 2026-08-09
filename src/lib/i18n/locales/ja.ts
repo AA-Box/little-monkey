@@ -1121,6 +1121,7 @@ export const ja: Record<string, string> = {
   "BackgroundTasksPanel.agentStatusCancelled": "キャンセル済み",
   "BackgroundTasksPanel.agentGroupTitle": "{{count}} エージェント",
   "BackgroundTasksPanel.workflowKindLabel": "ワークフロー",
+  "BackgroundTasksPanel.phaseQueued": "待機中",
   "BackgroundTasksPanel.stopAllAriaLabel": "実行中のエージェントをすべて停止",
   "BackgroundTasksPanel.tableAgentHeader": "エージェント",
   "BackgroundTasksPanel.tableTokensHeader": "トークン",

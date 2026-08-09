@@ -750,6 +750,7 @@ export const en: Record<string, string> = {
   "BackgroundTasksPanel.agentStatusCancelled": "Cancelled",
   "BackgroundTasksPanel.agentGroupTitle": "{{count}} agents",
   "BackgroundTasksPanel.workflowKindLabel": "Workflow",
+  "BackgroundTasksPanel.phaseQueued": "Queued",
   "BackgroundTasksPanel.stopAllAriaLabel": "Stop all running agents",
   "BackgroundTasksPanel.tableAgentHeader": "Agent",
   "BackgroundTasksPanel.tableTokensHeader": "Tokens",
