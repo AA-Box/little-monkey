@@ -733,6 +733,25 @@ pub(crate) fn reap_desktop_processes_at_startup<R: tauri::Runtime>(
             return;
         }
     };
+    // Killed *before* the reap, because the reap is what erases the evidence: it
+    // closes every one of these rows, and the recorded pid is the only handle
+    // anything has on a Chromium tree the previous app process left running.
+    // Ordinary desktop kinds need no equivalent — their worker was a WebView loop
+    // that died with the app, so there is nothing left to signal.
+    match with_process_table(app, state, |table| {
+        Ok(crate::browser_worker::reclaim_orphaned_browser_sessions(
+            table,
+        ))
+    }) {
+        Ok(Ok(killed)) if killed > 0 => {
+            eprintln!("browser worker: killed {killed} orphaned Chromium process group(s)")
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) | Err(error) => {
+            eprintln!("browser worker: orphan reclaim failed: {error}")
+        }
+    }
+
     let scope = ProcessFilter {
         kinds: ProcessKind::DESKTOP_OWNED.to_vec(),
         ..ProcessFilter::default()
