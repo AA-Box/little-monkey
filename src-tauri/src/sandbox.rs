@@ -2889,14 +2889,27 @@ mod tests {
         // `type X > Y` creates Y and then fails, leaving errorlevel 1, so the
         // `&&` after it runs only when the read actually succeeded. Same for the
         // `echo >` overwrite.
+        //
+        // The *allow* half asks `if not exist` rather than trusting `||`. A run
+        // that exited 0 here still left both sandbox directories empty on the
+        // host — not even `forbidden-copy`, which `type` creates before it fails
+        // to read — so cmd called every one of those redirects a success. Rather
+        // than argue about when a failed `>` sets errorlevel, ask the container
+        // the question directly: is the file there. `dir` at the end reports
+        // what the container itself sees, which is the half the host listing in
+        // the assertion below cannot show.
         let command = format!(
             "if /I not \"%USERPROFILE%\"==\"{home}\" exit /b 70 \
              & if /I not \"%TMP%\"==\"{tmp}\" exit /b 70 \
              & (type \"{allowed}\" > \"%TMP%\\allowed-copy\" || exit /b 73) \
+             & if not exist \"%TMP%\\allowed-copy\" exit /b 73 \
              & (type \"{forbidden}\" > \"%TMP%\\forbidden-copy\" && exit /b 71) \
              & (echo overwritten> \"{forbidden}\" && exit /b 72) \
-             & (echo home-ok> \"%USERPROFILE%\\probe\" || exit /b 74) \
-             & (echo tmp-ok> \"%TMP%\\probe\" || exit /b 75) \
+             & (echo home-ok> \"%USERPROFILE%\\probe\") \
+             & if not exist \"%USERPROFILE%\\probe\" exit /b 74 \
+             & (echo tmp-ok> \"%TMP%\\probe\") \
+             & if not exist \"%TMP%\\probe\" exit /b 75 \
+             & dir /b \"%USERPROFILE%\" \"%TMP%\" \
              & exit /b 0",
             home = expected_home.display(),
             tmp = expected_tmp.display(),
@@ -2904,6 +2917,11 @@ mod tests {
             forbidden = canonical_forbidden.display(),
         );
 
+        // What the container reported about its own filesystem, kept past the
+        // loop: a failed write says "Access is denied." on stderr, and the
+        // trailing `dir /b` says what the container could see. Without these the
+        // probe assertions below can only report the host's half.
+        let mut container_view = String::new();
         for allow_network in [false, true] {
             let profile_path = sandbox_root.join(if allow_network {
                 "boundary-network.sb"
@@ -2941,6 +2959,11 @@ mod tests {
                 fs::read_to_string(&forbidden_file).expect("read real file after run"),
                 "must-stay-secret"
             );
+            container_view = format!(
+                "network={allow_network} stdout={:?} stderr={:?}",
+                String::from_utf8_lossy(&outcome.stdout),
+                String::from_utf8_lossy(&outcome.stderr)
+            );
         }
         // The in-container guards (74/75) already proved the writes succeeded.
         // These assert the separate claim that the host still sees them after the
@@ -2957,10 +2980,12 @@ mod tests {
         assert!(
             expected_home.join("probe").is_file(),
             "the container wrote a probe under {} and exited 0, but the host cannot \
-             see it afterwards; home contains [{}], tmp contains [{}]",
+             see it afterwards; home contains [{}], tmp contains [{}]; the \
+             container reported {}",
             expected_home.display(),
             listing(&expected_home),
-            listing(&expected_tmp)
+            listing(&expected_tmp),
+            container_view
         );
         assert!(
             expected_tmp.join("probe").is_file(),
