@@ -273,6 +273,10 @@ export interface RunSubagentTaskParams {
    * `subagentStore.start` and the finish-time `SubagentRunMeta` snapshot so
    * the Background-tasks drawer can group the round's runs into one card. */
   groupId?: string;
+  /** Set when this run is one agent of a `workflow` tool call — see
+   * `SubagentRun.workflowRunId`. Threaded into `subagentStore.start` and the
+   * finish-time meta snapshot, exactly like `groupId`. */
+  workflowRunId?: string;
   /** Short (3-6 word) label the model supplied — folded into the child's
    * system prompt so it knows what it's here to do. */
   description: string;
@@ -334,7 +338,7 @@ export interface RunSubagentTaskParams {
  */
 export async function runSubagentTask(params: RunSubagentTaskParams): Promise<string> {
   useUsageHistoryStore.getState().recordSubagentTaskStarted();
-  const { sessionId, runId, parentCheckpointId, parentSignal, taskId, toolCallId, groupId, description, prompt, profile, target, effort, risk, onMutatedPath, onMutationFailure } =
+  const { sessionId, runId, parentCheckpointId, parentSignal, taskId, toolCallId, groupId, workflowRunId, description, prompt, profile, target, effort, risk, onMutatedPath, onMutationFailure } =
     params;
 
   // The key `subagentStore`/`ChatSession.subagentRuns` are updated under —
@@ -355,7 +359,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
   // Registered immediately (before any streaming happens) so `SubagentRow`
   // can render a spinner for this task the instant the parent turn
   // dispatches it — not just once the first `attemptStream` call settles.
-  useSubagentStore.getState().start({ sessionId, taskId: storeKey, cancelId: taskId, groupId, description, profile });
+  useSubagentStore.getState().start({ sessionId, taskId: storeKey, cancelId: taskId, groupId, workflowRunId, description, profile });
 
   // Projected onto the unified process table as a child of the turn that
   // dispatched it. `taskId` (the cancel id) is the surface identifier rather
@@ -408,6 +412,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
         ? {
             status,
             groupId: live.groupId,
+            workflowRunId: live.workflowRunId,
             description: live.description,
             profile: live.profile,
             startedAt: live.startedAt,

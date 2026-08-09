@@ -26,7 +26,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { GENERATE_IMAGE_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, buildTools } from './tools';
+import { GENERATE_IMAGE_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools } from './tools';
 import { mcpToolDefs } from './mcpTools';
 import { isVisionCapableLocalModel, isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
@@ -569,7 +569,7 @@ export function toolsForSettings(
   });
   return [
     ...filtered,
-    ...(subagentsEnabled ? [TASK_TOOL] : []),
+    ...(subagentsEnabled ? [TASK_TOOL, WORKFLOW_TOOL] : []),
     ...(skillToolEnabled ? [SKILL_INVOKE_TOOL] : []),
     ...(readSkillResourceToolEnabled ? [READ_SKILL_RESOURCE_TOOL] : []),
   ];

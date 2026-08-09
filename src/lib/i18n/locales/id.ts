@@ -1122,6 +1122,7 @@ export const id: Record<string, string> = {
   "BackgroundTasksPanel.agentStatusCancelled": "Dibatalkan",
   "BackgroundTasksPanel.agentGroupTitle": "{{count}} agen",
   "BackgroundTasksPanel.workflowKindLabel": "Alur kerja",
+  "BackgroundTasksPanel.phaseQueued": "Dalam antrean",
   "BackgroundTasksPanel.stopAllAriaLabel": "Hentikan semua agen yang berjalan",
   "BackgroundTasksPanel.tableAgentHeader": "Agen",
   "BackgroundTasksPanel.tableTokensHeader": "Token",
