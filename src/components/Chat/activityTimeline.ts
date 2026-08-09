@@ -15,17 +15,20 @@ export interface ActivityCall {
  * original order. */
 export type AssistantRoundEntry =
   | { kind: "activity"; calls: ActivityCall[] }
-  | { kind: "tasks"; calls: ActivityCall[] };
+  | { kind: "tasks"; calls: ActivityCall[] }
+  | { kind: "workflows"; calls: ActivityCall[] };
 
 export function groupAssistantRound(
   toolCalls: ToolCall[],
   resultByCallId: ReadonlyMap<string, string>,
 ): AssistantRoundEntry[] {
-  const activityCalls = toolCalls.filter((call) => call.function.name !== "task");
+  const activityCalls = toolCalls.filter((call) => call.function.name !== "task" && call.function.name !== "workflow");
   const taskCalls = toolCalls.filter((call) => call.function.name === "task");
+  const workflowCalls = toolCalls.filter((call) => call.function.name === "workflow");
   const entries: AssistantRoundEntry[] = [];
   let emittedActivity = false;
   let emittedTasks = false;
+  let emittedWorkflows = false;
 
   const toActivityCall = (call: ToolCall): ActivityCall => ({
     id: call.id,
@@ -39,6 +42,11 @@ export function groupAssistantRound(
       if (!emittedTasks) {
         emittedTasks = true;
         entries.push({ kind: "tasks", calls: taskCalls.map(toActivityCall) });
+      }
+    } else if (call.function.name === "workflow") {
+      if (!emittedWorkflows) {
+        emittedWorkflows = true;
+        entries.push({ kind: "workflows", calls: workflowCalls.map(toActivityCall) });
       }
     } else if (!emittedActivity) {
       emittedActivity = true;
