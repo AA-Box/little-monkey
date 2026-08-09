@@ -42,6 +42,39 @@ describe("describeWeightFile", () => {
       ["split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors", "diffusion_model"],
       ["split_files/text_encoders/umt5_xxl_fp8_scaled.safetensors", "t5xxl"],
       ["C:\\models\\vae\\wan2.2_vae.safetensors", "vae"],
+      // Conditioning files, which the form previously left for the user to
+      // classify by hand — the slot exists, so the name should reach it.
+      ["ip-adapter-plus_sdxl_vit-h.safetensors", "ip_adapter"],
+      ["control_v11p_sd15_canny.pth", "control_net"],
+      ["controlnet-union-sdxl-1.0.safetensors", "control_net"],
+      ["photomaker-v2.bin", "photo_maker"],
+      ["pulid_flux_v0.9.1.safetensors", "pulid_weights"],
+      ["face_yolov8n.pt", "ad_model"],
+      ["hand_yolov8s.pt", "ad_model"],
+      ["mm_sd_v15_v2.ckpt", "motion_module"],
+      ["animatediff_lightning_4step.safetensors", "motion_module"],
+      ["ltxav_embeddings_connectors.safetensors", "embeddings_connectors"],
+      ["uncond_diffusion_model_fp16.safetensors", "uncond_diffusion_model"],
+    ] as const) {
+      expect(describeWeightFile(file).slot, file).toBe(slot);
+    }
+  });
+
+  /** Order inside `SLOT_HINTS` is the whole correctness story for these: each
+   *  file name contains a token that an earlier pattern would otherwise claim,
+   *  and being filed as the component it merely mentions is exactly the
+   *  tensor-shape error the slot logic exists to avoid. */
+  it("prefers the specific component over the one its name merely mentions", () => {
+    for (const [file, slot] of [
+      // Mentions the vision encoder it pairs with, but is not one.
+      ["ip-adapter_sd15_vit-h.safetensors", "ip_adapter"],
+      // Contains "diffusion_model" outright.
+      ["uncond-diffusion-model.safetensors", "uncond_diffusion_model"],
+      // Contains "sd15", which the SD family pattern also reads — family and
+      // slot are independent, and the slot must still be the motion module.
+      ["mm_sd_v15.ckpt", "motion_module"],
+      // A ControlNet whose name carries the hint type it was trained on.
+      ["control_v11f1p_sd15_depth.pth", "control_net"],
     ] as const) {
       expect(describeWeightFile(file).slot, file).toBe(slot);
     }
