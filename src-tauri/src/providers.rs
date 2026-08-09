@@ -27,8 +27,14 @@ use tokio::sync::Notify;
 
 use crate::run_scope::{RunScope, Unattributed};
 use crate::AppState;
+use crate::profiles::ProfileScopedPaths;
 
-const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.app"));
 
 /// Valid values for the app's effort scale — the five levels Anthropic's
 /// native `output_config.effort` field accepts. Other providers with a
@@ -219,8 +225,7 @@ impl RawModelEntry {
 /// Resolves (and creates, if missing) `<app_data_dir>/providers.json`'s path.
 fn providers_file_path(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     if !base.exists() {
         std::fs::create_dir_all(&base).map_err(|e| {
@@ -301,7 +306,7 @@ fn find_base_url(app: &AppHandle, id: &str) -> Result<String, String> {
 /// actual credential remains in the OS keychain and is still loaded only for
 /// the lifetime of one request.
 pub fn credential_ref_id(id: &str) -> String {
-    format!("keychain:{KEYCHAIN_SERVICE}:{id}")
+    format!("keychain:{}:{id}", *KEYCHAIN_SERVICE)
 }
 
 pub fn configured_endpoint(app: &AppHandle, id: &str) -> Result<String, String> {
@@ -309,13 +314,13 @@ pub fn configured_endpoint(app: &AppHandle, id: &str) -> Result<String, String> 
 }
 
 pub fn has_key(id: &str) -> bool {
-    keyring::Entry::new(KEYCHAIN_SERVICE, id)
+    keyring::Entry::new(&KEYCHAIN_SERVICE, id)
         .and_then(|e| e.get_password())
         .is_ok()
 }
 
 pub fn read_key(provider_id: &str) -> Result<String, String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, provider_id)
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, provider_id)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     entry.get_password().map_err(|e| match e {
         keyring::Error::NoEntry => {
@@ -365,7 +370,7 @@ pub fn read_key_with_env(provider_id: &str) -> Result<String, String> {
 }
 
 fn remove_key_impl(provider_id: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, provider_id)
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, provider_id)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     match entry.delete_credential() {
         Ok(()) => Ok(()),
@@ -636,7 +641,7 @@ pub async fn providers_set_key(
     let base_url = find_base_url(&app, &id)?;
     let models = fetch_models(&base_url, &id, &api_key).await?;
 
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &id)
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &id)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     entry
         .set_password(&api_key)

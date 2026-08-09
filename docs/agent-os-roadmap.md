@@ -3262,8 +3262,11 @@ approximations, named rather than hidden:** it is CPU-only, so a job blocked on 
 remote provider is charged almost nothing while holding a slot, and a
 GPU-saturating job is charged only for the CPU feeding it (`gpu_device_ms` exists
 in the ledger but no runtime here reports it — the upgrade is purely additive); and
-it shares across workspaces only, not profiles, because `RunSpec` carries no
-profile field to read.
+it ranks across workspaces only, because a queue can only rank what is in it.
+**Profiles are shared at a different layer, and K23 says why:** each profile has
+its own ledger and its own daemon, so no queue ever holds two profiles' jobs;
+what they contend for is the machine, so a profile's weight sets its fraction of
+system memory at admission instead of its position in a ranking.
 
 **Preemption suspends, never kills**, via K2's durable latch — writing
 `ProcessSignal::Suspend` rather than setting `pause_requested`, because
@@ -5187,7 +5190,7 @@ refusal to load rather than a warning.
 
 *Maps to: ROADMAP #8.*
 
-## K23. Local multi-profile identity
+## K23. Local multi-profile identity *(built)*
 
 **Today:** `profile_store.rs` handles profile payloads, migration, and scoped
 global search; credentials live in the OS keychain; the app is otherwise
@@ -5200,6 +5203,101 @@ and ledger partition, switchable without cross-profile leakage — verified by a
 test that asserts one profile cannot read another's artifacts, credentials, or
 run history. This is local isolation only; it does not introduce a hosted
 identity plane and does not conflict with the stated non-goal.
+
+**Shipped — the boundary is the data root, not a predicate.** `profiles.rs`
+owns one rule: a profile *is* a directory, and every store in this app —
+the run ledger, the artifact store, sessions, prompts, stacks, the package
+set, the daemon's queue and its snapshots — is a file under it. So "one
+profile cannot read another's run history" holds for the same reason it cannot
+read an unrelated SQLite file on the disk, and there is no shared table on
+which a `WHERE profile_id = ?` could be forgotten. The alternative — one
+database with an owner column — was rejected on exactly that point: it makes
+isolation a property of every query ever written rather than of the layout.
+
+**The chokepoint is a single path resolution, and that is why the diff reaches
+every subsystem.** The desktop asked Tauri for `app_data_dir()` in 63 places
+and `monkey-cli` asked `app_paths::data_dir()`; both now resolve through the
+active profile (`ProfileScopedPaths::profile_data_dir` and `data_dir`
+respectively), so a store added next year is profile-scoped by construction
+rather than by remembering. The registry itself lives at the *unscoped* base —
+it is the file that decides which root the rest resolve to, so it is the one
+thing that cannot live inside one.
+
+**The default profile keeps the legacy layout, so nothing is migrated.**
+`default` resolves to the app data directory itself and every other profile to
+`<app data>/profiles/<id>`. An existing installation *is* the default profile
+on first launch after upgrade: no data moves, no path changes, and the failure
+mode a migration would have introduced — a half-moved data root — does not
+exist. Non-default roots nest under the default's directory, which is
+deliberate and only safe because nothing sweeps that directory recursively;
+the backup/export path enumerates named files and a prefix-filtered set of
+transaction directories, never the tree.
+
+**Credentials needed a second mechanism, because the keychain is not a
+directory.** Path scoping cannot reach an OS keychain item, so
+`profiles::keychain_service` suffixes the *service* name with the profile id
+(`com.littlemonkey.app.profile.work`) at all thirteen service definitions
+across the app and the CLI. A second profile's secrets are a different keychain
+item that the first profile's code never names. `default` is unsuffixed, so
+every credential stored before this existed still resolves. Honest ceiling,
+recorded in the code: deleting a profile *orphans* its keychain items rather
+than deleting them — the `keyring` crate cannot enumerate a service's contents,
+so there is no list to walk, and reaching them again would need a profile
+recreated under the identical id.
+
+**Switching restarts the app, and the restart is the switch.** Nothing caches
+the active id; what is cached is everything built *from* a path — an open
+ledger connection, the artifact store handle, a spawned daemon, an MCP server's
+environment. Swapping the registry entry underneath those live handles is
+precisely how a cross-profile write gets committed, so `profiles_switch`
+records the choice atomically and then restarts. A new process holds none of
+the old profile's handles. The Settings panel confirms first, because a silent
+restart in the middle of a chat is not a settings toggle.
+
+**Quota (K4) and machine share (K8) are enforced, not merely stored.** The
+daemon reads the active profile's `ProfileLimits` once at startup:
+
+- **Concurrency** is `min(configured, quota.max_concurrent_runs)` — a quota
+  bounds, it never grants. Tested against four remote jobs, `concurrency: 4`
+  and a two-run quota: two run.
+- **Memory** enters `admission::fit` as a ceiling, so a profile holds its own
+  bound even on an idle machine. A claim larger than the ceiling is `Never`
+  rather than a hold, because a hold for memory that will never be released is
+  the starvation K8 spent a bound ruling out.
+- **Wall clock** clamps each job's own budget at the watchdog, and the kill
+  message says which of the two numbers tripped.
+
+**What the share weight can and cannot be, given separate queues.** K8 noted
+that fair-share covered workspaces only, "because `RunSpec` carries no profile
+field to read". Adding one would not have helped: with a ledger per profile,
+one daemon never sees another profile's jobs, so there is no queue in which to
+rank them against each other. What two profiles *do* contend for is the
+machine. So the weight sets each profile's fraction of system memory at
+admission — 1.0 and 3.0 split it 25/75 — and a single-profile installation is
+exactly 1.0, i.e. unchanged. **Named rather than hidden: this is a ceiling, not
+a work-conserving share.** An idle profile's fraction is not lent to a busy
+one, because neither daemon can see that the other is idle; lending it — and
+cross-profile arbitration inside one queue generally — needs an arbiter above
+both daemons, which is a different item than this one.
+
+**The acceptance test is the clause, against the real stores.** It writes a run
+and an artifact as `default`, switches, and then — through a `RunLedger` and an
+`ArtifactStore` opened exactly the way the app opens them — asserts the second
+profile lists no runs, cannot load the first profile's run by naming its id,
+cannot resolve its artifact by the content-addressed digest (guessable on
+purpose: knowing the id must not be access), and addresses a different keychain
+service. The first profile's history is then re-read to confirm the second
+profile's run did not land in it either.
+
+**Naming, so two things called "profile" stay distinct.** `team_mode.rs`'s
+members and the process table's `profile` column are *personas* — attribution
+for who is driving, explicitly not an authentication boundary. K23's profiles
+are data roots. They compose without interacting: a persona is recorded inside
+whichever profile's ledger is open.
+
+*Surfaces:* Settings → Profiles; `monkey profiles list|create|switch|rename|limits|delete|current`;
+`--profile <id>` / `LITTLE_MONKEY_PROFILE` to run one command as another
+identity without changing the app's.
 
 ## K24. Configuration and definition versioning *(met)*
 

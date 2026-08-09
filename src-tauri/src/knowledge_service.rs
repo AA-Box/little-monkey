@@ -24,7 +24,7 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
@@ -44,6 +44,14 @@ use crate::knowledge_pipeline::{
     SensitiveDataMode, SensitiveDataScanner, SourceObject, UrlSourcePolicy,
     EMBEDDING_CONTRACT_VERSION, EXTRACTOR_CONTRACT_VERSION,
 };
+use crate::profiles::ProfileScopedPaths;
+
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static WEBDAV_KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("little-monkey-knowledge-webdav"));
 
 const CATALOG_VERSION: u32 = 1;
 const MAX_RETRY_HISTORY: usize = 20;
@@ -746,8 +754,7 @@ pub fn knowledge_v2_background_config_get(
     app: AppHandle,
 ) -> Result<KnowledgeBackgroundRefreshConfig, String> {
     let app_data = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     load_background_refresh_config_at(&app_data)
 }
@@ -758,8 +765,7 @@ pub fn knowledge_v2_background_config_save(
     request: SaveKnowledgeBackgroundRefreshConfig,
 ) -> Result<KnowledgeBackgroundRefreshConfig, String> {
     let app_data = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     let previous = load_background_refresh_config_at(&app_data).unwrap_or_default();
     let config = validate_background_refresh_config(KnowledgeBackgroundRefreshConfig {
@@ -1226,7 +1232,7 @@ pub fn knowledge_v2_add_source(
             if password.len() > 16 * 1024 {
                 return Err("WebDAV credential is too large".to_string());
             }
-            keyring::Entry::new("little-monkey-knowledge-webdav", credential_ref)
+            keyring::Entry::new(&WEBDAV_KEYCHAIN_SERVICE, credential_ref)
                 .map_err(|error| format!("Failed to access keychain: {error}"))?
                 .set_password(&password)
                 .map_err(|error| format!("Failed to save WebDAV credential: {error}"))?;
@@ -1273,7 +1279,7 @@ pub fn knowledge_v2_update_source(
     }
     if let ConnectorConfig::WebDav { credential_ref, .. } = &connector {
         if let Some(password) = webdav_password {
-            keyring::Entry::new("little-monkey-knowledge-webdav", credential_ref)
+            keyring::Entry::new(&WEBDAV_KEYCHAIN_SERVICE, credential_ref)
                 .map_err(|error| format!("Failed to access keychain: {error}"))?
                 .set_password(&password)
                 .map_err(|error| format!("Failed to save WebDAV credential: {error}"))?;
@@ -1308,8 +1314,7 @@ pub fn knowledge_v2_update_source(
 pub fn knowledge_v2_remove_source(app: AppHandle, source_id: String) -> Result<(), String> {
     validate_id("source id", &source_id)?;
     let app_data = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     let root = data_root_at(&app_data)?;
     let _guard = catalog_lock()
@@ -1344,7 +1349,7 @@ pub fn knowledge_v2_remove_source(app: AppHandle, source_id: String) -> Result<(
         if !catalog.sources.iter().any(|source| {
             matches!(&source.connector, ConnectorConfig::WebDav { credential_ref: other, .. } if other == &credential_ref)
         }) {
-            if let Ok(entry) = keyring::Entry::new("little-monkey-knowledge-webdav", &credential_ref)
+            if let Ok(entry) = keyring::Entry::new(&WEBDAV_KEYCHAIN_SERVICE, &credential_ref)
             {
                 let _ = entry.delete_credential();
             }
@@ -1719,8 +1724,7 @@ pub async fn knowledge_v2_refresh(
     stack_id: String,
 ) -> Result<KnowledgeRefreshReport, String> {
     let app_data = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     let progress_app = app.clone();
     refresh_as_user_action(&app_data, &stack_id, &move |progress| {
@@ -2435,8 +2439,7 @@ pub fn knowledge_v2_is_stale(
     stack_id: String,
 ) -> Result<KnowledgeV2Staleness, String> {
     let app_data = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     v2_staleness_impl(&app_data, &stack_id)
 }
@@ -2630,7 +2633,7 @@ async fn collect_source_objects(
             credential_ref,
             allow_loopback,
         } => {
-            let password = keyring::Entry::new("little-monkey-knowledge-webdav", credential_ref)
+            let password = keyring::Entry::new(&WEBDAV_KEYCHAIN_SERVICE, credential_ref)
                 .map_err(|error| format!("Failed to access WebDAV keychain item: {error}"))?
                 .get_password()
                 .map_err(|error| format!("WebDAV credential is unavailable: {error}"))?;
@@ -3917,7 +3920,7 @@ fn watched_folder_handles() -> &'static Mutex<HashMap<String, WatchedFolderHandl
 /// caller — this runs on background/setup paths that have no UI to show one
 /// to anyway.
 pub fn sync_watched_folder_watchers(app: &AppHandle) {
-    let Ok(app_data) = app.path().app_data_dir() else {
+    let Ok(app_data) = app.profile_data_dir() else {
         return;
     };
     let Ok(root) = data_root_at(&app_data) else {
@@ -3969,7 +3972,7 @@ pub fn sync_watched_folder_watchers(app: &AppHandle) {
                 let app = app_for_refresh.clone();
                 let stack_id = stack_id.clone();
                 tauri::async_runtime::spawn(async move {
-                    let Ok(app_data) = app.path().app_data_dir() else {
+                    let Ok(app_data) = app.profile_data_dir() else {
                         return;
                     };
                     // Called from inside the spawned task, deliberately: the scope it
@@ -4691,8 +4694,7 @@ pub fn knowledge_v2_update_chunking(
 ) -> Result<KnowledgeStack, String> {
     validate_id("stack id", &stack_id)?;
     let stacks_root = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| error.to_string())?
         .join("stacks");
     crate::knowledge_core::update_chunking_impl(&stacks_root, &stack_id, chunk_chars, chunk_overlap)
@@ -4743,8 +4745,7 @@ pub async fn knowledge_v2_query(
     }
     let root = data_root(&app)?;
     let stacks_root = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| error.to_string())?
         .join("stacks");
     let stack = crate::knowledge_core::list_impl(&stacks_root)?

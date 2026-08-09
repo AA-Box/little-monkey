@@ -83,7 +83,12 @@ use crate::m3_runtime_hub::{
 
 use crate::http_policy::MAX_REQUEST_BODY_BYTES;
 
-const TLS_KEYCHAIN_SERVICE: &str = "com.littlemonkey.m3.lan-tls";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static TLS_KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.m3.lan-tls"));
 const MAX_TLS_PEM_BYTES: usize = 1024 * 1024;
 const REQUEST_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 const RUNTIME_HEADER: HeaderName = HeaderName::from_static("x-little-monkey-runtime-id");
@@ -125,7 +130,7 @@ fn validate_reference(reference: &str) -> Result<(), String> {
 
 fn tls_keychain_entry(reference: &str) -> Result<keyring::Entry, String> {
     validate_reference(reference)?;
-    keyring::Entry::new(TLS_KEYCHAIN_SERVICE, reference)
+    keyring::Entry::new(&TLS_KEYCHAIN_SERVICE, reference)
         .map_err(|error| format!("Could not access the M3 TLS keychain entry: {error}"))
 }
 

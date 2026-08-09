@@ -153,6 +153,7 @@ Each workbench is a real model-driven flow. Where its scope is narrower than its
 - Export a Run Capsule — a redacted, replayable record of a run — and replay it by class.
 - Track token usage and cost in **Settings → Usage**: per-request cost against rates you enter, daily and monthly budgets, and a `warn` or `pause` enforcement mode checked before every provider request. Rates are yours; the app never claims to read a provider invoice.
 - Get a Daily Brief aggregating real run, task, and read-only MCP state, and search everything with Universal Search, whose workspace filter is validated against the roots actually attached to this instance.
+- Keep separate identities on one machine in **Settings → Profiles**: each profile is its own data root — sessions, run history, artifacts, packages and keychain items — plus its own quota (max concurrent runs, memory, run time) and its own share of the machine, enforced by the daemon at admission. A profile cannot read another's runs, artifacts or credentials, because they are different files and different keychain services rather than differently-filtered rows. Switching restarts the app, since everything currently open belongs to the profile it started under; the default profile keeps the existing layout, so upgrading moves nothing. Local isolation only — no account service, no sign-in, nothing leaves the device. From a terminal: `monkey profiles list|create|switch|limits|delete`, or `--profile <id>` to run one command as another identity.
 
 ### Developer integrations
 
@@ -312,6 +313,14 @@ monkey api-serve [--port <port>]
 monkey processes [--kind <kind>] [--all] [--json]
 monkey processes show <id>
 monkey processes signal <id> stop|suspend|resume|kill
+
+monkey profiles list [--json]
+monkey profiles create <name>
+monkey profiles switch <id>
+monkey profiles rename <id> <name>
+monkey profiles limits <id> [--weight <n>] [--max-concurrent-runs <n>] [--max-memory-bytes <n>] [--max-runtime-ms <n>] [--clear]
+monkey profiles delete <id> --yes
+monkey profiles current [--json]
 
 monkey stacks list | reindex <name>
 monkey stacks embed-server start --model-path <embedding.gguf> | status | stop

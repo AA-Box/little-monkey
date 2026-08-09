@@ -33,10 +33,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tauri::Manager;
 
 use crate::run_protocol::RunEvent;
 use crate::AppState;
+use crate::profiles::ProfileScopedPaths;
 
 const TEAM_MEMBERS_FILE: &str = "team_members.json";
 
@@ -203,8 +203,7 @@ fn now_ms() -> u64 {
 
 fn team_members_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {}", e))?;
     Ok(dir.join(TEAM_MEMBERS_FILE))

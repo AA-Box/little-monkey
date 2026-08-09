@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Manager};
+use tauri::{Emitter};
+use crate::profiles::ProfileScopedPaths;
 
 use crate::config_revisions::{self, RecordRequest};
 
@@ -80,8 +81,7 @@ pub struct PromptEntry {
 
 fn app_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {}", e))?;
     Ok(dir)

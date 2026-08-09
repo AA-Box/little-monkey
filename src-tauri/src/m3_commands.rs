@@ -57,6 +57,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
+use crate::profiles::ProfileScopedPaths;
 
 /// Bounded per-runtime max for the runtime log tails a support bundle can
 /// embed — mirrors `M3RuntimeHub::runtime_logs`'s own cap on a single
@@ -346,10 +347,8 @@ pub fn m3_benchmark_history(
 }
 
 fn benchmark_history_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    use tauri::Manager as _;
     Ok(app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data dir: {error}"))?
         .join(BENCHMARK_FILE))
 }
@@ -1422,10 +1421,8 @@ pub fn m3_mlx_install(
     app: tauri::AppHandle,
     package_directory: String,
 ) -> Result<crate::m3_production::MlxInstalledPackageView, String> {
-    use tauri::Manager as _;
     let app_data_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     crate::m3_production::install_mlx_package(
         &app_data_dir,
@@ -1449,7 +1446,6 @@ pub fn m3_mlx_install_component(
     state: tauri::State<'_, M3CommandState>,
     component_id: String,
 ) -> Result<crate::m3_production::MlxInstalledPackageView, String> {
-    use tauri::Manager as _;
     let installed = state
         .component_hub
         .list_installed()
@@ -1471,8 +1467,7 @@ pub fn m3_mlx_install_component(
         .artifact_path
         .clone();
     let app_data_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     crate::m3_production::install_mlx_from_artifact(&app_data_dir, &artifact).map_err(command_error)
 }

@@ -8,7 +8,7 @@
 //! server's bearer token comes from one of two places, never from
 //! `mcp_servers.json` itself: either a manually pasted static token saved to
 //! the OS keychain via `mcp_set_http_token`/`mcp_remove_http_token` (same
-//! `keyring::Entry::new(KEYCHAIN_SERVICE, ...)` convention as
+//! `keyring::Entry::new(&KEYCHAIN_SERVICE, ...)` convention as
 //! `providers.rs`), or a generic MCP-spec OAuth 2.0 flow run via
 //! `mcp_oauth.rs`'s `mcp_oauth_connect` (RFC 8414 discovery + RFC 7591
 //! dynamic client registration + PKCE, built on `rmcp`'s
@@ -50,9 +50,10 @@ use rmcp::model::{
 use rmcp::service::{PeerRequestOptions, RunningService, ServiceError};
 use rmcp::transport::streamable_http_client::StreamableHttpError;
 use rmcp::RoleClient;
-use tauri::{Emitter, Manager};
+use tauri::{Emitter};
 
 use crate::{permissions, AppState};
+use crate::profiles::ProfileScopedPaths;
 
 /// Filename for the persisted server list under the app data directory.
 const CONFIG_FILE: &str = "mcp_servers.json";
@@ -108,7 +109,12 @@ const CONNECTION_SCOPE: crate::run_scope::RunScope =
 /// there; keychain entries are disambiguated by *account*, not service, so
 /// this file's `mcp:<id>` account prefix is what keeps the two features'
 /// entries apart within the one service namespace).
-const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.app"));
 
 /// The keychain *account* name under which server `id`'s HTTP bearer token
 /// is stored — `mcp:<id>`, distinguishing it from `providers.rs`'s
@@ -121,7 +127,7 @@ fn keychain_account(server_id: &str) -> String {
 /// Absence is normal (no token configured, or the server doesn't require
 /// one) — `None`, not an error, mirroring `providers::has_key`'s stance.
 fn read_http_token(server_id: &str) -> Option<String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+    keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(server_id))
         .ok()?
         .get_password()
         .ok()
@@ -132,7 +138,7 @@ fn read_http_token(server_id: &str) -> Option<String> {
 /// an orphaned credential behind. A missing entry is a no-op success, same
 /// as `providers.rs::remove_key_impl`.
 fn remove_http_token_impl(server_id: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(server_id))
         .map_err(|e| format!("Failed to access keychain: {}", e))?;
     match entry.delete_credential() {
         Ok(()) => Ok(()),
@@ -208,8 +214,7 @@ pub(crate) fn validate_id(id: &str) -> Result<(), String> {
 /// Resolves (and creates, if missing) `<app_data_dir>/mcp_servers.json`'s path.
 pub(crate) fn config_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {}", e))?;
     Ok(dir.join(CONFIG_FILE))
@@ -1290,7 +1295,7 @@ pub fn mcp_set_http_token(server_id: String, token: String) -> Result<(), String
     if token.is_empty() {
         return Err("Bearer token must not be empty".to_string());
     }
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(&server_id))
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(&server_id))
         .map_err(|e| format!("Failed to access keychain: {}", e))?;
     entry
         .set_password(token)

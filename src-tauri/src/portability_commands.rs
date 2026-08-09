@@ -17,7 +17,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{Emitter, Manager};
+use tauri::{Emitter};
 use url::Url;
 use uuid::Uuid;
 
@@ -29,8 +29,14 @@ use crate::portability::{
     PortableDataV1, PortableSession, SnapshotFileInfo, SnapshotRetentionPolicy,
     SnapshotWriteOutcome,
 };
+use crate::profiles::ProfileScopedPaths;
 
-const KEYCHAIN_SERVICE: &str = "com.littlemonkey.backup";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.backup"));
 const BACKUP_KEY_ACCOUNT: &str = "portable-snapshot-aes256gcm-v1";
 const BACKUP_CONFIG_FILE: &str = "backup_config.json";
 const SNAPSHOT_DIRECTORY: &str = "backups";
@@ -395,7 +401,7 @@ struct PublishedRestore {
 }
 
 fn app_data_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let root = app.path().app_data_dir().map_err(command_error)?;
+    let root = app.profile_data_dir().map_err(command_error)?;
     fs::create_dir_all(&root)
         .map_err(|error| format!("Failed to create {}: {error}", root.display()))?;
     Ok(root)
@@ -1066,7 +1072,7 @@ struct KeychainAes256Gcm {
 
 impl KeychainAes256Gcm {
     fn load_or_create() -> Result<Self, String> {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, BACKUP_KEY_ACCOUNT)
+        let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, BACKUP_KEY_ACCOUNT)
             .map_err(|error| format!("Failed to access backup keychain entry: {error}"))?;
         let key_bytes = match entry.get_password() {
             Ok(encoded) => base64::engine::general_purpose::STANDARD
@@ -1162,8 +1168,7 @@ impl CryptoProvider for KeychainAes256Gcm {
 }
 
 fn snapshot_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
+    app.profile_data_dir()
         .map(|path| snapshot_root_at(&path))
         .map_err(command_error)
 }
@@ -1394,8 +1399,7 @@ enum BackupClaimOutcome {
 }
 
 fn config_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
+    app.profile_data_dir()
         .map(|path| config_path_at(&path))
         .map_err(command_error)
 }
@@ -1769,7 +1773,7 @@ fn credential_account(config: &WebDavBackupConfig) -> String {
 }
 
 fn load_webdav_password(config: &WebDavBackupConfig) -> Result<String, String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, &credential_account(config))
+    keyring::Entry::new(&KEYCHAIN_SERVICE, &credential_account(config))
         .map_err(|error| format!("Failed to access WebDAV keychain entry: {error}"))?
         .get_password()
         .map_err(|error| format!("Failed to read WebDAV password from keychain: {error}"))
@@ -1820,7 +1824,7 @@ pub fn portable_snapshot_stage_source(
     app: tauri::AppHandle,
     request: PortableBundleRequest,
 ) -> Result<WebDavStagedSnapshot, String> {
-    let app_data = app.path().app_data_dir().map_err(command_error)?;
+    let app_data = app.profile_data_dir().map_err(command_error)?;
     stage_webdav_snapshot_at(&app_data, request)
 }
 
@@ -1856,7 +1860,7 @@ pub fn webdav_backup_status_at(app_data: &Path) -> Result<WebDavBackupStatus, St
 
 #[tauri::command]
 pub fn portable_webdav_status_get(app: tauri::AppHandle) -> Result<WebDavBackupStatus, String> {
-    let app_data = app.path().app_data_dir().map_err(command_error)?;
+    let app_data = app.profile_data_dir().map_err(command_error)?;
     webdav_backup_status_at(&app_data)
 }
 
@@ -1865,7 +1869,7 @@ pub fn portable_webdav_config_save(
     app: tauri::AppHandle,
     request: SaveWebDavConfigRequest,
 ) -> Result<WebDavBackupConfig, String> {
-    let app_data = app.path().app_data_dir().map_err(command_error)?;
+    let app_data = app.profile_data_dir().map_err(command_error)?;
     let mut claim = match acquire_backup_claim(
         &app_data,
         &format!("desktop-config-{}", Uuid::new_v4()),
@@ -1925,7 +1929,7 @@ pub fn portable_webdav_config_save(
         if password.is_empty() || password.len() > 16_384 {
             return Err("WebDAV password must be 1..=16384 characters".to_string());
         }
-        keyring::Entry::new(KEYCHAIN_SERVICE, &credential_account(&config))
+        keyring::Entry::new(&KEYCHAIN_SERVICE, &credential_account(&config))
             .map_err(|error| format!("Failed to access WebDAV keychain entry: {error}"))?
             .set_password(&password)
             .map_err(|error| format!("Failed to save WebDAV password in the keychain: {error}"))?;
@@ -2584,7 +2588,7 @@ pub async fn portable_webdav_run_due(
     app: tauri::AppHandle,
     force: bool,
 ) -> Result<WebDavBackgroundRunOutcome, String> {
-    let app_data = app.path().app_data_dir().map_err(command_error)?;
+    let app_data = app.profile_data_dir().map_err(command_error)?;
     run_due_webdav_backup(
         &app_data,
         &format!("desktop-{}-{}", std::process::id(), Uuid::new_v4()),
@@ -2633,7 +2637,7 @@ pub enum WebDavDownloadResponse {
 pub async fn portable_webdav_download_snapshot(
     app: tauri::AppHandle,
 ) -> Result<WebDavDownloadResponse, String> {
-    let app_data = app.path().app_data_dir().map_err(command_error)?;
+    let app_data = app.profile_data_dir().map_err(command_error)?;
     let mut claim = match acquire_backup_claim(
         &app_data,
         &format!("desktop-download-{}", Uuid::new_v4()),

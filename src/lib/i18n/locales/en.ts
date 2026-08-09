@@ -21,6 +21,7 @@ import { privacyFirewallLocale } from "./privacyFirewall";
 import { sandboxLocale } from "./sandbox";
 import { diagnosticsLocale } from "./diagnostics";
 import { redTeamLabLocale } from "./redTeamLab";
+import { profilesLocale } from "./profiles";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { spreadsheetCopilotLocale } from "./spreadsheetCopilot";
@@ -69,6 +70,7 @@ export const en: Record<string, string> = {
   ...sandboxLocale,
   ...diagnosticsLocale,
   ...redTeamLabLocale,
+  ...profilesLocale,
   ...teamModeLocale,
   ...knowledgeGraphExplorerLocale,
   ...spreadsheetCopilotLocale,

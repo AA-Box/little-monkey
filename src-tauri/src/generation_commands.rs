@@ -26,6 +26,7 @@ use crate::generation::{self, GenerationModelSpec, GenerationRequest, JobProgres
 use crate::managed_runtime::{self, STABLE_DIFFUSION};
 use crate::studio_tools;
 use crate::AppState;
+use crate::profiles::ProfileScopedPaths;
 
 const GALLERY_FILE: &str = "studio-gallery.json";
 /// The user's own model list. There is no built-in catalogue — this file is
@@ -155,8 +156,7 @@ fn now_ms() -> u64 {
 
 fn studio_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?
         .join("studio-v1");
     std::fs::create_dir_all(&dir)
@@ -174,8 +174,7 @@ fn model_root(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn artifacts(app: &AppHandle) -> Result<ArtifactStore, String> {
     let base = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     ArtifactStore::with_max_blob_size(base.join("content-v1"), 256 * 1024 * 1024)
         .map_err(|error| error.to_string())
@@ -224,8 +223,7 @@ fn engine_binary(app: &AppHandle) -> Result<PathBuf, String> {
     // integrity check reports a tampered component.
     crate::self_integrity::ensure_loadable()?;
     let app_data = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     let resource_dir = app.path().resource_dir().ok();
     if let Ok(Some(path)) =
@@ -295,7 +293,7 @@ fn binary_starts(binary: &Path) -> bool {
 
 #[tauri::command]
 pub fn generation_engine_status(app: AppHandle) -> Result<GenerationEngineStatus, String> {
-    let app_data = app.path().app_data_dir().ok();
+    let app_data = app.profile_data_dir().ok();
     // Presence, not verification: this runs on every Studio refresh, and
     // hashing the whole runtime tree here made switching tabs take seconds.
     // The launch path still verifies before spawning anything.
@@ -640,8 +638,7 @@ async fn run_speech(
     // binary and gets the same gate.
     crate::self_integrity::ensure_loadable()?;
     let app_data = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     // Speech has its own verified tree, pinned ahead of the chat engine's.
     if let Ok(Some(path)) = managed_runtime::materialize_bundled_runtime_for(

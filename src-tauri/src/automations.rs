@@ -16,7 +16,8 @@ use std::str::FromStr;
 
 use chrono::Utc;
 use croner::Cron;
-use tauri::{Emitter, Manager};
+use tauri::{Emitter};
+use crate::profiles::ProfileScopedPaths;
 
 const AUTOMATIONS_FILE: &str = "automations.json";
 
@@ -27,8 +28,7 @@ pub const AUTOMATIONS_CHANGED_EVENT: &str = "automations://changed";
 
 fn automations_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {e}"))?;
     Ok(dir.join(AUTOMATIONS_FILE))

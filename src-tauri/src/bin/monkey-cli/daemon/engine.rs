@@ -22,6 +22,7 @@ use super::store::{
     DECISION_ADMITTED, DECISION_HELD, DECISION_PREEMPTED, DECISION_REJECTED, DECISION_RESUMED,
 };
 use super::worktree::OwnedWorktree;
+use little_monkey_lib::profiles::ProfileLimits;
 
 /// How the engine learns what this machine has.
 ///
@@ -727,6 +728,10 @@ pub struct DaemonEngine<P, N, C> {
     hardware: HardwareProbe,
     /// Per-job scheduling facts, memoized. See [`JobFacts`].
     facts: HashMap<String, JobFacts>,
+    /// Ceilings the active profile (K23) holds this daemon to: its quota (K4)
+    /// and its share of the machine (K8). Defaulted to unbounded so every
+    /// existing call site keeps its arity — see `with_profile_limits`.
+    profile_limits: ProfileLimits,
     /// Jobs the *scheduler* suspended, and when, so a scheduler-driven
     /// suspension is distinguishable from an operator pressing Pause.
     ///
@@ -765,8 +770,30 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             immediate_termination: std::collections::HashSet::new(),
             hardware: probe_hardware,
             facts: HashMap::new(),
+            profile_limits: ProfileLimits::unbounded(),
             preempted: HashMap::new(),
         }
+    }
+
+    /// Holds this daemon to the active profile's quota and machine share.
+    ///
+    /// A setter rather than a ninth constructor argument for the same reason
+    /// `set_hardware_probe` is one: there is a single production answer, read
+    /// once at startup from the registry, and no test should have to restate
+    /// "unbounded" to keep compiling.
+    #[must_use]
+    pub fn with_profile_limits(mut self, limits: ProfileLimits) -> Self {
+        self.profile_limits = limits;
+        self
+    }
+
+    /// This job's wall-clock ceiling: the lower of what it asked for and what
+    /// the profile allows.
+    fn effective_runtime_ms(&self, job: &DaemonJob) -> u64 {
+        self.profile_limits
+            .quota
+            .clamp_runtime_ms(Some(job.max_runtime_ms))
+            .unwrap_or(job.max_runtime_ms)
     }
 
     /// Swap the hardware probe. Exists so admission can be tested against a
@@ -1046,7 +1073,13 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
 
         self.release_preemptions(&candidates, now)?;
 
-        let mut slots = usize::try_from(self.config.concurrency)
+        // The profile's own ceiling applies on top of the configured
+        // concurrency, and only ever downward: a quota is a bound, not a grant.
+        let concurrency = self
+            .profile_limits
+            .quota
+            .clamp_concurrency(self.config.concurrency);
+        let mut slots = usize::try_from(concurrency)
             .unwrap_or(usize::MAX)
             .saturating_sub(self.active.len());
         if slots == 0 || candidates.is_empty() {
@@ -1104,7 +1137,13 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                     // which is what keeps the model reserved until the *last*
                     // holder exits.
                     Some(paid) => Fit::Fits { claim: paid },
-                    None => admission::fit(&reservation, &sum_reservations(&resident), snapshot),
+                    None => admission::fit(
+                        &reservation,
+                        &sum_reservations(&resident),
+                        snapshot,
+                        self.profile_limits
+                            .memory_ceiling_bytes(snapshot.total_ram_bytes),
+                    ),
                 };
                 match outcome {
                     Fit::Fits { claim: fitted } => {
@@ -1909,7 +1948,13 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             // back — recording the same claim is what keeps it reserved until the
             // last of them exits.
             Some(paid) => Fit::Fits { claim: paid },
-            None => admission::fit(&reservation, &sum_reservations(&resident), &snapshot),
+            None => admission::fit(
+                &reservation,
+                &sum_reservations(&resident),
+                &snapshot,
+                self.profile_limits
+                    .memory_ceiling_bytes(snapshot.total_ram_bytes),
+            ),
         };
         Ok(match outcome {
             Fit::Fits { claim } => Reacquired::Fits(
@@ -2176,16 +2221,22 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         // whoever reads the exit whether the budget was wrong or the job was.
         if let Some(started) = job.started_at_ms {
             let elapsed = now.saturating_sub(started);
-            if elapsed > job.max_runtime_ms {
+            // The profile's quota can only tighten the job's own budget, and
+            // the message names the number that actually tripped so an operator
+            // can tell a job's budget from an identity's ceiling.
+            let budget = self.effective_runtime_ms(&job);
+            if elapsed > budget {
+                let source = if budget < job.max_runtime_ms {
+                    " (profile quota)"
+                } else {
+                    ""
+                };
                 self.cancel_for_budget(
                     job_id,
                     run_id,
                     now,
                     BudgetLimit::Wall,
-                    &format!(
-                        "ran for {elapsed} ms against a {} ms budget",
-                        job.max_runtime_ms
-                    ),
+                    &format!("ran for {elapsed} ms against a {budget} ms budget{source}"),
                 )?;
                 return Ok(());
             }
@@ -3493,6 +3544,51 @@ pub(super) mod tests {
             job_state(&engine, "job-e"),
             JobState::Running,
             "a 1 GiB job must not be invisible behind four held 12 GiB ones"
+        );
+    }
+
+    /// K23/K4: a profile's quota binds *before* the daemon's own configuration
+    /// does, and only downward. Four remote jobs — nothing to reserve, so
+    /// memory cannot be what holds them — against `concurrency: 4` and a
+    /// two-run quota.
+    #[test]
+    fn a_profiles_quota_admits_fewer_jobs_than_the_configured_concurrency() {
+        let paths = sched_paths("quota");
+        let mut store = DaemonStore::open(&paths).unwrap();
+        for label in ["a", "b", "c", "d"] {
+            sched_job(
+                &paths,
+                &mut store,
+                // `bytes: 0` leaves the frozen provider target in place, which
+                // admission treats as remote: no local claim, no memory hold.
+                &SchedJob::new(label, RunKind::Background, 0, &format!("m-{label}")),
+            );
+        }
+        drop(store);
+        let mut engine = sched_engine(
+            &paths,
+            fake_adapter(),
+            4,
+            FakeClock(Arc::new(Mutex::new(2_000))),
+        )
+        .with_profile_limits(ProfileLimits {
+            quota: little_monkey_lib::profiles::ProfileQuota {
+                max_concurrent_runs: Some(2),
+                max_memory_bytes: None,
+                max_runtime_ms: None,
+            },
+            memory_share: 1.0,
+        });
+
+        engine.tick().unwrap();
+
+        let running = ["job-a", "job-b", "job-c", "job-d"]
+            .iter()
+            .filter(|job| job_state(&engine, job) == JobState::Running)
+            .count();
+        assert_eq!(
+            running, 2,
+            "the profile quota must bound dispatch below `concurrency: 4`"
         );
     }
 

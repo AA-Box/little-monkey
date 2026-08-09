@@ -47,9 +47,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tauri::Manager;
 
 use crate::AppState;
+use crate::profiles::ProfileScopedPaths;
 
 /// How many finished checkpoints to keep on disk before pruning the oldest,
 /// when the caller doesn't pass an explicit `max_keep`.
@@ -485,8 +485,7 @@ impl CheckpointInfo {
 
 fn checkpoints_base_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?
         .join("checkpoints");
     std::fs::create_dir_all(&dir)
