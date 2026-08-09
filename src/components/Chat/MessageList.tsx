@@ -117,6 +117,10 @@ export interface MessageListProps {
   /** Prepares a generated PNG as an image attachment in the composer so the
    * user can describe an edit before sending another turn. */
   onEditGeneratedImage?: (path: string, prompt: string, artifactId?: string) => void | Promise<void>;
+  /** Opens the Background-tasks drawer — threaded to `SubagentGroupCard` so
+   * clicking a parallel-agents card reveals its per-agent table there (see
+   * that component's `onOpenPanel`). Omitted keeps the inline expansion. */
+  onOpenBackgroundTasks?: () => void;
 }
 
 type TimelineItem =
@@ -1112,6 +1116,7 @@ export default function MessageList({
   messageIndexOffset = 0,
   onStartSideTask,
   onEditGeneratedImage,
+  onOpenBackgroundTasks,
 }: MessageListProps) {
   const { t } = useT();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -1216,7 +1221,7 @@ export default function MessageList({
               );
             }
             if (item.kind === "subagentGroup") {
-              return <SubagentGroupCard key={item.key} sessionId={sessionId} tasks={item.tasks} />;
+              return <SubagentGroupCard key={item.key} sessionId={sessionId} tasks={item.tasks} onOpenPanel={onOpenBackgroundTasks} />;
             }
             if (item.kind === "notice") {
               return <NoticeRow key={item.key} text={item.text} />;

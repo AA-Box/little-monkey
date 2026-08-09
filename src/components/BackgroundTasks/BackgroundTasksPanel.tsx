@@ -379,7 +379,7 @@ function AgentGroupCard({ runs }: { runs: SubagentRun[] }) {
         )}
       </div>
       <div className="mt-1 flex items-center gap-2 text-xs">
-        <span className="text-muted">{t("BackgroundTasksPanel.agentKindLabel")}</span>
+        <span className="text-muted">{t("BackgroundTasksPanel.workflowKindLabel")}</span>
         <span className="text-faint">{formatElapsed((settledAt ?? Date.now()) - startedAt)}</span>
         <span className="text-faint">{t("BackgroundTasksPanel.tokenUsage", { count: formatCompactTokens(totalTokens) })}</span>
         {running && <Loader2 size={11} className="shrink-0 animate-spin text-warning" />}

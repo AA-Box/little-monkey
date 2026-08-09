@@ -1120,6 +1120,7 @@ export const hi: Record<string, string> = {
   "BackgroundTasksPanel.agentStatusFailed": "विफल",
   "BackgroundTasksPanel.agentStatusCancelled": "रद्द",
   "BackgroundTasksPanel.agentGroupTitle": "{{count}} एजेंट",
+  "BackgroundTasksPanel.workflowKindLabel": "वर्कफ़्लो",
   "BackgroundTasksPanel.stopAllAriaLabel": "सभी चल रहे एजेंट रोकें",
   "BackgroundTasksPanel.tableAgentHeader": "एजेंट",
   "BackgroundTasksPanel.tableTokensHeader": "टोकन",
