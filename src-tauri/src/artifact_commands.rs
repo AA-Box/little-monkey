@@ -9,10 +9,10 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::Serialize;
-use tauri::Manager;
 
 use crate::artifact_store::{ArtifactBlob, ArtifactStore};
 use crate::AppState;
+use crate::profiles::ProfileScopedPaths;
 
 const STORE_DIRECTORY: &str = "content-v1";
 
@@ -33,8 +33,7 @@ pub(crate) fn store_for(app: &tauri::AppHandle, state: &AppState) -> Result<Arti
     }
 
     let root = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data dir: {error}"))?
         .join(STORE_DIRECTORY);
     let store = ArtifactStore::new(root).map_err(|error| error.to_string())?;
