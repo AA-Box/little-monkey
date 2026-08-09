@@ -865,6 +865,7 @@ fn persist_recipe(
         timeout_seconds: Some(24 * 60 * 60),
         output: RecipeOutput { json: true },
         desktop_turn: None,
+        placed_run: None,
     };
     little_monkey_lib::recipes::validate_recipe(&recipe)?;
     let bytes = serde_json::to_vec_pretty(&recipe).map_err(|error| error.to_string())?;

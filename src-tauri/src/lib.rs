@@ -208,6 +208,13 @@ pub mod triage;
 // Tauri-free static-registry + comparison logic shared by `providers.rs`'s
 // cloud-model command and `m3_runtime_hub.rs`'s local-model staleness check.
 pub mod model_retirement;
+// Remote node as a scheduled device (roadmap K17): the placement plane's wire
+// shapes and its pure decisions — which node qualifies, which one wins, whether
+// a node is still alive, and what a vanished node means for the work placed on
+// it. Tauri-free and I/O-free so the daemon binary, the CLI controller, and the
+// desktop all read the same contract, and so every decision is testable without
+// the second machine the rest of K17 genuinely needs.
+pub mod node_placement;
 // `pub` so `monkey-cli`'s `Stacks` subcommand (RAG design doc, slice 4) can call
 // `stacks::query_stacks` directly, the same AppHandle-free-core reasoning as
 // `checkpoints`/`rules`/`memory`. The registry half it also needs comes from
