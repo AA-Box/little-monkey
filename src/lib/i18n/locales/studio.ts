@@ -152,6 +152,23 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.chooseFolder": "Choose folder…",
   "Studio.add.clearFolder": "Clear folder",
   "Studio.add.noFolder": "None",
+  // Launch-time engine switches. Each hint says what it costs as well as what
+  // it buys — every one of these is a trade, and a checkbox that only promises
+  // the upside gets turned on by everybody and blamed for the downside.
+  "Studio.add.engineOptions": "Engine options",
+  "Studio.add.vaeTiling": "Decode the image in tiles",
+  "Studio.add.vaeTilingHint":
+    "Uses far less memory at the final decode, which is what usually fails on a large image. Slightly slower, and very occasionally leaves a faint seam.",
+  "Studio.add.offloadToCpu": "Keep weights in system memory",
+  "Studio.add.offloadToCpuHint":
+    "Holds the model in RAM and moves each part to the GPU as it is needed, so a model larger than the card can still run. Noticeably slower.",
+  "Studio.add.flashAttention": "Flash attention",
+  "Studio.add.flashAttentionHint":
+    "Faster and lighter on memory in the diffusion model. Not supported by every backend — turn it off if generation fails at startup.",
+  "Studio.add.seamless": "Tileable output",
+  "Studio.add.seamlessHint":
+    "Makes the result repeat without a visible join, for textures and patterns. Set per model rather than per image, because the engine takes it at startup.",
+
   "Studio.add.engineArgs": "Extra engine arguments",
   "Studio.add.engineArgsHint":
     "Passed to the engine as typed — no shell, so quote any path with spaces. This is how flags without their own field are reached: --vae-format, --model-args.",
