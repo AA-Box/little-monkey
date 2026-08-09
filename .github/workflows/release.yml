@@ -184,12 +184,93 @@ jobs:
           # No-op when the signing secrets are missing (nothing to describe).
           includeUpdaterJson: true
 
+  # Installs what the matrix just built, on the platform it was built for
+  # (roadmap K22). Between `release` and `publish` deliberately: a release that
+  # cannot be installed must not be published, and a draft is still retractable.
+  #
+  # Every leg reports PASS, FAIL, or SKIPPED **with its reason** — a hosted
+  # runner cannot exercise every installer, and the first release ever has
+  # nothing to upgrade from, so "not covered here" is often the honest answer
+  # and is said out loud in the job summary. Only a real failure is fatal;
+  # failing a release because a leg was inapplicable would train everyone to
+  # ignore this job.
+  install-smoke:
+    needs: release
+    name: install smoke (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            label: macOS
+          - platform: ubuntu-22.04
+            label: Linux
+          - platform: windows-latest
+            label: Windows
+
+    runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Download this release's installers
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          mkdir -p artifacts
+          # A draft release's assets are only reachable with a token, which is
+          # the whole reason this runs inside the workflow rather than against
+          # the public download URL.
+          gh release download "$VERSION" --dir artifacts --clobber || \
+            echo "no assets downloaded for $VERSION — the smoke test will report SKIPPED with that reason"
+
+      - name: Download the previous release's installers
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          mkdir -p previous
+          # The newest published, non-draft release that is not this one. Absent
+          # for the first release ever, which the upgrade leg reports as a skip
+          # rather than treating as a pass.
+          PREVIOUS="$(gh release list --limit 20 --json tagName,isDraft,isPrerelease \
+            --jq "[.[] | select(.isDraft == false and .isPrerelease == false) | .tagName] | map(select(. != \"$VERSION\")) | .[0] // empty")"
+          if [ -z "$PREVIOUS" ]; then
+            echo "PREVIOUS_VERSION=" >> "$GITHUB_ENV"
+            echo "no previous release found — the upgrade leg will report SKIPPED with that reason"
+            exit 0
+          fi
+          echo "PREVIOUS_VERSION=$PREVIOUS" >> "$GITHUB_ENV"
+          gh release download "$PREVIOUS" --dir previous --clobber || \
+            echo "the previous release ($PREVIOUS) published nothing downloadable"
+
+      - name: Clean install and upgrade smoke test
+        shell: bash
+        run: |
+          node scripts/install-smoke.mjs \
+            --artifacts artifacts \
+            --previous previous \
+            --previous-version "${PREVIOUS_VERSION:-}"
+
   # Publishing is what makes the release real: GitHub serves no draft assets,
   # so until this runs `/releases/latest/download/latest.json` 404s and no
   # installed app sees the update. It needs the whole matrix, so a target that
   # failed leaves the release a draft rather than shipping a partial one.
   publish:
-    needs: release
+    # Waits on the smoke test too: a release that cannot be installed must not
+    # be published. A skipped leg does not block — it is reported, not fatal.
+    needs: [release, install-smoke]
     runs-on: ubuntu-22.04
 
     steps:
