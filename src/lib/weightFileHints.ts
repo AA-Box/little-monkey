@@ -37,6 +37,26 @@ const SLOT_HINTS: [RegExp, ComponentSlot][] = [
   [/mmproj/i, "mmproj"],
   [/vocoder|wavtokenizer/i, "vocoder"],
   [/taesd/i, "taesd"],
+  // Conditioning, before the encoder patterns below it. These files carry an
+  // architecture tag as often as not — `ip-adapter-plus_sdxl_vit-h` — and the
+  // whole point of naming the slot is that a conditioning file must not be
+  // filed as the encoder it merely mentions.
+  [/photo[._-]?maker/i, "photo_maker"],
+  [/pulid/i, "pulid_weights"],
+  [/ip[._-]?adapter/i, "ip_adapter"],
+  // `controlnet-union-sdxl` names itself, but the ControlNet 1.1 family — by
+  // far the most common — does not: those ship as `control_v11p_sd15_canny`,
+  // `control_sd15_openpose`, `control-lora-depth`. Matching the leading
+  // `control` token is what actually covers them. T2I-Adapter fills the same
+  // engine slot.
+  [/control[._-]?net|(^|[^a-z])control[._-]|t2i[._-]?adapter|(^|[^a-z])cn[._-]/i, "control_net"],
+  // ADetailer's detector. These ship as YOLO weights and are named for what
+  // they find — `face_yolov8n`, `hand_yolov8s`, `person_yolov8m-seg`.
+  [/yolo|[._-]detect(or|ion)?([^a-z]|$)/i, "ad_model"],
+  [/motion[._-]?module|animate[._-]?diff|(^|[^a-z])mm[._-]sd/i, "motion_module"],
+  [/embeddings?[._-]?connectors?/i, "embeddings_connectors"],
+  // Before the diffusion-model pattern, which its own file name contains.
+  [/uncond/i, "uncond_diffusion_model"],
   [/clip[._\-/]?vision|clip_?vit|vision[._\-/]?encoder/i, "clip_vision"],
   [/clip[._-]?l(?![a-z])/i, "clip_l"],
   [/clip[._-]?g(?![a-z])/i, "clip_g"],
