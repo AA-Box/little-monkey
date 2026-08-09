@@ -1531,6 +1531,8 @@ pub fn run() {
             generation_commands::studio_tool_manifest,
             generation_commands::studio_tool_run,
             generation_commands::studio_tool_stop,
+            generation_commands::studio_tools_running,
+            generation_commands::studio_tool_import_catalog,
             m7_companion::m7_image_generate,
             m7_companion::m7_image_gallery,
             m7_companion::m7_image_data_url,

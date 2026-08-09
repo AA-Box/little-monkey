@@ -51,14 +51,20 @@ export function ToolPanel({ railSlot }: Props) {
   const [values, setValues] = useState<ToolInputs>({});
   const [results, setResults] = useState<GenerationEntry[]>([]);
   const [previews, setPreviews] = useState<Record<string, string>>({});
+  const [running, setRunningTools] = useState<string[]>([]);
   const [installing, setInstalling] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
-  const [running, setRunning] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      setTools(await toolsClient.list());
+      const [library, resident] = await Promise.all([
+        toolsClient.list(),
+        toolsClient.running(),
+      ]);
+      setTools(library);
+      setRunningTools(resident);
     } catch (cause) {
       setError(String(cause));
     }
@@ -72,24 +78,38 @@ export function ToolPanel({ railSlot }: Props) {
   // already reads. A failure here is not worth an error banner: it only means
   // the "available" list stays empty, and the installed list — the half that
   // matters — is unaffected.
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const entries = await runtimeHubClient.componentListRegistry({
-          operationId: createM3OperationId("studio-tools"),
-        });
-        if (!cancelled) {
-          setAvailable(entries.filter((entry) => entry.kind === "studio_tool"));
-        }
-      } catch {
-        if (!cancelled) setAvailable([]);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+  const loadAvailable = useCallback(async () => {
+    try {
+      const entries = await runtimeHubClient.componentListRegistry({
+        operationId: createM3OperationId("studio-tools"),
+      });
+      setAvailable(entries.filter((entry) => entry.kind === "studio_tool"));
+    } catch {
+      setAvailable([]);
+    }
   }, []);
+
+  useEffect(() => {
+    void loadAvailable();
+  }, [loadAvailable]);
+
+  /** A catalog is a small JSON file a publisher hands out. Importing one is
+   *  what puts entries behind the Install buttons below — the registry starts
+   *  empty and there is no catalog server to poll. */
+  const importCatalog = async () => {
+    const picked = await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: "Tool catalog", extensions: ["json"] }],
+    });
+    if (typeof picked !== "string") return;
+    setError(null);
+    try {
+      setAvailable(await toolsClient.importCatalog(picked));
+    } catch (cause) {
+      setError(String(cause));
+    }
+  };
 
   const selected = useMemo(
     () => tools.find((tool) => tool.id === selectedId) ?? null,
@@ -115,6 +135,9 @@ export function ToolPanel({ railSlot }: Props) {
         if (cancelled) return;
         setManifest(served);
         setValues(toolDefaults(served));
+        // Starting it changed what is resident, and that drives whether the
+        // release buttons are offered at all.
+        setRunningTools(await toolsClient.running());
       } catch (cause) {
         if (!cancelled) setError(String(cause));
       } finally {
@@ -229,7 +252,7 @@ export function ToolPanel({ railSlot }: Props) {
 
   const run = async () => {
     if (!manifest || missing.length > 0) return;
-    setRunning(true);
+    setBusy(true);
     setError(null);
     try {
       const entries = await toolsClient.run(selectedId, values);
@@ -242,7 +265,7 @@ export function ToolPanel({ railSlot }: Props) {
     } catch (cause) {
       setError(String(cause));
     } finally {
-      setRunning(false);
+      setBusy(false);
     }
   };
 
@@ -322,7 +345,12 @@ export function ToolPanel({ railSlot }: Props) {
       </section>
 
       <section className="mb-4">
-        <h2 className="mb-2 text-xs font-medium text-muted">{t("Studio.tools.available")}</h2>
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-xs font-medium text-muted">{t("Studio.tools.available")}</h2>
+          <Button size="sm" variant="secondary" onClick={() => void importCatalog()}>
+            {t("Studio.tools.importCatalog")}
+          </Button>
+        </div>
         {available.length === 0 ? (
           <p className="text-xs text-faint">{t("Studio.tools.noneAvailable")}</p>
         ) : (
@@ -409,7 +437,7 @@ export function ToolPanel({ railSlot }: Props) {
                     </div>
                   </SettingsCard>
                   <Button
-                    disabled={running || missing.length > 0}
+                    disabled={busy || missing.length > 0}
                     onClick={() => void run()}
                     title={
                       missing.length > 0
@@ -417,15 +445,34 @@ export function ToolPanel({ railSlot }: Props) {
                         : undefined
                     }
                   >
-                    {running ? t("Studio.tools.running") : t("Studio.tools.run")}
+                    {busy ? t("Studio.tools.running") : t("Studio.tools.run")}
                   </Button>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    onClick={() => void toolsClient.stop()}
-                  >
-                    {t("Studio.tools.stop")}
-                  </Button>
+                  {/* Only offered for tools actually holding memory, and
+                      scoped to the selected one — several stay warm at once, so
+                      an unconditional "release everything" would throw away a
+                      tool the user is mid-way through using. */}
+                  {running.includes(selectedId) && (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => {
+                        void toolsClient.stop(selectedId).then(refresh);
+                      }}
+                    >
+                      {t("Studio.tools.stop")}
+                    </Button>
+                  )}
+                  {running.length > 1 && (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => {
+                        void toolsClient.stop().then(refresh);
+                      }}
+                    >
+                      {t("Studio.tools.stopAll", { count: String(running.length) })}
+                    </Button>
+                  )}
                 </>
               ) : null}
             </div>,
