@@ -15,7 +15,7 @@
  * thing that makes inpainting usable.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Eraser, Paintbrush, Trash2 } from "lucide-react";
+import { Eraser, Paintbrush, Redo2, Trash2, Undo2 } from "lucide-react";
 
 import { Button, IconButton } from "../ui";
 import { useT } from "../../lib/i18n";
@@ -25,6 +25,13 @@ import { useT } from "../../lib/i18n";
 const MIN_BRUSH = 8;
 const MAX_BRUSH = 256;
 const DEFAULT_BRUSH = 64;
+
+/** How many strokes back undo reaches. Each entry is a full PNG of the mask —
+ *  cheap for the mostly-black images a mask is, but not free on a 2048px
+ *  source, so the tail is dropped rather than kept forever.
+ *  ponytail: whole-canvas snapshots, switch to dirty-rect diffs if a long
+ *  session on a large image gets heavy. */
+const MAX_UNDO = 24;
 
 interface Props {
   /** Bare base64 (no data URL prefix) of the image being painted over. */
@@ -44,6 +51,15 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
   const [brush, setBrush] = useState(DEFAULT_BRUSH);
   const [erasing, setErasing] = useState(false);
   const [size, setSize] = useState<{ width: number; height: number } | null>(null);
+  /** The mask as it stood before each stroke, and — once undone — the strokes
+   *  taken back. `null` is a legal entry: it is the empty mask, which is where
+   *  the first stroke and every clear start from. */
+  const [past, setPast] = useState<(string | null)[]>([]);
+  const [future, setFuture] = useState<(string | null)[]>([]);
+  /** The mask at `pointerdown`, held until the stroke commits: what undo has to
+   *  put back is where the canvas was before the brush touched it, not where it
+   *  is once the stroke has been painted. */
+  const before = useRef<string | null>(null);
 
   const source = `data:image/png;base64,${imageBase64}`;
 
@@ -63,6 +79,11 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
       if (!context) return;
       context.fillStyle = "#000";
       context.fillRect(0, 0, element.width, element.height);
+      // The history describes strokes over the old image. Over this one they
+      // are meaningless, so undo starts empty rather than able to paste a mask
+      // drawn for something else.
+      setPast([]);
+      setFuture([]);
       onChange(null);
     };
     image.src = source;
@@ -113,13 +134,56 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
   const commit = useCallback(() => {
     const element = canvas.current;
     if (!element) return;
+    const previous = before.current;
+    setPast((current) => [...current, previous].slice(-MAX_UNDO));
+    // A new stroke is a new branch: what was undone is no longer ahead of us.
+    setFuture([]);
     onChange(element.toDataURL("image/png").split(",")[1] ?? null);
   }, [onChange]);
+
+  /** Repaints the canvas to hold exactly `mask` — black everywhere when it is
+   *  null, which is what an empty mask is. */
+  const paint = (mask: string | null) => {
+    const element = canvas.current;
+    const context = element?.getContext("2d");
+    if (!element || !context) return;
+    context.fillStyle = "#000";
+    context.fillRect(0, 0, element.width, element.height);
+    if (!mask) return;
+    const image = new Image();
+    image.onload = () => context.drawImage(image, 0, 0, element.width, element.height);
+    image.src = `data:image/png;base64,${mask}`;
+  };
+
+  /** Moves one step through the stroke history. Undo and redo are the same move
+   *  with the stacks swapped — where you are goes onto the other stack, so the
+   *  step is reversible in either direction. */
+  const step = (direction: "undo" | "redo") => {
+    const from = direction === "undo" ? past : future;
+    if (from.length === 0) return;
+    const target = from[from.length - 1] ?? null;
+    const here = value;
+    const drop = (current: (string | null)[]) => current.slice(0, -1);
+    const push = (current: (string | null)[]) => [...current, here];
+    if (direction === "undo") {
+      setPast(drop);
+      setFuture(push);
+    } else {
+      setFuture(drop);
+      setPast(push);
+    }
+    paint(target);
+    onChange(target);
+  };
 
   const clear = () => {
     const element = canvas.current;
     const context = element?.getContext("2d");
     if (!element || !context) return;
+    // Undoable like any stroke: clearing a mask by accident is exactly the
+    // thing worth taking back.
+    setPast((current) => [...current, value].slice(-MAX_UNDO));
+    setFuture([]);
     context.fillStyle = "#000";
     context.fillRect(0, 0, element.width, element.height);
     onChange(null);
@@ -135,6 +199,7 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
           onPointerDown={(event) => {
             event.currentTarget.setPointerCapture(event.pointerId);
             painting.current = true;
+            before.current = value;
             const point = at(event);
             last.current = point;
             stroke(null, point);
@@ -163,7 +228,10 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
         />
       </div>
 
-      <div className="flex items-center gap-2 text-xs">
+      {/* Wraps rather than pushing the clear button past the panel's edge: the
+          brush slider will give up width down to a point and then the row
+          breaks. */}
+      <div className="flex flex-wrap items-center gap-2 text-xs">
         <IconButton
           size="sm"
           aria-label={t(erasing ? "Studio.mask.paint" : "Studio.mask.erase")}
@@ -172,7 +240,25 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
         >
           {erasing ? <Paintbrush size={12} /> : <Eraser size={12} />}
         </IconButton>
-        <label className="flex flex-1 items-center gap-2">
+        <IconButton
+          size="sm"
+          aria-label={t("Studio.mask.undo")}
+          title={t("Studio.mask.undo")}
+          disabled={past.length === 0}
+          onClick={() => step("undo")}
+        >
+          <Undo2 size={12} />
+        </IconButton>
+        <IconButton
+          size="sm"
+          aria-label={t("Studio.mask.redo")}
+          title={t("Studio.mask.redo")}
+          disabled={future.length === 0}
+          onClick={() => step("redo")}
+        >
+          <Redo2 size={12} />
+        </IconButton>
+        <label className="flex min-w-32 flex-1 items-center gap-2">
           <span className="shrink-0 text-muted">{t("Studio.mask.brush")}</span>
           <input
             type="range"
