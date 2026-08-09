@@ -202,9 +202,11 @@ const MIGRATION_V16: i64 = 16;
 const MIGRATION_V16_CHECKSUM: &str = "context-reuse-v16-2026-08-08";
 const MIGRATION_V17: i64 = 17;
 const MIGRATION_V17_CHECKSUM: &str = "context-budget-v17-2026-08-08";
+const MIGRATION_V18: i64 = 18;
+const MIGRATION_V18_CHECKSUM: &str = "browser-session-kind-v18-2026-08-09";
 
 /// The newest schema this binary knows how to write.
-const SCHEMA_VERSION: i64 = MIGRATION_V17;
+const SCHEMA_VERSION: i64 = MIGRATION_V18;
 
 /// Whether a migration keeps older binaries able to open the database.
 ///
@@ -2161,6 +2163,18 @@ const MIGRATION_LADDER: &[(i64, &str, Compatibility)] = &[
         MIGRATION_V17_CHECKSUM,
         Compatibility::Additive,
     ),
+    // Breaking, and this is the one migration where that is the *point* rather
+    // than a cost. It widens `agent_processes.kind` to admit `browser_session`,
+    // and a V17 binary's `ProcessKind::parse` rejects any kind it does not know
+    // — so a V17 binary reading a database that now contains browser rows does
+    // not degrade gracefully, it errors out of `list`/`get` for every caller.
+    // Raising the floor is what stops that; an `Additive` claim here would be a
+    // promise the older binary cannot keep.
+    (
+        MIGRATION_V18,
+        MIGRATION_V18_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
 ];
 
 /// The oldest binary that may open a database with `version` applied.
@@ -2671,6 +2685,46 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
                 MIGRATION_V17_CHECKSUM,
                 now_ms_i64()?,
                 min_reader_version_for(MIGRATION_V17)
+            ],
+        )?;
+    }
+
+    let has_v18 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V18],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v18 {
+        // Probed by asking the table itself whether it would accept the new
+        // kind, rather than by a column check like V16's and V17's — this
+        // migration adds no column, it widens a `CHECK`, so there is nothing for
+        // `SELECT … LIMIT 0` to find. The probe runs the rebuild only when the
+        // constraint is still the narrow one, which keeps it idempotent for a
+        // database that already has V18's schema but lost its ledger row.
+        let already_wide = transaction
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'agent_processes'
+                   AND sql LIKE '%browser_session%'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !already_wide {
+            transaction.execute_batch(MIGRATION_V18_SQL)?;
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V18,
+                MIGRATION_V18_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V18)
             ],
         )?;
     }
@@ -3456,6 +3510,163 @@ ALTER TABLE agent_processes ADD COLUMN context_tokens_reused INTEGER
 const MIGRATION_V17_SQL: &str = r#"
 ALTER TABLE agent_processes ADD COLUMN max_context_tokens INTEGER
     CHECK (max_context_tokens IS NULL OR max_context_tokens > 0);
+"#;
+
+/// Admits `browser_session` to `agent_processes.kind` (roadmap K4).
+///
+/// # Why this is a whole-table rebuild and not an `ALTER`
+///
+/// The kind vocabulary is a column `CHECK`, and SQLite has no
+/// `ALTER TABLE … DROP CONSTRAINT`. Widening it is the documented twelve-step
+/// rebuild — new table, copy, drop, rename, recreate every index and trigger —
+/// and it is the only correct route. The alternative, `PRAGMA writable_schema`,
+/// edits the schema out from under a live connection with no validation at all,
+/// which is not a shortcut worth taking on the table that holds every process
+/// this app has ever run.
+///
+/// Every column is listed explicitly on both sides of the copy rather than
+/// relying on `SELECT *`. The live table's column *order* is an artifact of the
+/// order six migrations happened to run their `ADD COLUMN`s in; naming them makes
+/// this correct even if that order ever changes, and makes a forgotten column a
+/// compile-time-visible omission rather than a silent shift of every value one
+/// place to the left.
+///
+/// Foreign keys are not disabled around this. The self-reference on
+/// `parent_process_id` is the only one into this table, `PRAGMA foreign_keys` is
+/// a no-op inside a transaction anyway, and the rename step carries child
+/// references across by design — which is exactly the behaviour wanted here,
+/// since the rows are the same rows.
+///
+/// The two rebuilt triggers and six rebuilt indexes are transcribed from V5, V6,
+/// V7 and V8 unchanged. `agent_processes_kind_idx` and the rest are recreated by
+/// hand because `DROP TABLE` takes them with it.
+const MIGRATION_V18_SQL: &str = r#"
+CREATE TABLE agent_processes_v18 (
+    process_id TEXT PRIMARY KEY,
+    parent_process_id TEXT REFERENCES agent_processes_v18(process_id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'chat_turn', 'daemon_job', 'subagent', 'crew_member', 'workflow_run',
+        'workflow_node', 'remote_run', 'background_shell', 'side_task',
+        'browser_session'
+    )),
+    external_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('admitted', 'running', 'suspended', 'exited')),
+    run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
+    workspace TEXT,
+    profile TEXT,
+    native_pid INTEGER,
+    max_wall_ms INTEGER CHECK (max_wall_ms IS NULL OR max_wall_ms > 0),
+    max_memory_bytes INTEGER CHECK (max_memory_bytes IS NULL OR max_memory_bytes > 0),
+    max_output_bytes INTEGER CHECK (max_output_bytes IS NULL OR max_output_bytes > 0),
+    max_child_processes INTEGER CHECK (max_child_processes IS NULL OR max_child_processes > 0),
+    exit_status TEXT CHECK (exit_status IS NULL OR exit_status IN (
+        'succeeded', 'failed', 'cancelled', 'limit_exceeded', 'lost', 'needs_reconciliation'
+    )),
+    exit_code INTEGER,
+    exit_signal TEXT,
+    exit_reason TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    started_at_ms INTEGER CHECK (started_at_ms IS NULL OR started_at_ms > 0),
+    exited_at_ms INTEGER CHECK (exited_at_ms IS NULL OR exited_at_ms > 0),
+    stop_requested INTEGER NOT NULL DEFAULT 0 CHECK (stop_requested IN (0, 1)),
+    suspend_requested INTEGER NOT NULL DEFAULT 0 CHECK (suspend_requested IN (0, 1)),
+    signal_reason TEXT,
+    signal_requested_at_ms INTEGER
+        CHECK (signal_requested_at_ms IS NULL OR signal_requested_at_ms > 0),
+    kill_requested INTEGER NOT NULL DEFAULT 0 CHECK (kill_requested IN (0, 1)),
+    cpu_time_ms INTEGER CHECK (cpu_time_ms IS NULL OR cpu_time_ms >= 0),
+    peak_rss_bytes INTEGER CHECK (peak_rss_bytes IS NULL OR peak_rss_bytes >= 0),
+    bytes_read INTEGER CHECK (bytes_read IS NULL OR bytes_read >= 0),
+    bytes_written INTEGER CHECK (bytes_written IS NULL OR bytes_written >= 0),
+    bytes_egressed INTEGER CHECK (bytes_egressed IS NULL OR bytes_egressed >= 0),
+    tokens_in INTEGER CHECK (tokens_in IS NULL OR tokens_in >= 0),
+    tokens_out INTEGER CHECK (tokens_out IS NULL OR tokens_out >= 0),
+    gpu_resident_bytes INTEGER CHECK (gpu_resident_bytes IS NULL OR gpu_resident_bytes >= 0),
+    gpu_device_ms INTEGER CHECK (gpu_device_ms IS NULL OR gpu_device_ms >= 0),
+    usage_unavailable_json TEXT,
+    egress_destinations_dropped INTEGER
+        CHECK (egress_destinations_dropped IS NULL OR egress_destinations_dropped >= 0),
+    context_tokens_reused INTEGER
+        CHECK (context_tokens_reused IS NULL OR context_tokens_reused >= 0),
+    max_context_tokens INTEGER CHECK (max_context_tokens IS NULL OR max_context_tokens > 0),
+    context_tokens_evaluated INTEGER
+        CHECK (context_tokens_evaluated IS NULL OR context_tokens_evaluated >= 0),
+    CHECK ((state = 'exited') = (exit_status IS NOT NULL)),
+    CHECK (parent_process_id IS NULL OR parent_process_id <> process_id),
+    UNIQUE(kind, external_id)
+) STRICT;
+
+INSERT INTO agent_processes_v18 (
+    process_id, parent_process_id, kind, external_id, state, run_id, workspace, profile,
+    native_pid, max_wall_ms, max_memory_bytes, max_output_bytes, max_child_processes,
+    exit_status, exit_code, exit_signal, exit_reason, created_at_ms, updated_at_ms,
+    started_at_ms, exited_at_ms, stop_requested, suspend_requested, signal_reason,
+    signal_requested_at_ms, kill_requested, cpu_time_ms, peak_rss_bytes, bytes_read,
+    bytes_written, bytes_egressed, tokens_in, tokens_out, gpu_resident_bytes, gpu_device_ms,
+    usage_unavailable_json, egress_destinations_dropped, context_tokens_reused,
+    max_context_tokens, context_tokens_evaluated
+)
+SELECT
+    process_id, parent_process_id, kind, external_id, state, run_id, workspace, profile,
+    native_pid, max_wall_ms, max_memory_bytes, max_output_bytes, max_child_processes,
+    exit_status, exit_code, exit_signal, exit_reason, created_at_ms, updated_at_ms,
+    started_at_ms, exited_at_ms, stop_requested, suspend_requested, signal_reason,
+    signal_requested_at_ms, kill_requested, cpu_time_ms, peak_rss_bytes, bytes_read,
+    bytes_written, bytes_egressed, tokens_in, tokens_out, gpu_resident_bytes, gpu_device_ms,
+    usage_unavailable_json, egress_destinations_dropped, context_tokens_reused,
+    max_context_tokens, context_tokens_evaluated
+FROM agent_processes;
+
+DROP TABLE agent_processes;
+ALTER TABLE agent_processes_v18 RENAME TO agent_processes;
+
+CREATE INDEX agent_processes_live_idx ON agent_processes(created_at_ms DESC)
+    WHERE state <> 'exited';
+CREATE INDEX agent_processes_kind_idx ON agent_processes(kind, created_at_ms DESC);
+CREATE INDEX agent_processes_parent_idx ON agent_processes(parent_process_id)
+    WHERE parent_process_id IS NOT NULL;
+CREATE INDEX agent_processes_run_idx ON agent_processes(run_id)
+    WHERE run_id IS NOT NULL;
+CREATE INDEX agent_processes_workspace_idx ON agent_processes(workspace, created_at_ms DESC)
+    WHERE workspace IS NOT NULL;
+CREATE INDEX agent_processes_pending_signal_idx ON agent_processes(kind)
+    WHERE state <> 'exited' AND (stop_requested = 1 OR suspend_requested = 1);
+
+CREATE TRIGGER agent_processes_validate_transition
+BEFORE UPDATE OF state ON agent_processes
+WHEN OLD.state <> NEW.state AND NOT (
+       (OLD.state = 'admitted'  AND NEW.state IN ('running', 'exited'))
+    OR (OLD.state = 'running'   AND NEW.state IN ('suspended', 'exited'))
+    OR (OLD.state = 'suspended' AND NEW.state IN ('running', 'exited'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'illegal agent process state transition');
+END;
+
+CREATE TRIGGER agent_processes_forbid_identity_update
+BEFORE UPDATE ON agent_processes
+WHEN OLD.process_id <> NEW.process_id
+  OR OLD.kind <> NEW.kind
+  OR OLD.external_id <> NEW.external_id
+  OR OLD.created_at_ms <> NEW.created_at_ms
+BEGIN
+    SELECT RAISE(ABORT, 'agent process identity is immutable');
+END;
+
+CREATE TRIGGER agent_processes_kill_implies_stop
+BEFORE UPDATE OF kill_requested ON agent_processes
+WHEN NEW.kill_requested = 1 AND NEW.stop_requested <> 1
+BEGIN
+    SELECT RAISE(ABORT, 'kill_requested implies stop_requested');
+END;
+
+CREATE TRIGGER agent_processes_close_out_states_its_gaps
+BEFORE UPDATE OF state ON agent_processes
+WHEN NEW.state = 'exited' AND NEW.usage_unavailable_json IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'an exited agent process must state its unmeasured fields');
+END;
 "#;
 
 /// V16's other half — the prompt tokens the runtime said it actually evaluated,
@@ -6154,7 +6365,7 @@ mod tests {
                 .execute(
                     "INSERT INTO schema_migrations
                         (version, checksum, applied_at_ms, min_reader_version)
-                     VALUES (18, 'from-the-future-additive', 18, 17)",
+                     VALUES (19, 'from-the-future-additive', 19, 18)",
                     [],
                 )
                 .unwrap();
@@ -6168,7 +6379,7 @@ mod tests {
             let connection = Connection::open(&database.path).unwrap();
             connection
                 .execute(
-                    "UPDATE schema_migrations SET min_reader_version = 18 WHERE version = 18",
+                    "UPDATE schema_migrations SET min_reader_version = 19 WHERE version = 19",
                     [],
                 )
                 .unwrap();
@@ -6176,9 +6387,153 @@ mod tests {
         assert!(
             matches!(
                 RunLedger::open(&database.path),
-                Err(LedgerError::MigrationConflict { version: 18 })
+                Err(LedgerError::MigrationConflict { version: 19 })
             ),
             "a future migration that requires a newer binary must still refuse"
+        );
+    }
+
+    /// V18 is a whole-table rebuild, which is the one migration shape that can
+    /// lose data silently: a forgotten column in the copy shifts every value one
+    /// place, and a forgotten index or trigger removes a guard nothing will
+    /// notice until it is needed.
+    ///
+    /// So this asserts all three — the rows survive with their values intact, the
+    /// widened vocabulary is genuinely widened, and every index and trigger the
+    /// dropped table carried is back.
+    #[test]
+    fn migration_v18_widens_the_kind_vocabulary_without_losing_rows_or_guards() {
+        let database = TempDb::new("kind-rebuild");
+        let ledger = RunLedger::open(&database.path).unwrap();
+        let connection = &ledger.connection;
+
+        // A row on every column family the rebuild had to carry across: an
+        // identity, a limit, a signal latch, a measurement, and a terminal exit.
+        connection
+            .execute(
+                "INSERT INTO agent_processes (
+                     process_id, kind, external_id, state, created_at_ms, updated_at_ms,
+                     started_at_ms, native_pid, max_wall_ms, stop_requested, signal_reason,
+                     cpu_time_ms, usage_unavailable_json, max_context_tokens
+                 ) VALUES (
+                     'turn-rebuild', 'chat_turn', 'ext-rebuild', 'running', 10, 20,
+                     15, 4242, 60000, 1, 'stopped by the user',
+                     77, '{}', 8192
+                 )",
+                [],
+            )
+            .unwrap();
+
+        // The row is untouched by the rebuild, value for value.
+        let (kind, pid, wall, stop, reason, cpu, budget): (
+            String,
+            i64,
+            i64,
+            i64,
+            String,
+            i64,
+            i64,
+        ) = connection
+            .query_row(
+                "SELECT kind, native_pid, max_wall_ms, stop_requested, signal_reason,
+                        cpu_time_ms, max_context_tokens
+                 FROM agent_processes WHERE process_id = 'turn-rebuild'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(kind, "chat_turn");
+        assert_eq!(pid, 4242);
+        assert_eq!(wall, 60_000);
+        assert_eq!(stop, 1);
+        assert_eq!(reason, "stopped by the user");
+        assert_eq!(cpu, 77);
+        assert_eq!(budget, 8192);
+
+        // The point of the migration: the new kind is accepted…
+        connection
+            .execute(
+                "INSERT INTO agent_processes
+                     (process_id, kind, external_id, state, created_at_ms, updated_at_ms)
+                 VALUES ('browser-1', 'browser_session', 'sess-1', 'running', 30, 30)",
+                [],
+            )
+            .unwrap();
+        // …and the constraint is still a constraint, not merely absent.
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO agent_processes
+                         (process_id, kind, external_id, state, created_at_ms, updated_at_ms)
+                     VALUES ('bogus-1', 'not_a_kind', 'sess-2', 'running', 30, 30)",
+                    [],
+                )
+                .is_err(),
+            "widening the vocabulary must not drop the CHECK altogether"
+        );
+
+        // Every index and trigger `DROP TABLE` took with it is back.
+        let mut objects: Vec<String> = connection
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE tbl_name = 'agent_processes' AND type IN ('index', 'trigger')
+                   AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        objects.sort();
+        assert_eq!(
+            objects,
+            vec![
+                "agent_processes_close_out_states_its_gaps",
+                "agent_processes_forbid_identity_update",
+                "agent_processes_kill_implies_stop",
+                "agent_processes_kind_idx",
+                "agent_processes_live_idx",
+                "agent_processes_parent_idx",
+                "agent_processes_pending_signal_idx",
+                "agent_processes_run_idx",
+                "agent_processes_validate_transition",
+                "agent_processes_workspace_idx",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        );
+
+        // And a rebuilt trigger still fires, which the name alone does not prove.
+        assert!(
+            connection
+                .execute(
+                    "UPDATE agent_processes SET state = 'running'
+                     WHERE process_id = 'turn-rebuild'",
+                    [],
+                )
+                .is_ok(),
+            "a no-op transition is legal"
+        );
+        assert!(
+            connection
+                .execute(
+                    "UPDATE agent_processes SET kind = 'subagent'
+                     WHERE process_id = 'turn-rebuild'",
+                    [],
+                )
+                .is_err(),
+            "the identity trigger must have come back with the table"
         );
     }
 
@@ -6199,6 +6554,10 @@ mod tests {
         // it — the first migration to actually spend what V13 bought.
         assert_eq!(min_reader_version_for(MIGRATION_V14), MIGRATION_V13);
         assert_eq!(min_reader_version_for(MIGRATION_V15), MIGRATION_V13);
+        // …until V18 raises it again: a widened kind vocabulary is not something
+        // an older binary can read past.
+        assert_eq!(min_reader_version_for(MIGRATION_V17), MIGRATION_V13);
+        assert_eq!(min_reader_version_for(MIGRATION_V18), MIGRATION_V18);
         // And the pre-V9 ladder keeps exactly its old behaviour.
         assert_eq!(min_reader_version_for(MIGRATION_V8), MIGRATION_V8);
         assert_eq!(min_reader_version_for(MIGRATION_V1), MIGRATION_V1);
@@ -6222,7 +6581,10 @@ mod tests {
         let required = required_reader_version(&ledger.connection)
             .unwrap()
             .unwrap();
-        assert_eq!(required, MIGRATION_V13);
+        // V18 is the newest breaking migration: it widened `agent_processes.kind`
+        // to admit `browser_session`, which a V17 binary's `ProcessKind::parse`
+        // rejects outright rather than ignoring.
+        assert_eq!(required, MIGRATION_V18);
         assert!(required <= SCHEMA_VERSION);
 
         // No row may be left at the `DEFAULT 1` the ALTER used: that would claim
@@ -6246,13 +6608,13 @@ mod tests {
             let ledger = RunLedger::open(&database.path).unwrap();
             assert_eq!(
                 ledger.applied_migrations().unwrap(),
-                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
             );
         }
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
             "reopening must not re-apply or add a migration"
         );
 
@@ -6501,7 +6863,7 @@ mod tests {
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
             "opening a V10 database must apply every migration above it"
         );
         assert_eq!(
