@@ -144,11 +144,20 @@ the requested split.
 **Today:** the in-app updater ships on all three desktop platforms — background
 checks, a staged bundle, a relaunch card, and Windows deferring its installer to
 the click so an update cannot kill a turn mid-flight — and releases publish
-themselves once every matrix target has uploaded. What is missing: rollback, a
-manual check control, a visible failed check, Linux coverage beyond the AppImage,
-and a startup self-integrity check. Signing is macOS-only. Ten locales are each
-missing the same ~650 of 1,726 keys (they fall back to English at runtime). There
-is no dependency scanning, SBOM, accessibility CI, or penetration test.
+themselves once every matrix target has uploaded. Settings → Updates & integrity
+adds the manual half: a check-now control, the last check and its failure if it
+failed, and a per-platform rollback that snapshots the install before an update
+replaces it and restores it with a detached script. A Linux install that is not
+an AppImage is told so instead of silently never updating. A startup
+self-integrity check verifies the app's own signature and every managed runtime
+file against its trusted manifest before anything native is executed, and a
+mismatch refuses to launch rather than warning. CI runs dependency review, a
+Rust and npm advisory audit, and publishes a CycloneDX SBOM, which is also
+attached to every release. What is missing: signing beyond macOS (Windows needs
+a code-signing certificate; Linux has no OS-level signature to produce),
+clean-machine install/upgrade tests, an accessibility audit in CI, and a release
+penetration test. Ten locales are each missing the same ~650 of 1,726 keys (they
+fall back to English at runtime).
 
 **Acceptance:** signed, verifiable in-app updates with rollback on every
 supported platform; signed/notarized installers per platform; clean-machine

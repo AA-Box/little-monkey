@@ -220,6 +220,9 @@ fn total_ram_bytes() -> u64 {
 /// The verified app-owned `sd-server`, materializing it from bundled resources
 /// on first use exactly as the llama runtime does.
 fn engine_binary(app: &AppHandle) -> Result<PathBuf, String> {
+    // K22: refuse to hand out an executable path at all while the startup
+    // integrity check reports a tampered component.
+    crate::self_integrity::ensure_loadable()?;
     let app_data = app
         .path()
         .app_data_dir()
@@ -633,6 +636,9 @@ async fn run_speech(
     spec: &GenerationModelSpec,
     request: &GenerationRequest,
 ) -> Result<generation::GeneratedMedia, String> {
+    // K22: same refusal as the diffusion engine — speech is a second native
+    // binary and gets the same gate.
+    crate::self_integrity::ensure_loadable()?;
     let app_data = app
         .path()
         .app_data_dir()

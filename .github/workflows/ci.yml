@@ -112,3 +112,60 @@ jobs:
 
       - name: Rust tests
         run: pnpm test:rust
+
+  # ROADMAP #8 / K22: supply-chain review of what a release actually ships.
+  # Split from the test matrix on purpose — these check the dependency set, not
+  # the code, so they run once and neither blocks nor is blocked by a platform.
+  supply-chain:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fails the PR on a dependency introduced with a known vulnerability or a
+      # disallowed licence. Pull-request only: it diffs the manifests against
+      # the base commit, and there is no base to diff on a push.
+      - name: Dependency review
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Audit npm dependencies
+        # `--prod` because a vulnerable build-time devDependency is not shipped
+        # to a user; --audit-level high matches the dependency review above.
+        run: pnpm audit --prod --audit-level high
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Audit Rust dependencies
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The SBOM covers both dependency trees (pnpm-lock.yaml and Cargo.lock are
+      # both in the scanned tree), so one artifact describes the whole app.
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: little-monkey-sbom.cyclonedx.json
+          output-file: little-monkey-sbom.cyclonedx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: little-monkey-sbom.cyclonedx.json
+          if-no-files-found: error
