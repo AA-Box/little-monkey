@@ -42,6 +42,9 @@ export const studioLocale: Record<string, string> = {
   // Outpainting. Presented as extending rather than as a canvas, because that
   // is what the buttons do: each press grows one side and asks the model to
   // fill it.
+  "Studio.mask.zoomIn": "Zoom in",
+  "Studio.mask.zoomOut": "Zoom out",
+
   "Studio.outpaint.title": "Extend the picture",
   "Studio.outpaint.hint":
     "Grows the image on one side and fills the new space to match. Press again to keep going. The seam is blended by letting the model repaint a thin strip of the existing picture.",
