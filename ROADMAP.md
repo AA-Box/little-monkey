@@ -79,16 +79,30 @@ view.
 local revision history with diff, restore, and branch/compare; a concurrent
 edit is detected and surfaced rather than silently overwritten.
 
-## 4. Cost attribution and budget enforcement *(partially built)*
+## 4. Cost attribution and budget enforcement *(built)*
 
 **Shipped:** per-request cost recording against user-entered rates, daily and
 monthly budgets with a warn/pause enforcement mode, and a live budget check
 before every provider request (**Settings → Usage**).
 
-**Remaining:** per-workspace and per-project attribution, multi-tier warning
-thresholds, and honest handling of providers whose real billing differs from
-the user's entered rate (the app cannot see actual invoices and must not
-imply that it can).
+Every recorded call is attributed to the workspace that was open when it went
+out and to the project folder its conversation belongs to — two different
+things once a chat outlives the folder it was started in — and can be broken
+down by either, or by session or model. Anything recorded without one is
+counted under *Unattributed* rather than charged to a folder it may not belong
+to. The workspace key is the same one the K6 process ledger stamps on
+processes, so a workspace's measured wall/CPU/GPU time is shown beside its
+token bill; an unmeasured field renders as its reason, never as a zero.
+
+Budget warnings are multi-tier (default 50/80/95%), and the highest tier
+crossed is reported rather than the first.
+
+Provider billing is handled honestly rather than pretended away: every figure
+the app computes is labelled an estimate from user-entered rates, calls with no
+configured rate stay visibly unpriced, and a month's actual invoice total can be
+entered per provider to show the drift against the estimate. Recording a bill
+never rewrites the per-call estimates — a monthly total cannot be honestly split
+back across the calls that produced it — and the app never reads an invoice.
 
 ## 5. Mobile companion — remaining gaps *(partially built)*
 

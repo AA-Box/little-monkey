@@ -38,6 +38,8 @@ import {
   useCostControlStore,
 } from "../store/costControlStore";
 import { usePrivacyFirewallStore } from "../store/privacyFirewallStore";
+import { useWorkspaceStore } from "../store/workspaceStore";
+import { useSessionStore } from "../store/sessionStore";
 import { providerModelTargetKey } from "./modelTargets";
 
 const emptyMcpRegistry: McpToolRegistry = new Map();
@@ -863,13 +865,47 @@ describe("attemptStream / recordUsage", () => {
     ]);
   });
 
+  // K25: the recorded entry has to say WHERE to charge the call, and the two
+  // places are genuinely different — the folder open right now (which is what
+  // the process ledger stamps on the processes this turn spawns) and the
+  // folder the conversation belongs to.
+  it("attributes a call to the open workspace and to the session's own project folder", async () => {
+    useWorkspaceStore.setState({
+      roots: [{ id: "root-1", path: "/work/current", label: "current", is_primary: true }],
+    });
+    useSessionStore.setState({
+      sessions: [{ id: "session-cost", workspacePath: "/work/older" }],
+    } as unknown as Parameters<typeof useSessionStore.setState>[0]);
+
+    await attemptStream(fakeTarget, [], [], undefined, undefined, "session-cost");
+
+    expect(useCostControlStore.getState().entries[0]).toMatchObject({
+      workspacePath: "/work/current",
+      projectPath: "/work/older",
+    });
+  });
+
+  it("records no attribution rather than a guessed one when there is no folder or session", async () => {
+    useWorkspaceStore.setState({ roots: [] });
+    useSessionStore.setState({ sessions: [] } as unknown as Parameters<
+      typeof useSessionStore.setState
+    >[0]);
+
+    await attemptStream(fakeTarget, [], [], undefined, undefined, "session-unknown");
+
+    expect(useCostControlStore.getState().entries[0]).toMatchObject({
+      workspacePath: null,
+      projectPath: null,
+    });
+  });
+
   it("pauses a provider request before transport when a hard budget is reached", async () => {
     useCostControlStore.setState({
       policy: {
         enabled: true,
         dailyBudgetUsd: 1,
         monthlyBudgetUsd: null,
-        warningPercent: 0.8,
+        warningPercents: [0.8],
         enforcement: "pause",
       },
       entries: [

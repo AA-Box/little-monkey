@@ -2453,7 +2453,6 @@ export const id: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "Aktifkan anggaran",
   "UsagePanel.dailyBudget": "Anggaran harian (USD)",
   "UsagePanel.monthlyBudget": "Anggaran bulanan (USD)",
-  "UsagePanel.warningThreshold": "Peringatkan pada (%)",
   "UsagePanel.enforcement": "Saat batas tercapai",
   "UsagePanel.enforcementWarn": "Hanya peringatkan",
   "UsagePanel.enforcementPause": "Jeda panggilan cloud",

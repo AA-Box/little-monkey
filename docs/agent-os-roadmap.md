@@ -5033,10 +5033,25 @@ it is what makes a scheduling or policy change auditable after the fact.
 
 *Maps to: ROADMAP #3.*
 
-## K25. Resource attribution completion
+## K25. Resource attribution completion — **met**
 
-**Today:** per-request cost against user-entered rates, daily and monthly
-budgets, and a warn/pause check before every provider request.
+**Today:** every recorded provider call carries the workspace that was open
+when it went out and the project folder its conversation belongs to, and
+**Settings → Usage** breaks spend down by workspace, project, session, or
+model. The workspace key is the path the K6 process ledger already stamps on
+processes, so the two ledgers join: a workspace's measured wall, CPU, and GPU
+time sits beside its token bill, and an unmeasured field renders as the
+backend's own reason rather than a zero. Warnings are multi-tier (default
+50/80/95%) and report the highest tier crossed. Provider billing is
+reconcilable: estimates are labelled as estimates, unpriced calls stay visibly
+unpriced, and an entered monthly invoice total is shown against the estimate as
+a drift — without ever rewriting the per-call figures, which a monthly total
+cannot honestly be split back across.
+
+Two limits stated rather than papered over: what the app cannot attribute goes
+to an explicit *Unattributed* bucket instead of being charged to whichever
+folder is open, and process rows carry only a workspace, so the project
+breakdown shows token spend alone.
 
 **Acceptance:** ROADMAP #4 — per-workspace and per-project attribution,
 multi-tier thresholds, and honest handling of providers whose real billing
