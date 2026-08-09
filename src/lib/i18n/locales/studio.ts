@@ -50,6 +50,7 @@ export const studioLocale: Record<string, string> = {
   "Studio.outpaint.up": "Extend upwards",
   "Studio.outpaint.down": "Extend downwards",
   "Studio.outpaint.undo": "Undo the last extension",
+  "Studio.outpaint.redo": "Redo the undone extension",
 
   "Studio.preprocess.label": "Turn this photo into a hint map",
   "Studio.preprocess.placeholder": "Leave as it is",
@@ -263,6 +264,8 @@ export const studioLocale: Record<string, string> = {
   "Studio.mask.paint": "Paint",
   "Studio.mask.erase": "Erase",
   "Studio.mask.clear": "Clear",
+  "Studio.mask.undo": "Undo the last stroke",
+  "Studio.mask.redo": "Redo the undone stroke",
   "Studio.mask.loading": "Loading the source image…",
   "Studio.mask.hint":
     "Paint over what should be redrawn; everything unpainted is kept. Mask is {{width}}×{{height}}, matching the source.",
