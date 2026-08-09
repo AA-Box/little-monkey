@@ -780,7 +780,7 @@ fn insert_existing_read_root(
     real_home: Option<&Path>,
     real_workspace: &Path,
 ) {
-    let Ok(candidate) = fs::canonicalize(candidate) else {
+    let Ok(candidate) = plain_canonical(candidate) else {
         return;
     };
     if readable_root_is_safe(&candidate, real_home, real_workspace) {
@@ -802,10 +802,12 @@ fn readable_roots(
     real_home: Option<&Path>,
     real_workspace: &Path,
 ) -> Vec<PathBuf> {
-    let canonical_home = real_home.and_then(|path| fs::canonicalize(path).ok());
+    // Both sides of every `starts_with` below resolve through the same helper,
+    // so a verbatim path can never be compared against a stripped one.
+    let canonical_home = real_home.and_then(|path| plain_canonical(path).ok());
     let real_home = canonical_home.as_deref().or(real_home);
     let canonical_workspace =
-        fs::canonicalize(real_workspace).unwrap_or_else(|_| real_workspace.to_path_buf());
+        plain_canonical(real_workspace).unwrap_or_else(|_| real_workspace.to_path_buf());
     let mut candidates: Vec<PathBuf> = system_roots.iter().map(PathBuf::from).collect();
     let path_entries: Vec<PathBuf> = path_env
         .map(std::env::split_paths)
@@ -993,7 +995,10 @@ pub async fn execute_in_sandbox(
             "Seatbelt profile must have a parent directory",
         )
     })?;
-    let profile_parent = fs::canonicalize(profile_parent)?;
+    // `plain_canonical`, like the three above: this is compared against
+    // `sandbox_root` on the next line, and comparing a verbatim path with a
+    // stripped one is a containment check that can only ever fail.
+    let profile_parent = plain_canonical(profile_parent)?;
     if !profile_parent.starts_with(&sandbox_root) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
