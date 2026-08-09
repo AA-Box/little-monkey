@@ -2451,7 +2451,6 @@ export const esES: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "Habilitar presupuestos",
   "UsagePanel.dailyBudget": "Presupuesto diario (USD)",
   "UsagePanel.monthlyBudget": "Presupuesto mensual (USD)",
-  "UsagePanel.warningThreshold": "Avisar al (%)",
   "UsagePanel.enforcement": "Al llegar al límite",
   "UsagePanel.enforcementWarn": "Solo avisar",
   "UsagePanel.enforcementPause": "Pausar las llamadas a la nube",

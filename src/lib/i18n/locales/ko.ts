@@ -2451,7 +2451,6 @@ export const ko: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "예산 활성화",
   "UsagePanel.dailyBudget": "일별 예산(USD)",
   "UsagePanel.monthlyBudget": "월별 예산(USD)",
-  "UsagePanel.warningThreshold": "경고 기준(%)",
   "UsagePanel.enforcement": "한도 도달 시",
   "UsagePanel.enforcementWarn": "경고만",
   "UsagePanel.enforcementPause": "클라우드 호출 일시 중지",

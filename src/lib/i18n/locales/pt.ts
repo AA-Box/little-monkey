@@ -2453,7 +2453,6 @@ export const pt: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "Ativar orçamentos",
   "UsagePanel.dailyBudget": "Orçamento diário (USD)",
   "UsagePanel.monthlyBudget": "Orçamento mensal (USD)",
-  "UsagePanel.warningThreshold": "Avisar em (%)",
   "UsagePanel.enforcement": "Ao atingir o limite",
   "UsagePanel.enforcementWarn": "Apenas avisar",
   "UsagePanel.enforcementPause": "Pausar chamadas à nuvem",

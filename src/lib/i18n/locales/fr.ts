@@ -2451,7 +2451,6 @@ export const fr: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "Activer les budgets",
   "UsagePanel.dailyBudget": "Budget quotidien (USD)",
   "UsagePanel.monthlyBudget": "Budget mensuel (USD)",
-  "UsagePanel.warningThreshold": "Avertir à (%)",
   "UsagePanel.enforcement": "À la limite",
   "UsagePanel.enforcementWarn": "Avertir seulement",
   "UsagePanel.enforcementPause": "Mettre en pause les appels cloud",

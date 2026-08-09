@@ -38,6 +38,7 @@ import { riskCacheKey, type RiskClassification } from './riskJudge';
 import { gatePrivacyWireMessages, type PrivacyWireCache } from './privacyWire';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
+import { useSessionStore } from '../store/sessionStore';
 import { runSubagentTask } from './subagent';
 import { protocolToolCallId } from './durableRun';
 import { formatSkillToolResult, type SlashSkill } from './skills';
@@ -73,6 +74,28 @@ function costTargetKey(target: ResolvedTarget): string {
   return localModelTargetKey(
     useModelStore.getState().active?.id ?? target.modelLabel ?? 'local',
   );
+}
+
+/**
+ * Where to charge this request (K25).
+ *
+ * `workspacePath` is the folder open right now — the same identity the K6
+ * process ledger stamps on the processes this turn will spawn, which is what
+ * lets a workspace's token bill and its device time be added up together.
+ * `projectPath` is the folder the *conversation* belongs to, snapshotted when
+ * the session was created: a chat resumed after the user switched folders is
+ * still that project's cost, and charging it to today's folder would be wrong.
+ */
+function attributionOf(sessionId: string): {
+  workspacePath: string | null;
+  projectPath: string | null;
+} {
+  return {
+    workspacePath: primaryRoot(useWorkspaceStore.getState().roots)?.path ?? null,
+    projectPath:
+      useSessionStore.getState().sessions.find((session) => session.id === sessionId)
+        ?.workspacePath ?? null,
+  };
 }
 
 function isMeteredTarget(target: ResolvedTarget): boolean {
@@ -1007,6 +1030,12 @@ export async function attemptStream(
           targetLabel: describeUsageTarget(target),
           sessionId,
           runId: runId ?? null,
+          // K25 attribution, captured here because this is the only place a
+          // priced call is recorded. Both may be null — a headless/one-shot
+          // caller has no session and the app may have no folder open — and
+          // null attributes to the "unattributed" bucket rather than to
+          // whichever workspace happens to be open when the panel is read.
+          ...attributionOf(sessionId),
           usage,
           costUsd: isMeteredTarget(target)
             ? calculateUsageCostUsd(costState.rates[targetKey], usage)

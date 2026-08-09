@@ -2452,7 +2452,6 @@ export const ja: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "予算を有効にする",
   "UsagePanel.dailyBudget": "日次予算(USD)",
   "UsagePanel.monthlyBudget": "月次予算(USD)",
-  "UsagePanel.warningThreshold": "警告しきい値(%)",
   "UsagePanel.enforcement": "上限到達時",
   "UsagePanel.enforcementWarn": "警告のみ",
   "UsagePanel.enforcementPause": "クラウド呼び出しを一時停止",
