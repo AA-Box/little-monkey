@@ -12,12 +12,12 @@ holds keychain items, and it enforces an egress policy. Third-party code inside
 that process defeats all three at once, and on macOS unsigned native code will
 not load into a hardened runtime at all.
 
-The consequence people ask about: you cannot install an Automatic1111-style
-extension here, because those are Python files a Python app imports and executes
-in-process. There is no interpreter in this binary to run them, and the
-generation pipeline they would hook is a compiled C++ process rather than Python
-objects. What you get instead is everything on this page — one-click install of
-a verified tool, whose UI appears without an app release.
+The consequence people ask about: you cannot install a script-style extension
+here — the kind that ships as source a scripting runtime imports and executes
+in-process. There is no interpreter in this binary to run such code, and the
+generation pipeline it would hook is a compiled C++ process rather than objects
+in that language. What you get instead is everything on this page — one-click
+install of a verified tool, whose UI appears without an app release.
 
 ## Launch
 
