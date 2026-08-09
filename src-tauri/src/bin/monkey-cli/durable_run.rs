@@ -755,6 +755,17 @@ pub fn normalize_semantic_stream(events: &[RunEventEnvelope]) -> Vec<NormalizedS
                     RunEvent::NeedsReconciliation { .. } => {
                         terminal = Some(semantic("terminal", serde_json::json!({ "status": "needs_reconciliation" })));
                     }
+                    // The node ids, because a replay of a migrated run read on
+                    // either machine is otherwise silent about the fact that
+                    // half of it happened somewhere else.
+                    RunEvent::MigrationDeparted { target_node_id, .. } => normalized.push(semantic(
+                        "migration_departed",
+                        serde_json::json!({ "target_node_id": target_node_id }),
+                    )),
+                    RunEvent::MigrationArrived { origin_node_id, origin_last_sequence, .. } => normalized.push(semantic(
+                        "migration_arrived",
+                        serde_json::json!({ "origin_node_id": origin_node_id, "origin_last_sequence": origin_last_sequence }),
+                    )),
                     RunEvent::ModelDelta { .. } | RunEvent::UsageRecorded { .. } => unreachable!(),
                 }
             }

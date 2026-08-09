@@ -1,6 +1,7 @@
 pub(crate) mod api;
 mod client;
 mod desktop;
+pub(crate) mod migrate;
 mod protocol;
 mod server;
 mod store;
@@ -151,6 +152,28 @@ pub enum RemoteCmd {
     /// states, and apply the restart policy to placements whose node vanished
     /// (roadmap K17 S4).
     PlacementSync,
+    /// Move a *frozen process image* to an owned node and resume it there
+    /// (roadmap K18).
+    ///
+    /// `place` submits a spec the node then runs from the start. This hands the
+    /// node a turn already in flight — its conversation, its workspace and its
+    /// checkpoint — and refuses before transferring anything when the target
+    /// cannot satisfy it. The move is recorded on both nodes' run-event chains
+    /// as one chain. Use `node-refresh` first to see what a target is.
+    Migrate {
+        alias: String,
+        /// The frozen checkpoint to move. `monkey ps` names the process; the
+        /// checkpoint is the image that process froze into.
+        #[arg(long)]
+        checkpoint: String,
+        /// Require the target's data-residency label to be exactly this. The
+        /// node checks it against its own rather than trusting it.
+        #[arg(long)]
+        residency: Option<String>,
+        /// Check the target and stop, transferring nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -200,7 +223,11 @@ pub struct RemotePairCreateArgs {
     actions: Vec<PairAction>,
     #[arg(long = "run")]
     run_ids: Vec<String>,
-    #[arg(long = "workspace")]
+    /// `--workspace-id`, not `--workspace`: the CLI's global `--workspace` is a
+    /// filesystem path and is declared `global = true`, so it reaches every
+    /// subcommand — two arguments claiming that name made `pair-create` abort
+    /// on clap's own uniqueness assert before it could parse anything at all.
+    #[arg(long = "workspace-id")]
     workspace_ids: Vec<String>,
     #[arg(long, default_value_t = protocol::MAX_REMOTE_ARTIFACT_BYTES)]
     max_artifact_bytes: u64,
@@ -240,6 +267,10 @@ pub enum PairMobileCapability {
     /// `--mobile describe-node` and `--action view-runs`; `validate_capabilities`
     /// refuses the invitation otherwise rather than silently widening either.
     PlaceRuns,
+    /// Hand this node a frozen process image (roadmap K18). Strictly more than
+    /// `place-runs`, which it also requires: a migration writes a workspace, a
+    /// checkpoint and a conversation onto the target.
+    Migrate,
 }
 
 impl From<PairMobileCapability> for protocol::DeviceCapability {
@@ -252,6 +283,7 @@ impl From<PairMobileCapability> for protocol::DeviceCapability {
             PairMobileCapability::Capture => Self::Capture,
             PairMobileCapability::DescribeNode => Self::DescribeNode,
             PairMobileCapability::PlaceRuns => Self::PlaceRuns,
+            PairMobileCapability::Migrate => Self::Migrate,
         }
     }
 }
@@ -528,6 +560,12 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
             )
             .await?,
         )?,
+        RemoteCmd::Migrate {
+            alias,
+            checkpoint,
+            residency,
+            dry_run,
+        } => migrate_run(&paths, alias, checkpoint, residency.as_deref(), *dry_run).await?,
         RemoteCmd::Audit { limit } => {
             print_json(
                 serde_json::to_value(RemoteStore::open(&paths.root)?.audit_entries(*limit)?)
@@ -1020,6 +1058,174 @@ fn pair_list(paths: &DaemonPaths) -> Result<(), String> {
             serde_json::to_string(&device.scopes).map_err(|error| error.to_string())?
         );
     }
+    Ok(())
+}
+
+/// Moves a frozen process image to a paired node (roadmap K18).
+///
+/// The order is the whole design, so it is worth stating:
+///
+/// 1. **Preflight first, and it transfers nothing.** The target answers from the
+///    header alone, so a refusal costs a round trip instead of a workspace.
+/// 2. **The departure is appended locally *before* the image is sent**, because
+///    the arrival on the far side has to name the origin's chain tip — and the
+///    tip is that departure. Doing it the other way round would leave the target
+///    naming an event that did not exist when it named it.
+/// 3. **A departure that is then refused stays in the origin's history.** It is
+///    not terminal and changes no status, so this run carries on here; an audit
+///    that only recorded successful moves would be an audit of nothing.
+async fn migrate_run(
+    paths: &DaemonPaths,
+    alias: &str,
+    checkpoint_id: &str,
+    required_residency: Option<&str>,
+    dry_run: bool,
+) -> Result<(), String> {
+    use little_monkey_lib::run_ledger::RunLedger;
+    use little_monkey_lib::run_protocol::{
+        ClientIdentity, ClientKind, RunEvent, RunEventEnvelope, RUN_PROTOCOL_SCHEMA_VERSION,
+    };
+
+    let app_data_dir = crate::app_data_dir()
+        .ok_or_else(|| "Could not resolve the app data directory".to_string())?;
+    let host = enabled_host(paths)?;
+    if let Some(residency) = required_residency {
+        little_monkey_lib::node_placement::validate_residency(residency)?;
+    }
+
+    // The run this checkpoint's process belongs to. Read from the process row
+    // rather than guessed: a checkpoint records a turn, and only the process
+    // table knows which durable run that turn was charged to.
+    let manifest_dir = migrate::checkpoints_dir(&app_data_dir).join(checkpoint_id);
+    little_monkey_lib::checkpoints::validate_checkpoint_id(checkpoint_id)?;
+    if !manifest_dir.is_dir() {
+        return Err(format!("No checkpoint '{checkpoint_id}' on this node"));
+    }
+    let mut ledger = RunLedger::open(&paths.ledger_db).map_err(|error| error.to_string())?;
+    let frozen_process_id = {
+        let raw = std::fs::read_to_string(manifest_dir.join("manifest.json"))
+            .map_err(|error| format!("Could not read the checkpoint manifest: {error}"))?;
+        let manifest: little_monkey_lib::checkpoints::CheckpointManifest =
+            serde_json::from_str(&raw)
+                .map_err(|error| format!("Checkpoint manifest is invalid: {error}"))?;
+        manifest
+            .resume
+            .map(|resume| resume.process_id)
+            .ok_or_else(|| {
+                format!("Checkpoint '{checkpoint_id}' is a turn snapshot, not a frozen process")
+            })?
+    };
+    let run_id = ledger
+        .process_table()
+        .get(&frozen_process_id)
+        .map_err(|error| error.to_string())?
+        .and_then(|record| record.run_id)
+        .ok_or_else(|| {
+            format!("Frozen process '{frozen_process_id}' is not charged to a durable run, so there is no chain to hand over")
+        })?;
+    let spec = ledger
+        .load_run(&run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Unknown durable run '{run_id}'"))?
+        .spec;
+
+    let mut image = migrate::build_image(
+        &app_data_dir,
+        &host.runner_id,
+        checkpoint_id,
+        &spec,
+        // Placeholders. The real tip is only knowable after the departure is
+        // appended, which only happens once the preflight has passed.
+        1,
+        &"0".repeat(64),
+        required_residency.map(str::to_string),
+    )?;
+
+    let preflight = client::call(
+        paths,
+        alias,
+        Method::POST,
+        "/v1/remote/node/migration/preflight",
+        serde_json::to_vec(&protocol::MigrationPreflightRequest {
+            protocol_version: protocol::REMOTE_PROTOCOL_VERSION,
+            header: image.header.clone(),
+        })
+        .map_err(|error| error.to_string())?,
+        now_ms()?,
+    )
+    .await?;
+    let acceptable = preflight
+        .get("verdict")
+        .and_then(|verdict| verdict.get("state"))
+        .and_then(serde_json::Value::as_str)
+        == Some("acceptable");
+    if !acceptable || dry_run {
+        print_json(preflight)?;
+        if !acceptable {
+            return Err("The target node refused this image; nothing was transferred.".to_string());
+        }
+        println!("Dry run: the target would accept this image. Nothing was transferred.");
+        return Ok(());
+    }
+
+    let departure_event = RunEvent::MigrationDeparted {
+        target_node_id: preflight
+            .get("node")
+            .and_then(|node| node.get("runner_id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "The target did not identify itself".to_string())?
+            .to_string(),
+        payload_sha256: image.header.payload_sha256.clone(),
+        checkpoint_id: checkpoint_id.to_string(),
+    };
+    let now = now_ms()?;
+    let sequence = ledger
+        .load_run(&run_id)
+        .map_err(|error| error.to_string())?
+        .map(|run| run.last_sequence + 1)
+        .ok_or_else(|| format!("Unknown durable run '{run_id}'"))?;
+    ledger
+        .append_event(&RunEventEnvelope {
+            schema_version: RUN_PROTOCOL_SCHEMA_VERSION,
+            event_id: format!("evt-depart-{}", &image.header.payload_sha256[..24]),
+            run_id: run_id.clone(),
+            sequence,
+            occurred_at_ms: now,
+            actor_id: None,
+            emitter: ClientIdentity {
+                client_id: host.runner_id.clone(),
+                instance_id: host.runner_id.clone(),
+                kind: ClientKind::Cli,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            event: departure_event,
+        })
+        .map_err(|error| error.to_string())?;
+    let departure = ledger
+        .migration_departure(&run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "The departure did not chain on this node".to_string())?;
+    image.origin_last_sequence = departure.sequence;
+    image.origin_last_event_hash = departure.event_hash.clone();
+
+    let receipt = client::call(
+        paths,
+        alias,
+        Method::POST,
+        "/v1/remote/node/migration/accept",
+        serde_json::to_vec(&protocol::MigrationAcceptRequest {
+            protocol_version: protocol::REMOTE_PROTOCOL_VERSION,
+            image,
+        })
+        .map_err(|error| error.to_string())?,
+        now_ms()?,
+    )
+    .await?;
+    print_json(receipt)?;
+    println!(
+        "Handed run {run_id} to '{alias}'. The origin's chain ends at sequence {} ({}), which the target's first event names.",
+        departure.sequence, departure.event_hash
+    );
     Ok(())
 }
 
