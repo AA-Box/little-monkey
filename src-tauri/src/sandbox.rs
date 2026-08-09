@@ -3067,11 +3067,18 @@ mod tests {
             // The two `dir /b` are not asserted on. Labelling every step settled
             // what four denials against six candidates could not: `S2-write-home`
             // and `S3-write-tmp` are silent, which is a write that worked, and the
-            // denials land under `S4-list-home` and `S5-list-tmp`. So the container
-            // writes into its own directories and cannot enumerate them.
+            // denials land under `S4-list-home` and `S5-list-tmp`.
             //
-            // Whether it should be able to is a real question and not this test's.
-            // This one is about the *real* workspace, and making it fail on the
+            // Those two denials are not this boundary. The container enumerates
+            // its own directories perfectly well through `FindFirstFile` and
+            // through `System.IO`; `dir` is a `cmd` builtin that reads the volume
+            // first, and the volume root is granted to nothing here, so it is
+            // refused on every path — including ones this app has no ACL on. See
+            // `sandbox_windows::AppContainer::grant_tree_access` for the evidence
+            // and `a_confined_run_can_enumerate_the_tree_it_was_granted` for the
+            // assertions. Leaving them unasserted here is therefore right for a
+            // second reason: they would be measuring `cmd`, not the sandbox. This
+            // test is about the *real* workspace, and making it fail on the
             // listing means asserting a proxy for the write in place of the write,
             // which the host checks directly after the loop. The labels and their
             // output stay in `ran`, so the fact is in the failure message of every
