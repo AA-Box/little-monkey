@@ -70,25 +70,46 @@ why the abandoned TypeScript prototype was audited and not salvaged.
 whose own text defers to this benchmark; replacing that prose with measurements is
 a separate change.
 
-## 3. Prompt and workflow version control
+## 3. Prompt and workflow version control *(built)*
 
-**Today:** last-write-wins everywhere. Only marketplace packages have a diff
-view.
+**Shipped:** personas, snippets, skills, and workflow definitions keep an
+append-only local revision history (`config-revisions/` in the app data
+directory). **Settings → Prompts** gives every entry a History button and the
+workflow editor gives every saved workflow one: list revisions, select any two
+— including two on different branches — to diff, restore an older snapshot
+back into the editor, and fork a named branch to keep a variant instead of
+overwriting it. A save that would clobber another window's (or the CLI's) is
+refused and surfaced with a choice — take theirs, or knowingly overwrite —
+rather than silently winning.
 
-**Acceptance:** prompts, personas, skills, and workflow definitions keep a
-local revision history with diff, restore, and branch/compare; a concurrent
-edit is detected and surfaced rather than silently overwritten.
+**Remaining:** rules/memory files and MCP server definitions are not versioned
+yet; the history is per-entity, with no cross-entity "what did this release
+change" view.
 
-## 4. Cost attribution and budget enforcement *(partially built)*
+## 4. Cost attribution and budget enforcement *(built)*
 
 **Shipped:** per-request cost recording against user-entered rates, daily and
 monthly budgets with a warn/pause enforcement mode, and a live budget check
 before every provider request (**Settings → Usage**).
 
-**Remaining:** per-workspace and per-project attribution, multi-tier warning
-thresholds, and honest handling of providers whose real billing differs from
-the user's entered rate (the app cannot see actual invoices and must not
-imply that it can).
+Every recorded call is attributed to the workspace that was open when it went
+out and to the project folder its conversation belongs to — two different
+things once a chat outlives the folder it was started in — and can be broken
+down by either, or by session or model. Anything recorded without one is
+counted under *Unattributed* rather than charged to a folder it may not belong
+to. The workspace key is the same one the K6 process ledger stamps on
+processes, so a workspace's measured wall/CPU/GPU time is shown beside its
+token bill; an unmeasured field renders as its reason, never as a zero.
+
+Budget warnings are multi-tier (default 50/80/95%), and the highest tier
+crossed is reported rather than the first.
+
+Provider billing is handled honestly rather than pretended away: every figure
+the app computes is labelled an estimate from user-entered rates, calls with no
+configured rate stay visibly unpriced, and a month's actual invoice total can be
+entered per provider to show the drift against the estimate. Recording a bill
+never rewrites the per-call estimates — a monthly total cannot be honestly split
+back across the calls that produced it — and the app never reads an invoice.
 
 ## 5. Mobile companion — remaining gaps *(partially built)*
 

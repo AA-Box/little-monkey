@@ -14,11 +14,30 @@
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 
+use crate::config_revisions::{self, RecordRequest};
+
 const PROMPTS_FILE: &str = "prompts.json";
+
+/// Revision kind for the library as a whole — one head that every window's
+/// save is checked against, which is what makes a concurrent edit detectable
+/// (roadmap K24). Per-entry history lives under [`ENTRY_REVISION_KIND`].
+pub const LIBRARY_REVISION_KIND: &str = "prompt-library";
+/// The library is a single document, so it needs exactly one entity id.
+pub const LIBRARY_REVISION_ENTITY: &str = "library";
+/// Revision kind for one persona/snippet/skill, keyed by the entry's id. This
+/// is what the Prompts tab's per-row History button reads.
+pub const ENTRY_REVISION_KIND: &str = "prompt";
+
+/// Serializes check-then-write across windows in this process: the
+/// conflict check, the blob write, and the revision append must not
+/// interleave with another save, or two windows could both see the same head
+/// and both "win".
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Emitted to every window after each successful [`prompts_save`], with the
 /// saving window's label as payload — same cross-window rehydrate mechanism
@@ -59,13 +78,97 @@ pub struct PromptEntry {
     pub updated_at: u64,
 }
 
-fn prompts_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+fn app_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {}", e))?;
-    Ok(dir.join(PROMPTS_FILE))
+    Ok(dir)
+}
+
+fn prompts_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join(PROMPTS_FILE))
+}
+
+/// The fields of an entry a revision remembers, as stable pretty JSON.
+///
+/// Deliberately omits `id`/`createdAt`/`updatedAt`: a timestamp that moves on
+/// every unrelated library write would make every save look like a change,
+/// filling the history with revisions whose diff is one epoch number. What is
+/// left is exactly what a user edits — and exactly what "restore this
+/// revision" should put back.
+pub fn entry_snapshot(entry: &PromptEntry) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "kind": entry.kind,
+        "name": entry.name,
+        "command": entry.command,
+        "description": entry.description,
+        "content": entry.content,
+    }))
+    .unwrap_or_default()
+}
+
+/// The library payload's entries, or an empty list when the blob is not the
+/// shape this module knows. The frontend owns that schema, so an unrecognized
+/// payload costs the per-entry history for that save — never the save itself.
+fn entries_of(payload: &str) -> Vec<PromptEntry> {
+    #[derive(Deserialize)]
+    struct Blob {
+        #[serde(default)]
+        entries: Vec<PromptEntry>,
+    }
+    serde_json::from_str::<Blob>(payload)
+        .map(|blob| blob.entries)
+        .unwrap_or_default()
+}
+
+/// Records a revision for the library and for every entry whose authored
+/// fields changed. Unchanged entries dedupe inside
+/// [`config_revisions::record`], so a save touching one persona appends one
+/// entry revision, not one per entry.
+fn record_revisions(
+    root: &Path,
+    payload: &str,
+    base_revision_id: Option<String>,
+) -> Result<String, String> {
+    let library = config_revisions::record(
+        root,
+        LIBRARY_REVISION_KIND,
+        LIBRARY_REVISION_ENTITY,
+        RecordRequest {
+            branch: None,
+            base_revision_id,
+            label: "Saved".to_string(),
+            content: payload.to_string(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    for entry in entries_of(payload) {
+        if entry.id.is_empty() {
+            continue;
+        }
+        let label = if entry.name.trim().is_empty() {
+            "Edited".to_string()
+        } else {
+            format!("Edited {}", entry.name.trim())
+        };
+        // Best-effort: an entry whose snapshot is somehow unstorable must not
+        // fail the library save that already succeeded.
+        let _ = config_revisions::record(
+            root,
+            ENTRY_REVISION_KIND,
+            &entry.id,
+            RecordRequest {
+                branch: None,
+                base_revision_id: None,
+                label,
+                content: entry_snapshot(&entry),
+            },
+        );
+    }
+    Ok(library.revision_id)
 }
 
 /// Core load logic, parameterized by path so it needs no `AppHandle` —
@@ -97,17 +200,51 @@ pub fn prompts_load(app: tauri::AppHandle) -> Result<Option<String>, String> {
 }
 
 /// Persist the prompt-library blob (opaque JSON string owned by the
-/// frontend).
+/// frontend) and record a revision of it.
+///
+/// `base_revision_id` is the library revision the caller last saw. Supplying
+/// it opts into the concurrent-edit check: if another window (or the CLI)
+/// saved since, the write is REFUSED with a `conflict:`-prefixed error and the
+/// blob on disk is left untouched, instead of the last writer silently winning
+/// — roadmap K24 / ROADMAP #3. Passing `None` keeps the old unconditional
+/// behavior, which is what a first save, an import, and a restore want.
+///
+/// Returns the new library revision id, which the caller holds as its base for
+/// the next save.
 #[tauri::command]
 pub fn prompts_save(
     app: tauri::AppHandle,
     window: tauri::Window,
     payload: String,
-) -> Result<(), String> {
-    save_impl(&prompts_file_path(&app)?, &payload)?;
+    base_revision_id: Option<String>,
+) -> Result<String, String> {
+    let root = config_revisions::revision_root(&app_data_dir(&app)?);
+    let path = prompts_file_path(&app)?;
+    let revision_id = {
+        let _guard = SAVE_LOCK
+            .lock()
+            .map_err(|_| "prompt save lock poisoned".to_string())?;
+        // Revision first: it is the only step that can reject the write, and
+        // rejecting after the blob is already overwritten would defeat the
+        // point of detecting the conflict at all.
+        let revision_id = record_revisions(&root, &payload, base_revision_id)?;
+        save_impl(&path, &payload)?;
+        revision_id
+    };
     // Best-effort fan-out to the other windows; the save itself succeeded.
     let _ = app.emit(PROMPTS_CHANGED_EVENT, window.label());
-    Ok(())
+    Ok(revision_id)
+}
+
+/// The current library revision id, so a window that just hydrated from disk
+/// knows what base to save against. `None` when nothing has been recorded yet
+/// (a library saved before this feature existed, or a fresh install).
+#[tauri::command]
+pub fn prompts_current_revision(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let root = config_revisions::revision_root(&app_data_dir(&app)?);
+    config_revisions::head(&root, LIBRARY_REVISION_KIND, LIBRARY_REVISION_ENTITY, None)
+        .map(|head| head.map(|revision| revision.revision_id))
+        .map_err(|e| e.to_string())
 }
 
 /// Read an arbitrary file's contents as UTF-8 text, for the Settings
@@ -231,6 +368,121 @@ mod tests {
             "second"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn temp_dir() -> PathBuf {
+        let path = temp_file().with_extension("d");
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn library_payload(entries: &str) -> String {
+        format!(r#"{{"version":1,"entries":[{entries}],"defaultPersonaId":null}}"#)
+    }
+
+    const ONE_ENTRY: &str =
+        r#"{"id":"e1","kind":"persona","name":"Reviewer","command":"rev","content":"first"}"#;
+
+    #[test]
+    fn a_save_records_a_library_revision_and_one_per_entry() {
+        let root = temp_dir();
+        let payload = library_payload(ONE_ENTRY);
+        record_revisions(&root, &payload, None).unwrap();
+        assert_eq!(
+            crate::config_revisions::history(
+                &root,
+                LIBRARY_REVISION_KIND,
+                LIBRARY_REVISION_ENTITY,
+                None
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        let entry_history =
+            crate::config_revisions::history(&root, ENTRY_REVISION_KIND, "e1", None).unwrap();
+        assert_eq!(entry_history.len(), 1);
+        assert_eq!(entry_history[0].label, "Edited Reviewer");
+    }
+
+    #[test]
+    fn re_saving_an_unchanged_entry_adds_no_entry_revision() {
+        let root = temp_dir();
+        let first = library_payload(ONE_ENTRY);
+        record_revisions(&root, &first, None).unwrap();
+        // A second entry appears; the first entry's authored fields did not
+        // change, so only the library and the NEW entry gain a revision.
+        let second = library_payload(&format!(
+            r#"{ONE_ENTRY},{{"id":"e2","kind":"snippet","name":"Snip","command":"snip","content":"x"}}"#
+        ));
+        record_revisions(&root, &second, None).unwrap();
+        assert_eq!(
+            crate::config_revisions::history(&root, ENTRY_REVISION_KIND, "e1", None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            crate::config_revisions::history(&root, ENTRY_REVISION_KIND, "e2", None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_stale_base_revision_refuses_the_library_save() {
+        let root = temp_dir();
+        let first = record_revisions(&root, &library_payload(ONE_ENTRY), None).unwrap();
+        // Another window saves in between.
+        record_revisions(&root, &library_payload(""), None).unwrap();
+        let error = record_revisions(&root, &library_payload(ONE_ENTRY), Some(first)).unwrap_err();
+        assert!(error.starts_with("conflict:"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn an_unparseable_payload_still_records_the_library_revision() {
+        let root = temp_dir();
+        // The blob is frontend-owned; a shape this module doesn't know must
+        // cost the per-entry history, never the save.
+        record_revisions(&root, "not json at all", None).unwrap();
+        assert_eq!(
+            crate::config_revisions::history(
+                &root,
+                LIBRARY_REVISION_KIND,
+                LIBRARY_REVISION_ENTITY,
+                None
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_entry_snapshot_ignores_ids_and_timestamps() {
+        let base = PromptEntry {
+            id: "e1".to_string(),
+            kind: "persona".to_string(),
+            name: "Reviewer".to_string(),
+            command: "rev".to_string(),
+            content: "body".to_string(),
+            description: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        let moved = PromptEntry {
+            id: "different".to_string(),
+            created_at: 999,
+            updated_at: 1000,
+            ..base.clone()
+        };
+        assert_eq!(entry_snapshot(&base), entry_snapshot(&moved));
+        let edited = PromptEntry {
+            content: "changed".to_string(),
+            ..base.clone()
+        };
+        assert_ne!(entry_snapshot(&base), entry_snapshot(&edited));
     }
 
     #[test]

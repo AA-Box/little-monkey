@@ -37,7 +37,8 @@ use crate::mcp_app_core::{
 };
 use crate::package_ecosystem::{
     signed_first_party_catalog, InstallEnvironment, InstallTrustPolicy, PackageLimits,
-    RingEd25519SignatureVerifier, SemanticVersion, FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS,
+    RingEd25519SignatureVerifier, SemanticVersion, AGENT_CONTRACT_VERSION,
+    FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS,
 };
 use crate::process_table::{LedgerProcessProjector, LedgerSignalSource};
 use crate::run_scope::{RunScope, Unattributed};
@@ -2274,7 +2275,12 @@ fn production_workflow_service_with_browser(
     // level boundary see a pause requested from any of them.
     .with_signal_source(Arc::new(LedgerSignalSource::new(
         app_data_dir.join("profile-v1.sqlite3"),
-    )));
+    )))
+    // Same "every production path reaches this service" reasoning: attaching
+    // the shared revision store here is what gives a workflow definition the
+    // same history (diff/restore/branch) a persona has, whether it was saved
+    // from the desktop, the CLI, or a daemon-hosted trigger.
+    .with_revision_store(crate::config_revisions::revision_root(app_data_dir));
     let service = Arc::new(service);
     Ok((service, browser))
 }
@@ -2296,6 +2302,7 @@ pub fn production_m4_services(app_data_dir: &Path) -> Result<ProductionM4Service
                 app_version,
                 platform: std::env::consts::OS.to_string(),
                 architecture: std::env::consts::ARCH.to_string(),
+                contract_version: AGENT_CONTRACT_VERSION,
             },
             InstallTrustPolicy {
                 // Local developer packages remain data-only, checksum-bound,

@@ -227,6 +227,11 @@ pub mod stacks;
 // `pub` so `monkey-cli` (slice 4) can reuse `load_impl`/`PromptEntry` directly,
 // the same reasoning as `rules`/`checkpoints` above.
 pub mod prompts;
+// Local revision history (diff/restore/branch/compare) for everything the user
+// authors — personas, snippets, skills, workflow definitions (roadmap K24 /
+// ROADMAP #3). `pub` for the same reason as `prompts`: `WorkflowService` and
+// `monkey-cli` record into it without an `AppHandle`.
+pub mod config_revisions;
 mod login_path;
 mod sessions;
 mod system;
@@ -328,6 +333,12 @@ pub mod http_policy;
 // Pure, AppHandle-free allowlist and dispatch matrix shared by the legacy and
 // M3 HTTP implementations while D1 collapses them into one listener.
 pub mod http_route_registry;
+// The agent tool schemas. In the library rather than beside the agent loop
+// because `contract` generates the published tool contract from them.
+pub mod agent_tools;
+// The published, semver'd syscall ABI (K19), generated from the route table,
+// the remote plane's dispatch, the ACP methods and `agent_tools`.
+pub mod contract;
 // Pure union model catalog used by the same D1 HTTP merge.
 pub mod http_model_catalog;
 pub mod http_model_service;
@@ -1213,6 +1224,14 @@ pub fn run() {
             prompts::prompts_save,
             prompts::prompts_read_external,
             prompts::prompts_write_external,
+            prompts::prompts_current_revision,
+            config_revisions::config_revisions_record,
+            config_revisions::config_revisions_history,
+            config_revisions::config_revisions_get,
+            config_revisions::config_revisions_head,
+            config_revisions::config_revisions_branch,
+            config_revisions::config_revisions_branches,
+            config_revisions::config_revisions_entities,
             checkpoints::checkpoint_begin,
             checkpoints::checkpoint_end,
             checkpoints::checkpoint_revert,

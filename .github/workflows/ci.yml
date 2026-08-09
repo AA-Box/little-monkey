@@ -113,6 +113,13 @@ jobs:
       - name: Rust tests
         run: pnpm test:rust
 
+      # The K19 gate, named as its own step so a failure reads as "the
+      # published ABI changed without a version bump" rather than as one line
+      # in a 2,000-test run. Everything is already compiled by the step above,
+      # so this costs a test binary invocation.
+      - name: Contract ABI gate
+        run: pnpm contract:check
+
   # ROADMAP #8 / K22: supply-chain review of what a release actually ships.
   # Split from the test matrix on purpose — these check the dependency set, not
   # the code, so they run once and neither blocks nor is blocked by a platform.

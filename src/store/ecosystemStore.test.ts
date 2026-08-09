@@ -38,6 +38,13 @@ const preview = {
     mcp_actions_separate: [],
     file_count: 1,
     total_bytes: 10,
+    plan: {
+      package_id: "first-party.skill",
+      version: "1.0.0",
+      steps: [{ package_id: "first-party.skill", version: "1.0.0", action: "install", required_by: [] }],
+      problems: [],
+      satisfiable: true,
+    },
     warnings: [],
   },
   approval_digest: "approval-digest",

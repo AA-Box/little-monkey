@@ -2053,6 +2053,11 @@ impl M3HttpRequestService {
                     "conformance": self.hub.conformance_manifest(),
                 }),
             )
+        } else if method == Method::GET && route == RouteId::Contract {
+            // Answered beside `/health`, before authentication, for the reason
+            // the route table gives: a client negotiates the ABI before it can
+            // know its credentials still fit it.
+            json_response(StatusCode::OK, crate::contract::introspection())
         } else {
             let auth = match preflight_request_auth(&self.hub, &headers, &policy, remote_address) {
                 Ok(auth) => auth,
@@ -2226,7 +2231,8 @@ where
         .as_deref()
         .is_some_and(|origin| !origin_allowed(&policy, origin));
     let public_without_body = request.method() == Method::OPTIONS
-        || (request.method() == Method::GET && route == RouteId::Health);
+        || (request.method() == Method::GET
+            && matches!(route, RouteId::Health | RouteId::Contract));
     if !public_without_body && !origin_denied {
         if let Err(mut response) =
             preflight_request_auth(&service.hub, request.headers(), &policy, remote_address)
@@ -2770,6 +2776,47 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(polls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// The K19 introspection endpoint on the LAN/paired listener, answered
+    /// with no `Authorization` header at all. It is deliberately in the same
+    /// pre-authentication band as `/health`: a caller negotiating the ABI has
+    /// not necessarily got a credential of the right shape yet, and the body
+    /// is a pure function of the built binary — no configuration, no model
+    /// list, no credential state — so there is nothing here to leak.
+    #[tokio::test]
+    async fn the_contract_route_answers_the_m3_listener_before_authentication() {
+        let root = TestRoot::new();
+        let service = M3HttpRequestService::new(test_hub(&root));
+        let response = service
+            .handle(M3HttpServiceRequest {
+                route: RouteId::Contract,
+                method: Method::GET,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+                remote_address: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                policy: Arc::new(LanServerPolicy::default()),
+                context: M3OperationContext::new(REQUEST_TIMEOUT_MS),
+            })
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("contract body")
+                .to_bytes(),
+        )
+        .expect("contract JSON");
+        assert_eq!(
+            payload["contract_version"],
+            crate::contract::CONTRACT_VERSION
+        );
+        assert_eq!(payload["digest"], crate::contract::digest());
+        assert!(payload["manifest"]["http_routes"]
+            .as_array()
+            .is_some_and(|routes| !routes.is_empty()));
     }
 
     #[tokio::test]

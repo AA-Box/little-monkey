@@ -12,6 +12,7 @@ mod agent;
 mod chat;
 mod checkpoints_cli;
 mod cmds;
+mod contract_cli;
 mod daemon;
 mod durable_run;
 mod embed_cli;
@@ -404,6 +405,10 @@ enum Cmd {
     /// Inspect local security posture and apply narrowly-scoped safe fixes.
     #[command(subcommand)]
     Security(security_cli::SecurityCmd),
+    /// Print, emit, or version-check the published syscall ABI (roadmap
+    /// K19) — the schema set third parties build against.
+    #[command(subcommand)]
+    Contract(contract_cli::ContractCmd),
     /// Inspect agent processes across every execution surface.
     ///
     /// Named `processes` because `monkey ps` is the Ollama-compatible
@@ -1452,6 +1457,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                 Err(error) => Err(error),
             }
         }
+        Cmd::Contract(action) => contract_cli::run(action).await,
         Cmd::Acp => acp::run(cli).await,
     };
     if let Err(e) = result {
