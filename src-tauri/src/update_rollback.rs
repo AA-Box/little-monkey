@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 
 /// What kind of thing the installed app *is* on this platform, which decides
 /// both how it is copied and how it is relaunched.
@@ -247,7 +247,7 @@ fn read_snapshot(app_data_dir: &Path) -> Option<RollbackSnapshot> {
         .map(|_| snapshot)
 }
 
-fn app_data(app: &AppHandle) -> Result<PathBuf, String> {
+fn app_data<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
         .map_err(|error| format!("Failed to resolve the app data directory: {error}"))
@@ -376,7 +376,9 @@ pub async fn update_install_info() -> Result<InstallInfo, String> {
 }
 
 #[tauri::command]
-pub async fn update_snapshot_create(app: AppHandle) -> Result<RollbackSnapshot, String> {
+pub async fn update_snapshot_create<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<RollbackSnapshot, String> {
     let app_data_dir = app_data(&app)?;
     let version = app.package_info().version.to_string();
     let executable = std::env::current_exe()
@@ -389,12 +391,14 @@ pub async fn update_snapshot_create(app: AppHandle) -> Result<RollbackSnapshot, 
 }
 
 #[tauri::command]
-pub async fn update_rollback_status(app: AppHandle) -> Result<Option<RollbackSnapshot>, String> {
+pub async fn update_rollback_status<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Option<RollbackSnapshot>, String> {
     Ok(read_snapshot(&app_data(&app)?))
 }
 
 #[tauri::command]
-pub async fn update_rollback_discard(app: AppHandle) -> Result<(), String> {
+pub async fn update_rollback_discard<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let directory = rollback_dir(&app_data(&app)?);
     match std::fs::remove_dir_all(&directory) {
         Ok(()) => Ok(()),
@@ -406,7 +410,7 @@ pub async fn update_rollback_discard(app: AppHandle) -> Result<(), String> {
 /// Restores the snapshot and relaunches. Returns only if the restore could not
 /// be *started*; on success the app exits and the script takes over.
 #[tauri::command]
-pub async fn update_rollback_apply(app: AppHandle) -> Result<(), String> {
+pub async fn update_rollback_apply<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let app_data_dir = app_data(&app)?;
     let snapshot = read_snapshot(&app_data_dir)
         .ok_or_else(|| "There is no rollback snapshot to restore".to_string())?;
@@ -580,6 +584,75 @@ mod tests {
             body.contains("start \"\" \"C:\\Program Files\\Little Monkey\\little-monkey.exe\""),
             "{body}"
         );
+    }
+
+    fn invoke_request(cmd: &str) -> tauri::webview::InvokeRequest {
+        tauri::webview::InvokeRequest {
+            cmd: cmd.to_string(),
+            callback: tauri::ipc::CallbackFn(0),
+            error: tauri::ipc::CallbackFn(1),
+            url: if cfg!(any(windows, target_os = "android")) {
+                "http://tauri.localhost"
+            } else {
+                "tauri://localhost"
+            }
+            .parse()
+            .unwrap(),
+            body: tauri::ipc::InvokeBody::Json(serde_json::json!({})),
+            headers: Default::default(),
+            invoke_key: tauri::test::INVOKE_KEY.to_string(),
+        }
+    }
+
+    /// The panel calls these three over IPC and nothing else does, so an
+    /// argument the macro cannot match, or a command missing from the handler
+    /// list, would only show up in a running desktop build. Round-trip them.
+    #[test]
+    fn the_panels_commands_answer_over_ipc() {
+        let app = crate::test_support::build(tauri::test::mock_builder().invoke_handler(
+            tauri::generate_handler![
+                update_install_info,
+                update_rollback_status,
+                update_rollback_discard,
+                crate::self_integrity::self_integrity_report
+            ],
+        ));
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+
+        // No snapshot has been taken in this app's private data directory.
+        let status =
+            tauri::test::get_ipc_response(&webview, invoke_request("update_rollback_status"))
+                .expect("update_rollback_status answers");
+        assert!(status
+            .deserialize::<Option<RollbackSnapshot>>()
+            .unwrap()
+            .is_none());
+
+        // Discarding nothing is not an error — the panel's button is safe to
+        // press twice.
+        tauri::test::get_ipc_response(&webview, invoke_request("update_rollback_discard"))
+            .expect("update_rollback_discard answers");
+
+        // The install shape is only unanswerable on macOS, where a test binary
+        // is not inside an .app bundle; everywhere else it must classify.
+        let install =
+            tauri::test::get_ipc_response(&webview, invoke_request("update_install_info"));
+        if cfg!(target_os = "macos") {
+            assert!(install.is_err(), "a non-bundle macOS install has no root");
+        } else {
+            let info = install.unwrap().deserialize::<InstallInfo>().unwrap();
+            assert!(!info.root.is_empty());
+        }
+
+        let report =
+            tauri::test::get_ipc_response(&webview, invoke_request("self_integrity_report"))
+                .expect("self_integrity_report answers")
+                .deserialize::<crate::self_integrity::IntegrityReport>()
+                .unwrap();
+        assert_eq!(report.components.len(), 4, "signature plus three runtimes");
+        assert!(!report.refused, "a source build must not refuse");
     }
 
     #[test]
