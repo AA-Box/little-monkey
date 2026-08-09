@@ -3,8 +3,14 @@ use std::sync::{Arc, Mutex};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use little_monkey_lib::artifact_store::ArtifactStore;
+use little_monkey_lib::migration::{
+    admit, MigrationVerdict, TargetNode, MAX_MIGRATION_PAYLOAD_BYTES,
+};
 use little_monkey_lib::run_ledger::{RunLedger, StoredApproval, StoredRun};
-use little_monkey_lib::run_protocol::{ModelTargetSnapshot, PermissionDecision, RunEvent};
+use little_monkey_lib::run_protocol::{
+    ClientIdentity, ClientKind, ModelTargetSnapshot, PermissionDecision, RunEvent,
+    RunEventEnvelope, RUN_PROTOCOL_SCHEMA_VERSION,
+};
 use serde::Serialize;
 
 use crate::daemon::ledger::SharedLedger;
@@ -14,10 +20,12 @@ use crate::durable_run::{bounded_text, CliRunEventSink, DurableRunRecorder};
 use little_monkey_lib::run_protocol::OutputChannel;
 
 use super::desktop::DesktopControlRuntime;
+use super::migrate::land_migration;
 use super::protocol::{
     canonical_request, legacy_capabilities, sha256_hex, ApprovalRequestBody, CancelRequestBody,
     DesktopControlActionRequest, DesktopControlStartRequest, DesktopControlStopRequest,
-    DeviceCapability, PairAcceptRequest, RemoteAction, RemoteHostConfig, RemoteScopes, RunSummary,
+    DeviceCapability, MigrationAcceptRequest, MigrationPreflightRequest, MigrationReceipt,
+    PairAcceptRequest, RemoteAction, RemoteHostConfig, RemoteScopes, RunSummary,
     SignedRequestHeaders, MAX_REMOTE_BODY_BYTES, REMOTE_PROTOCOL_VERSION,
 };
 use super::store::{
@@ -626,6 +634,19 @@ impl RemoteApi {
                 require_capability(device, DeviceCapability::DescribeNode)
                     .and_then(|_| self.placed_run_status(device_id, submitted_run_id))
             }
+            // Live migration (roadmap K18) sits on the placement plane rather
+            // than beside it: a migration *is* a placement — a `RunSpec` this
+            // node did not author — plus the frozen image that turns it into a
+            // continuation. `GET /v1/remote/node` above is what an origin reads
+            // to choose a target, so migration needs no describe route of its own.
+            ("POST", ["v1", "remote", "node", "migration", "preflight"]) => {
+                require_capability(device, DeviceCapability::Migrate)
+                    .and_then(|_| self.migration_preflight(&request.body, now_ms))
+            }
+            ("POST", ["v1", "remote", "node", "migration", "accept"]) => {
+                require_capability(device, DeviceCapability::Migrate)
+                    .and_then(|_| self.migration_accept(&request.body, now_ms))
+            }
             // Self-revocation needs no extra capability: a device may always
             // sever itself. The store path force-stops any live desktop
             // session the device owns, exactly like an operator revoke.
@@ -1091,6 +1112,240 @@ impl RemoteApi {
 
     fn run_ledger(&self) -> Result<RunLedger, (u16, String)> {
         RunLedger::open(&self.paths.ledger_db).map_err(internal)
+    }
+
+    // --- `/v1/remote/node` and `/v1/remote/migration/*` (roadmap K18) -------
+
+    /// The app data directory this node's desktop half also uses.
+    ///
+    /// A migration writes into the *desktop's* checkpoint directory and session
+    /// file on purpose: the thing that finally resumes a frozen turn is the
+    /// desktop's own K13 re-entry, and it reads those two places. Landing the
+    /// image anywhere else would make the daemon the only reader of a state
+    /// whose whole point is being resumed.
+    fn app_data_dir(&self) -> Result<&std::path::Path, (u16, String)> {
+        self.paths.ledger_db.parent().ok_or_else(|| {
+            (
+                500,
+                "This node's ledger path has no app-data parent".to_string(),
+            )
+        })
+    }
+
+    /// Collapses K17's node descriptor into what [`admit`] asks about.
+    ///
+    /// Built from `describe_node` rather than from a second probe, so a
+    /// migration is admitted against exactly the facts an origin read from
+    /// `GET /v1/remote/node` when it chose this target.
+    ///
+    /// **Installed rather than loaded, deliberately.** K13's `ModelNotResident`
+    /// asks what the *next round trip would reach*, which on the machine running
+    /// the turn is what is loaded. A target node is idle by definition — it has
+    /// loaded nothing — so asking the residency question here would refuse every
+    /// migration to every idle node. What a target can honestly promise is that
+    /// the model is present and will load; what it still refuses is a model it
+    /// does not have at all.
+    fn migration_target(
+        &self,
+        descriptor: &little_monkey_lib::node_placement::NodeDescriptor,
+        run_present: bool,
+    ) -> (Vec<String>, Vec<String>, bool) {
+        let mut models = descriptor
+            .resident_models
+            .iter()
+            .map(|model| model.model_id.clone())
+            .collect::<Vec<_>>();
+        models.sort();
+        models.dedup();
+        let mut runtimes = descriptor
+            .resident_models
+            .iter()
+            .map(|model| model.runtime.clone())
+            .collect::<Vec<_>>();
+        runtimes.sort();
+        runtimes.dedup();
+        (models, runtimes, run_present)
+    }
+
+    /// Answers "would you take this?" from metadata alone, before any bytes move.
+    ///
+    /// An optimisation and never the authority: `migration_accept` runs the very
+    /// same `admit` against the very same header. A target that trusted a
+    /// preflight would be trusting the *sender's* copy of facts about itself.
+    fn migration_preflight(
+        &self,
+        body: &[u8],
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let request: MigrationPreflightRequest = serde_json::from_slice(body)
+            .map_err(|error| (400, format!("Invalid migration preflight: {error}")))?;
+        if request.protocol_version != REMOTE_PROTOCOL_VERSION {
+            return Err((400, "Unsupported remote protocol version".to_string()));
+        }
+        let (verdict, descriptor) = self.admit_migration(&request.header, now_ms)?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "node": descriptor,
+                "verdict": verdict,
+            }),
+            Some(request.header.run_id),
+        ))
+    }
+
+    /// The one admission decision, run identically by both migration routes.
+    ///
+    /// Returns the descriptor alongside the verdict because a refusal is only
+    /// actionable next to the facts it was made against — "this node does not
+    /// have that model" is answerable, "refused" is not.
+    fn admit_migration(
+        &self,
+        header: &little_monkey_lib::migration::MigrationHeader,
+        now_ms: u64,
+    ) -> Result<
+        (
+            MigrationVerdict,
+            little_monkey_lib::node_placement::NodeDescriptor,
+        ),
+        (u16, String),
+    > {
+        let descriptor = self.describe_node(now_ms)?;
+        let run_present = self
+            .run_ledger()?
+            .load_run(&header.run_id)
+            .map_err(internal)?
+            .is_some();
+        let (models, runtimes, run_present) = self.migration_target(&descriptor, run_present);
+        let verdict = admit(
+            header,
+            &TargetNode {
+                node_id: &descriptor.runner_id,
+                resident_models: &models,
+                runtime_ids: &runtimes,
+                // No live approvals: this node has granted the incoming process
+                // none, which is exactly why an image frozen with an outstanding
+                // one is refused rather than resumed past a permission nobody
+                // here gave.
+                live_approvals: &[],
+                // K17's rule, applied to a move: the *origin* states the
+                // residency it required and this node checks it against its own
+                // rather than trusting it — because a rule only the sender
+                // enforces is not enforced, and an alias can start pointing at a
+                // different host.
+                residency: &descriptor.residency,
+                max_payload_bytes: MAX_MIGRATION_PAYLOAD_BYTES,
+                run_present,
+            },
+        );
+        Ok((verdict, descriptor))
+    }
+
+    /// Takes the image, or refuses it — and on success leaves this node in the
+    /// exact state its desktop half's K13 re-entry reads.
+    fn migration_accept(
+        &self,
+        body: &[u8],
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let request: MigrationAcceptRequest = serde_json::from_slice(body)
+            .map_err(|error| (400, format!("Invalid migration image: {error}")))?;
+        if request.protocol_version != REMOTE_PROTOCOL_VERSION {
+            return Err((400, "Unsupported remote protocol version".to_string()));
+        }
+        let image = request.image;
+        // Structural first, capability second: a malformed image is a bad
+        // request on any node and must not be reported as a refusal this node
+        // could be reconfigured out of.
+        image.validate().map_err(|error| (400, error))?;
+        // The same gate K17's placement route applies, and for its reason: a run
+        // must not arrive while the operator has stopped this machine.
+        if DaemonStore::open(&self.paths)
+            .map_err(internal)?
+            .kill_switch()
+            .map_err(internal)?
+        {
+            return Err((409, "Global kill switch is engaged".to_string()));
+        }
+        let (verdict, descriptor) = self.admit_migration(&image.header, now_ms)?;
+        let MigrationVerdict::Acceptable { .. } = &verdict else {
+            // 409, not 400: the image is well-formed and this node simply
+            // cannot satisfy it. The blockers say what would have to change.
+            return Ok((
+                409,
+                serde_json::json!({
+                    "protocol_version": REMOTE_PROTOCOL_VERSION,
+                    "node": descriptor,
+                    "verdict": verdict,
+                }),
+                Some(image.header.run_id.clone()),
+            ));
+        };
+        let mut ledger = self.run_ledger()?;
+
+        // The run row comes from the *origin's* frozen spec, unmodified, and it
+        // goes in *first*. That is what makes the policy travel: the allowlist
+        // this node enforces and the budgets it charges are the ones the origin
+        // declared, and `egress.rs` resolves them by run id against this node's
+        // own ledger from here on. First rather than after the landing because
+        // the process row the landing creates references it — a foreign key,
+        // which is the schema saying the same thing.
+        //
+        // A landing that then fails leaves an event-less `queued` row, which is
+        // recoverable: `submit_run` is keyed by the spec's idempotency key and
+        // returns the existing run rather than erroring, so the same image can
+        // be sent again.
+        ledger.submit_run(&image.spec).map_err(internal)?;
+        let app_data_dir = self.app_data_dir()?.to_path_buf();
+        let landed = land_migration(&app_data_dir, &self.paths, &image, now_ms)
+            .map_err(|error| (500, error))?;
+        let arrival = RunEvent::MigrationArrived {
+            origin_node_id: image.header.origin_node_id.clone(),
+            origin_last_sequence: image.origin_last_sequence,
+            origin_last_event_hash: image.origin_last_event_hash.clone(),
+            payload_sha256: image.header.payload_sha256.clone(),
+        };
+        let envelope = RunEventEnvelope {
+            schema_version: RUN_PROTOCOL_SCHEMA_VERSION,
+            event_id: format!("evt-migration-{}", &image.header.payload_sha256[..24]),
+            run_id: image.header.run_id.clone(),
+            sequence: 1,
+            occurred_at_ms: now_ms,
+            actor_id: None,
+            emitter: ClientIdentity {
+                client_id: descriptor.runner_id.clone(),
+                instance_id: descriptor.runner_id.clone(),
+                kind: ClientKind::RemoteRunner,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            event: arrival,
+        };
+        ledger.append_event(&envelope).map_err(internal)?;
+        let arrival_event_hash = ledger
+            .migration_arrival(&image.header.run_id)
+            .map_err(internal)?
+            .map(|arrival| arrival.event_hash)
+            .ok_or_else(|| {
+                (
+                    500,
+                    "The arrival event did not chain on this node".to_string(),
+                )
+            })?;
+
+        Ok((
+            201,
+            serde_json::to_value(MigrationReceipt {
+                protocol_version: REMOTE_PROTOCOL_VERSION,
+                node_id: descriptor.runner_id,
+                run_id: image.header.run_id.clone(),
+                process_id: landed.process_id,
+                workspace_root: landed.workspace_root.to_string_lossy().to_string(),
+                arrival_event_hash,
+                caveats: little_monkey_lib::migration::caveats(),
+            })
+            .map_err(internal)?,
+            Some(image.header.run_id),
+        ))
     }
 
     // --- `/v1/remote/mobile/*` handlers -----------------------------------
@@ -2135,6 +2390,16 @@ mod tests {
     fn fixture_with(
         actions: BTreeSet<RemoteAction>,
     ) -> (PathBuf, RemoteApi, Arc<FakeSecrets>, String, Vec<u8>) {
+        fixture_scoped(actions, BTreeSet::from(["run-one".to_string()]))
+    }
+
+    /// The same fixture with an explicit run scope, so a migration test can pair
+    /// a device for a run this node does not have yet — which is the only shape
+    /// a placement ever has.
+    fn fixture_scoped(
+        actions: BTreeSet<RemoteAction>,
+        run_ids: BTreeSet<String>,
+    ) -> (PathBuf, RemoteApi, Arc<FakeSecrets>, String, Vec<u8>) {
         let root =
             std::env::temp_dir().join(format!("little-monkey-remote-api-{}", uuid::Uuid::new_v4()));
         let paths = DaemonPaths::under(&root);
@@ -2216,7 +2481,7 @@ mod tests {
         let mut store = RemoteStore::open(&paths.root).unwrap();
         let scopes = RemoteScopes {
             actions,
-            run_ids: BTreeSet::from(["run-one".into()]),
+            run_ids,
             workspace_ids: BTreeSet::new(),
             max_artifact_bytes: 1_024,
         };
@@ -3099,5 +3364,409 @@ mod tests {
         );
         assert_eq!(response.status, 501);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // --- Live migration (roadmap K18) -------------------------------------
+    //
+    // Two machines is the honest bar for this feature and this repository's CI
+    // has one. What these exercise is the *wire path* against a loopback node:
+    // the real routes, the real signed transport, the real ledger, the real
+    // files on disk. They are not a substitute for two hosts — nothing here
+    // proves a network, a clock skew between machines, or a partial transfer.
+
+    /// Writes a frozen checkpoint and its workspace on a pretend origin node,
+    /// and returns that node's app-data root plus the checkpoint id.
+    fn frozen_origin(model: Option<&str>) -> (PathBuf, String) {
+        use little_monkey_lib::checkpoints::{CheckpointEntry, CheckpointManifest, ResumeState};
+
+        let origin = std::env::temp_dir().join(format!(
+            "little-monkey-migration-origin-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = origin.join("work");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/main.rs"), b"fn main() {}").unwrap();
+
+        let checkpoint_id = "cp-migrate-01".to_string();
+        let checkpoint_dir = origin.join("checkpoints").join(&checkpoint_id);
+        std::fs::create_dir_all(&checkpoint_dir).unwrap();
+        std::fs::write(checkpoint_dir.join("0.bak"), b"fn main() {} // before").unwrap();
+        let manifest = CheckpointManifest {
+            version: 3,
+            created_at_ms: 1_000,
+            session_id: "session-migrated".to_string(),
+            anchor_index: 0,
+            label: "the frozen turn".to_string(),
+            shell_ran: false,
+            external_effects: vec![],
+            committed_effects: None,
+            reverted: false,
+            prev_id: None,
+            entries: vec![CheckpointEntry {
+                path: workspace.join("src/main.rs").to_string_lossy().to_string(),
+                backup: Some("0.bak".to_string()),
+                redo: None,
+                after: None,
+            }],
+            remembered_facts: vec![],
+            staged_task_suggestions: vec![],
+            resume: Some(ResumeState {
+                process_id: "turn-origin-01".to_string(),
+                frozen_at_ms: 1_500,
+                model: model.map(str::to_string),
+                runtime_id: None,
+                workspace: Some(workspace.to_string_lossy().to_string()),
+                pending_approvals: vec![],
+            }),
+        };
+        std::fs::write(
+            checkpoint_dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            origin.join("chat_sessions.json"),
+            serde_json::json!({
+                "sessions": [{ "id": "session-migrated", "messages": ["the frozen conversation"] }],
+                "activeSessionId": "session-migrated",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (origin, checkpoint_id)
+    }
+
+    /// K17's placement pairing plus the K18 grant, which is exactly the shape
+    /// the capability rule requires: `migrate` implies `place_runs`.
+    fn migration_fixture() -> (PathBuf, RemoteApi, String, Vec<u8>) {
+        migration_pairing(BTreeSet::from([
+            DeviceCapability::ViewRuns,
+            DeviceCapability::DescribeNode,
+            DeviceCapability::PlaceRuns,
+            DeviceCapability::Migrate,
+        ]))
+    }
+
+    fn migration_pairing(
+        capabilities: BTreeSet<DeviceCapability>,
+    ) -> (PathBuf, RemoteApi, String, Vec<u8>) {
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-remote-migrate-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = DaemonPaths::under(&root);
+        paths.ensure().unwrap();
+        DaemonConfig::default().save(&paths).unwrap();
+        let host = RemoteHostConfig {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            runner_id: "runner-one".into(),
+            listen: "127.0.0.1:1".into(),
+            advertise_url: "https://runner.invalid".into(),
+            certificate_path: "/tmp/cert".into(),
+            private_key_path: "/tmp/key".into(),
+            certificate_sha256: "a".repeat(64),
+            enabled: true,
+        };
+        let mut store = RemoteStore::open(&paths.root).unwrap();
+        let scopes = RemoteScopes {
+            actions: BTreeSet::from([RemoteAction::ViewRuns]),
+            run_ids: BTreeSet::from(["run-one".into()]),
+            workspace_ids: BTreeSet::new(),
+            max_artifact_bytes: 1_024,
+        };
+        let secrets = Arc::new(FakeSecrets::default());
+        let invite = store
+            .create_invitation_with_capabilities(&scopes, &capabilities, 1_000, 3_000)
+            .unwrap();
+        let accepted = store
+            .accept_invitation_with_capabilities(
+                &invite.pairing_id,
+                &invite.token,
+                "origin",
+                "runner-one",
+                None,
+                1_100,
+                secrets.as_ref(),
+            )
+            .unwrap();
+        let secret = accepted.device_secret.as_bytes().to_vec();
+        let api = RemoteApi::injected(paths, host, store, secrets);
+        (root, api, accepted.device_id, secret)
+    }
+
+    #[test]
+    fn a_frozen_image_moves_to_the_node_and_lands_as_a_resumable_turn() {
+        let (root, api, device, secret) = migration_fixture();
+        // No model recorded, so the target's "is it here" check has nothing to
+        // refuse. The model refusal has its own test below.
+        let (origin, checkpoint_id) = frozen_origin(None);
+        let spec = spec("run-migrated", "workspace-one");
+        let image = super::super::migrate::build_image(
+            &origin,
+            "runner-origin",
+            &checkpoint_id,
+            &spec,
+            7,
+            &"c".repeat(64),
+            None,
+        )
+        .expect("the origin can read its own frozen image");
+
+        let preflight = serde_json::to_vec(&MigrationPreflightRequest {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            header: image.header.clone(),
+        })
+        .unwrap();
+        let response = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-preflight",
+                "POST",
+                "/v1/remote/node/migration/preflight",
+                &preflight,
+            ),
+            2_000,
+        );
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["verdict"]["state"], "acceptable");
+        // The determinism statement travels with the verdict, so whoever presses
+        // Migrate reads it rather than a doc.
+        assert!(!body["verdict"]["caveats"].as_array().unwrap().is_empty());
+        // Nothing has moved yet: a preflight that landed anything would make the
+        // refusal path a write.
+        assert!(!root.join("checkpoints").join(&checkpoint_id).exists());
+
+        let accept = serde_json::to_vec(&MigrationAcceptRequest {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            image: image.clone(),
+        })
+        .unwrap();
+        let response = api.handle(
+            signed(
+                &device,
+                &secret,
+                2,
+                "cmd-accept",
+                "POST",
+                "/v1/remote/node/migration/accept",
+                &accept,
+            ),
+            2_100,
+        );
+        assert_eq!(
+            response.status,
+            201,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let receipt: MigrationReceipt = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(receipt.run_id, "run-migrated");
+
+        // The workspace really crossed.
+        let landed_file = PathBuf::from(&receipt.workspace_root).join("src/main.rs");
+        assert_eq!(std::fs::read(&landed_file).unwrap(), b"fn main() {}");
+
+        // The conversation crossed too — without it a resume would continue a
+        // turn with no history.
+        let sessions: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("chat_sessions.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sessions["sessions"][0]["id"], "session-migrated");
+
+        // And the checkpoint the desktop's K13 re-entry reads is on disk, with
+        // its paths re-rooted here and its resume naming the *local* row.
+        let manifest: little_monkey_lib::checkpoints::CheckpointManifest = serde_json::from_str(
+            &std::fs::read_to_string(
+                root.join("checkpoints")
+                    .join(&checkpoint_id)
+                    .join("manifest.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let resume = manifest
+            .resume
+            .expect("the landed checkpoint is still a freeze");
+        assert_eq!(resume.process_id, receipt.process_id);
+        assert_eq!(
+            resume.workspace.as_deref(),
+            Some(receipt.workspace_root.as_str())
+        );
+        assert!(manifest.entries[0]
+            .path
+            .starts_with(&receipt.workspace_root));
+        assert!(root
+            .join("checkpoints")
+            .join(&checkpoint_id)
+            .join("0.bak")
+            .exists());
+
+        // The process row is suspended, which is exactly the state the desktop's
+        // Resume path looks for.
+        let ledger = RunLedger::open(&DaemonPaths::under(&root).ledger_db).unwrap();
+        let record = ledger
+            .process_table()
+            .get(&receipt.process_id)
+            .unwrap()
+            .expect("the landed process exists");
+        assert_eq!(
+            record.state,
+            little_monkey_lib::process_table::ProcessState::Suspended
+        );
+        assert_eq!(record.run_id.as_deref(), Some("run-migrated"));
+
+        // One chain across both nodes: the target's first event names the
+        // origin's tip, and the join is what an auditor holding both halves runs.
+        let arrival = ledger
+            .migration_arrival("run-migrated")
+            .unwrap()
+            .expect("the target's half starts with an arrival");
+        assert_eq!(arrival.event_hash, receipt.arrival_event_hash);
+        let departure = little_monkey_lib::run_ledger::MigrationDeparture {
+            run_id: "run-migrated".to_string(),
+            sequence: 7,
+            event_hash: "c".repeat(64),
+            target_node_id: "runner-one".to_string(),
+            payload_sha256: image.header.payload_sha256.clone(),
+            checkpoint_id: checkpoint_id.clone(),
+        };
+        assert!(matches!(
+            little_monkey_lib::run_ledger::join_migration_chain(&departure, &arrival),
+            little_monkey_lib::run_ledger::MigrationChainJoin::Joined { .. }
+        ));
+        // And an origin claiming a different tip does not join, which is the
+        // whole point of hashing the link rather than trusting the field.
+        let mut forged = departure;
+        forged.event_hash = "d".repeat(64);
+        assert!(matches!(
+            little_monkey_lib::run_ledger::join_migration_chain(&forged, &arrival),
+            little_monkey_lib::run_ledger::MigrationChainJoin::Broken { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(origin);
+    }
+
+    #[test]
+    fn a_node_without_the_model_refuses_and_writes_nothing() {
+        let (root, api, device, secret) = migration_fixture();
+        let (origin, checkpoint_id) = frozen_origin(Some("a-model-this-node-never-installed"));
+        let spec = spec("run-migrated", "workspace-one");
+        let image = super::super::migrate::build_image(
+            &origin,
+            "runner-origin",
+            &checkpoint_id,
+            &spec,
+            7,
+            &"c".repeat(64),
+            None,
+        )
+        .unwrap();
+        let accept = serde_json::to_vec(&MigrationAcceptRequest {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            image,
+        })
+        .unwrap();
+        let response = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-accept-refused",
+                "POST",
+                "/v1/remote/node/migration/accept",
+                &accept,
+            ),
+            2_000,
+        );
+        assert_eq!(response.status, 409);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["verdict"]["state"], "refused");
+        assert!(body["verdict"]["blockers"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("model-not-resident")));
+        // A refusal is not a partial landing.
+        assert!(!root.join("checkpoints").join(&checkpoint_id).exists());
+        let ledger = RunLedger::open(&DaemonPaths::under(&root).ledger_db).unwrap();
+        assert!(ledger.load_run("run-migrated").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(origin);
+    }
+
+    /// A scheduler paired to *place* runs must not thereby be able to write a
+    /// workspace and a conversation onto this machine.
+    #[test]
+    fn a_pairing_that_may_place_runs_still_cannot_migrate_one_here() {
+        let (root, api, device, secret) = migration_pairing(BTreeSet::from([
+            DeviceCapability::ViewRuns,
+            DeviceCapability::DescribeNode,
+            DeviceCapability::PlaceRuns,
+        ]));
+        let response = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-migrate-denied",
+                "POST",
+                "/v1/remote/node/migration/accept",
+                b"{}",
+            ),
+            2_000,
+        );
+        assert_eq!(response.status, 403);
+        assert!(String::from_utf8_lossy(&response.body).contains("Migrate"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Tampering with a transferred file breaks the payload digest, and the
+    /// image is refused as malformed rather than admitted and then landed.
+    #[test]
+    fn a_tampered_payload_is_refused_before_any_capability_question() {
+        let (root, api, device, secret) = migration_fixture();
+        let (origin, checkpoint_id) = frozen_origin(None);
+        let spec = spec("run-migrated", "workspace-one");
+        let mut image = super::super::migrate::build_image(
+            &origin,
+            "runner-origin",
+            &checkpoint_id,
+            &spec,
+            7,
+            &"c".repeat(64),
+            None,
+        )
+        .unwrap();
+        image.payload.workspace_files[0].contents_base64 = STANDARD.encode(b"fn main() { evil() }");
+        let accept = serde_json::to_vec(&MigrationAcceptRequest {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            image,
+        })
+        .unwrap();
+        let response = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-accept-tampered",
+                "POST",
+                "/v1/remote/node/migration/accept",
+                &accept,
+            ),
+            2_000,
+        );
+        assert_eq!(response.status, 400);
+        assert!(String::from_utf8_lossy(&response.body).contains("digest"));
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(origin);
     }
 }
