@@ -2880,34 +2880,49 @@ mod tests {
         // same whichever platform reported it. The allow codes (73-75) have no
         // `sh` counterpart because there `set -eu` fails the script for us.
         //
-        // Every step is checked, and the script does **not** end in a bare
-        // `exit /b 0`: `&` does not stop on failure, so an unchecked step would
-        // let a silent denial through and leave the exit code saying nothing.
-        // That is what a first draft of this test did, and the write it failed to
-        // notice only surfaced as an is_file() assertion with no reason attached.
+        // `&` does not stop on failure, so every step is followed by its own
+        // check; an unchecked step would let a silent denial through and leave the
+        // exit code saying nothing. Reaching the trailing `exit /b 0` therefore
+        // means each check passed — which is a claim about the checks, so they
+        // have to be able to fire. See below for the two that could not.
         //
-        // `type X > Y` creates Y and then fails, leaving errorlevel 1, so the
-        // `&&` after it runs only when the read actually succeeded. Same for the
-        // `echo >` overwrite.
+        // **No step is wrapped in parentheses.** `exit /b` inside `(...)` leaves
+        // the block, not `cmd`, so the earlier `(… && exit /b 71)` and
+        // `(… && exit /b 72)` set an errorlevel that the trailing `exit /b 0`
+        // then overwrote: the two deny codes could not fire at all, and `exit 0`
+        // was reporting "reached the end", not "every step passed". Both deny
+        // steps are top-level now, and the pair of `if not errorlevel 1` after
+        // them is what actually stops the run.
         //
-        // The *allow* half asks `if not exist` rather than trusting `||`. A run
-        // that exited 0 here still left both sandbox directories empty on the
-        // host — not even `forbidden-copy`, which `type` creates before it fails
-        // to read — so cmd called every one of those redirects a success. Rather
-        // than argue about when a failed `>` sets errorlevel, ask the container
-        // the question directly: is the file there. `dir` at the end reports
-        // what the container itself sees, which is the half the host listing in
-        // the assertion below cannot show.
+        // `if errorlevel` rather than `%ERRORLEVEL%`: a one-liner is expanded
+        // once, before any of it runs, so `%ERRORLEVEL%` would compare the value
+        // this script started with. `if not errorlevel 1` is a live test, and it
+        // means "errorlevel is below 1" — the step succeeded, which for these two
+        // steps is the boundary failing.
+        //
+        // Neither deny step redirects into the sandbox any more. The old ones
+        // wrote `forbidden-copy`, and `>` creates its target before the command
+        // that failed to read — so the file proved nothing about the read either
+        // way, and its absence on the host was read as evidence when it was not.
+        // `>nul` keeps a *successful* read from printing the secret; stderr is
+        // deliberately left alone, because "Access is denied." is the diagnosis.
+        //
+        // `dir /b` at the end reports what the container itself sees, which is
+        // the half the host listing in the assertion below cannot show — and the
+        // stdout assertion in the loop is what makes that reporting load-bearing
+        // instead of decorative.
         let command = format!(
             "if /I not \"%USERPROFILE%\"==\"{home}\" exit /b 70 \
              & if /I not \"%TMP%\"==\"{tmp}\" exit /b 70 \
-             & (type \"{allowed}\" > \"%TMP%\\allowed-copy\" || exit /b 73) \
+             & type \"{allowed}\" > \"%TMP%\\allowed-copy\" \
              & if not exist \"%TMP%\\allowed-copy\" exit /b 73 \
-             & (type \"{forbidden}\" > \"%TMP%\\forbidden-copy\" && exit /b 71) \
-             & (echo overwritten> \"{forbidden}\" && exit /b 72) \
-             & (echo home-ok> \"%USERPROFILE%\\probe\") \
+             & type \"{forbidden}\" >nul \
+             & if not errorlevel 1 exit /b 71 \
+             & echo overwritten> \"{forbidden}\" \
+             & if not errorlevel 1 exit /b 72 \
+             & echo home-ok> \"%USERPROFILE%\\probe\" \
              & if not exist \"%USERPROFILE%\\probe\" exit /b 74 \
-             & (echo tmp-ok> \"%TMP%\\probe\") \
+             & echo tmp-ok> \"%TMP%\\probe\" \
              & if not exist \"%TMP%\\probe\" exit /b 75 \
              & dir /b \"%USERPROFILE%\" \"%TMP%\" \
              & exit /b 0",
@@ -2945,6 +2960,20 @@ mod tests {
                 Isolation::OsSandboxed,
                 "the container was created, so the run must report the boundary it got"
             );
+            // Asserted before the exit code, because it is what decides whether
+            // the exit code means anything. The script ends in `dir /b` over two
+            // directories it has just written into, and `dir` prints to one stream
+            // or the other however it goes — so a run with nothing on either did
+            // not reach that line, and an `exit 0` from it is not "every check
+            // passed" but a child that ran none of them.
+            assert!(
+                !outcome.stdout.is_empty(),
+                "the confined child printed nothing, so it never reached the \
+                 trailing `dir /b` and its exit code describes a script that did \
+                 not run (network={allow_network}); exit={:?} stderr={:?}",
+                outcome.exit_code,
+                String::from_utf8_lossy(&outcome.stderr)
+            );
             // Each code names its own step, so a red run says which half broke
             // rather than only that something did: 70 wrong env, 71 the secret
             // was readable, 72 it was writable, 73 its own copy was not readable,
@@ -2952,7 +2981,8 @@ mod tests {
             assert_eq!(
                 outcome.exit_code,
                 Some(0),
-                "AppContainer boundary failed (network={allow_network}); stderr={}",
+                "AppContainer boundary failed (network={allow_network}); stdout={:?} stderr={:?}",
+                String::from_utf8_lossy(&outcome.stdout),
                 String::from_utf8_lossy(&outcome.stderr)
             );
             assert_eq!(
