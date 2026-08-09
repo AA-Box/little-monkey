@@ -1551,6 +1551,8 @@ fn event_type(event: &RunEvent) -> &'static str {
         RunEvent::Failed { .. } => "failed",
         RunEvent::Cancelled { .. } => "cancelled",
         RunEvent::NeedsReconciliation { .. } => "needs_reconciliation",
+        RunEvent::MigrationDeparted { .. } => "migration_departed",
+        RunEvent::MigrationArrived { .. } => "migration_arrived",
     }
 }
 

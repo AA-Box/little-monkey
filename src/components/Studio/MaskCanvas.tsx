@@ -227,7 +227,13 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
   };
 
   return (
-    <div className="flex flex-col gap-2">
+    // `min-w-0`: a grid or flex item's automatic minimum is its own min-content,
+    // and the brush row's is set by the range input — whose intrinsic width is
+    // around 130px whatever `min-width` says. Without this the whole painter
+    // refuses to go below roughly 330px, so in a narrower column the picture,
+    // `Clear` and the brush readout all hang past the right edge of every
+    // settings card beside them.
+    <div className="flex min-w-0 flex-col gap-2">
       {/* `overflow-auto` rather than a drag-to-pan mode: past 1× the content is
           wider than the box and the browser's own scrolling moves it, which
           costs no code and never competes with the brush for the pointer. */}
@@ -290,14 +296,25 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
           <ZoomIn size={12} />
         </IconButton>
         <span className="font-mono text-[11px] text-faint">{zoom}×</span>
+        {/* Pushed to the far end of the zoom row rather than sharing the brush
+            row below: it is the one destructive control here, and a labelled
+            button beside the slider is what left the slider no width. */}
+        <Button
+          size="sm"
+          variant="secondary"
+          className="ml-auto"
+          onClick={clear}
+          disabled={!value}
+        >
+          <Trash2 size={12} />
+          {t("Studio.mask.clear")}
+        </Button>
       </div>
 
-      {/* Wraps rather than pushing the clear button past the panel's edge: the
-          brush slider will give up width down to a point and then the row
-          breaks. */}
-      <div className="flex flex-wrap items-center gap-2 text-xs">
+      <div className="flex items-center gap-2 text-xs">
         <IconButton
           size="sm"
+          className="shrink-0"
           aria-label={t(erasing ? "Studio.mask.paint" : "Studio.mask.erase")}
           aria-pressed={erasing}
           onClick={() => setErasing((current) => !current)}
@@ -306,6 +323,7 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
         </IconButton>
         <IconButton
           size="sm"
+          className="shrink-0"
           aria-label={t("Studio.mask.undo")}
           title={t("Studio.mask.undo")}
           disabled={past.length === 0}
@@ -315,6 +333,7 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
         </IconButton>
         <IconButton
           size="sm"
+          className="shrink-0"
           aria-label={t("Studio.mask.redo")}
           title={t("Studio.mask.redo")}
           disabled={future.length === 0}
@@ -322,7 +341,11 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
         >
           <Redo2 size={12} />
         </IconButton>
-        <label className="flex min-w-32 flex-1 items-center gap-2">
+        {/* `min-w-0` on both: a range input's intrinsic width is around 130px
+            and a flex item does not shrink past its content by default, so the
+            slider held the row wider than the panel and pushed its own readout
+            off the edge. */}
+        <label className="flex min-w-0 flex-1 items-center gap-2">
           <span className="shrink-0 text-muted">{t("Studio.mask.brush")}</span>
           <input
             type="range"
@@ -331,14 +354,15 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
             step={4}
             value={brush}
             onChange={(event) => setBrush(Number(event.target.value))}
-            className="flex-1"
+            className="min-w-0 flex-1"
           />
-          <span className="w-10 shrink-0 text-right font-mono text-[11px] text-faint">{brush}</span>
+          {/* Fixed at `3ch` — the widest value in a monospace font — so the
+              slider keeps its width as the number grows rather than resizing
+              under the cursor mid-drag. Aligned left, because right-aligning it
+              put that spare width between the slider and the digits, which read
+              as a wider gap there than the one before the slider. */}
+          <span className="w-[3ch] shrink-0 font-mono text-[11px] text-faint">{brush}</span>
         </label>
-        <Button size="sm" variant="secondary" onClick={clear} disabled={!value}>
-          <Trash2 size={12} />
-          {t("Studio.mask.clear")}
-        </Button>
       </div>
       <p className="text-[11px] text-faint">
         {size
