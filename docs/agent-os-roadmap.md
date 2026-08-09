@@ -500,10 +500,29 @@ migration over users' existing embedded vectors**:
   One claim in this section stands unchanged and was not what forced the staging: **v1's
   query cache was never worth porting** — the test-search box fires on Enter, not per
   keystroke, and `LoadedStack` was an unbounded `HashMap` holding every parsed chunk and
-  vector. The real v2 regression is still open and still worth fixing on its own terms:
-  `HybridIndex::open` re-digests and re-validates every chunk on **every query**, so a warm
-  v1 query did zero deserialization passes where v2 does three. That is a fix to the open
-  path, not a cache, and it is now the only performance debt v1's removal leaves behind.
+  vector.
+
+  **The v2 regression this named is closed.** `HybridIndex::open` re-digested and
+  re-validated every chunk on *every query*, so a warm v1 query did zero deserialization
+  passes where v2 did three. The two O(all chunks) passes — re-deriving the content
+  digest, and the FTS mirror set-difference — now run once per *file version*.
+
+  The cache is keyed on the file's identity: device, inode, size and mtime, together
+  with the digest stored inside it. A path alone would be wrong (a prune replaces
+  `index.sqlite3` under a stable path) and the digest alone would be wrong for the
+  opposite reason — it is read *out of* the file, so it is the claim being checked
+  rather than evidence about it. A generation is immutable, so a match on all four
+  means the bytes are the ones that were validated.
+
+  **What it deliberately does not claim.** Corruption detection stays where it belongs,
+  at write and at import, and the first open of any file version still pays the full
+  check. A rewrite preserving device, inode, size and mtime to the nanosecond would be
+  skipped — an accepted limit, because an actor able to do that can also rewrite the
+  `index_digest` this check compares against, so the check was never the defence against
+  them. What it does defend is the ordinary case: a truncated write, a bit-rotted page, a
+  partially copied file, each of which changes size or mtime and re-validates. A test
+  corrupts a chunk *after* a successful open has already cached a verdict and asserts the
+  refusal, which is the case a path-keyed cache would have served happily.
 
 **Blocks:** nothing now. K11's precondition was that two systems stopped producing
 context by different rules; one index is one rule.
