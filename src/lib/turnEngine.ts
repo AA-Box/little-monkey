@@ -40,6 +40,7 @@ import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { useSessionStore } from '../store/sessionStore';
 import { runSubagentTask } from './subagent';
+import { parseWorkflowSpec, runWorkflow } from './workflow';
 import { protocolToolCallId } from './durableRun';
 import { formatSkillToolResult, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
@@ -111,7 +112,7 @@ function isMeteredTarget(target: ResolvedTarget): boolean {
 }
 
 /** Stringifies a tool invocation's result (or error) for use as tool-message content. */
-function stringifyToolResult(result: unknown): string {
+export function stringifyToolResult(result: unknown): string {
   if (typeof result === 'string') return result;
   try {
     return JSON.stringify(result);
@@ -373,6 +374,13 @@ export interface SubagentContext {
   sessionId: string;
   /** Immutable durable parent run id used for permission/cancellation audit. */
   runId?: string;
+  /** Shared id for THIS round's parallel `task` calls — set by
+   * `agentLoop.ts` only when the round carries two or more of them (a fresh
+   * UUID per round, since provider-fallback tool-call ids repeat), and
+   * threaded through to `runSubagentTask` as its `groupId` so the
+   * Background-tasks drawer can render the round as one grouped card.
+   * `undefined` for a lone `task` call. */
+  taskGroupId?: string;
   /** THIS turn's already-resolved active target (see `ResolvedTarget`) —
    * passed down rather than re-resolved, so a mid-turn manual model switch
    * can never split the parent and child across different targets. */
@@ -640,6 +648,7 @@ export async function executeToolCall(
         // `subagentStore`/`ChatSession.subagentRuns` key `MessageList.tsx`
         // can actually correlate against the persisted transcript.
         toolCallId: toolCall.id,
+        groupId: subagent.taskGroupId,
         description,
         prompt: taskPrompt,
         profile,
@@ -647,6 +656,37 @@ export async function executeToolCall(
         effort: subagent.effort,
         onRoutingDecision: subagent.onRoutingDecision,
         risk: subagent.risk,
+        onMutatedPath: subagent.onMutatedPath,
+        onMutationFailure: subagent.onMutationFailure,
+      });
+    } catch (err) {
+      return stringifyToolError(err);
+    }
+  }
+
+  // `workflow` is the named, phased counterpart of `task` — same frontend-only
+  // interception, same SubagentContext requirement (which is also what keeps a
+  // child loop from ever running one: `runSubagentTask`'s own dispatch never
+  // configures the context, and `toolsForProfile` never offers the name).
+  // Same whole-branch try/catch as `task`, for the same transcript-validity
+  // invariant.
+  if (name === 'workflow') {
+    try {
+      if (!subagent) {
+        return stringifyToolError(new Error('The workflow tool has no subagent execution context configured for this turn.'));
+      }
+      const spec = parseWorkflowSpec(args);
+      return await runWorkflow({
+        sessionId: subagent.sessionId,
+        runId: subagent.runId,
+        parentCheckpointId: checkpointId,
+        parentSignal: signal,
+        toolCallId: toolCall.id,
+        spec,
+        target: subagent.target,
+        effort: subagent.effort,
+        risk: subagent.risk,
+        onRoutingDecision: subagent.onRoutingDecision,
         onMutatedPath: subagent.onMutatedPath,
         onMutationFailure: subagent.onMutationFailure,
       });

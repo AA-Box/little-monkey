@@ -70,6 +70,14 @@ pub enum ProcessKind {
     BackgroundShell,
     /// A side task running beside the main conversation.
     SideTask,
+    /// An isolated Chromium the browser tool owns (`browser_worker.rs`).
+    ///
+    /// The one desktop kind that owns a real OS process *tree*: Chromium forks
+    /// renderer, GPU and utility children, and before this kind existed nothing
+    /// outside the owning process could name any of them. A crash left an orphan
+    /// that the startup sweep could collect the profile directory of but never
+    /// kill.
+    BrowserSession,
 }
 
 impl ProcessKind {
@@ -84,6 +92,7 @@ impl ProcessKind {
             ProcessKind::RemoteRun => "remote_run",
             ProcessKind::BackgroundShell => "background_shell",
             ProcessKind::SideTask => "side_task",
+            ProcessKind::BrowserSession => "browser_session",
         }
     }
 
@@ -101,6 +110,7 @@ impl ProcessKind {
             ProcessKind::RemoteRun => "remote",
             ProcessKind::BackgroundShell => "sh",
             ProcessKind::SideTask => "side",
+            ProcessKind::BrowserSession => "browser",
         }
     }
 
@@ -115,6 +125,7 @@ impl ProcessKind {
             "remote_run" => ProcessKind::RemoteRun,
             "background_shell" => ProcessKind::BackgroundShell,
             "side_task" => ProcessKind::SideTask,
+            "browser_session" => ProcessKind::BrowserSession,
             other => {
                 return Err(ProcessTableError::UnknownKind {
                     kind: other.to_string(),
@@ -142,6 +153,11 @@ impl ProcessKind {
         ProcessKind::CrewMember,
         ProcessKind::BackgroundShell,
         ProcessKind::SideTask,
+        // Its Chromium is spawned by this app and dies with it — but only if the
+        // app got to run its teardown. The reap is what covers the crash, and
+        // for this kind alone the reap has something to kill first: see
+        // [`crate::browser_worker::reclaim_orphaned_browser_sessions`].
+        ProcessKind::BrowserSession,
     ];
 
     /// Kinds that record their host's pid, and are therefore swept by whether
@@ -201,6 +217,11 @@ impl ProcessKind {
             | ProcessKind::CrewMember
             | ProcessKind::BackgroundShell
             | ProcessKind::SideTask => RestartPolicy::Never,
+            // A browser session is a *tool call's* resource, not work in its own
+            // right: relaunching Chromium would restore a blank profile with no
+            // navigation history and no grant, which is not the session that was
+            // lost. The turn that owned it is what retries, if anything does.
+            ProcessKind::BrowserSession => RestartPolicy::Never,
         }
     }
 
@@ -239,7 +260,13 @@ impl ProcessKind {
             (_, S::Stop) => SignalSupport::Honoured,
 
             // Kill needs an OS process this app owns.
-            (K::DaemonJob | K::BackgroundShell, S::Kill) => SignalSupport::Honoured,
+            // The browser session earns `Kill` for the same reason the other two
+            // do, and it is the reason this kind exists at all: its `native_pid`
+            // leads a real process group, so a terminate reaches Chromium's
+            // renderer and GPU children rather than orphaning them.
+            (K::DaemonJob | K::BackgroundShell | K::BrowserSession, S::Kill) => {
+                SignalSupport::Honoured
+            }
             (K::RemoteRun, S::Kill | S::Suspend | S::Resume) => SignalSupport::Refused(
                 "a remote run records the request, not the work: it owns no process of its \
                  own and is closed as soon as the job is queued; signal the daemon job it \
@@ -260,6 +287,17 @@ impl ProcessKind {
                 SignalSupport::Honoured
             }
             (K::WorkflowRun, S::Suspend | S::Resume) => SignalSupport::Honoured,
+            // Refused deliberately, and by the same rule as `workflow_node`:
+            // nothing delivers it. A SIGSTOP'd Chromium would keep its CDP
+            // socket open while answering nothing, so every in-flight action
+            // would hang to its own timeout instead of pausing — and the latch
+            // would sit `suspend_requested` with no deliverer to clear it.
+            (K::BrowserSession, S::Suspend | S::Resume) => SignalSupport::Refused(
+                "a browser session has no pause that a caller could resume from: stopping its \
+                 Chromium mid-action leaves the DevTools connection open but unanswering, so \
+                 every in-flight action would time out rather than park. Stop the session \
+                 instead, which tears it down and reclaims its profile",
+            ),
             (K::WorkflowNode, S::Suspend | S::Resume) => SignalSupport::Refused(
                 "a workflow node has no independent pause mechanism and no safe point of its \
                  own; suspend the owning workflow run instead, which the executor observes at \
@@ -289,6 +327,7 @@ impl ProcessKind {
         ProcessKind::RemoteRun,
         ProcessKind::BackgroundShell,
         ProcessKind::SideTask,
+        ProcessKind::BrowserSession,
     ];
 
     /// The bounds a process of this kind is *actually* subject to, seeded into
@@ -358,6 +397,20 @@ impl ProcessKind {
             | ProcessKind::WorkflowNode
             | ProcessKind::RemoteRun
             | ProcessKind::SideTask => ProcessLimits::default(),
+            // The second kind with a real, enforced wall bound, and the only
+            // desktop one. `browser_worker`'s watchdog already reclaims a
+            // session past `BrowserLimits::max_session_ms` on a 30-second sweep;
+            // this declares the number the sweep enforces rather than inventing
+            // a second one, on the same terms as `BackgroundShell` above.
+            //
+            // A per-session override is not read here: this is the *class*
+            // default, and a caller that starts a session with a tighter budget
+            // writes its own `max_wall_ms` onto the row through the projection,
+            // exactly as the daemon does with its per-job recipe.
+            ProcessKind::BrowserSession => ProcessLimits {
+                max_wall_ms: Some(crate::browser_worker::DEFAULT_MAX_SESSION_MS),
+                ..ProcessLimits::default()
+            },
         }
     }
 }
@@ -3818,10 +3871,21 @@ mod tests {
             .collect();
         assert_eq!(
             bounded,
-            vec![ProcessKind::BackgroundShell],
+            vec![ProcessKind::BackgroundShell, ProcessKind::BrowserSession],
             "a kind gained or lost a class-level bound; if that is intended, the \
              field docs on ProcessLimits and the K4 roadmap entry have to move with it"
         );
+
+        // The only desktop kind with an *enforced* wall bound, and the number is
+        // the one `browser_worker`'s watchdog actually sweeps on — not a second
+        // ceiling declared beside it.
+        let browser = ProcessKind::BrowserSession.default_limits();
+        assert_eq!(
+            browser.max_wall_ms,
+            Some(crate::browser_worker::DEFAULT_MAX_SESSION_MS)
+        );
+        assert_eq!(browser.max_output_bytes, None);
+        assert_eq!(browser.max_memory_bytes, None);
 
         let shell = ProcessKind::BackgroundShell.default_limits();
         assert_eq!(
@@ -5068,6 +5132,7 @@ mod tests {
             ProcessKind::RemoteRun => "bin/monkey-cli/daemon/mod.rs — project_queue_origin",
             ProcessKind::BackgroundShell => "background_shell.rs — emit_status",
             ProcessKind::SideTask => "src/lib/sideTaskRunner.ts — runSideTask",
+            ProcessKind::BrowserSession => "browser_worker.rs — OwnedBrowser::project",
         }
     }
 
@@ -5604,7 +5669,7 @@ mod tests {
         // `ALL` must itself be exhaustive, or the loop above proves nothing.
         assert_eq!(
             ProcessKind::ALL.len(),
-            9,
+            10,
             "ProcessKind::ALL is out of sync with the enum"
         );
     }
