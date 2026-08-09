@@ -2802,6 +2802,147 @@ mod tests {
         assert_real_workspace_stays_out_of_reach("landlock").await;
     }
 
+    /// The Windows arm of the same boundary, and the third platform finally
+    /// joins the assertion rather than being argued about.
+    ///
+    /// # It is a sibling, not a copy
+    ///
+    /// macOS and Linux share `assert_real_workspace_stays_out_of_reach`
+    /// verbatim because both run the same `sh` script. Windows cannot: `cmd /C`
+    /// takes one line, has no `set -eu`, and reads `%USERPROFILE%`/`%TMP%` where
+    /// the others read `$HOME`/`$TMPDIR`. What is shared is the *claim* — read
+    /// your own copy, fail to read the real workspace, fail to overwrite it,
+    /// write to the sandbox-owned home and tmp, with and without network — and
+    /// the claim is what the acceptance is about. Forcing one string across
+    /// three shells would have meant a weaker assertion on all three.
+    ///
+    /// # CI is the privileged case, and for a *deny* assertion that is the
+    /// stronger one
+    ///
+    /// The entry that deferred this warned that a hosted runner's account is an
+    /// administrator, so a green CI run would not prove the mechanism works for
+    /// a standard user. That is right for a capability check and backwards for
+    /// this one. An AppContainer's filesystem check is against the container
+    /// SID's ACE, not the user's group membership: a process with an
+    /// administrator token inside a container still cannot read a directory that
+    /// grants the container nothing. So "denied while running as an
+    /// administrator" implies denied for a standard user, not the other way
+    /// round. The direction that would genuinely need an unprivileged context is
+    /// the *allow* half — reading its own sandbox copy — and that is granted
+    /// explicitly by `grant_tree_access`, which is exercised here too.
+    ///
+    /// Skips rather than fails when the machine cannot create a container, for
+    /// the reason the Linux arm skips without Landlock — and fails on CI for the
+    /// same reason, since a skip and a pass are the same colour.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn app_container_cannot_read_or_write_real_workspace_with_or_without_network() {
+        if !crate::sandbox_windows::app_containers_are_enforceable() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "AppContainers are unavailable on this CI runner, so the filesystem \
+                 boundary they enforce went untested"
+            );
+            eprintln!(
+                "skipping AppContainer integration test: this machine cannot create a \
+                 container profile (group policy, or a locked-down registry hive)"
+            );
+            return;
+        }
+
+        let sandbox_root = temp_dir("appcontainer-integration");
+        let workspace_dir = sandbox_root.join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("create sandbox workspace");
+        let real_workspace = temp_dir("appcontainer-real-workspace");
+        let allowed_file = workspace_dir.join("allowed.txt");
+        let forbidden_file = real_workspace.join("secret.txt");
+        write(&allowed_file, "sandbox-visible");
+        write(&forbidden_file, "must-stay-secret");
+
+        let canonical_sandbox = fs::canonicalize(&sandbox_root).expect("canonical sandbox");
+        let canonical_workspace =
+            fs::canonicalize(&workspace_dir).expect("canonical sandbox workspace");
+        let canonical_forbidden =
+            fs::canonicalize(&forbidden_file).expect("canonical forbidden file");
+        let expected_home = canonical_sandbox.join(SANDBOX_HOME_DIR);
+        let expected_tmp = canonical_sandbox.join(SANDBOX_TMP_DIR);
+
+        // One line, `&`-separated: `cmd /C` takes the remainder of the command
+        // line verbatim and has no `set -eu`, so every step carries its own
+        // `exit /b`. The two deny codes match the `sh` version's on purpose — 71
+        // for a readable secret, 72 for a writable one — so a failure reads the
+        // same whichever platform reported it. The allow codes (73-75) have no
+        // `sh` counterpart because there `set -eu` fails the script for us.
+        //
+        // Every step is checked, and the script does **not** end in a bare
+        // `exit /b 0`: `&` does not stop on failure, so an unchecked step would
+        // let a silent denial through and leave the exit code saying nothing.
+        // That is what a first draft of this test did, and the write it failed to
+        // notice only surfaced as an is_file() assertion with no reason attached.
+        //
+        // `type X > Y` creates Y and then fails, leaving errorlevel 1, so the
+        // `&&` after it runs only when the read actually succeeded. Same for the
+        // `echo >` overwrite.
+        let command = format!(
+            "if /I not \"%USERPROFILE%\"==\"{home}\" exit /b 70 \
+             & if /I not \"%TMP%\"==\"{tmp}\" exit /b 70 \
+             & (type \"{allowed}\" > \"%TMP%\\allowed-copy\" || exit /b 73) \
+             & (type \"{forbidden}\" > \"%TMP%\\forbidden-copy\" && exit /b 71) \
+             & (echo overwritten> \"{forbidden}\" && exit /b 72) \
+             & (echo home-ok> \"%USERPROFILE%\\probe\" || exit /b 74) \
+             & (echo tmp-ok> \"%TMP%\\probe\" || exit /b 75) \
+             & exit /b 0",
+            home = expected_home.display(),
+            tmp = expected_tmp.display(),
+            allowed = canonical_workspace.join("allowed.txt").display(),
+            forbidden = canonical_forbidden.display(),
+        );
+
+        for allow_network in [false, true] {
+            let profile_path = sandbox_root.join(if allow_network {
+                "boundary-network.sb"
+            } else {
+                "boundary-offline.sb"
+            });
+            let outcome = execute_in_sandbox(
+                &sandbox_root,
+                &workspace_dir,
+                &real_workspace,
+                &profile_path,
+                &command,
+                Duration::from_secs(30),
+                allow_network,
+                &[],
+            )
+            .await
+            .expect("the sandbox launches");
+            assert_eq!(
+                outcome.isolation,
+                Isolation::OsSandboxed,
+                "the container was created, so the run must report the boundary it got"
+            );
+            // Each code names its own step, so a red run says which half broke
+            // rather than only that something did: 70 wrong env, 71 the secret
+            // was readable, 72 it was writable, 73 its own copy was not readable,
+            // 74/75 the sandbox-owned home or tmp was not writable.
+            assert_eq!(
+                outcome.exit_code,
+                Some(0),
+                "AppContainer boundary failed (network={allow_network}); stderr={}",
+                String::from_utf8_lossy(&outcome.stderr)
+            );
+            assert_eq!(
+                fs::read_to_string(&forbidden_file).expect("read real file after run"),
+                "must-stay-secret"
+            );
+        }
+        assert!(expected_home.join("probe").is_file());
+        assert!(expected_tmp.join("probe").is_file());
+
+        let _ = fs::remove_dir_all(&sandbox_root);
+        let _ = fs::remove_dir_all(&real_workspace);
+    }
+
     /// The network filter has to compile on the machine that will install it:
     /// [`crate::sandbox_linux::network_denial_filter`] fails on an architecture
     /// seccompiler has no audit value for, and that failure turns into a failed
