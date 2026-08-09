@@ -1846,6 +1846,7 @@ for that rather than against it — it took owning `CreateProcessW` to get there
   not keep. `browser_session` is also the second kind — and the only desktop one —
   with an *enforced* class wall bound, declaring the `max_session_ms` the
   browser watchdog already sweeps on rather than inventing a second ceiling.
+
 - **Two acceptance resources are unachievable as written** and the criteria should
   be amended rather than left standing: "open files" has no Windows job-object
   equivalent, so it is permanently unix-only; and "disk written" cannot come from
