@@ -10,9 +10,11 @@ import {
   ALL_TASKS,
   emptyModelSpec,
   formatLaunchArgs,
+  hasLaunchFlag,
   launchArgValue,
   parseLaunchArgs,
   setLaunchArg,
+  setLaunchFlag,
   studioClient,
   type GenerationModelSpec,
   type GenerationTask,
@@ -22,7 +24,7 @@ import {
 /** Engine flags that name a *directory* of extra weights rather than one file.
  *  The engine rescans these per run, so pointing at a folder is enough — the
  *  upscaler picker fills itself from whatever is found. */
-const DIRECTORY_FLAGS = [
+export const DIRECTORY_FLAGS = [
   {
     flag: "--hires-upscalers-dir",
     labelKey: "Studio.add.upscalersDir",
@@ -32,6 +34,42 @@ const DIRECTORY_FLAGS = [
     flag: "--embd-dir",
     labelKey: "Studio.add.embeddingsDir",
     hintKey: "Studio.add.embeddingsDirHint",
+  },
+] as const;
+
+/**
+ * Launch-time switches worth a control of their own.
+ *
+ * Every one is verified present in the pinned engine's own `--help`, and every
+ * one is a *launch* flag — so it belongs to the model entry rather than to a
+ * run. That is a real limitation for `--circular`, which is a creative choice
+ * someone would reasonably want per image; it is here because the engine takes
+ * it at startup, not because that is the better place for it.
+ *
+ * Deliberately short. The engine has 136 flags and most are either already sent
+ * per run (samplers, steps, guidance, schedulers) or so specialised that a
+ * checkbox would be noise beside the args field that already reaches them.
+ */
+export const ENGINE_TOGGLES = [
+  {
+    flag: "--vae-tiling",
+    labelKey: "Studio.add.vaeTiling",
+    hintKey: "Studio.add.vaeTilingHint",
+  },
+  {
+    flag: "--offload-to-cpu",
+    labelKey: "Studio.add.offloadToCpu",
+    hintKey: "Studio.add.offloadToCpuHint",
+  },
+  {
+    flag: "--diffusion-fa",
+    labelKey: "Studio.add.flashAttention",
+    hintKey: "Studio.add.flashAttentionHint",
+  },
+  {
+    flag: "--circular",
+    labelKey: "Studio.add.seamless",
+    hintKey: "Studio.add.seamlessHint",
   },
 ] as const;
 
@@ -251,6 +289,36 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
           </label>
         );
       })}
+
+      {/* Launch-time switches. Reachable by typing them into the field below
+          since the quote-aware parser landed, so this is discoverability rather
+          than new capability — which is exactly why they are toggles over the
+          same `extraLaunchArgs` and not a second place to store settings. */}
+      <div className="grid gap-1.5">
+        <span className="text-[11px] text-muted">{t("Studio.add.engineOptions")}</span>
+        {ENGINE_TOGGLES.map(({ flag, labelKey, hintKey }) => (
+          <label key={flag} className="flex items-start gap-2 text-[11px]">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={hasLaunchFlag(spec.extraLaunchArgs, flag)}
+              onChange={(event) =>
+                patch({
+                  extraLaunchArgs: setLaunchFlag(
+                    spec.extraLaunchArgs,
+                    flag,
+                    event.target.checked,
+                  ),
+                })
+              }
+            />
+            <span className="grid gap-0.5">
+              <span className="text-foreground">{t(labelKey)}</span>
+              <span className="text-faint">{t(hintKey)}</span>
+            </span>
+          </label>
+        ))}
+      </div>
 
       <label className="grid gap-1 text-[11px] text-muted">
         {t("Studio.add.engineArgs")}

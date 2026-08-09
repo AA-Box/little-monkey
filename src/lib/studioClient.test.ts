@@ -18,8 +18,10 @@ import {
   COMPONENT_SLOTS,
   type ComponentSlot,
   type EngineCapabilities,
+  hasLaunchFlag,
   launchArgValue,
   setLaunchArg,
+  setLaunchFlag,
 } from "./studioClient";
 
 /** A running engine reporting exactly these flags and nothing else. */
@@ -188,6 +190,52 @@ describe("setLaunchArg", () => {
     ]);
   });
 
+  it("round-trips a path with spaces through the args field", () => {
+    const args = setLaunchArg([], "--embd-dir", "/Users/me/My Embeddings");
+    expect(parseLaunchArgs(formatLaunchArgs(args))).toEqual(args);
+    expect(launchArgValue(args, "--embd-dir")).toBe("/Users/me/My Embeddings");
+  });
+});
+
+describe("setLaunchFlag", () => {
+  it("adds and removes a flag that carries no value", () => {
+    expect(setLaunchFlag([], "--vae-tiling", true)).toEqual(["--vae-tiling"]);
+    expect(setLaunchFlag(["--vae-tiling"], "--vae-tiling", false)).toEqual([]);
+  });
+
+  it("is idempotent, so a toggle cannot add the same flag twice", () => {
+    const once = setLaunchFlag([], "--circular", true);
+    expect(setLaunchFlag(once, "--circular", true)).toEqual(["--circular"]);
+    expect(setLaunchFlag([], "--circular", false)).toEqual([]);
+  });
+
+  /** The whole reason this is not `setLaunchArg`: removing a valueless flag
+   *  must take one slot, not two, or it eats whatever the user typed next. */
+  it("does not swallow the following flag when removing", () => {
+    expect(setLaunchFlag(["--vae-tiling", "--threads", "8"], "--vae-tiling", false)).toEqual([
+      "--threads",
+      "8",
+    ]);
+    expect(setLaunchFlag(["--threads", "8", "--circular"], "--circular", false)).toEqual([
+      "--threads",
+      "8",
+    ]);
+  });
+
+  it("leaves the hand-typed args around it alone", () => {
+    const args = ["--diffusion-fa", "--embd-dir", "/tmp/e"];
+    expect(setLaunchFlag(args, "--vae-tiling", true)).toEqual([...args, "--vae-tiling"]);
+    expect(hasLaunchFlag(args, "--diffusion-fa")).toBe(true);
+    expect(hasLaunchFlag(args, "--vae-tiling")).toBe(false);
+  });
+
+  it("survives the args field round trip", () => {
+    const args = setLaunchFlag(setLaunchArg([], "--embd-dir", "/tmp/e"), "--vae-tiling", true);
+    expect(parseLaunchArgs(formatLaunchArgs(args))).toEqual(args);
+  });
+});
+
+describe("launch arg round trip", () => {
   it("round-trips a path with spaces through the args field", () => {
     const args = setLaunchArg([], "--embd-dir", "/Users/me/My Embeddings");
     expect(parseLaunchArgs(formatLaunchArgs(args))).toEqual(args);
