@@ -373,6 +373,13 @@ export interface SubagentContext {
   sessionId: string;
   /** Immutable durable parent run id used for permission/cancellation audit. */
   runId?: string;
+  /** Shared id for THIS round's parallel `task` calls — set by
+   * `agentLoop.ts` only when the round carries two or more of them (a fresh
+   * UUID per round, since provider-fallback tool-call ids repeat), and
+   * threaded through to `runSubagentTask` as its `groupId` so the
+   * Background-tasks drawer can render the round as one grouped card.
+   * `undefined` for a lone `task` call. */
+  taskGroupId?: string;
   /** THIS turn's already-resolved active target (see `ResolvedTarget`) —
    * passed down rather than re-resolved, so a mid-turn manual model switch
    * can never split the parent and child across different targets. */
@@ -640,6 +647,7 @@ export async function executeToolCall(
         // `subagentStore`/`ChatSession.subagentRuns` key `MessageList.tsx`
         // can actually correlate against the persisted transcript.
         toolCallId: toolCall.id,
+        groupId: subagent.taskGroupId,
         description,
         prompt: taskPrompt,
         profile,

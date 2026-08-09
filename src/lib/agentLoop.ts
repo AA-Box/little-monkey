@@ -3054,6 +3054,13 @@ async function runAgentTurnBody(
     // (bounded by `settings.maxConcurrentSubagents`), everything else stays
     // sequential — see `runToolCallsForRound`'s own doc comment for why, and
     // for the order-preservation guarantee the rest of this loop depends on.
+    // One shared group id for this round's parallel `task` calls (two or
+    // more — a lone one stays ungrouped), so the Background-tasks drawer can
+    // render them as one card. A fresh UUID rather than any tool-call id:
+    // provider-fallback ids (`call_0`) repeat across rounds and would merge
+    // unrelated groups. See `SubagentContext.taskGroupId`.
+    const roundTaskCallCount = toolCalls.filter((call) => call.function.name === 'task').length;
+    const taskGroupId = roundTaskCallCount > 1 ? crypto.randomUUID() : undefined;
     const results = await runToolCallsForRound(toolCalls, settings.maxConcurrentSubagents, async (toolCall) => {
       const toolStartedAt = Date.now();
       const recorder = durable.recorder;
@@ -3111,6 +3118,7 @@ async function runAgentTurnBody(
       const subagentContext: SubagentContext = {
         sessionId,
         runId: durable.recorder?.runId,
+        taskGroupId,
         target,
         effort,
         risk: riskAnnotation,
