@@ -19,6 +19,7 @@
     "test:machO": "node scripts/lib/machO.test.mjs",
     "test:manifest": "node scripts/lib/runtimeManifest.test.mjs",
     "test:rust": "pnpm stage:cli:placeholder && cargo test --manifest-path src-tauri/Cargo.toml",
+  "contract:check": "cargo test --manifest-path src-tauri/Cargo.toml --test contract_abi",
     "i18n:lint": "vitest run src/lib/i18n/keyLint.test.ts",
     "stage:runtime": "node scripts/stage-managed-runtime.mjs",
     "stage:runtime:tts": "node scripts/stage-managed-runtime.mjs llama-tts",

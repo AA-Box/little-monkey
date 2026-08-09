@@ -2251,6 +2251,118 @@ mod tests {
     use crate::daemon::remote::store::RemoteSecretStore;
     use crate::daemon::store::DaemonConfig;
     use crate::durable_run::DurableRunRecorder;
+    use little_monkey_lib::contract;
+
+    /// **The published contract's remote-plane table is checked against this
+    /// file's own dispatch match, not against a memory of it.**
+    ///
+    /// `little_monkey_lib::contract::REMOTE_ROUTES` is what third parties read
+    /// (K19). It cannot live beside the match — the contract is generated in
+    /// the library and this is a binary crate — so the risk is the ordinary
+    /// one for any second copy: a route added here, never published, and a
+    /// package that gates on the contract version therefore gating on a lie.
+    ///
+    /// This scans the match arms themselves: method, path shape *and* the
+    /// exact `RemoteAction`/`DeviceCapability` variant each arm requires. A
+    /// new route, a moved segment or a re-graded gate fails here rather than
+    /// in a reviewer's memory. The technique is `egress.rs`'s bare-client
+    /// ratchet and `server.rs`'s admission scan, for the same reason: the
+    /// defect class is "a call site that looks fine in isolation".
+    #[test]
+    fn every_dispatched_remote_route_is_in_the_published_contract() {
+        const SOURCE: &str = include_str!("api.rs");
+        let production = SOURCE
+            .split_once("\n#[cfg(test)]")
+            .map_or(SOURCE, |(before, _)| before);
+
+        // The one route dispatched before the match, because it runs before a
+        // device (and therefore a signature) exists.
+        assert!(
+            production.contains(r#"request.path_and_query == "/v1/remote/pairings/accept""#),
+            "the unauthenticated pairing route moved; the contract still names it"
+        );
+
+        let lines: Vec<&str> = production.lines().collect();
+        let mut dispatched: BTreeSet<(String, String, String)> = BTreeSet::new();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed.strip_prefix('(') else {
+                continue;
+            };
+            let Some((method, rest)) = rest.split_once(", [") else {
+                continue;
+            };
+            let Some(method) = method.strip_prefix('"').and_then(|m| m.strip_suffix('"')) else {
+                continue;
+            };
+            let Some((segments, _)) = rest.split_once("]) =>") else {
+                continue;
+            };
+            let path = segments
+                .split(',')
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .map(
+                    |segment| match segment.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                        Some(literal) => format!("/{literal}"),
+                        None => format!("/{{{segment}}}"),
+                    },
+                )
+                .collect::<String>();
+            // The gate is whatever the arm's first grant check names. Three
+            // lines is enough for every arm rustfmt produces here; an arm that
+            // grew past it would fail as `self_service` and be noticed.
+            let arm = lines[index..(index + 3).min(lines.len())].join(" ");
+            let gate = arm
+                .split_once("RemoteAction::")
+                .map(|(_, tail)| format!("action:{}", variant(tail)))
+                .or_else(|| {
+                    arm.split_once("DeviceCapability::")
+                        .map(|(_, tail)| format!("capability:{}", variant(tail)))
+                })
+                .unwrap_or_else(|| "self_service".to_string());
+            dispatched.insert((method.to_string(), path, gate));
+        }
+
+        let published: BTreeSet<(String, String, String)> = contract::REMOTE_ROUTES
+            .iter()
+            .filter(|route| route.gate != contract::RemoteGate::Unauthenticated)
+            .map(|route| {
+                (
+                    route.method.to_string(),
+                    route.path.to_string(),
+                    match route.gate {
+                        contract::RemoteGate::Action(action) => format!("action:{action}"),
+                        contract::RemoteGate::Capability(capability) => {
+                            format!("capability:{capability}")
+                        }
+                        contract::RemoteGate::SelfService => "self_service".to_string(),
+                        contract::RemoteGate::Unauthenticated => unreachable!("filtered above"),
+                    },
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            dispatched, published,
+            "the dispatch match and the published K19 contract disagree; \
+             update contract::REMOTE_ROUTES and republish (docs/contract-abi.md)"
+        );
+    }
+
+    /// The leading identifier of `Variant => ...`, `Variant)` or similar.
+    fn variant(tail: &str) -> String {
+        tail.chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect()
+    }
+
+    /// The wire version the contract publishes is the one this plane rejects
+    /// mismatches against. Two constants, one fact.
+    #[test]
+    fn the_published_remote_protocol_version_is_the_one_enforced() {
+        assert_eq!(contract::REMOTE_PROTOCOL_VERSION, REMOTE_PROTOCOL_VERSION);
+    }
 
     #[derive(Default)]
     struct FakeSecrets(Mutex<HashMap<String, Vec<u8>>>);
