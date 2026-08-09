@@ -487,11 +487,23 @@ fn cors_origin(response: &reqwest::Response) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------
-// 2. `/health` is byte-exact
+// 2. `/health` is byte-exact, and `/v1/contract` answers beside it
 // ---------------------------------------------------------------------
 
+/// The two routes legacy answers **before authentication**, pinned together
+/// because that is the one property they share and the one a merge can lose.
+///
+/// `/health` is a liveness probe: a caller has to reach it before it has a
+/// token to present. `/v1/contract` (roadmap K19) is the same situation one
+/// step earlier — a client negotiates the ABI before it can know whether the
+/// credential shape it holds is still the right one — and its body is a pure
+/// function of the built binary, so there is nothing in it to gate.
+///
+/// One server for both, deliberately: every test in this file binds a real
+/// listener and they run in parallel, so an extra server is a real cost on a
+/// slow CI runner rather than a free assertion.
 #[tokio::test]
-async fn the_health_route_returns_the_status_ok_object_byte_for_byte() {
+async fn the_unauthenticated_routes_answer_byte_for_byte_and_publish_the_abi() {
     let Some(server) = LegacyServer::start("health", base_config()).await else {
         return;
     };
@@ -527,6 +539,54 @@ async fn the_health_route_returns_the_status_ok_object_byte_for_byte() {
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
     let body = response.bytes().await.expect("POST /health body");
     assert_bytes("POST /health", &body, NOT_FOUND_BODY);
+
+    // `GET /v1/contract`, unauthenticated, on the same listener.
+    let response = client
+        .get(server.url("/v1/contract"))
+        .send()
+        .await
+        .expect("GET /v1/contract");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "the ABI is negotiated before a credential is presented"
+    );
+    let body: serde_json::Value = response.json().await.expect("/v1/contract body");
+    assert_eq!(
+        body["contract_version"],
+        little_monkey_lib::contract::CONTRACT_VERSION
+    );
+    assert_eq!(body["digest"], little_monkey_lib::contract::digest());
+    // The manifest travels whole: a client needs no second request and no
+    // shipped copy to know which routes and tools this instance has.
+    assert_eq!(
+        body["manifest"],
+        serde_json::to_value(little_monkey_lib::contract::manifest()).expect("manifest as JSON")
+    );
+    let published: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../contract/agent-os-contract.json"),
+        )
+        .expect("the published contract artifact"),
+    )
+    .expect("published contract JSON");
+    assert_eq!(
+        body["manifest"], published,
+        "a running instance and the published artifact must not disagree"
+    );
+
+    // Method-scoped, exactly as `/health` is above.
+    let response = client
+        .post(server.url("/v1/contract"))
+        .send()
+        .await
+        .expect("POST /v1/contract");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "the pre-auth answer belongs to GET, exactly as it does for /health"
+    );
 }
 
 // ---------------------------------------------------------------------

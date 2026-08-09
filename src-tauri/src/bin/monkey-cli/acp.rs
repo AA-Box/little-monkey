@@ -1607,6 +1607,52 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// The published K19 contract's ACP section is scanned out of this file's
+    /// own dispatch match rather than kept in step by hand — same technique,
+    /// same reason, as the remote plane's route scan in `daemon/remote/api.rs`.
+    /// A method added to the loop and not to the contract is a surface a third
+    /// party is told does not exist.
+    #[test]
+    fn every_dispatched_acp_method_is_in_the_published_contract() {
+        const SOURCE: &str = include_str!("acp.rs");
+        // Only the dispatch match itself: other matches in this file map
+        // permission-mode strings, and a scan that swept the whole file would
+        // publish "smart" as an ACP method.
+        let dispatch = SOURCE
+            .split_once("match method {")
+            .and_then(|(_, tail)| tail.split_once("\n            _ => {"))
+            .map(|(arms, _)| arms)
+            .expect("the ACP dispatch match");
+        let dispatched = dispatch
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                let method = trimmed.strip_prefix('"')?;
+                let (method, rest) = method.split_once('"')?;
+                rest.trim_start().starts_with("=>").then_some(method)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let published = little_monkey_lib::contract::ACP_METHODS
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            dispatched, published,
+            "the ACP dispatch and the published K19 contract disagree; \
+             update contract::ACP_METHODS and republish (docs/contract-abi.md)"
+        );
+    }
+
+    /// One protocol version, two constants — the one `initialize` refuses a
+    /// mismatch against, and the one the contract publishes.
+    #[test]
+    fn the_published_acp_protocol_version_is_the_one_negotiated() {
+        assert_eq!(
+            little_monkey_lib::contract::ACP_PROTOCOL_VERSION,
+            ACP_PROTOCOL_VERSION
+        );
+    }
+
     /// The choke point, pinned. `send` is the only place every ACP response
     /// leaves through, so the pairing it does — response id back to the method
     /// the loop dispatched — is what makes "no branch can be missed" true rather

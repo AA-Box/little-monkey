@@ -4881,12 +4881,74 @@ as a single ledger event chain across both nodes.
 
 ## K19. Versioned syscall ABI
 
-**Today:** 490 `#[tauri::command]` entry points, a large agent tool surface
-(`tools.rs`), an OpenAI/Anthropic/Ollama-compatible HTTP surface with a real
-route-level regression harness (`m3_compatibility_harness.rs`), and ACP v1
-over stdio. The HTTP and ACP surfaces are contracts; the internal command
-surface is not versioned, and the tool schemas are not published as a
-standalone artifact third parties can build against.
+**Shipped.** `contract/agent-os-contract.json` is a semver'd description of
+every externally reachable route, the signed remote plane, the ACP methods and
+the agent tool schemas; `GET /v1/contract` answers with the version, the digest
+and the manifest itself; and CI fails when the surface changes and
+`CONTRACT_VERSION` does not. `docs/contract-abi.md` is the policy and the
+publishing procedure.
+
+**The decision the whole entry follows from: generated means read from the
+table the running code dispatches from, not written next to it.** A published
+contract that is a second copy of the surface is worth less than no contract,
+because it is believed. So the HTTP section is built from
+`http_route_registry::ROUTES` — the same const the listener classifies against
+— and the tool section from `agent_tools.rs`, which is `tools_def.rs`'s
+definitions *moved into the library* rather than duplicated there. That move is
+the reason the contract can be generated at all: the schemas were in a binary
+crate the library cannot read, so publishing them would have meant hand-copying
+them into the generator. `tools_def.rs` now re-exports, and there is still
+exactly one definition of each tool.
+
+- **The two surfaces a table could not be read from are scanned out of their
+  own source.** The remote plane (K10–K18) dispatches from a 26-arm `match` and
+  ACP from another; turning either into a data table would have been a large
+  refactor of a working security boundary for a documentation benefit. Instead
+  `contract::REMOTE_ROUTES` and `contract::ACP_METHODS` are declared, and a test
+  in each of those files parses its *own* dispatch match — method, path shape,
+  and the exact `RemoteAction`/`DeviceCapability` variant each arm requires —
+  and fails on any disagreement. It is `egress.rs`'s bare-client ratchet applied
+  to a different defect of the same class. It earned itself immediately: the
+  first run found two routes whose grants had been recorded from memory
+  (`/events` requires `ViewEvents`, not `ViewRuns`; artifacts require
+  `ReadArtifacts`), which is exactly the drift a hand-maintained table produces.
+- **Two files, because one cannot gate anything.**
+  `contract/agent-os-contract.json` is regenerated from the code, so it always
+  tracks it; `contract/baseline.json` is what was last *published* and only
+  changes when a human publishes. With a single file, regenerating it would
+  silently accept the breaking change along with the edit that caused it. The
+  gate diffs the two, classifies every difference, derives the smallest version
+  that covers them, and fails naming the required version and each change that
+  forced it.
+- **The bump rules are executable rather than advisory.** Removing a route,
+  moving it, dropping a tool parameter, making one required, re-grading a remote
+  route's grant, changing a protocol version, or shortening the support window
+  are `Breaking`; additions and relaxations are `Additive`; wording is `Patch`.
+  A reviewer never has to decide which one an edit was.
+- **`GET /v1/contract` answers before authentication, on both listeners**, for
+  the reason `/health` does: a client negotiating an ABI has not necessarily got
+  a credential of the right shape yet, and one whose shape changed must still be
+  able to find out. The body is a pure function of the built binary — no
+  configuration, no model list, no credential state — and carries the whole
+  manifest, so a client needs neither a second request nor a shipped copy. The
+  endpoint is itself in the contract it publishes.
+- **The support window is a number in code.** 180 days from the release that
+  announces a deprecation, with removal a major bump on top of it, because K20's
+  resolver has to answer "is this still here next quarter?" without a human
+  reading a policy page.
+
+**What v1 does not publish, stated because it is a real limit.** The six
+desktop-only tools (`spawn_task`, `shell_output`, `shell_kill`, `skill`,
+`read_skill_resource`, `generate_image`) are defined in TypeScript and are not
+in the contract; a vitest pins that list *and* compares every published tool's
+schema against `tools.ts`, so the set cannot grow silently and the two surfaces
+cannot disagree about what a tool's arguments are. Descriptions deliberately
+differ per surface (the desktop tells the model about multi-root workspaces;
+the CLI has one root), so the drift test compares schemas rather than prose.
+The ~490 Tauri commands remain absent by design — they are the app's own
+webview IPC, and `DENIED_SURFACES`, published in the manifest, is the
+machine-readable statement that no HTTP caller reaches an agent, workspace,
+tool, file, git, MCP or recipe surface.
 
 **Acceptance:** a published, semver'd schema set for the agent tool contract
 and every external route, generated from the source of truth rather than
@@ -4894,16 +4956,19 @@ hand-written; a deprecation policy with a stated support window; an
 introspection endpoint that reports the contract version a running instance
 implements; and a CI check that fails on an unversioned breaking change.
 
-**Blocks:** K20, K21.
+**Blocks:** K21. K20's hard gate ships against `AGENT_CONTRACT_VERSION`, a
+number this crate declares; what K19 still owes is the published, generated
+schema set that number refers to, which is what a third party would build
+against.
 
-## K20. Package dependency resolution
+## K20. Package dependency resolution *(built)*
 
 **Today:** signed declarative packages with install/update permission
 previews, pins, enable/disable, rollback, revocation state, uninstall, offline
 cache, and portable export/import — plus digest-approved skills that fail
 closed on symlinks, mutable refs, command collisions, oversized trees, and
-unmet OS/binary/environment requirements. Each package is resolved on its own;
-there is no dependency graph between packages and no compatibility gate
+unmet OS/binary/environment requirements. Each package was resolved on its own;
+there was no dependency graph between packages and no compatibility gate
 against the contract version.
 
 **Acceptance:** declared inter-package dependencies with version constraints,
@@ -4911,6 +4976,61 @@ a solver that reports an unsatisfiable set as a specific conflict rather than
 a generic failure, detection of two packages claiming the same command or
 tool, and a hard gate on the K19 contract version so a package built against
 an older ABI is refused with the version it needs.
+
+**Shipped — `resolve_install` in `package_ecosystem.rs`, on the path every
+install already takes.**
+
+- **`dependencies` and `compatibility.contract` are manifest fields that
+  cannot change a byte of an existing signing payload.** Both are
+  `#[serde(default, skip_serializing_if = …)]`, so a manifest that declares
+  neither serializes exactly as it did before they existed. That is not a
+  style choice: the shipped first-party catalog's ten Ed25519 signatures are
+  over those exact bytes and are hardcoded hex, so any field that serialized
+  unconditionally would have invalidated the release catalog on first launch.
+- **An unsatisfiable set is a typed `DependencyProblem`, not a message.** Each
+  variant carries the ids, every accumulated constraint *with the package that
+  imposed it*, and the versions that actually existed — so the refusal reads
+  "no version of `…skill.review` satisfies `…assistant → >=2.0.0`; available:
+  1.0.0" rather than "install failed". The same values render in the install
+  dialog and in `PackageError::Unresolvable`, because both come off the plan.
+- **Constraints accumulate and selection re-runs until it is stable.** A
+  worklist re-selects a package whenever a new requirer narrows it, which is
+  what makes a two-requirer conflict a *conflict* rather than whichever
+  requirement happened to be walked first. Constraints only ever grow, so it
+  converges; `MAX_RESOLUTION_ROUNDS` is a runaway guard and reports itself
+  rather than silently truncating a set that would have failed.
+- **A dependency is resolved, never fetched.** Acquiring a package is its own
+  trust decision — signature, registry catalog match, permission preview — so
+  a missing dependency is reported with an install order, not downloaded
+  behind the approval the user gave for something else. It also keeps the
+  approval honest: nothing installs permissions the previewed diff did not
+  show.
+- **Collision detection keys by what the runtime keys by.** `skill_command`
+  now has one implementation, in `package_ecosystem.rs`, used by the resolver,
+  the runtime skill table and the plugin health view alike — a collision found
+  at install time is the same ambiguity `active_skills` would have refused at
+  run time. Connectors claim their slug rather than each operation id, because
+  the slug is what OAuth binding and every operation address live under.
+- **An assistant's `skill_package_ids` resolve as unconstrained
+  dependencies.** They already *were* dependencies — the plugin health view
+  reported them missing after install — so the composition is now checked
+  before the install rather than diagnosed after it, with no new field for a
+  publisher to remember.
+- **Disabled is not satisfied.** An installed-but-disabled or revoked package
+  cannot satisfy a requirement, because nothing loads it; disabling a
+  dependency makes the next resolution of its dependent fail by name.
+- **The contract gate sits in `verify_package`, not only in the resolver**, so
+  an import cannot walk past it — a bundle declaring a contract this build
+  does not implement is refused at verification with the range it needs.
+  `AGENT_CONTRACT_VERSION` lives in `package_ecosystem.rs` until K19 generates
+  the schema set that documents it; K20 needs the number, not the schemas.
+
+**What this does not do.** It does not fetch, and it does not auto-install a
+resolved dependency: the plan names what to install and in what order, and the
+user installs each one through the same preview. There is no downgrade path
+either — the store only moves a package forward — so a requirement that could
+only be met by an older version than the one installed is reported as
+unsatisfiable rather than quietly rolling back.
 
 ## K21. Conformance suite
 
@@ -4984,10 +5104,25 @@ what a given change touched.
 
 *Maps to: ROADMAP #3.*
 
-## K25. Resource attribution completion
+## K25. Resource attribution completion — **met**
 
-**Today:** per-request cost against user-entered rates, daily and monthly
-budgets, and a warn/pause check before every provider request.
+**Today:** every recorded provider call carries the workspace that was open
+when it went out and the project folder its conversation belongs to, and
+**Settings → Usage** breaks spend down by workspace, project, session, or
+model. The workspace key is the path the K6 process ledger already stamps on
+processes, so the two ledgers join: a workspace's measured wall, CPU, and GPU
+time sits beside its token bill, and an unmeasured field renders as the
+backend's own reason rather than a zero. Warnings are multi-tier (default
+50/80/95%) and report the highest tier crossed. Provider billing is
+reconcilable: estimates are labelled as estimates, unpriced calls stay visibly
+unpriced, and an entered monthly invoice total is shown against the estimate as
+a drift — without ever rewriting the per-call figures, which a monthly total
+cannot honestly be split back across.
+
+Two limits stated rather than papered over: what the app cannot attribute goes
+to an explicit *Unattributed* bucket instead of being charged to whichever
+folder is open, and process rows carry only a workspace, so the project
+breakdown shows token spend alone.
 
 **Acceptance:** ROADMAP #4 — per-workspace and per-project attribution,
 multi-tier thresholds, and honest handling of providers whose real billing

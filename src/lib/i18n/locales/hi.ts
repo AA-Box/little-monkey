@@ -2452,7 +2452,6 @@ export const hi: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "बजट सक्षम करें",
   "UsagePanel.dailyBudget": "दैनिक बजट (USD)",
   "UsagePanel.monthlyBudget": "मासिक बजट (USD)",
-  "UsagePanel.warningThreshold": "चेतावनी दें (%)",
   "UsagePanel.enforcement": "सीमा पर पहुँचने पर",
   "UsagePanel.enforcementWarn": "केवल चेतावनी दें",
   "UsagePanel.enforcementPause": "क्लाउड कॉल रोकें",

@@ -26,11 +26,12 @@ use crate::mcp_app_core::{
     ToolRouterModel, ToolRoutingPolicy, UiActionApprovalGate, UiBridgeRequest,
 };
 use crate::package_ecosystem::{
-    install_preview, signed_first_party_catalog, verify_package, verify_registry_snapshot,
-    AdditionalRegistryRecord, AdditionalRegistrySource, ConnectorAuthKind, ContentKind,
-    InstallEnvironment, InstallPreview, InstallTrustPolicy, InstalledPackageState,
-    McpRequirementKind, PackageBundle, PackageError, PackageKind, PackageLimits, PackageManifest,
-    PackagePermission, PackageStore, PermissionApproval, PortablePackageExport, RegistrySnapshot,
+    install_preview, resolve_install, signed_first_party_catalog, skill_command, verify_package,
+    verify_registry_snapshot, AdditionalRegistryRecord, AdditionalRegistrySource,
+    ConnectorAuthKind, ContentKind, InstallEnvironment, InstallPlan, InstallPreview,
+    InstallTrustPolicy, InstalledPackageState, InstalledPackageView, McpRequirementKind,
+    PackageBundle, PackageError, PackageKind, PackageLimits, PackageManifest, PackagePermission,
+    PackageStore, PermissionApproval, PortablePackageExport, RegistrySnapshot, ResolutionRequest,
     SemanticVersion, SignatureVerifier, TrustEvidence, TrustStore, VerifiedPackage,
     VerifiedRegistryState,
 };
@@ -482,6 +483,43 @@ impl PackageRegistryService {
         Ok(entries)
     }
 
+    /// Resolves one manifest's dependency closure against the current catalog
+    /// and the installed set. Installed packages whose cached bundle no
+    /// longer validates are skipped rather than resolved against: the plugin
+    /// health view is what reports a corrupt cache, and a package that cannot
+    /// be read cannot satisfy a dependency either.
+    pub fn resolution(&self, manifest: &PackageManifest) -> Result<InstallPlan, M4ServiceError> {
+        let catalog = lock(&self.catalog, "package catalog")?
+            .values()
+            .map(|bundle| bundle.manifest.clone())
+            .collect::<Vec<_>>();
+        let mut installed = Vec::new();
+        for state in self.store.list_installed()? {
+            if state.tombstoned || state.active_version.is_none() {
+                continue;
+            }
+            let Ok(portable) = self.store.export_active(&state.package_id) else {
+                continue;
+            };
+            let Ok(bundle) = portable.into_bundle(&self.limits) else {
+                continue;
+            };
+            installed.push(InstalledPackageView {
+                manifest: bundle.manifest,
+                enabled: state.enabled && !state.revoked,
+                pinned_version: state.pinned_version,
+            });
+        }
+        Ok(resolve_install(
+            manifest,
+            &ResolutionRequest {
+                catalog: &catalog,
+                installed: &installed,
+                contract_version: self.environment.contract_version,
+            },
+        ))
+    }
+
     pub fn preview(
         &self,
         package_id: &str,
@@ -490,7 +528,8 @@ impl PackageRegistryService {
     ) -> Result<ApprovedInstallPreview, M4ServiceError> {
         let verified = self.catalog_package(package_id, version, now_unix_ms)?;
         let installed = self.store.installed(package_id)?;
-        let preview = install_preview(&verified, installed.as_ref())?;
+        let plan = self.resolution(verified.manifest())?;
+        let preview = install_preview(&verified, installed.as_ref(), plan)?;
         let approval_digest = sha256(&serde_json::to_vec(&preview)?);
         Ok(ApprovedInstallPreview {
             preview,
@@ -513,6 +552,9 @@ impl PackageRegistryService {
                 "install authorization is denied or does not match the current preview".to_string(),
             ));
         }
+        if !approved.preview.plan.satisfiable {
+            return Err(PackageError::Unresolvable(approved.preview.plan.problem_summary()).into());
+        }
         let verified = self.catalog_package(
             &authorization.package_id,
             authorization.version,
@@ -529,6 +571,10 @@ impl PackageRegistryService {
         now_unix_ms: u64,
     ) -> Result<InstalledPackageState, M4ServiceError> {
         let verified = self.catalog_package(package_id, version, now_unix_ms)?;
+        let plan = self.resolution(verified.manifest())?;
+        if !plan.satisfiable {
+            return Err(PackageError::Unresolvable(plan.problem_summary()).into());
+        }
         Ok(self.store.update(&verified, approval)?)
     }
 
@@ -763,7 +809,7 @@ impl PackageRegistryService {
                     label: manifest.display_name.clone(),
                     source_path: None,
                     content_sha256: Some(bundle_sha256.clone()),
-                    activation_id: skill_command(&manifest.package_id).ok(),
+                    activation_id: skill_command(&manifest.package_id),
                     state: base_state,
                     detail: "Available as a deterministic slash command; turn permissions remain enforced.".to_string(),
                 }),
@@ -1130,7 +1176,12 @@ impl PackageRegistryService {
                     state.package_id
                 )));
             }
-            let command = skill_command(&state.package_id)?;
+            let command = skill_command(&state.package_id).ok_or_else(|| {
+                M4ServiceError::Conflict(format!(
+                    "skill package id {} cannot form a slash command",
+                    state.package_id
+                ))
+            })?;
             if let Some(existing) = commands.insert(command.clone(), state.package_id.clone()) {
                 return Err(M4ServiceError::Conflict(format!(
                     "skill command /{command} is ambiguous between {existing} and {}",
@@ -1247,34 +1298,6 @@ impl PackageRegistryService {
             available: true,
             validation_error: None,
         }
-    }
-}
-
-fn skill_command(package_id: &str) -> Result<String, M4ServiceError> {
-    let tail = package_id.rsplit('.').next().unwrap_or(package_id);
-    let mut command = String::new();
-    let mut previous_dash = false;
-    for character in tail.chars().flat_map(char::to_lowercase) {
-        if character.is_ascii_alphanumeric() {
-            command.push(character);
-            previous_dash = false;
-        } else if !previous_dash && !command.is_empty() {
-            command.push('-');
-            previous_dash = true;
-        }
-        if command.len() >= 32 {
-            break;
-        }
-    }
-    while command.ends_with('-') {
-        command.pop();
-    }
-    if command.is_empty() {
-        Err(M4ServiceError::Conflict(format!(
-            "skill package id {package_id} cannot form a slash command"
-        )))
-    } else {
-        Ok(command)
     }
 }
 
@@ -2753,7 +2776,9 @@ mod tests {
         OAuthTokenSet, PkceMaterial, SecretMaterial, SecretReference,
     };
     use crate::package_ecosystem::{
-        RingEd25519SignatureVerifier, FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS, PACKAGE_STATE_VERSION,
+        first_party_package_fixtures, PackageDependency, RingEd25519SignatureVerifier,
+        VersionConstraint, AGENT_CONTRACT_VERSION, FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS,
+        PACKAGE_STATE_VERSION,
     };
     use crate::workflow_core::{
         workflow_core_fixture_capabilities, workflow_core_fixtures, NodeAdapterResult,
@@ -2789,6 +2814,7 @@ mod tests {
                 app_version: SemanticVersion::new(1, 0, 0),
                 platform: "macos".to_string(),
                 architecture: "aarch64".to_string(),
+                contract_version: AGENT_CONTRACT_VERSION,
             },
             InstallTrustPolicy::default(),
             PackageLimits::default(),
@@ -2841,6 +2867,101 @@ mod tests {
                 .tombstoned
         );
         assert!(service.installed().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_declared_dependency_gates_install_until_the_catalog_can_satisfy_it() {
+        let directory = TempDirectory::new("package-dependencies");
+        let service = package_service(&directory.0);
+        let now = FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS;
+        let mut fixtures = first_party_package_fixtures();
+        let dependency = fixtures.remove(0).bundle;
+        let mut dependent = fixtures.remove(0).bundle;
+        dependent.manifest.dependencies.push(PackageDependency {
+            package_id: dependency.manifest.package_id.clone(),
+            constraint: VersionConstraint::at_least(SemanticVersion::new(1, 0, 0)),
+        });
+        let dependent_id = dependent.manifest.package_id.clone();
+        let dependent_version = dependent.manifest.version;
+        service.import_bundle(dependent, now).unwrap();
+
+        let blocked = service
+            .preview(&dependent_id, dependent_version, now)
+            .unwrap();
+        assert!(!blocked.preview.plan.satisfiable);
+        assert!(
+            blocked
+                .preview
+                .plan
+                .problem_summary()
+                .contains(&dependency.manifest.package_id),
+            "{}",
+            blocked.preview.plan.problem_summary()
+        );
+        let authorization = PackageInstallAuthorization {
+            package_id: dependent_id.clone(),
+            version: dependent_version,
+            approval_digest: blocked.approval_digest,
+            approved: true,
+        };
+        let refusal = service.install(&authorization, now).unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains(&dependency.manifest.package_id),
+            "{refusal}"
+        );
+
+        // Publishing the dependency and installing it makes the same install
+        // resolvable, and the plan says so without needing a second lookup.
+        let dependency_id = dependency.manifest.package_id.clone();
+        let dependency_version = dependency.manifest.version;
+        service.import_bundle(dependency, now).unwrap();
+        let dependency_preview = service
+            .preview(&dependency_id, dependency_version, now)
+            .unwrap();
+        assert!(dependency_preview.preview.plan.satisfiable);
+        service
+            .install(
+                &PackageInstallAuthorization {
+                    package_id: dependency_id.clone(),
+                    version: dependency_version,
+                    approval_digest: dependency_preview.approval_digest,
+                    approved: true,
+                },
+                now,
+            )
+            .unwrap();
+
+        let resolved = service
+            .preview(&dependent_id, dependent_version, now)
+            .unwrap();
+        assert!(
+            resolved.preview.plan.satisfiable,
+            "{:?}",
+            resolved.preview.warnings
+        );
+        assert_eq!(resolved.preview.plan.steps.len(), 2);
+        assert_eq!(resolved.preview.plan.steps[0].package_id, dependency_id);
+        service
+            .install(
+                &PackageInstallAuthorization {
+                    package_id: dependent_id.clone(),
+                    version: dependent_version,
+                    approval_digest: resolved.approval_digest,
+                    approved: true,
+                },
+                now,
+            )
+            .unwrap();
+
+        // Disabling the dependency is enough to block the next resolution:
+        // nothing loads a disabled package, so it satisfies nothing.
+        service.set_enabled(&dependency_id, false).unwrap();
+        let after = service
+            .preview(&dependent_id, dependent_version, now)
+            .unwrap();
+        assert!(!after.preview.plan.satisfiable);
     }
 
     #[test]
