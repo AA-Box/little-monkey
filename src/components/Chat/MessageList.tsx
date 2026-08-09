@@ -70,6 +70,7 @@ import GeneratedImageCard from "./GeneratedImageCard";
 import PlanCard from "./PlanCard";
 import SubagentRow from "./SubagentRow";
 import SubagentGroupCard, { type SubagentGroupTask } from "./SubagentGroupCard";
+import WorkflowChatCard from "./WorkflowChatCard";
 import { CheckpointPreviewModal } from "./CheckpointPreviewModal";
 import { useT } from "../../lib/i18n";
 import { StepCopyButton, ToolStepRow, TOOL_STEP_LIST_CLASSES } from "./ToolStepRow";
@@ -117,6 +118,10 @@ export interface MessageListProps {
   /** Prepares a generated PNG as an image attachment in the composer so the
    * user can describe an edit before sending another turn. */
   onEditGeneratedImage?: (path: string, prompt: string, artifactId?: string) => void | Promise<void>;
+  /** Opens the Background-tasks drawer — threaded to `SubagentGroupCard` so
+   * clicking a parallel-agents card reveals its per-agent table there (see
+   * that component's `onOpenPanel`). Omitted keeps the inline expansion. */
+  onOpenBackgroundTasks?: () => void;
 }
 
 type TimelineItem =
@@ -124,6 +129,7 @@ type TimelineItem =
   | { kind: "activity"; key: string; calls: ActivityCall[]; prompt: string }
   | { kind: "subagent"; key: string; taskId: string; args: string; result?: string }
   | { kind: "subagentGroup"; key: string; tasks: SubagentGroupTask[] }
+  | { kind: "workflow"; key: string; runId: string; args: string; result?: string }
   | { kind: "notice"; key: string; text: string }
   | { kind: "command"; key: string; notice: CommandNotice }
   | { kind: "checkpoint"; key: string; notice: CheckpointNotice; messageIndex: number }
@@ -192,6 +198,16 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
             calls: entry.calls,
             prompt: latestUserPrompt,
           });
+          continue;
+        }
+
+        if (entry.kind === "workflows") {
+          // One card per `workflow` call — a round issuing several distinct
+          // named workflows should read as several named cards, unlike the
+          // interchangeable agents of a task group.
+          for (const call of entry.calls) {
+            items.push({ kind: "workflow", key: `workflow-${call.id}`, runId: call.id, args: call.args, result: call.result });
+          }
           continue;
         }
 
@@ -1112,6 +1128,7 @@ export default function MessageList({
   messageIndexOffset = 0,
   onStartSideTask,
   onEditGeneratedImage,
+  onOpenBackgroundTasks,
 }: MessageListProps) {
   const { t } = useT();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -1215,8 +1232,20 @@ export default function MessageList({
                 <SubagentRow key={item.key} sessionId={sessionId} taskId={item.taskId} args={item.args} result={item.result} />
               );
             }
+            if (item.kind === "workflow") {
+              return (
+                <WorkflowChatCard
+                  key={item.key}
+                  sessionId={sessionId}
+                  runId={item.runId}
+                  args={item.args}
+                  result={item.result}
+                  onOpenPanel={onOpenBackgroundTasks}
+                />
+              );
+            }
             if (item.kind === "subagentGroup") {
-              return <SubagentGroupCard key={item.key} sessionId={sessionId} tasks={item.tasks} />;
+              return <SubagentGroupCard key={item.key} sessionId={sessionId} tasks={item.tasks} onOpenPanel={onOpenBackgroundTasks} />;
             }
             if (item.kind === "notice") {
               return <NoticeRow key={item.key} text={item.text} />;
