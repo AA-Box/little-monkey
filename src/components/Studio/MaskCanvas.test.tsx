@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 
-import { MaskCanvas } from "./MaskCanvas";
+import { MaskCanvas, nextStop, previousStop } from "./MaskCanvas";
 
 /** Incremented per export so each stroke commits a distinguishable mask. */
 let exportCount = 0;
@@ -164,5 +164,62 @@ describe("MaskCanvas stroke history", () => {
 
     fireEvent.click(redo());
     await waitFor(() => expect(context.drawImage).toHaveBeenCalled());
+  });
+});
+
+/** The zoom stepping is pure, so it needs no rendering — but the clamping does
+ *  need pinning: a helper that walked off the list would hand the container a
+ *  magnification with no stop behind it and strand the user there. */
+describe("zoom stepping", () => {
+  it("steps through the stops and clamps at both ends", () => {
+    expect(nextStop(1)).toBe(2);
+    expect(previousStop(3)).toBe(2);
+    expect(previousStop(1)).toBe(1);
+    expect(nextStop(4)).toBe(4);
+  });
+
+  it("lands on a real stop from a value between two, or outside them", () => {
+    expect(nextStop(2.5)).toBe(3);
+    expect(previousStop(2.5)).toBe(2);
+    expect(nextStop(99)).toBe(4);
+    expect(previousStop(-5)).toBe(1);
+  });
+});
+
+/**
+ * A mask supplied for the image being handed over has to survive.
+ *
+ * Extending the picture sets a new source *and* the mask marking the new margin
+ * in one update. Clearing unconditionally threw that mask away, so the margin
+ * reached the engine unmarked and outpainting could not work — the failure was
+ * invisible, because the picture really did grow.
+ */
+describe("MaskCanvas with a mask supplied for the new image", () => {
+  beforeEach(() => {
+    stubCanvas();
+    vi.stubGlobal("Image", StubImage);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps it, and paints it onto the canvas", async () => {
+    const context = stubCanvas();
+    vi.stubGlobal("Image", StubImage);
+    const onChange = vi.fn();
+    render(<MaskCanvas imageBase64="EXTENDED" value="MARGIN_MASK" onChange={onChange} />);
+
+    await waitFor(() => expect(context.drawImage).toHaveBeenCalled());
+    // Never cleared: reporting null here is what dropped the margin.
+    expect(onChange).not.toHaveBeenCalledWith(null);
+  });
+
+  it("still clears when the parent has no mask for the new image", async () => {
+    const onChange = vi.fn();
+    render(<MaskCanvas imageBase64="FRESH" value={null} onChange={onChange} />);
+
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith(null));
   });
 });
