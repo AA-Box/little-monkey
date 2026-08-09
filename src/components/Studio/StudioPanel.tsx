@@ -27,6 +27,7 @@ import type { StudioMode } from "./StudioNav";
 import { ToolPanel } from "./ToolPanel";
 import { useT } from "../../lib/i18n";
 import { describeWeightFile } from "../../lib/weightFileHints";
+import { PREPROCESSORS, runPreprocessor, type Preprocessor } from "../../lib/preprocess";
 import {
   componentFileName,
   editTaskFor,
@@ -163,6 +164,7 @@ function ConditioningImageField({
   strength,
   onStrength,
   strengthLabel,
+  onPreprocess,
 }: {
   label: string;
   hint: string;
@@ -172,6 +174,11 @@ function ConditioningImageField({
   strength: number;
   onStrength: (value: number) => void;
   strengthLabel: string;
+  /** Offered only where a hint map is what the slot wants. ControlNet takes an
+   *  edge or depth map rather than a photograph; IP-Adapter and PhotoMaker take
+   *  the picture itself, and running an edge detector over those would throw
+   *  away the very thing they read. */
+  onPreprocess?: (kind: Preprocessor) => void;
 }) {
   const { t } = useT();
   const input = useRef<HTMLInputElement | null>(null);
@@ -201,6 +208,23 @@ function ConditioningImageField({
           </IconButton>
         )}
       </div>
+      {value && onPreprocess && (
+        <label className="grid gap-1">
+          <span className="text-[11px] font-medium text-muted">
+            {t("Studio.preprocess.label")}
+          </span>
+          <Listbox
+            ariaLabel={t("Studio.preprocess.label")}
+            value=""
+            placeholder={t("Studio.preprocess.placeholder")}
+            options={PREPROCESSORS.filter((kind) => kind !== "none").map((kind) => ({
+              value: kind,
+              label: t(`Studio.preprocess.${kind}`),
+            }))}
+            onChange={(kind) => onPreprocess(kind as Preprocessor)}
+          />
+        </label>
+      )}
       {value && (
         <SliderField
           label={strengthLabel}
@@ -767,6 +791,24 @@ export function StudioPanel({ mode, railSlot }: Props) {
    *  asked. One reader for the init image, the control image, the IP-Adapter
    *  reference and the reference list — they differ only in where the bytes
    *  land. */
+  /** Replaces a conditioning image with its hint map, in place.
+   *
+   *  Destructive on purpose: the run sends one image, so keeping the original
+   *  beside the processed one would only raise the question of which is used.
+   *  Re-picking the file is the undo. */
+  const preprocessInto = async (
+    current: string | null,
+    kind: Preprocessor,
+    receive: (base64: string) => void,
+  ) => {
+    if (!current) return;
+    try {
+      receive(await runPreprocessor(current, kind));
+    } catch (cause) {
+      setError(String(cause));
+    }
+  };
+
   const pickImage = async (file: File, receive: (base64: string) => void) => {
     const reader = new FileReader();
     reader.onload = () => {
@@ -1477,6 +1519,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
               value={controlImage}
               onPick={(file) => void pickImage(file, setControlImage)}
               onClear={() => setControlImage(null)}
+              onPreprocess={(kind) => void preprocessInto(controlImage, kind, setControlImage)}
               strength={controlStrength}
               onStrength={setControlStrength}
               strengthLabel={t("Studio.control.strength")}
@@ -1885,6 +1928,14 @@ export function StudioPanel({ mode, railSlot }: Props) {
             <textarea
               className="min-h-16 min-w-0 flex-1 resize-none rounded border border-border bg-background p-2 text-xs"
               placeholder={t("Studio.promptPlaceholder")}
+              // A placeholder is not a label: it disappears on the first
+              // keystroke and screen readers may never announce it.
+              aria-label={isSpeechTask(task) ? t("Studio.speechText") : t("Studio.prompt")}
+              // The engine parses `(word:1.3)` inside the prompt itself —
+              // verified against the pinned build, which exports
+              // `parse_prompt_attention`. It costs nothing to expose and is
+              // invisible otherwise. Speech has no sampler to weight.
+              title={isSpeechTask(task) ? undefined : t("Studio.promptWeighting")}
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
             />
@@ -1904,6 +1955,8 @@ export function StudioPanel({ mode, railSlot }: Props) {
               <input
                 className="min-w-0 flex-1 rounded border border-border bg-background p-2 text-xs"
                 placeholder={t("Studio.negativePlaceholder")}
+                aria-label={t("Studio.negativePrompt")}
+                title={t("Studio.promptWeighting")}
                 value={negativePrompt}
                 onChange={(event) => setNegativePrompt(event.target.value)}
               />
