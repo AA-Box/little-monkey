@@ -364,6 +364,7 @@ fn hardware_with_cuda() -> HardwareSnapshot {
                 device_names: vec!["Test GPU".to_string()],
                 total_memory_bytes: Some(24 * 1024 * 1024 * 1024),
                 available_memory_bytes: Some(20 * 1024 * 1024 * 1024),
+                devices: Vec::new(),
             }],
         ),
     }

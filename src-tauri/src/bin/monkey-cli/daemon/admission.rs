@@ -393,6 +393,7 @@ mod tests {
                     device_names: vec!["fixture".into()],
                     total_memory_bytes: Some(vram_gib * GIB),
                     available_memory_bytes: Some(free_vram_gib * GIB),
+                    devices: Vec::new(),
                 }],
             ),
         }
@@ -621,6 +622,7 @@ mod tests {
                 device_names: vec!["fixture".into()],
                 total_memory_bytes: Some(32 * GIB),
                 available_memory_bytes: Some(32 * GIB),
+                devices: Vec::new(),
             }],
         );
         match fit(&measured(8 * GIB, 8 * GIB, None), &ZERO_MEMORY, &snapshot) {

@@ -737,6 +737,7 @@ mod tests {
             parallel_sequences: 1,
             available_ram_bytes: 8_000_000_000,
             available_vram_bytes: 16_000_000_000,
+            device_split: crate::runtime_adapter::DeviceSplit::SingleDevice { index: 0 },
             rationale: Vec::new(),
             improvement_suggestions: Vec::new(),
         }

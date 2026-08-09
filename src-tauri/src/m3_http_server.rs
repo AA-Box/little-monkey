@@ -2517,6 +2517,7 @@ mod tests {
                     device_names: vec!["test-cpu".to_string()],
                     total_memory_bytes: None,
                     available_memory_bytes: None,
+                    devices: Vec::new(),
                 }]),
             })
         }

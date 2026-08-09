@@ -146,6 +146,16 @@ impl crate::m3_runtime_hub::M3HardwareProbe for SystemM3HardwareProbe {
             device_names: vec!["Apple Silicon unified GPU".to_string()],
             total_memory_bytes: Some(total_ram_bytes),
             available_memory_bytes: Some(available_ram_bytes),
+            // One device, and the sum above is not a lie for it: Apple Silicon
+            // has a single unified pool, so the largest device *is* the total.
+            // Enumerated anyway, so a reader never has to special-case "this
+            // kind cannot be split" separately from "this kind has one device".
+            devices: vec![crate::runtime_adapter::AcceleratorDevice {
+                index: 0,
+                name: "Apple Silicon unified GPU".to_string(),
+                total_memory_bytes: Some(total_ram_bytes),
+                available_memory_bytes: Some(available_ram_bytes),
+            }],
         }];
         if let Some(cuda) = detect_nvidia_accelerator() {
             accelerators.push(cuda);
@@ -867,6 +877,7 @@ fn detect_nvidia_accelerator() -> Option<crate::runtime_adapter::AcceleratorCapa
 fn parse_nvidia_smi(output: &str) -> Option<crate::runtime_adapter::AcceleratorCapability> {
     const MIB: u64 = 1024 * 1024;
     let mut device_names = Vec::new();
+    let mut devices: Vec<crate::runtime_adapter::AcceleratorDevice> = Vec::new();
     let mut total_memory_bytes = 0_u64;
     let mut available_memory_bytes = 0_u64;
     for line in output
@@ -882,6 +893,17 @@ fn parse_nvidia_smi(output: &str) -> Option<crate::runtime_adapter::AcceleratorC
             return None;
         }
         device_names.push(name.to_string());
+        // Kept per device as well as summed (roadmap K15). The sum alone is what
+        // made two 24 GB cards read as one 48 GB pool — the exact figure that
+        // makes a 40 GB model look like it fits when no single device can hold
+        // it. `nvidia-smi` lists devices in ordinal order, which is the same
+        // order `--main-gpu` and `--tensor-split` index by.
+        devices.push(crate::runtime_adapter::AcceleratorDevice {
+            index: u32::try_from(devices.len()).unwrap_or(u32::MAX),
+            name: name.to_string(),
+            total_memory_bytes: Some(total_mib.saturating_mul(MIB)),
+            available_memory_bytes: Some(free_mib.saturating_mul(MIB)),
+        });
         total_memory_bytes = total_memory_bytes.saturating_add(total_mib.saturating_mul(MIB));
         available_memory_bytes =
             available_memory_bytes.saturating_add(free_mib.saturating_mul(MIB));
@@ -895,6 +917,7 @@ fn parse_nvidia_smi(output: &str) -> Option<crate::runtime_adapter::AcceleratorC
         device_names,
         total_memory_bytes: Some(total_memory_bytes),
         available_memory_bytes: Some(available_memory_bytes),
+        devices,
     })
 }
 
@@ -4651,6 +4674,50 @@ mod tests {
         assert!(parse_nvidia_smi("GPU, N/A, N/A").is_none());
     }
 
+    /// Roadmap K15: the sum is display-only, and each card's own memory is what
+    /// a placement decision is allowed to read.
+    ///
+    /// Summing was not merely lossy, it was wrong in a specific direction: a
+    /// 24 GB card beside an 8 GB card reports 32 GB, and a 20 GB model then
+    /// looks like it fits when neither card can hold it.
+    #[test]
+    fn nvidia_inventory_keeps_each_cards_own_memory_beside_the_sum() {
+        let cuda = parse_nvidia_smi("NVIDIA RTX 4090, 24564, 20100\nNVIDIA RTX 4060, 8188, 4096\n")
+            .expect("valid nvidia-smi inventory");
+
+        let devices: Vec<_> = cuda
+            .devices
+            .iter()
+            .map(|device| {
+                (
+                    device.index,
+                    device.name.as_str(),
+                    device.available_memory_bytes,
+                )
+            })
+            .collect();
+        assert_eq!(
+            devices,
+            vec![
+                (0, "NVIDIA RTX 4090", Some(20_100 * 1024 * 1024)),
+                (1, "NVIDIA RTX 4060", Some(4_096 * 1024 * 1024)),
+            ],
+            "ordinal order, because that is what --main-gpu and --tensor-split index by"
+        );
+
+        // The honest budget for a runtime that cannot split: the biggest card,
+        // not the pair.
+        assert_eq!(
+            cuda.largest_device_memory(),
+            Some(20_100 * 1024 * 1024),
+            "the largest single device, never the sum"
+        );
+        assert!(
+            cuda.largest_device_memory().unwrap() < cuda.available_memory_bytes.unwrap(),
+            "if these were ever equal this test would be asserting nothing"
+        );
+    }
+
     // --- Hardware Compatibility Matrix / Driver Doctor -------------------
     //
     // These tests exercise the parsers with fixture strings (no real
@@ -5037,6 +5104,7 @@ GPU1:
                             device_names: Vec::new(),
                             total_memory_bytes: None,
                             available_memory_bytes: None,
+                            devices: Vec::new(),
                         }],
                     ),
                 })
