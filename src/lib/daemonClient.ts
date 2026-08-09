@@ -175,6 +175,43 @@ export const remotePairRevoke = (deviceId: string, reason: string) => invoke<str
 export const remotePairRotate = (deviceId: string, output: string) => invoke<string>("remote_pair_rotate", { deviceId, output });
 export const remoteAudit = (limit = 100) => invoke<unknown>("remote_audit", { limit });
 
+/** One node this machine may place work on, as `monkey daemon remote node-list --json` reports it (roadmap K17 S1). */
+export interface RemoteNodeRow {
+  alias: string;
+  runner_id: string;
+  node_name: string;
+  residency: string;
+  accepting: boolean;
+  queue_depth: number;
+  queue_capacity: number;
+  last_seen_at_ms: number | null;
+  /** `alive` | `stale` | `vanished` — computed by the daemon, never here, so
+   * one implementation of the silence thresholds exists. */
+  liveness: string;
+}
+
+/** One run this machine has placed on a node (roadmap K17 S2/S4). */
+export interface RemotePlacementRow {
+  submitted_run_id: string;
+  alias: string;
+  node_run_id: string;
+  job_id: string;
+  state: string;
+  attempt: number;
+  residency: string;
+  /** Which of `select_node`'s keys chose that node — the record says why, not only where. */
+  deciding_key: string;
+  last_error: string | null;
+  updated_at_ms: number;
+}
+
+export const remoteNodeList = () => invoke<{ nodes: RemoteNodeRow[] }>("remote_node_list");
+export const remotePlacements = () => invoke<{ placements: RemotePlacementRow[] }>("remote_placements");
+export const remoteNodeRefresh = (alias?: string) => invoke<string>("remote_node_refresh", { alias: alias ?? null });
+export const remotePlacementSync = () => invoke<string>("remote_placement_sync");
+export const remoteNodeLabel = (name: string | null, residency: string | null) =>
+  invoke<string>("remote_node_label", { name, residency });
+
 /**
  * What an older daemon — or one whose status could not be read — means.
  *

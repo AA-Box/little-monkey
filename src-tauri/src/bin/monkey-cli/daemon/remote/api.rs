@@ -80,6 +80,73 @@ pub struct PlacedJobState {
     pub last_error: Option<String>,
 }
 
+/// Every model resident on this node: the managed hub's inventory plus whatever
+/// the local Ollama daemon has pulled (roadmap K17 S1).
+///
+/// # The synchronous-handler problem, and why it is not solved by giving up
+///
+/// Listing Ollama tags is one async loopback GET, and [`RemoteApi::handle`] is
+/// synchronous — it is called from `handle_http`, which is not. The first cut of
+/// this simply omitted Ollama, and the cost was real rather than cosmetic:
+/// `select_node`'s strongest ranking key is "the model is already resident", and
+/// a node's Ollama models are exactly the local models a placement would want to
+/// avoid re-pulling. A whole class of placements silently ranked as if every
+/// node were cold.
+///
+/// `block_in_place` moves this blocking section off the async worker so the
+/// runtime can keep serving, which is precisely what it exists for. It is
+/// **only** reached on a multi-threaded runtime — `block_in_place` panics on a
+/// current-thread one, and unit tests call `handle` with no runtime at all — so
+/// the flavour is checked first and the absence of a runtime degrades to "hub
+/// models only" rather than to a panic in a route handler.
+///
+/// A daemon whose Ollama is not running is not an error either: an unreachable
+/// Ollama contributes nothing and the node still describes itself.
+fn resident_models(
+    app_data: &std::path::Path,
+) -> Vec<little_monkey_lib::node_placement::NodeModel> {
+    let mut models = little_monkey_lib::m3_runtime_hub::installed_model_inventory(app_data);
+    let known: std::collections::BTreeSet<String> =
+        models.iter().map(|model| model.model_id.clone()).collect();
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return models;
+    };
+    if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+        return models;
+    }
+    let tags = tokio::task::block_in_place(|| {
+        handle.block_on(async {
+            let client = little_monkey_lib::egress::hardened()
+                .build()
+                .map_err(|error| error.to_string())?;
+            little_monkey_lib::ollama::list_tag_names(&client).await
+        })
+    });
+    let Ok(tags) = tags else {
+        return models;
+    };
+    for tag in tags {
+        if known.contains(&tag) {
+            continue;
+        }
+        models.push(little_monkey_lib::node_placement::NodeModel {
+            model_id: tag.clone(),
+            display_name: tag,
+            runtime: "ollama".to_string(),
+            // Ollama's tag listing carries a size, but this route deliberately
+            // does not ask for it: `/api/tags` reports the blob size on disk,
+            // which is not the memory footprint the hub's numbers mean, and one
+            // field holding two different measurements is worse than a zero that
+            // is obviously not a measurement.
+            weights_bytes: 0,
+            estimated_ram_bytes: 0,
+            estimated_vram_bytes: 0,
+        });
+    }
+    models.sort_by(|left, right| left.model_id.cmp(&right.model_id));
+    models
+}
+
 /// Meta keys holding the two operator statements a node makes about itself
 /// (roadmap K17 S1). In the daemon's own meta table rather than in
 /// `RemoteHostConfig` because they are facts about the *machine*, not about its
@@ -1560,15 +1627,7 @@ impl RemoteApi {
             node_name,
             residency,
             accelerators: little_monkey_lib::node_placement::describe_accelerators(&hardware),
-            // Managed-hub models only. Ollama-hosted tags are deliberately not
-            // enumerated: listing them is an async HTTP call and this handler is
-            // synchronous, and the consequence is bounded and stated — a
-            // placement naming an Ollama model simply does not win
-            // `select_node`'s resident-model key and falls through to the queue
-            // and memory keys, which is the same answer as a cold node.
-            resident_models: little_monkey_lib::m3_runtime_hub::installed_model_inventory(
-                &self.app_data()?,
-            ),
+            resident_models: resident_models(&self.app_data()?),
             hardware,
             accepting: backpressure.accepting,
             queue_depth: backpressure.queue_depth,

@@ -1137,6 +1137,90 @@ pub async fn remote_pair_rotate(device_id: String, output: String) -> Result<Str
     .await
 }
 
+// --- Roadmap K17: the placement plane, for the desktop ---------------------
+//
+// Thin wrappers over the CLI's own JSON, exactly like every command above. The
+// node and placement tables live in the daemon's remote database, which this
+// library cannot open — `RemoteStore` is a `monkey-cli` type — so the sidecar
+// that already owns that state is also the one that answers for it. That is the
+// same reasoning `remote_host_status` and `remote_audit` follow, and it keeps
+// one implementation of the placement rules rather than a second one here.
+
+#[tauri::command]
+pub async fn remote_node_list() -> Result<Value, String> {
+    parse_json(
+        &command(vec![
+            "daemon".into(),
+            "remote".into(),
+            "node-list".into(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn remote_placements() -> Result<Value, String> {
+    parse_json(
+        &command(vec![
+            "daemon".into(),
+            "remote".into(),
+            "placements".into(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Re-describes one paired node, or every one when `alias` is absent.
+///
+/// This is the call that reaches other machines, so it is the slow one; the
+/// listing above only reads what a previous refresh stored.
+#[tauri::command]
+pub async fn remote_node_refresh(alias: Option<String>) -> Result<String, String> {
+    let mut args = vec!["daemon".into(), "remote".into(), "node-refresh".into()];
+    if let Some(alias) = alias {
+        validate_id("node alias", &alias)?;
+        args.push(alias);
+    }
+    command(args).await
+}
+
+#[tauri::command]
+pub async fn remote_placement_sync() -> Result<String, String> {
+    command(vec![
+        "daemon".into(),
+        "remote".into(),
+        "placement-sync".into(),
+    ])
+    .await
+}
+
+/// States what this machine advertises to schedulers allowed to place work on
+/// it. Both values are operator statements — nothing infers a machine's
+/// jurisdiction — so both are validated here before they reach the sidecar.
+#[tauri::command]
+pub async fn remote_node_label(
+    name: Option<String>,
+    residency: Option<String>,
+) -> Result<String, String> {
+    let mut args = vec!["daemon".into(), "remote".into(), "node-label".into()];
+    if let Some(name) = name {
+        validate_token("node name", &name, 128)?;
+        args.push("--name".into());
+        args.push(name);
+    }
+    if let Some(residency) = residency {
+        crate::node_placement::validate_residency(&residency)?;
+        args.push("--residency".into());
+        args.push(residency);
+    }
+    if args.len() == 3 {
+        return Err("Set a node name, a data-residency label, or both".to_string());
+    }
+    command(args).await
+}
+
 #[tauri::command]
 pub async fn remote_audit(limit: u32) -> Result<Value, String> {
     if !(1..=10_000).contains(&limit) {
@@ -1197,8 +1281,7 @@ mod tests {
         assert!(validate_remote_pair_request(&unknown_mobile).is_err());
 
         let mut granted_mobile = valid;
-        granted_mobile.mobile_capabilities =
-            vec!["view-sessions".to_string(), "chat".to_string()];
+        granted_mobile.mobile_capabilities = vec!["view-sessions".to_string(), "chat".to_string()];
         assert!(validate_remote_pair_request(&granted_mobile).is_ok());
     }
 

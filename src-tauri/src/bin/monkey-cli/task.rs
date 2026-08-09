@@ -74,10 +74,31 @@ pub fn parse_param_flags(raw: &[String]) -> Result<HashMap<String, String>, Stri
 /// type) into `monkey-cli`'s `chat::Target` (resolved against live
 /// provider/keychain state) — mirrors `main.rs::resolve_target`'s exact XOR
 /// logic, just reading from a `Recipe` instead of CLI flags.
-fn resolve_recipe_chat_target(recipe: &Recipe) -> Result<Target, String> {
+fn resolve_recipe_chat_target(recipe: &Recipe) -> Result<ResolvedTarget, String> {
     let target = &recipe.target;
+    // The node's own managed runtime is not listening yet — it is started for
+    // the life of this run — so it resolves to an intent rather than to an
+    // origin. Checked before the desktop branch below because a placed recipe
+    // never carries a `desktop_turn` (`validate_recipe` refuses both at once).
+    if let Some(model_id) = &target.managed_model {
+        return Ok(ResolvedTarget::ManagedModel {
+            model_id: model_id.clone(),
+        });
+    }
     if let Some(snapshot) = &recipe.desktop_turn {
-        return match (&snapshot.target, &snapshot.execution_base_url) {
+        return desktop_execution_target(target, snapshot).map(ResolvedTarget::Ready);
+    }
+    resolve_chat_target(target).map(ResolvedTarget::Ready)
+}
+
+/// The desktop turn's frozen execution target, checked against the recipe copy
+/// it was queued with. Unchanged behaviour, split out so
+/// [`resolve_recipe_chat_target`] reads as the four-way choice it now is.
+fn desktop_execution_target(
+    target: &recipes::RecipeTarget,
+    snapshot: &DesktopTurnSnapshot,
+) -> Result<Target, String> {
+    match (&snapshot.target, &snapshot.execution_base_url) {
             (
                 ModelTargetSnapshot::Provider {
                     provider_id,
@@ -138,10 +159,19 @@ fn resolve_recipe_chat_target(recipe: &Recipe) -> Result<Target, String> {
                     native_ollama: false,
                 })
             }
-            _ => Err("desktop execution target is incomplete".to_string()),
-        };
+        _ => Err("desktop execution target is incomplete".to_string()),
     }
-    resolve_chat_target(target)
+}
+
+/// What a recipe's target resolves to before the run starts.
+///
+/// Two arms because one of the four recipe targets cannot be an origin yet:
+/// [`Self::ManagedModel`] names a model this machine has installed and the
+/// caller starts the app's own verified `llama-server` for it, on a fresh
+/// loopback port, for exactly the life of the run.
+enum ResolvedTarget {
+    Ready(Target),
+    ManagedModel { model_id: String },
 }
 
 fn resolve_chat_target(target: &recipes::RecipeTarget) -> Result<Target, String> {
@@ -680,7 +710,36 @@ fn snapshot_target(target: &recipes::RecipeTarget) -> Result<ModelTargetSnapshot
             capabilities,
         });
     }
-    Err("recipe target must set exactly one of provider, ollama, or local_url".to_string())
+    if let Some(model_id) = &target.managed_model {
+        // The frozen snapshot records the artifact this machine will serve. The
+        // *path* is deliberately local and is never portable — a node receiving
+        // this spec resolves the `model_id` against its own hub inventory rather
+        // than trusting the path (see `daemon::placed_recipe_target`).
+        let app_data = crate::app_data_dir().ok_or("Could not resolve the app data directory")?;
+        let artifact =
+            little_monkey_lib::m3_runtime_hub::installed_model_artifact(&app_data, model_id)
+                .ok_or_else(|| {
+                    format!("this machine has no managed model '{model_id}' installed")
+                })?;
+        let target_digest = sha256_hex(format!("managed-llama\0{model_id}").as_bytes());
+        return Ok(ModelTargetSnapshot::ManagedLlama {
+            target_id: format!("managed-{}", &target_digest[..24]),
+            label: format!("Managed runtime / {model_id}"),
+            model_id: model_id.clone(),
+            model_path: artifact.to_string_lossy().to_string(),
+            capabilities,
+            estimated_memory_bytes: match little_monkey_lib::m3_runtime_hub::installed_model_footprint(&app_data, model_id) {
+                little_monkey_lib::m3_runtime_hub::M3ModelFootprint::Known { memory, .. } => {
+                    Some(memory.ram_bytes)
+                }
+                little_monkey_lib::m3_runtime_hub::M3ModelFootprint::Unknown => None,
+            },
+        });
+    }
+    Err(
+        "recipe target must set exactly one of provider, ollama, local_url, or managed_model"
+            .to_string(),
+    )
 }
 
 fn snapshot_permission_mode(mode: PermissionMode) -> RunPermissionMode {
@@ -885,7 +944,7 @@ async fn run_inner(
     let overrides = parse_param_flags(param_flags)?;
     let rendered = recipes::render_recipe(&recipe, &overrides)?;
 
-    let target = resolve_recipe_chat_target(&recipe)?;
+    let resolved_target = resolve_recipe_chat_target(&recipe)?;
     let mode = PermissionMode::parse(&recipe.permission_mode)?;
 
     // Fail fast, before any network/model work. Shared recipe validation
@@ -1169,6 +1228,62 @@ async fn run_inner(
         .as_ref()
         .map(|snapshot| snapshot.history.clone())
         .unwrap_or_default();
+
+    // The app's own verified `llama-server`, started for exactly this run and
+    // killed when `_managed_session` drops — normal return, error, and unwind
+    // all reap it, which is what `ManagedServerSession`'s `Drop` is for.
+    //
+    // Started here rather than at resolution time because this is the point at
+    // which the run really begins: a start failure is recorded against the
+    // durable run like any other execution failure, instead of being a bare
+    // error from a process the ledger never heard finish.
+    let (target, _managed_session) = match resolved_target {
+        ResolvedTarget::Ready(target) => (target, None),
+        ResolvedTarget::ManagedModel { model_id } => {
+            let started = async {
+                let artifact = little_monkey_lib::m3_runtime_hub::installed_model_artifact(
+                    &app_data_dir,
+                    &model_id,
+                )
+                .ok_or_else(|| {
+                    format!("this machine has no managed model '{model_id}' installed")
+                })?;
+                // Managed llama-server consumes the context size at process
+                // startup, so it is never forwarded as a request option.
+                let context = crate::managed_model_cli::context_tokens(None)?;
+                crate::managed_model_cli::start_server(client, &artifact, context).await
+            }
+            .await;
+            match started {
+                Ok(session) => (
+                    Target::Local {
+                        base_url: session.base_url(),
+                        model: Some(session.model_alias().to_string()),
+                        native_ollama: false,
+                    },
+                    Some(session),
+                ),
+                Err(error) => {
+                    recorder.emit(RunEvent::Failed {
+                        code: "managed_runtime_unavailable".to_string(),
+                        message: bounded_text(&error, 60 * 1024),
+                        retryable: false,
+                    })?;
+                    return Ok((
+                        EXIT_CONFIG_ERROR,
+                        RunResult {
+                            name: recipe.name,
+                            run_id: Some(recorder.run_id()),
+                            status: "failed".to_string(),
+                            iterations_capped: false,
+                            final_message: Some(error),
+                            files_changed: Vec::new(),
+                        },
+                    ));
+                }
+            }
+        }
+    };
 
     let turn_future = async {
         if recipe.desktop_turn.is_some() {
@@ -1514,12 +1629,34 @@ mod tests {
         assert!(invocation_identity(Some("   ")).is_err());
     }
 
+    /// A managed target resolves to an *intent*, never to an origin: the
+    /// runtime it names is not listening until the run starts it. This is the
+    /// gap that made K17 refuse `ManagedLlama` placements outright.
+    #[test]
+    fn a_managed_recipe_target_resolves_to_a_runtime_to_start_rather_than_a_url() {
+        let mut recipe = recipe_with_workspace(None);
+        recipe.target = recipes::RecipeTarget {
+            provider: None,
+            model: None,
+            ollama: None,
+            local_url: None,
+            managed_model: Some("qwen3-8b".to_string()),
+        };
+        match resolve_recipe_chat_target(&recipe).unwrap() {
+            ResolvedTarget::ManagedModel { model_id } => assert_eq!(model_id, "qwen3-8b"),
+            ResolvedTarget::Ready(_) => {
+                panic!("a managed target must not resolve to an origin that is not listening yet")
+            }
+        }
+    }
+
     fn ollama_target() -> recipes::RecipeTarget {
         recipes::RecipeTarget {
             provider: None,
             model: None,
             ollama: Some("qwen2.5:14b".to_string()),
             local_url: None,
+            managed_model: None,
         }
     }
 
@@ -1561,6 +1698,7 @@ mod tests {
             model: Some("anthropic/claude-sonnet".to_string()),
             ollama: None,
             local_url: None,
+            managed_model: None,
         };
         let resolved = resolve_chat_target(&target).unwrap();
         match resolved {
@@ -1579,6 +1717,7 @@ mod tests {
             model: None,
             ollama: None,
             local_url: Some("http://127.0.0.1:8090".to_string()),
+            managed_model: None,
         };
         let resolved = resolve_chat_target(&target).unwrap();
         match resolved {
@@ -1601,6 +1740,7 @@ mod tests {
             model: None,
             ollama: None,
             local_url: Some("http://127.0.0.1:8090".to_string()),
+            managed_model: None,
         };
         let snapshot = snapshot_target(&target).unwrap();
         snapshot.validate().unwrap();

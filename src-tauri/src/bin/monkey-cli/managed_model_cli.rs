@@ -377,19 +377,27 @@ fn models_payload_reports_alias(bytes: &[u8], expected_alias: &str) -> bool {
 }
 
 /// Materializes/finds the verified app-owned runtime, starts it against the
-/// installed GGUF on an available loopback port, and waits for `/health`.
+/// GGUF at `model_path` on an available loopback port, and waits for `/health`.
+///
+/// Takes the path rather than an `InstalledModelReference` because it only ever
+/// used that struct's `local_path`, and the second caller has no reference to
+/// give: a run placed by another owned machine names a model *id*, which the
+/// receiving node resolves against its own runtime-hub inventory
+/// (`m3_runtime_hub::installed_model_artifact`) rather than against the CLI's
+/// separate `<app_data>/models` store. Both callers still go through
+/// `verify_managed_model_for_runtime` below, which is the check that matters.
 pub async fn start_server(
     client: &reqwest::Client,
-    installed: &InstalledModelReference,
+    model_path: &Path,
     context_tokens: u32,
 ) -> Result<ManagedServerSession, String> {
-    model_sources::verify_managed_model_for_runtime(&installed.local_path)?;
+    model_sources::verify_managed_model_for_runtime(model_path)?;
     let data = app_data_dir()?;
     let binary = managed_llama_server(&data)?;
     for attempt in 1..=MAX_START_ATTEMPTS {
         let port = candidate_loopback_port()?;
         let startup_alias = little_monkey_lib::llama::fresh_server_alias();
-        let args = chat_server_args(&installed.local_path, port, context_tokens, &startup_alias);
+        let args = chat_server_args(model_path, port, context_tokens, &startup_alias);
         eprintln!("Starting Little Monkey's managed llama-server on 127.0.0.1:{port}...");
 
         let mut command = Command::new(&binary);

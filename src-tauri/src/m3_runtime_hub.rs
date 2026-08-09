@@ -41,9 +41,9 @@ use reqwest::header::{
     HeaderValue, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, RANGE,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 #[cfg(any(target_os = "macos", test))]
 use serde_json::json;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1226,6 +1226,43 @@ pub fn installed_model_footprint(app_data_dir: &Path, model_id: &str) -> M3Model
     M3ModelFootprint::Unknown
 }
 
+/// The on-disk artifact for `model_id`'s **active** version on this machine, or
+/// `None` when this machine has not installed it.
+///
+/// The companion to [`installed_model_footprint`] directly above: that one
+/// answers "how big is it", this one answers "where is it", and both are free
+/// functions for the same reason — the callers are a run submission path and a
+/// remote route handler that have an app-data directory and no hub.
+///
+/// `ensure_descendant` is applied for the same reason the hub applies it when
+/// building its own views: `artifact_relative_path` comes off durable state, and
+/// a path that escaped the models root would hand a caller an arbitrary file to
+/// execute a model server against.
+#[must_use]
+pub fn installed_model_artifact(app_data_dir: &Path, model_id: &str) -> Option<PathBuf> {
+    let root = app_data_dir.join(M3_HUB_DIRECTORY);
+    let models_root = root.join("models");
+    let state = load_hub_state(&root.join("state"), &models_root).ok()?;
+    for stored in &state.models {
+        // `continue`, not `?`: one model row without an active version must not
+        // hide every model listed after it.
+        let Some(version) = stored
+            .versions
+            .iter()
+            .find(|version| version.version_key == stored.active_version_key)
+        else {
+            continue;
+        };
+        if version.model.model_id != model_id {
+            continue;
+        }
+        let artifact = models_root.join(&version.artifact_relative_path);
+        ensure_descendant(&models_root, &artifact).ok()?;
+        return artifact.is_file().then_some(artifact);
+    }
+    None
+}
+
 /// Every model this machine has installed, as the placement plane advertises it
 /// (roadmap K17 S1).
 ///
@@ -1737,9 +1774,7 @@ pub enum M3RuntimeStatusView {
         running_models: Vec<RunningModel>,
     },
     #[cfg(target_os = "macos")]
-    Mlx {
-        status: MlxRuntimeStatus,
-    },
+    Mlx { status: MlxRuntimeStatus },
 }
 
 #[derive(Clone, Debug, Serialize)]
