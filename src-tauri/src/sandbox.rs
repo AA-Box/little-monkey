@@ -2810,7 +2810,13 @@ mod tests {
     /// macOS and Linux share `assert_real_workspace_stays_out_of_reach`
     /// verbatim because both run the same `sh` script. Windows cannot: `cmd /C`
     /// takes one line, has no `set -eu`, and reads `%USERPROFILE%`/`%TMP%` where
-    /// the others read `$HOME`/`$TMPDIR`. What is shared is the *claim* — read
+    /// the others read `$HOME`/`$TMPDIR`. The deeper split is where the
+    /// assertions live. The `sh` version can hold its own, because `set -eu` plus
+    /// a distinct `exit` per step makes the exit code a verdict; a `cmd`
+    /// one-liner cannot, so this version's script only *reports* and every
+    /// assertion is made in Rust against its stdout. See the comment on the
+    /// command for the two ways the other arrangement lied. What is shared is
+    /// the *claim* — read
     /// your own copy, fail to read the real workspace, fail to overwrite it,
     /// write to the sandbox-owned home and tmp, with and without network — and
     /// the claim is what the acceptance is about. Forcing one string across
@@ -2863,8 +2869,8 @@ mod tests {
         // arm gives above — and Windows is the platform that reason is about.
         // `execute_in_sandbox` resolves through it and hands the child the
         // prefix-free `C:\...` form, so `%USERPROFILE%` never equals a verbatim
-        // `\\?\C:\...`. Comparing against the verbatim one exits 70 on the very
-        // first guard and the boundary below never runs.
+        // `\\?\C:\...`. Comparing against the verbatim one fails the environment
+        // assertion below and nothing after it means anything.
         let canonical_sandbox = plain_canonical(&sandbox_root).expect("canonical sandbox");
         let canonical_workspace =
             plain_canonical(&workspace_dir).expect("canonical sandbox workspace");
@@ -2873,61 +2879,52 @@ mod tests {
         let expected_home = canonical_sandbox.join(SANDBOX_HOME_DIR);
         let expected_tmp = canonical_sandbox.join(SANDBOX_TMP_DIR);
 
-        // One line, `&`-separated: `cmd /C` takes the remainder of the command
-        // line verbatim and has no `set -eu`, so every step carries its own
-        // `exit /b`. The two deny codes match the `sh` version's on purpose — 71
-        // for a readable secret, 72 for a writable one — so a failure reads the
-        // same whichever platform reported it. The allow codes (73-75) have no
-        // `sh` counterpart because there `set -eu` fails the script for us.
+        // Straight line, and **no `if`, no `(…)`, no `exit /b`** — every claim is
+        // printed here and asserted in Rust below. That is not a style choice; a
+        // one-liner cannot carry its own assertions on this platform.
         //
-        // `&` does not stop on failure, so every step is followed by its own
-        // check; an unchecked step would let a silent denial through and leave the
-        // exit code saying nothing. Reaching the trailing `exit /b 0` therefore
-        // means each check passed — which is a claim about the checks, so they
-        // have to be able to fire. See below for the two that could not.
+        // Two earlier drafts encoded them in `cmd` control flow and both were
+        // reporting nothing. `exit /b` inside `(…)` leaves the block rather than
+        // `cmd`, so the deny guards could not fail and the trailing `exit /b 0`
+        // overwrote their errorlevel. Removing the parentheses left the harder
+        // one: the whole `&`-chain trails a leading `if`, and cmd took the chain
+        // for that `if`'s command, so once the environment check finally *passed*
+        // — `not` false — it skipped the entire rest of the line and exited 0
+        // having done nothing. The history is the tell. An earlier run returned
+        // this script's own `exit /b 70`, which is the branch *taken*; fixing the
+        // paths is what made the run silent.
         //
-        // **No step is wrapped in parentheses.** `exit /b` inside `(...)` leaves
-        // the block, not `cmd`, so the earlier `(… && exit /b 71)` and
-        // `(… && exit /b 72)` set an errorlevel that the trailing `exit /b 0`
-        // then overwrote: the two deny codes could not fire at all, and `exit 0`
-        // was reporting "reached the end", not "every step passed". Both deny
-        // steps are top-level now, and the pair of `if not errorlevel 1` after
-        // them is what actually stops the run.
+        // So the exit code stops being the verdict, and `dir /b` and `type` stop
+        // being decoration. The one-liner's whole job is to say what the container
+        // saw, on stdout, where the host can read it:
         //
-        // `if errorlevel` rather than `%ERRORLEVEL%`: a one-liner is expanded
-        // once, before any of it runs, so `%ERRORLEVEL%` would compare the value
-        // this script started with. `if not errorlevel 1` is a live test, and it
-        // means "errorlevel is below 1" — the step succeeded, which for these two
-        // steps is the boundary failing.
+        // * `LM-BEGIN` and `LM-END` bracket the run, so "the script stopped early"
+        //   is a distinguishable outcome rather than an empty string.
+        // * `home=` / `tmp=` replace the two `exit /b 70` guards.
+        // * `type "{allowed}"` replaces 73: its content on stdout *is* the read.
+        // * the two `dir /b` replace 74/75 — what the container sees of its own
+        //   writes, which the host listing in the assertions below cannot show.
+        // * `type "{forbidden}"` replaces 71: the secret must not appear.
+        // * the `echo` into `{forbidden}` replaces 72, and the host reads that
+        //   file afterwards to check it did not land.
         //
-        // Neither deny step redirects into the sandbox any more. The old ones
-        // wrote `forbidden-copy`, and `>` creates its target before the command
-        // that failed to read — so the file proved nothing about the read either
-        // way, and its absence on the host was read as evidence when it was not.
-        // `>nul` keeps a *successful* read from printing the secret; stderr is
-        // deliberately left alone, because "Access is denied." is the diagnosis.
-        //
-        // `dir /b` at the end reports what the container itself sees, which is
-        // the half the host listing in the assertion below cannot show — and the
-        // stdout assertion in the loop is what makes that reporting load-bearing
-        // instead of decorative.
+        // The deny probes come last on purpose. They are the two steps expected to
+        // fail, and a failed step is the one that might take the rest of the line
+        // with it — after them there is nothing left to lose but `LM-END`, whose
+        // absence is then itself the finding. Their "Access is denied." on stderr
+        // is left unredirected, because it is the diagnosis.
         let command = format!(
-            "if /I not \"%USERPROFILE%\"==\"{home}\" exit /b 70 \
-             & if /I not \"%TMP%\"==\"{tmp}\" exit /b 70 \
-             & type \"{allowed}\" > \"%TMP%\\allowed-copy\" \
-             & if not exist \"%TMP%\\allowed-copy\" exit /b 73 \
-             & type \"{forbidden}\" >nul \
-             & if not errorlevel 1 exit /b 71 \
-             & echo overwritten> \"{forbidden}\" \
-             & if not errorlevel 1 exit /b 72 \
+            "echo LM-BEGIN \
+             & echo home=%USERPROFILE% \
+             & echo tmp=%TMP% \
+             & type \"{allowed}\" \
              & echo home-ok> \"%USERPROFILE%\\probe\" \
-             & if not exist \"%USERPROFILE%\\probe\" exit /b 74 \
              & echo tmp-ok> \"%TMP%\\probe\" \
-             & if not exist \"%TMP%\\probe\" exit /b 75 \
-             & dir /b \"%USERPROFILE%\" \"%TMP%\" \
-             & exit /b 0",
-            home = expected_home.display(),
-            tmp = expected_tmp.display(),
+             & dir /b \"%USERPROFILE%\" \
+             & dir /b \"%TMP%\" \
+             & type \"{forbidden}\" \
+             & echo overwritten> \"{forbidden}\" \
+             & echo LM-END",
             allowed = canonical_workspace.join("allowed.txt").display(),
             forbidden = canonical_forbidden.display(),
         );
@@ -2960,45 +2957,69 @@ mod tests {
                 Isolation::OsSandboxed,
                 "the container was created, so the run must report the boundary it got"
             );
-            // Asserted before the exit code, because it is what decides whether
-            // the exit code means anything. The script ends in `dir /b` over two
-            // directories it has just written into, and `dir` prints to one stream
-            // or the other however it goes — so a run with nothing on either did
-            // not reach that line, and an `exit 0` from it is not "every check
-            // passed" but a child that ran none of them.
-            assert!(
-                !outcome.stdout.is_empty(),
-                "the confined child printed nothing, so it never reached the \
-                 trailing `dir /b` and its exit code describes a script that did \
-                 not run (network={allow_network}); exit={:?} stderr={:?}",
-                outcome.exit_code,
-                String::from_utf8_lossy(&outcome.stderr)
+            let stdout = String::from_utf8_lossy(&outcome.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&outcome.stderr).into_owned();
+            // Everything below reads this run's own report, so first establish
+            // there is one. Asserted before anything else, including the exit
+            // code: a script that never ran exits 0 too, and that is precisely how
+            // this test used to pass its way into a misleading failure.
+            let ran = format!(
+                "(network={allow_network}) exit={:?} stdout={stdout:?} stderr={stderr:?}",
+                outcome.exit_code
             );
-            // Each code names its own step, so a red run says which half broke
-            // rather than only that something did: 70 wrong env, 71 the secret
-            // was readable, 72 it was writable, 73 its own copy was not readable,
-            // 74/75 the sandbox-owned home or tmp was not writable.
-            assert_eq!(
-                outcome.exit_code,
-                Some(0),
-                "AppContainer boundary failed (network={allow_network}); stdout={:?} stderr={:?}",
-                String::from_utf8_lossy(&outcome.stdout),
-                String::from_utf8_lossy(&outcome.stderr)
+            assert!(
+                stdout.contains("LM-BEGIN") && stdout.contains("LM-END"),
+                "the confined child did not run its script from start to finish, so \
+                 nothing below is a statement about the boundary — an absent \
+                 LM-BEGIN means it ran nothing at all, an absent LM-END means a \
+                 step took the rest of the line with it: {ran}"
+            );
+            // The two `exit /b 70` guards, moved out of `cmd`. A wrong `%TMP%` or
+            // `%USERPROFILE%` would make every path below name somewhere other
+            // than the directories the host checks afterwards.
+            assert!(
+                stdout.contains(&format!("home={}", expected_home.display()))
+                    && stdout.contains(&format!("tmp={}", expected_tmp.display())),
+                "the child's sandbox-owned environment is not what this test \
+                 expects, so its writes did not go where the assertions look: \
+                 wanted home={} tmp={}; {ran}",
+                expected_home.display(),
+                expected_tmp.display()
+            );
+            // The allow half: its own copy of the workspace is readable, and its
+            // own home and tmp are writable *as the container sees them*. The host
+            // half of that second claim is asserted after the loop.
+            assert!(
+                stdout.contains("sandbox-visible"),
+                "the container could not read its own workspace copy, so this run \
+                 proves nothing about what it cannot read: {ran}"
+            );
+            assert!(
+                stdout.matches("probe").count() >= 2,
+                "the container wrote a probe into its own home and tmp and then \
+                 could not list them itself, so the boundary is too tight rather \
+                 than correct: {ran}"
+            );
+            // The deny half. `type` printing the secret is the read succeeding,
+            // which is the boundary gone — and the file's content on the host is
+            // the write half, checked here so a clobber is reported against the
+            // run that did it.
+            assert!(
+                !stdout.contains("must-stay-secret"),
+                "the container read a file outside the sandbox: {ran}"
             );
             assert_eq!(
                 fs::read_to_string(&forbidden_file).expect("read real file after run"),
-                "must-stay-secret"
+                "must-stay-secret",
+                "the container overwrote a file outside the sandbox: {ran}"
             );
-            container_view = format!(
-                "network={allow_network} stdout={:?} stderr={:?}",
-                String::from_utf8_lossy(&outcome.stdout),
-                String::from_utf8_lossy(&outcome.stderr)
-            );
+            container_view = ran;
         }
-        // The in-container guards (74/75) already proved the writes succeeded.
-        // These assert the separate claim that the host still sees them after the
-        // container is gone — true on the other two platforms, so when it fails
-        // here, say what is on disk rather than only that something is not.
+        // The `dir /b` assertion above already proved the writes succeeded as far
+        // as the container is concerned. These assert the separate claim that the
+        // host still sees them after the container is gone — true on the other two
+        // platforms, so when it fails here, say what is on disk rather than only
+        // that something is not.
         let listing = |dir: &Path| match fs::read_dir(dir) {
             Ok(entries) => entries
                 .filter_map(Result::ok)
