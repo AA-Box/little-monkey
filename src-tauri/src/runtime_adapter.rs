@@ -672,8 +672,74 @@ pub struct AcceleratorCapability {
     pub kind: AcceleratorKind,
     pub available: bool,
     pub device_names: Vec<String>,
+    /// Every device of this kind summed, and **display-only**.
+    ///
+    /// It is not a budget. Two 24 GB cards report 48 GB here and cannot between
+    /// them hold a 40 GB model unless the runtime splits it — sizing against
+    /// this number is precisely how a model that fits nothing looks like it
+    /// fits. [`AcceleratorCapability::largest_device_memory`] is what a planner
+    /// that cannot split must ask, and [`devices`](Self::devices) is what one
+    /// that can must ask.
+    pub total_memory_bytes: Option<u64>,
+    /// Free memory summed across devices. Same warning as `total_memory_bytes`.
+    pub available_memory_bytes: Option<u64>,
+    /// One row per physical device, which is the shape the two numbers above
+    /// destroy (roadmap K15).
+    ///
+    /// `serde(default)` because a snapshot written before this existed carries
+    /// none — and empty means *this detector could not enumerate devices*, not
+    /// *there is one device*. A reader that needs per-device memory and finds
+    /// this empty has to refuse rather than divide the sum by a guess.
+    #[serde(default)]
+    pub devices: Vec<AcceleratorDevice>,
+}
+
+/// One physical accelerator, with the memory that is actually its own.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcceleratorDevice {
+    /// The runtime's own device ordinal — what `--main-gpu` and the position in
+    /// `--tensor-split` mean. Not an index into any of this app's vectors.
+    pub index: u32,
+    pub name: String,
     pub total_memory_bytes: Option<u64>,
     pub available_memory_bytes: Option<u64>,
+}
+
+impl AcceleratorCapability {
+    /// The largest single device's free memory — the honest budget for a
+    /// runtime that cannot split a model across devices.
+    ///
+    /// `None` when no device was enumerated, which is a refusal to guess rather
+    /// than a zero: a detector that reported a sum without a device list has not
+    /// said how that sum is distributed, and dividing it evenly would invent a
+    /// machine.
+    #[must_use]
+    pub fn largest_device_memory(&self) -> Option<u64> {
+        self.devices
+            .iter()
+            .filter_map(|device| device.available_memory_bytes.or(device.total_memory_bytes))
+            .max()
+    }
+
+    /// Free memory per device in ordinal order, or `None` if any device did not
+    /// report it. All-or-nothing on purpose: a split computed from a partially
+    /// known machine would silently overcommit the devices it could not see.
+    #[must_use]
+    pub fn per_device_memory(&self) -> Option<Vec<(u32, u64)>> {
+        if self.devices.is_empty() {
+            return None;
+        }
+        self.devices
+            .iter()
+            .map(|device| {
+                device
+                    .available_memory_bytes
+                    .or(device.total_memory_bytes)
+                    .map(|bytes| (device.index, bytes))
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -705,6 +771,10 @@ impl PlatformCapabilities {
                 device_names: Vec::new(),
                 total_memory_bytes: None,
                 available_memory_bytes: None,
+                // The CPU is not a device a split addresses, and saying so with
+                // an empty list is right: `largest_device_memory` returns `None`
+                // for it, which is what "ask RAM, not VRAM" looks like here.
+                devices: Vec::new(),
             },
         );
         for capability in detected {
@@ -3489,7 +3559,9 @@ pub struct OffloadRationale {
     pub explanation: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+// No `Eq`: the split's weights are floats. `PartialEq` is what the tests
+// compare with, and a float budget has no meaningful total order anyway.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct OffloadPlan {
     pub schema_version: u32,
@@ -3504,8 +3576,169 @@ pub struct OffloadPlan {
     pub parallel_sequences: u16,
     pub available_ram_bytes: u64,
     pub available_vram_bytes: u64,
+    /// Which device(s) the weights go on (roadmap K15).
+    ///
+    /// `serde(default)` so a plan serialized before this existed still loads;
+    /// its default is the single-device placement every such plan implied.
+    #[serde(default = "default_device_split")]
+    pub device_split: DeviceSplit,
     pub rationale: Vec<OffloadRationale>,
     pub improvement_suggestions: Vec<String>,
+}
+
+fn default_device_split() -> DeviceSplit {
+    DeviceSplit::SingleDevice { index: 0 }
+}
+
+/// The `llama.cpp` flags a split becomes, or a refusal naming the runtime that
+/// cannot take it (roadmap K15).
+///
+/// A free function rather than a method on [`DeviceSplit`], because whether a
+/// split can be honoured is a fact about the *runtime*, not about the split: the
+/// same placement is fine for `llama.cpp` and impossible for Ollama, whose HTTP
+/// surface exposes `num_gpu` and nothing that names a device.
+///
+/// Verified against the pinned build's own `--help`: `--tensor-split` takes a
+/// comma-separated proportion per device and `--main-gpu` an ordinal, which is
+/// exactly the shape [`DeviceSplit::Across`] carries.
+pub fn device_split_args(
+    runtime: RuntimeKind,
+    split: &DeviceSplit,
+) -> RuntimeAdapterResult<Vec<String>> {
+    match split {
+        // Every runtime can put a model on one device; only naming *which* one
+        // needs a flag, and only llama.cpp has it. An unsplit placement on a
+        // runtime without `--main-gpu` is not a refusal — it is the default that
+        // runtime would have picked anyway.
+        DeviceSplit::SingleDevice { index } => match runtime {
+            RuntimeKind::LlamaCpp if *index != 0 => {
+                Ok(vec!["--main-gpu".to_string(), index.to_string()])
+            }
+            _ => Ok(Vec::new()),
+        },
+        DeviceSplit::Across { main, weights } => match runtime {
+            RuntimeKind::LlamaCpp => Ok(vec![
+                "--main-gpu".to_string(),
+                main.to_string(),
+                "--tensor-split".to_string(),
+                weights
+                    .iter()
+                    .map(|weight| format!("{weight:.4}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ]),
+            // Refused rather than silently dropped. Dropping it would load the
+            // model on one device with a budget computed for several, which
+            // fails at load time with an out-of-memory error that names nothing
+            // about the split that caused it.
+            RuntimeKind::Ollama => Err(RuntimeAdapterError::UnsupportedCapability {
+                runtime_id: "ollama".to_string(),
+                capability: "splitting one model across multiple devices".to_string(),
+            }),
+        },
+    }
+}
+
+/// How a model's weights are laid across the accelerator's devices (roadmap
+/// K15).
+///
+/// A tagged union rather than an optional `Vec<f32>` for the reason
+/// `Compensation` is one: a caller cannot read a split without also reading
+/// whether there *is* one, so "one device" and "spread over three" cannot be
+/// confused by a reader that forgot to check a flag.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", tag = "mode")]
+pub enum DeviceSplit {
+    /// Everything on one device. The budget is that device's own memory — never
+    /// the sum across devices, which is the figure that makes a model too large
+    /// for any single card look like it fits.
+    SingleDevice { index: u32 },
+    /// Spread across devices in proportion to their free memory. `weights` is in
+    /// device-ordinal order and sums to 1.0, which is exactly what llama.cpp's
+    /// `--tensor-split` takes; `main` is its `--main-gpu`.
+    Across { main: u32, weights: Vec<f32> },
+}
+
+impl DeviceSplit {
+    /// The memory this split may actually use.
+    ///
+    /// `None` when the capability enumerated no devices — a refusal to guess
+    /// rather than a zero, since a detector that reported only a sum has not
+    /// said how it is distributed.
+    #[must_use]
+    pub fn budget_bytes(&self, capability: &AcceleratorCapability) -> Option<u64> {
+        match self {
+            DeviceSplit::SingleDevice { index } => capability
+                .devices
+                .iter()
+                .find(|device| device.index == *index)
+                .and_then(|device| device.available_memory_bytes.or(device.total_memory_bytes))
+                .or_else(|| capability.largest_device_memory())
+                // No device list at all — an older snapshot, or a detector that
+                // only ever reported a sum. With devices unenumerated that sum
+                // is indistinguishable from one device's own memory, so it is
+                // the honest budget rather than a guess, and the machine plans
+                // exactly as it did before per-device memory existed. Refusing
+                // here would silently drop a GPU the planner used yesterday.
+                //
+                // The bug this whole change fixes is still fixed: when devices
+                // *are* enumerated, the largest one wins over their sum above.
+                .or(capability.available_memory_bytes)
+                .or(capability.total_memory_bytes),
+            // Only here is the sum a legitimate budget: the weights below are
+            // what make each device hold its own share of it.
+            DeviceSplit::Across { .. } => capability
+                .per_device_memory()
+                .map(|devices| devices.iter().map(|(_, bytes)| *bytes).sum()),
+        }
+    }
+
+    /// True when this split needs a runtime that can place weights per device.
+    #[must_use]
+    pub fn needs_multi_device_runtime(&self) -> bool {
+        matches!(self, DeviceSplit::Across { .. })
+    }
+}
+
+/// Picks the split for one model on one accelerator.
+///
+/// Prefers a single device — it is the simpler placement and the one every
+/// runtime supports — and only spreads when no single device can hold the model
+/// but the devices together can. Spreading when one card would do costs
+/// cross-device traffic for nothing.
+#[must_use]
+fn plan_device_split(capability: &AcceleratorCapability, model_bytes: u64) -> DeviceSplit {
+    let Some(devices) = capability.per_device_memory() else {
+        // Nothing enumerated: the only honest placement is "the first device",
+        // and `budget_bytes` falls back to the largest known figure. A split
+        // computed from an unknown machine would be an invention.
+        return DeviceSplit::SingleDevice { index: 0 };
+    };
+    let largest = devices
+        .iter()
+        .max_by_key(|(_, bytes)| *bytes)
+        .copied()
+        .unwrap_or((0, 0));
+    if devices.len() < 2 || largest.1 >= model_bytes {
+        return DeviceSplit::SingleDevice { index: largest.0 };
+    }
+    let total: u64 = devices.iter().map(|(_, bytes)| *bytes).sum();
+    if total == 0 {
+        return DeviceSplit::SingleDevice { index: largest.0 };
+    }
+    // Proportional to free memory, so the smaller card is not handed a share it
+    // cannot hold. Ordinal order, because that is the order `--tensor-split`
+    // reads positionally.
+    let mut ordered = devices.clone();
+    ordered.sort_by_key(|(index, _)| *index);
+    let weights = ordered
+        .iter()
+        .map(|(_, bytes)| (*bytes as f64 / total as f64) as f32)
+        .collect();
+    DeviceSplit::Across {
+        main: largest.0,
+        weights,
+    }
 }
 
 pub struct LocalOffloadPlanner;
@@ -3540,16 +3773,22 @@ impl LocalOffloadPlanner {
         // rather than a second, independently reserved figure. That avoids both
         // double-counting the pool and skipping the OS/other-resident reserve on
         // the accelerator side.
+        let capability = input
+            .hardware
+            .platform
+            .accelerators
+            .iter()
+            .find(|entry| entry.kind == accelerator && entry.available);
+        // The split this machine's devices allow, decided before the budget so
+        // the budget can be the split's own (roadmap K15).
+        let device_split = capability
+            .map(|entry| plan_device_split(entry, input.model.estimated_vram_bytes))
+            .unwrap_or(DeviceSplit::SingleDevice { index: 0 });
         let mut available_vram_bytes = match accelerator {
             AcceleratorKind::Cpu => 0,
             AcceleratorKind::Metal => available_ram_bytes,
-            other => input
-                .hardware
-                .platform
-                .accelerators
-                .iter()
-                .find(|entry| entry.kind == other && entry.available)
-                .and_then(|entry| entry.available_memory_bytes.or(entry.total_memory_bytes))
+            _ => capability
+                .and_then(|entry| device_split.budget_bytes(entry))
                 .unwrap_or(0)
                 .saturating_sub(input.reserved.vram_bytes),
         };
@@ -3792,6 +4031,7 @@ impl LocalOffloadPlanner {
         }
 
         Ok(OffloadPlan {
+            device_split,
             schema_version: RUNTIME_ADAPTER_SCHEMA_VERSION,
             accelerator,
             context_tokens,
@@ -3946,6 +4186,120 @@ fn validate_offload_plan_input(input: &OffloadPlanInput) -> RuntimeAdapterResult
 
 #[cfg(test)]
 mod tests {
+    fn cuda_pair() -> AcceleratorCapability {
+        AcceleratorCapability {
+            kind: AcceleratorKind::Cuda,
+            available: true,
+            device_names: vec!["A".to_string(), "B".to_string()],
+            total_memory_bytes: Some(32),
+            available_memory_bytes: Some(32),
+            devices: vec![
+                AcceleratorDevice {
+                    index: 0,
+                    name: "A".to_string(),
+                    total_memory_bytes: Some(24),
+                    available_memory_bytes: Some(24),
+                },
+                AcceleratorDevice {
+                    index: 1,
+                    name: "B".to_string(),
+                    total_memory_bytes: Some(8),
+                    available_memory_bytes: Some(8),
+                },
+            ],
+        }
+    }
+
+    /// Roadmap K15. A model one card can hold goes on that card — spreading it
+    /// would buy cross-device traffic for nothing — and the budget is that
+    /// card's own memory rather than the pair's sum.
+    #[test]
+    fn a_model_that_fits_one_card_is_not_split_across_two() {
+        let capability = cuda_pair();
+        let split = plan_device_split(&capability, 20);
+        assert_eq!(split, DeviceSplit::SingleDevice { index: 0 });
+        assert_eq!(split.budget_bytes(&capability), Some(24));
+        assert!(!split.needs_multi_device_runtime());
+    }
+
+    /// The case the aggregate figure used to hide: 30 fits neither card alone,
+    /// and only the split makes the pair's 32 a legitimate budget.
+    #[test]
+    fn a_model_too_large_for_any_one_card_is_split_in_proportion_to_free_memory() {
+        let capability = cuda_pair();
+        let split = plan_device_split(&capability, 30);
+        let DeviceSplit::Across { main, weights } = &split else {
+            panic!("expected a split, got {split:?}");
+        };
+        assert_eq!(*main, 0, "the largest card leads");
+        assert_eq!(weights.len(), 2);
+        assert!(
+            (weights[0] - 0.75).abs() < 1e-6 && (weights[1] - 0.25).abs() < 1e-6,
+            "weights follow free memory so the smaller card is not handed a share it cannot hold: {weights:?}"
+        );
+        assert_eq!(
+            split.budget_bytes(&capability),
+            Some(32),
+            "only a real split may spend the sum"
+        );
+    }
+
+    /// llama.cpp takes the split; Ollama's HTTP surface has nothing that names a
+    /// device, so it refuses rather than dropping it. A dropped split loads the
+    /// model on one card with a budget computed for two, and fails at load time
+    /// with an out-of-memory error that names nothing about the cause.
+    #[test]
+    fn a_split_is_refused_by_a_runtime_that_cannot_place_per_device() {
+        let split = plan_device_split(&cuda_pair(), 30);
+        assert_eq!(
+            device_split_args(RuntimeKind::LlamaCpp, &split).unwrap(),
+            vec![
+                "--main-gpu".to_string(),
+                "0".to_string(),
+                "--tensor-split".to_string(),
+                "0.7500,0.2500".to_string(),
+            ]
+        );
+        let refused = device_split_args(RuntimeKind::Ollama, &split).unwrap_err();
+        assert!(
+            matches!(refused, RuntimeAdapterError::UnsupportedCapability { .. }),
+            "{refused:?}"
+        );
+
+        // A single-device placement on device 0 is every runtime's own default,
+        // so it is not a refusal and emits nothing.
+        let single = DeviceSplit::SingleDevice { index: 0 };
+        assert!(device_split_args(RuntimeKind::Ollama, &single)
+            .unwrap()
+            .is_empty());
+        assert!(device_split_args(RuntimeKind::LlamaCpp, &single)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The regression this fallback exists for: a detector that reports only a
+    /// sum must keep the GPU it always had. Honest-absence applies to inventing
+    /// a *split*, not to dropping a device the planner used yesterday.
+    #[test]
+    fn a_capability_with_no_device_list_keeps_its_aggregate_budget() {
+        let aggregate = AcceleratorCapability {
+            kind: AcceleratorKind::Cuda,
+            available: true,
+            device_names: vec!["Only".to_string()],
+            total_memory_bytes: Some(16),
+            available_memory_bytes: Some(12),
+            devices: Vec::new(),
+        };
+        let split = plan_device_split(&aggregate, 8);
+        assert_eq!(split, DeviceSplit::SingleDevice { index: 0 });
+        assert_eq!(split.budget_bytes(&aggregate), Some(12));
+        assert_eq!(
+            aggregate.per_device_memory(),
+            None,
+            "empty means unenumerated, so nothing may compute a split from it"
+        );
+    }
+
     use super::*;
     use serde_json::json;
     use std::collections::VecDeque;
@@ -4222,6 +4576,7 @@ mod tests {
             device_names: vec!["CPU".to_string()],
             total_memory_bytes: None,
             available_memory_bytes: None,
+            devices: Vec::new(),
         }
     }
 
@@ -4352,6 +4707,7 @@ mod tests {
                 device_names: vec!["Apple GPU".to_string()],
                 total_memory_bytes: None,
                 available_memory_bytes: None,
+                devices: Vec::new(),
             }],
         );
         assert_eq!(mac.os, "macos");
@@ -4368,6 +4724,7 @@ mod tests {
                 device_names: Vec::new(),
                 total_memory_bytes: None,
                 available_memory_bytes: None,
+                devices: Vec::new(),
             }],
         );
         assert!(windows.supports_accelerator(AcceleratorKind::DirectMl));
@@ -5202,6 +5559,7 @@ mod tests {
                         device_names: vec!["Apple Silicon unified GPU".to_string()],
                         total_memory_bytes: Some(gib(total_ram_gib)),
                         available_memory_bytes: Some(gib(available_ram_gib)),
+                        devices: Vec::new(),
                     },
                 ],
             ),

@@ -4452,6 +4452,44 @@ added when a tool that produces the effect exists.
 detected by the Hardware Compatibility Matrix and never used as more than one
 device.
 
+**Shipped — per-device memory, the split it makes possible, and the refusal when
+a runtime cannot take it. Not yet the per-device admission reservation.**
+
+The entry read as a missing feature. It was also a live bug, and finding it is
+what set the shape of the fix: `parse_nvidia_smi` **summed** each card's memory
+into one figure at the moment of detection, so two 24 GB cards became one 48 GB
+pool — the exact number that makes a 40 GB model look like it fits when neither
+card can hold it. Two surfaces had drifted apart: the Driver Doctor enumerated
+multiple devices but carried no memory, and the snapshot the planner reads
+carried memory but had summed the devices away.
+
+- **`AcceleratorDevice`, one row per card**, with its own memory, in the ordinal
+  order `--main-gpu` and `--tensor-split` index by. The aggregate stays, marked
+  display-only in its own doc — it is not a budget.
+- **The budget asks the right question.** A runtime that cannot split gets the
+  *largest single device*, never the sum. A capability that enumerated no
+  devices keeps its aggregate, because with devices unenumerated the sum is
+  indistinguishable from one device's own memory — refusing there would silently
+  drop a GPU the planner used yesterday, which a regression test now pins.
+- **`DeviceSplit` is a tagged union**, so a caller cannot read a split without
+  also reading whether there is one. A model that fits one card is not spread
+  across two: that buys cross-device traffic for nothing.
+- **Weights follow free memory**, so the smaller card is not handed a share it
+  cannot hold, and only a real split may spend the sum as its budget.
+- **The refusal is per runtime, not per split.** `llama.cpp` takes
+  `--main-gpu`/`--tensor-split`; Ollama's HTTP surface has nothing that names a
+  device, so it errors with `UnsupportedCapability` rather than dropping the
+  split — a dropped split loads the model on one card with a budget computed for
+  several and dies at load time with an out-of-memory error that names nothing
+  about the cause.
+
+**Remaining: "each device is a schedulable resource K7 reserves against
+independently."** `daemon/admission.rs`'s `Resource` is `Ram | Vram` and the
+reservation row has two byte columns, so a second job is still admitted against
+an aggregate the first job may have exhausted on one card. That is a daemon
+schema change on top of this one, and it is the half that needs multi-GPU
+hardware to be worth trusting.
+
 **Acceptance:** ROADMAP #7 — an explicit per-device split chosen from the real
 hardware snapshot, the offload planner accounting for each device's own
 memory, and an honest refusal when a runtime does not support the requested
