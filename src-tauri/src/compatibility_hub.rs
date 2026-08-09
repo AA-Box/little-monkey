@@ -371,7 +371,7 @@ impl ProtocolStreamFrame {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EndpointConformance {
     pub protocol: CompatibilityProtocol,
@@ -390,7 +390,7 @@ pub struct EndpointConformance {
 /// separate from [`EndpointConformance`] rather than stretching
 /// [`CompatibilityProtocol`] to cover them, since those routes are not
 /// translated through `translate_request`/`encode_response`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuxiliaryEndpointConformance {
     pub method: String,
@@ -399,7 +399,7 @@ pub struct AuxiliaryEndpointConformance {
     pub streaming: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompatibilityConformanceManifest {
     pub manifest_version: u32,

@@ -142,6 +142,23 @@ pub const DEFAULT_HTTP_PORT: u16 = 1234;
 /// Maximum requests in flight across one logical server generation.
 pub const MAX_ACTIVE_REQUESTS: usize = 64;
 
+/// Largest request body either listener will read before answering 413.
+///
+/// Enforced by [`read_capped_body`] as it streams frames in, never after the
+/// fact — buffering the whole thing first and checking the length would defeat
+/// the point. Chat-completion payloads can legitimately run to several MB
+/// (inline base64 image content for multimodal messages), so this is set
+/// generously rather than to a tight "small JSON payload" bound: it exists to
+/// put a ceiling on a malicious or mistaken caller's memory impact, the same
+/// "streamed cap regardless of what Content-Length claims" stance
+/// `web.rs::MAX_BODY_BYTES` takes for fetched page bodies.
+///
+/// Lives here rather than once per listener because it is a shared
+/// *mechanism*, which is what this module owns — and because the K21
+/// attestation publishes it as a limit clients may rely on. A value a client
+/// is told and a value a listener enforces must be one constant.
+pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 pub const LEGACY_TOKEN_RATE_WINDOW_MS: u64 = 60_000;
 pub const LEGACY_TOKEN_MAX_REQUESTS: u64 = 60;
 pub const LEGACY_TOKEN_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;

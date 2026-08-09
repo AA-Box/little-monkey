@@ -1,5 +1,5 @@
 {
-  "contract_version": "1.0.0",
+  "contract_version": "1.1.0",
   "support_window_days": 180,
   "http_routes": [
     {
@@ -214,6 +214,16 @@
         "GET",
         "OPTIONS"
       ]
+    },
+    {
+      "id": "Conformance",
+      "path": "/v1/conformance",
+      "family": "legacy_host",
+      "legacy_methods": [
+        "GET",
+        "OPTIONS"
+      ],
+      "m3_methods": []
     },
     {
       "id": "LegacyV1Preflight",

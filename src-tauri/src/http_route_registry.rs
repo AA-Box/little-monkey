@@ -119,6 +119,7 @@ pub enum RouteId {
     ModelDelete,
     RequestCancel,
     Contract,
+    Conformance,
     LegacyV1Preflight,
 }
 
@@ -381,6 +382,21 @@ pub const ROUTES: &[RouteSpec] = &[
         family: RouteFamily::Shared,
         path: PathMatcher::Exact("/v1/contract"),
         methods: shared_methods(GET_OPTIONS, GET_OPTIONS),
+    },
+    // K21. The conformance attestation: what this node claims to implement,
+    // and the live evidence a conformance run needs to check the claim.
+    //
+    // `LegacyHost` — so loopback only, never LAN — because the attestation
+    // carries this machine's isolation posture and the head hashes of its
+    // subsystem chain. A conformance run is something a node's own operator
+    // performs against their own node; nothing about it needs to be readable
+    // from the network, and `owner_for` refuses this family on a LAN
+    // exposure without a second check having to remember to.
+    RouteSpec {
+        id: RouteId::Conformance,
+        family: RouteFamily::LegacyHost,
+        path: PathMatcher::Exact("/v1/conformance"),
+        methods: legacy_methods(GET_OPTIONS),
     },
     RouteSpec {
         id: RouteId::LegacyV1Preflight,
@@ -1011,6 +1027,7 @@ mod tests {
             // binary — so it exposes no agent, workspace, tool, file, git, MCP
             // or recipe surface. It publishes the fact that those are denied.
             "/v1/contract",
+            "/v1/conformance",
             "/v1/*",
         ];
         let actual: Vec<String> = ROUTES
@@ -1105,7 +1122,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(ids.len(), 21);
+        assert_eq!(ids.len(), 22);
     }
 
     #[test]

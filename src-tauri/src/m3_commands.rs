@@ -1145,6 +1145,41 @@ pub fn m3_compatibility_matrix(
     state.hub.compatibility_matrix().map_err(command_error)
 }
 
+/// Run the published K21 conformance suite against a live node and return
+/// its report.
+///
+/// Takes no hub state on purpose. The suite's whole claim is that it grades a
+/// node from the outside, over a socket, exactly as a third party would —
+/// handing it a `State<M3CommandState>` would let a future edit shortcut a
+/// check by reading the hub the node is built on. `base_url` therefore points
+/// wherever the operator says, including at a node this app did not start.
+///
+/// The token is the operator's own API-server token. Nothing is persisted:
+/// the desktop stores only token digests, so a plaintext round trip through
+/// here would be the only place one lived.
+#[tauri::command]
+pub async fn run_conformance_suite(
+    base_url: String,
+    token: Option<String>,
+    sections: Vec<String>,
+) -> Result<crate::conformance::ConformanceReport, String> {
+    let mut selected = Vec::new();
+    for name in &sections {
+        selected.push(
+            crate::conformance::SectionId::parse(name)
+                .ok_or_else(|| format!("Unknown conformance section '{name}'."))?,
+        );
+    }
+    let options = crate::conformance::SuiteOptions {
+        base_url,
+        token: token.filter(|token| !token.trim().is_empty()),
+        sections: selected,
+        model: None,
+    };
+    let client = crate::conformance::client()?;
+    Ok(crate::conformance::run_suite(&client, &options).await)
+}
+
 #[tauri::command]
 pub fn m3_lan_validate_policy(policy: LanServerPolicy) -> Result<(), String> {
     M3RuntimeHub::validate_lan_policy(&policy).map_err(command_error)

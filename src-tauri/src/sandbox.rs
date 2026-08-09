@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::Manager;
 
@@ -286,7 +286,7 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// `crate::sandbox_linux` installs no ruleset and the run proceeds with the
 /// restricted-cwd/env isolation. Nothing fails, so `ProcessOnly` — the state
 /// that means "this ran without a kernel boundary" — is the whole truth.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxEnforcement {
     /// A kernel-enforced boundary applies: macOS Seatbelt via `sandbox-exec`, or
