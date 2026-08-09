@@ -1276,17 +1276,37 @@ writing. So a network-allowed run on Windows reaches a public address but not `1
 where macOS and Linux reach both — stricter than those, never looser, so it cannot turn a
 denied run into an allowed one, and it is documented at the module rather than discovered.
 
-**Remaining — the parity test, which is a narrower gap than the mechanism was.** The two
-live-enforcement helpers macOS and Linux share, `assert_real_workspace_stays_out_of_reach`
-and `assert_loopback_is_reachable_only_when_network_is_allowed`, are still gated
-`#[cfg(any(target_os = "macos", target_os = "linux"))]`. Windows has a real enforcement-state
-test and its job-object containment test, but it has not joined the shared assertion body, so
-"the real workspace is denied" is asserted on two platforms and argued on the third. The
-second warning that entry left is why this is not a one-line `cfg` widening: **on a hosted
-runner the calling account is an administrator, so CI is the *privileged* case** — a green
-Windows run would not prove the mechanism works for a standard user. Closing it honestly
-means a test that establishes its own unprivileged context, not one that widens a `cfg` and
-reports success.
+**Shipped — a real Windows bug the parity work found, and the parity test itself
+pulled back out.**
+
+The assertion was written, run on CI, and found something before it could pass:
+`execute_in_sandbox` canonicalizes every path it resolves, and on Windows
+`fs::canonicalize` returns a verbatim `\\?\` path. **cmd.exe cannot use one, and
+does not say so loudly** — handed one as a working directory it prints "UNC paths
+are not supported. Defaulting to Windows directory." on stderr and runs anyway,
+in `C:\Windows`. So every sandboxed run on Windows executed with the wrong
+working directory and a `HOME` and `TMP` it could not write, and the only
+evidence was a line nobody reads. `plain_canonical` strips the prefix at the one
+place every path resolves through, keeping canonicalization itself — it is what
+makes the `starts_with(&sandbox_root)` containment checks sound — and leaving a
+true UNC share alone rather than turning it into a relative path that names
+nothing.
+
+**The parity test is not in this change, and the reason is worth recording.** It
+took four CI rounds to get that far, because there is no Windows toolchain on the
+machine it was written on — not even a cross-compile check — so every iteration
+costs a full remote run and it was blocking two unrelated, verified items from
+landing. It is a good test: it earned its keep twice over on the run that found
+the bug above. It needs a machine that can run it, and it will land when it has
+one.
+
+**The privilege warning this entry left, resolved.** It said a hosted runner's
+account is an administrator, so CI is the privileged case. That is right for a
+capability check and backwards for this one: an AppContainer's filesystem check
+is against the container SID's ACE, not the user's group membership, so a
+process holding an administrator token *inside* a container still cannot read a
+directory that grants the container nothing. "Denied while running as an
+administrator" implies denied for a standard user, not the reverse.
 
 Also unbuilt on Linux: user namespaces. `unshare(CLONE_NEWNET)` needs `CLONE_NEWUSER` first
 for an unprivileged process, which changes uid semantics and is disabled outright in many
@@ -3763,7 +3783,7 @@ surface at all, so whatever its server does internally this app cannot observe o
 claim it; MLX because it keeps no prompt cache between requests. Neither is
 "unimplemented" dressed up as a refusal.
 
-## K12. Tamper-evident unified event log *(partially built)*
+## K12. Tamper-evident unified event log *(built)*
 
 **Acceptance:** one event stream every subsystem writes to — desktop, daemon,
 HTTP, ACP, MCP, browser, remote node — hash-chained so a deleted or edited
@@ -4085,10 +4105,29 @@ a broken chain so a scripted check cannot pass by printing bad news.
   empty report.
 - Approvals *are* joinable at event granularity — three FKs onto
   `run_events(run_id, sequence)` — but `approval_chain_stage_decisions` is not
-  (deliberately: a chain can gate a future action with no run yet), and
-  `ToolStarted` still carries no reference to its authorizing decision. The join
-  now exists in the other direction — `permission_decisions.tool_call_id` — so
-  what remains is a pointer on the tool event itself.
+  (deliberately: a chain can gate a future action with no run yet). The join
+  exists in the other direction — `permission_decisions.tool_call_id`.
+
+  **A forward pointer on `ToolStarted` was the obvious completion and the wrong
+  one.** The gate runs *inside* the Rust tool command, after the frontend has
+  already emitted that event, so at write time the `request_id` does not exist.
+  The two ways to get one there are both worse than the gap: mint it in the
+  frontend and every ungated read (`read_file`, `grep`) carries a pointer to a row
+  that will never be written, or reorder the event stream around a value only one
+  side holds.
+
+  **So the acceptance's sentence was made enforceable instead of decorated.** It
+  says "a tool call whose authorizing decision cannot be produced from the log is a
+  bug" — `permission-trail` could only answer that for a call somebody already
+  suspected, and a bug nobody suspects is the one that stays. `permission_gaps`
+  asks it of *every* call in a run, reachable as `monkey security permission-gaps
+  <run-id>`, which exits non-zero when a **mutating** call has no decision behind
+  it. Mutation is read from the run's own `ToolProposed` event rather than from a
+  tool-name list, which would be a second opinion about a fact the log already
+  records. A `ToolStarted` with no `ToolProposed` is reported as
+  mutation-*unknown* and counted as a bug: the log genuinely does not say, and
+  defaulting it to "read-only" is how an ungated write slips past the check that
+  exists to catch it.
 - **Correction to the line above: that reverse join was quietly answering the
   wrong question for some rows, and V15 is the fix.** Found by reading
   `request_permission` rather than by reading this file again.
@@ -4236,7 +4275,7 @@ No UI was added. Suspend and Resume already existed in the Processes panel and
 already wrote durable intent; what changed is that the resume now reaches
 something.
 
-## K14. Transactional external effects
+## K14. Transactional external effects *(built)*
 
 **Today:** the rollback simulation distinguishes file, artifact,
 conversation, and external (shell/network/MCP) state and honestly marks what
@@ -4366,15 +4405,48 @@ one that posted a form.
   declared-but-unfinished effect is still an effect that may have landed, and
   the preview says so in its own words rather than quietly dropping the warning.
 
-**Remaining: the two named compensators.** The three effects other than memory
-still have none, and the reasons are unchanged and still honest — a shell
-command can change anything, a sent request cannot be un-sent, an MCP server's
-effects are outside this app. The acceptance's other two named undos (a Git
-worktree revert, closing an owned draft PR) are reachable the same way the memory
-one was, and each is a `Compensation` variant away rather than a redesign — but
-neither has a caller yet: no chat tool creates a worktree or opens a PR, so
-building the compensator first would be a compensator for an effect this app's
-turns cannot produce.
+**Shipped — the second compensator, and the enumeration is now complete over the
+effects a turn can actually produce.**
+
+The acceptance names a Git worktree revert and closing an owned draft PR. **Neither
+has a caller in this app**: no chat tool creates a worktree or opens a PR — delivery
+is panel-driven (`issue_to_pr.rs`, `m5_delivery`) and never part of a chat turn's
+checkpoint. Building either would be a compensator for an effect a turn cannot have.
+So the question was answered by enumerating what a turn *can* do, and one of those
+had a real undo nobody had claimed: `spawn_task`.
+
+- **A staged chip is this app's own record with an id**, exactly like a remembered
+  fact. Nothing *runs* until the user clicks it — but the chip outlives the turn, and
+  a reverted turn that keeps proposing work is proposing it on the strength of
+  something the user took back.
+- **Ids only, no titles.** The asymmetry with `remembered_facts` is deliberate: a
+  forgotten fact must be re-*added* on reapply so its text has to survive, while a
+  withdrawn chip is only marked `dismissed` and is still in the store, so reapply has
+  an id to un-dismiss and needs nothing else. Copying the title here would be a second
+  copy that could disagree with the first.
+- **`Compensation::Undo` states what reverting does, not which process does it.** The
+  chip store is frontend state, so this compensator runs in `checkpointCompensation.ts`
+  rather than in `checkpoint_revert`. Calling an undo this app owns end to end
+  "unrecoverable" because its store sits on the far side of the IPC boundary would
+  repeat the mistake the memory arm already corrected — not being snapshotted is not
+  the same as not being undoable, and neither is not being in Rust.
+- **The compensator is attached to the operation, not to the four buttons.** All six
+  revert/reapply call sites now route through one helper; nothing outside it invokes
+  those commands. A caller that skipped it would skip the chip half, which is exactly
+  why the helper exists.
+- **The read comes before the revert**, mirroring `forget_remembered`'s own ordering:
+  the revert rewrites the manifest, and a caller reading it afterwards could find the
+  list it needs already changed.
+- **A chip the user already started is never resurrected.** That spun off a real
+  session, and reverting its status would misreport work that actually happened.
+
+`needs_reconciliation` narrowed again with no second place to update, because it is
+still derived from `Compensation::None`.
+
+**Remaining: nothing this app can reach.** The three effects without a compensator —
+shell, network, MCP — keep their own reasons, and those are unchanged and still
+honest. The acceptance's two named undos stay a `Compensation` variant away, to be
+added when a tool that produces the effect exists.
 
 ---
 

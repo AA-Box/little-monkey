@@ -1,5 +1,6 @@
 import { memo, useEffect, useId, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { reapplyCheckpoint, revertCheckpoint } from "../../lib/checkpointCompensation";
 import {
   BookmarkX,
   BookOpen,
@@ -634,7 +635,7 @@ const CheckpointRow = memo(function CheckpointRow({
 
   const restoreFiles = async (): Promise<boolean> => {
     try {
-      await invoke("checkpoint_revert", { id: notice.id });
+      await revertCheckpoint(notice.id);
       useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
         content: formatCheckpointNotice({ ...notice, reverted: true }),
       });
@@ -654,7 +655,7 @@ const CheckpointRow = memo(function CheckpointRow({
     setBusy(true);
     setError(null);
     try {
-      await invoke("checkpoint_reapply", { id: notice.id });
+      await reapplyCheckpoint(notice.id);
       useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
         content: formatCheckpointNotice({ ...notice, reverted: false }),
       });

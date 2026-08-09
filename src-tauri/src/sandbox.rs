@@ -67,6 +67,42 @@ const MAX_ARTIFACT_BYTES_BUDGET: u64 = 128 * 1024 * 1024;
 const MAX_EVENT_TEXT_EXCERPT: usize = 4_096;
 const PROMOTE_PREVIEW_TTL_MS: u64 = 5 * 60 * 1_000;
 const MAX_PROMOTE_FILES: usize = 500;
+/// `fs::canonicalize` without the `\\?\` prefix Windows puts on the front.
+///
+/// Every path this module resolves ends up somewhere a child process has to
+/// use — its working directory, its `HOME`, its `TMP`, the arguments in its
+/// command line — and **cmd.exe cannot use a verbatim path**. It does not fail
+/// loudly either: given one as a working directory it prints "UNC paths are not
+/// supported. Defaulting to Windows directory." on stderr and runs anyway, in
+/// `C:\Windows`. So a sandboxed run would execute with the wrong cwd and a HOME
+/// it cannot write, and the only evidence would be a line on stderr nobody
+/// reads.
+///
+/// Canonicalization itself is still wanted — it is what makes the
+/// `starts_with(&sandbox_root)` containment checks below sound. Only the prefix
+/// goes.
+///
+/// A no-op on macOS and Linux, where canonical paths have no such prefix.
+fn plain_canonical(path: &Path) -> io::Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(canonical)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let text = canonical.to_string_lossy();
+        // Only the plain disk form. A true UNC share canonicalizes to
+        // `\\?\UNC\server\share`, and stripping to `UNC\server\share` would
+        // name a relative path that does not exist — left alone so it fails
+        // where it is used rather than silently pointing somewhere else.
+        match text.strip_prefix(r"\\?\") {
+            Some(rest) if !rest.starts_with("UNC\\") => Ok(PathBuf::from(rest)),
+            _ => Ok(canonical),
+        }
+    }
+}
+
 const SANDBOX_HOME_DIR: &str = "home";
 const SANDBOX_TMP_DIR: &str = "tmp";
 
@@ -744,7 +780,7 @@ fn insert_existing_read_root(
     real_home: Option<&Path>,
     real_workspace: &Path,
 ) {
-    let Ok(candidate) = fs::canonicalize(candidate) else {
+    let Ok(candidate) = plain_canonical(candidate) else {
         return;
     };
     if readable_root_is_safe(&candidate, real_home, real_workspace) {
@@ -766,10 +802,12 @@ fn readable_roots(
     real_home: Option<&Path>,
     real_workspace: &Path,
 ) -> Vec<PathBuf> {
-    let canonical_home = real_home.and_then(|path| fs::canonicalize(path).ok());
+    // Both sides of every `starts_with` below resolve through the same helper,
+    // so a verbatim path can never be compared against a stripped one.
+    let canonical_home = real_home.and_then(|path| plain_canonical(path).ok());
     let real_home = canonical_home.as_deref().or(real_home);
     let canonical_workspace =
-        fs::canonicalize(real_workspace).unwrap_or_else(|_| real_workspace.to_path_buf());
+        plain_canonical(real_workspace).unwrap_or_else(|_| real_workspace.to_path_buf());
     let mut candidates: Vec<PathBuf> = system_roots.iter().map(PathBuf::from).collect();
     let path_entries: Vec<PathBuf> = path_env
         .map(std::env::split_paths)
@@ -935,9 +973,9 @@ pub async fn execute_in_sandbox(
     allow_network: bool,
     approved_env: &[String],
 ) -> io::Result<SandboxExecOutcome> {
-    let sandbox_root = fs::canonicalize(sandbox_root)?;
-    let workspace_dir = fs::canonicalize(workspace_dir)?;
-    let real_workspace_root = fs::canonicalize(real_workspace_root)?;
+    let sandbox_root = plain_canonical(sandbox_root)?;
+    let workspace_dir = plain_canonical(workspace_dir)?;
+    let real_workspace_root = plain_canonical(real_workspace_root)?;
     if !workspace_dir.starts_with(&sandbox_root) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -957,7 +995,10 @@ pub async fn execute_in_sandbox(
             "Seatbelt profile must have a parent directory",
         )
     })?;
-    let profile_parent = fs::canonicalize(profile_parent)?;
+    // `plain_canonical`, like the three above: this is compared against
+    // `sandbox_root` on the next line, and comparing a verbatim path with a
+    // stripped one is a containment check that can only ever fail.
+    let profile_parent = plain_canonical(profile_parent)?;
     if !profile_parent.starts_with(&sandbox_root) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2595,10 +2636,14 @@ mod tests {
             Some(&home),
             &workspace,
         );
-        let canonical_home = fs::canonicalize(&home).expect("canonical home");
-        let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
-        let canonical_cargo = fs::canonicalize(&cargo_bin).expect("canonical cargo bin");
-        let canonical_external = fs::canonicalize(&external_bin).expect("canonical external bin");
+        // `plain_canonical`, matching what `readable_roots` now resolves with.
+        // On Windows `fs::canonicalize` returns a verbatim `\\?\` path and the
+        // roots do not, so comparing the two forms asserts a mismatch that has
+        // nothing to do with what this test is about.
+        let canonical_home = plain_canonical(&home).expect("canonical home");
+        let canonical_workspace = plain_canonical(&workspace).expect("canonical workspace");
+        let canonical_cargo = plain_canonical(&cargo_bin).expect("canonical cargo bin");
+        let canonical_external = plain_canonical(&external_bin).expect("canonical external bin");
 
         assert!(!roots.iter().any(|root| root == &canonical_home));
         assert!(
@@ -2638,11 +2683,15 @@ mod tests {
         write(&allowed_file, "sandbox-visible");
         write(&forbidden_file, "must-stay-secret");
 
-        let canonical_sandbox = fs::canonicalize(&sandbox_root).expect("canonical sandbox");
+        // `plain_canonical`, not `fs::canonicalize`: the child is handed the
+        // prefix-free form, so comparing against the verbatim one would assert a
+        // path nothing uses. Using the product's own resolver is also what makes
+        // this test fail if that resolver ever stops stripping.
+        let canonical_sandbox = plain_canonical(&sandbox_root).expect("canonical sandbox");
         let canonical_workspace =
-            fs::canonicalize(&workspace_dir).expect("canonical sandbox workspace");
+            plain_canonical(&workspace_dir).expect("canonical sandbox workspace");
         let canonical_forbidden =
-            fs::canonicalize(&forbidden_file).expect("canonical forbidden file");
+            plain_canonical(&forbidden_file).expect("canonical forbidden file");
         let expected_home = canonical_sandbox.join(SANDBOX_HOME_DIR);
         let expected_tmp = canonical_sandbox.join(SANDBOX_TMP_DIR);
         let command = format!(

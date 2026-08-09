@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { revertCheckpoint } from "../../lib/checkpointCompensation";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -223,7 +223,7 @@ export function CheckpointPreviewModal({ sessionId, checkpoint, onClose, onChang
       let filesOk = true;
       if (scope !== "conversation") {
         try {
-          await invoke("checkpoint_revert", { id: checkpoint.id });
+          await revertCheckpoint(checkpoint.id);
         } catch (err) {
           filesOk = false;
           setActionError(t("CheckpointPreview.restoreFailed", { error: errorMessage(err) }));
