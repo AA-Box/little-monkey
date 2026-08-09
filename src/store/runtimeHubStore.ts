@@ -7,6 +7,8 @@ import {
   type AgentTool,
   type GeneratedAgentConfig,
   type BackendDescriptor,
+  type ConformanceReport,
+  type ConformanceSectionId,
   type ConversionReport,
   type ChatTemplateLabReport,
   type HardwareProfile,
@@ -113,6 +115,7 @@ interface RuntimeHubStoreState {
   catalogResults: M3CatalogMatch[];
   apiResult: M3ApiDispatchResponse | null;
   compatibilityMatrix: M3CompatibilityMatrixReport | null;
+  conformanceReport: ConformanceReport | null;
   lanPolicy: LanServerPolicy | null;
   lanTokens: ScopedToken[];
   lanAudit: SecurityAuditEvent[];
@@ -193,6 +196,12 @@ interface RuntimeHubStoreState {
   dispatchApi: (request: M3DiagnosticDispatchRequest) => Promise<void>;
   cancelInference: (request: M3DiagnosticCancelRequest) => Promise<boolean>;
   refreshCompatibilityMatrix: () => Promise<void>;
+  runConformanceSuite: (
+    baseUrl: string,
+    token: string | null,
+    sections: ConformanceSectionId[],
+  ) => Promise<void>;
+  clearConformanceReport: () => void;
   refreshLan: () => Promise<void>;
   validateLanPolicy: (policy: LanServerPolicy) => Promise<void>;
   configureLan: (policy: LanServerPolicy) => Promise<void>;
@@ -366,6 +375,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     catalogResults: [],
     apiResult: null,
     compatibilityMatrix: null,
+    conformanceReport: null,
     lanPolicy: null,
     lanTokens: [],
     lanAudit: [],
@@ -999,6 +1009,21 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         finish(key);
       }
     },
+
+    runConformanceSuite: async (baseUrl, token, sections) => {
+      const key = "conformance-suite";
+      begin(key);
+      try {
+        const conformanceReport = await runtimeHubClient.runConformanceSuite(baseUrl, token, sections);
+        set({ conformanceReport });
+      } catch (error) {
+        fail(key, error);
+      } finally {
+        finish(key);
+      }
+    },
+
+    clearConformanceReport: () => set({ conformanceReport: null }),
 
     refreshLan: async () => {
       const key = "lan-refresh";

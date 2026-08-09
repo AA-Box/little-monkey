@@ -81,7 +81,8 @@ use crate::m3_runtime_hub::{
     M3UnloadModelRequest,
 };
 
-const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+use crate::http_policy::MAX_REQUEST_BODY_BYTES;
+
 const TLS_KEYCHAIN_SERVICE: &str = "com.littlemonkey.m3.lan-tls";
 const MAX_TLS_PEM_BYTES: usize = 1024 * 1024;
 const REQUEST_TIMEOUT_MS: u64 = 30 * 60 * 1_000;

@@ -12,6 +12,7 @@ mod agent;
 mod chat;
 mod checkpoints_cli;
 mod cmds;
+mod conformance_cli;
 mod contract_cli;
 mod daemon;
 mod durable_run;
@@ -415,6 +416,9 @@ enum Cmd {
     /// "list running models" command.
     #[command(subcommand, alias = "proc")]
     Processes(processes_cli::ProcessesCmd),
+    /// Run the published conformance suite (roadmap K21) against a live node
+    /// and report whether it may claim compatibility with this revision.
+    Conformance(conformance_cli::ConformanceArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -1458,6 +1462,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             }
         }
         Cmd::Contract(action) => contract_cli::run(action).await,
+        Cmd::Conformance(args) => conformance_cli::run(args).await,
         Cmd::Acp => acp::run(cli).await,
     };
     if let Err(e) = result {

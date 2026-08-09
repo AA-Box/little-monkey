@@ -771,6 +771,41 @@ export interface M3CompatibilityMatrixReport {
   rows: M3CompatibilityMatrixRow[];
 }
 
+/** Roadmap K21. Mirrors `src-tauri/src/conformance.rs`. */
+export type ConformanceSectionId = "contract" | "isolation" | "limits" | "ledger";
+export type ConformanceRequirement = "required" | "optional";
+export type ConformanceCheckStatus = "passed" | "failed" | "skipped";
+export type ConformanceSectionStatus = "passed" | "failed" | "incomplete" | "skipped";
+
+export interface ConformanceCheckResult {
+  id: string;
+  title: string;
+  status: ConformanceCheckStatus;
+  detail: string;
+}
+
+export interface ConformanceSectionReport {
+  id: ConformanceSectionId;
+  requirement: ConformanceRequirement;
+  covers: string;
+  status: ConformanceSectionStatus;
+  skipReason?: string | null;
+  checks: ConformanceCheckResult[];
+}
+
+export type ConformanceVerdict =
+  | { state: "compatible"; suiteRevision: string }
+  | { state: "notCompatible"; reasons: string[] };
+
+export interface ConformanceReport {
+  suiteRevision: string;
+  nodeSuiteRevision: string | null;
+  target: string;
+  sections: ConformanceSectionReport[];
+  skippedOptionalSections: string[];
+  verdict: ConformanceVerdict;
+}
+
 export interface RuntimeDescriptor {
   schema_version: number;
   runtime_id: string;
@@ -1325,6 +1360,8 @@ export const runtimeHubClient = {
   apiCancelInference: (args: OperationArgs & { request: M3DiagnosticCancelRequest }) =>
     invoke<boolean>("m3_api_cancel_inference", args),
   compatibilityMatrix: () => invoke<M3CompatibilityMatrixReport>("m3_compatibility_matrix"),
+  runConformanceSuite: (baseUrl: string, token: string | null, sections: ConformanceSectionId[]) =>
+    invoke<ConformanceReport>("run_conformance_suite", { baseUrl, token, sections }),
   lanValidatePolicy: (policy: LanServerPolicy) => invoke<void>("m3_lan_validate_policy", { policy }),
   lanConfigure: (policy: LanServerPolicy) => invoke<LanServerPolicy>("m3_lan_configure", { policy }),
   lanDisable: (confirmation: string) => invoke<boolean>("m3_lan_disable", { confirmation }),
