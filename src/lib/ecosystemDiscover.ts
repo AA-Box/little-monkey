@@ -106,8 +106,14 @@ export function worstVulnerabilitySeverity(notices: VulnerabilityNotice[] | unde
 
 /** Gates the pre-install confirmation dialog's Approve button: the install
  * call must never fire before a preview has been loaded for the exact
- * package/version being approved AND the user has explicitly ticked the
- * "I reviewed this" checkbox — either condition failing keeps it disabled. */
-export function canApproveInstall(hasPreview: boolean, reviewedByUser: boolean): boolean {
-  return hasPreview && reviewedByUser;
+ * package/version being approved, the user has explicitly ticked the
+ * "I reviewed this" checkbox, AND the previewed dependency resolution is
+ * satisfiable — any condition failing keeps it disabled. The backend refuses
+ * an unresolvable install regardless; this stops the pointless round trip. */
+export function canApproveInstall(
+  hasPreview: boolean,
+  reviewedByUser: boolean,
+  resolvable: boolean,
+): boolean {
+  return hasPreview && reviewedByUser && resolvable;
 }
