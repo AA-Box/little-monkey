@@ -227,6 +227,11 @@ export function isToolCallAllowed(toolCall: ToolCall, toolsForTurn: ToolDef[]): 
  * `tool_run_shell` doc comment for the load-bearing invariant this must never
  * violate: nothing computed here ever feeds into whether `run_shell` (or
  * anything else) gets auto-approved. */
+/** How many streamed characters accumulate before the status line's live
+ * token estimate is updated — roughly 50 tokens, which is under one tick of
+ * the 0.1k the label rounds to, so batching costs nothing visible. */
+const STATUS_CHAR_FLUSH = 200;
+
 const RISK_ELIGIBLE_TOOLS = new Set(['write_file', 'edit_file', 'run_shell']);
 
 /** Same three tools, under the name that reads right at each of this
@@ -980,6 +985,9 @@ export async function attemptStream(
   // earlier would charge this target for the privacy gate and budget check.
   let firstFragmentAtMs: number | null = null;
   const startedAtMs = Date.now();
+  // Streamed characters not yet reported to the status line — see the delta
+  // branch below.
+  let pendingChars = 0;
 
   const events: AsyncGenerator<StreamEvent> =
     target.kind === 'provider'
@@ -1012,6 +1020,18 @@ export async function attemptStream(
         contentStarted = true;
         content += event.content;
         onDelta?.(content);
+        // Feeds the status line's live token estimate while the answer is
+        // being written — `usage` doesn't arrive until the stream's final
+        // chunk, so this is the only signal there is until then. Batched:
+        // a store write per delta would re-render the transcript on every
+        // token for a number that only reads to the nearest 0.1k anyway.
+        if (recordTurnStatusTokens) {
+          pendingChars += event.content.length;
+          if (pendingChars >= STATUS_CHAR_FLUSH) {
+            useTurnStatusStore.getState().noteStreamedChars(sessionId, pendingChars);
+            pendingChars = 0;
+          }
+        }
       } else if (event.type === 'tool_call') {
         firstFragmentAtMs ??= Date.now();
         contentStarted = true;
@@ -1052,6 +1072,10 @@ export async function attemptStream(
           // registered for `sessionId`. The risk judge opts out via
           // `recordTurnStatusTokens` (see the param's doc comment).
           if (recordTurnStatusTokens) {
+            // Exact number supersedes the estimate: the store drops its
+            // streamed-character count, and this attempt's unflushed
+            // remainder goes with it.
+            pendingChars = 0;
             useTurnStatusStore.getState().addTokens(sessionId, usage.totalTokens);
           }
         }
@@ -1060,6 +1084,12 @@ export async function attemptStream(
     }
   } catch (err) {
     streamError = errorMessage(err);
+  }
+
+  // An endpoint that never reports `usage` (or a stream that died mid-answer)
+  // would otherwise leave the last partial batch off the status line.
+  if (recordTurnStatusTokens && pendingChars > 0) {
+    useTurnStatusStore.getState().noteStreamedChars(sessionId, pendingChars);
   }
 
   return { content, toolCalls, streamError, contentStarted, usage };
