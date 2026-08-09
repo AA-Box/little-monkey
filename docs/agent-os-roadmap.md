@@ -5083,15 +5083,24 @@ test that asserts one profile cannot read another's artifacts, credentials, or
 run history. This is local isolation only; it does not introduce a hosted
 identity plane and does not conflict with the stated non-goal.
 
-## K24. Configuration and definition versioning
+## K24. Configuration and definition versioning *(met)*
 
-**Today:** last-write-wins for prompts, personas, skills, and workflow
-definitions. Only marketplace packages have a diff view.
+**Today:** every persona, snippet, skill, and workflow definition is written
+through an append-only revision log (`config_revisions.rs`, one JSONL file per
+entity under `<app_data>/config-revisions/`). Each revision is a full snapshot
+with a parent, a branch, and a content digest; an unchanged save records
+nothing, so the log is a history of edits rather than of keystrokes. The UI
+lists revisions, diffs any two — including across branches — restores an older
+snapshot through the owning store's normal save path, and forks named
+branches. A save carrying a stale base revision is refused with a `conflict:`
+error the UI turns into a choice (take theirs, or overwrite knowingly); for
+workflows the same refusal comes from the definition store's own version rule.
+Both the desktop and the CLI/daemon write the same history, because the store
+sits below the Tauri layer.
 
-**Acceptance:** ROADMAP #3 — local revision history with diff, restore, and
-branch/compare; concurrent edits detected and surfaced rather than silently
-overwritten. In OS terms this is a versioned system configuration store, and
-it is what makes a scheduling or policy change auditable after the fact.
+**Remaining:** rules/memory files and MCP server definitions still save
+last-write-wins; the history is per-entity, so there is no cross-entity view of
+what a given change touched.
 
 *Maps to: ROADMAP #3.*
 

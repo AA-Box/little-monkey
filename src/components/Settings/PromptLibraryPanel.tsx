@@ -1,10 +1,11 @@
 import { useMemo, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
-import { Download, Pencil, Plus, RotateCcw, ShieldAlert, Star, Trash2, Upload, X } from "lucide-react";
+import { Download, History, Pencil, Plus, RotateCcw, ShieldAlert, Star, Trash2, Upload, X } from "lucide-react";
 import { Button } from "../ui";
 import {
   findByCommand,
+  parseEntrySnapshot,
   parseImportPayload,
   slugify,
   usePromptStore,
@@ -15,6 +16,8 @@ import { useT } from "../../lib/i18n";
 import { BUILT_IN_SLASH_COMMANDS } from "../../lib/slashCommands";
 import { useSkillProposalStore } from "../../store/skillProposalStore";
 import { NativeSkillsManager } from "./NativeSkillsManager";
+import { RevisionHistoryPanel } from "./RevisionHistoryPanel";
+import { PROMPT_ENTRY_KIND } from "../../store/configRevisionStore";
 import { errorMessage } from "../../lib/errors";
 
 /** Same slash-trigger slug shape the design doc pins for `PromptEntry.command`. */
@@ -75,6 +78,9 @@ export function PromptLibraryPanel() {
   const exportPayload = usePromptStore((s) => s.exportPayload);
   const defaultPersonaId = usePromptStore((s) => s.defaultPersonaId);
   const setDefaultPersona = usePromptStore((s) => s.setDefaultPersona);
+  const conflict = usePromptStore((s) => s.conflict);
+  const reloadAfterConflict = usePromptStore((s) => s.reloadAfterConflict);
+  const overwriteAfterConflict = usePromptStore((s) => s.overwriteAfterConflict);
   const proposals = useSkillProposalStore((s) => s.proposals);
   const approveProposal = useSkillProposalStore((s) => s.approveProposal);
   const rejectProposal = useSkillProposalStore((s) => s.rejectProposal);
@@ -83,6 +89,7 @@ export function PromptLibraryPanel() {
   const [draft, setDraft] = useState<DraftState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirmingRemoveId, setConfirmingRemoveId] = useState<string | null>(null);
+  const [historyForId, setHistoryForId] = useState<string | null>(null);
 
   const [importError, setImportError] = useState<string | null>(null);
   const [importPreview, setImportPreview] = useState<PromptEntry[] | null>(null);
@@ -217,6 +224,24 @@ export function PromptLibraryPanel() {
   return (
     <div className="flex flex-col gap-3 py-2">
       <p className="text-xs text-muted">{t("PromptLibraryPanel.description")}</p>
+
+      {conflict && (
+        <div className="flex flex-col gap-2 rounded-lg border border-warning bg-warning-soft p-3">
+          <p className="text-xs text-warning">
+            This prompt library was changed somewhere else (another window, or the CLI) after you
+            loaded it, so your last save was refused rather than overwriting it. Your edits are
+            still here and still unsaved.
+          </p>
+          <div className="flex items-center justify-end gap-2">
+            <Button variant="ghost" size="sm" onClick={() => void reloadAfterConflict()}>
+              Discard mine, load theirs
+            </Button>
+            <Button variant="secondary" size="sm" onClick={() => void overwriteAfterConflict()}>
+              Keep mine, overwrite
+            </Button>
+          </div>
+        </div>
+      )}
 
       <NativeSkillsManager />
 
@@ -364,6 +389,14 @@ export function PromptLibraryPanel() {
                     <Pencil size={12} />
                     {t("PromptLibraryPanel.editButton")}
                   </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setHistoryForId((current) => (current === entry.id ? null : entry.id))}
+                  >
+                    <History size={12} />
+                    History
+                  </Button>
                   {confirmingRemoveId === entry.id ? (
                     <span className="flex items-center gap-1">
                       <Button variant="ghost" size="sm" onClick={() => setConfirmingRemoveId(null)}>
@@ -391,6 +424,25 @@ export function PromptLibraryPanel() {
               </div>
               {(entry.description || entry.content) && (
                 <p className="mt-1 truncate text-xs text-faint">{entry.description || firstLine(entry.content)}</p>
+              )}
+              {historyForId === entry.id && (
+                <div className="mt-2">
+                  <RevisionHistoryPanel
+                    kind={PROMPT_ENTRY_KIND}
+                    entityId={entry.id}
+                    title={entry.name}
+                    onClose={() => setHistoryForId(null)}
+                    onRestore={(content) => {
+                      const patch = parseEntrySnapshot(content);
+                      if (!patch) {
+                        setError("That revision isn't a prompt snapshot.");
+                        return;
+                      }
+                      updateEntry(entry.id, patch);
+                      setDraft((prev) => (prev?.id === entry.id ? null : prev));
+                    }}
+                  />
+                </div>
               )}
             </div>
           ))}
