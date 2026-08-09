@@ -29,9 +29,12 @@ The port is reserved by the app and handed over on the command line. Bind
 loopback only. Both stdout and stderr are drained by the app; the tail of them
 is what a user sees when a launch fails, so log the reason a start failed.
 
-The app runs one tool at a time and leaves it running between runs so a model is
-not reloaded per operation. It is killed on tool switch, on "Release memory",
-and on app exit.
+Up to three tools stay resident at once, and each is left running between runs so
+a model is not reloaded per operation — alternating two tools (swap a face, then
+upscale the result) is the normal way these get used. Past that the least
+recently used one is stopped, so the tool being worked with is never the one
+evicted. A tool is also killed when it is removed from the library, on "Release
+memory", and on app exit.
 
 ## `GET /tool/v1/manifest`
 
@@ -108,13 +111,47 @@ In Studio → Tools → **Add your own binary**, pick the script (make it execut
 first, or point at a wrapper that runs `node`). Its card appears, built entirely
 from the manifest above.
 
-## Getting a tool installed for real
+## Publishing a tool
 
-Tools published by this project install through the Runtime Hub's component
-path, unchanged: a registry entry of kind `studio_tool` is downloaded, checked
-against its declared SHA-256, versioned and made rollback-able before it is ever
-run. That is the **Verified** badge in the tools list.
+Tools install through the Runtime Hub's component path, unchanged: an entry of
+kind `studio_tool` is downloaded, checked against its declared SHA-256,
+versioned and made rollback-able before it is ever run. That is the **Verified**
+badge in the tools list.
+
+There is no catalog server to poll, so a catalog is a JSON file you hand out and
+the user imports with **Import a catalog** in Studio → Tools:
+
+```json
+[
+  {
+    "schemaVersion": 1,
+    "sourceId": "local",
+    "componentId": "face-swap",
+    "kind": "studio_tool",
+    "displayName": "Face Swap",
+    "accelerator": null,
+    "version": "1.2.0",
+    "channel": "stable",
+    "downloadUrl": "https://example.com/face-swap-1.2.0-macos-arm64",
+    "sha256": "<64 hex characters>",
+    "sizeBytes": 41231872,
+    "publishedAtMs": 1754000000000,
+    "compatibilityNote": null,
+    "metadata": {}
+  }
+]
+```
+
+`{ "entries": [...] }` is accepted too. `sizeBytes` must be exact — the hub
+checks it against the server's own `Content-Length` before downloading a byte,
+and the SHA-256 after.
+
+**Only `studio_tool` entries are imported.** That registry also feeds llama.cpp,
+MLX and accelerator components, so a file titled "tool catalog" must not be able
+to add or replace an inference runtime; entries of other kinds are dropped.
+Importing merges rather than replaces, so a second publisher's catalog does not
+discard the first's.
 
 A binary you point at yourself is labelled **Your own** and is not checked by
-anything — it is allowed for the same reason a weight file from your own disk is
-allowed, and it is labelled so the two are never confused.
+anything — allowed for the same reason a weight file from your own disk is
+allowed, and labelled so the two are never confused.

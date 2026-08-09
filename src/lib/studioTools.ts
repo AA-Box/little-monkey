@@ -146,5 +146,15 @@ export const toolsClient = {
       toolId,
       inputs,
     }),
-  stop: () => invoke<void>("studio_tool_stop"),
+  /** Tool ids holding memory right now. Several can be warm at once. */
+  running: () => invoke<string[]>("studio_tools_running"),
+  /** One tool, or every resident one when `toolId` is omitted. */
+  stop: (toolId?: string) => invoke<void>("studio_tool_stop", { toolId: toolId ?? null }),
+  /** Merges a published catalog's `studio_tool` entries into the component
+   *  registry, which is what puts them behind the one-click Install. */
+  importCatalog: (path: string) =>
+    invoke<import("./runtimeHubClient").M3ComponentCatalogEntry[]>(
+      "studio_tool_import_catalog",
+      { path },
+    ),
 };
