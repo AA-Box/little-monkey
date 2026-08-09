@@ -2992,13 +2992,47 @@ from `egress::send`.
   empty list: "reached nowhere" and "this build recorded nothing" are the same
   absence here, and an empty list on screen would claim the first.
 
-**Still missing: unattributed egress names no destinations.** Only the attributed
-case is recorded, which is the same split byte counting already makes — an
-unattributed byte has a reason to be charged to but no row to hang a destination
-list off, and `UNATTRIBUTED_EGRESS` is a fixed array of counters precisely so it
-never allocates per request. Upgrade path is a bounded global map behind the same
-cap, if "which hosts does the app itself reach outside a run" turns out to be a
-question anyone asks.
+**Shipped — unattributed egress now names its destinations.** This was the last
+split in the record: an unattributed byte had a *reason* to be charged to and no
+row to hang a destination list off, so "which hosts does the app itself reach
+outside a run" had no answer at all. It is answered by the upgrade path this entry
+named — a bounded global map behind the same cap — and it lands in the *same*
+table the attributed case writes to, because "which hosts did this app reach" is
+one question and splitting its answer by whether a run happened to be in scope
+would make every reader join twice to ask it.
+
+- **The vocabulary is the existing one, not a second one.** Rows are keyed by
+  `Unattributed::code()` — the same strings `UNATTRIBUTED_EGRESS`'s tallies
+  already carry — plus `egress.no-scope` and `egress.run-without-process`, the two
+  cases that enum does not cover. A test pins the two label lists as equal and in
+  the same order, so correlating "how much left under this reason" with "where it
+  went" is a match rather than a guess.
+- **The lock this entry worried about is real and is paid on the right path.**
+  Volume is counted per body *frame* — an SSE stream calls it thousands of times —
+  so `UNATTRIBUTED_EGRESS` stays a lock-free array of atomics. A destination is
+  noted once per *request*, beside a DNS lookup and a TLS handshake, and the map
+  is bounded at the same `MAX_DESTINATIONS` a process gets, so the critical
+  section is a probe over at most 128 entries. The split is deliberate: volume
+  stays lock-free, destinations pay a lock they can afford.
+- **Migration V19 relaxes rather than adds**, and is `Additive` on that basis:
+  `egress_destinations.process_id` becomes nullable beside a new
+  `unattributed_reason`, under a `CHECK` that exactly one is present — "neither"
+  is a destination charged to nothing, which is the failure this item is about,
+  and "both" is a row two readers would each count once. The primary key becomes a
+  unique index over `COALESCE`d attribution columns, because SQLite permits NULLs
+  in a non-`INTEGER` primary key and the old key would have silently stopped
+  deduplicating. A V18 binary reads exactly the attributed rows it always did.
+- **The overflow count gets its own small table** rather than a sentinel row,
+  which V14's own note rejects: the attributed count lives on `agent_processes`
+  because it is a property of that process, and an unattributed overflow has no
+  process. A reason that overflowed while naming nothing is still reported —
+  the case a reader would most easily mistake for "reached nowhere".
+- **It needs a drain of its own**, on a 30-second tick, because unattributed
+  traffic has no lifetime to ride: piggy-backing on a run's drain would mean an app
+  that only ever made unattributed requests — a `monkey` invocation, an update
+  check — wrote no destinations at all, which is the gap itself. Fail-soft with
+  return-on-failure like every other drain here, and a returned drain past the cap
+  becomes overflow rather than breaching it.
 
 **Blocks:** K17 — placing a run on a remote node is only safe if the run's
 egress travels with it.

@@ -94,7 +94,12 @@ pub struct PendingHostedOAuth {
     created_at: std::time::Instant,
 }
 
-fn emit_progress<R: Runtime>(app: &AppHandle<R>, server_id: &str, phase: &str, error: Option<String>) {
+fn emit_progress<R: Runtime>(
+    app: &AppHandle<R>,
+    server_id: &str,
+    phase: &str,
+    error: Option<String>,
+) {
     let _ = app.emit(
         "hosted-oauth://status",
         serde_json::json!({ "serverId": server_id, "phase": phase, "error": error }),
@@ -125,7 +130,9 @@ fn load_credentials(server_id: &str) -> Result<Option<StoredHostedCredentials>, 
             .map(Some)
             .map_err(|e| format!("Corrupt stored hosted-OAuth credentials: {e}")),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("Failed to read hosted-OAuth credentials from keychain: {e}")),
+        Err(e) => Err(format!(
+            "Failed to read hosted-OAuth credentials from keychain: {e}"
+        )),
     }
 }
 
@@ -280,7 +287,10 @@ async fn redeem_handoff(handoff: &str) -> Result<BackendTokenResponse, String> {
     Ok(body)
 }
 
-async fn refresh_via_backend(provider: &str, refresh_token: &str) -> Result<BackendTokenResponse, String> {
+async fn refresh_via_backend(
+    provider: &str,
+    refresh_token: &str,
+) -> Result<BackendTokenResponse, String> {
     let response = crate::egress::send(
         relay_client()?
             .post(format!("{BACKEND_BASE}/mcp/oauth/refresh"))
@@ -402,7 +412,11 @@ pub fn hosted_oauth_connect<R: Runtime>(
 /// just makes a later, now-unwanted deep-link callback a no-op and resets
 /// the UI's "waiting" state.
 #[tauri::command(rename_all = "snake_case")]
-pub fn hosted_oauth_cancel<R: Runtime>(app: AppHandle<R>, state: tauri::State<'_, AppState>, server_id: String) -> Result<(), String> {
+pub fn hosted_oauth_cancel<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    server_id: String,
+) -> Result<(), String> {
     let mut pending = state
         .hosted_oauth_pending
         .lock()
@@ -439,7 +453,8 @@ pub fn handle_deep_link_urls<R: Runtime>(app: &AppHandle<R>, urls: Vec<url::Url>
 }
 
 async fn handle_callback_url<R: Runtime>(app: &AppHandle<R>, url: &url::Url) {
-    let params: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    let params: std::collections::HashMap<String, String> =
+        url.query_pairs().into_owned().collect();
     let Some(csrf_state) = params.get("state").cloned() else {
         return;
     };

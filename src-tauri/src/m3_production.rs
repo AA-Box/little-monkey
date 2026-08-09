@@ -13,13 +13,14 @@ use crate::compatibility_hub::{
 use crate::context_cache::{classify_context_failure, ContextFailureInput};
 use crate::m3_commands::{M3CommandState, M3OwnedProcessShutdown};
 use crate::m3_runtime_hub::{
-    DefaultM3LanAccessFactory, HttpM3CatalogSource, M3AcceleratorCompatibility, M3AcceleratorStatus,
-    M3CanonicalStreamSink, M3CatalogSource, M3Clock, M3ComponentCatalogEntry, M3ComponentHub,
-    M3ComponentHubDependencies, M3ComponentSource, M3HardwareCompatibilityReport, M3HardwareProbe,
-    M3HubConfig, M3HubError, M3HubFuture, M3HubResult, M3InferenceEngine, M3InstalledModelView,
-    M3JetsonInfo, M3ModelCapabilities, M3OperationContext, M3RuntimeDriver, M3RuntimeHub,
-    M3RuntimeHubDependencies, M3RuntimeKind, M3RuntimeReconciler, M3RuntimeStatusView,
-    ReqwestM3DownloadTransport, RuntimeAdapterM3Driver, StaticM3ComponentSource, SystemM3Clock,
+    DefaultM3LanAccessFactory, HttpM3CatalogSource, M3AcceleratorCompatibility,
+    M3AcceleratorStatus, M3CanonicalStreamSink, M3CatalogSource, M3Clock, M3ComponentCatalogEntry,
+    M3ComponentHub, M3ComponentHubDependencies, M3ComponentSource, M3HardwareCompatibilityReport,
+    M3HardwareProbe, M3HubConfig, M3HubError, M3HubFuture, M3HubResult, M3InferenceEngine,
+    M3InstalledModelView, M3JetsonInfo, M3ModelCapabilities, M3OperationContext, M3RuntimeDriver,
+    M3RuntimeHub, M3RuntimeHubDependencies, M3RuntimeKind, M3RuntimeReconciler,
+    M3RuntimeStatusView, ReqwestM3DownloadTransport, RuntimeAdapterM3Driver,
+    StaticM3ComponentSource, SystemM3Clock,
 };
 // MLX is Metal-only, so the module and everything that assembles it are compiled
 // into the macOS build alone.
@@ -326,12 +327,12 @@ fn build_compatibility_report(snapshot: &HardwareSnapshot) -> M3HardwareCompatib
         }
     }
 
-    let cuda_available = accelerators
-        .iter()
-        .any(|entry| entry.kind == AcceleratorKind::Cuda && entry.status == M3AcceleratorStatus::Available);
-    let rocm_available = accelerators
-        .iter()
-        .any(|entry| entry.kind == AcceleratorKind::Rocm && entry.status == M3AcceleratorStatus::Available);
+    let cuda_available = accelerators.iter().any(|entry| {
+        entry.kind == AcceleratorKind::Cuda && entry.status == M3AcceleratorStatus::Available
+    });
+    let rocm_available = accelerators.iter().any(|entry| {
+        entry.kind == AcceleratorKind::Rocm && entry.status == M3AcceleratorStatus::Available
+    });
     if cuda_available && rocm_available {
         notes.push(
             "Both NVIDIA (CUDA) and AMD (ROCm) GPUs were detected. Little Monkey selects one runtime per model; mixed-vendor acceleration within a single model load is not supported."
@@ -547,7 +548,8 @@ fn cuda_compatibility(os: &str) -> M3AcceleratorCompatibility {
                     .min_compute_capability
                     .as_deref()
                     .and_then(|value| value.parse::<f64>().ok());
-                let driver_too_old = driver_major.is_some_and(|major| major < MIN_CUDA_DRIVER_MAJOR);
+                let driver_too_old =
+                    driver_major.is_some_and(|major| major < MIN_CUDA_DRIVER_MAJOR);
                 let compute_too_old =
                     compute_cap_value.is_some_and(|value| value < MIN_CUDA_COMPUTE_CAPABILITY);
                 if driver_too_old || compute_too_old {
@@ -751,20 +753,25 @@ fn vulkan_compatibility(os: &str) -> M3AcceleratorCompatibility {
             Some(devices) => {
                 let device_names = devices.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
                 let driver_version = devices.first().and_then(|d| d.driver_version.clone());
-                let has_discrete = devices
-                    .iter()
-                    .any(|d| d.device_type.as_deref().is_some_and(|t| t.contains("DISCRETE")));
-                let has_integrated = devices
-                    .iter()
-                    .any(|d| d.device_type.as_deref().is_some_and(|t| t.contains("INTEGRATED")));
+                let has_discrete = devices.iter().any(|d| {
+                    d.device_type
+                        .as_deref()
+                        .is_some_and(|t| t.contains("DISCRETE"))
+                });
+                let has_integrated = devices.iter().any(|d| {
+                    d.device_type
+                        .as_deref()
+                        .is_some_and(|t| t.contains("INTEGRATED"))
+                });
                 let mut summary = format!(
                     "Vulkan is available ({} device{}).",
                     devices.len(),
                     if devices.len() == 1 { "" } else { "s" }
                 );
                 if has_discrete && has_integrated {
-                    summary
-                        .push_str(" Both an integrated and a discrete GPU were reported (hybrid graphics).");
+                    summary.push_str(
+                        " Both an integrated and a discrete GPU were reported (hybrid graphics).",
+                    );
                 }
                 M3AcceleratorCompatibility {
                     kind: AcceleratorKind::Vulkan,
@@ -1250,9 +1257,7 @@ pub fn component_registry_entries(root: &Path) -> M3HubResult<Vec<M3ComponentCat
 /// reads `source_id`: identity is `component_id`, and a version is keyed on
 /// version/digest/URL. The digest and the publisher-key check that actually
 /// establish trust are untouched.
-fn adopt_into_registry(
-    entries: Vec<M3ComponentCatalogEntry>,
-) -> Vec<M3ComponentCatalogEntry> {
+fn adopt_into_registry(entries: Vec<M3ComponentCatalogEntry>) -> Vec<M3ComponentCatalogEntry> {
     entries
         .into_iter()
         .map(|mut entry| {
@@ -3917,8 +3922,9 @@ pub fn install_mlx_package(
     // Derived the same way `build_m3_command_state` derives it, so an install
     // lands in the tree the running driver reads rather than beside it.
     let installer = production_mlx_installer(&app_data_dir.join(M3_DIRECTORY))?;
-    let bundle = mlx_runtime::read_package_directory(package_directory, &MlxInstallLimits::default())
-        .map_err(|error| M3HubError::Runtime(error.to_string()))?;
+    let bundle =
+        mlx_runtime::read_package_directory(package_directory, &MlxInstallLimits::default())
+            .map_err(|error| M3HubError::Runtime(error.to_string()))?;
     let installed = installer
         .install_and_activate(&bundle, &host)
         .map_err(|error| M3HubError::Runtime(error.to_string()))?;
@@ -4148,7 +4154,9 @@ pub fn build_quantization_command_state(
     backends.push(Arc::new(crate::quantization::PassthroughGgufRequantize));
 
     let workbench = crate::quantization::QuantizationWorkbench::new(root, backends);
-    Ok(crate::m3_commands::M3QuantizationCommandState::new(workbench))
+    Ok(crate::m3_commands::M3QuantizationCommandState::new(
+        workbench,
+    ))
 }
 
 #[cfg(test)]
@@ -4909,12 +4917,16 @@ GPU1:
         )
         .expect("fixture parses");
         assert_eq!(devices.len(), 2);
-        let has_discrete = devices
-            .iter()
-            .any(|d| d.device_type.as_deref().is_some_and(|t| t.contains("DISCRETE")));
-        let has_integrated = devices
-            .iter()
-            .any(|d| d.device_type.as_deref().is_some_and(|t| t.contains("INTEGRATED")));
+        let has_discrete = devices.iter().any(|d| {
+            d.device_type
+                .as_deref()
+                .is_some_and(|t| t.contains("DISCRETE"))
+        });
+        let has_integrated = devices.iter().any(|d| {
+            d.device_type
+                .as_deref()
+                .is_some_and(|t| t.contains("INTEGRATED"))
+        });
         assert!(has_discrete && has_integrated);
     }
 
@@ -4938,7 +4950,10 @@ GPU1:
         let names = parse_windows_video_controllers(
             "Intel(R) UHD Graphics 630\nNVIDIA GeForce RTX 3070\n\n",
         );
-        assert_eq!(names, ["Intel(R) UHD Graphics 630", "NVIDIA GeForce RTX 3070"]);
+        assert_eq!(
+            names,
+            ["Intel(R) UHD Graphics 630", "NVIDIA GeForce RTX 3070"]
+        );
         assert!(parse_windows_video_controllers("").is_empty());
     }
 
@@ -5211,7 +5226,10 @@ GPU1:
         // existing non-vision fixture/driver is unaffected.
         let text_only = request("req-text", "text-model", false);
         let text_body = openai_request_body(&text_only, false).expect("compose text request");
-        assert_eq!(text_body["messages"][0]["content"], Value::String("hello".to_string()));
+        assert_eq!(
+            text_body["messages"][0]["content"],
+            Value::String("hello".to_string())
+        );
     }
 
     /// K11's read-only prefix sharing is the runtime's, and this app gets it by
@@ -5271,9 +5289,13 @@ GPU1:
                 },
             ],
         };
-        let mlx_message = crate::m3_runtime_hub::canonical_message_to_mlx(&message).expect("flatten");
+        let mlx_message =
+            crate::m3_runtime_hub::canonical_message_to_mlx(&message).expect("flatten");
         assert_eq!(mlx_message.text, "what is this?");
-        assert_eq!(mlx_message.images, vec!["data:image/jpeg;base64,Zm9v".to_string()]);
+        assert_eq!(
+            mlx_message.images,
+            vec!["data:image/jpeg;base64,Zm9v".to_string()]
+        );
     }
 
     // ------------------------------------------------------------------
@@ -5915,11 +5937,8 @@ GPU1:
 
         // The exact rejection this fixes: a foreign source id, unchanged.
         assert!(
-            StaticM3ComponentSource::new(
-                COMPONENT_REGISTRY_SOURCE_ID,
-                vec![published.clone()]
-            )
-            .is_err(),
+            StaticM3ComponentSource::new(COMPONENT_REGISTRY_SOURCE_ID, vec![published.clone()])
+                .is_err(),
             "the foreign source id must still be what the source constructor refuses"
         );
 

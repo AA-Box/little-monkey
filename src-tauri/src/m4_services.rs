@@ -19,11 +19,11 @@ use uuid::Uuid;
 use crate::mcp_app_core::{
     authorize_ui_bridge_action, begin_oauth, build_ui_host_plan, complete_oauth,
     prepare_ui_bridge_action, refresh_oauth, revoke_oauth, route_tools, verify_ui_resource_bytes,
-    AuthorizedBridgeAction, BridgeCapability, McpCoreError,
-    McpToolDescriptor, McpUiHostPlan, McpUiManifest, OAuthAuthorizationPlan, OAuthCallback,
-    OAuthClientConfig, OAuthFlowStore, OAuthSecretVault, OAuthSecurityProvider,
-    OAuthServerMetadata, OAuthTokenMetadata, OAuthTransport, PreparedBridgeAction, RoutedTool,
-    ToolRouterModel, ToolRoutingPolicy, UiActionApprovalGate, UiBridgeRequest,
+    AuthorizedBridgeAction, BridgeCapability, McpCoreError, McpToolDescriptor, McpUiHostPlan,
+    McpUiManifest, OAuthAuthorizationPlan, OAuthCallback, OAuthClientConfig, OAuthFlowStore,
+    OAuthSecretVault, OAuthSecurityProvider, OAuthServerMetadata, OAuthTokenMetadata,
+    OAuthTransport, PreparedBridgeAction, RoutedTool, ToolRouterModel, ToolRoutingPolicy,
+    UiActionApprovalGate, UiBridgeRequest,
 };
 use crate::package_ecosystem::{
     install_preview, resolve_install, signed_first_party_catalog, skill_command, verify_package,
@@ -674,9 +674,11 @@ impl PackageRegistryService {
             self.verifier.as_ref(),
             now_unix_ms,
         ) {
-            Ok(verified) => Ok(self
-                .store
-                .record_registry_verification(source_id, Some(verified), None)?),
+            Ok(verified) => {
+                Ok(self
+                    .store
+                    .record_registry_verification(source_id, Some(verified), None)?)
+            }
             Err(error) => Ok(self.store.record_registry_verification(
                 source_id,
                 None,
@@ -1909,16 +1911,12 @@ fn workflow_run_projection(history: &WorkflowRunHistory) -> Option<ProcessProjec
         ),
     };
 
-    let mut projection = ProcessProjection::new(
-        ProcessKind::WorkflowRun,
-        history.run_id.clone(),
-        state,
-    );
+    let mut projection =
+        ProcessProjection::new(ProcessKind::WorkflowRun, history.run_id.clone(), state);
     projection.native_pid = hosting_pid(state);
     projection.exit = exit;
     Some(projection)
 }
-
 
 /// A node instance's globally unique surface id.
 ///
@@ -2298,13 +2296,11 @@ impl WorkflowService {
                 cancellation: cancel.clone(),
             },
         );
-        let result = HeadlessWorkflowExecutor::new(
-            self.node_executor.as_ref(),
-            self.clock.as_ref(),
-        )
-        .with_signal_source(self.signal_source.as_deref())
-        .with_process_projector(self.process_projector.as_deref())
-        .replay(&ir, request.clone(), &source, &plan, &cancel);
+        let result =
+            HeadlessWorkflowExecutor::new(self.node_executor.as_ref(), self.clock.as_ref())
+                .with_signal_source(self.signal_source.as_deref())
+                .with_process_projector(self.process_projector.as_deref())
+                .replay(&ir, request.clone(), &source, &plan, &cancel);
         lock(&self.cancellations, "workflow cancellations")?.remove(&request.run_id);
         let history = result?;
         self.append_history(&history)?;
@@ -2439,13 +2435,11 @@ impl WorkflowService {
                 cancellation: cancel.clone(),
             },
         );
-        let result = HeadlessWorkflowExecutor::new(
-            self.node_executor.as_ref(),
-            self.clock.as_ref(),
-        )
-        .with_signal_source(self.signal_source.as_deref())
-        .with_process_projector(self.process_projector.as_deref())
-        .run(&ir, request.clone(), &cancel);
+        let result =
+            HeadlessWorkflowExecutor::new(self.node_executor.as_ref(), self.clock.as_ref())
+                .with_signal_source(self.signal_source.as_deref())
+                .with_process_projector(self.process_projector.as_deref())
+                .run(&ir, request.clone(), &cancel);
         lock(&self.cancellations, "workflow cancellations")?.remove(&request.run_id);
         let history = match result {
             Ok(history) => history,
@@ -2770,7 +2764,6 @@ fn sync_directory(path: &Path) -> Result<(), M4ServiceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process_table::SignalIntent;
     use crate::mcp_app_core::{
         DeclaredHostAction, HostActionKind, OAuthCodeExchangeRequest, OAuthRefreshRequest,
         OAuthTokenSet, PkceMaterial, SecretMaterial, SecretReference,
@@ -2780,6 +2773,7 @@ mod tests {
         VersionConstraint, AGENT_CONTRACT_VERSION, FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS,
         PACKAGE_STATE_VERSION,
     };
+    use crate::process_table::SignalIntent;
     use crate::workflow_core::{
         workflow_core_fixture_capabilities, workflow_core_fixtures, NodeAdapterResult,
         NodeExecutionRequest, ResourceUsage, WorkflowNodeKind, WorkflowRunStatus, WorkflowValue,
@@ -4098,8 +4092,8 @@ mod tests {
     fn with_signal_source_threads_through_the_service_into_the_executor() {
         let directory = TempDirectory::new("workflow-signal-source");
         let signal_source = Arc::new(RecordingSignalSource::default());
-        let service =
-            workflow_service(&directory.0, None, BTreeSet::new()).with_signal_source(signal_source.clone());
+        let service = workflow_service(&directory.0, None, BTreeSet::new())
+            .with_signal_source(signal_source.clone());
 
         let definition = workflow_core_fixtures()
             .into_iter()

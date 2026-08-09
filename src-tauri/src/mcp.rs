@@ -50,10 +50,10 @@ use rmcp::model::{
 use rmcp::service::{PeerRequestOptions, RunningService, ServiceError};
 use rmcp::transport::streamable_http_client::StreamableHttpError;
 use rmcp::RoleClient;
-use tauri::{Emitter};
+use tauri::Emitter;
 
-use crate::{permissions, AppState};
 use crate::profiles::ProfileScopedPaths;
+use crate::{permissions, AppState};
 
 /// Filename for the persisted server list under the app data directory.
 const CONFIG_FILE: &str = "mcp_servers.json";

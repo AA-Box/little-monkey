@@ -48,6 +48,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::profiles::ProfileScopedPaths;
 use crate::run_protocol::{
     ArtifactKind, CapabilityAssessment, CapabilityState, CheckpointKind, ClientIdentity,
     ModelCapabilitiesSnapshot, ModelTargetSnapshot, MutationKind, PermissionMode,
@@ -55,7 +56,6 @@ use crate::run_protocol::{
     ToolPolicyDecision, UsageSnapshot, WorkspaceContext, RUN_PROTOCOL_SCHEMA_VERSION,
 };
 use crate::{permissions, workspace, AppState};
-use crate::profiles::ProfileScopedPaths;
 
 const SANDBOX_RUNS_DIR: &str = "sandbox-runs";
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
@@ -592,7 +592,9 @@ fn confirmation_phrase_for(digest: &str) -> String {
 /// True for directory names that are never worth copying wholesale into the
 /// ephemeral sandbox (see [`SKIP_DIR_NAMES`]).
 fn is_skippable_dir_name(name: &str) -> bool {
-    SKIP_DIR_NAMES.iter().any(|skip| skip.eq_ignore_ascii_case(name))
+    SKIP_DIR_NAMES
+        .iter()
+        .any(|skip| skip.eq_ignore_ascii_case(name))
 }
 
 /// True for files whose content is secret-shaped (currently: `.env*`, via
@@ -1082,8 +1084,9 @@ pub async fn execute_in_sandbox(
         // and says so, rather than failing the run or overstating it.
         // A fresh name per run, so two concurrent sandboxed runs never share a
         // container and one finishing never deletes the other's profile.
-        let container =
-            crate::sandbox_windows::create_app_container(&uuid::Uuid::new_v4().simple().to_string());
+        let container = crate::sandbox_windows::create_app_container(
+            &uuid::Uuid::new_v4().simple().to_string(),
+        );
         let container = match container {
             Ok(container) => {
                 // The single grant that makes the sandbox copy reachable. Fatal:
@@ -1342,7 +1345,10 @@ fn require_sandboxed_run(
     Ok(run)
 }
 
-fn expect_matching_root(run: &crate::run_ledger::StoredRun, current_root: &Path) -> Result<(), String> {
+fn expect_matching_root(
+    run: &crate::run_ledger::StoredRun,
+    current_root: &Path,
+) -> Result<(), String> {
     let recorded = run
         .spec
         .workspace
@@ -1351,9 +1357,7 @@ fn expect_matching_root(run: &crate::run_ledger::StoredRun, current_root: &Path)
         .map(|root| root.canonical_path.as_str())
         .ok_or_else(|| "Sandboxed run has no recorded workspace root".to_string())?;
     if recorded != current_root.to_string_lossy() {
-        return Err(
-            "The primary workspace has changed since this sandbox run started".to_string(),
-        );
+        return Err("The primary workspace has changed since this sandbox run started".to_string());
     }
     Ok(())
 }
@@ -1386,7 +1390,10 @@ fn compute_promote_digest(run_id: &str, files: &[PromoteFileEntry]) -> String {
     sorted.sort_by(|a, b| a.path.cmp(&b.path));
     let mut buffer = format!("run:{run_id}\n");
     for file in &sorted {
-        buffer.push_str(&format!("{}:{}:{}\n", file.path, file.sha256, file.size_bytes));
+        buffer.push_str(&format!(
+            "{}:{}:{}\n",
+            file.path, file.sha256, file.size_bytes
+        ));
     }
     sha256_hex_bytes(buffer.as_bytes())
 }
@@ -1421,9 +1428,7 @@ pub fn build_promote_preview(
         }
         let absolute = sandbox_workspace_dir.join(&relative);
         if !absolute.is_file() {
-            return Err(format!(
-                "'{normalized}' was not found in the sandbox copy"
-            ));
+            return Err(format!("'{normalized}' was not found in the sandbox copy"));
         }
         let (sha256, size_bytes) = hash_file(&absolute).map_err(|error| {
             format!("Failed to read '{normalized}' from the sandbox copy: {error}")
@@ -1501,7 +1506,10 @@ fn verify_unchanged_since_preview(
 
 fn atomic_write(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = dest.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent directory")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination has no parent directory",
+        )
     })?;
     fs::create_dir_all(parent)?;
     let file_name = dest
@@ -1532,7 +1540,10 @@ pub fn promote_files(
         let relative = validate_relative_promote_path(&file.path)?;
         let source = sandbox_workspace_dir.join(&relative);
         let bytes = fs::read(&source).map_err(|error| {
-            format!("Failed to read '{}' from the sandbox copy: {error}", file.path)
+            format!(
+                "Failed to read '{}' from the sandbox copy: {error}",
+                file.path
+            )
         })?;
         if sha256_hex_bytes(&bytes) != file.sha256 {
             return Err(format!(
@@ -1652,8 +1663,12 @@ async fn run_sandboxed_body(
     .map_err(|error| format!("Failed to execute the sandboxed command: {error}"))?;
 
     let store = crate::artifact_commands::store_for(app, state)?;
-    let stdout_blob = store.put(&outcome.stdout).map_err(|error| error.to_string())?;
-    let stderr_blob = store.put(&outcome.stderr).map_err(|error| error.to_string())?;
+    let stdout_blob = store
+        .put(&outcome.stdout)
+        .map_err(|error| error.to_string())?;
+    let stderr_blob = store
+        .put(&outcome.stderr)
+        .map_err(|error| error.to_string())?;
 
     crate::run_commands::append_event_as(
         app,
@@ -1718,8 +1733,14 @@ async fn run_sandboxed_body(
         duration_ms: outcome.duration_ms,
         stdout_artifact_id: stdout_blob.id,
         stderr_artifact_id: stderr_blob.id,
-        stdout_excerpt: bounded(&String::from_utf8_lossy(&outcome.stdout), MAX_EVENT_TEXT_EXCERPT),
-        stderr_excerpt: bounded(&String::from_utf8_lossy(&outcome.stderr), MAX_EVENT_TEXT_EXCERPT),
+        stdout_excerpt: bounded(
+            &String::from_utf8_lossy(&outcome.stdout),
+            MAX_EVENT_TEXT_EXCERPT,
+        ),
+        stderr_excerpt: bounded(
+            &String::from_utf8_lossy(&outcome.stderr),
+            MAX_EVENT_TEXT_EXCERPT,
+        ),
         files_copied: stats.files_copied,
     })
 }
@@ -1876,7 +1897,8 @@ pub fn sandbox_prepare_promote(
     expect_matching_root(&run, &root)?;
     let workspace_dir = sandbox_run_dir(&app, &run_id)?.join("workspace");
     let now = crate::run_commands::unix_time_ms()?;
-    let preview = build_promote_preview(&run_id, &workspace_dir, &files, now, PROMOTE_PREVIEW_TTL_MS)?;
+    let preview =
+        build_promote_preview(&run_id, &workspace_dir, &files, now, PROMOTE_PREVIEW_TTL_MS)?;
 
     {
         let mut guard = state
@@ -1990,7 +2012,11 @@ pub fn sandbox_execute_promote(
         None,
         RunEvent::Completed {
             summary: Some(bounded(
-                &format!("Promoted {} file(s): {}", promoted.len(), promoted.join(", ")),
+                &format!(
+                    "Promoted {} file(s): {}",
+                    promoted.len(),
+                    promoted.join(", ")
+                ),
                 MAX_EVENT_TEXT_EXCERPT,
             )),
             result_artifact_ids: Vec::new(),
@@ -2230,7 +2256,10 @@ mod tests {
         let dest = temp_dir("copy-dest");
 
         write(&root.join(".git/HEAD"), "ref: refs/heads/main");
-        write(&root.join("node_modules/pkg/index.js"), "module.exports = {};");
+        write(
+            &root.join("node_modules/pkg/index.js"),
+            "module.exports = {};",
+        );
         write(&root.join("target/debug/app"), "binary");
         write(&root.join(".env"), "API_KEY=super-secret");
         write(&root.join("src/main.rs"), "fn main() {}");
@@ -2239,10 +2268,16 @@ mod tests {
         let stats = copy_workspace_into_sandbox(&root, &dest).expect("copy succeeds");
 
         assert!(!dest.join(".git").exists(), ".git must never be copied");
-        assert!(!dest.join("node_modules").exists(), "node_modules must never be copied");
+        assert!(
+            !dest.join("node_modules").exists(),
+            "node_modules must never be copied"
+        );
         assert!(!dest.join("target").exists(), "target must never be copied");
         assert!(!dest.join(".env").exists(), "secrets must never be copied");
-        assert!(dest.join("src/main.rs").is_file(), "ordinary source files must be copied");
+        assert!(
+            dest.join("src/main.rs").is_file(),
+            "ordinary source files must be copied"
+        );
         assert!(
             dest.join("package.json").is_file(),
             "manifests must still be copied so the sandbox copy can actually build/test"
@@ -2549,7 +2584,10 @@ mod tests {
              successfully when network is allowed; stderr={}",
             String::from_utf8_lossy(&denied.stderr)
         );
-        assert!(!denied.timed_out, "the denied connection hung instead of failing");
+        assert!(
+            !denied.timed_out,
+            "the denied connection hung instead of failing"
+        );
 
         drop(accepting);
         let _ = fs::remove_dir_all(&sandbox_root);
@@ -3158,17 +3196,34 @@ mod tests {
     #[test]
     fn promote_digest_changes_with_content_and_is_order_independent() {
         let a = vec![
-            PromoteFileEntry { path: "a.txt".into(), sha256: "1".repeat(64), size_bytes: 1 },
-            PromoteFileEntry { path: "b.txt".into(), sha256: "2".repeat(64), size_bytes: 2 },
+            PromoteFileEntry {
+                path: "a.txt".into(),
+                sha256: "1".repeat(64),
+                size_bytes: 1,
+            },
+            PromoteFileEntry {
+                path: "b.txt".into(),
+                sha256: "2".repeat(64),
+                size_bytes: 2,
+            },
         ];
         let shuffled = vec![a[1].clone(), a[0].clone()];
-        assert_eq!(compute_promote_digest("run-1", &a), compute_promote_digest("run-1", &shuffled));
+        assert_eq!(
+            compute_promote_digest("run-1", &a),
+            compute_promote_digest("run-1", &shuffled)
+        );
 
         let mut changed = a.clone();
         changed[0].sha256 = "3".repeat(64);
-        assert_ne!(compute_promote_digest("run-1", &a), compute_promote_digest("run-1", &changed));
+        assert_ne!(
+            compute_promote_digest("run-1", &a),
+            compute_promote_digest("run-1", &changed)
+        );
 
-        assert_ne!(compute_promote_digest("run-1", &a), compute_promote_digest("run-2", &a));
+        assert_ne!(
+            compute_promote_digest("run-1", &a),
+            compute_promote_digest("run-2", &a)
+        );
     }
 
     #[test]
@@ -3176,7 +3231,8 @@ mod tests {
         let dir = temp_dir("preview-src");
         write(&dir.join("kept.txt"), "hello");
 
-        let traversal = build_promote_preview("run-1", &dir, &["../escape.txt".to_string()], 0, 1_000);
+        let traversal =
+            build_promote_preview("run-1", &dir, &["../escape.txt".to_string()], 0, 1_000);
         assert!(traversal.is_err());
 
         let missing = build_promote_preview("run-1", &dir, &["missing.txt".to_string()], 0, 1_000);
@@ -3195,7 +3251,11 @@ mod tests {
     fn validate_promote_confirmation_rejects_wrong_phrase_without_touching_anything() {
         let pending = PendingPromote {
             run_id: "run-1".to_string(),
-            files: vec![PromoteFileEntry { path: "a.txt".into(), sha256: "a".repeat(64), size_bytes: 1 }],
+            files: vec![PromoteFileEntry {
+                path: "a.txt".into(),
+                sha256: "a".repeat(64),
+                size_bytes: 1,
+            }],
             expires_at_ms: now_ms() + 60_000,
         };
         let digest = compute_promote_digest("run-1", &pending.files);
@@ -3219,7 +3279,10 @@ mod tests {
         assert!(wrong_run.is_err());
 
         let expired = validate_promote_confirmation(
-            Some(&PendingPromote { expires_at_ms: 0, ..pending.clone() }),
+            Some(&PendingPromote {
+                expires_at_ms: 0,
+                ..pending.clone()
+            }),
             "run-1",
             &digest,
             &confirmation_phrase_for(&digest),
@@ -3227,7 +3290,13 @@ mod tests {
         );
         assert!(expired.is_err());
 
-        let missing = validate_promote_confirmation(None, "run-1", &digest, &confirmation_phrase_for(&digest), now_ms());
+        let missing = validate_promote_confirmation(
+            None,
+            "run-1",
+            &digest,
+            &confirmation_phrase_for(&digest),
+            now_ms(),
+        );
         assert!(missing.is_err());
 
         let ok = validate_promote_confirmation(

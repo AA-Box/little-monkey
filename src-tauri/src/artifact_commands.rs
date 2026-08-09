@@ -11,8 +11,8 @@ use base64::Engine;
 use serde::Serialize;
 
 use crate::artifact_store::{ArtifactBlob, ArtifactStore};
-use crate::AppState;
 use crate::profiles::ProfileScopedPaths;
+use crate::AppState;
 
 const STORE_DIRECTORY: &str = "content-v1";
 

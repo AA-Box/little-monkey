@@ -878,7 +878,9 @@ impl WorkflowHumanApprovalBroker for InMemoryWorkflowApprovalBroker {
         let now = system_now_unix_ms();
         let mut records = lock(&self.records, "workflow approval broker")?;
         Self::purge_expired(&mut records, now);
-        Ok(records.get(challenge_id).map(|record| record.challenge.clone()))
+        Ok(records
+            .get(challenge_id)
+            .map(|record| record.challenge.clone()))
     }
 
     fn decide(&self, challenge_id: &str, approved: bool) -> Result<(), String> {

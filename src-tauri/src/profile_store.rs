@@ -16,9 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use rusqlite::{
-    params, params_from_iter,
-    types::Value as SqlValue,
-    OptionalExtension, Transaction, TransactionBehavior,
+    params, params_from_iter, types::Value as SqlValue, OptionalExtension, Transaction,
+    TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -680,23 +679,23 @@ fn global_search_impl(
 
     let mut statement = ledger.connection().prepare(&sql)?;
     let rows = statement.query_map(params_from_iter(values.iter()), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, Option<String>>(11)?,
-                row.get::<_, i64>(12)?,
-                row.get::<_, f64>(13)?,
-            ))
-        })?;
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+            row.get::<_, i64>(12)?,
+            row.get::<_, f64>(13)?,
+        ))
+    })?;
 
     let mut hits = Vec::new();
     for row in rows {
@@ -3425,8 +3424,7 @@ mod tests {
         assert!(component_prefix_is_not_a_grant.is_empty());
 
         let no_attached_roots =
-            global_search_with_artifacts_scoped(&mut ledger, &artifacts, &request, &[])
-                .unwrap();
+            global_search_with_artifacts_scoped(&mut ledger, &artifacts, &request, &[]).unwrap();
         assert!(no_attached_roots.is_empty());
 
         let explicitly_detached = global_search_with_artifacts_scoped(
@@ -3617,7 +3615,11 @@ mod tests {
         // budget across unrelated PRs' CI runs) — widen the budget under CI
         // rather than chase a threshold no shared runner can hit reliably,
         // while keeping the tight local budget as the real regression signal.
-        let budget_ms = if std::env::var_os("CI").is_some() { 400 } else { 200 };
+        let budget_ms = if std::env::var_os("CI").is_some() {
+            400
+        } else {
+            200
+        };
         assert!(
             p95 < Duration::from_millis(budget_ms),
             "10k search p95 exceeded {budget_ms} ms: {p95:?}"
