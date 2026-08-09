@@ -4504,7 +4504,7 @@ against independently.
 
 *Maps to: ROADMAP #7.*
 
-## K16. Driver coverage completion
+## K16. Driver coverage completion *(built; harness route owed)*
 
 **Today:** real detection of Metal, CUDA, ROCm, Vulkan, and best-effort
 DirectML, with per-backend `available` / `not_detected` / `driver_too_old` /
@@ -4517,7 +4517,53 @@ executes on it (with a passing compatibility-harness route) or a stated
 reason it is detection-only. Apple Neural Engine and Windows DirectML each
 resolve to one of those two states rather than remaining ambiguous.
 
-## K17. Remote node as a scheduled device
+**Shipped — the gap this entry's own "Today" line named is now a typed field.**
+
+That line said "detection is ahead of use — a detected backend is not always a
+usable execution target", and **nothing in the code encoded it**. The nearest
+candidates each meant something else: `AcceleratorCapability.available` means
+"detected and reporting itself usable" and the planner read it as permission;
+`M3AcceleratorCompatibility.confirmed` means "obtained by direct query rather
+than inferred", which is a fact about the *probe*. Neither is a fact about
+*this build*, and that is the one a user needs.
+
+- **`ExecutionSupport` is a tagged union**, so a caller cannot read "it executes"
+  without also reading *what* executes on it, nor "it does not" without a reason
+  to show. `execution_support(kind)` is exhaustive over the enum: a seventh
+  backend cannot be added without answering the question for it, and a test
+  asserts neither arm is ever empty.
+- **Three of the six do not execute, and each says why differently.** ROCm has no
+  bundled archive. DirectML has no runtime targeting it, and Windows device
+  enumeration can confirm a display adapter but not a working DirectML path.
+  Vulkan is the one that reads "yes" if you skim: the bundled `sd-server`
+  genuinely uses it — **for image and video** — while no chat or embedding
+  runtime targets it and it never enters the snapshot the planner reads, so a
+  model can never be placed there.
+- **CUDA executes, with the qualification in the same breath**: no bundled
+  archive is compiled for it, so it runs on a binary the user supplied.
+- **The Neural Engine is a variant that is never detected**, and that is the
+  point. "Absent from the enum" was the third state — the ambiguous one this
+  entry asked to remove. It is now on the report with the honest answer: the
+  GGUF runtimes have no ANE backend, and reaching it would mean shipping a Core
+  ML engine rather than configuring an existing one.
+- **The Driver Doctor gained a column**, not a footnote. "Detected" and "this app
+  can use it" are different facts, and three of six are the first without being
+  the second, so folding it into the status pill would have hidden exactly the
+  case that needs explaining. The reason renders beside the summary, because the
+  summary describes the *hardware* and cannot give it.
+- **The row's field is derived from its own `kind`**, asserted by a test, so the
+  two report builders cannot drift — which is not hypothetical: the existing
+  cross-builder test caught the second list when only the first had grown.
+
+**Remaining: the acceptance's parenthetical, "with a passing
+compatibility-harness route".** The harness mocks at the runtime-driver boundary
+and never spawns a process, and its `ApiBackend` is an API family
+(`ManagedLocal`/`Ollama`/`Mlx`/`CloudProvider`) rather than a hardware
+accelerator — there is no accelerator-keyed route anywhere. Proving execution
+*per backend* means running real work on real hardware, which is a per-machine
+claim this repo's CI cannot make for any backend but its own.
+
+## K17. Remote node as a scheduled device *(scoped; not started)*
 
 **Today:** a paired user-owned runner over direct/Tailscale/SSH-forwarded
 HTTPS with pinned TLS, scoped credentials, rotation/revocation, replay
@@ -4532,9 +4578,125 @@ assumed; and a node going away is a process-level failure with a defined
 restart policy (K2), not a lost run. No relay, consistent with the existing
 non-goal — placement is between machines the user owns.
 
+**Scoped, not started.** Five slices, in dependency order, each shipping
+something on its own. Written down because this is the first entry in the
+roadmap that is a subsystem rather than a task, and starting it from the
+acceptance downward is how it becomes a six-week branch.
+
+### The inversion this rests on, and it is the first decision
+
+What exists is a **remote-control plane for one runner**: the node is the
+server, the paired device is a *controller*, and the direction of authority
+runs controller → runner. Every route reflects it — approve, cancel, pause,
+resume, kill, a chat prompt, a capture, and a workflow launch that takes only
+an id the node already holds. **No route accepts a `RunSpec`, a policy, or a
+budget.** The run is authored on the node, not shipped to it.
+
+K17 needs the other direction: a scheduler holding a list of nodes it can place
+work on. That is not an extension of the control plane, it is a second plane
+beside it, and the two share only the transport (pinned TLS, signed +
+replay-proof requests, scoped capabilities, rotation/revocation) — which is the
+part already built and worth reusing untouched.
+
+**A naming trap to note before anyone greps for groundwork:** `admission.rs`'s
+`Placement` / `placement()` mean *RAM-vs-VRAM placement of model layers on the
+local box*, not machine selection. And `Reservation::Remote` is an accounting
+exemption for provider HTTP, not a node. Neither is K17 groundwork.
+
+### S1 — Node identity and capability advertisement
+
+A node can describe itself: its `HardwareSnapshot`, its runtimes, which models
+are resident, and a data-residency label the operator sets. A `nodes` table on
+the asking side; a signed read route on the answering side. `HardwareSnapshot`
+appears **zero times** under `remote/` today.
+
+*Ships alone:* Run Center can show what each paired node actually is, which is
+useful before any placement exists.
+
+### S2 — Submit a run to a node
+
+A route that accepts a frozen `RunSpec` — carrying its
+`PermissionPolicySnapshot` and `RunBudgets` — instead of a workflow id. This is
+where policy travel starts, and both types are already `Serialize` with
+`deny_unknown_fields`, so the wire shape is not the work; the receiving,
+validating and *owning* of a foreign spec is.
+
+*Ships alone:* an operator can start real work on a node, which today they
+cannot.
+
+### S3 — The node enforces what it received
+
+**Not optional, and not a slice that may be deferred behind S2.** A policy that
+travels and is not enforced is worse than one that never travelled: it reads as
+a guarantee. `egress.rs`'s `RunEgressPolicy` is a process-global `OnceLock`
+source that resolves a run id against the **local** ledger, so a foreign run's
+policy has to be installed locally *before* the run starts or the allowlist
+silently covers nothing. Same for `RunBudgets` and the daemon's own
+`max_runtime_ms` / `max_memory_bytes`.
+
+*Acceptance for this slice alone:* a run placed with a host allowlist is
+refused by the node when it reaches outside it, proven by the node's own denial
+record — not by the submitter's.
+
+### S4 — Liveness, and what a vanished node means
+
+There is no heartbeat, no reachability probe, and no failure semantics, because
+there is no placed work to lose: `ProcessKind::RemoteRun` is
+`RestartPolicy::Never` and terminal from birth, and its doc says why — *"a
+remote run records that a remote controller asked for work, not the work
+itself."* That is correct today and stops being correct the moment S2 lands.
+
+Needs: a heartbeat, a real restart policy for the placed process, and a
+"node vanished" arm on `reconcile_interrupted` — which today handles a dead
+child, a lapsed lease and a restarted daemon, and routes to `Queued`,
+`NeedsReconciliation`, `Cancelled` or `Failed`.
+
+### S5 — Placement in the scheduler
+
+Only here does `rank()` gain a *where* axis. `Candidate` has no node, host or
+device field, and neither does `Running`; `rank` sorts in place by six keys and
+`fit` reserves against one machine's snapshot.
+
+**Decide this before writing it — the acceptance contains a collision.** It asks
+for placement by *measured throughput*, and the benchmark surface is built on
+the opposite invariant: **"no number is displayed that was not measured on the
+machine displaying it"**, with `BenchmarkFreshness::DifferentMachine` existing
+precisely to refuse another machine's numbers. Two honest ways out:
+
+- **Place by capability and the node's own admission verdict only**, and say
+  throughput is not an input. Cheap, needs no change to the benchmark's
+  invariant, and is very likely enough — a node that admits the job can run it.
+- **Import the node's measurement tagged with its own `MachineIdentity`**, and
+  keep it out of every surface that displays local numbers. Strictly more
+  faithful to the acceptance and strictly more machinery.
+
+The first is the recommended start. The second is an upgrade with a stated
+trigger: when two nodes both admit a job and the choice between them measurably
+matters.
+
+### What none of this can prove here
+
+Every slice past S1 needs **two machines**. Nothing in this repo's CI has a
+second node, so the honest bar is: pure functions (ranking, capability
+matching, policy validation) unit-tested, and the wire path exercised against a
+loopback node in an integration test that is explicitly *not* a substitute for
+two real hosts. State that in the PR rather than letting a green run imply it.
+
 ## K18. Live migration
 
 **Today:** nothing. Requires K13 and K17.
+
+K13 is built — a process freezes into a durable image at a tool boundary and
+re-enters from it. What K18 adds on top is the wire: the image moving to another
+owned node, that node refusing it when it cannot satisfy the process's
+requirements, and one ledger event chain spanning both machines.
+
+So this is **K17's S1–S4 plus a transport for the image**, and its refusal is
+already half-written: `Restorability` is a tagged union whose blockers are
+`WorkspaceGone` / `ModelNotResident` / `ApprovalExpired`, and those are exactly
+the questions a *target node* has to answer about an incoming image. The one
+genuinely new piece is the cross-node chain, since `run_events` hash-chains per
+run on one machine and a migrated run has two halves.
 
 **Acceptance:** a frozen process image moves to another owned node and resumes
 there, with a stated list of what does not survive the move and a refusal when
