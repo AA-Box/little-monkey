@@ -5054,13 +5054,33 @@ other people implement against, not a single binary.
 ## K22. Verified boot and updater
 
 **Today:** the in-app updater ships on all three desktop platforms and releases
-publish themselves once every matrix target has uploaded; rollback, a manual
-check control, a visible failed check, and Linux coverage beyond the AppImage
-are still missing. Signing is macOS-only. Managed runtime components install
-with digest verification and macOS notarization codesigning, and installed
-models carry content-addressed, digest-verified manifests that never trust a
-corrupt local copy for reuse. Ten locales are each missing ~650 of 1,726 keys.
-No dependency scanning, SBOM, accessibility CI, or penetration test.
+publish themselves once every matrix target has uploaded. Rollback exists on
+every platform (`update_rollback.rs`: one snapshot of the install taken before
+an update replaces it, restored by a detached script that waits for this
+process to exit), and Settings → Updates & integrity carries the manual check,
+the last check time, and the failure a background check keeps quiet. A Linux
+install the updater cannot replace — anything that is not an AppImage — is
+reported as such rather than failing silently. **The startup self-integrity
+check is in** (`self_integrity.rs`): the app's own code signature plus every
+file of every managed runtime against the trusted manifest digest compiled into
+the binary, computed once per process and consulted by every path that resolves
+a native binary (`llama.rs`, the Studio image/video and speech engines,
+`monkey-cli`). A mismatch refuses to load them; "cannot verify" — an unsigned
+source build, a developer runtime override, a tree staged with no trusted
+digest — is reported honestly and does not refuse, because treating absence of
+evidence as evidence of tampering would make the app unrunnable from source.
+Managed runtime components install with digest verification and macOS
+notarization codesigning, and installed models carry content-addressed,
+digest-verified manifests that never trust a corrupt local copy for reuse. CI
+runs dependency review plus Rust/npm advisory audits and publishes a CycloneDX
+SBOM, attached to each release as an asset.
+
+**Still open:** signing beyond macOS (Windows needs a code-signing certificate
+this project does not have; Linux has no OS-level binary signature to verify,
+which is why the integrity check reports the runtime digests as the whole of
+the evidence there), clean-machine install/upgrade tests, an accessibility
+audit in CI, a release penetration test, and the ~650 keys each of ten locales
+is missing.
 
 **Acceptance:** ROADMAP #8 in full, plus a startup self-integrity check that
 verifies the app's own binary signature and the digests of every managed

@@ -29,6 +29,7 @@ import {
   Sparkles,
   Stethoscope,
   Terminal,
+  RefreshCw,
   Users,
   X,
   Zap,
@@ -67,6 +68,7 @@ import { ApprovalChainsPanel } from "./ApprovalChainsPanel";
 import { LocalAppsPanel } from "./LocalAppsPanel";
 import { CompanionPanel } from "./CompanionPanel";
 import { SecurityDoctorPanel } from "./SecurityDoctorPanel";
+import { UpdatesPanel } from "./UpdatesPanel";
 import { PrivacyFirewallPanel } from "./PrivacyFirewallPanel";
 import { DesktopControlPanel } from "./DesktopControlPanel";
 import { DiagnosticsPanel } from "./DiagnosticsPanel";
@@ -91,7 +93,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-type StaticSettingsTab = "local" | "ollama" | "providers" | "automation" | "rules" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "approvalchains" | "localapps" | "comparelab" | "resources";
+type StaticSettingsTab = "local" | "ollama" | "providers" | "automation" | "rules" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "approvalchains" | "localapps" | "comparelab" | "resources" | "updates";
 export type SettingsTab = StaticSettingsTab | ProviderSettingsTab;
 
 const ICONS: Record<StaticSettingsTab, LucideIcon> = {
@@ -126,10 +128,11 @@ const ICONS: Record<StaticSettingsTab, LucideIcon> = {
   team: Users,
   comparelab: FlaskConical,
   resources: Gauge,
+  updates: RefreshCw,
 };
 
 const GROUPS: { labelKey: string; ids: StaticSettingsTab[] }[] = [
-  { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "security", "privacy", "diagnostics", "approvalchains", "team", "companion", "desktopcontrol", "shortcuts", "usage", "resources", "portability"] },
+  { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "updates", "security", "privacy", "diagnostics", "approvalchains", "team", "companion", "desktopcontrol", "shortcuts", "usage", "resources", "portability"] },
   { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers", "comparelab"] },
   { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "memorystudio", "tasks", "localapps"] },
   { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "triage", "background", "connectors", "prompts", "apiserver"] },
@@ -167,6 +170,7 @@ const LABEL_KEYS: Record<StaticSettingsTab, string> = {
   team: "SettingsModal.tabTeamMode",
   comparelab: "SettingsModal.tabCompareLab",
   resources: "SettingsModal.tabResourceLedger",
+  updates: "SettingsModal.tabUpdates",
 };
 
 const FOCUSABLE_SELECTOR = [
@@ -444,6 +448,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "approvalchains" && <ApprovalChainsPanel />}
               {tab === "background" && <BackgroundAgentsPanel />}
               {tab === "companion" && <CompanionPanel />}
+              {tab === "updates" && <UpdatesPanel />}
               {tab === "security" && <SecurityDoctorPanel />}
               {tab === "privacy" && <PrivacyFirewallPanel />}
               {tab === "diagnostics" && <DiagnosticsPanel />}
