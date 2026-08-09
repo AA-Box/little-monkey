@@ -15,7 +15,7 @@
  * thing that makes inpainting usable.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Eraser, Paintbrush, Redo2, Trash2, Undo2 } from "lucide-react";
+import { Eraser, Paintbrush, Redo2, Trash2, Undo2, ZoomIn, ZoomOut } from "lucide-react";
 
 import { Button, IconButton } from "../ui";
 import { useT } from "../../lib/i18n";
@@ -25,6 +25,18 @@ import { useT } from "../../lib/i18n";
 const MIN_BRUSH = 8;
 const MAX_BRUSH = 256;
 const DEFAULT_BRUSH = 64;
+
+/** Zoom stops. 1 fits the column; past that the container scrolls, which is
+ *  what gives panning for free rather than a drag mode that would fight the
+ *  brush for the same pointer. */
+const ZOOM_STOPS = [1, 2, 3, 4] as const;
+
+/** Steps between stops, clamping at each end. Written against the list so a
+ *  stop added or removed needs no other change. */
+export const nextStop = (current: number) =>
+  ZOOM_STOPS.find((stop) => stop > current) ?? ZOOM_STOPS[ZOOM_STOPS.length - 1];
+export const previousStop = (current: number) =>
+  [...ZOOM_STOPS].reverse().find((stop) => stop < current) ?? ZOOM_STOPS[0];
 
 /** How many strokes back undo reaches. Each entry is a full PNG of the mask —
  *  cheap for the mostly-black images a mask is, but not free on a 2048px
@@ -61,7 +73,15 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
    *  is once the stroke has been painted. */
   const before = useRef<string | null>(null);
 
+  const [zoom, setZoom] = useState(1);
+
   const source = `data:image/png;base64,${imageBase64}`;
+
+  /** The mask the parent is holding, read inside the load effect without making
+   *  it a dependency — see the effect's own note on why `onChange` is excluded
+   *  for the same reason. */
+  const incoming = useRef(value);
+  incoming.current = value;
 
   // Sizing the canvas to the source resets it, which is correct: a mask drawn
   // over one image means nothing over another.
@@ -84,7 +104,24 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
       // drawn for something else.
       setPast([]);
       setFuture([]);
-      onChange(null);
+      setZoom(1);
+
+      // Unless the parent supplied a mask *for this image*. Extending the
+      // picture hands over a new source and the mask marking the new margin in
+      // the same update, and clearing unconditionally threw that mask away — so
+      // the margin the user asked to have filled reached the engine unmarked,
+      // and the run repainted everything or nothing rather than the new ground.
+      const supplied = incoming.current;
+      if (!supplied) {
+        onChange(null);
+        return;
+      }
+      const mask = new Image();
+      mask.onload = () => {
+        if (cancelled) return;
+        context.drawImage(mask, 0, 0, element.width, element.height);
+      };
+      mask.src = `data:image/png;base64,${supplied}`;
     };
     image.src = source;
     return () => {
@@ -191,8 +228,12 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="relative max-h-80 w-fit overflow-hidden rounded-md border border-border">
-        <img src={source} alt="" className="block max-h-80 w-auto select-none" draggable={false} />
+      {/* `overflow-auto` rather than a drag-to-pan mode: past 1× the content is
+          wider than the box and the browser's own scrolling moves it, which
+          costs no code and never competes with the brush for the pointer. */}
+      <div className="max-h-80 overflow-auto rounded-md border border-border">
+        <div className="relative w-fit" style={{ width: `${zoom * 100}%` }}>
+        <img src={source} alt="" className="block w-full select-none" draggable={false} />
         <canvas
           ref={canvas}
           className="absolute inset-0 h-full w-full cursor-crosshair opacity-50 mix-blend-screen"
@@ -226,6 +267,29 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
             commit();
           }}
         />
+        </div>
+      </div>
+
+      <div className="flex items-center gap-1.5 text-xs">
+        <IconButton
+          size="sm"
+          aria-label={t("Studio.mask.zoomOut")}
+          title={t("Studio.mask.zoomOut")}
+          disabled={zoom <= ZOOM_STOPS[0]}
+          onClick={() => setZoom(previousStop)}
+        >
+          <ZoomOut size={12} />
+        </IconButton>
+        <IconButton
+          size="sm"
+          aria-label={t("Studio.mask.zoomIn")}
+          title={t("Studio.mask.zoomIn")}
+          disabled={zoom >= ZOOM_STOPS[ZOOM_STOPS.length - 1]}
+          onClick={() => setZoom(nextStop)}
+        >
+          <ZoomIn size={12} />
+        </IconButton>
+        <span className="font-mono text-[11px] text-faint">{zoom}×</span>
       </div>
 
       {/* Wraps rather than pushing the clear button past the panel's edge: the
