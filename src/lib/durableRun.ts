@@ -1,6 +1,7 @@
 import { isTauri } from "@tauri-apps/api/core";
 
 import type { ModelTargetSnapshot, CapabilityAssessment } from "./modelTargets";
+import type { RoutingDecision } from "./modelRouting";
 import {
   EMPTY_USAGE,
   RUN_PROTOCOL_SCHEMA_VERSION,
@@ -549,6 +550,31 @@ export class DurableRunRecorder {
       model_calls: this.usage.model_calls + 1,
     };
     void this.enqueue({ type: "usage_recorded", payload: { usage: { ...this.usage } } });
+  }
+
+  /** Which dispatch policy chose this run's target, and why (roadmap K9).
+   *
+   * The run's frozen `ModelTargetSnapshot` already records *what* ran; this is
+   * the *why*, on the same append-only hash-chained stream, so the answer
+   * survives a restart instead of living only in the transcript and in
+   * `routingPolicyStore`'s in-memory decision list.
+   *
+   * Recorded even when no policy matched. "Nothing routed this" is the answer
+   * for a fresh profile and is worth being able to produce — an absent event
+   * would leave a reader unable to tell it from an event that was never
+   * written. */
+  recordRoutingDecision(decision: RoutingDecision): void {
+    void this.enqueue({
+      type: "routing_decided",
+      payload: {
+        task_class: decision.taskClass,
+        policy_id: decision.policyId,
+        policy_name: decision.policyName,
+        chosen_key: decision.chosenKey,
+        changed_from_active: decision.changedFromActive,
+        reason: decision.reason,
+      },
+    });
   }
 
   recordCheckpoint(checkpointId: string, label: string): void {

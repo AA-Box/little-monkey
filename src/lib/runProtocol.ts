@@ -201,6 +201,21 @@ export type RunEventWire =
       decision: PermissionDecision;
       decided_by: ClientIdentityWire;
     }>
+  /** Mirrors `RunEvent::RoutingDecided` — which dispatch policy chose this
+   * run's target and why (roadmap K9). Every field but the two the reader
+   * cannot do without is nullable, because "no policy matched" is a real
+   * answer rather than a missing one. */
+  | Event<
+      "routing_decided",
+      {
+        task_class: string;
+        policy_id: string | null;
+        policy_name: string | null;
+        chosen_key: string | null;
+        changed_from_active: boolean;
+        reason: string;
+      }
+    >
   | Event<"tool_started", { tool_call_id: string }>
   | Event<"tool_finished", {
       tool_call_id: string;
