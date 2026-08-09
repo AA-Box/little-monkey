@@ -33,6 +33,24 @@ export interface ChatMessage {
   content: string | ChatContentPart[];
   tool_call_id?: string;
   tool_calls?: ToolCall[];
+  /** Local-only: wall-clock time the message entered the transcript, stamped
+   * once by `sessionStore.addMessage`. Shown under an assistant answer (see
+   * `MessageActions.tsx`) and stripped before every request by
+   * {@link toWireMessages}. */
+  at?: number;
+  /** Local-only: title of the chapter this message was pinned as, or absent
+   * when it isn't pinned. Kept on the message rather than in a per-session
+   * index map so it survives forks, edits, and truncation without any
+   * index bookkeeping; stripped from the wire like `at`. */
+  chapter?: string;
+}
+
+/** Strips the local-only fields above so a request body carries nothing but
+ * the OpenAI-compatible message shape. Both wire paths run this: cloud
+ * providers reject unknown message properties outright, and the Rust proxy
+ * forwards `messages` as opaque JSON, so it can't do the filtering for us. */
+export function toWireMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map(({ at: _at, chapter: _chapter, ...wire }) => wire);
 }
 
 /** Extracts the plain-text portion of a message's `content` — a no-op for
@@ -230,7 +248,7 @@ export async function* streamChat(
   let response: Response;
   try {
     const body: Record<string, unknown> = {
-      messages,
+      messages: toWireMessages(messages),
       stream: true,
       stream_options: { include_usage: true },
       model: model ?? 'local',
