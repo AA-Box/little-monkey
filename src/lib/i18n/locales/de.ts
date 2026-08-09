@@ -2451,7 +2451,6 @@ export const de: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "Budgets aktivieren",
   "UsagePanel.dailyBudget": "Tagesbudget (USD)",
   "UsagePanel.monthlyBudget": "Monatsbudget (USD)",
-  "UsagePanel.warningThreshold": "Warnen bei (%)",
   "UsagePanel.enforcement": "Bei Erreichen des Limits",
   "UsagePanel.enforcementWarn": "Nur warnen",
   "UsagePanel.enforcementPause": "Cloud-Aufrufe pausieren",

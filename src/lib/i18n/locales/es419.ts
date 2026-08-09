@@ -2451,7 +2451,6 @@ export const es419: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "Habilitar presupuestos",
   "UsagePanel.dailyBudget": "Presupuesto diario (USD)",
   "UsagePanel.monthlyBudget": "Presupuesto mensual (USD)",
-  "UsagePanel.warningThreshold": "Advertir al alcanzar (%)",
   "UsagePanel.enforcement": "Al llegar al límite",
   "UsagePanel.enforcementWarn": "Solo advertir",
   "UsagePanel.enforcementPause": "Pausar llamadas a la nube",
