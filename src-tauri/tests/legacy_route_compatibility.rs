@@ -530,6 +530,74 @@ async fn the_health_route_returns_the_status_ok_object_byte_for_byte() {
 }
 
 // ---------------------------------------------------------------------
+// 2b. `/v1/contract` answers the K19 ABI without a token
+// ---------------------------------------------------------------------
+
+/// The contract introspection endpoint (roadmap K19) on the *real* listener.
+///
+/// Two properties, both load-bearing and neither visible from the pure
+/// generator's own unit tests. It answers **before authentication** — a client
+/// negotiating an ABI has no reason to hold a credential yet, and one whose
+/// credential shape changed must still be able to find that out. And what it
+/// answers is the same manifest the published artifact holds, digest included,
+/// so "the version this instance implements" is a fact about the running
+/// binary rather than about a file someone remembered to update.
+#[tokio::test]
+async fn the_contract_route_serves_the_published_abi_without_a_token() {
+    let Some(server) = LegacyServer::start("contract", base_config()).await else {
+        return;
+    };
+    let client = http_client();
+
+    let response = client
+        .get(server.url("/v1/contract"))
+        .send()
+        .await
+        .expect("GET /v1/contract");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "the ABI is negotiated before a credential is presented"
+    );
+    let body: serde_json::Value = response.json().await.expect("/v1/contract body");
+    assert_eq!(
+        body["contract_version"],
+        little_monkey_lib::contract::CONTRACT_VERSION
+    );
+    assert_eq!(body["digest"], little_monkey_lib::contract::digest());
+    // The manifest travels whole: a client needs no second request and no
+    // shipped copy to know which routes and tools this instance has.
+    assert_eq!(
+        body["manifest"],
+        serde_json::to_value(little_monkey_lib::contract::manifest()).expect("manifest as JSON")
+    );
+    let published: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../contract/agent-os-contract.json"),
+        )
+        .expect("the published contract artifact"),
+    )
+    .expect("published contract JSON");
+    assert_eq!(
+        body["manifest"], published,
+        "a running instance and the published artifact must not disagree"
+    );
+
+    // Counter-test, same shape as `/health`'s: the route is method-scoped.
+    let response = client
+        .post(server.url("/v1/contract"))
+        .send()
+        .await
+        .expect("POST /v1/contract");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "the pre-auth answer belongs to GET, exactly as it does for /health"
+    );
+}
+
+// ---------------------------------------------------------------------
 // 1. `Access-Control-Allow-Origin: *` on every response
 // ---------------------------------------------------------------------
 

@@ -2224,6 +2224,21 @@ pub async fn handle_request(
         return (with_cors(health_response()), None);
     }
 
+    // `GET /v1/contract` is the second one, and for the same reason (roadmap
+    // K19): a caller asks which ABI this instance implements before it can
+    // know whether the credential shape it holds is still the right one. The
+    // body is a pure function of the built binary — no configuration, no
+    // model list, no token state.
+    if method == Method::GET && path == "/v1/contract" {
+        return (
+            with_cors(json_response(
+                StatusCode::OK,
+                crate::contract::introspection(),
+            )),
+            None,
+        );
+    }
+
     // CORS preflight never carries a bearer token — browsers deliberately
     // don't attach one to an `OPTIONS` request.
     if method == Method::OPTIONS && path.starts_with("/v1/") {
@@ -2311,8 +2326,10 @@ fn http_action_worth_recording(method: &Method, path: &str) -> Option<String> {
         return None;
     }
     // Discovery, not action: every client asks before it does anything, and the
-    // request that follows is the one that acted.
-    if method == Method::GET && path == "/v1/models" {
+    // request that follows is the one that acted. `/v1/contract` is the same
+    // kind of question one step earlier — which ABI is this? — answered from a
+    // constant, so it is filtered here for the same reason.
+    if method == Method::GET && (path == "/v1/models" || path == "/v1/contract") {
         return None;
     }
     Some(format!("{method} {path}"))
@@ -2786,6 +2803,7 @@ where
     }
 
     let public_legacy_request = (method == Method::GET && path == "/health")
+        || (method == Method::GET && path == "/v1/contract")
         || (method == Method::OPTIONS && path.starts_with("/v1/"))
         || (app.is_some()
             && matches!(
