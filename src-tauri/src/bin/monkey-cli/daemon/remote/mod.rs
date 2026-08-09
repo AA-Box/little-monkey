@@ -1,6 +1,7 @@
 pub(crate) mod api;
 mod client;
 mod desktop;
+pub(crate) mod migrate;
 mod protocol;
 mod server;
 mod store;
@@ -114,6 +115,88 @@ pub enum RemoteCmd {
         #[arg(long, default_value_t = 100)]
         limit: u32,
     },
+    /// State what this machine is, for the schedulers allowed to place work on
+    /// it (roadmap K17 S1). Both values are operator statements: nothing can
+    /// infer which jurisdiction a machine's disks are in, and an unset label
+    /// never satisfies a residency rule naming a real zone.
+    NodeLabel {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        residency: Option<String>,
+    },
+    /// Ask a paired node to describe itself and remember the answer.
+    NodeRefresh {
+        /// One alias, or every paired controller when omitted.
+        alias: Option<String>,
+    },
+    /// Show the nodes this machine may place work on, and how long each has
+    /// been silent.
+    NodeList {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Place a frozen `RunSpec` on an owned node (roadmap K17 S2/S5).
+    ///
+    /// With `--alias` the node is named; without it, the node is chosen by
+    /// capability, the node's own admission verdict, and the data-residency
+    /// rule — see `node_placement::select_node`, including why measured
+    /// throughput is deliberately not an input.
+    Place(RemotePlaceArgs),
+    /// List the runs this machine has placed on nodes.
+    Placements {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-probe every node and reconcile the placements on it: refresh live
+    /// states, and apply the restart policy to placements whose node vanished
+    /// (roadmap K17 S4).
+    PlacementSync,
+    /// Move a *frozen process image* to an owned node and resume it there
+    /// (roadmap K18).
+    ///
+    /// `place` submits a spec the node then runs from the start. This hands the
+    /// node a turn already in flight — its conversation, its workspace and its
+    /// checkpoint — and refuses before transferring anything when the target
+    /// cannot satisfy it. The move is recorded on both nodes' run-event chains
+    /// as one chain. Use `node-refresh` first to see what a target is.
+    Migrate {
+        alias: String,
+        /// The frozen checkpoint to move. `monkey ps` names the process; the
+        /// checkpoint is the image that process froze into.
+        #[arg(long)]
+        checkpoint: String,
+        /// Require the target's data-residency label to be exactly this. The
+        /// node checks it against its own rather than trusting it.
+        #[arg(long)]
+        residency: Option<String>,
+        /// Check the target and stop, transferring nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct RemotePlaceArgs {
+    /// A frozen `RunSpec` as JSON. Frozen on purpose: the placer authors the
+    /// spec, and everything the node enforces travels inside it.
+    #[arg(long)]
+    spec: PathBuf,
+    /// Place on this exact node instead of selecting one.
+    #[arg(long)]
+    alias: Option<String>,
+    /// The data-residency rule. Only a node whose operator set this exact label
+    /// is eligible, and the node re-checks the claim on arrival.
+    #[arg(long)]
+    residency: Option<String>,
+    /// A backend the node must actually execute on — not merely detect.
+    #[arg(long = "require-accelerator")]
+    required_accelerator: Option<String>,
+    /// Free system memory the node must report.
+    #[arg(long, default_value_t = 0)]
+    min_available_ram_bytes: u64,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -140,7 +223,11 @@ pub struct RemotePairCreateArgs {
     actions: Vec<PairAction>,
     #[arg(long = "run")]
     run_ids: Vec<String>,
-    #[arg(long = "workspace")]
+    /// `--workspace-id`, not `--workspace`: the CLI's global `--workspace` is a
+    /// filesystem path and is declared `global = true`, so it reaches every
+    /// subcommand — two arguments claiming that name made `pair-create` abort
+    /// on clap's own uniqueness assert before it could parse anything at all.
+    #[arg(long = "workspace-id")]
     workspace_ids: Vec<String>,
     #[arg(long, default_value_t = protocol::MAX_REMOTE_ARTIFACT_BYTES)]
     max_artifact_bytes: u64,
@@ -174,6 +261,16 @@ pub enum PairMobileCapability {
     ViewTasks,
     RunWorkflows,
     Capture,
+    /// Roadmap K17 S1 — read this node's identity and inventory.
+    DescribeNode,
+    /// Roadmap K17 S2 — submit a frozen `RunSpec` to this node. Requires
+    /// `--mobile describe-node` and `--action view-runs`; `validate_capabilities`
+    /// refuses the invitation otherwise rather than silently widening either.
+    PlaceRuns,
+    /// Hand this node a frozen process image (roadmap K18). Strictly more than
+    /// `place-runs`, which it also requires: a migration writes a workspace, a
+    /// checkpoint and a conversation onto the target.
+    Migrate,
 }
 
 impl From<PairMobileCapability> for protocol::DeviceCapability {
@@ -184,6 +281,9 @@ impl From<PairMobileCapability> for protocol::DeviceCapability {
             PairMobileCapability::ViewTasks => Self::ViewTasks,
             PairMobileCapability::RunWorkflows => Self::RunWorkflows,
             PairMobileCapability::Capture => Self::Capture,
+            PairMobileCapability::DescribeNode => Self::DescribeNode,
+            PairMobileCapability::PlaceRuns => Self::PlaceRuns,
+            PairMobileCapability::Migrate => Self::Migrate,
         }
     }
 }
@@ -276,10 +376,11 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
         }
         RemoteCmd::HostServe => {
             let desktop = DesktopControlRuntime::production(&paths);
-            let mobile_chat = std::sync::Arc::new(
-                crate::daemon::DaemonMobileChatQueue::new(paths.clone()),
-            );
-            server::serve(paths, desktop, mobile_chat).await?
+            let mobile_chat =
+                std::sync::Arc::new(crate::daemon::DaemonMobileChatQueue::new(paths.clone()));
+            let placement =
+                std::sync::Arc::new(crate::daemon::DaemonPlacementQueue::new(paths.clone()));
+            server::serve(paths, desktop, mobile_chat, placement).await?
         }
         RemoteCmd::PairCreate(args) => pair_create(&paths, args)?,
         RemoteCmd::PairList => pair_list(&paths)?,
@@ -459,22 +560,424 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
             )
             .await?,
         )?,
+        RemoteCmd::Migrate {
+            alias,
+            checkpoint,
+            residency,
+            dry_run,
+        } => migrate_run(&paths, alias, checkpoint, residency.as_deref(), *dry_run).await?,
         RemoteCmd::Audit { limit } => {
             print_json(
                 serde_json::to_value(RemoteStore::open(&paths.root)?.audit_entries(*limit)?)
                     .map_err(|error| error.to_string())?,
             )?;
         }
+        RemoteCmd::NodeLabel { name, residency } => {
+            node_label(&paths, name.as_deref(), residency.as_deref())?
+        }
+        RemoteCmd::NodeRefresh { alias } => node_refresh(&paths, alias.as_deref()).await?,
+        RemoteCmd::NodeList { json } => node_list(&paths, *json)?,
+        RemoteCmd::Place(args) => place(&paths, args).await?,
+        RemoteCmd::Placements { json } => placements(&paths, *json)?,
+        RemoteCmd::PlacementSync => placement_sync(&paths).await?,
     }
     Ok(())
+}
+
+// --- Roadmap K17 CLI ------------------------------------------------------
+
+fn node_label(
+    paths: &DaemonPaths,
+    name: Option<&str>,
+    residency: Option<&str>,
+) -> Result<(), String> {
+    let mut store = crate::daemon::store::DaemonStore::open(paths)?;
+    if let Some(residency) = residency {
+        little_monkey_lib::node_placement::validate_residency(residency)?;
+        store.set_meta(api::NODE_RESIDENCY_META, residency)?;
+    }
+    if let Some(name) = name {
+        if name.trim().is_empty() || name.len() > 128 {
+            return Err("Node name must be 1-128 characters".to_string());
+        }
+        store.set_meta(api::NODE_NAME_META, name)?;
+    }
+    println!(
+        "This node advertises name={:?} residency={:?}",
+        store
+            .get_meta(api::NODE_NAME_META)?
+            .unwrap_or_else(|| "(runner id)".to_string()),
+        store
+            .get_meta(api::NODE_RESIDENCY_META)?
+            .unwrap_or_else(|| {
+                little_monkey_lib::node_placement::RESIDENCY_UNSPECIFIED.to_string()
+            })
+    );
+    Ok(())
+}
+
+/// Every paired controller alias, which is the set of nodes this machine could
+/// place work on. A controller without the `describe_node` grant simply answers
+/// 403 and is reported as such rather than being filtered out silently — an
+/// operator who granted the wrong capability needs to see that.
+fn aliases(paths: &DaemonPaths, only: Option<&str>) -> Result<Vec<String>, String> {
+    if let Some(alias) = only {
+        return Ok(vec![alias.to_string()]);
+    }
+    RemoteStore::open(&paths.root)?.controller_aliases()
+}
+
+async fn node_refresh(paths: &DaemonPaths, alias: Option<&str>) -> Result<(), String> {
+    let aliases = aliases(paths, alias)?;
+    if aliases.is_empty() {
+        println!("No paired controllers; nothing to describe.");
+        return Ok(());
+    }
+    for alias in aliases {
+        match client::refresh_node(paths, &alias, now_ms()?).await {
+            Ok(descriptor) => println!(
+                "{alias}: {} residency={} accepting={} queue={}/{} models={} backends={}",
+                descriptor.node_name,
+                descriptor.residency,
+                descriptor.accepting,
+                descriptor.queue_depth,
+                descriptor.queue_capacity,
+                descriptor.resident_models.len(),
+                descriptor
+                    .accelerators
+                    .iter()
+                    .filter(|entry| entry.executes && entry.available)
+                    .map(|entry| entry.kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join("+")
+            ),
+            Err(error) => println!("{alias}: unavailable ({error})"),
+        }
+    }
+    Ok(())
+}
+
+fn node_list(paths: &DaemonPaths, json: bool) -> Result<(), String> {
+    let now = now_ms()?;
+    let nodes = RemoteStore::open(&paths.root)?.nodes()?;
+    if json {
+        let rows = nodes
+            .iter()
+            .map(|(alias, descriptor, last_seen)| {
+                serde_json::json!({
+                    "alias": alias,
+                    "runner_id": descriptor.runner_id,
+                    "node_name": descriptor.node_name,
+                    "residency": descriptor.residency,
+                    "accepting": descriptor.accepting,
+                    "queue_depth": descriptor.queue_depth,
+                    "queue_capacity": descriptor.queue_capacity,
+                    "last_seen_at_ms": last_seen,
+                    "liveness": liveness_token(*last_seen, now),
+                })
+            })
+            .collect::<Vec<_>>();
+        return print_json(serde_json::json!({ "nodes": rows }));
+    }
+    if nodes.is_empty() {
+        println!("No described nodes. Run `monkey daemon remote node-refresh` first.");
+    }
+    for (alias, descriptor, last_seen) in nodes {
+        println!(
+            "{alias} runner={} residency={} accepting={} queue={}/{} liveness={}",
+            descriptor.runner_id,
+            descriptor.residency,
+            descriptor.accepting,
+            descriptor.queue_depth,
+            descriptor.queue_capacity,
+            liveness_token(last_seen, now)
+        );
+    }
+    Ok(())
+}
+
+fn liveness_token(last_seen: Option<u64>, now_ms: u64) -> &'static str {
+    match little_monkey_lib::node_placement::liveness(last_seen, now_ms) {
+        little_monkey_lib::node_placement::NodeLiveness::Alive => "alive",
+        little_monkey_lib::node_placement::NodeLiveness::Stale { .. } => "stale",
+        little_monkey_lib::node_placement::NodeLiveness::Vanished { .. } => "vanished",
+    }
+}
+
+/// The model id a spec's frozen target names, when it names a local one.
+///
+/// Only used as a placement *preference*, never a requirement — see
+/// `select_node`. A provider target has no local model, so it contributes
+/// nothing here, which is correct: the weights are on someone else's machine
+/// either way.
+fn preferred_model_id(
+    target: &little_monkey_lib::run_protocol::ModelTargetSnapshot,
+) -> Option<String> {
+    use little_monkey_lib::run_protocol::ModelTargetSnapshot;
+    match target {
+        ModelTargetSnapshot::Provider { .. } => None,
+        ModelTargetSnapshot::Ollama {
+            model,
+            is_cloud: false,
+            ..
+        } => Some(model.clone()),
+        ModelTargetSnapshot::Ollama { .. } => None,
+        ModelTargetSnapshot::ManagedLlama { model_id, .. } => Some(model_id.clone()),
+    }
+}
+
+async fn place(paths: &DaemonPaths, args: &RemotePlaceArgs) -> Result<(), String> {
+    let spec: little_monkey_lib::run_protocol::RunSpec = serde_json::from_slice(
+        &std::fs::read(&args.spec)
+            .map_err(|error| format!("Could not read the run spec: {error}"))?,
+    )
+    .map_err(|error| format!("Run spec is invalid: {error}"))?;
+    spec.validate().map_err(|error| error.to_string())?;
+    if let Some(residency) = &args.residency {
+        little_monkey_lib::node_placement::validate_residency(residency)?;
+    }
+
+    let now = now_ms()?;
+    let requirement = little_monkey_lib::node_placement::PlacementRequirement {
+        residency: args.residency.clone(),
+        model_id: preferred_model_id(&spec.target),
+        required_accelerator: args.required_accelerator.clone(),
+        min_available_ram_bytes: args.min_available_ram_bytes,
+    };
+
+    let store = RemoteStore::open(&paths.root)?;
+    let described = store.nodes()?;
+    drop(store);
+    let candidates: Vec<little_monkey_lib::node_placement::NodeCandidate> = described
+        .iter()
+        .filter(|(alias, _, _)| args.alias.as_ref().is_none_or(|only| only == alias))
+        .map(|(alias, descriptor, last_seen)| descriptor.candidate(alias, *last_seen))
+        .collect();
+
+    // An explicit `--alias` still goes through `select_node`, which is the
+    // point: naming the node chooses *which* node, it does not waive the
+    // residency rule, the liveness check, or the node's own refusal to accept
+    // work. A named node that fails one of those is refused here with the same
+    // sentence an unnamed one would get.
+    let chosen = little_monkey_lib::node_placement::select_node(&candidates, &requirement, now)
+        .map_err(|refusal| refusal.message())?;
+    let runner_up = candidates
+        .iter()
+        .find(|candidate| candidate.alias != chosen.alias);
+    let deciding = little_monkey_lib::node_placement::deciding_key(chosen, runner_up, &requirement);
+
+    let request = little_monkey_lib::node_placement::PlaceRunRequest {
+        protocol_version: little_monkey_lib::node_placement::NODE_PROTOCOL_VERSION,
+        spec: spec.clone(),
+        required_residency: args.residency.clone(),
+        expected_runner_id: Some(chosen.runner_id.clone()),
+    };
+    let response = client::place_run(paths, &chosen.alias, &request, now).await?;
+
+    let mut store = RemoteStore::open(&paths.root)?;
+    store.save_placement(&store::PlacementRecord {
+        submitted_run_id: response.submitted_run_id.clone(),
+        alias: chosen.alias.clone(),
+        runner_id: chosen.runner_id.clone(),
+        node_run_id: response.node_run_id.clone(),
+        job_id: response.job_id.clone(),
+        state: little_monkey_lib::node_placement::PlacementState::Accepted
+            .token()
+            .to_string(),
+        attempt: 1,
+        residency: response.residency.clone(),
+        deciding_key: deciding.to_string(),
+        last_error: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+    })?;
+
+    if args.json {
+        return print_json(serde_json::json!({
+            "alias": chosen.alias,
+            "deciding_key": deciding,
+            "placement": serde_json::to_value(&response).map_err(|error| error.to_string())?,
+        }));
+    }
+    println!(
+        "Placed {} on '{}' (chosen by {deciding}) as node run {} / job {} under residency '{}'.",
+        response.submitted_run_id,
+        chosen.alias,
+        response.node_run_id,
+        response.job_id,
+        response.residency
+    );
+    Ok(())
+}
+
+fn placements(paths: &DaemonPaths, json: bool) -> Result<(), String> {
+    let records = RemoteStore::open(&paths.root)?.placements()?;
+    if json {
+        let rows = records
+            .iter()
+            .map(|record| {
+                serde_json::json!({
+                    "submitted_run_id": record.submitted_run_id,
+                    "alias": record.alias,
+                    "node_run_id": record.node_run_id,
+                    "job_id": record.job_id,
+                    "state": record.state,
+                    "attempt": record.attempt,
+                    "residency": record.residency,
+                    "deciding_key": record.deciding_key,
+                    "last_error": record.last_error,
+                    "updated_at_ms": record.updated_at_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        return print_json(serde_json::json!({ "placements": rows }));
+    }
+    if records.is_empty() {
+        println!("No placed runs.");
+    }
+    for record in records {
+        println!(
+            "{} on {} state={} attempt={} residency={} chosen_by={}{}",
+            record.submitted_run_id,
+            record.alias,
+            record.state,
+            record.attempt,
+            record.residency,
+            record.deciding_key,
+            record
+                .last_error
+                .map(|error| format!(" error={error}"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// **Roadmap K17 S4, as a command.** Probe every node, refresh what it says
+/// about the placements it holds, and apply the restart policy to the ones whose
+/// node has gone away.
+///
+/// Re-placement is deliberately *not* automatic here: it marks the placement
+/// `lost` and says what to run. A vanished node's run may have completed its
+/// external side effects before the network went, and this machine cannot know —
+/// so re-placing without a human is exactly the "confirmed mutations are not
+/// replayed" rule the daemon's own `reconcile_interrupted` already holds to.
+pub(crate) async fn placement_sync(paths: &DaemonPaths) -> Result<(), String> {
+    let now = now_ms()?;
+    for alias in aliases(paths, None)? {
+        if let Err(error) = client::probe_node(paths, &alias, now).await {
+            eprintln!("monkey remote: node '{alias}' did not answer: {error}");
+        }
+    }
+    let store = RemoteStore::open(&paths.root)?;
+    let nodes = store.nodes()?;
+    let records = store.placements()?;
+    drop(store);
+    for record in records {
+        let Some(state) = little_monkey_lib::node_placement::PlacementState::parse(&record.state)
+        else {
+            continue;
+        };
+        if state.terminal() {
+            continue;
+        }
+        let last_seen = nodes
+            .iter()
+            .find(|(alias, _, _)| alias == &record.alias)
+            .and_then(|(_, _, last_seen)| *last_seen);
+        // The node is answering: ask it what became of this placement, which is
+        // the only authority on it. The node's own denial record is what the S3
+        // acceptance is read from — never this side's prediction of it.
+        if matches!(
+            little_monkey_lib::node_placement::liveness(last_seen, now),
+            little_monkey_lib::node_placement::NodeLiveness::Alive
+        ) {
+            match client::placed_status(paths, &record.alias, &record.submitted_run_id, now).await {
+                Ok(status) => {
+                    let mapped = map_node_state(&status.state);
+                    RemoteStore::open(&paths.root)?.set_placement_state(
+                        &record.submitted_run_id,
+                        mapped.token(),
+                        status.last_error.as_deref(),
+                        now,
+                    )?;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "monkey remote: could not read placement {} on '{}': {error}",
+                        record.submitted_run_id, record.alias
+                    );
+                }
+            }
+            continue;
+        }
+        match little_monkey_lib::node_placement::reconcile_placement(
+            state,
+            last_seen,
+            record.attempt,
+            little_monkey_lib::node_placement::PLACEMENT_MAX_ATTEMPTS,
+            now,
+        ) {
+            little_monkey_lib::node_placement::PlacementReconcile::Keep => {}
+            little_monkey_lib::node_placement::PlacementReconcile::Degraded { silent_ms } => {
+                RemoteStore::open(&paths.root)?.set_placement_state(
+                    &record.submitted_run_id,
+                    state.token(),
+                    Some(&format!(
+                        "node '{}' silent for {silent_ms} ms",
+                        record.alias
+                    )),
+                    now,
+                )?;
+            }
+            little_monkey_lib::node_placement::PlacementReconcile::Replace { reason, .. } => {
+                RemoteStore::open(&paths.root)?.set_placement_state(
+                    &record.submitted_run_id,
+                    little_monkey_lib::node_placement::PlacementState::Lost.token(),
+                    Some(&format!(
+                        "{reason}; re-place it with `monkey daemon remote place`"
+                    )),
+                    now,
+                )?;
+                println!("Placement {} is lost: {reason}", record.submitted_run_id);
+            }
+            little_monkey_lib::node_placement::PlacementReconcile::Fail { reason } => {
+                RemoteStore::open(&paths.root)?.set_placement_state(
+                    &record.submitted_run_id,
+                    little_monkey_lib::node_placement::PlacementState::Failed.token(),
+                    Some(&reason),
+                    now,
+                )?;
+                println!("Placement {} failed: {reason}", record.submitted_run_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The node's job state, translated into this side's placement vocabulary.
+///
+/// Anything unrecognised maps to `Running` rather than to a terminal state: a
+/// node running a newer build may name a state this one has never heard of, and
+/// guessing "failed" would discard live work.
+fn map_node_state(state: &str) -> little_monkey_lib::node_placement::PlacementState {
+    use little_monkey_lib::node_placement::PlacementState;
+    match state {
+        "queued" | "preparing" | "held" => PlacementState::Accepted,
+        "succeeded" => PlacementState::Succeeded,
+        "failed" | "unknown" => PlacementState::Failed,
+        "cancelled" => PlacementState::Cancelled,
+        _ => PlacementState::Running,
+    }
 }
 
 pub async fn spawn_if_configured(
     paths: DaemonPaths,
     desktop: std::sync::Arc<DesktopControlRuntime>,
     mobile_chat: std::sync::Arc<dyn api::MobileChatQueue>,
+    placement: std::sync::Arc<dyn api::PlacementQueue>,
 ) -> Result<bool, String> {
-    server::spawn_if_configured(paths, desktop, mobile_chat).await
+    server::spawn_if_configured(paths, desktop, mobile_chat, placement).await
 }
 
 fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), String> {
@@ -555,6 +1058,174 @@ fn pair_list(paths: &DaemonPaths) -> Result<(), String> {
             serde_json::to_string(&device.scopes).map_err(|error| error.to_string())?
         );
     }
+    Ok(())
+}
+
+/// Moves a frozen process image to a paired node (roadmap K18).
+///
+/// The order is the whole design, so it is worth stating:
+///
+/// 1. **Preflight first, and it transfers nothing.** The target answers from the
+///    header alone, so a refusal costs a round trip instead of a workspace.
+/// 2. **The departure is appended locally *before* the image is sent**, because
+///    the arrival on the far side has to name the origin's chain tip — and the
+///    tip is that departure. Doing it the other way round would leave the target
+///    naming an event that did not exist when it named it.
+/// 3. **A departure that is then refused stays in the origin's history.** It is
+///    not terminal and changes no status, so this run carries on here; an audit
+///    that only recorded successful moves would be an audit of nothing.
+async fn migrate_run(
+    paths: &DaemonPaths,
+    alias: &str,
+    checkpoint_id: &str,
+    required_residency: Option<&str>,
+    dry_run: bool,
+) -> Result<(), String> {
+    use little_monkey_lib::run_ledger::RunLedger;
+    use little_monkey_lib::run_protocol::{
+        ClientIdentity, ClientKind, RunEvent, RunEventEnvelope, RUN_PROTOCOL_SCHEMA_VERSION,
+    };
+
+    let app_data_dir = crate::app_data_dir()
+        .ok_or_else(|| "Could not resolve the app data directory".to_string())?;
+    let host = enabled_host(paths)?;
+    if let Some(residency) = required_residency {
+        little_monkey_lib::node_placement::validate_residency(residency)?;
+    }
+
+    // The run this checkpoint's process belongs to. Read from the process row
+    // rather than guessed: a checkpoint records a turn, and only the process
+    // table knows which durable run that turn was charged to.
+    let manifest_dir = migrate::checkpoints_dir(&app_data_dir).join(checkpoint_id);
+    little_monkey_lib::checkpoints::validate_checkpoint_id(checkpoint_id)?;
+    if !manifest_dir.is_dir() {
+        return Err(format!("No checkpoint '{checkpoint_id}' on this node"));
+    }
+    let mut ledger = RunLedger::open(&paths.ledger_db).map_err(|error| error.to_string())?;
+    let frozen_process_id = {
+        let raw = std::fs::read_to_string(manifest_dir.join("manifest.json"))
+            .map_err(|error| format!("Could not read the checkpoint manifest: {error}"))?;
+        let manifest: little_monkey_lib::checkpoints::CheckpointManifest =
+            serde_json::from_str(&raw)
+                .map_err(|error| format!("Checkpoint manifest is invalid: {error}"))?;
+        manifest
+            .resume
+            .map(|resume| resume.process_id)
+            .ok_or_else(|| {
+                format!("Checkpoint '{checkpoint_id}' is a turn snapshot, not a frozen process")
+            })?
+    };
+    let run_id = ledger
+        .process_table()
+        .get(&frozen_process_id)
+        .map_err(|error| error.to_string())?
+        .and_then(|record| record.run_id)
+        .ok_or_else(|| {
+            format!("Frozen process '{frozen_process_id}' is not charged to a durable run, so there is no chain to hand over")
+        })?;
+    let spec = ledger
+        .load_run(&run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Unknown durable run '{run_id}'"))?
+        .spec;
+
+    let mut image = migrate::build_image(
+        &app_data_dir,
+        &host.runner_id,
+        checkpoint_id,
+        &spec,
+        // Placeholders. The real tip is only knowable after the departure is
+        // appended, which only happens once the preflight has passed.
+        1,
+        &"0".repeat(64),
+        required_residency.map(str::to_string),
+    )?;
+
+    let preflight = client::call(
+        paths,
+        alias,
+        Method::POST,
+        "/v1/remote/node/migration/preflight",
+        serde_json::to_vec(&protocol::MigrationPreflightRequest {
+            protocol_version: protocol::REMOTE_PROTOCOL_VERSION,
+            header: image.header.clone(),
+        })
+        .map_err(|error| error.to_string())?,
+        now_ms()?,
+    )
+    .await?;
+    let acceptable = preflight
+        .get("verdict")
+        .and_then(|verdict| verdict.get("state"))
+        .and_then(serde_json::Value::as_str)
+        == Some("acceptable");
+    if !acceptable || dry_run {
+        print_json(preflight)?;
+        if !acceptable {
+            return Err("The target node refused this image; nothing was transferred.".to_string());
+        }
+        println!("Dry run: the target would accept this image. Nothing was transferred.");
+        return Ok(());
+    }
+
+    let departure_event = RunEvent::MigrationDeparted {
+        target_node_id: preflight
+            .get("node")
+            .and_then(|node| node.get("runner_id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "The target did not identify itself".to_string())?
+            .to_string(),
+        payload_sha256: image.header.payload_sha256.clone(),
+        checkpoint_id: checkpoint_id.to_string(),
+    };
+    let now = now_ms()?;
+    let sequence = ledger
+        .load_run(&run_id)
+        .map_err(|error| error.to_string())?
+        .map(|run| run.last_sequence + 1)
+        .ok_or_else(|| format!("Unknown durable run '{run_id}'"))?;
+    ledger
+        .append_event(&RunEventEnvelope {
+            schema_version: RUN_PROTOCOL_SCHEMA_VERSION,
+            event_id: format!("evt-depart-{}", &image.header.payload_sha256[..24]),
+            run_id: run_id.clone(),
+            sequence,
+            occurred_at_ms: now,
+            actor_id: None,
+            emitter: ClientIdentity {
+                client_id: host.runner_id.clone(),
+                instance_id: host.runner_id.clone(),
+                kind: ClientKind::Cli,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            event: departure_event,
+        })
+        .map_err(|error| error.to_string())?;
+    let departure = ledger
+        .migration_departure(&run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "The departure did not chain on this node".to_string())?;
+    image.origin_last_sequence = departure.sequence;
+    image.origin_last_event_hash = departure.event_hash.clone();
+
+    let receipt = client::call(
+        paths,
+        alias,
+        Method::POST,
+        "/v1/remote/node/migration/accept",
+        serde_json::to_vec(&protocol::MigrationAcceptRequest {
+            protocol_version: protocol::REMOTE_PROTOCOL_VERSION,
+            image,
+        })
+        .map_err(|error| error.to_string())?,
+        now_ms()?,
+    )
+    .await?;
+    print_json(receipt)?;
+    println!(
+        "Handed run {run_id} to '{alias}'. The origin's chain ends at sequence {} ({}), which the target's first event names.",
+        departure.sequence, departure.event_hash
+    );
     Ok(())
 }
 

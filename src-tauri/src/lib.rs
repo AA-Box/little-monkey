@@ -208,6 +208,13 @@ pub mod triage;
 // Tauri-free static-registry + comparison logic shared by `providers.rs`'s
 // cloud-model command and `m3_runtime_hub.rs`'s local-model staleness check.
 pub mod model_retirement;
+// Remote node as a scheduled device (roadmap K17): the placement plane's wire
+// shapes and its pure decisions — which node qualifies, which one wins, whether
+// a node is still alive, and what a vanished node means for the work placed on
+// it. Tauri-free and I/O-free so the daemon binary, the CLI controller, and the
+// desktop all read the same contract, and so every decision is testable without
+// the second machine the rest of K17 genuinely needs.
+pub mod node_placement;
 // `pub` so `monkey-cli`'s `Stacks` subcommand (RAG design doc, slice 4) can call
 // `stacks::query_stacks` directly, the same AppHandle-free-core reasoning as
 // `checkpoints`/`rules`/`memory`. The registry half it also needs comes from
@@ -287,6 +294,12 @@ pub mod run_protocol;
 // idempotency, leases, triggers, and the migration-controlled profile schema.
 // Like the protocol module, this remains reusable by non-Tauri clients.
 pub mod run_ledger;
+// The portable form of K13's frozen process image, plus the target node's
+// admission decision over it (roadmap K18). Kept out of `checkpoints` because
+// nothing here needs an AppHandle and both halves of a migration — the desktop
+// that freezes and the daemon's remote runner that receives — have to build the
+// same types.
+pub mod migration;
 // The one place a run-less subsystem writes to the unified event stream
 // (`run_ledger`'s `subsystem_events`). Public because the three writing contexts
 // — desktop, a process that owns its data directory, and a disabled test — do
@@ -1467,6 +1480,11 @@ pub fn run() {
             daemon_commands::remote_pair_revoke,
             daemon_commands::remote_pair_rotate,
             daemon_commands::remote_audit,
+            daemon_commands::remote_node_list,
+            daemon_commands::remote_placements,
+            daemon_commands::remote_node_refresh,
+            daemon_commands::remote_placement_sync,
+            daemon_commands::remote_node_label,
             m5_delivery::m5_delivery_prepare_mutation,
             m5_delivery::m5_delivery_execute_mutation,
             m5_delivery::m5_delivery_list_worktrees,

@@ -42,13 +42,18 @@ export const studioLocale: Record<string, string> = {
   // Outpainting. Presented as extending rather than as a canvas, because that
   // is what the buttons do: each press grows one side and asks the model to
   // fill it.
+  "Studio.mask.zoomIn": "Zoom in",
+  "Studio.mask.zoomOut": "Zoom out",
+
   "Studio.outpaint.title": "Extend the picture",
   "Studio.outpaint.hint":
-    "Grows the image on one side and fills the new space to match. Press again to keep going. The seam is blended by letting the model repaint a thin strip of the existing picture.",
+    "Grows the image by the chosen number of pixels on one side and fills the new space to match. Press again to keep going. The seam is blended by letting the model repaint a thin strip of the existing picture.",
   "Studio.outpaint.left": "Extend to the left",
   "Studio.outpaint.right": "Extend to the right",
   "Studio.outpaint.up": "Extend upwards",
   "Studio.outpaint.down": "Extend downwards",
+  "Studio.outpaint.undo": "Undo the last extension",
+  "Studio.outpaint.redo": "Redo the undone extension",
 
   "Studio.preprocess.label": "Turn this photo into a hint map",
   "Studio.preprocess.placeholder": "Leave as it is",
@@ -262,6 +267,8 @@ export const studioLocale: Record<string, string> = {
   "Studio.mask.paint": "Paint",
   "Studio.mask.erase": "Erase",
   "Studio.mask.clear": "Clear",
+  "Studio.mask.undo": "Undo the last stroke",
+  "Studio.mask.redo": "Redo the undone stroke",
   "Studio.mask.loading": "Loading the source image…",
   "Studio.mask.hint":
     "Paint over what should be redrawn; everything unpainted is kept. Mask is {{width}}×{{height}}, matching the source.",

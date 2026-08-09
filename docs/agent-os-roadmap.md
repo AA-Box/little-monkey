@@ -4563,7 +4563,7 @@ accelerator — there is no accelerator-keyed route anywhere. Proving execution
 *per backend* means running real work on real hardware, which is a per-machine
 claim this repo's CI cannot make for any backend but its own.
 
-## K17. Remote node as a scheduled device *(scoped; not started)*
+## K17. Remote node as a scheduled device *(built)*
 
 **Today:** a paired user-owned runner over direct/Tailscale/SSH-forwarded
 HTTPS with pinned TLS, scoped credentials, rotation/revocation, replay
@@ -4682,21 +4682,193 @@ matching, policy validation) unit-tested, and the wire path exercised against a
 loopback node in an integration test that is explicitly *not* a substitute for
 two real hosts. State that in the PR rather than letting a green run imply it.
 
+### Built
+
+**The second plane exists.** `node_placement.rs` is the contract and the four
+decisions — does a node qualify, which qualifying node wins, is a node alive,
+and what a vanished node means for the work on it — with no I/O and no Tauri, so
+both binaries read the same rules and every rule is testable on one machine.
+The transport is reused untouched: pinned TLS, signed and replay-proof requests,
+scoped capabilities, rotation and revocation.
+
+- **S1.** `GET /v1/remote/node` answers with the `HardwareSnapshot`, the
+  backends, the resident models, and an **operator-set** data-residency label
+  (`monkey daemon remote node-label`). Nothing infers residency; an unset label
+  is `unspecified` and never satisfies a rule naming a real zone. Each backend
+  carries K16's `execution_support` rather than the detector's `available`, so a
+  node that merely *detects* ROCm advertises exactly that and is refused for a
+  run requiring it. `GET /v1/remote/node/health` is the cheap half, because a
+  placer polling every node every 30 s must not make each one fork `nvidia-smi`.
+- **S2.** `POST /v1/remote/node/runs` takes a frozen `RunSpec`. The node mints
+  its **own** run id — adopting a foreign one would let a submitter choose a
+  local identity — and both ids travel back. It re-checks the residency rule and
+  the runner identity rather than trusting the placer's word, and a spec it has
+  already placed resolves to the same placement instead of a second run.
+- **S3.** The travelled policy is enforced, and two things had to be true for
+  that. The spec's `PermissionPolicySnapshot` and `RunBudgets` ride verbatim in
+  `recipe.placed_run`, because a recipe has nowhere to put an egress allowlist
+  and a re-derived policy would silently be the *node's*. And
+  `monkey-cli task run` now installs an egress policy source from the spec it
+  froze and runs the turn inside `RunScope::run` — before this, a frozen
+  allowlist was enforced in the desktop app and ignored in every headless run,
+  placed or local. `bypass` is refused on arrival: a placed run is unattended
+  here by definition.
+- **S4.** The placing daemon heartbeats every node it has placed work on, every
+  `HEARTBEAT_INTERVAL_MS`, from its own serve loop — every machine is both a
+  node and a placer, so there is no separate controller process to put it in.
+  Three missed beats drop a node from ranking; ten declare its work lost.
+  Re-placement is **not** automatic: a vanished node's run may have completed
+  its external side effects and this machine cannot know, which is the same rule
+  `reconcile_interrupted` already holds to for confirmed mutations.
+- **S5.** `select_node` places by capability and the node's own admission
+  verdict, and **says that measured throughput is not an input**. That is the
+  documented resolution of the acceptance's collision with the benchmark
+  surface's invariant — no number is displayed that was not measured on the
+  machine displaying it. The upgrade has a stated trigger rather than a plan.
+
+**All three targets place, both inventories are advertised, and Run Center
+shows it.** The first cut of this entry shipped with three stated gaps; they are
+closed, and each is worth a line because the fix was structural rather than a
+flag.
+
+- **A `ManagedLlama` placement runs.** The gap was real: `RecipeTarget` had no
+  managed-runtime option, and the reason it could not simply reuse `local_url`
+  is that the managed runtime *is not listening* — it starts on a fresh loopback
+  port when the run starts, so any origin written at placement time would be
+  wrong by the time it ran. `RecipeTarget::managed_model` is that fourth,
+  mutually-exclusive option: it names a model id, the receiving node resolves it
+  against **its own** hub inventory (never the spec's `model_path`, which is a
+  location on the submitter's disk), and the executing process starts the app's
+  own verified `llama-server` for exactly the life of the run. A node without
+  that model refuses by name instead of failing at spawn. Hand-authored recipes
+  gain the same target, which was a genuine gap independent of placement.
+- **`resident_models` covers Ollama too.** Omitting it was not cosmetic:
+  `select_node`'s strongest key is "the model is already resident", and a node's
+  Ollama models are precisely the local weights a placement wants to avoid
+  re-pulling — so a whole class of placements ranked as if every node were cold.
+  The handler is synchronous, so the listing runs under `block_in_place`, guarded
+  on the runtime flavour; no runtime, or an Ollama that is not running, degrades
+  to hub-only rather than failing the description.
+- **Run Center shows the nodes and the placements**, with each node's liveness
+  and each placement's *deciding key* — why that node, not only which one. It is
+  read-only by design: placing a run means authoring a frozen `RunSpec`, and a
+  button that quietly composed one would invent the policy S3 exists to protect.
+  The two actions are the two that only ask — re-describe, and re-read.
+
+The CLI remains the full surface (`node-label`, `node-refresh`, `node-list`,
+`place`, `placements`, `placement-sync`).
+
+**And what a green run here does not mean.** Everything past S1 needs two
+machines. The routes are exercised through the real signed-request choke point —
+signature verification, replay reservation, capability gate — with a fake
+placement queue, and the enforcement of a travelled allowlist is proven end to
+end *within one process*. Neither is a substitute for two real hosts, and no
+test here claims to be one.
+
 ## K18. Live migration
 
-**Today:** nothing. Requires K13 and K17.
+**Shipped.** `monkey daemon remote migrate <alias> --checkpoint <id>` moves a frozen
+process image to a paired node, that node refuses it when it cannot satisfy the
+process's requirements, and the move is one hash chain across both machines.
 
-K13 is built — a process freezes into a durable image at a tool boundary and
-re-enters from it. What K18 adds on top is the wire: the image moving to another
-owned node, that node refusing it when it cannot satisfy the process's
-requirements, and one ledger event chain spanning both machines.
+**The inversion K18 makes, and it is the one decision everything else follows
+from.** K13's image *references* rather than copies — the conversation is in the
+profile store, the files are in the checkpoint's entries, an approval is a
+`permission_decisions` row — because on one machine a second copy could only
+disagree with the first. Across two machines there is no first copy to disagree
+with: the target has none of the workspace, none of the backups, no session and
+no run row. So `migration::MigrationImage` copies exactly where K13 points, and
+that is why it is a separate type rather than another field on the manifest.
 
-So this is **K17's S1–S4 plus a transport for the image**, and its refusal is
-already half-written: `Restorability` is a tagged union whose blockers are
-`WorkspaceGone` / `ModelNotResident` / `ApprovalExpired`, and those are exactly
-the questions a *target node* has to answer about an incoming image. The one
-genuinely new piece is the cross-node chain, since `run_events` hash-chains per
-run on one machine and a migrated run has two halves.
+- **The refusal is K13's, reused rather than restated.** `admit` calls
+  `checkpoints::restorability` and adds only what is specific to a *move*:
+  `ProtocolUnsupported`, `RuntimeMissing`, `RunAlreadyPresent`, `ImageTooLarge`,
+  `DataResidencyRefused`. `WorkspaceGone` is deliberately unreachable — the image
+  carries the workspace, so the target creates it and it cannot be the thing that
+  is missing. Every blocker is reported at once, for `restorability`'s reason
+  doubled: across two machines each round of "fix one, discover the next" is a
+  transfer.
+- **A preflight refuses before a byte of workspace crosses.**
+  `POST /v1/remote/node/migration/preflight` answers from the header alone. It is an
+  optimisation and never the authority: `accept` runs the *same* `admit` against
+  the same header, because a target that trusted a preflight would be trusting
+  the sender's copy of facts about itself.
+- **The cross-node chain is a hash inside a hashed envelope, not a column.**
+  `run_events` chains per run on one machine, and no database spans both. The
+  origin appends `MigrationDeparted`; its event hash *is* the origin's tip; the
+  target's first event is `MigrationArrived`, which names that hash. Because
+  `envelope_json` is already covered by `event_chain_hash`, the seam cannot be
+  edited on the target without breaking the target's own chain.
+  `join_migration_chain` is what an auditor holding both halves runs, and it is a
+  tagged union so "joined" cannot be read off a chain that does not meet.
+- **The departure is appended before the image is sent, and a refused departure
+  stays in history.** The arrival has to name a tip that already exists. A
+  departure is therefore an *attempt*: it is not terminal and changes no status,
+  so a run the target refused carries on at home — and only the chain *tip* may
+  anchor a join, so a superseded departure cannot be passed off as a handover.
+- **Landing aims at the desktop's own K13 re-entry, and adds no second resume
+  path.** `frozenTurn.ts` already resumes a frozen turn: it finds the checkpoint
+  whose `resume.process_id` matches a suspended `chat_turn` row and continues the
+  conversation. So landing writes exactly the three places that path reads — the
+  checkpoints directory, `chat_sessions.json`, and `agent_processes` — with every
+  path re-rooted at the local workspace and `resume.process_id` rewritten to the
+  *local* row. A manifest whose entries cannot be re-rooted is refused rather
+  than landed half-translated. Paths are re-rooted as *native* paths, which is
+  also the honest limit on a cross-OS move: an image whose entries are Windows
+  paths cannot be re-rooted under a POSIX workspace, and that is refused rather
+  than half-translated.
+- **Policy travels because the frozen `RunSpec` is what the target inserts.**
+  Its `PermissionPolicySnapshot` and `RunBudgets` go into the target's own
+  ledger unmodified, which is what `egress.rs` then resolves by run id — the run
+  is governed on the new node by what the origin declared, not by the target's
+  defaults. This is K17's S2/S3 as far as a migrated run needs them.
+- **`MIGRATION_CAVEATS` ships beside the verdict**, appended to K13's
+  `DETERMINISM_CAVEATS`, for the same reason K13 gives: the reader who needs it
+  is whoever is deciding to press Migrate. It names only what is *not* preserved
+  — the machine changed, absolute paths moved, nothing outside the workspace
+  travelled, credentials were never in the image, and the origin still holds its
+  copy.
+- **It sits on K17's placement plane rather than beside it.** A migration *is*
+  a placement — a `RunSpec` this node did not author — plus the frozen image
+  that turns it into a continuation, so the routes are
+  `POST /v1/remote/node/migration/{preflight,accept}`, the target is chosen from
+  the `GET /v1/remote/node` descriptor K17 already serves, and admission reads
+  that descriptor rather than probing a second time. There is no second node
+  route, no second residency rule and no second hardware probe.
+- **`Migrate` is its own capability and requires `place_runs`.** Folding it into
+  `place_runs` would have been smaller and wrong: placing a run submits a spec
+  the node executes under its own workspace and its own conversation, while a
+  migration additionally writes a workspace tree, a checkpoint and a
+  *conversation* onto the machine — into the same session list the local user
+  reads. An operator who wanted a scheduler to place work did not thereby agree
+  to transcripts appearing in their chat history.
+- **Residency is K17's rule, unchanged.** The origin states the residency it
+  required and the node checks it against its own label rather than trusting it,
+  because a rule only the sender enforces is not enforced — and across two owned
+  machines an alias really can start pointing at a different host.
+
+**One honest widening, stated because it is a real difference from K13.** The
+node descriptor's `resident_models` is the managed hub's installed inventory. K13's
+`ModelNotResident` asks what the next round trip would reach, which on the
+machine running the turn is what is loaded; a target is idle by definition, so
+asking the same question there would refuse every migration to every idle node.
+What a target can promise is that the model is here and will load; what it still
+refuses is a model it does not have at all.
+
+**One unrelated bug this had to fix to be usable at all.** `pair-create` took
+`--workspace` for a workspace *id* while the CLI's global `--workspace` is a
+filesystem path declared `global = true`, so the two collided on clap's own
+uniqueness assert and the subcommand aborted before parsing anything. It is now
+`--workspace-id`. Nothing could have depended on the old spelling: the command
+panicked.
+
+**What none of this proves.** Every path past the image itself needs two
+machines, and this repository's CI has one. Pure functions — admission, the
+chain join, path re-rooting, digests — are unit-tested; the wire path is
+exercised end to end against a **loopback node** through the real signed
+transport, the real routes, the real ledger and real files on disk. That is not
+a substitute for two hosts: nothing here exercises a network, clock skew between
+machines, or a partial transfer.
 
 **Acceptance:** a frozen process image moves to another owned node and resumes
 there, with a stated list of what does not survive the move and a refusal when

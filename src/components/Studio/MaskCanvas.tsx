@@ -15,7 +15,7 @@
  * thing that makes inpainting usable.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Eraser, Paintbrush, Trash2 } from "lucide-react";
+import { Eraser, Paintbrush, Redo2, Trash2, Undo2, ZoomIn, ZoomOut } from "lucide-react";
 
 import { Button, IconButton } from "../ui";
 import { useT } from "../../lib/i18n";
@@ -25,6 +25,25 @@ import { useT } from "../../lib/i18n";
 const MIN_BRUSH = 8;
 const MAX_BRUSH = 256;
 const DEFAULT_BRUSH = 64;
+
+/** Zoom stops. 1 fits the column; past that the container scrolls, which is
+ *  what gives panning for free rather than a drag mode that would fight the
+ *  brush for the same pointer. */
+const ZOOM_STOPS = [1, 2, 3, 4] as const;
+
+/** Steps between stops, clamping at each end. Written against the list so a
+ *  stop added or removed needs no other change. */
+export const nextStop = (current: number) =>
+  ZOOM_STOPS.find((stop) => stop > current) ?? ZOOM_STOPS[ZOOM_STOPS.length - 1];
+export const previousStop = (current: number) =>
+  [...ZOOM_STOPS].reverse().find((stop) => stop < current) ?? ZOOM_STOPS[0];
+
+/** How many strokes back undo reaches. Each entry is a full PNG of the mask —
+ *  cheap for the mostly-black images a mask is, but not free on a 2048px
+ *  source, so the tail is dropped rather than kept forever.
+ *  ponytail: whole-canvas snapshots, switch to dirty-rect diffs if a long
+ *  session on a large image gets heavy. */
+const MAX_UNDO = 24;
 
 interface Props {
   /** Bare base64 (no data URL prefix) of the image being painted over. */
@@ -44,8 +63,25 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
   const [brush, setBrush] = useState(DEFAULT_BRUSH);
   const [erasing, setErasing] = useState(false);
   const [size, setSize] = useState<{ width: number; height: number } | null>(null);
+  /** The mask as it stood before each stroke, and — once undone — the strokes
+   *  taken back. `null` is a legal entry: it is the empty mask, which is where
+   *  the first stroke and every clear start from. */
+  const [past, setPast] = useState<(string | null)[]>([]);
+  const [future, setFuture] = useState<(string | null)[]>([]);
+  /** The mask at `pointerdown`, held until the stroke commits: what undo has to
+   *  put back is where the canvas was before the brush touched it, not where it
+   *  is once the stroke has been painted. */
+  const before = useRef<string | null>(null);
+
+  const [zoom, setZoom] = useState(1);
 
   const source = `data:image/png;base64,${imageBase64}`;
+
+  /** The mask the parent is holding, read inside the load effect without making
+   *  it a dependency — see the effect's own note on why `onChange` is excluded
+   *  for the same reason. */
+  const incoming = useRef(value);
+  incoming.current = value;
 
   // Sizing the canvas to the source resets it, which is correct: a mask drawn
   // over one image means nothing over another.
@@ -63,7 +99,29 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
       if (!context) return;
       context.fillStyle = "#000";
       context.fillRect(0, 0, element.width, element.height);
-      onChange(null);
+      // The history describes strokes over the old image. Over this one they
+      // are meaningless, so undo starts empty rather than able to paste a mask
+      // drawn for something else.
+      setPast([]);
+      setFuture([]);
+      setZoom(1);
+
+      // Unless the parent supplied a mask *for this image*. Extending the
+      // picture hands over a new source and the mask marking the new margin in
+      // the same update, and clearing unconditionally threw that mask away — so
+      // the margin the user asked to have filled reached the engine unmarked,
+      // and the run repainted everything or nothing rather than the new ground.
+      const supplied = incoming.current;
+      if (!supplied) {
+        onChange(null);
+        return;
+      }
+      const mask = new Image();
+      mask.onload = () => {
+        if (cancelled) return;
+        context.drawImage(mask, 0, 0, element.width, element.height);
+      };
+      mask.src = `data:image/png;base64,${supplied}`;
     };
     image.src = source;
     return () => {
@@ -113,28 +171,82 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
   const commit = useCallback(() => {
     const element = canvas.current;
     if (!element) return;
+    const previous = before.current;
+    setPast((current) => [...current, previous].slice(-MAX_UNDO));
+    // A new stroke is a new branch: what was undone is no longer ahead of us.
+    setFuture([]);
     onChange(element.toDataURL("image/png").split(",")[1] ?? null);
   }, [onChange]);
+
+  /** Repaints the canvas to hold exactly `mask` — black everywhere when it is
+   *  null, which is what an empty mask is. */
+  const paint = (mask: string | null) => {
+    const element = canvas.current;
+    const context = element?.getContext("2d");
+    if (!element || !context) return;
+    context.fillStyle = "#000";
+    context.fillRect(0, 0, element.width, element.height);
+    if (!mask) return;
+    const image = new Image();
+    image.onload = () => context.drawImage(image, 0, 0, element.width, element.height);
+    image.src = `data:image/png;base64,${mask}`;
+  };
+
+  /** Moves one step through the stroke history. Undo and redo are the same move
+   *  with the stacks swapped — where you are goes onto the other stack, so the
+   *  step is reversible in either direction. */
+  const step = (direction: "undo" | "redo") => {
+    const from = direction === "undo" ? past : future;
+    if (from.length === 0) return;
+    const target = from[from.length - 1] ?? null;
+    const here = value;
+    const drop = (current: (string | null)[]) => current.slice(0, -1);
+    const push = (current: (string | null)[]) => [...current, here];
+    if (direction === "undo") {
+      setPast(drop);
+      setFuture(push);
+    } else {
+      setFuture(drop);
+      setPast(push);
+    }
+    paint(target);
+    onChange(target);
+  };
 
   const clear = () => {
     const element = canvas.current;
     const context = element?.getContext("2d");
     if (!element || !context) return;
+    // Undoable like any stroke: clearing a mask by accident is exactly the
+    // thing worth taking back.
+    setPast((current) => [...current, value].slice(-MAX_UNDO));
+    setFuture([]);
     context.fillStyle = "#000";
     context.fillRect(0, 0, element.width, element.height);
     onChange(null);
   };
 
   return (
-    <div className="flex flex-col gap-2">
-      <div className="relative max-h-80 w-fit overflow-hidden rounded-md border border-border">
-        <img src={source} alt="" className="block max-h-80 w-auto select-none" draggable={false} />
+    // `min-w-0`: a grid or flex item's automatic minimum is its own min-content,
+    // and the brush row's is set by the range input — whose intrinsic width is
+    // around 130px whatever `min-width` says. Without this the whole painter
+    // refuses to go below roughly 330px, so in a narrower column the picture,
+    // `Clear` and the brush readout all hang past the right edge of every
+    // settings card beside them.
+    <div className="flex min-w-0 flex-col gap-2">
+      {/* `overflow-auto` rather than a drag-to-pan mode: past 1× the content is
+          wider than the box and the browser's own scrolling moves it, which
+          costs no code and never competes with the brush for the pointer. */}
+      <div className="max-h-80 overflow-auto rounded-md border border-border">
+        <div className="relative w-fit" style={{ width: `${zoom * 100}%` }}>
+        <img src={source} alt="" className="block w-full select-none" draggable={false} />
         <canvas
           ref={canvas}
           className="absolute inset-0 h-full w-full cursor-crosshair opacity-50 mix-blend-screen"
           onPointerDown={(event) => {
             event.currentTarget.setPointerCapture(event.pointerId);
             painting.current = true;
+            before.current = value;
             const point = at(event);
             last.current = point;
             stroke(null, point);
@@ -161,18 +273,79 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
             commit();
           }}
         />
+        </div>
+      </div>
+
+      <div className="flex items-center gap-1.5 text-xs">
+        <IconButton
+          size="sm"
+          aria-label={t("Studio.mask.zoomOut")}
+          title={t("Studio.mask.zoomOut")}
+          disabled={zoom <= ZOOM_STOPS[0]}
+          onClick={() => setZoom(previousStop)}
+        >
+          <ZoomOut size={12} />
+        </IconButton>
+        <IconButton
+          size="sm"
+          aria-label={t("Studio.mask.zoomIn")}
+          title={t("Studio.mask.zoomIn")}
+          disabled={zoom >= ZOOM_STOPS[ZOOM_STOPS.length - 1]}
+          onClick={() => setZoom(nextStop)}
+        >
+          <ZoomIn size={12} />
+        </IconButton>
+        <span className="font-mono text-[11px] text-faint">{zoom}×</span>
+        {/* Pushed to the far end of the zoom row rather than sharing the brush
+            row below: it is the one destructive control here, and a labelled
+            button beside the slider is what left the slider no width. */}
+        <Button
+          size="sm"
+          variant="secondary"
+          className="ml-auto"
+          onClick={clear}
+          disabled={!value}
+        >
+          <Trash2 size={12} />
+          {t("Studio.mask.clear")}
+        </Button>
       </div>
 
       <div className="flex items-center gap-2 text-xs">
         <IconButton
           size="sm"
+          className="shrink-0"
           aria-label={t(erasing ? "Studio.mask.paint" : "Studio.mask.erase")}
           aria-pressed={erasing}
           onClick={() => setErasing((current) => !current)}
         >
           {erasing ? <Paintbrush size={12} /> : <Eraser size={12} />}
         </IconButton>
-        <label className="flex flex-1 items-center gap-2">
+        <IconButton
+          size="sm"
+          className="shrink-0"
+          aria-label={t("Studio.mask.undo")}
+          title={t("Studio.mask.undo")}
+          disabled={past.length === 0}
+          onClick={() => step("undo")}
+        >
+          <Undo2 size={12} />
+        </IconButton>
+        <IconButton
+          size="sm"
+          className="shrink-0"
+          aria-label={t("Studio.mask.redo")}
+          title={t("Studio.mask.redo")}
+          disabled={future.length === 0}
+          onClick={() => step("redo")}
+        >
+          <Redo2 size={12} />
+        </IconButton>
+        {/* `min-w-0` on both: a range input's intrinsic width is around 130px
+            and a flex item does not shrink past its content by default, so the
+            slider held the row wider than the panel and pushed its own readout
+            off the edge. */}
+        <label className="flex min-w-0 flex-1 items-center gap-2">
           <span className="shrink-0 text-muted">{t("Studio.mask.brush")}</span>
           <input
             type="range"
@@ -181,14 +354,15 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
             step={4}
             value={brush}
             onChange={(event) => setBrush(Number(event.target.value))}
-            className="flex-1"
+            className="min-w-0 flex-1"
           />
-          <span className="w-10 shrink-0 text-right font-mono text-[11px] text-faint">{brush}</span>
+          {/* Fixed at `3ch` — the widest value in a monospace font — so the
+              slider keeps its width as the number grows rather than resizing
+              under the cursor mid-drag. Aligned left, because right-aligning it
+              put that spare width between the slider and the digits, which read
+              as a wider gap there than the one before the slider. */}
+          <span className="w-[3ch] shrink-0 font-mono text-[11px] text-faint">{brush}</span>
         </label>
-        <Button size="sm" variant="secondary" onClick={clear} disabled={!value}>
-          <Trash2 size={12} />
-          {t("Studio.mask.clear")}
-        </Button>
       </div>
       <p className="text-[11px] text-faint">
         {size
