@@ -1224,6 +1224,135 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A confined run must keep working when the caller sets it up the way
+    /// `sandbox::execute_in_sandbox` does, not just the way the tests above do.
+    ///
+    /// The tests above prove `run_confined` in isolation — one granted directory,
+    /// a two-key environment, a working directory that *is* the granted root, and
+    /// a command with no variables in it. `execute_in_sandbox` differs from that
+    /// in four ways at once, and #290's windows-latest failure lives somewhere in
+    /// the gap: it reports exit 0 with both streams empty, which for a command
+    /// ending in `dir /b` over two directories means the child ran nothing at all
+    /// (`dir` is not silent on either stream, even when it fails).
+    ///
+    /// So this adds those four differences one at a time, and each rung asserts
+    /// the same trivially-true thing — the child printed its marker. The first
+    /// rung that goes red names the difference that breaks the run, which is
+    /// what a single CI run on this platform has to buy.
+    #[tokio::test]
+    async fn a_confined_run_survives_the_setup_its_real_caller_uses() {
+        let root = std::env::temp_dir().join(format!("lm-ac-caller-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Created before the grant below, exactly as `execute_in_sandbox` creates
+        // its home and tmp before asking for the container: an inheritable ACE
+        // reaches existing children only if `SetNamedSecurityInfoW` propagates
+        // it, and nothing here has ever tested that it does.
+        let workspace = root.join("workspace");
+        let home = root.join("home");
+        let tmp = root.join("tmp");
+        for dir in [&workspace, &home, &tmp] {
+            std::fs::create_dir_all(dir).expect("sandbox subdirectory");
+        }
+
+        let Ok(container) = create_app_container("callertest") else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "no AppContainer on this CI runner, so nothing this test exists for ran"
+            );
+            return;
+        };
+        container.grant_tree_access(&root).expect("grant");
+
+        let system_root = (
+            "SystemRoot".to_string(),
+            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
+        );
+        // What `sandbox::allowlisted_env` produces, taken from the function itself
+        // rather than restated, so a change there cannot leave this rung testing
+        // an environment the caller no longer sends.
+        let full_env = crate::sandbox::allowlisted_env(&home, &tmp, &[]);
+
+        let rungs: [(&str, std::path::PathBuf, Vec<(String, String)>, &str); 4] = [
+            // The baseline the tests above already prove, re-run here only so a
+            // red rung below is a difference and not the whole mechanism.
+            (
+                "granted root as cwd",
+                root.clone(),
+                vec![system_root.clone()],
+                "echo marker",
+            ),
+            // 1: cwd is a pre-existing subdirectory of the granted tree.
+            (
+                "subdirectory as cwd",
+                workspace.clone(),
+                vec![system_root.clone()],
+                "echo marker",
+            ),
+            // 2: the caller's full environment, whose PATH names directories this
+            //    container has no grant on, and whose TMP/TEMP point inside it.
+            (
+                "caller's environment",
+                workspace.clone(),
+                full_env.clone(),
+                "echo marker",
+            ),
+            // 3: the command reads those variables and writes through them, which
+            //    is every remaining difference from #290's script.
+            (
+                "variables and a write through them",
+                workspace.clone(),
+                full_env.clone(),
+                "echo marker & (echo probe> \"%USERPROFILE%\\probe\") \
+                 & if not exist \"%USERPROFILE%\\probe\" exit /b 74 \
+                 & dir /b \"%USERPROFILE%\"",
+            ),
+        ];
+
+        for (label, cwd, env, command) in rungs {
+            let output = run_confined(
+                Some(&container),
+                &create_job().expect("job"),
+                command,
+                &cwd,
+                &env,
+                false,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("the confined run itself must work");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("marker"),
+                "a confined run printed nothing once the caller's setup added \
+                 \"{label}\", so that is the difference #290 is failing on: \
+                 exit={:?} stdout={:?} stderr={:?}",
+                output.exit_code,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        // The other half of #290's failure, and a separate claim from the one
+        // above: the container's own `if not exist` guard passed on the last rung,
+        // so the file exists as far as the child is concerned. Whether the host
+        // still sees it afterwards is what #290 asserts and what fails there.
+        assert!(
+            home.join("probe").is_file(),
+            "the child's own guard found the probe it wrote under {}, but the host \
+             cannot see it afterwards; home contains [{}]",
+            home.display(),
+            match std::fs::read_dir(&home) {
+                Ok(entries) => entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                Err(error) => format!("<unreadable: {error}>"),
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Network is denied unless the run asked for it, which for an AppContainer is
     /// the absence of a capability rather than a filter.
     ///
