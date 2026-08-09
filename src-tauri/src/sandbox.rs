@@ -2859,11 +2859,17 @@ mod tests {
         write(&allowed_file, "sandbox-visible");
         write(&forbidden_file, "must-stay-secret");
 
-        let canonical_sandbox = fs::canonicalize(&sandbox_root).expect("canonical sandbox");
+        // `plain_canonical`, not `fs::canonicalize`, for the reason the shared
+        // arm gives above — and Windows is the platform that reason is about.
+        // `execute_in_sandbox` resolves through it and hands the child the
+        // prefix-free `C:\...` form, so `%USERPROFILE%` never equals a verbatim
+        // `\\?\C:\...`. Comparing against the verbatim one exits 70 on the very
+        // first guard and the boundary below never runs.
+        let canonical_sandbox = plain_canonical(&sandbox_root).expect("canonical sandbox");
         let canonical_workspace =
-            fs::canonicalize(&workspace_dir).expect("canonical sandbox workspace");
+            plain_canonical(&workspace_dir).expect("canonical sandbox workspace");
         let canonical_forbidden =
-            fs::canonicalize(&forbidden_file).expect("canonical forbidden file");
+            plain_canonical(&forbidden_file).expect("canonical forbidden file");
         let expected_home = canonical_sandbox.join(SANDBOX_HOME_DIR);
         let expected_tmp = canonical_sandbox.join(SANDBOX_TMP_DIR);
 
