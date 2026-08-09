@@ -2360,7 +2360,12 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
 
       const now = Date.now();
       const hadUserMessage = target.messages.some((m) => m.role === "user");
-      const messages = [...target.messages, msg];
+      // Stamped here, the one place every message enters a transcript, so a
+      // streamed answer carries the time its turn started rather than the
+      // time its last token landed. Never overwritten on a patch (see
+      // `applyMessagePatch`), and stripped before every request by
+      // `toWireMessages`.
+      const messages = [...target.messages, msg.at === undefined ? { ...msg, at: now } : msg];
 
       const derivedText = msg.role === "user" ? textContent(msg.content).trim() : "";
       const title =
