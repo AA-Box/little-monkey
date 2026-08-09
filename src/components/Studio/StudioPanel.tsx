@@ -1535,38 +1535,37 @@ export function StudioPanel({ mode, railSlot }: Props) {
 
           {canMask && initImage && (
             <SettingsCard title={t("Studio.outpaint.title")} hint={t("Studio.outpaint.hint")}>
-              {/* Two rows, not one wrapping row. The seven controls do not fit
-                  the sidebar's width, so a single `flex-wrap` dropped the last
-                  arrow onto a line of its own — which reads as a broken layout
-                  rather than as three of one thing and four of another. */}
-              <div className="grid gap-1.5">
-                <div className="flex items-center gap-1.5">
-                  {OUTPAINT_STEPS.map((step) => (
-                    <Button
-                      key={step}
-                      size="sm"
-                      variant={outpaintStep === step ? "primary" : "secondary"}
-                      onClick={() => setOutpaintStep(step)}
-                    >
-                      {step}
-                    </Button>
-                  ))}
-                  <span className="text-[11px] text-faint">px</span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  {OUTPAINT_SIDES.map(({ side, labelKey, icon: Icon }) => (
-                    <IconButton
-                      key={side}
-                      size="sm"
-                      aria-label={t(labelKey)}
-                      title={t(labelKey)}
-                      disabled={extending}
-                      onClick={() => void extend(side)}
-                    >
-                      <Icon size={13} />
-                    </IconButton>
-                  ))}
-                </div>
+              {/* One row, and it only fits because it is kept tight: the unit
+                  moved into the card's hint and the gaps are 4px. `min-w-0` on
+                  the step buttons lets them shrink rather than forcing a wrap,
+                  and the divider is what stops "256" and "←" reading as one
+                  group of seven. */}
+              <div className="flex items-center gap-1">
+                {OUTPAINT_STEPS.map((step) => (
+                  <Button
+                    key={step}
+                    size="sm"
+                    className="min-w-0 px-2"
+                    variant={outpaintStep === step ? "primary" : "secondary"}
+                    onClick={() => setOutpaintStep(step)}
+                  >
+                    {step}
+                  </Button>
+                ))}
+                <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 bg-border" />
+                {OUTPAINT_SIDES.map(({ side, labelKey, icon: Icon }) => (
+                  <IconButton
+                    key={side}
+                    size="sm"
+                    className="shrink-0"
+                    aria-label={t(labelKey)}
+                    title={t(labelKey)}
+                    disabled={extending}
+                    onClick={() => void extend(side)}
+                  >
+                    <Icon size={13} />
+                  </IconButton>
+                ))}
               </div>
             </SettingsCard>
           )}

@@ -160,7 +160,14 @@ function encode(bitmap: Bitmap): string {
     0,
     0,
   );
-  return canvas.toDataURL("image/png").split(",")[1] ?? "";
+  // A zero-sized canvas encodes to the literal string `data:,` — no comma-
+  // separated payload — and the old `?? ""` turned that into an empty image
+  // the caller then stored as the user's picture, which reads in the UI as the
+  // picture having silently vanished. Refuse instead: a visible error is
+  // recoverable, a disappeared image is not.
+  const encoded = canvas.toDataURL("image/png").split(",")[1];
+  if (!encoded) throw new Error("That image could not be redrawn at its new size");
+  return encoded;
 }
 
 /**
@@ -181,6 +188,13 @@ export async function runOutpaint(
     source.onerror = () => reject(new Error("That image could not be read"));
     source.src = `data:image/png;base64,${base64}`;
   });
+
+  // `onload` can fire for an image that decoded to nothing, and every size
+  // downstream is derived from these two numbers — a zero here becomes a
+  // zero-sized canvas, which encodes to an empty string rather than failing.
+  if (!source.naturalWidth || !source.naturalHeight) {
+    throw new Error("That image could not be read");
+  }
 
   const canvas = document.createElement("canvas");
   canvas.width = source.naturalWidth;

@@ -44,7 +44,7 @@ export const studioLocale: Record<string, string> = {
   // fill it.
   "Studio.outpaint.title": "Extend the picture",
   "Studio.outpaint.hint":
-    "Grows the image on one side and fills the new space to match. Press again to keep going. The seam is blended by letting the model repaint a thin strip of the existing picture.",
+    "Grows the image by that many pixels on one side and fills the new space to match. Press again to keep going. The seam is blended by letting the model repaint a thin strip of the existing picture.",
   "Studio.outpaint.left": "Extend to the left",
   "Studio.outpaint.right": "Extend to the right",
   "Studio.outpaint.up": "Extend upwards",
