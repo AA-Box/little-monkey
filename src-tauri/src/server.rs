@@ -183,6 +183,7 @@ use crate::unified_http_server::{
     UnifiedGenerationSpec, UnifiedHttpServerState,
 };
 use crate::{ollama, providers, AppState};
+use crate::profiles::ProfileScopedPaths;
 
 /// LM Studio-compatible default port, so drop-in clients that hardcode 1234
 /// need no configuration at all.
@@ -753,8 +754,7 @@ impl From<&ApiServerConfig> for ApiServerConfigView {
 /// APP_IDENTIFIER, the same config-drift concern the design doc flags.
 pub fn config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     if !base.exists() {
         std::fs::create_dir_all(&base).map_err(|e| {
@@ -2061,7 +2061,7 @@ async fn handle_local_app_static(
     app_id: &str,
     rel_path: &str,
 ) -> Response<ResponseBody> {
-    let Ok(app_data_dir) = app.path().app_data_dir() else {
+    let Ok(app_data_dir) = app.profile_data_dir() else {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to resolve the app data directory",
@@ -2103,7 +2103,7 @@ async fn handle_local_app_run(
     {
         return not_found_response();
     }
-    let Ok(app_data_dir) = app.path().app_data_dir() else {
+    let Ok(app_data_dir) = app.profile_data_dir() else {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to resolve the app data directory",

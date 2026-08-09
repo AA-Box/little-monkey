@@ -27,9 +27,9 @@
 
 use std::path::{Path, PathBuf};
 
-use tauri::Manager;
 
 use crate::{workspace, AppState};
+use crate::profiles::ProfileScopedPaths;
 
 /// Filename looked for at the global app-data dir and at the top of every
 /// attached workspace root.
@@ -135,8 +135,7 @@ pub fn rules_read(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<RuleFile>, String> {
     let global_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
     let global_path = global_dir.join(RULE_FILE_NAME);
     let roots = workspace::all_roots(state.inner()).unwrap_or_default();
@@ -220,8 +219,7 @@ pub fn rules_write(
     content: String,
 ) -> Result<(), String> {
     let global_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
     let global_path = global_dir.join(RULE_FILE_NAME);
     write_rules_impl(

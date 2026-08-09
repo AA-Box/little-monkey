@@ -53,7 +53,8 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle};
+use crate::profiles::ProfileScopedPaths;
 
 /// Default target chunk size (characters), per `KnowledgeStack::chunk_chars`.
 pub(crate) const DEFAULT_CHUNK_CHARS: usize = 1600;
@@ -160,8 +161,7 @@ pub struct StackQueryResult {
 /// and `*_at` entry point takes a plain `&Path` and only the thin Tauri wrappers
 /// call this.
 pub(crate) fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
+    app.profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {e}"))
 }
 

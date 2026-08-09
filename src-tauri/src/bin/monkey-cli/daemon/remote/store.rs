@@ -10,6 +10,12 @@ use super::protocol::{
     RotationBundle, REMOTE_PROTOCOL_VERSION,
 };
 
+/// Profile-scoped (K23): the default profile keeps this exact service name,
+/// so credentials stored before profiles existed still resolve, and any other
+/// profile's secrets are a different keychain item entirely.
+static REMOTE_KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| little_monkey_lib::profiles::keychain_service("com.littlemonkey.remote"));
+
 const REMOTE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS pairing_invitations (
     pairing_id TEXT PRIMARY KEY,
@@ -202,7 +208,7 @@ pub struct KeyringRemoteSecrets;
 
 impl KeyringRemoteSecrets {
     fn entry(slot: &str) -> Result<keyring::Entry, String> {
-        keyring::Entry::new("com.littlemonkey.remote", slot).map_err(|error| error.to_string())
+        keyring::Entry::new(&REMOTE_KEYCHAIN_SERVICE, slot).map_err(|error| error.to_string())
     }
 }
 
