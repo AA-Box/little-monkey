@@ -24,8 +24,8 @@
 //! - `GET /tool/v1/manifest` → [`ToolManifest`], which *declares its own
 //!   inputs*. Studio renders its form from that declaration, so a tool adds UI
 //!   without shipping any: the manifest is the only thing standing between "a
-//!   new binary" and "a working panel". This is the A1111 feel — browse,
-//!   install, it appears — reached without an interpreter.
+//!   new binary" and "a working panel": browse, install, it appears — reached
+//!   without an interpreter.
 //! - `POST /tool/v1/run` with `{"inputs": {…}}` → [`ToolRunResponse`].
 //!
 //! Synchronous, unlike the diffusion engine's submit-and-poll: these
