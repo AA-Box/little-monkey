@@ -61,7 +61,7 @@ const MANIFEST_FILE: &str = "manifest.json";
 const MANIFEST_VERSION: u8 = 3;
 
 /// One file recorded in a checkpoint.
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Clone)]
 pub struct CheckpointEntry {
     /// Absolute path of the workspace file that was (about to be) mutated.
     pub path: String,
@@ -100,7 +100,7 @@ pub struct CheckpointEntry {
 /// `Vec<CheckpointEntry>` with no metadata — [`parse_manifest`] falls back
 /// to them and synthesizes defaults, so checkpoints written before the
 /// upgrade stay revertable without any migration pass.
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Clone)]
 pub struct CheckpointManifest {
     pub version: u8,
     /// Unix millis when the checkpoint's turn began.
@@ -492,6 +492,14 @@ fn checkpoints_base_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create checkpoints dir: {}", e))?;
     Ok(dir)
+}
+
+/// The same guard as [`validate_id`], for the out-of-crate callers that build a
+/// checkpoint path themselves — today the daemon's migration transport, which
+/// takes a checkpoint id off the wire and must not be able to join it onto the
+/// checkpoints directory unchecked.
+pub fn validate_checkpoint_id(id: &str) -> Result<(), String> {
+    validate_id(id)
 }
 
 /// Reject anything that isn't a plain UUID-shaped id, so a crafted id can
