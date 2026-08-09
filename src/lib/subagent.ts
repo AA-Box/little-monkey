@@ -33,6 +33,8 @@ import { honourPause, forgetPause } from './pauseRegistry';
 import { useSubagentStore } from '../store/subagentStore';
 import { useSessionStore } from '../store/sessionStore';
 import { useSettingsStore } from '../store/settingsStore';
+import { routeFromActive, type RoutedTarget } from './targetRouting';
+import type { RoutingDecision } from './modelRouting';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { protectToolResult } from './untrustedContent';
 import { mutationToolFailureReason } from './workspaceMutation';
@@ -151,23 +153,70 @@ function emptyMcpRegistry(): McpToolRegistry {
 }
 
 /**
- * Applies the optional per-profile model override (slice 4,
- * `settingsStore.subagentProfileModels`) on top of the parent's own
- * already-resolved `target`, if the user configured one for this specific
- * `profile` — e.g. running every `explore` subagent on a cheap/local model
- * while the parent conversation stays on something stronger. Off by default
- * (`subagentProfileModels` starts empty): when nothing is configured for
- * `profile`, this returns `target` unchanged, so a fresh install behaves
- * exactly like slices 1-3 with zero new surface. Only ever swaps to another
- * PROVIDER target (see that setting's own doc comment for why) — never
- * re-resolves the parent's own target, so a mid-turn manual model switch in
- * the parent still can't split-brain a turn (the design doc's own
- * `resolveTarget`-once invariant, preserved here for the override path too).
+ * Decides which model runs this subagent: the explicit per-profile override if
+ * the user set one, otherwise whatever K9's dispatch policy chooses, otherwise
+ * the parent's own target.
+ *
+ * That order is the whole rule. `settingsStore.subagentProfileModels` is a
+ * target the user pinned to this profile by hand — e.g. every `explore`
+ * subagent on a cheap or local model while the conversation stays on something
+ * stronger — and a policy is a rule about work nobody pinned. A policy that
+ * quietly overrode a hand-picked model would make the setting a suggestion.
+ *
+ * Routing here at all is new: subagents used to be the one dispatch surface no
+ * policy could reach, because this module cannot import `agentLoop.ts`
+ * (`turnEngine.ts` imports this one, so the edge would close a cycle) and
+ * target resolution lived there. It now lives in `targetRouting.ts`, which has
+ * no such edge — the lift is what made the two subagent task classes possible.
+ *
+ * Never re-resolves the parent's own target, exactly as before: a mid-run
+ * settings or model change must not retarget a subagent partway through its own
+ * loop, which is the `resolveTarget`-once invariant this call site has always
+ * held.
+ *
+ * The routing decision is returned rather than only its target, so the caller
+ * can record *why* this subagent ran where it did.
  */
-function resolveSubagentTarget(target: ResolvedTarget, profile: 'explore' | 'code'): ResolvedTarget {
+function resolveSubagentTarget(
+  target: ResolvedTarget,
+  profile: 'explore' | 'code',
+): RoutedTarget {
   const override = useSettingsStore.getState().subagentProfileModels[profile];
-  if (!override) return target;
-  return { kind: 'provider', providerId: override.providerId, model: override.model };
+  if (override) {
+    const pinned: ResolvedTarget = {
+      kind: 'provider',
+      providerId: override.providerId,
+      model: override.model,
+    };
+    return { target: pinned, decision: pinnedDecision(profile, override), sequence: [pinned] };
+  }
+  return routeFromActive(target, {
+    taskClass: profile === 'explore' ? 'subagent_explore' : 'subagent_code',
+    // A subagent is never handed an image (`runSubagentTask` builds its history
+    // from a text description) and is always offered tools by
+    // `toolsForProfile`, so both constraints are facts about this surface
+    // rather than per-run guesses.
+    requiresVision: false,
+    requiresTools: true,
+  });
+}
+
+/** The "no policy ran, the user had already chosen" decision, in the same shape
+ * a real one takes so the recorder below has one code path rather than two. */
+function pinnedDecision(
+  profile: 'explore' | 'code',
+  override: { providerId: string; model: string },
+): RoutingDecision {
+  return {
+    policyId: null,
+    policyName: null,
+    taskClass: profile === 'explore' ? 'subagent_explore' : 'subagent_code',
+    chosenKey: null,
+    sequence: [],
+    rejected: [],
+    reason: `Pinned by the ${profile} subagent model setting (${override.providerId} · ${override.model}), so no dispatch policy was consulted.`,
+    changedFromActive: true,
+  };
 }
 
 /** Everything `runSubagentTask` needs to drive one subagent run — see
@@ -190,6 +239,10 @@ export interface RunSubagentTaskParams {
    * in this slice never call a checkpoint-eligible tool at all, but the
    * plumbing is already correct for when they do. */
   parentCheckpointId: string | null;
+  /** Called once with this subagent's K9 dispatch decision — see
+   * `turnEngine.ts`'s `SubagentContext.onRoutingDecision` for why it is a
+   * callback rather than a recorder handle. */
+  onRoutingDecision?: (decision: RoutingDecision) => void;
   /** The parent turn's own `AbortSignal` — Stop in the parent pane must
    * cancel the whole subagent tree, exactly like it cancels any other
    * in-flight tool call the parent turn is waiting on. */
@@ -385,7 +438,11 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
     // rather than re-resolved (see `RunSubagentTaskParams.target`'s doc
     // comment): a settings change mid-run shouldn't retarget an
     // already-running subagent partway through its own loop.
-    const resolvedTarget = resolveSubagentTarget(target, profile);
+    const routed = resolveSubagentTarget(target, profile);
+    const resolvedTarget = routed.target;
+    // Onto the parent's run: a subagent has none of its own, and the decision
+    // is about work the parent asked for.
+    params.onRoutingDecision?.(routed.decision);
 
     for (let iteration = 0; iteration < MAX_SUBAGENT_ITERATIONS; iteration++) {
       await honourPause(taskId, processIdPromise, signal);

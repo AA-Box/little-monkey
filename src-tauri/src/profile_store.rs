@@ -2634,6 +2634,18 @@ fn searchable_run_event(
             ]),
         ),
         RunEvent::Started { engine_id } => ("started", "run", engine_id.clone()),
+        // Searchable by the reason, which is the sentence naming the policy —
+        // "which policy chose this run's target" is the question this event
+        // exists to answer, so it is the text worth finding it by.
+        RunEvent::RoutingDecided {
+            policy_name,
+            reason,
+            ..
+        } => (
+            "routing_decided",
+            "run",
+            join_search_text([policy_name.as_deref(), Some(reason.as_str())]),
+        ),
         RunEvent::ModelDelta { channel, text, .. } => (
             "model_delta",
             match channel {

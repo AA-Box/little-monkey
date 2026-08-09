@@ -3623,6 +3623,10 @@ fn derive_event_effects(event: &RunEvent) -> EventEffects<'_> {
                 decided_by,
             },
         ),
+        // No projection: a routing decision changes no run status. It is a
+        // fact about *why* this run's target was chosen, recorded beside the
+        // snapshot that records what it was.
+        RunEvent::RoutingDecided { .. } => ("routing_decided", None, Projection::None),
         RunEvent::ToolStarted { .. } => ("tool_started", None, Projection::None),
         RunEvent::ToolFinished { .. } => ("tool_finished", None, Projection::None),
         RunEvent::ArtifactAdded {

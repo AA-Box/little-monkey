@@ -940,6 +940,8 @@ export const en: Record<string, string> = {
   "AutomationPanel.dispatchAppliesToLabel": "Applies to",
   "AutomationPanel.dispatchTaskClass_chat": "Chat turns",
   "AutomationPanel.dispatchTaskClass_summarize": "Summarization",
+  "AutomationPanel.dispatchTaskClass_subagent_explore": "Subagents (explore)",
+  "AutomationPanel.dispatchTaskClass_subagent_code": "Subagents (code)",
   "AutomationPanel.dispatchEveryClassNote": "every task class",
   "AutomationPanel.dispatchSensitivityLabel": "Data sensitivity",
   "AutomationPanel.dispatchSensitivityAny": "Any model",

@@ -3343,7 +3343,7 @@ have outlived the change that widened the candidate window.
 
 **Blocks:** nothing now.
 
-## K9. Dispatch policy (model routing) *(built for chat and summarization; subagent classes and a durable record owed)*
+## K9. Dispatch policy (model routing) *(built)*
 
 **Acceptance:** ROADMAP #1 — user-authored named routing policies by task
 class, cost ceiling, latency target, data sensitivity, or tool requirement;
@@ -3428,28 +3428,55 @@ rejected candidate and its reason) in the Settings panel. The note fires only
 when the choice actually moves off the active target — an enabled policy that
 the current model already satisfies is a no-op, not an announcement every turn.
 
-**Remaining.**
+**Shipped — subagents route, and the decision outlives the session.** The two
+gaps this entry named as remaining were a refactor and a missing event; both are
+in. The third was never a gap and is restated below as the settled call it is.
 
-- **Subagents do not route, and the reason is a layering rule rather than
-  effort.** They dispatch through `subagent.ts::resolveSubagentTarget`, and
-  that module must not import `agentLoop.ts` — `turnEngine.ts` imports
-  `subagent.ts`, so the edge would be a cycle, which is a rule that module
-  states explicitly and keeps a duplicated helper to honour. Per-profile
-  subagent models are already covered by
-  `settingsStore.subagentProfileModels` (`explore`/`code`, provider targets
-  only), so nothing is unreachable today; folding them into policies means
-  lifting target resolution out of `agentLoop.ts` into its own module first.
-  That is a refactor, and it is what the two missing task classes cost.
-- **Inspection is not durable.** The decision lives in the transcript and in
-  session state, not in the run ledger, so "which policy chose this run's
-  target" is not answerable after a restart the way K12's events are. The
-  frozen `ModelTargetSnapshot` on the durable run already records *what* ran;
-  what is missing is *why*.
-- **Managed llama.cpp is not a routable target.** `applyTargetSwitch` has no
-  `local` arm, for the reason `buildFailoverChain` and `findLocalOnlyTarget`
-  already document — making it the active target is not something an automatic
-  switch has a basis to do unattended. So `local_only` policies are served by
-  non-cloud Ollama, exactly as the Privacy Firewall's own local fallback is.
+- **The layering rule was real, and the fix was to delete the reason for it.**
+  `subagent.ts` still must not import `agentLoop.ts` — `turnEngine.ts` imports
+  `subagent.ts`, so that edge closes a cycle — but target resolution had no
+  business being in the agent loop. `targetRouting.ts` now holds `resolveTarget`,
+  the inventory, `routeFromActive` and the rest, lifted **verbatim**; nothing
+  there needs the loop, and everything it needs is a store or a pure function.
+  The dependency was never real, only co-located. `agentLoop.ts` re-exports the
+  four names its callers already import, so the ~70 modules that read target
+  resolution through it are untouched by the move.
+- **Two subagent classes, not one.** `explore` reads and reports, `code` mutates
+  a workspace; a user who wants a cheap model for the first and a careful one for
+  the second cannot say that with a single "subagent" class. Both appear in the
+  policy editor with no change to it — the class list drives the UI.
+- **A pinned model still wins.** `settingsStore.subagentProfileModels` is a
+  target the user chose by hand for that profile, and a policy is a rule about
+  work nobody pinned. A policy that quietly overrode it would make the setting a
+  suggestion. The pinned path still produces a decision, whose reason says a
+  policy was never consulted — an event that is absent cannot be told apart from
+  one that was never written.
+- **`RunEvent::RoutingDecided` makes the *why* durable**, on the same
+  append-only hash-chained stream K12 built, beside the frozen
+  `ModelTargetSnapshot` that already recorded the *what*. No migration:
+  `run_events.event_type` carries no `CHECK`, so a new variant is additive by
+  construction.
+
+  It is deliberately **not** a `subsystem_events` row. That table's vocabulary is
+  `CHECK`-constrained, and widening it means a table rebuild — of a hash-chained,
+  append-only log whose whole value is that its rows cannot be rewritten. A
+  migration that rewrites every row of a tamper-evident stream is
+  indistinguishable from tampering with it.
+- **A subagent's decision lands on the parent's run**, because a subagent has no
+  durable run of its own — it already borrows the parent's id for permission and
+  cancellation audit. Delivered by a callback (`SubagentContext.onRoutingDecision`)
+  for the same reason `onMutatedPath` is one: the recorder lives in the module
+  `subagent.ts` cannot import.
+- **Recorded even when no policy matched.** "Nothing routed this" is the answer
+  for a fresh profile and is worth being able to produce.
+
+**Settled, not remaining: managed llama.cpp is not a routable target.**
+`applyTargetSwitch` has no `local` arm, for the reason `buildFailoverChain` and
+`findLocalOnlyTarget` already document — making it the active target is not
+something an automatic switch has a basis to do unattended. So `local_only`
+policies are served by non-cloud Ollama, exactly as the Privacy Firewall's own
+local fallback is. The upgrade path is recorded at `resolvedFromSnapshot` if it
+is ever wanted.
 
 **Note:** in OS terms K8 decides *when* a process runs and K9 decides *which
 device* executes it. They are separable and K8 is the harder half. Shipping

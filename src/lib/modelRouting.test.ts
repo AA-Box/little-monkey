@@ -50,6 +50,20 @@ describe("matchPolicy", () => {
     expect(matchPolicy([second, first], "chat")?.id).toBe("b");
   });
 
+  /** The two subagent classes are separate on purpose: `explore` reads and
+   * reports, `code` mutates a workspace, and a single "subagent" class could
+   * not express "cheap model for the first, careful one for the second". */
+  it("scopes the two subagent classes independently of each other and of chat", () => {
+    const explore = policy({ id: "explore-only", taskClasses: ["subagent_explore"] });
+    expect(matchPolicy([explore], "subagent_explore")?.id).toBe("explore-only");
+    expect(matchPolicy([explore], "subagent_code")).toBeNull();
+    expect(matchPolicy([explore], "chat")).toBeNull();
+
+    // And the catch-all still catches them, so a user who wants one rule for
+    // everything does not have to enumerate four classes.
+    expect(matchPolicy([policy({ taskClasses: [] })], "subagent_code")?.id).toBe("p1");
+  });
+
   it("skips disabled policies and non-matching classes", () => {
     expect(matchPolicy([policy({ enabled: false })], "chat")).toBeNull();
     expect(matchPolicy([policy({ taskClasses: ["summarize"] })], "chat")).toBeNull();

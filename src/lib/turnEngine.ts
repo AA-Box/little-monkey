@@ -13,6 +13,7 @@
  */
 import { invoke } from '@tauri-apps/api/core';
 import { streamChat } from './llamaClient';
+import type { RoutingDecision } from './modelRouting';
 import type { ChatMessage, StreamEvent, ToolCall, ToolDef } from './llamaClient';
 import { streamProviderChat } from './providerClient';
 import { formatMcpCallToolResult, resolveMcpToolName, type McpCallToolResult, type McpToolRegistry } from './mcpTools';
@@ -349,6 +350,17 @@ export interface SubagentContext {
    * can never split the parent and child across different targets. */
   target: ResolvedTarget;
   effort?: string;
+  /** Called once with the child's K9 dispatch decision, so it reaches the
+   * ledger on the parent's run.
+   *
+   * A callback for the reason `onMutatedPath` is one: `subagent.ts` cannot
+   * import `agentLoop.ts` (this module imports `subagent.ts`, so the edge
+   * closes a cycle), and the recorder lives there. A subagent has no durable
+   * run of its own — it borrows the parent's `runId` for permission and
+   * cancellation audit already — so the parent's run is where its decision
+   * belongs. `undefined` when the caller has no recorder, which is the same
+   * shape every other optional hook here takes. */
+  onRoutingDecision?: (decision: RoutingDecision) => void;
   /** The parent turn's own risk-annotation context (built once by
    * `agentLoop.ts`'s `runAgentTurnBody`, same object every `executeToolCall`
    * this turn already receives via the `risk` parameter) — threaded through
@@ -595,6 +607,7 @@ export async function executeToolCall(
         profile,
         target: subagent.target,
         effort: subagent.effort,
+        onRoutingDecision: subagent.onRoutingDecision,
         risk: subagent.risk,
         onMutatedPath: subagent.onMutatedPath,
         onMutationFailure: subagent.onMutationFailure,
