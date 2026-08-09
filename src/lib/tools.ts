@@ -485,6 +485,76 @@ export const TASK_TOOL: ToolDef = {
 };
 
 /**
+ * The `workflow` tool: a named, phased orchestration of subagents — the
+ * multi-stage counterpart of `task`. The model supplies a declarative spec
+ * (name + phases, each phase a set of agents); `runWorkflow`
+ * (`lib/workflow.ts`) drives phases sequentially with each phase's agents
+ * in parallel, injecting earlier phases' reports into later phases'
+ * prompts. Deliberately data-only — no model-authored code ever executes.
+ * Kept OUT of `TOOLS` and offered by `toolsForSettings` under the same
+ * `subagentsEnabled` gate as `TASK_TOOL`; never offered to a child loop
+ * (`toolsForProfile`), which caps orchestration depth at 1 structurally.
+ * Frontend-only: `executeToolCall` intercepts the name before the
+ * `invoke('tool_'+name)` dispatch, exactly like `task`.
+ */
+export const WORKFLOW_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'workflow',
+    description:
+      'Run a named, multi-phase orchestration of subagents. Phases run in order; the agents inside one phase run in parallel. Each later phase automatically receives the earlier phases\' reports appended to its prompts. Use this instead of plain task calls when the work has distinct stages (e.g. survey then verify, or explore then implement then review). Each agent is isolated: give every prompt full, self-contained context. Limits: at most 6 phases, 6 agents per phase, 16 agents total.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'A short kebab-case name for the whole workflow (e.g. "roadmap-audit"), shown to the user.',
+        },
+        description: {
+          type: 'string',
+          description: 'One line describing what the workflow does, shown to the user.',
+        },
+        phases: {
+          type: 'array',
+          description: 'The stages, executed strictly in order.',
+          items: {
+            type: 'object',
+            properties: {
+              title: { type: 'string', description: 'Short phase title (e.g. "Audit", "Verify"), shown to the user.' },
+              agents: {
+                type: 'array',
+                description: 'The agents of this phase — dispatched together, in parallel.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    description: { type: 'string', description: 'A short (3-6 word) label for this agent, shown to the user.' },
+                    prompt: {
+                      type: 'string',
+                      description: 'Full, self-contained instructions — the agent cannot see this conversation or its sibling agents.',
+                    },
+                    profile: {
+                      type: 'string',
+                      enum: ['explore', 'code'],
+                      description: "Tool access profile — same meaning as the task tool's profile.",
+                    },
+                  },
+                  required: ['description', 'prompt', 'profile'],
+                  additionalProperties: false,
+                },
+              },
+            },
+            required: ['title', 'agents'],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ['name', 'description', 'phases'],
+      additionalProperties: false,
+    },
+  },
+};
+
+/**
  * The `skill` tool: lets the model invoke one of the skills listed in the
  * turn's "## Available skills" catalog (see `skills.ts`'s
  * `composeSkillCatalog`) on its own initiative, instead of only ever loading
