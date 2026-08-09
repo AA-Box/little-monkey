@@ -2973,19 +2973,26 @@ mod tests {
         // The deny probes come last on purpose. They are the two steps expected to
         // fail, and a failed step is the one that might take the rest of the line
         // with it — after them there is nothing left to lose but `LM-END`, whose
-        // absence is then itself the finding. Their "Access is denied." on stderr
-        // is left unredirected, because it is the diagnosis.
+        // absence is then itself the finding.
+        //
+        // Each step is labelled and sends its stderr to stdout, `2>&1` before any
+        // `>` so the diagnostic goes to the pipe and not into the file being
+        // written. stdout is one ordered stream, so every "Access is denied."
+        // arrives under the label of the step that earned it. Without that the two
+        // streams cannot be lined up: a run that printed four denials against six
+        // steps that could each produce one is not enough to say which four, and
+        // every consistent guess contradicted another part of the same output.
         let command = format!(
             "echo LM-BEGIN \
              & echo home=%USERPROFILE% \
              & set TMP \
-             & type \"{allowed}\" \
-             & echo home-ok> \"%USERPROFILE%\\probe\" \
-             & echo tmp-ok> \"{tmp}\\probe\" \
-             & dir /b \"%USERPROFILE%\" \
-             & dir /b \"{tmp}\" \
-             & type \"{forbidden}\" \
-             & echo overwritten> \"{forbidden}\" \
+             & echo S1-read-own & type \"{allowed}\" 2>&1 \
+             & echo S2-write-home & echo home-ok 2>&1> \"%USERPROFILE%\\probe\" \
+             & echo S3-write-tmp & echo tmp-ok 2>&1> \"{tmp}\\probe\" \
+             & echo S4-list-home & dir /b \"%USERPROFILE%\" 2>&1 \
+             & echo S5-list-tmp & dir /b \"{tmp}\" 2>&1 \
+             & echo S6-read-real & type \"{forbidden}\" 2>&1 \
+             & echo S7-write-real & echo overwritten 2>&1> \"{forbidden}\" \
              & echo LM-END",
             allowed = canonical_workspace.join("allowed.txt").display(),
             tmp = expected_tmp.display(),
