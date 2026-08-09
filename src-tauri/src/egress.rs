@@ -2976,6 +2976,77 @@ mod tests {
                 clear_run_policy_source();
             }
 
+            /// **K17 S3's acceptance, at the only layer this repo can prove it.**
+            ///
+            /// The slice's own wording: *a run placed with a host allowlist is
+            /// refused by the node when it reaches outside it, proven by the
+            /// node's own denial record — not by the submitter's.* The two
+            /// halves that could break it are both here.
+            ///
+            /// First, the policy has to *survive the trip*. A placed spec
+            /// becomes a recipe on the node, and a recipe has nowhere to put an
+            /// allowlist — so the snapshot is round-tripped through the exact
+            /// JSON the node writes and the child reads, and the allowlist is
+            /// taken from the far side of that trip. A conversion that dropped
+            /// it would leave `declared` empty here and every assertion below
+            /// would pass vacuously against `Undeclared`, which is why the
+            /// permitted case is asserted too.
+            ///
+            /// Second, it has to be *enforced by this process*. Before K17 no
+            /// headless `monkey-cli task run` installed a policy source at all,
+            /// so a frozen allowlist was enforced in the desktop app and ignored
+            /// in the daemon's own children. `task::run_inner` now installs one
+            /// from the spec it just froze and runs the turn inside
+            /// `RunScope::run`; this reproduces both steps.
+            ///
+            /// What this is not: proof across two machines. There is one host
+            /// here, and the wire is exercised by the API tests in
+            /// `daemon/remote/api.rs`. This proves the enforcement that the wire
+            /// delivers work to.
+            #[test]
+            fn a_placed_runs_travelled_allowlist_is_enforced_by_the_node_that_received_it() {
+                let _guard = crate::denial_sink::test_lock();
+
+                let allowlist = declaring(&["api.example.com"], &[443], &["https"]);
+                let mut spec = crate::node_placement::tests_support::placement_spec("run:placed");
+                spec.permission_policy.egress_allowlist = Some(allowlist);
+
+                // The trip: spec -> snapshot -> the recipe JSON the node writes
+                // -> the snapshot the executing child reads back.
+                let snapshot = crate::node_placement::PlacedRunSnapshot::from_spec(&spec);
+                snapshot.validate().expect("a placed snapshot must validate");
+                let wire = serde_json::to_vec(&snapshot).expect("the snapshot serializes");
+                let arrived: crate::node_placement::PlacedRunSnapshot =
+                    serde_json::from_slice(&wire).expect("the snapshot survives the trip");
+                let declared = arrived
+                    .permission_policy
+                    .egress_allowlist
+                    .clone()
+                    .expect("the allowlist must survive the conversion the node performs");
+
+                // The install `task::run_inner` performs for its own frozen spec.
+                install_declared("run:placed", declared);
+
+                verdict_for("run:placed", "https://api.example.com/v1/messages").expect(
+                    "the destination the submitter declared must still be reachable on the node",
+                );
+                assert_eq!(
+                    rule_for("run:placed", "https://exfiltrate.example.net/v1"),
+                    Some(EgressRule::RunHostNotAllowlisted),
+                    "the node must refuse a destination outside the travelled allowlist"
+                );
+                // And the refusal is the node's own record, carrying the rule
+                // that decided it rather than a generic failure.
+                let denial = verdict_for("run:placed", "https://exfiltrate.example.net/v1")
+                    .expect_err("the refusal is what is being recorded");
+                assert!(
+                    denial.rule().summary().len() > 8,
+                    "a denial record must say which rule refused it"
+                );
+
+                clear_run_policy_source();
+            }
+
             /// The suffix-matching bypass, which is why the matcher checks for the
             /// separator instead of trusting `ends_with`.
             #[test]

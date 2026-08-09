@@ -28,6 +28,7 @@ use little_monkey_lib::run_protocol::{
     RootGrant, RunBudgets, RunEvent, RunKind, RunSpec, RunStatus, ToolPermissionRule,
     ToolPolicyDecision, WorkspaceContext, RUN_PROTOCOL_SCHEMA_VERSION,
 };
+use little_monkey_lib::run_scope::RunScope;
 use little_monkey_lib::workspace;
 use little_monkey_lib::workspace::WorkspaceRoot;
 
@@ -915,7 +916,14 @@ async fn run_inner(
             quiet: json_output,
             ..Default::default()
         };
-        options.system = crate::effective_system(cli, &state, options.system.as_deref());
+        // A placed run's snapshot was frozen on the submitting machine and
+        // enqueued here with `snapshot_is_frozen`. Merging this node's rules
+        // into it would be the same immutability violation an explicit retry
+        // avoids — and worse, it would inject one machine's instructions into
+        // another machine's run.
+        if recipe.placed_run.is_none() {
+            options.system = crate::effective_system(cli, &state, options.system.as_deref());
+        }
         options
     };
 
@@ -925,14 +933,20 @@ async fn run_inner(
     }
     let max_iterations_u32 = u32::try_from(max_iterations)
         .map_err(|_| "recipe max_iterations exceeds the durable run protocol".to_string())?;
-    let wall_time_ms = match recipe.timeout_seconds {
-        Some(seconds) => seconds
+    // A placed run's wall clock is the submitter's, not this node's default:
+    // the budget travelled with the spec and this is the first place it is
+    // spent. `RunBudgets::validate` already bounded it, and the node's own
+    // `max_runtime_ms` on the daemon job is the second, independent ceiling —
+    // the run is held to whichever is tighter, which is the correct direction.
+    let wall_time_ms = match (&recipe.placed_run, recipe.timeout_seconds) {
+        (Some(placed), _) => placed.budgets.wall_time_ms,
+        (None, Some(seconds)) => seconds
             .checked_mul(1_000)
             .filter(|millis| *millis > 0 && *millis <= DEFAULT_WALL_TIME_MS)
             .ok_or_else(|| {
                 "recipe timeout_seconds must be between 1 second and 7 days".to_string()
             })?,
-        None => DEFAULT_WALL_TIME_MS,
+        (None, None) => DEFAULT_WALL_TIME_MS,
     };
     let approval_timeout_ms = wall_time_ms.clamp(60_000, DEFAULT_APPROVAL_TIMEOUT_MS);
 
@@ -962,23 +976,24 @@ async fn run_inner(
         kind: ClientKind::Cli,
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    let frozen_target = recipe
-        .desktop_turn
-        .as_ref()
-        .map(|snapshot| snapshot.target.clone())
-        .map(Ok)
-        .unwrap_or_else(|| snapshot_target(&recipe.target))?;
-    let frozen_workspace = recipe
-        .desktop_turn
-        .as_ref()
-        .map(|snapshot| snapshot.workspace.clone())
-        .map(Ok)
-        .unwrap_or_else(|| workspace_snapshot(&state))?;
-    let frozen_policy = recipe
-        .desktop_turn
-        .as_ref()
-        .map(|snapshot| snapshot.permission_policy.clone())
-        .unwrap_or_else(|| permission_policy(mode, approval_timeout_ms));
+    let frozen_target = match (&recipe.placed_run, &recipe.desktop_turn) {
+        (Some(placed), _) => placed.target.clone(),
+        (_, Some(snapshot)) => snapshot.target.clone(),
+        _ => snapshot_target(&recipe.target)?,
+    };
+    let frozen_workspace = match (&recipe.placed_run, &recipe.desktop_turn) {
+        // A placed run without a workspace is a model-only run, and the node
+        // must not invent one for it: `None` here is the submitter's statement
+        // that this run has no filesystem, not an absence to be filled in.
+        (Some(placed), _) => placed.workspace.clone(),
+        (_, Some(snapshot)) => Some(snapshot.workspace.clone()),
+        _ => Some(workspace_snapshot(&state)?),
+    };
+    let frozen_policy = match (&recipe.placed_run, &recipe.desktop_turn) {
+        (Some(placed), _) => placed.permission_policy.clone(),
+        (_, Some(snapshot)) => snapshot.permission_policy.clone(),
+        _ => permission_policy(mode, approval_timeout_ms),
+    };
     let input_artifact_ids = recipe
         .desktop_turn
         .as_ref()
@@ -995,33 +1010,67 @@ async fn run_inner(
         run_id: run_id.clone(),
         idempotency_key: invocation.idempotency_key,
         created_at_ms,
-        kind: if recipe.desktop_turn.is_some() {
-            RunKind::Interactive
-        } else {
-            RunKind::Workflow
+        kind: match (&recipe.placed_run, &recipe.desktop_turn) {
+            (Some(placed), _) => placed.kind.clone(),
+            (_, Some(_)) => RunKind::Interactive,
+            _ => RunKind::Workflow,
         },
         submitted_by,
         task: rendered.prompt.clone(),
         instructions: options.system.clone(),
         input_artifact_ids,
         target: frozen_target,
-        workspace: Some(frozen_workspace),
+        workspace: frozen_workspace,
         permission_policy: frozen_policy,
-        budgets: RunBudgets {
-            wall_time_ms,
-            max_iterations: max_iterations_u32,
-            // The existing CLI bounds top-level iterations but an optional
-            // explore subagent can add model calls inside one iteration.
-            // These protocol maxima avoid claiming a tighter unenforced cap.
-            max_model_calls: 100_000,
-            max_tool_calls: 100_000,
-            max_input_tokens: 1_000_000_000,
-            max_output_tokens: 1_000_000_000,
-            max_cost_micros: None,
-            max_artifact_bytes: 1 << 40,
-            max_event_count: 10_000_000,
+        budgets: match &recipe.placed_run {
+            Some(placed) => placed.budgets.clone(),
+            None => RunBudgets {
+                wall_time_ms,
+                max_iterations: max_iterations_u32,
+                // The existing CLI bounds top-level iterations but an optional
+                // explore subagent can add model calls inside one iteration.
+                // These protocol maxima avoid claiming a tighter unenforced cap.
+                max_model_calls: 100_000,
+                max_tool_calls: 100_000,
+                max_input_tokens: 1_000_000_000,
+                max_output_tokens: 1_000_000_000,
+                max_cost_micros: None,
+                max_artifact_bytes: 1 << 40,
+                max_event_count: 10_000_000,
+            },
         },
     };
+    // **The half of K17 S3 that makes a travelled policy more than paperwork.**
+    //
+    // `egress::send` resolves a run's allowlist through a process-wide source,
+    // and this process never installed one — only the desktop app did
+    // (`run_commands::install_run_egress_policy_source`). So until now a run's
+    // frozen `egress_allowlist` was enforced in the app and ignored in every
+    // headless `monkey-cli task run`, placed or local.
+    //
+    // The source is installed from the spec this process just froze rather than
+    // from a ledger read, because the spec is right here and is immutable: there
+    // is no row to go stale against. Every other run id answers `Unknown`, which
+    // is the existing "not a ledger entity" case and stays permitted.
+    {
+        let scoped_run_id = run_spec.run_id.clone();
+        let allowlist = run_spec
+            .permission_policy
+            .egress_allowlist
+            .clone()
+            .map(std::sync::Arc::new);
+        little_monkey_lib::egress::install_run_policy_source(move |candidate| {
+            if candidate != scoped_run_id {
+                return little_monkey_lib::egress::RunEgressPolicy::Unknown;
+            }
+            match &allowlist {
+                Some(allowlist) => little_monkey_lib::egress::RunEgressPolicy::Declared(
+                    std::sync::Arc::clone(allowlist),
+                ),
+                None => little_monkey_lib::egress::RunEgressPolicy::Undeclared,
+            }
+        });
+    }
     let (recorder, disposition) =
         DurableRunRecorder::submit(ledger, &run_spec, format!("recipe:{}", recipe.name))?;
     match disposition {
@@ -1152,6 +1201,15 @@ async fn run_inner(
             .await
         }
     };
+
+    // The run identity travels implicitly through `run_scope`'s task-local, and
+    // that is what `egress::send` reads before asking the policy source
+    // installed above. Without this the source would be installed and never
+    // consulted — the allowlist would be attached to a run nothing knew it was
+    // inside. Wrapping the turn rather than the whole function is deliberate:
+    // this is where the run's own model and tool traffic happens.
+    let turn_future =
+        little_monkey_lib::run_scope::scoped(RunScope::run(recorder.run_id()), turn_future);
 
     let turn_result =
         match tokio::time::timeout(Duration::from_millis(wall_time_ms), turn_future).await {
@@ -1585,6 +1643,7 @@ mod tests {
             timeout_seconds: None,
             output: recipes::RecipeOutput::default(),
             desktop_turn: None,
+            placed_run: None,
         }
     }
 

@@ -4563,7 +4563,7 @@ accelerator — there is no accelerator-keyed route anywhere. Proving execution
 *per backend* means running real work on real hardware, which is a per-machine
 claim this repo's CI cannot make for any backend but its own.
 
-## K17. Remote node as a scheduled device *(scoped; not started)*
+## K17. Remote node as a scheduled device *(built)*
 
 **Today:** a paired user-owned runner over direct/Tailscale/SSH-forwarded
 HTTPS with pinned TLS, scoped credentials, rotation/revocation, replay
@@ -4681,6 +4681,66 @@ second node, so the honest bar is: pure functions (ranking, capability
 matching, policy validation) unit-tested, and the wire path exercised against a
 loopback node in an integration test that is explicitly *not* a substitute for
 two real hosts. State that in the PR rather than letting a green run imply it.
+
+### Built
+
+**The second plane exists.** `node_placement.rs` is the contract and the four
+decisions — does a node qualify, which qualifying node wins, is a node alive,
+and what a vanished node means for the work on it — with no I/O and no Tauri, so
+both binaries read the same rules and every rule is testable on one machine.
+The transport is reused untouched: pinned TLS, signed and replay-proof requests,
+scoped capabilities, rotation and revocation.
+
+- **S1.** `GET /v1/remote/node` answers with the `HardwareSnapshot`, the
+  backends, the resident models, and an **operator-set** data-residency label
+  (`monkey daemon remote node-label`). Nothing infers residency; an unset label
+  is `unspecified` and never satisfies a rule naming a real zone. Each backend
+  carries K16's `execution_support` rather than the detector's `available`, so a
+  node that merely *detects* ROCm advertises exactly that and is refused for a
+  run requiring it. `GET /v1/remote/node/health` is the cheap half, because a
+  placer polling every node every 30 s must not make each one fork `nvidia-smi`.
+- **S2.** `POST /v1/remote/node/runs` takes a frozen `RunSpec`. The node mints
+  its **own** run id — adopting a foreign one would let a submitter choose a
+  local identity — and both ids travel back. It re-checks the residency rule and
+  the runner identity rather than trusting the placer's word, and a spec it has
+  already placed resolves to the same placement instead of a second run.
+- **S3.** The travelled policy is enforced, and two things had to be true for
+  that. The spec's `PermissionPolicySnapshot` and `RunBudgets` ride verbatim in
+  `recipe.placed_run`, because a recipe has nowhere to put an egress allowlist
+  and a re-derived policy would silently be the *node's*. And
+  `monkey-cli task run` now installs an egress policy source from the spec it
+  froze and runs the turn inside `RunScope::run` — before this, a frozen
+  allowlist was enforced in the desktop app and ignored in every headless run,
+  placed or local. `bypass` is refused on arrival: a placed run is unattended
+  here by definition.
+- **S4.** The placing daemon heartbeats every node it has placed work on, every
+  `HEARTBEAT_INTERVAL_MS`, from its own serve loop — every machine is both a
+  node and a placer, so there is no separate controller process to put it in.
+  Three missed beats drop a node from ranking; ten declare its work lost.
+  Re-placement is **not** automatic: a vanished node's run may have completed
+  its external side effects and this machine cannot know, which is the same rule
+  `reconcile_interrupted` already holds to for confirmed mutations.
+- **S5.** `select_node` places by capability and the node's own admission
+  verdict, and **says that measured throughput is not an input**. That is the
+  documented resolution of the acceptance's collision with the benchmark
+  surface's invariant — no number is displayed that was not measured on the
+  machine displaying it. The upgrade has a stated trigger rather than a plan.
+
+**What this does not do.** A placement must name a provider or an Ollama model:
+`monkey-cli`'s recipe target has no managed-runtime variant, so a
+`ManagedLlama` spec is refused with that reason rather than accepted and failed
+at spawn. `resident_models` lists the managed hub's inventory only — enumerating
+Ollama tags is an async call from a synchronous handler — so an Ollama placement
+falls through `select_node`'s resident-model key to the queue and memory keys.
+Run Center still shows nothing; the surface is the CLI
+(`node-refresh`, `node-list`, `place`, `placements`, `placement-sync`).
+
+**And what a green run here does not mean.** Everything past S1 needs two
+machines. The routes are exercised through the real signed-request choke point —
+signature verification, replay reservation, capability gate — with a fake
+placement queue, and the enforcement of a travelled allowlist is proven end to
+end *within one process*. Neither is a substitute for two real hosts, and no
+test here claims to be one.
 
 ## K18. Live migration
 

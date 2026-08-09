@@ -289,6 +289,116 @@ pub async fn fetch_artifact(
     Ok(())
 }
 
+// --- Roadmap K17: the placement plane, from the asking side ----------------
+
+/// Asks one node to describe itself and stores the answer.
+///
+/// The store write is what makes `last_seen_at_ms` meaningful: it happens only
+/// on a successful answer, so a failed probe leaves the previous timestamp
+/// alone and `node_placement::liveness` sees the silence grow rather than
+/// resetting on every attempt.
+pub async fn refresh_node(
+    paths: &DaemonPaths,
+    alias: &str,
+    now_ms: u64,
+) -> Result<little_monkey_lib::node_placement::NodeDescriptor, String> {
+    let value = call(paths, alias, Method::GET, "/v1/remote/node", vec![], now_ms).await?;
+    let descriptor: little_monkey_lib::node_placement::NodeDescriptor =
+        serde_json::from_value(value)
+            .map_err(|error| format!("Node descriptor is invalid: {error}"))?;
+    descriptor.validate()?;
+    RemoteStore::open(&paths.root)?.save_node(alias, &descriptor, now_ms)?;
+    Ok(descriptor)
+}
+
+/// The cheap liveness probe. Refreshes `last_seen_at_ms` without making the node
+/// re-measure its hardware.
+///
+/// The node's queue state *is* refreshed here, because that is the part that
+/// actually moves between probes — and a placer ranking on a two-minute-old
+/// "accepting" flag would keep choosing a node that has since filled up.
+pub async fn probe_node(
+    paths: &DaemonPaths,
+    alias: &str,
+    now_ms: u64,
+) -> Result<little_monkey_lib::node_placement::NodeHealth, String> {
+    let value = call(
+        paths,
+        alias,
+        Method::GET,
+        "/v1/remote/node/health",
+        vec![],
+        now_ms,
+    )
+    .await?;
+    let health: little_monkey_lib::node_placement::NodeHealth = serde_json::from_value(value)
+        .map_err(|error| format!("Node health is invalid: {error}"))?;
+    let mut store = RemoteStore::open(&paths.root)?;
+    if let Some((_, descriptor, _)) = store
+        .nodes()?
+        .into_iter()
+        .find(|(stored_alias, _, _)| stored_alias == alias)
+    {
+        if descriptor.runner_id != health.runner_id {
+            // The alias now points at a different machine. Refusing here rather
+            // than quietly re-pointing is the whole reason the runner id is on
+            // the health response: a residency rule proved against one host must
+            // not silently carry over to another.
+            return Err(format!(
+                "Node '{alias}' answered as runner '{}' but is recorded as '{}'; re-pair it",
+                health.runner_id, descriptor.runner_id
+            ));
+        }
+        store.save_node(
+            alias,
+            &little_monkey_lib::node_placement::NodeDescriptor {
+                accepting: health.accepting,
+                queue_depth: health.queue_depth,
+                queue_capacity: health.queue_capacity,
+                ..descriptor
+            },
+            now_ms,
+        )?;
+    }
+    Ok(health)
+}
+
+/// Ships one frozen `RunSpec` to a node.
+pub async fn place_run(
+    paths: &DaemonPaths,
+    alias: &str,
+    request: &little_monkey_lib::node_placement::PlaceRunRequest,
+    now_ms: u64,
+) -> Result<little_monkey_lib::node_placement::PlaceRunResponse, String> {
+    request.validate()?;
+    let body = serde_json::to_vec(request).map_err(|error| error.to_string())?;
+    let value = call(
+        paths,
+        alias,
+        Method::POST,
+        "/v1/remote/node/runs",
+        body,
+        now_ms,
+    )
+    .await?;
+    serde_json::from_value(value).map_err(|error| format!("Placement response is invalid: {error}"))
+}
+
+/// Reads one placement back from the node that holds it.
+pub async fn placed_status(
+    paths: &DaemonPaths,
+    alias: &str,
+    submitted_run_id: &str,
+    now_ms: u64,
+) -> Result<little_monkey_lib::node_placement::PlacedRunStatus, String> {
+    let path = format!(
+        "/v1/remote/node/runs/{}",
+        percent_segment(submitted_run_id)?
+    );
+    let value = call(paths, alias, Method::GET, &path, vec![], now_ms).await?;
+    serde_json::from_value(value).map_err(|error| format!("Placed run status is invalid: {error}"))
+}
+
 fn pinned_client(certificate_pem: &str, expected_sha256: &str) -> Result<reqwest::Client, String> {
     if certificate_fingerprint(certificate_pem.as_bytes())? != expected_sha256 {
         return Err("Pinned certificate bytes do not match the stored fingerprint".to_string());

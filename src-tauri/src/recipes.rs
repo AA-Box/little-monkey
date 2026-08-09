@@ -620,6 +620,24 @@ pub struct Recipe {
     /// daemon. Hand-authored/scheduled recipes remain unchanged.
     #[serde(default)]
     pub desktop_turn: Option<DesktopTurnSnapshot>,
+    /// Present only for a run **placed on this node by another machine we own**
+    /// (roadmap K17 S2/S3). Written by the node's own placement route; never
+    /// hand-authored, and rejected on any recipe that also carries a
+    /// `desktop_turn`.
+    ///
+    /// # Why the frozen spec has to ride here rather than be re-derived
+    ///
+    /// The node's queue takes recipes, and the executing process builds the
+    /// `RunSpec` from the recipe it was handed. A recipe carries a permission
+    /// *mode* and a timeout and nothing else — no egress allowlist, no token or
+    /// cost budget — so a placed spec converted to a recipe and back would come
+    /// out wearing the **node's** defaults. The submitter's policy would have
+    /// travelled and then been silently discarded at the last step, which is
+    /// worse than never travelling: it reads as a guarantee. These four fields
+    /// ride verbatim so the executing process builds its spec from the
+    /// submitter's policy and budgets.
+    #[serde(default)]
+    pub placed_run: Option<crate::node_placement::PlacedRunSnapshot>,
 }
 
 fn is_valid_recipe_name(name: &str) -> bool {
@@ -677,6 +695,17 @@ pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
     }
     if let Some(snapshot) = &recipe.desktop_turn {
         snapshot.validate_for_recipe(recipe)?;
+    }
+    if let Some(placed) = &recipe.placed_run {
+        if recipe.desktop_turn.is_some() {
+            // Both freeze the same four fields, and a recipe carrying both
+            // would leave "which one wins" to the order of two `unwrap_or_else`
+            // chains in `task.rs`. Refused here so that question never arises.
+            return Err(
+                "a recipe cannot be both a desktop turn and a placed run".to_string(),
+            );
+        }
+        placed.validate()?;
     }
     Ok(())
 }
@@ -1127,7 +1156,63 @@ mod tests {
             timeout_seconds: None,
             output: RecipeOutput::default(),
             desktop_turn: None,
+            placed_run: None,
         }
+    }
+
+    /// **The policy really does survive the trip** (roadmap K17 S3).
+    ///
+    /// The node writes this recipe to disk and the executing child parses it
+    /// back, so the round trip is the actual mechanism, not a stand-in for one.
+    /// The egress allowlist and the budgets are the two fields a recipe has
+    /// nowhere else to put — re-deriving either on the node would silently swap
+    /// the submitter's policy for this machine's defaults, which is the failure
+    /// the whole slice exists to prevent.
+    #[test]
+    fn a_placed_runs_policy_and_budgets_survive_the_recipe_round_trip() {
+        let spec = crate::node_placement::tests_support::placement_spec("run:placed");
+        let mut spec = spec;
+        spec.permission_policy.egress_allowlist = Some(crate::run_protocol::EgressAllowlist {
+            hosts: vec!["api.example.com".to_string()],
+            ports: vec![443],
+            protocols: vec!["https".to_string()],
+        });
+        spec.budgets.max_output_tokens = 4_321;
+
+        let mut recipe = valid_recipe();
+        recipe.placed_run = Some(crate::node_placement::PlacedRunSnapshot::from_spec(&spec));
+        validate_recipe(&recipe).expect("a placed recipe must validate");
+
+        let written = serde_json::to_string(&recipe).expect("the node writes JSON");
+        let parsed = parse_recipe(&written, "json").expect("the child parses it back");
+        let placed = parsed.placed_run.expect("the placement snapshot survives");
+        assert_eq!(
+            placed
+                .permission_policy
+                .egress_allowlist
+                .as_ref()
+                .map(|list| list.hosts.clone()),
+            Some(vec!["api.example.com".to_string()]),
+            "the travelled allowlist must reach the executing process"
+        );
+        assert_eq!(placed.budgets.max_output_tokens, 4_321);
+        assert_eq!(placed.submitted_run_id, "run:placed");
+    }
+
+    /// Both snapshots freeze the same four fields, so a recipe carrying both
+    /// would leave "which wins" to the order of two fallback chains in
+    /// `task.rs`. Refused at parse time so that question never arises.
+    #[test]
+    fn a_recipe_cannot_be_both_a_desktop_turn_and_a_placed_run() {
+        let spec = crate::node_placement::tests_support::placement_spec("run:placed");
+        let mut recipe = desktop_recipe();
+        validate_recipe(&recipe).expect("the desktop half alone is valid");
+        recipe.placed_run = Some(crate::node_placement::PlacedRunSnapshot::from_spec(&spec));
+        let error = validate_recipe(&recipe).unwrap_err();
+        assert!(
+            error.contains("desktop turn") && error.contains("placed run"),
+            "the refusal must name both: {error}"
+        );
     }
 
     fn unknown_capability() -> crate::run_protocol::CapabilityAssessment {
