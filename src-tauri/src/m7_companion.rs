@@ -1439,15 +1439,11 @@ async fn generate_comfy_image(
         }
         tokio::time::sleep(Duration::from_millis(750)).await;
     };
-    let response = crate::egress::send(
-        client
-            .get(format!("{base}/view"))
-            .query(&[
-                ("filename", descriptor.0.as_str()),
-                ("subfolder", descriptor.1.as_str()),
-                ("type", descriptor.2.as_str()),
-            ]),
-    )
+    let response = crate::egress::send(client.get(format!("{base}/view")).query(&[
+        ("filename", descriptor.0.as_str()),
+        ("subfolder", descriptor.1.as_str()),
+        ("type", descriptor.2.as_str()),
+    ]))
     .await
     .map_err(|error| error.to_string())?;
     if !response.status().is_success() {

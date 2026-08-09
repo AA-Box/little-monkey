@@ -27,9 +27,8 @@
 
 use std::path::{Path, PathBuf};
 
-
-use crate::{workspace, AppState};
 use crate::profiles::ProfileScopedPaths;
+use crate::{workspace, AppState};
 
 /// Filename looked for at the global app-data dir and at the top of every
 /// attached workspace root.
@@ -84,8 +83,7 @@ fn read_rule_file_with_fallback(primary_path: &Path) -> Option<(PathBuf, String,
         return Some((primary_path.to_path_buf(), content, truncated));
     }
     let fallback_path = primary_path.with_file_name(AGENTS_FILE_NAME);
-    read_rule_file(&fallback_path)
-        .map(|(content, truncated)| (fallback_path, content, truncated))
+    read_rule_file(&fallback_path).map(|(content, truncated)| (fallback_path, content, truncated))
 }
 
 /// Core logic behind [`rules_read`], parameterized by plain paths so it
@@ -541,10 +539,7 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].scope, "project");
         assert_eq!(files[0].content, "Project agents rules.");
-        assert_eq!(
-            files[0].path,
-            root.path.join("AGENTS.md").to_string_lossy()
-        );
+        assert_eq!(files[0].path, root.path.join("AGENTS.md").to_string_lossy());
     }
 
     #[test]

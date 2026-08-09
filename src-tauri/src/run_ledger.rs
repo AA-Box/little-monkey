@@ -204,9 +204,11 @@ const MIGRATION_V17: i64 = 17;
 const MIGRATION_V17_CHECKSUM: &str = "context-budget-v17-2026-08-08";
 const MIGRATION_V18: i64 = 18;
 const MIGRATION_V18_CHECKSUM: &str = "browser-session-kind-v18-2026-08-09";
+const MIGRATION_V19: i64 = 19;
+const MIGRATION_V19_CHECKSUM: &str = "unattributed-egress-destinations-v19-2026-08-09";
 
 /// The newest schema this binary knows how to write.
-const SCHEMA_VERSION: i64 = MIGRATION_V18;
+const SCHEMA_VERSION: i64 = MIGRATION_V19;
 
 /// Whether a migration keeps older binaries able to open the database.
 ///
@@ -2175,6 +2177,19 @@ const MIGRATION_LADDER: &[(i64, &str, Compatibility)] = &[
         MIGRATION_V18_CHECKSUM,
         Compatibility::RequiresThisVersion,
     ),
+    // Additive in effect, and it inherits V18's floor rather than raising it. It
+    // rebuilds `egress_destinations` to *relax* a constraint — `process_id`
+    // becomes nullable beside a new `unattributed_reason` — so a V18 binary's
+    // reads (`egress_destinations_for`, which filters `WHERE process_id IN (…)`)
+    // return exactly the attributed rows they always did, and its writes still
+    // name a process, which the widened `CHECK` still accepts. The unattributed
+    // rows are simply invisible to it, which is what they were before this
+    // migration existed.
+    (
+        MIGRATION_V19,
+        MIGRATION_V19_CHECKSUM,
+        Compatibility::Additive,
+    ),
 ];
 
 /// The oldest binary that may open a database with `version` applied.
@@ -2725,6 +2740,36 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
                 MIGRATION_V18_CHECKSUM,
                 now_ms_i64()?,
                 min_reader_version_for(MIGRATION_V18)
+            ],
+        )?;
+    }
+
+    let has_v19 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V19],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v19 {
+        // Probed on the new column rather than on the migration row, like V16's
+        // and V17's, so a database that already carries the rebuilt shape is not
+        // rebuilt a second time.
+        let already_widened = transaction
+            .prepare("SELECT unattributed_reason FROM egress_destinations LIMIT 0")
+            .is_ok();
+        if !already_widened {
+            transaction.execute_batch(MIGRATION_V19_SQL)?;
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V19,
+                MIGRATION_V19_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V19)
             ],
         )?;
     }
@@ -3435,6 +3480,75 @@ CREATE TABLE egress_destinations (
 ) STRICT;
 
 CREATE INDEX egress_destinations_host_idx ON egress_destinations(host, last_seen_ms DESC);
+"#;
+
+/// Lets `egress_destinations` hold the traffic no run made (roadmap K5).
+///
+/// V14 recorded **where** allowed egress went, but only for traffic a process row
+/// could be charged. Everything else — a user clicking Check for updates, a
+/// scheduled fetch, an inbound request, startup, a shared MCP transport — had a
+/// *reason* to be charged to and no row to hang a destination list off, so
+/// `UNATTRIBUTED_EGRESS` reported volume by reason and named nowhere at all. "Which
+/// hosts does the app itself reach outside a run" had no answer.
+///
+/// This gives those rows a home in the same table, keyed by
+/// [`crate::run_scope::Unattributed`]'s own persisted `code()` rather than by a
+/// second vocabulary invented here.
+///
+/// # Nullable `process_id`, and exactly one attribution
+///
+/// A row names a process or a reason, never both and never neither. That is a
+/// `CHECK` rather than a convention, because "neither" is a destination charged to
+/// nothing — which is the exact failure this whole item is about — and "both" is a
+/// row two readers would each count once.
+///
+/// # Why the primary key becomes a unique index
+///
+/// SQLite permits NULLs in the columns of a non-`INTEGER` primary key, so
+/// `PRIMARY KEY (process_id, scheme, host, port)` would stop deduplicating the
+/// moment `process_id` went nullable: every unattributed insert would look
+/// distinct and the upsert would never fire. The unique index over `COALESCE`d
+/// attribution columns has the semantics the primary key was there to provide,
+/// and `ON CONFLICT` can target it by the same expressions.
+///
+/// # Why the overflow count is a separate table
+///
+/// The attributed cap's overflow lives on `agent_processes`
+/// (`egress_destinations_dropped`) because it is a property of that process. An
+/// unattributed overflow has no process, and V14's own note rejects a sentinel row
+/// in this table — it would have to be excluded by every reader that joins here.
+/// So it gets the smallest thing that is not either: one row per reason.
+const MIGRATION_V19_SQL: &str = r#"
+CREATE TABLE egress_destinations_v19 (
+    process_id TEXT REFERENCES agent_processes(process_id) ON DELETE CASCADE,
+    unattributed_reason TEXT CHECK (unattributed_reason IS NULL OR length(unattributed_reason) > 0),
+    scheme TEXT NOT NULL CHECK (length(scheme) > 0),
+    host TEXT NOT NULL CHECK (length(host) > 0),
+    port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+    requests INTEGER NOT NULL CHECK (requests > 0),
+    first_seen_ms INTEGER NOT NULL CHECK (first_seen_ms > 0),
+    last_seen_ms INTEGER NOT NULL CHECK (last_seen_ms >= first_seen_ms),
+    CHECK ((process_id IS NULL) <> (unattributed_reason IS NULL))
+) STRICT;
+
+INSERT INTO egress_destinations_v19
+    (process_id, unattributed_reason, scheme, host, port, requests, first_seen_ms, last_seen_ms)
+SELECT process_id, NULL, scheme, host, port, requests, first_seen_ms, last_seen_ms
+  FROM egress_destinations;
+
+DROP TABLE egress_destinations;
+ALTER TABLE egress_destinations_v19 RENAME TO egress_destinations;
+
+CREATE UNIQUE INDEX egress_destinations_key_idx ON egress_destinations(
+    COALESCE(process_id, ''), COALESCE(unattributed_reason, ''), scheme, host, port
+);
+CREATE INDEX egress_destinations_host_idx ON egress_destinations(host, last_seen_ms DESC);
+
+CREATE TABLE unattributed_egress_overflow (
+    reason TEXT PRIMARY KEY,
+    dropped INTEGER NOT NULL CHECK (dropped > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0)
+) STRICT;
 "#;
 
 /// V14's second half — see [`MIGRATION_V14_SQL`] on why the count of dropped
@@ -6365,7 +6479,7 @@ mod tests {
                 .execute(
                     "INSERT INTO schema_migrations
                         (version, checksum, applied_at_ms, min_reader_version)
-                     VALUES (19, 'from-the-future-additive', 19, 18)",
+                     VALUES (20, 'from-the-future-additive', 20, 19)",
                     [],
                 )
                 .unwrap();
@@ -6379,7 +6493,7 @@ mod tests {
             let connection = Connection::open(&database.path).unwrap();
             connection
                 .execute(
-                    "UPDATE schema_migrations SET min_reader_version = 19 WHERE version = 19",
+                    "UPDATE schema_migrations SET min_reader_version = 20 WHERE version = 20",
                     [],
                 )
                 .unwrap();
@@ -6387,7 +6501,7 @@ mod tests {
         assert!(
             matches!(
                 RunLedger::open(&database.path),
-                Err(LedgerError::MigrationConflict { version: 19 })
+                Err(LedgerError::MigrationConflict { version: 20 })
             ),
             "a future migration that requires a newer binary must still refuse"
         );
@@ -6537,6 +6651,108 @@ mod tests {
         );
     }
 
+    /// V19 is the second whole-table rebuild, and the one whose *key* changes:
+    /// SQLite permits NULLs in a non-`INTEGER` primary key, so a nullable
+    /// `process_id` would have silently stopped deduplicating these rows. This
+    /// asserts the rows survive, the unique index does the primary key's old job,
+    /// and the exactly-one-attribution rule is enforced rather than assumed.
+    #[test]
+    fn migration_v19_keeps_attributed_destinations_and_admits_unattributed_ones() {
+        let database = TempDb::new("egress-destinations-rebuild");
+        let ledger = RunLedger::open(&database.path).unwrap();
+        let connection = &ledger.connection;
+
+        connection
+            .execute(
+                "INSERT INTO agent_processes
+                     (process_id, kind, external_id, state, created_at_ms, updated_at_ms)
+                 VALUES ('p-dest', 'chat_turn', 'ext-dest', 'running', 10, 10)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO egress_destinations
+                     (process_id, scheme, host, port, requests, first_seen_ms, last_seen_ms)
+                 VALUES ('p-dest', 'https', 'api.test', 443, 7, 100, 200)",
+                [],
+            )
+            .unwrap();
+
+        // The attributed row is untouched, and its `unattributed_reason` is NULL
+        // rather than a back-filled string — it was never unattributed.
+        let (requests, reason): (i64, Option<String>) = connection
+            .query_row(
+                "SELECT requests, unattributed_reason FROM egress_destinations
+                  WHERE process_id = 'p-dest'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(requests, 7);
+        assert_eq!(reason, None);
+
+        // The same host under a reason is a *different* row.
+        connection
+            .execute(
+                "INSERT INTO egress_destinations
+                     (unattributed_reason, scheme, host, port, requests, first_seen_ms, last_seen_ms)
+                 VALUES ('unattributed.startup', 'https', 'api.test', 443, 1, 100, 200)",
+                [],
+            )
+            .unwrap();
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM egress_destinations WHERE host = 'api.test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2, "a process and a reason must not share a row");
+
+        // The unique index still refuses a duplicate of either, which is the
+        // primary key's old job.
+        for duplicate in [
+            "INSERT INTO egress_destinations
+                 (process_id, scheme, host, port, requests, first_seen_ms, last_seen_ms)
+             VALUES ('p-dest', 'https', 'api.test', 443, 1, 100, 200)",
+            "INSERT INTO egress_destinations
+                 (unattributed_reason, scheme, host, port, requests, first_seen_ms, last_seen_ms)
+             VALUES ('unattributed.startup', 'https', 'api.test', 443, 1, 100, 200)",
+        ] {
+            assert!(
+                connection.execute(duplicate, []).is_err(),
+                "the unique index must still deduplicate: {duplicate}"
+            );
+        }
+
+        // Exactly one attribution, enforced. Neither is a destination charged to
+        // nothing; both is a row two readers would each count once.
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO egress_destinations
+                         (scheme, host, port, requests, first_seen_ms, last_seen_ms)
+                     VALUES ('https', 'orphan.test', 443, 1, 100, 200)",
+                    [],
+                )
+                .is_err(),
+            "a destination attributed to nothing must be refused"
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO egress_destinations
+                         (process_id, unattributed_reason, scheme, host, port, requests,
+                          first_seen_ms, last_seen_ms)
+                     VALUES ('p-dest', 'unattributed.startup', 'https', 'both.test', 443, 1, 100, 200)",
+                    [],
+                )
+                .is_err(),
+            "a destination attributed to both must be refused"
+        );
+    }
+
     /// The floor is derived from the ladder, so it cannot drift from the
     /// compatibility each migration declares.
     #[test]
@@ -6558,6 +6774,9 @@ mod tests {
         // an older binary can read past.
         assert_eq!(min_reader_version_for(MIGRATION_V17), MIGRATION_V13);
         assert_eq!(min_reader_version_for(MIGRATION_V18), MIGRATION_V18);
+        // V19 relaxes a constraint rather than adding a kind, so a V18 binary
+        // reads past it unchanged and it inherits V18's floor.
+        assert_eq!(min_reader_version_for(MIGRATION_V19), MIGRATION_V18);
         // And the pre-V9 ladder keeps exactly its old behaviour.
         assert_eq!(min_reader_version_for(MIGRATION_V8), MIGRATION_V8);
         assert_eq!(min_reader_version_for(MIGRATION_V1), MIGRATION_V1);
@@ -6608,13 +6827,13 @@ mod tests {
             let ledger = RunLedger::open(&database.path).unwrap();
             assert_eq!(
                 ledger.applied_migrations().unwrap(),
-                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
             );
         }
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
             "reopening must not re-apply or add a migration"
         );
 
@@ -6863,7 +7082,7 @@ mod tests {
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
             "opening a V10 database must apply every migration above it"
         );
         assert_eq!(

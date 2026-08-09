@@ -137,7 +137,9 @@ mod tests {
     #[test]
     fn system_only_path_is_detected() {
         assert!(is_system_only("/usr/bin:/bin:/usr/sbin:/sbin"));
-        assert!(is_system_only("/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin"));
+        assert!(is_system_only(
+            "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin"
+        ));
         assert!(!is_system_only("/Users/x/.local/bin:/usr/bin:/bin"));
         assert!(!is_system_only("/opt/homebrew/bin:/usr/bin"));
     }

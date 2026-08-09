@@ -3544,7 +3544,10 @@ mod tests {
         assert_eq!(history.status, WorkflowRunStatus::Succeeded);
         // 3 `true` polls each advance the virtual clock by one interval before
         // the 4th (`false`) poll lets the level proceed.
-        assert_eq!(clock.now_unix_ms(), 1_000 + 3 * WORKFLOW_PAUSE_POLL_INTERVAL_MS);
+        assert_eq!(
+            clock.now_unix_ms(),
+            1_000 + 3 * WORKFLOW_PAUSE_POLL_INTERVAL_MS
+        );
         assert_eq!(signal_source.poll_count.load(Ordering::SeqCst), 4);
 
         let states: Vec<ProcessState> = projector
@@ -3587,7 +3590,11 @@ mod tests {
             WorkflowRunStatus::Cancelled,
             "a stop requested while parked must win immediately, not wait for resume"
         );
-        assert_eq!(adapter.call_count("prompt"), 0, "the node must never have run");
+        assert_eq!(
+            adapter.call_count("prompt"),
+            0,
+            "the node must never have run"
+        );
     }
 
     /// A [`SignalSource`] serving a fixed intent — the durable latch as another
@@ -3617,11 +3624,19 @@ mod tests {
 
         let history = HeadlessWorkflowExecutor::new(&adapter, &TestClock::at(1_000))
             .with_signal_source(Some(&signal_source))
-            .run(&ir, run_request("durable-stop-run"), &CancellationToken::new())
+            .run(
+                &ir,
+                run_request("durable-stop-run"),
+                &CancellationToken::new(),
+            )
             .unwrap();
 
         assert_eq!(history.status, WorkflowRunStatus::Cancelled);
-        assert_eq!(adapter.call_count("prompt"), 0, "the node must never have run");
+        assert_eq!(
+            adapter.call_count("prompt"),
+            0,
+            "the node must never have run"
+        );
     }
 
     #[test]
@@ -3640,7 +3655,11 @@ mod tests {
 
         let history = HeadlessWorkflowExecutor::new(&adapter, &clock)
             .with_signal_source(Some(&signal_source))
-            .run(&ir, run_request("stop-and-suspend-run"), &CancellationToken::new())
+            .run(
+                &ir,
+                run_request("stop-and-suspend-run"),
+                &CancellationToken::new(),
+            )
             .unwrap();
 
         assert_eq!(history.status, WorkflowRunStatus::Cancelled);
@@ -3661,10 +3680,18 @@ mod tests {
 
         let history = HeadlessWorkflowExecutor::new(&adapter, &clock)
             .with_signal_source(Some(&signal_source))
-            .run(&ir, run_request("clear-latch-run"), &CancellationToken::new())
+            .run(
+                &ir,
+                run_request("clear-latch-run"),
+                &CancellationToken::new(),
+            )
             .unwrap();
 
         assert_eq!(history.status, WorkflowRunStatus::Succeeded);
-        assert_eq!(clock.now_unix_ms(), 1_000, "no polling sleep on the clear path");
+        assert_eq!(
+            clock.now_unix_ms(),
+            1_000,
+            "no polling sleep on the clear path"
+        );
     }
 }

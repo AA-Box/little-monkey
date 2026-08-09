@@ -1474,7 +1474,10 @@ mod tests {
 
         let commit = run_json_with(
             &fake,
-            vec!["api".to_string(), "repos/owner/repo/commits/main".to_string()],
+            vec![
+                "api".to_string(),
+                "repos/owner/repo/commits/main".to_string(),
+            ],
             None,
         )
         .unwrap();
@@ -1500,7 +1503,10 @@ mod tests {
         let fake = FakeGitHub::new("deadbeef".to_string(), "main".to_string(), false);
         let error = run_json_with(
             &fake,
-            vec!["api".to_string(), "repos/owner/repo/commits/main".to_string()],
+            vec![
+                "api".to_string(),
+                "repos/owner/repo/commits/main".to_string(),
+            ],
             None,
         )
         .unwrap_err();
@@ -1553,6 +1559,9 @@ mod tests {
         assert_eq!(response["id"], 99);
         let state = fake.state.lock().unwrap();
         assert_eq!(state.posts, 1);
-        assert_eq!(state.comment_body.as_deref(), Some("Draft reply from triage"));
+        assert_eq!(
+            state.comment_body.as_deref(),
+            Some("Draft reply from triage")
+        );
     }
 }

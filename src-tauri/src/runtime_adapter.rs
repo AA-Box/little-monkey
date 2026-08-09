@@ -2511,12 +2511,12 @@ impl ManagedLlamaCppAdapter {
                         model_id: value.clone(),
                     }
                 })?;
-                let path = path
-                    .to_str()
-                    .ok_or_else(|| RuntimeAdapterError::ModelPathUnavailable {
-                        runtime_id: self.descriptor.runtime_id.clone(),
-                        model_id: value.clone(),
-                    })?;
+                let path =
+                    path.to_str()
+                        .ok_or_else(|| RuntimeAdapterError::ModelPathUnavailable {
+                            runtime_id: self.descriptor.runtime_id.clone(),
+                            model_id: value.clone(),
+                        })?;
                 Some(path.to_string())
             }
             _ => None,
@@ -3937,8 +3937,9 @@ impl LocalOffloadPlanner {
             }
             (0, estimated_total_layers)
         } else {
-            let fit_fraction =
-                (available_vram_bytes as f64 / input.model.estimated_vram_bytes as f64).clamp(0.0, 1.0);
+            let fit_fraction = (available_vram_bytes as f64
+                / input.model.estimated_vram_bytes as f64)
+                .clamp(0.0, 1.0);
             let gpu_layers = ((estimated_total_layers as f64) * fit_fraction).floor() as u32;
             let cpu_spill_layers = estimated_total_layers.saturating_sub(gpu_layers);
             if gpu_layers >= estimated_total_layers {
@@ -4013,8 +4014,12 @@ impl LocalOffloadPlanner {
             ));
         }
 
-        let kv_bytes_for_chosen_context = kv_bytes_per_token.saturating_mul(u64::from(context_tokens));
-        let used_bytes = input.model.weights_bytes.saturating_add(kv_bytes_for_chosen_context);
+        let kv_bytes_for_chosen_context =
+            kv_bytes_per_token.saturating_mul(u64::from(context_tokens));
+        let used_bytes = input
+            .model
+            .weights_bytes
+            .saturating_add(kv_bytes_for_chosen_context);
         let leftover_bytes = combined_budget_bytes.saturating_sub(used_bytes);
         let extra_parallel = if kv_bytes_for_chosen_context == 0 {
             0
@@ -4094,7 +4099,8 @@ impl LocalOffloadPlanner {
             ProjectorPlacement::Cpu
         };
 
-        if input.other_resident_count > 0 && (cpu_spill_layers > 0 || context_tokens < requested_context_tokens)
+        if input.other_resident_count > 0
+            && (cpu_spill_layers > 0 || context_tokens < requested_context_tokens)
         {
             improvements.push(format!(
                 "Unload {} other resident model{} to free memory and raise the offload/context budget for this load.",
@@ -4171,7 +4177,9 @@ fn resolve_offload_accelerator(
         return AcceleratorKind::Cpu;
     }
     if profile.preferred_accelerator != AcceleratorKind::Cpu
-        && hardware.platform.supports_accelerator(profile.preferred_accelerator)
+        && hardware
+            .platform
+            .supports_accelerator(profile.preferred_accelerator)
     {
         rationale.push(OffloadRationale {
             field: "accelerator".to_string(),
@@ -4184,7 +4192,8 @@ fn resolve_offload_accelerator(
     }
     rationale.push(OffloadRationale {
         field: "accelerator".to_string(),
-        explanation: "No GPU or Metal accelerator is available; the plan runs entirely on CPU.".to_string(),
+        explanation: "No GPU or Metal accelerator is available; the plan runs entirely on CPU."
+            .to_string(),
     });
     AcceleratorKind::Cpu
 }
@@ -5281,7 +5290,10 @@ mod tests {
         );
         assert_eq!(
             spec.args[0..2],
-            ["-m".to_string(), fixture_absolute_path_arg(ALPHA_MODEL_PATH)]
+            [
+                "-m".to_string(),
+                fixture_absolute_path_arg(ALPHA_MODEL_PATH)
+            ]
         );
         assert!(spec.args.windows(2).any(|pair| pair == ["-c", "8192"]));
         assert!(spec.args.windows(2).any(|pair| pair == ["-ngl", "32"]));
@@ -5356,9 +5368,10 @@ mod tests {
         controller.push_launch(Ok(process_handle()));
         let adapter = llama(controller.clone());
         let mut request = load_request("alpha");
-        request
-            .settings
-            .insert("temperature".to_string(), SettingValue::Float { value: 0.5 });
+        request.settings.insert(
+            "temperature".to_string(),
+            SettingValue::Float { value: 0.5 },
+        );
         request
             .settings
             .insert("top_p".to_string(), SettingValue::Float { value: 0.85 });
@@ -5372,9 +5385,10 @@ mod tests {
         request
             .settings
             .insert("min_p".to_string(), SettingValue::Float { value: 0.02 });
-        request
-            .settings
-            .insert("batch_size".to_string(), SettingValue::Integer { value: 1_024 });
+        request.settings.insert(
+            "batch_size".to_string(),
+            SettingValue::Integer { value: 1_024 },
+        );
         request.settings.insert(
             "mixed_precision".to_string(),
             SettingValue::Choice {
@@ -5428,10 +5442,7 @@ mod tests {
             "--model-draft".to_string(),
             fixture_absolute_path_arg(BETA_MODEL_PATH),
         ];
-        assert!(spec
-            .args
-            .windows(2)
-            .any(|pair| pair == expected_draft_arg));
+        assert!(spec.args.windows(2).any(|pair| pair == expected_draft_arg));
     }
 
     #[tokio::test]
@@ -5489,12 +5500,22 @@ mod tests {
     #[test]
     fn ollama_setting_capabilities_expose_sampler_and_batch_controls_unconditionally() {
         let capabilities = ollama_setting_capabilities();
-        for key in ["temperature", "top_p", "top_k", "repeat_penalty", "min_p", "num_batch"] {
+        for key in [
+            "temperature",
+            "top_p",
+            "top_k",
+            "repeat_penalty",
+            "min_p",
+            "num_batch",
+        ] {
             let capability = capabilities
                 .iter()
                 .find(|capability| capability.key == key)
                 .unwrap_or_else(|| panic!("{key} capability declared"));
-            assert!(capability.supported, "{key} should be unconditionally supported");
+            assert!(
+                capability.supported,
+                "{key} should be unconditionally supported"
+            );
             assert!(capability.unsupported_reason.is_none());
         }
     }
@@ -5682,7 +5703,11 @@ mod tests {
         count * 1024 * 1024 * 1024
     }
 
-    fn cpu_only_hardware(total_ram_gib: u64, available_ram_gib: u64, cpu_count: u32) -> HardwareSnapshot {
+    fn cpu_only_hardware(
+        total_ram_gib: u64,
+        available_ram_gib: u64,
+        cpu_count: u32,
+    ) -> HardwareSnapshot {
         HardwareSnapshot {
             captured_at_ms: 1,
             total_ram_bytes: gib(total_ram_gib),
@@ -5692,7 +5717,11 @@ mod tests {
         }
     }
 
-    fn metal_hardware(total_ram_gib: u64, available_ram_gib: u64, cpu_count: u32) -> HardwareSnapshot {
+    fn metal_hardware(
+        total_ram_gib: u64,
+        available_ram_gib: u64,
+        cpu_count: u32,
+    ) -> HardwareSnapshot {
         HardwareSnapshot {
             captured_at_ms: 1,
             total_ram_bytes: gib(total_ram_gib),
@@ -5831,8 +5860,11 @@ mod tests {
         assert_eq!(plan.available_ram_bytes, gib(2));
         assert_eq!(plan.available_vram_bytes, gib(2));
         assert_eq!(plan.projector_placement, ProjectorPlacement::Gpu);
-        assert!(plan.rationale.iter().any(|entry| entry.field == "projector_memory_bytes"
-            && entry.explanation.contains("2.0 GB")));
+        assert!(plan
+            .rationale
+            .iter()
+            .any(|entry| entry.field == "projector_memory_bytes"
+                && entry.explanation.contains("2.0 GB")));
     }
 
     #[test]
