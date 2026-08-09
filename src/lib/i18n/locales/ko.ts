@@ -1121,6 +1121,7 @@ export const ko: Record<string, string> = {
   "BackgroundTasksPanel.agentStatusCancelled": "취소됨",
   "BackgroundTasksPanel.agentGroupTitle": "에이전트 {{count}}개",
   "BackgroundTasksPanel.workflowKindLabel": "워크플로",
+  "BackgroundTasksPanel.phaseQueued": "대기 중",
   "BackgroundTasksPanel.stopAllAriaLabel": "실행 중인 에이전트 모두 중지",
   "BackgroundTasksPanel.tableAgentHeader": "에이전트",
   "BackgroundTasksPanel.tableTokensHeader": "토큰",
