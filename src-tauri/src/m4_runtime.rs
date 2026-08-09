@@ -37,7 +37,8 @@ use crate::mcp_app_core::{
 };
 use crate::package_ecosystem::{
     signed_first_party_catalog, InstallEnvironment, InstallTrustPolicy, PackageLimits,
-    RingEd25519SignatureVerifier, SemanticVersion, FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS,
+    RingEd25519SignatureVerifier, SemanticVersion, AGENT_CONTRACT_VERSION,
+    FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS,
 };
 use crate::process_table::{LedgerProcessProjector, LedgerSignalSource};
 use crate::run_scope::{RunScope, Unattributed};
@@ -2296,6 +2297,7 @@ pub fn production_m4_services(app_data_dir: &Path) -> Result<ProductionM4Service
                 app_version,
                 platform: std::env::consts::OS.to_string(),
                 architecture: std::env::consts::ARCH.to_string(),
+                contract_version: AGENT_CONTRACT_VERSION,
             },
             InstallTrustPolicy {
                 // Local developer packages remain data-only, checksum-bound,
