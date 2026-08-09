@@ -44,7 +44,7 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -515,75 +515,132 @@ fn drain_output(stream: impl Read + Send + 'static, tail: Arc<Mutex<String>>) {
     });
 }
 
-/// The one running tool sidecar.
+/// How many tool sidecars may be resident at once.
 ///
-/// ponytail: one at a time. Switching tools stops the previous process, which
-/// costs a reload of its model. Tools are small and used one at a time in the
-/// UI, so a pool would be idle memory; give this a map keyed by tool id if
-/// chaining two tools in one run ever becomes a feature.
+/// Each holds its own model, so this is a memory ceiling rather than a
+/// concurrency one. Reaching it evicts the least recently used tool instead of
+/// refusing the run: a user who alternates between two tools should not have to
+/// know about a limit, and the cost of being wrong is one model reload.
+const MAX_RESIDENT_TOOLS: usize = 3;
+
+/// The running tool sidecars, keyed by tool id.
+///
+/// Kept warm between runs because a tool reloads its model on every start, and
+/// alternating two tools — swap a face, then upscale it — is the normal way
+/// these get used. `stop` is how the user takes the memory back.
 #[derive(Default)]
 pub struct StudioToolState {
-    inner: Mutex<ToolProcess>,
+    running: Mutex<HashMap<String, ToolProcess>>,
 }
 
-#[derive(Default)]
 struct ToolProcess {
-    child: Option<Child>,
-    tool_id: Option<String>,
-    port: Option<u16>,
+    child: Child,
+    port: u16,
     manifest: Option<ToolManifest>,
-    stderr_tail: Option<Arc<Mutex<String>>>,
+    stderr_tail: Arc<Mutex<String>>,
+    /// Drives eviction at [`MAX_RESIDENT_TOOLS`]. Bumped on every use, so the
+    /// tool the user is actually working with is never the one evicted.
+    last_used: Instant,
+}
+
+impl ToolProcess {
+    fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    fn kill(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl StudioToolState {
-    pub fn running_tool(&self) -> Option<String> {
-        self.inner
+    /// Which tools hold memory right now, so the UI can offer to release them.
+    pub fn running_tools(&self) -> Vec<String> {
+        self.running
             .lock()
-            .ok()
-            .and_then(|state| state.tool_id.clone())
+            .map(|state| state.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
-    pub fn base_url(&self) -> Option<String> {
-        self.inner
+    pub fn base_url(&self, tool_id: &str) -> Option<String> {
+        self.running
             .lock()
             .ok()
-            .and_then(|state| state.port)
-            .map(|port| format!("http://127.0.0.1:{port}"))
+            .and_then(|state| state.get(tool_id).map(ToolProcess::base_url))
     }
 
-    pub fn stop(&self) -> Result<(), String> {
-        let mut state = self.inner.lock().map_err(|error| error.to_string())?;
-        if let Some(mut child) = state.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+    /// Stops one tool. Stopping one that is not running is not an error — the
+    /// caller wanted it gone, and it is.
+    pub fn stop(&self, tool_id: &str) -> Result<(), String> {
+        let process = self
+            .running
+            .lock()
+            .map_err(|error| error.to_string())?
+            .remove(tool_id);
+        if let Some(process) = process {
+            process.kill();
         }
-        state.tool_id = None;
-        state.port = None;
-        state.manifest = None;
         Ok(())
     }
 
-    /// `Some(message)` when the child is already gone, carrying its own output
-    /// so the failure says why.
-    fn child_exited(&self) -> Result<Option<String>, String> {
-        let mut state = self.inner.lock().map_err(|error| error.to_string())?;
-        let Some(child) = state.child.as_mut() else {
+    /// Stops every tool. Used on shutdown, and by the UI's "release memory".
+    pub fn stop_all(&self) -> Result<(), String> {
+        let processes: Vec<ToolProcess> = self
+            .running
+            .lock()
+            .map_err(|error| error.to_string())?
+            .drain()
+            .map(|(_, process)| process)
+            .collect();
+        for process in processes {
+            process.kill();
+        }
+        Ok(())
+    }
+
+    /// `Some(message)` when that tool's child is already gone, carrying its own
+    /// output so the failure says why.
+    fn child_exited(&self, tool_id: &str) -> Result<Option<String>, String> {
+        let mut state = self.running.lock().map_err(|error| error.to_string())?;
+        let Some(process) = state.get_mut(tool_id) else {
             return Ok(Some("The tool is not running".to_string()));
         };
-        let outcome = match child.try_wait() {
+        let outcome = match process.child.try_wait() {
             Ok(Some(status)) => format!("The tool exited early ({status})"),
             Ok(None) => return Ok(None),
             Err(error) => format!("The tool is unreachable: {error}"),
         };
-        let detail = state
+        let detail = process
             .stderr_tail
-            .as_ref()
-            .and_then(|tail| tail.lock().ok().map(|value| value.trim().to_string()))
+            .lock()
+            .ok()
+            .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         Ok(Some(match detail {
             Some(detail) => format!("{outcome}:\n{detail}"),
             None => outcome,
         }))
+    }
+
+    /// Drops the least recently used tools until there is room for one more.
+    fn evict_to_fit(&self) -> Result<(), String> {
+        loop {
+            let victim = {
+                let state = self.running.lock().map_err(|error| error.to_string())?;
+                if state.len() < MAX_RESIDENT_TOOLS {
+                    return Ok(());
+                }
+                state
+                    .iter()
+                    .min_by_key(|(_, process)| process.last_used)
+                    .map(|(id, _)| id.clone())
+            };
+            match victim {
+                Some(id) => self.stop(&id)?,
+                None => return Ok(()),
+            }
+        }
     }
 
     /// Ensures `tool` is running and has served a valid manifest, then returns
@@ -593,23 +650,27 @@ impl StudioToolState {
         tool: &StudioTool,
         client: &reqwest::Client,
     ) -> Result<(String, ToolManifest), String> {
-        let warm = {
-            let state = self.inner.lock().map_err(|error| error.to_string())?;
-            state.tool_id.as_deref() == Some(tool.id.as_str())
-        };
-        if warm && self.child_exited()?.is_none() {
-            if let (Some(base_url), Some(manifest)) = (
-                self.base_url(),
-                self.inner
-                    .lock()
-                    .map_err(|error| error.to_string())?
-                    .manifest
-                    .clone(),
-            ) {
-                return Ok((base_url, manifest));
+        // A warm tool answers from its cached manifest. Touched here so that
+        // reusing it also protects it from eviction.
+        if self.child_exited(&tool.id)?.is_none() {
+            let warm = {
+                let mut state = self.running.lock().map_err(|error| error.to_string())?;
+                state.get_mut(&tool.id).and_then(|process| {
+                    process.last_used = Instant::now();
+                    process
+                        .manifest
+                        .clone()
+                        .map(|manifest| (process.base_url(), manifest))
+                })
+            };
+            if let Some(warm) = warm {
+                return Ok(warm);
             }
         }
-        self.stop()?;
+        // Either it died or it never finished starting; either way this id gets
+        // a fresh process rather than a second one beside the old.
+        self.stop(&tool.id)?;
+        self.evict_to_fit()?;
 
         let binary = PathBuf::from(&tool.path);
         if !binary.is_file() {
@@ -640,19 +701,25 @@ impl StudioToolState {
             drain_output(stream, Arc::clone(&tail));
         }
         {
-            let mut state = self.inner.lock().map_err(|error| error.to_string())?;
-            state.child = Some(child);
-            state.tool_id = Some(tool.id.clone());
-            state.port = Some(port);
-            state.stderr_tail = Some(tail);
+            let mut state = self.running.lock().map_err(|error| error.to_string())?;
+            state.insert(
+                tool.id.clone(),
+                ToolProcess {
+                    child,
+                    port,
+                    manifest: None,
+                    stderr_tail: tail,
+                    last_used: Instant::now(),
+                },
+            );
         }
 
         let endpoint = format!("{base_url}/tool/v1/manifest");
         let deadline = Instant::now() + READY_TIMEOUT;
         let mut last_error = String::new();
         while Instant::now() < deadline {
-            if let Some(failure) = self.child_exited()? {
-                self.stop()?;
+            if let Some(failure) = self.child_exited(&tool.id)? {
+                self.stop(&tool.id)?;
                 return Err(failure);
             }
             if let Ok(response) = crate::egress::send(client.get(&endpoint)).await {
@@ -662,12 +729,14 @@ impl StudioToolState {
                     let manifest = match read_manifest(response).await {
                         Ok(manifest) => manifest,
                         Err(error) => {
-                            self.stop()?;
+                            self.stop(&tool.id)?;
                             return Err(error);
                         }
                     };
-                    if let Ok(mut state) = self.inner.lock() {
-                        state.manifest = Some(manifest.clone());
+                    if let Ok(mut state) = self.running.lock() {
+                        if let Some(process) = state.get_mut(&tool.id) {
+                            process.manifest = Some(manifest.clone());
+                        }
                     }
                     return Ok((base_url, manifest));
                 }
@@ -675,7 +744,7 @@ impl StudioToolState {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        self.stop()?;
+        self.stop(&tool.id)?;
         Err(if last_error.is_empty() {
             format!("{} did not start in time", tool.name)
         } else {
@@ -727,7 +796,7 @@ impl StudioToolState {
 
 impl Drop for StudioToolState {
     fn drop(&mut self) {
-        let _ = self.stop();
+        let _ = self.stop_all();
     }
 }
 
@@ -960,7 +1029,7 @@ mod tests {
         let client = test_client();
         let (base_url, manifest) = state.ensure_ready(&tool, &client).await.unwrap();
         assert_eq!(manifest.id, "echo");
-        assert_eq!(state.running_tool().as_deref(), Some("echo"));
+        assert_eq!(state.running_tools(), vec!["echo".to_string()]);
 
         // Through the same validator the command uses, so the example's own
         // declarations are checked against the rules the UI enforces.
@@ -982,8 +1051,64 @@ mod tests {
         let error = state.run(&base_url, &client, &failing).await.unwrap_err();
         assert!(error.contains("on purpose"), "{error}");
 
-        state.stop().unwrap();
-        assert_eq!(state.running_tool(), None);
+        state.stop("echo").unwrap();
+        assert!(state.running_tools().is_empty());
+    }
+
+    /// Two tools stay warm at once, and the cap evicts the *least recently
+    /// used* rather than the oldest.
+    ///
+    /// The eviction order is the part worth pinning: getting it backwards would
+    /// throw away the tool the user is working with and keep the one they
+    /// touched once, which reads as random slowness rather than as a bug.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tools_stay_resident_together_and_evict_least_recently_used() {
+        let example = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("examples/studio-tool-echo.mjs");
+        if Command::new("node")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipping: no node on this host");
+            return;
+        }
+        let tool = |id: &str| StudioTool {
+            id: id.to_string(),
+            name: id.to_string(),
+            path: example.to_string_lossy().to_string(),
+            version: None,
+            managed: false,
+        };
+
+        let state = StudioToolState::default();
+        let client = test_client();
+        for id in ["a", "b", "c"] {
+            state.ensure_ready(&tool(id), &client).await.unwrap();
+        }
+        assert_eq!(state.running_tools().len(), MAX_RESIDENT_TOOLS);
+
+        // Touch "a" so "b" becomes the least recently used.
+        state.ensure_ready(&tool("a"), &client).await.unwrap();
+        state.ensure_ready(&tool("d"), &client).await.unwrap();
+
+        let mut running = state.running_tools();
+        running.sort();
+        assert_eq!(
+            running,
+            vec!["a", "c", "d"],
+            "b was the least recently used"
+        );
+
+        state.stop("a").unwrap();
+        assert!(!state.running_tools().contains(&"a".to_string()));
+        state.stop_all().unwrap();
+        assert!(state.running_tools().is_empty());
     }
 
     /// A tool that is not there must fail with the path, and must not leave a
@@ -1000,7 +1125,7 @@ mod tests {
         };
         let error = state.ensure_ready(&tool, &test_client()).await.unwrap_err();
         assert!(error.contains("/nonexistent/studio-tool-ghost"), "{error}");
-        assert_eq!(state.running_tool(), None);
+        assert!(state.running_tools().is_empty());
     }
 
     fn input(key: &str, kind: ToolInputKind) -> ToolInput {

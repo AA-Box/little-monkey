@@ -1091,9 +1091,7 @@ pub fn studio_tool_remove(
     write_state(&app, TOOLS_FILE, &tools)?;
     // A removed tool must not keep running: its process outlives the library
     // entry otherwise, holding its model in memory with no way to reach it.
-    if state.studio_tool.running_tool().as_deref() == Some(tool_id.as_str()) {
-        state.studio_tool.stop()?;
-    }
+    state.studio_tool.stop(&tool_id)?;
     Ok(tools)
 }
 
@@ -1207,15 +1205,187 @@ pub async fn studio_tool_run(
     Ok(entries)
 }
 
-/// Releases a tool's memory, as `generation_unload_engine` does the engine's.
+/// Imports a published tool catalog into the component registry.
+///
+/// The one-click Install beside each Available tool has always worked; what was
+/// missing was any way to get entries in front of it, because the registry file
+/// starts empty and there is no catalog server to poll. A catalog is a small
+/// JSON array a publisher hands out, so importing one is the whole distribution
+/// story short of running a CDN — and every entry still goes through the hub's
+/// digest-checked download when the user actually installs it.
+///
+/// **Only `studio_tool` entries are taken.** The registry this writes into also
+/// feeds llama.cpp, MLX and accelerator components, so a file titled "tool
+/// catalog" must not be able to add or replace an inference runtime — that
+/// would turn importing a tool list into repointing the engine. Entries of any
+/// other kind are dropped rather than rejected, so one stray line does not
+/// discard a catalog the user meant to import.
 #[tauri::command]
-pub fn studio_tool_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.studio_tool.stop()
+pub fn studio_tool_import_catalog(
+    m3: tauri::State<'_, crate::m3_commands::M3CommandState>,
+    path: String,
+) -> Result<Vec<crate::m3_runtime_hub::M3ComponentCatalogEntry>, String> {
+    use crate::m3_runtime_hub::{M3ComponentCatalogEntry, M3ComponentKind};
+
+    let metadata = std::fs::metadata(&path).map_err(|error| format!("{path}: {error}"))?;
+    if !metadata.is_file() || metadata.len() > MAX_STATE_BYTES {
+        return Err("A tool catalog must be a bounded JSON file".to_string());
+    }
+    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+    // Accepts either a bare array or `{ "entries": [...] }`, because both
+    // spellings are what people actually publish.
+    let imported: Vec<M3ComponentCatalogEntry> = serde_json::from_slice(&bytes)
+        .or_else(|_| {
+            serde_json::from_slice::<serde_json::Value>(&bytes).and_then(|value| {
+                serde_json::from_value(value.get("entries").cloned().unwrap_or(value))
+            })
+        })
+        .map_err(|error| format!("This is not a tool catalog this app can read: {error}"))?;
+
+    let held = crate::m3_production::component_registry_entries(m3.component_hub.root())
+        .map_err(|error| error.to_string())?;
+    let merged = merge_tool_catalog(held, imported)?;
+    let stored = crate::m3_production::replace_component_registry_entries(&m3.component_hub, merged)
+        .map_err(|error| error.to_string())?;
+    Ok(stored
+        .into_iter()
+        .filter(|entry| entry.kind == M3ComponentKind::StudioTool)
+        .collect())
+}
+
+/// Folds an imported catalog into what the registry already holds.
+///
+/// Pure so the two rules that matter are testable without a hub: nothing but a
+/// `studio_tool` survives the import, and existing entries are merged rather
+/// than replaced.
+fn merge_tool_catalog(
+    mut held: Vec<crate::m3_runtime_hub::M3ComponentCatalogEntry>,
+    imported: Vec<crate::m3_runtime_hub::M3ComponentCatalogEntry>,
+) -> Result<Vec<crate::m3_runtime_hub::M3ComponentCatalogEntry>, String> {
+    use crate::m3_runtime_hub::M3ComponentKind;
+
+    let tools: Vec<_> = imported
+        .into_iter()
+        .filter(|entry| entry.kind == M3ComponentKind::StudioTool)
+        .collect();
+    if tools.is_empty() {
+        return Err("That catalog contains no Studio tools".to_string());
+    }
+    // Keyed on id *and* version so a re-import updates in place rather than
+    // duplicating every entry, and so two versions of one tool coexist.
+    for entry in tools {
+        match held
+            .iter_mut()
+            .find(|held| held.component_id == entry.component_id && held.version == entry.version)
+        {
+            Some(held) => *held = entry,
+            None => held.push(entry),
+        }
+    }
+    Ok(held)
+}
+
+/// Which tools are resident, so the UI can offer to release only those.
+#[tauri::command]
+pub fn studio_tools_running(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    Ok(state.studio_tool.running_tools())
+}
+
+/// Releases tool memory, as `generation_unload_engine` does the engine's.
+///
+/// `tool_id` releases one; omitting it releases every resident tool, which is
+/// what the user means by "release memory" when several are warm.
+#[tauri::command]
+pub fn studio_tool_stop(
+    state: tauri::State<'_, AppState>,
+    tool_id: Option<String>,
+) -> Result<(), String> {
+    match tool_id {
+        Some(tool_id) => state.studio_tool.stop(&tool_id),
+        None => state.studio_tool.stop_all(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{binary_starts, Duration, SystemTime, Uuid};
+    use super::{binary_starts, merge_tool_catalog, Duration, SystemTime, Uuid};
+    use crate::m3_runtime_hub::{M3ComponentCatalogEntry, M3ComponentChannel, M3ComponentKind};
+
+    fn entry(id: &str, version: &str, kind: M3ComponentKind) -> M3ComponentCatalogEntry {
+        M3ComponentCatalogEntry {
+            schema_version: 1,
+            source_id: "local".to_string(),
+            component_id: id.to_string(),
+            kind,
+            display_name: id.to_string(),
+            accelerator: None,
+            version: version.to_string(),
+            channel: M3ComponentChannel::Stable,
+            download_url: "https://example.com/tool.bin".to_string(),
+            sha256: "a".repeat(64),
+            size_bytes: 1024,
+            published_at_ms: 1_700_000_000_000,
+            compatibility_note: None,
+            metadata: Default::default(),
+        }
+    }
+
+    /// The registry this writes into also feeds llama.cpp, MLX and accelerator
+    /// components. A file titled "tool catalog" that could add or replace one of
+    /// those would turn importing a tool list into repointing the engine.
+    #[test]
+    fn importing_a_catalog_takes_only_studio_tools() {
+        let held = vec![entry("llama-cpp-server", "1.0.0", M3ComponentKind::LlamaCppServer)];
+        let imported = vec![
+            entry("face-swap", "1.0.0", M3ComponentKind::StudioTool),
+            // The smuggled one: same id as the installed runtime, so a blind
+            // merge would overwrite where llama.cpp is fetched from.
+            entry("llama-cpp-server", "1.0.0", M3ComponentKind::LlamaCppServer),
+        ];
+        let merged = merge_tool_catalog(held, imported).unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|held| held.kind == M3ComponentKind::LlamaCppServer)
+                .count(),
+            1,
+            "the runtime entry must be the one already held"
+        );
+        assert!(merged
+            .iter()
+            .any(|held| held.component_id == "face-swap"));
+    }
+
+    #[test]
+    fn a_catalog_with_no_tools_is_refused_rather_than_silently_doing_nothing() {
+        let imported = vec![entry("cuda", "1.0.0", M3ComponentKind::CudaSupport)];
+        assert!(merge_tool_catalog(Vec::new(), imported)
+            .unwrap_err()
+            .contains("no Studio tools"));
+    }
+
+    /// Importing a second publisher's catalog must not drop the first's.
+    #[test]
+    fn importing_merges_rather_than_replaces_and_updates_in_place() {
+        let held = vec![entry("face-swap", "1.0.0", M3ComponentKind::StudioTool)];
+        let merged = merge_tool_catalog(
+            held,
+            vec![
+                // Same id and version: an update, not a duplicate.
+                entry("face-swap", "1.0.0", M3ComponentKind::StudioTool),
+                // Same id, new version: both are keepable.
+                entry("face-swap", "2.0.0", M3ComponentKind::StudioTool),
+                entry("upscaler", "1.0.0", M3ComponentKind::StudioTool),
+            ],
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 3);
+        assert_eq!(
+            merged.iter().filter(|e| e.component_id == "face-swap").count(),
+            2
+        );
+    }
 
     /// The whole point of the probe: a file that is present but cannot be
     /// executed here reads as "does not start", which is what an old-glibc
