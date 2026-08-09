@@ -487,11 +487,23 @@ fn cors_origin(response: &reqwest::Response) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------
-// 2. `/health` is byte-exact
+// 2. `/health` is byte-exact, and `/v1/contract` answers beside it
 // ---------------------------------------------------------------------
 
+/// The two routes legacy answers **before authentication**, pinned together
+/// because that is the one property they share and the one a merge can lose.
+///
+/// `/health` is a liveness probe: a caller has to reach it before it has a
+/// token to present. `/v1/contract` (roadmap K19) is the same situation one
+/// step earlier — a client negotiates the ABI before it can know whether the
+/// credential shape it holds is still the right one — and its body is a pure
+/// function of the built binary, so there is nothing in it to gate.
+///
+/// One server for both, deliberately: every test in this file binds a real
+/// listener and they run in parallel, so an extra server is a real cost on a
+/// slow CI runner rather than a free assertion.
 #[tokio::test]
-async fn the_health_route_returns_the_status_ok_object_byte_for_byte() {
+async fn the_unauthenticated_routes_answer_byte_for_byte_and_publish_the_abi() {
     let Some(server) = LegacyServer::start("health", base_config()).await else {
         return;
     };
@@ -527,28 +539,8 @@ async fn the_health_route_returns_the_status_ok_object_byte_for_byte() {
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
     let body = response.bytes().await.expect("POST /health body");
     assert_bytes("POST /health", &body, NOT_FOUND_BODY);
-}
 
-// ---------------------------------------------------------------------
-// 2b. `/v1/contract` answers the K19 ABI without a token
-// ---------------------------------------------------------------------
-
-/// The contract introspection endpoint (roadmap K19) on the *real* listener.
-///
-/// Two properties, both load-bearing and neither visible from the pure
-/// generator's own unit tests. It answers **before authentication** — a client
-/// negotiating an ABI has no reason to hold a credential yet, and one whose
-/// credential shape changed must still be able to find that out. And what it
-/// answers is the same manifest the published artifact holds, digest included,
-/// so "the version this instance implements" is a fact about the running
-/// binary rather than about a file someone remembered to update.
-#[tokio::test]
-async fn the_contract_route_serves_the_published_abi_without_a_token() {
-    let Some(server) = LegacyServer::start("contract", base_config()).await else {
-        return;
-    };
-    let client = http_client();
-
+    // `GET /v1/contract`, unauthenticated, on the same listener.
     let response = client
         .get(server.url("/v1/contract"))
         .send()
@@ -584,7 +576,7 @@ async fn the_contract_route_serves_the_published_abi_without_a_token() {
         "a running instance and the published artifact must not disagree"
     );
 
-    // Counter-test, same shape as `/health`'s: the route is method-scoped.
+    // Method-scoped, exactly as `/health` is above.
     let response = client
         .post(server.url("/v1/contract"))
         .send()

@@ -87,7 +87,7 @@ Skipping step 5 is safe (the gate keeps failing until you do it); skipping step
 | Remote routes are real | `daemon/remote/api.rs` test | The dispatch match has a route, method or grant the contract does not. |
 | ACP methods are real | `acp.rs` test | The ACP loop dispatches a method the contract does not name. |
 | Desktop tools match | `src/lib/contractDrift.test.ts` | `tools.ts` and the published schema disagree about a tool's arguments. |
-| Endpoint serves it | `tests/legacy_route_compatibility.rs`, `m3_http_server.rs` | A listener stops answering `/v1/contract`, or answers something other than the published manifest. |
+| Endpoint serves it | `tests/legacy_route_compatibility.rs` (with `/health`, the other pre-auth route), `m3_http_server.rs` | A listener stops answering `/v1/contract`, or answers something other than the published manifest. |
 
 All of them run in CI on Linux, macOS and Windows (`pnpm test:rust` and
 `pnpm test`); `pnpm contract:check` runs the two gate tests alone.
