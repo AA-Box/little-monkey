@@ -1928,6 +1928,14 @@ export function StudioPanel({ mode, railSlot }: Props) {
             <textarea
               className="min-h-16 min-w-0 flex-1 resize-none rounded border border-border bg-background p-2 text-xs"
               placeholder={t("Studio.promptPlaceholder")}
+              // A placeholder is not a label: it disappears on the first
+              // keystroke and screen readers may never announce it.
+              aria-label={isSpeechTask(task) ? t("Studio.speechText") : t("Studio.prompt")}
+              // The engine parses `(word:1.3)` inside the prompt itself —
+              // verified against the pinned build, which exports
+              // `parse_prompt_attention`. It costs nothing to expose and is
+              // invisible otherwise. Speech has no sampler to weight.
+              title={isSpeechTask(task) ? undefined : t("Studio.promptWeighting")}
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
             />
@@ -1947,6 +1955,8 @@ export function StudioPanel({ mode, railSlot }: Props) {
               <input
                 className="min-w-0 flex-1 rounded border border-border bg-background p-2 text-xs"
                 placeholder={t("Studio.negativePlaceholder")}
+                aria-label={t("Studio.negativePrompt")}
+                title={t("Studio.promptWeighting")}
                 value={negativePrompt}
                 onChange={(event) => setNegativePrompt(event.target.value)}
               />
