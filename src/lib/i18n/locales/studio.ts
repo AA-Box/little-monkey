@@ -28,6 +28,14 @@ export const studioLocale: Record<string, string> = {
   "Studio.video.subtitle": "Generate video on this machine. No account, no upload.",
   "Studio.models": "Models",
 
+  // Control-image preprocessors. ControlNet wants a hint map, not a
+  // photograph; before this the user had to make one elsewhere.
+  "Studio.preprocess.label": "Turn this photo into a hint map",
+  "Studio.preprocess.placeholder": "Leave as it is",
+  "Studio.preprocess.canny": "Edges (Canny)",
+  "Studio.preprocess.grayscale": "Greyscale",
+  "Studio.preprocess.invert": "Invert",
+
   // Tools — the sidecar tier. A tool is a separate program, not a model and
   // not part of the engine, and the copy says so: what the user installs here
   // runs beside the app rather than inside it.
