@@ -40,6 +40,54 @@ pub trait MobileChatQueue: Send + Sync {
     fn chat_run_id(&self, client_key: &str) -> Result<Option<String>, String>;
 }
 
+/// Seam through which the placement route reaches this node's own queue
+/// (roadmap K17 S2).
+///
+/// The same shape as [`MobileChatQueue`] and for the same reason: the route's
+/// contract — validate a foreign spec, refuse what this node cannot satisfy,
+/// record the placement — is testable without a configured daemon, while
+/// production (`daemon::DaemonPlacementQueue`) does the real enqueue.
+pub trait PlacementQueue: Send + Sync {
+    /// Accepts a frozen foreign spec and queues it here.
+    ///
+    /// The implementation owns the refusal for anything about *this* machine
+    /// that the spec needs and this machine has not got — a workspace root that
+    /// does not exist, a model target this node cannot execute — because those
+    /// are exactly the facts the wire cannot carry.
+    fn place(&self, spec: &little_monkey_lib::run_protocol::RunSpec) -> Result<PlacedJob, String>;
+    /// Current state of a previously placed run, by the node-side job id.
+    ///
+    /// Keyed on the job rather than the run because the job row is what carries
+    /// the *node's* verdict — its hold reason, its spawn failure, its budget
+    /// cancellation — and that verdict is what a placer needs to read.
+    fn placed_state(&self, job_id: &str) -> Result<Option<PlacedJobState>, String>;
+}
+
+/// What the node minted for one accepted placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedJob {
+    pub node_run_id: String,
+    pub job_id: String,
+    pub state: String,
+}
+
+/// A placed run's current state as the node sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedJobState {
+    pub state: String,
+    pub terminal: bool,
+    pub updated_at_ms: u64,
+    pub last_error: Option<String>,
+}
+
+/// Meta keys holding the two operator statements a node makes about itself
+/// (roadmap K17 S1). In the daemon's own meta table rather than in
+/// `RemoteHostConfig` because they are facts about the *machine*, not about its
+/// TLS listener, and an operator who has not configured a remote host can still
+/// set them.
+pub const NODE_RESIDENCY_META: &str = "node_residency";
+pub const NODE_NAME_META: &str = "node_name";
+
 #[derive(Debug, Clone)]
 pub struct ApiRequest {
     pub method: String,
@@ -92,6 +140,11 @@ pub struct RemoteApi {
     /// `None` (bare unit tests) answers those routes with a clear 501-style
     /// error instead of pretending to queue anything.
     mobile_chat: Option<Arc<dyn MobileChatQueue>>,
+    /// Placement execution seam for `/v1/remote/node/runs` (roadmap K17 S2).
+    /// `None` (bare unit tests, and any build without a configured daemon)
+    /// answers the placement route with an explicit refusal rather than
+    /// accepting a spec it cannot run.
+    placement: Option<Arc<dyn PlacementQueue>>,
     /// Where remote requests land in the unified subsystem event stream
     /// (roadmap K12).
     ///
@@ -112,6 +165,7 @@ impl Clone for RemoteApi {
             secrets: Arc::clone(&self.secrets),
             desktop: self.desktop.clone(),
             mobile_chat: self.mobile_chat.clone(),
+            placement: self.placement.clone(),
             audit: self.audit.clone(),
         }
     }
@@ -123,6 +177,7 @@ impl RemoteApi {
         host: RemoteHostConfig,
         desktop: Arc<DesktopControlRuntime>,
         mobile_chat: Arc<dyn MobileChatQueue>,
+        placement: Arc<dyn PlacementQueue>,
     ) -> Result<Self, String> {
         let store = RemoteStore::open(&paths.root)?;
         let audit = audit_for(&paths);
@@ -133,6 +188,7 @@ impl RemoteApi {
             secrets: Arc::new(KeyringRemoteSecrets),
             desktop: Some(desktop),
             mobile_chat: Some(mobile_chat),
+            placement: Some(placement),
             audit,
         })
     }
@@ -152,6 +208,7 @@ impl RemoteApi {
             secrets,
             desktop: None,
             mobile_chat: None,
+            placement: None,
             audit,
         }
     }
@@ -161,6 +218,14 @@ impl RemoteApi {
     #[cfg(test)]
     pub fn with_mobile_chat(mut self, mobile_chat: Arc<dyn MobileChatQueue>) -> Self {
         self.mobile_chat = Some(mobile_chat);
+        self
+    }
+
+    /// Test builder: the injected API plus a fake placement queue, so the K17
+    /// placement contract is exercisable without a configured daemon.
+    #[cfg(test)]
+    pub fn with_placement(mut self, placement: Arc<dyn PlacementQueue>) -> Self {
+        self.placement = Some(placement);
         self
     }
 
@@ -472,6 +537,27 @@ impl RemoteApi {
                 require_capability(device, DeviceCapability::Capture).and_then(|_| {
                     self.mobile_capture_post(&request.body, device, request_sha256, now_ms)
                 })
+            }
+            // --- Versioned `/v1/remote/node/*` placement plane (roadmap K17).
+            // A second plane beside the control plane above, sharing only this
+            // transport. The control-plane routes act on runs the node already
+            // holds; these are the only ones through which a run authored
+            // elsewhere can arrive.
+            ("GET", ["v1", "remote", "node"]) => {
+                require_capability(device, DeviceCapability::DescribeNode)
+                    .and_then(|_| self.node_descriptor())
+            }
+            ("GET", ["v1", "remote", "node", "health"]) => {
+                require_capability(device, DeviceCapability::DescribeNode)
+                    .and_then(|_| self.node_health(now_ms))
+            }
+            ("POST", ["v1", "remote", "node", "runs"]) => {
+                require_capability(device, DeviceCapability::PlaceRuns)
+                    .and_then(|_| self.place_run(&request.body, device_id, request_sha256, now_ms))
+            }
+            ("GET", ["v1", "remote", "node", "runs", submitted_run_id]) => {
+                require_capability(device, DeviceCapability::DescribeNode)
+                    .and_then(|_| self.placed_run_status(device_id, submitted_run_id))
             }
             // Self-revocation needs no extra capability: a device may always
             // sever itself. The store path force-stops any live desktop
@@ -1411,6 +1497,304 @@ impl RemoteApi {
         ))
     }
 
+    // --- `/v1/remote/node/*` handlers (roadmap K17) ------------------------
+
+    /// The app-data directory this node's hub and workflow service live under.
+    /// The daemon root is a child of it, which is the same derivation the mobile
+    /// workflow routes above already make.
+    fn app_data(&self) -> Result<std::path::PathBuf, (u16, String)> {
+        self.paths
+            .root
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| internal("Daemon root has no app-data parent"))
+    }
+
+    /// The operator-set identity of this node.
+    ///
+    /// Both values are operator statements held in the daemon's own meta table,
+    /// not inferred: nothing can derive which jurisdiction a machine's disks are
+    /// in, and a guess there is worse than an explicit
+    /// [`RESIDENCY_UNSPECIFIED`](little_monkey_lib::node_placement::RESIDENCY_UNSPECIFIED),
+    /// which a residency rule naming a real zone never matches.
+    fn node_identity(&self, store: &DaemonStore) -> (String, String) {
+        let residency = store
+            .get_meta(NODE_RESIDENCY_META)
+            .ok()
+            .flatten()
+            .filter(|value| little_monkey_lib::node_placement::validate_residency(value).is_ok())
+            .unwrap_or_else(|| {
+                little_monkey_lib::node_placement::RESIDENCY_UNSPECIFIED.to_string()
+            });
+        let name = store
+            .get_meta(NODE_NAME_META)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| self.host.runner_id.clone());
+        (name, residency)
+    }
+
+    fn describe_node(
+        &self,
+        now_ms: u64,
+    ) -> Result<little_monkey_lib::node_placement::NodeDescriptor, (u16, String)> {
+        use little_monkey_lib::m3_runtime_hub::M3HardwareProbe;
+        let store = DaemonStore::open(&self.paths).map_err(internal)?;
+        let config = crate::daemon::store::DaemonConfig::load(&self.paths).map_err(internal)?;
+        let backpressure = crate::daemon::backpressure_for(&store, &config).map_err(internal)?;
+        let (node_name, residency) = self.node_identity(&store);
+        // The same probe the admission loop uses, so a placer reads the numbers
+        // this node's own scheduler will judge the job against — not a second,
+        // differently-collected view of the same machine.
+        let hardware = little_monkey_lib::m3_production::SystemM3HardwareProbe
+            .snapshot()
+            .map_err(|error| {
+                (
+                    503,
+                    format!("This node could not measure its own hardware: {error}"),
+                )
+            })?;
+        Ok(little_monkey_lib::node_placement::NodeDescriptor {
+            protocol_version: little_monkey_lib::node_placement::NODE_PROTOCOL_VERSION,
+            runner_id: self.host.runner_id.clone(),
+            node_name,
+            residency,
+            accelerators: little_monkey_lib::node_placement::describe_accelerators(&hardware),
+            // Managed-hub models only. Ollama-hosted tags are deliberately not
+            // enumerated: listing them is an async HTTP call and this handler is
+            // synchronous, and the consequence is bounded and stated — a
+            // placement naming an Ollama model simply does not win
+            // `select_node`'s resident-model key and falls through to the queue
+            // and memory keys, which is the same answer as a cold node.
+            resident_models: little_monkey_lib::m3_runtime_hub::installed_model_inventory(
+                &self.app_data()?,
+            ),
+            hardware,
+            accepting: backpressure.accepting,
+            queue_depth: backpressure.queue_depth,
+            queue_capacity: backpressure.queue_capacity,
+            captured_at_ms: now_ms,
+        })
+    }
+
+    fn node_descriptor(&self) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        // `captured_at_ms` comes from the hardware probe's own stamp rather than
+        // from the request clock: the snapshot is the measurement, and stamping
+        // it with "when you asked" would make a cached or slow probe look fresh.
+        let descriptor = self.describe_node(0)?;
+        let captured_at_ms = descriptor.hardware.captured_at_ms;
+        let descriptor = little_monkey_lib::node_placement::NodeDescriptor {
+            captured_at_ms,
+            ..descriptor
+        };
+        Ok((
+            200,
+            serde_json::to_value(&descriptor).map_err(internal)?,
+            None,
+        ))
+    }
+
+    /// The cheap half of [`Self::node_descriptor`], for the heartbeat.
+    ///
+    /// Separate because the descriptor probes hardware — which forks
+    /// `nvidia-smi` on CUDA hosts — and a placer polling every node every
+    /// 30 seconds must not make each node pay that. This reads only the queue.
+    fn node_health(
+        &self,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let store = DaemonStore::open(&self.paths).map_err(internal)?;
+        let config = crate::daemon::store::DaemonConfig::load(&self.paths).map_err(internal)?;
+        let backpressure = crate::daemon::backpressure_for(&store, &config).map_err(internal)?;
+        let placed_active = self.locked_store()?.placed_run_count().map_err(internal)?;
+        let health = little_monkey_lib::node_placement::NodeHealth {
+            protocol_version: little_monkey_lib::node_placement::NODE_PROTOCOL_VERSION,
+            runner_id: self.host.runner_id.clone(),
+            now_ms,
+            accepting: backpressure.accepting,
+            queue_depth: backpressure.queue_depth,
+            queue_capacity: backpressure.queue_capacity,
+            placed_active,
+        };
+        Ok((200, serde_json::to_value(&health).map_err(internal)?, None))
+    }
+
+    /// **Roadmap K17 S2: this node takes ownership of a foreign `RunSpec`.**
+    ///
+    /// The order of the checks is the contract. The spec is validated against
+    /// the shared protocol first, then against *this node's* facts — its
+    /// residency, its identity, its kill switch — and only then handed to the
+    /// queue, which owns the last class of refusal (a workspace root that does
+    /// not exist here, a target this node cannot execute). Nothing is recorded
+    /// until the queue has accepted, so a refused placement leaves no row
+    /// claiming the node took work it did not.
+    fn place_run(
+        &self,
+        body: &[u8],
+        device_id: &str,
+        request_sha256: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let Some(queue) = self.placement.as_ref() else {
+            return Err((
+                501,
+                "This node build does not accept placed runs".to_string(),
+            ));
+        };
+        let request: little_monkey_lib::node_placement::PlaceRunRequest =
+            serde_json::from_slice(body)
+                .map_err(|error| (400, format!("Invalid placement request: {error}")))?;
+        request
+            .validate()
+            .map_err(|error| (400, format!("Placement request is invalid: {error}")))?;
+
+        let store = DaemonStore::open(&self.paths).map_err(internal)?;
+        if store.kill_switch().map_err(internal)? {
+            return Err((409, "Global kill switch is engaged".to_string()));
+        }
+        let (_, residency) = self.node_identity(&store);
+        drop(store);
+
+        // The placer states the rule it applied and this node checks it rather
+        // than trusting it. Two owned machines is exactly the case where an
+        // alias silently starts pointing somewhere else — a rotated bundle
+        // restored onto a different host, a re-provisioned box reusing a name —
+        // and a data-residency rule that only the *sender* enforces is not
+        // enforced at all.
+        if let Some(required) = &request.required_residency {
+            if required != &residency {
+                return Err((
+                    409,
+                    format!(
+                        "This node's data residency is '{residency}', not the required '{required}'"
+                    ),
+                ));
+            }
+        }
+        if let Some(expected) = &request.expected_runner_id {
+            if expected != &self.host.runner_id {
+                return Err((
+                    409,
+                    format!(
+                        "This node is '{}', not the expected '{expected}'",
+                        self.host.runner_id
+                    ),
+                ));
+            }
+        }
+
+        let submitted_run_id = request.spec.run_id.clone();
+        // A spec this node already owns is the same placement, not a second
+        // one. The signed-request replay guard covers an identical *retried*
+        // request; it cannot see a fresh request carrying a spec already placed.
+        if let Some(existing) = self
+            .locked_store()?
+            .placed_run(&submitted_run_id)
+            .map_err(internal)?
+        {
+            return Ok((
+                200,
+                serde_json::to_value(little_monkey_lib::node_placement::PlaceRunResponse {
+                    protocol_version: little_monkey_lib::node_placement::NODE_PROTOCOL_VERSION,
+                    submitted_run_id,
+                    node_run_id: existing.node_run_id,
+                    job_id: existing.job_id,
+                    state: "queued".to_string(),
+                    accepted_at_ms: existing.created_at_ms,
+                    residency: existing.residency,
+                })
+                .map_err(internal)?,
+                Some(existing.submitted_run_id),
+            ));
+        }
+
+        let placed = queue
+            .place(&request.spec)
+            .map_err(|error| (409, format!("This node refused the placement: {error}")))?;
+        self.locked_store()?
+            .insert_placed_run(&super::store::PlacedRunRecord {
+                submitted_run_id: submitted_run_id.clone(),
+                device_id: device_id.to_string(),
+                node_run_id: placed.node_run_id.clone(),
+                job_id: placed.job_id.clone(),
+                residency: residency.clone(),
+                // The digest of the signed request, which covers the exact spec
+                // bytes this node accepted. What was enforced here is auditable
+                // against what the submitter says it sent.
+                spec_sha256: request_sha256.to_string(),
+                created_at_ms: now_ms,
+            })
+            .map_err(internal)?;
+        Ok((
+            201,
+            serde_json::to_value(little_monkey_lib::node_placement::PlaceRunResponse {
+                protocol_version: little_monkey_lib::node_placement::NODE_PROTOCOL_VERSION,
+                submitted_run_id: submitted_run_id.clone(),
+                node_run_id: placed.node_run_id,
+                job_id: placed.job_id,
+                state: placed.state,
+                accepted_at_ms: now_ms,
+                residency,
+            })
+            .map_err(internal)?,
+            Some(submitted_run_id),
+        ))
+    }
+
+    /// One placed run's current state, keyed by the *submitter's* run id.
+    ///
+    /// Scoped to the placing device: a device may read the placements it made
+    /// and no others, which is the same rule `RemoteScopes::permits_run` applies
+    /// to the control plane's run listing.
+    fn placed_run_status(
+        &self,
+        device_id: &str,
+        submitted_run_id: &str,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let Some(queue) = self.placement.as_ref() else {
+            return Err((
+                501,
+                "This node build does not accept placed runs".to_string(),
+            ));
+        };
+        let record = self
+            .locked_store()?
+            .placed_run(submitted_run_id)
+            .map_err(internal)?
+            .filter(|record| record.device_id == device_id)
+            .ok_or((404, "No such placed run".to_string()))?;
+        let state = queue
+            .placed_state(&record.job_id)
+            .map_err(internal)?
+            .unwrap_or(PlacedJobState {
+                // The placement row exists and the job row does not, which is
+                // what job retention leaves behind. Reported as its own state
+                // rather than as "failed": the node genuinely does not know how
+                // it ended, and saying "failed" would be a claim.
+                state: "unknown".to_string(),
+                terminal: true,
+                updated_at_ms: record.created_at_ms,
+                last_error: Some(
+                    "This node no longer retains the job row for this placement".to_string(),
+                ),
+            });
+        Ok((
+            200,
+            serde_json::to_value(little_monkey_lib::node_placement::PlacedRunStatus {
+                protocol_version: little_monkey_lib::node_placement::NODE_PROTOCOL_VERSION,
+                submitted_run_id: record.submitted_run_id.clone(),
+                node_run_id: record.node_run_id,
+                job_id: record.job_id,
+                state: state.state,
+                terminal: state.terminal,
+                updated_at_ms: state.updated_at_ms,
+                last_error: state.last_error,
+            })
+            .map_err(internal)?,
+            Some(record.submitted_run_id),
+        ))
+    }
+
     fn audit_denied(
         &self,
         now_ms: u64,
@@ -2307,6 +2691,354 @@ mod tests {
         );
         assert_eq!(response.status, 400);
         assert!(String::from_utf8_lossy(&response.body).contains("content_sha256"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+    // --- `/v1/remote/node/*` placement plane (roadmap K17) -----------------
+
+    #[derive(Default)]
+    struct FakePlacementQueue {
+        placed: Mutex<Vec<String>>,
+        refuse: Option<String>,
+    }
+
+    impl FakePlacementQueue {
+        fn refusing(reason: &str) -> Self {
+            Self {
+                placed: Mutex::new(Vec::new()),
+                refuse: Some(reason.to_string()),
+            }
+        }
+    }
+
+    impl PlacementQueue for FakePlacementQueue {
+        fn place(
+            &self,
+            spec: &little_monkey_lib::run_protocol::RunSpec,
+        ) -> Result<PlacedJob, String> {
+            if let Some(reason) = &self.refuse {
+                return Err(reason.clone());
+            }
+            self.placed.lock().unwrap().push(spec.run_id.clone());
+            Ok(PlacedJob {
+                // The node mints its own ids — deliberately different from the
+                // submitter's, which is the property the response's two id
+                // fields exist to keep visible.
+                node_run_id: format!("node-{}", spec.run_id),
+                job_id: format!("job-{}", spec.run_id),
+                state: "queued".to_string(),
+            })
+        }
+
+        fn placed_state(&self, job_id: &str) -> Result<Option<PlacedJobState>, String> {
+            Ok(Some(PlacedJobState {
+                state: "running".to_string(),
+                terminal: false,
+                updated_at_ms: 3_000,
+                last_error: Some(format!("state of {job_id}")),
+            }))
+        }
+    }
+
+    /// A pairing that carries the two K17 grants, so the placement plane is
+    /// reachable at all.
+    fn placement_fixture() -> (PathBuf, RemoteApi, String, Vec<u8>) {
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-remote-place-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = DaemonPaths::under(&root);
+        paths.ensure().unwrap();
+        DaemonConfig::default().save(&paths).unwrap();
+        let host = RemoteHostConfig {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            runner_id: "runner-one".into(),
+            listen: "127.0.0.1:1".into(),
+            advertise_url: "https://runner.invalid".into(),
+            certificate_path: "/tmp/cert".into(),
+            private_key_path: "/tmp/key".into(),
+            certificate_sha256: "a".repeat(64),
+            enabled: true,
+        };
+        let mut store = RemoteStore::open(&paths.root).unwrap();
+        let scopes = RemoteScopes {
+            actions: BTreeSet::from([RemoteAction::ViewRuns]),
+            run_ids: BTreeSet::from(["run-one".into()]),
+            workspace_ids: BTreeSet::new(),
+            max_artifact_bytes: 1_024,
+        };
+        let capabilities = BTreeSet::from([
+            DeviceCapability::ViewRuns,
+            DeviceCapability::DescribeNode,
+            DeviceCapability::PlaceRuns,
+        ]);
+        let secrets = Arc::new(FakeSecrets::default());
+        let invite = store
+            .create_invitation_with_capabilities(&scopes, &capabilities, 1_000, 3_000)
+            .unwrap();
+        let accepted = store
+            .accept_invitation_with_capabilities(
+                &invite.pairing_id,
+                &invite.token,
+                "scheduler",
+                "runner-one",
+                None,
+                1_100,
+                secrets.as_ref(),
+            )
+            .unwrap();
+        let secret = accepted.device_secret.as_bytes().to_vec();
+        let api = RemoteApi::injected(paths, host, store, secrets);
+        (root, api, accepted.device_id, secret)
+    }
+
+    fn placement_body(
+        run_id: &str,
+        required_residency: Option<&str>,
+        expected_runner_id: Option<&str>,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&little_monkey_lib::node_placement::PlaceRunRequest {
+            protocol_version: little_monkey_lib::node_placement::NODE_PROTOCOL_VERSION,
+            spec: spec(run_id, "workspace-one"),
+            required_residency: required_residency.map(str::to_string),
+            expected_runner_id: expected_runner_id.map(str::to_string),
+        })
+        .unwrap()
+    }
+
+    /// **The grant that gates the only route through which a run this machine
+    /// did not author can start here.** Every existing pairing — and any new
+    /// one that was not explicitly given the K17 grants — is refused, which is
+    /// why `PlaceRuns` is its own capability rather than an implication of
+    /// `RunWorkflows` or of any run scope.
+    #[test]
+    fn a_pairing_without_the_placement_grants_cannot_describe_or_place() {
+        let (root, api, _secrets, device, secret) = fixture();
+        let api = api.with_placement(Arc::new(FakePlacementQueue::default()));
+        for (index, (method, path, body)) in [
+            ("GET", "/v1/remote/node", &b""[..]),
+            ("GET", "/v1/remote/node/health", b""),
+            ("POST", "/v1/remote/node/runs", b"{}"),
+            ("GET", "/v1/remote/node/runs/run-one", b""),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = api.handle(
+                signed(
+                    &device,
+                    &secret,
+                    index as u64 + 1,
+                    &format!("cmd-node-{index}"),
+                    method,
+                    path,
+                    body,
+                ),
+                2_000,
+            );
+            assert_eq!(
+                response.status, 403,
+                "{method} {path} must need an explicit K17 grant"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The node checks the residency claim rather than trusting the placer's
+    /// word for it. A rule enforced only by the sender is not enforced.
+    #[test]
+    fn the_node_refuses_a_placement_whose_residency_rule_it_does_not_satisfy() {
+        let (root, api, device, secret) = placement_fixture();
+        let api = api.with_placement(Arc::new(FakePlacementQueue::default()));
+        let body = placement_body("run-placed", Some("eu-west"), None);
+        let response = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-residency",
+                "POST",
+                "/v1/remote/node/runs",
+                &body,
+            ),
+            2_000,
+        );
+        assert_eq!(response.status, 409);
+        let message = String::from_utf8_lossy(&response.body).to_string();
+        assert!(
+            message.contains("unspecified") && message.contains("eu-west"),
+            "the refusal must name both labels: {message}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Same shape for identity: an alias that has started pointing at a
+    /// different machine is a refusal, not a silent re-target.
+    #[test]
+    fn the_node_refuses_a_placement_addressed_to_a_different_runner() {
+        let (root, api, device, secret) = placement_fixture();
+        let api = api.with_placement(Arc::new(FakePlacementQueue::default()));
+        let body = placement_body("run-placed", None, Some("runner-two"));
+        let response = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-runner",
+                "POST",
+                "/v1/remote/node/runs",
+                &body,
+            ),
+            2_000,
+        );
+        assert_eq!(response.status, 409);
+        assert!(String::from_utf8_lossy(&response.body).contains("runner-two"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The node owns what it accepts: it mints its own run id, records the
+    /// placement against the placing device, and a second *different* signed
+    /// request carrying the same spec resolves to the same placement instead of
+    /// starting a second run. (The replay guard covers an identical retry; this
+    /// covers the case it cannot see.)
+    #[test]
+    fn an_accepted_placement_is_owned_recorded_and_idempotent_per_spec() {
+        let (root, api, device, secret) = placement_fixture();
+        let queue = Arc::new(FakePlacementQueue::default());
+        let api = api.with_placement(queue.clone());
+        let body = placement_body("run-placed", None, Some("runner-one"));
+
+        let first = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-place-a",
+                "POST",
+                "/v1/remote/node/runs",
+                &body,
+            ),
+            2_000,
+        );
+        assert_eq!(
+            first.status,
+            201,
+            "{}",
+            String::from_utf8_lossy(&first.body)
+        );
+        let accepted: little_monkey_lib::node_placement::PlaceRunResponse =
+            serde_json::from_slice(&first.body).unwrap();
+        assert_eq!(accepted.submitted_run_id, "run-placed");
+        assert_eq!(accepted.node_run_id, "node-run-placed");
+        assert_ne!(
+            accepted.node_run_id, accepted.submitted_run_id,
+            "the node must not adopt a foreign run id as its own"
+        );
+
+        let second = api.handle(
+            signed(
+                &device,
+                &secret,
+                2,
+                "cmd-place-b",
+                "POST",
+                "/v1/remote/node/runs",
+                &body,
+            ),
+            2_500,
+        );
+        assert_eq!(second.status, 200, "a re-placed spec is the same placement");
+        let replayed: little_monkey_lib::node_placement::PlaceRunResponse =
+            serde_json::from_slice(&second.body).unwrap();
+        assert_eq!(replayed.node_run_id, accepted.node_run_id);
+        assert_eq!(
+            queue.placed.lock().unwrap().len(),
+            1,
+            "the node queued the spec exactly once"
+        );
+
+        // And the placement reads back, keyed by the SUBMITTER's id.
+        let status = api.handle(
+            signed(
+                &device,
+                &secret,
+                3,
+                "cmd-status",
+                "GET",
+                "/v1/remote/node/runs/run-placed",
+                b"",
+            ),
+            2_600,
+        );
+        assert_eq!(status.status, 200);
+        let status: little_monkey_lib::node_placement::PlacedRunStatus =
+            serde_json::from_slice(&status.body).unwrap();
+        assert_eq!(status.node_run_id, "node-run-placed");
+        assert_eq!(status.state, "running");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The node's own refusal reaches the placer as a refusal, and nothing is
+    /// recorded: a placement row claiming this node took work it never queued
+    /// would be worse than the failed request.
+    #[test]
+    fn a_queue_refusal_is_reported_and_leaves_no_placement_record() {
+        let (root, api, device, secret) = placement_fixture();
+        let api = api.with_placement(Arc::new(FakePlacementQueue::refusing(
+            "the placed workspace root '/nowhere' does not exist on this node",
+        )));
+        let body = placement_body("run-placed", None, None);
+        let response = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-refuse",
+                "POST",
+                "/v1/remote/node/runs",
+                &body,
+            ),
+            2_000,
+        );
+        assert_eq!(response.status, 409);
+        assert!(String::from_utf8_lossy(&response.body).contains("/nowhere"));
+
+        let follow_up = api.handle(
+            signed(
+                &device,
+                &secret,
+                2,
+                "cmd-refuse-status",
+                "GET",
+                "/v1/remote/node/runs/run-placed",
+                b"",
+            ),
+            2_100,
+        );
+        assert_eq!(
+            follow_up.status, 404,
+            "a refused placement must leave no record behind"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A build with no placement queue answers the route explicitly rather than
+    /// accepting a spec it has no way to run.
+    #[test]
+    fn a_node_without_a_placement_queue_refuses_rather_than_accepting() {
+        let (root, api, device, secret) = placement_fixture();
+        let response = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-no-queue",
+                "POST",
+                "/v1/remote/node/runs",
+                &placement_body("run-placed", None, None),
+            ),
+            2_000,
+        );
+        assert_eq!(response.status, 501);
         let _ = std::fs::remove_dir_all(root);
     }
 }

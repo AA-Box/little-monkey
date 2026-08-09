@@ -1226,6 +1226,44 @@ pub fn installed_model_footprint(app_data_dir: &Path, model_id: &str) -> M3Model
     M3ModelFootprint::Unknown
 }
 
+/// Every model this machine has installed, as the placement plane advertises it
+/// (roadmap K17 S1).
+///
+/// The same free-function shape and the same failure direction as
+/// [`installed_model_footprint`] directly above, and for the same reason: the
+/// caller is a remote route handler with an app-data directory and no hub, and
+/// an unreadable inventory is "this node advertises no resident models" rather
+/// than a failed request. Sorted by model id so two descriptions of an unchanged
+/// node are byte-identical.
+#[must_use]
+pub fn installed_model_inventory(app_data_dir: &Path) -> Vec<crate::node_placement::NodeModel> {
+    let root = app_data_dir.join(M3_HUB_DIRECTORY);
+    let Ok(state) = load_hub_state(&root.join("state"), &root.join("models")) else {
+        return Vec::new();
+    };
+    let mut models: Vec<crate::node_placement::NodeModel> = state
+        .models
+        .iter()
+        .filter_map(|stored| {
+            let version = stored
+                .versions
+                .iter()
+                .find(|version| version.version_key == stored.active_version_key)?;
+            Some(crate::node_placement::NodeModel {
+                model_id: version.model.model_id.clone(),
+                display_name: version.model.display_name.clone(),
+                runtime: format!("{:?}", version.model.runtime).to_ascii_lowercase(),
+                weights_bytes: version.model.size_bytes,
+                estimated_ram_bytes: version.model.estimated_ram_bytes,
+                estimated_vram_bytes: version.model.estimated_vram_bytes,
+            })
+        })
+        .collect();
+    models.sort_by(|left, right| left.model_id.cmp(&right.model_id));
+    models.dedup_by(|left, right| left.model_id == right.model_id);
+    models
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct M3InstalledVersionView {
