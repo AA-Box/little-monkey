@@ -25,12 +25,13 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use sha2::{Digest, Sha256};
-use tauri::{Emitter, Manager};
+use tauri::{Emitter};
 
 use crate::run_protocol::{
     ModelTargetSnapshot, PermissionMode as RunPermissionMode, PermissionPolicySnapshot,
     WorkspaceContext,
 };
+use crate::profiles::ProfileScopedPaths;
 
 /// Current (and, so far, only) recipe schema version.
 pub const RECIPE_SCHEMA_VERSION: u32 = 1;
@@ -1046,8 +1047,7 @@ pub fn delete_recipe_impl(app_data_dir: &Path, name: &str) -> Result<(), String>
 // ---------------------------------------------------------------------------
 
 fn app_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
+    app.profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {e}"))
 }
 

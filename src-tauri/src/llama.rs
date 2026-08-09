@@ -26,6 +26,7 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::AppState;
+use crate::profiles::ProfileScopedPaths;
 
 /// Port the managed chat `llama-server` instance listens on.
 pub(crate) const CHAT_PORT: u16 = 8090;
@@ -237,8 +238,7 @@ pub fn find_llama_server_binary() -> Result<String, String> {
 /// materialization makes the same runtime available to the standalone CLI.
 fn find_llama_server_binary_for_app(app: &AppHandle) -> Result<String, String> {
     let app_data_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     let resource_dir = app.path().resource_dir().ok();
     // A bundle that fails verification must not be the end of the search: an

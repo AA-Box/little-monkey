@@ -29,7 +29,12 @@ pub const DIAGNOSTICS_SCHEMA_VERSION: u32 = 1;
 
 /// Keychain service identifier — same constant Little Monkey uses everywhere
 /// else it touches the OS keychain (see `mcp.rs::KEYCHAIN_SERVICE`).
-const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.app"));
 /// A single fixed, namespaced, never-user-facing account used only for the
 /// write/read/delete round trip below. Never holds anything but a fresh
 /// random probe value, and is deleted again before the probe returns.
@@ -639,7 +644,7 @@ async fn probe_health(port: u16) -> bool {
 /// writable without touching any real credential. Deletes its own entry
 /// before returning, success or failure, so no probe residue survives a run.
 fn probe_keychain() -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_PROBE_ACCOUNT)
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, KEYCHAIN_PROBE_ACCOUNT)
         .map_err(|error| format!("Could not open a keychain entry: {error}"))?;
     let probe_value = format!("lm-diagnostics-{}", uuid::Uuid::new_v4());
     let write_result = entry
@@ -1249,7 +1254,7 @@ mod tests {
         // Calling it again must still succeed (overwrite-then-clean, not
         // "already exists" failure) and must not leave the entry behind.
         assert!(probe_keychain().is_ok());
-        let leftover = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_PROBE_ACCOUNT)
+        let leftover = keyring::Entry::new(&KEYCHAIN_SERVICE, KEYCHAIN_PROBE_ACCOUNT)
             .and_then(|entry| entry.get_password());
         assert!(leftover.is_err(), "probe entry must be deleted after the round trip");
     }

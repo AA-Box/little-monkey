@@ -62,9 +62,9 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use tauri::Manager;
 
 use crate::{workspace, AppState};
+use crate::profiles::ProfileScopedPaths;
 
 const MEMORIES_FILE: &str = "memories.json";
 
@@ -228,8 +228,7 @@ impl Default for MemoriesFile {
 
 pub(crate) fn memories_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {}", e))?;
     Ok(dir.join(MEMORIES_FILE))

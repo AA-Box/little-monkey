@@ -355,6 +355,11 @@ pub mod portability;
 // CLI service from growing a second encryption, credential, or conflict path.
 pub mod portability_commands;
 mod profile_commands;
+// K23's identity boundary. `pub` because `monkey-cli` and the daemon resolve
+// the same active profile through it — a second copy of the resolution rule is
+// a second answer to "whose data is this".
+pub mod profiles;
+use crate::profiles::ProfileScopedPaths;
 pub mod profile_store;
 mod run_commands;
 // `pub` so a future `monkey-cli` `task schedule` subcommand could reuse
@@ -913,7 +918,7 @@ pub fn run() {
             // same app-owned runtime without Ollama or a system install.
             // A source/dev build may intentionally have no staged bundle;
             // model start still fails closed if a present bundle is invalid.
-            if let Ok(runtime_app_data) = app.path().app_data_dir() {
+            if let Ok(runtime_app_data) = app.profile_data_dir() {
                 let resource_dir = app.path().resource_dir().ok();
                 if let Err(error) = managed_runtime::materialize_bundled_runtime(
                     resource_dir.as_deref(),
@@ -1203,6 +1208,12 @@ pub fn run() {
             memory::memory_import,
             sessions::sessions_load,
             sessions::sessions_save,
+            profiles::profiles_list,
+            profiles::profiles_create,
+            profiles::profiles_rename,
+            profiles::profiles_set_limits,
+            profiles::profiles_delete,
+            profiles::profiles_switch,
             profile_commands::profile_migration_status,
             profile_commands::profile_migrate,
             profile_commands::profile_global_search,

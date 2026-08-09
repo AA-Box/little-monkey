@@ -25,6 +25,7 @@ mod ollama_api;
 mod permission;
 mod plugins_cli;
 mod processes_cli;
+mod profiles_cli;
 mod providers_cli;
 mod repl;
 mod security_cli;
@@ -76,6 +77,12 @@ struct Cli {
     /// current directory.
     #[arg(long, value_name = "PATH", global = true)]
     workspace: Option<PathBuf>,
+
+    /// Run this command as another local profile (K23), without changing
+    /// which profile the desktop app opens. Equivalent to setting
+    /// `LITTLE_MONKEY_PROFILE`; see `monkey profiles list` for the ids.
+    #[arg(long, value_name = "ID", global = true)]
+    profile: Option<String>,
 
     /// Provider id (for example ollama, managed-llama, openai, anthropic,
     /// gemini, openrouter, or a custom provider id). Use only to override or
@@ -419,6 +426,10 @@ enum Cmd {
     /// Run the published conformance suite (roadmap K21) against a live node
     /// and report whether it may claim compatibility with this revision.
     Conformance(conformance_cli::ConformanceArgs),
+    /// Manage local profiles: separate sessions, run history, artifacts,
+    /// credentials and machine share on one machine (K23).
+    #[command(subcommand, alias = "profile")]
+    Profiles(profiles_cli::ProfilesCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -1105,6 +1116,15 @@ async fn resolve_mcp_entries(cli: &Cli, state: &AppState) -> Vec<McpServerEntry>
 async fn main() {
     let mut cli = Cli::parse();
 
+    // Applied before anything resolves a path, and as the environment variable
+    // the library already reads, so the flag and `LITTLE_MONKEY_PROFILE` cannot
+    // disagree — a second resolution rule is a second answer to "whose data is
+    // this". Single-threaded here: `Cli::parse()` is the only thing that has
+    // run.
+    if let Some(profile) = cli.profile.as_deref() {
+        std::env::set_var(little_monkey_lib::profiles::PROFILE_ENV_VAR, profile);
+    }
+
     // The one client the whole CLI shares — threaded through as
     // `&reqwest::Client` by every subcommand below — so hardening it here is
     // the whole binary's egress posture in one line. See
@@ -1463,6 +1483,16 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
         }
         Cmd::Contract(action) => contract_cli::run(action).await,
         Cmd::Conformance(args) => conformance_cli::run(args).await,
+        Cmd::Profiles(action) => {
+            // The registry lives *above* the profile roots, so this is the one
+            // command that must not resolve through the active profile.
+            let base = little_monkey_lib::app_paths::base_data_dir()
+                .ok_or_else(|| "Could not resolve the app data directory".to_string());
+            match base {
+                Ok(base) => profiles_cli::run(action, &base),
+                Err(error) => Err(error),
+            }
+        }
         Cmd::Acp => acp::run(cli).await,
     };
     if let Err(e) = result {
@@ -1939,6 +1969,7 @@ mod tests {
             cmd: None,
             model_or_prompt: None,
             prompt: Vec::new(),
+            profile: None,
             workspace: None,
             provider: None,
             model: None,
@@ -2167,6 +2198,7 @@ mod tests {
             cmd: None,
             model_or_prompt: None,
             prompt: Vec::new(),
+            profile: None,
             workspace: None,
             provider: None,
             model: None,

@@ -276,10 +276,20 @@ fn accelerator_memory(kind: AcceleratorKind, snapshot: &HardwareSnapshot) -> Opt
 /// which already exists as this codebase's answer to "how much must stay free" —
 /// a second, differently-tuned constant here would be one more number to
 /// disagree with the planner.
+/// `profile_ceiling_bytes` is the system memory the *active profile* (K23) may
+/// hold at once — its K4 quota, or its K8 share of a machine it splits with
+/// another profile, whichever is tighter. `None` is every installation that has
+/// only ever had one identity and set no quota, and takes the same path as
+/// before this parameter existed.
+///
+/// A ceiling smaller than a single job's claim is a [`Fit::Never`], not a hold:
+/// holding forever for memory that will never be released is exactly the
+/// starvation K8 spent a bound ruling out.
 pub fn fit(
     reservation: &Reservation,
     committed: &MemoryRequirement,
     snapshot: &HardwareSnapshot,
+    profile_ceiling_bytes: Option<u64>,
 ) -> Fit {
     let model = match reservation {
         Reservation::Remote => return Fit::Fits { claim: ZERO_MEMORY },
@@ -316,7 +326,20 @@ pub fn fit(
         }
     }
 
+    if let Some(ceiling) = profile_ceiling_bytes {
+        if placement.claim.ram_bytes > ceiling {
+            return Fit::Never {
+                resource: Resource::Ram,
+                shortfall_bytes: placement.claim.ram_bytes.saturating_sub(ceiling),
+            };
+        }
+    }
+
     let ram_budget = snapshot.available_ram_bytes.saturating_sub(reserve);
+    let ram_budget = match profile_ceiling_bytes {
+        Some(ceiling) => ram_budget.min(ceiling),
+        None => ram_budget,
+    };
     let wanted_ram = placement
         .claim
         .ram_bytes
@@ -454,7 +477,7 @@ mod tests {
             Reservation::Remote
         );
         assert_eq!(
-            fit(&Reservation::Remote, &ZERO_MEMORY, &machine(16, 1)),
+            fit(&Reservation::Remote, &ZERO_MEMORY, &machine(16, 1), None),
             Fit::Fits { claim: ZERO_MEMORY }
         );
     }
@@ -501,7 +524,7 @@ mod tests {
         assert_eq!(unknown.model_key(), None, "it commits nothing");
         // Not `Fits`: it is admitted, but never counted as having fitted.
         assert_eq!(
-            fit(&unknown, &ZERO_MEMORY, &machine(16, 16)),
+            fit(&unknown, &ZERO_MEMORY, &machine(16, 16), None),
             Fit::Unmeasured
         );
     }
@@ -512,7 +535,7 @@ mod tests {
         let machine = machine(16, 16);
         let job = measured(12 * GIB, 0, None);
         assert!(matches!(
-            fit(&job, &ZERO_MEMORY, &machine),
+            fit(&job, &ZERO_MEMORY, &machine, None),
             Fit::Fits { .. }
         ));
 
@@ -520,7 +543,7 @@ mod tests {
             ram_bytes: 12 * GIB,
             vram_bytes: 0,
         };
-        match fit(&job, &committed, &machine) {
+        match fit(&job, &committed, &machine, None) {
             Fit::Hold {
                 resource: Resource::Ram,
                 ..
@@ -532,7 +555,7 @@ mod tests {
     #[test]
     fn a_job_too_big_for_the_machine_is_never_rather_than_held() {
         // Held would mean waiting forever for memory that cannot appear.
-        match fit(&measured(64 * GIB, 0, None), &ZERO_MEMORY, &machine(16, 16)) {
+        match fit(&measured(64 * GIB, 0, None), &ZERO_MEMORY, &machine(16, 16), None) {
             Fit::Never {
                 resource: Resource::Ram,
                 shortfall_bytes,
@@ -547,7 +570,7 @@ mod tests {
     fn accelerator_memory_holds_a_job_the_ram_leg_would_admit() {
         let machine = cuda_machine(16, 16);
         let job = measured(4 * GIB, 12 * GIB, Some(AcceleratorKind::Cuda));
-        let claim = match fit(&job, &ZERO_MEMORY, &machine) {
+        let claim = match fit(&job, &ZERO_MEMORY, &machine, None) {
             Fit::Fits { claim } => claim,
             other => panic!("the first job must fit, got {other:?}"),
         };
@@ -560,7 +583,7 @@ mod tests {
             ram_bytes: 0,
             vram_bytes: 8 * GIB,
         };
-        match fit(&job, &committed, &machine) {
+        match fit(&job, &committed, &machine, None) {
             Fit::Hold {
                 resource: Resource::Vram,
                 shortfall_bytes,
@@ -575,6 +598,7 @@ mod tests {
             &measured(4 * GIB, 40 * GIB, Some(AcceleratorKind::Cuda)),
             &ZERO_MEMORY,
             &cuda_machine(16, 16),
+            None,
         ) {
             Fit::Never {
                 resource: Resource::Vram,
@@ -582,6 +606,59 @@ mod tests {
             } => assert_eq!(shortfall_bytes, 24 * GIB),
             other => panic!("expected Never on accelerator memory, got {other:?}"),
         }
+    }
+
+    /// A profile's ceiling (K23) binds before the machine's free memory does,
+    /// and a claim no ceiling could ever satisfy is `Never` rather than a hold
+    /// that would wait forever.
+    #[test]
+    fn a_profile_ceiling_bounds_admission_below_what_the_machine_would_allow() {
+        let job = measured(6 * GIB, 0, None);
+        let idle = machine(64, 64);
+
+        // No ceiling: the machine's own headroom decides, as before K23.
+        assert!(matches!(
+            fit(&job, &ZERO_MEMORY, &idle, None),
+            Fit::Fits { .. }
+        ));
+
+        // An 8 GiB ceiling admits the first 6 GiB job and holds the second,
+        // on a machine with 58 GiB still free.
+        assert!(matches!(
+            fit(&job, &ZERO_MEMORY, &idle, Some(8 * GIB)),
+            Fit::Fits { .. }
+        ));
+        match fit(
+            &job,
+            &MemoryRequirement {
+                ram_bytes: 6 * GIB,
+                vram_bytes: 0,
+            },
+            &idle,
+            Some(8 * GIB),
+        ) {
+            Fit::Hold {
+                resource: Resource::Ram,
+                shortfall_bytes,
+            } => assert_eq!(shortfall_bytes, 4 * GIB),
+            other => panic!("expected a hold against the profile ceiling, got {other:?}"),
+        }
+
+        // A ceiling smaller than one job's claim can never be satisfied by
+        // waiting, so it is a refusal at enqueue rather than a permanent hold.
+        match fit(&job, &ZERO_MEMORY, &idle, Some(2 * GIB)) {
+            Fit::Never {
+                resource: Resource::Ram,
+                shortfall_bytes,
+            } => assert_eq!(shortfall_bytes, 4 * GIB),
+            other => panic!("expected Never under an unsatisfiable ceiling, got {other:?}"),
+        }
+
+        // A remote run claims nothing local, so no profile ceiling applies.
+        assert!(matches!(
+            fit(&Reservation::Remote, &ZERO_MEMORY, &idle, Some(1)),
+            Fit::Fits { .. }
+        ));
     }
 
     /// A model with no hard accelerator requirement spills instead of being
@@ -592,6 +669,7 @@ mod tests {
             &measured(20 * GIB, 40 * GIB, None),
             &ZERO_MEMORY,
             &cuda_machine(16, 16),
+            None,
         );
         match outcome {
             Fit::Fits { claim } => {
@@ -625,7 +703,7 @@ mod tests {
                 devices: Vec::new(),
             }],
         );
-        match fit(&measured(8 * GIB, 8 * GIB, None), &ZERO_MEMORY, &snapshot) {
+        match fit(&measured(8 * GIB, 8 * GIB, None), &ZERO_MEMORY, &snapshot, None) {
             Fit::Fits { claim } => {
                 assert_eq!(claim.ram_bytes, 8 * GIB);
                 assert_eq!(claim.vram_bytes, 0, "unified memory has no second pool");
