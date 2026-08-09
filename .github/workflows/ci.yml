@@ -152,6 +152,9 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # The lockfile is the Tauri crate's, not the repository root's, and
+          # the action looks for `./Cargo.lock` relative to this directory.
+          working-directory: src-tauri
 
       # The SBOM covers both dependency trees (pnpm-lock.yaml and Cargo.lock are
       # both in the scanned tree), so one artifact describes the whole app.
