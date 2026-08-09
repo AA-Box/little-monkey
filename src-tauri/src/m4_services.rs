@@ -49,6 +49,10 @@ use crate::workflow_core::{
 pub const M4_SERVICE_CONTRACT_VERSION: u32 = 1;
 pub const M4_TRIGGER_ADAPTER_CONTRACT_VERSION: u32 = 1;
 
+/// Revision kind under which workflow definitions are versioned in the shared
+/// config revision store (`config_revisions.rs`), keyed by `workflow_id`.
+pub const WORKFLOW_REVISION_KIND: &str = "workflow";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum M4ServiceError {
     Package(String),
@@ -1822,6 +1826,13 @@ pub struct WorkflowService {
     /// boundary. Same "port, not a ledger handle" reasoning and the same
     /// `None` meaning "no signal delivery" for a bare checkout or a unit test.
     signal_source: Option<Arc<dyn SignalSource>>,
+    /// Where every accepted definition is also written as a revision (roadmap
+    /// K24 / ROADMAP #3), so a workflow gains the same diff/restore/branch
+    /// history as a persona. A plain `PathBuf` rather than a port: the
+    /// revision store is already an `AppHandle`-free module, so the CLI and
+    /// daemon paths record into the same history the desktop reads. `None`
+    /// means "do not version" — a unit test in a temp dir.
+    revision_root: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -2006,7 +2017,16 @@ impl WorkflowService {
             approval_broker: None,
             process_projector: None,
             signal_source: None,
+            revision_root: None,
         })
+    }
+
+    /// Attaches the shared config revision store, so each accepted definition
+    /// is recorded alongside personas and snippets rather than in a private
+    /// per-service history. Builder-style, matching the two ports above.
+    pub fn with_revision_store(mut self, root: impl Into<PathBuf>) -> Self {
+        self.revision_root = Some(root.into());
+        self
     }
 
     /// Attaches the unified process table as a projection sink.
@@ -2167,9 +2187,15 @@ impl WorkflowService {
                 M4ServiceError::NotFound(format!("workflow {}", definition.workflow_id))
             })?;
         if definition.workflow_version <= current.workflow_version {
-            return Err(M4ServiceError::Conflict(
-                "workflow update version must increase".to_string(),
-            ));
+            // This IS the concurrent-edit check (roadmap K24): an editor
+            // derives the version it saves from the copy it loaded, so a
+            // non-increasing version means someone else saved in between. The
+            // `conflict:` prefix and the stored version let the UI say that,
+            // and offer a reload, instead of showing a bare version rule.
+            return Err(M4ServiceError::Conflict(format!(
+                "conflict: workflow {} was changed elsewhere since you loaded it (stored version {}, attempted {})",
+                definition.workflow_id, current.workflow_version, definition.workflow_version
+            )));
         }
         let workflow_id = definition.workflow_id.clone();
         self.append_workflow_record_unlocked(&workflow_id, Some(definition))?;
@@ -2589,7 +2615,37 @@ impl WorkflowService {
             .root
             .join("workflows")
             .join(sha256(workflow_id.as_bytes()));
-        self.append_record(&directory, sequence, &record)
+        self.append_record(&directory, sequence, &record)?;
+        self.record_revision(workflow_id, record.definition.as_ref());
+        Ok(())
+    }
+
+    /// Mirrors an accepted definition into the shared config revision store.
+    ///
+    /// Best-effort by design: the definition is already committed to the
+    /// workflow store by the time this runs, and a history that cannot be
+    /// written must not turn a successful save into a failed one. A delete
+    /// records nothing — an empty snapshot is not a revision anyone would want
+    /// to restore, and the last real definition stays in the history exactly
+    /// so a deleted workflow can be brought back.
+    fn record_revision(&self, workflow_id: &str, definition: Option<&WorkflowDefinition>) {
+        let (Some(root), Some(definition)) = (self.revision_root.as_ref(), definition) else {
+            return;
+        };
+        let Ok(content) = serde_json::to_string_pretty(definition) else {
+            return;
+        };
+        let _ = crate::config_revisions::record(
+            root,
+            WORKFLOW_REVISION_KIND,
+            workflow_id,
+            crate::config_revisions::RecordRequest {
+                branch: None,
+                base_revision_id: None,
+                label: format!("Saved v{}", definition.workflow_version),
+                content,
+            },
+        );
     }
 
     fn load_workflow_record_unlocked(
@@ -3530,6 +3586,76 @@ mod tests {
             registrar,
         )
         .unwrap()
+    }
+
+    /// Every accepted definition must land in the shared revision store, and a
+    /// stale save must be refused as a conflict rather than overwriting the
+    /// newer one (roadmap K24 / ROADMAP #3).
+    #[test]
+    fn workflow_saves_are_versioned_and_a_stale_save_is_refused() {
+        let directory = TempDirectory::new("workflow-revisions");
+        let revisions = directory.0.join("revisions");
+        let service =
+            workflow_service(&directory.0, None, BTreeSet::new()).with_revision_store(&revisions);
+        let mut definition = workflow_core_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.fixture_id == "parallel-transform")
+            .unwrap()
+            .workflow;
+        service.create(definition.clone()).unwrap();
+
+        definition.workflow_version = 2;
+        definition.name = format!("{} (renamed)", definition.name);
+        service.update(definition.clone()).unwrap();
+
+        let history = crate::config_revisions::history(
+            &revisions,
+            WORKFLOW_REVISION_KIND,
+            &definition.workflow_id,
+            None,
+        )
+        .unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].label, "Saved v2");
+
+        // Both sides of the comparison are addressable and actually differ —
+        // rendering the diff itself is `DiffViewer.tsx`'s job.
+        let older = crate::config_revisions::get(
+            &revisions,
+            WORKFLOW_REVISION_KIND,
+            &definition.workflow_id,
+            &history[1].revision_id,
+        )
+        .unwrap();
+        let newer = crate::config_revisions::get(
+            &revisions,
+            WORKFLOW_REVISION_KIND,
+            &definition.workflow_id,
+            &history[0].revision_id,
+        )
+        .unwrap();
+        assert!(newer.content.contains("(renamed)"));
+        assert!(!older.content.contains("(renamed)"));
+
+        // A second editor still holding version 1 saves version 2: that is a
+        // concurrent edit, and it must be refused, not applied on top.
+        definition.name = "written by the stale editor".to_string();
+        let error = service.update(definition.clone()).unwrap_err();
+        assert!(
+            error.to_string().contains("conflict:"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            crate::config_revisions::history(
+                &revisions,
+                WORKFLOW_REVISION_KIND,
+                &definition.workflow_id,
+                None
+            )
+            .unwrap()
+            .len(),
+            2
+        );
     }
 
     /// Records projections instead of writing them, which is the whole reason

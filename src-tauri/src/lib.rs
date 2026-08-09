@@ -223,6 +223,11 @@ pub mod stacks;
 // `pub` so `monkey-cli` (slice 4) can reuse `load_impl`/`PromptEntry` directly,
 // the same reasoning as `rules`/`checkpoints` above.
 pub mod prompts;
+// Local revision history (diff/restore/branch/compare) for everything the user
+// authors — personas, snippets, skills, workflow definitions (roadmap K24 /
+// ROADMAP #3). `pub` for the same reason as `prompts`: `WorkflowService` and
+// `monkey-cli` record into it without an `AppHandle`.
+pub mod config_revisions;
 mod login_path;
 mod sessions;
 mod system;
@@ -1186,6 +1191,14 @@ pub fn run() {
             prompts::prompts_save,
             prompts::prompts_read_external,
             prompts::prompts_write_external,
+            prompts::prompts_current_revision,
+            config_revisions::config_revisions_record,
+            config_revisions::config_revisions_history,
+            config_revisions::config_revisions_get,
+            config_revisions::config_revisions_head,
+            config_revisions::config_revisions_branch,
+            config_revisions::config_revisions_branches,
+            config_revisions::config_revisions_entities,
             checkpoints::checkpoint_begin,
             checkpoints::checkpoint_end,
             checkpoints::checkpoint_revert,

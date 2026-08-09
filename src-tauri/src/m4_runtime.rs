@@ -2274,7 +2274,12 @@ fn production_workflow_service_with_browser(
     // level boundary see a pause requested from any of them.
     .with_signal_source(Arc::new(LedgerSignalSource::new(
         app_data_dir.join("profile-v1.sqlite3"),
-    )));
+    )))
+    // Same "every production path reaches this service" reasoning: attaching
+    // the shared revision store here is what gives a workflow definition the
+    // same history (diff/restore/branch) a persona has, whether it was saved
+    // from the desktop, the CLI, or a daemon-hosted trigger.
+    .with_revision_store(crate::config_revisions::revision_root(app_data_dir));
     let service = Arc::new(service);
     Ok((service, browser))
 }
