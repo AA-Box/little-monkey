@@ -11,13 +11,14 @@
  * already downloads, checks a published SHA-256, keeps versions and can roll
  * back, so a tool is never less verified than a runtime is.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Trash2 } from "lucide-react";
 
 import { Button, IconButton, Listbox, StatusPill } from "../ui";
 import { SettingsCard } from "./SettingsCard";
+import { pickImageBase64 } from "../../lib/imageAttachment";
 import { useT } from "../../lib/i18n";
 import { formatBytes, studioClient, type GenerationEntry } from "../../lib/studioClient";
 import {
@@ -221,17 +222,16 @@ export function ToolPanel({ railSlot }: Props) {
       return { ...current, [key]: value };
     });
 
-  /** The same `FileReader` the generation form uses for its init and
-   *  conditioning images: the tool contract wants bare base64, which is the
-   *  data URL past its comma. */
-  const readImageInto = (key: string, file: File) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result ?? "");
-      const comma = result.indexOf(",");
-      if (comma >= 0) setValue(key, result.slice(comma + 1));
-    };
-    reader.readAsDataURL(file);
+  /** The same native picker the generation form uses for its init and
+   *  conditioning images: the tool contract wants bare base64, which is what it
+   *  hands back. */
+  const readImageInto = async (key: string) => {
+    try {
+      const base64 = await pickImageBase64();
+      if (base64) setValue(key, base64);
+    } catch (cause) {
+      setError(String(cause));
+    }
   };
 
   const useNewestResult = async (key: string) => {
@@ -430,7 +430,7 @@ export function ToolPanel({ railSlot }: Props) {
                           input={input}
                           value={values[input.key]}
                           onChange={(next) => setValue(input.key, next)}
-                          onPickImage={(file) => readImageInto(input.key, file)}
+                          onPickImage={() => void readImageInto(input.key)}
                           onUseNewest={() => void useNewestResult(input.key)}
                         />
                       ))}
@@ -487,7 +487,7 @@ interface FieldProps {
   input: ToolInput;
   value: ToolInputs[string] | undefined;
   onChange: (value: ToolInputs[string] | undefined) => void;
-  onPickImage: (file: File) => void;
+  onPickImage: () => void;
   onUseNewest: () => void;
 }
 
@@ -501,7 +501,6 @@ interface FieldProps {
  */
 function ToolField({ input, value, onChange, onPickImage, onUseNewest }: FieldProps) {
   const { t } = useT();
-  const fileInput = useRef<HTMLInputElement | null>(null);
   const label = (
     <span className="flex items-baseline justify-between gap-2">
       <span className="text-[11px] font-medium text-muted">{input.label}</span>
@@ -527,19 +526,7 @@ function ToolField({ input, value, onChange, onPickImage, onUseNewest }: FieldPr
             </span>
           ) : (
             <span className="grid gap-1">
-              <input
-                ref={fileInput}
-                type="file"
-                accept="image/png,image/jpeg,image/webp"
-                className="hidden"
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  if (file) onPickImage(file);
-                  // Cleared so re-picking the same file still fires a change.
-                  event.target.value = "";
-                }}
-              />
-              <Button size="sm" variant="secondary" onClick={() => fileInput.current?.click()}>
+              <Button size="sm" variant="secondary" onClick={onPickImage}>
                 {t("Studio.tools.pickImage")}
               </Button>
               <Button size="sm" variant="secondary" onClick={onUseNewest}>

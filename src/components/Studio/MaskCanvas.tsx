@@ -163,7 +163,10 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
         />
       </div>
 
-      <div className="flex items-center gap-2 text-xs">
+      {/* Wraps rather than pushing the clear button past the panel's edge: the
+          brush slider will give up width down to a point and then the row
+          breaks. */}
+      <div className="flex flex-wrap items-center gap-2 text-xs">
         <IconButton
           size="sm"
           aria-label={t(erasing ? "Studio.mask.paint" : "Studio.mask.erase")}
@@ -172,7 +175,7 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
         >
           {erasing ? <Paintbrush size={12} /> : <Eraser size={12} />}
         </IconButton>
-        <label className="flex flex-1 items-center gap-2">
+        <label className="flex min-w-32 flex-1 items-center gap-2">
           <span className="shrink-0 text-muted">{t("Studio.mask.brush")}</span>
           <input
             type="range"
