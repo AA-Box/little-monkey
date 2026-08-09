@@ -53,10 +53,10 @@ vi.mock("./turnEngine", () => ({
     target.kind === "local" ? "Local model" : target.kind === "ollama" ? `Ollama · ${target.model}` : `${target.providerId} · ${target.model}`,
 }));
 
-import { MAX_SUBAGENT_ITERATIONS, runSubagentTask, type RunSubagentTaskParams } from "./subagent";
+import { MAX_SUBAGENT_ITERATIONS, runSubagentTask, steerSubagentRun, type RunSubagentTaskParams } from "./subagent";
 import { clearPauseRegistryForTests, setPauseRequested } from "./pauseRegistry";
 import type { ResolvedTarget, RiskAnnotationContext } from "./turnEngine";
-import type { ToolCall } from "./llamaClient";
+import type { ChatMessage, ToolCall } from "./llamaClient";
 import { selectSubagentRun, useSubagentStore } from "../store/subagentStore";
 import { useSessionStore, type ChatSession } from "../store/sessionStore";
 import { useSettingsStore } from "../store/settingsStore";
@@ -907,5 +907,82 @@ describe("runSubagentTask / onMutatedPath reporting", () => {
 
     expect(executeToolCallMock).not.toHaveBeenCalled();
     expect(onMutatedPath).not.toHaveBeenCalled();
+  });
+});
+
+// Mid-run steering: `steerSubagentRun` queues user messages for a LIVE run
+// (keyed by `cancelId`, same rule as `cancelSubagentRun`); `runSubagentTask`
+// drains the queue at the top of its next loop iteration, appending each as a
+// plain `user` message to both its local wire transcript and the live store.
+describe("runSubagentTask / mid-run steering", () => {
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+  });
+
+  it("drains queued steer messages, in order, into the next iteration's wire history and liveMessages", async () => {
+    let resolveFirst!: (value: unknown) => void;
+    attemptStreamMock
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("grep result");
+
+    const promise = runSubagentTask(baseParams({ taskId: "steer-run-1", toolCallId: "call-steer-1" }));
+    await vi.waitFor(() => expect(attemptStreamMock).toHaveBeenCalledTimes(1));
+
+    expect(steerSubagentRun("steer-run-1", "first steer")).toBe(true);
+    expect(steerSubagentRun("steer-run-1", "second steer")).toBe(true);
+
+    resolveFirst({ content: "", toolCalls: [toolCall("grep", "call-g")], streamError: null, contentStarted: true });
+    expect(await promise).toBe("done");
+
+    // Not in the FIRST call's history (the steers arrived mid-iteration) …
+    const firstWire = attemptStreamMock.mock.calls[0][1] as ChatMessage[];
+    expect(firstWire.some((m) => m.content === "first steer")).toBe(false);
+
+    // … but in the second call's, in queue order, AFTER the tool result.
+    const secondWire = attemptStreamMock.mock.calls[1][1] as ChatMessage[];
+    const userTexts = secondWire.filter((m) => m.role === "user").map((m) => m.content);
+    expect(userTexts).toEqual(["find every caller of X", "first steer", "second steer"]);
+    const toolIndex = secondWire.findIndex((m) => m.role === "tool");
+    expect(secondWire.findIndex((m) => m.content === "first steer")).toBeGreaterThan(toolIndex);
+
+    const run = selectSubagentRun("call-steer-1")(useSubagentStore.getState());
+    expect(run?.liveMessages.filter((m) => m.role === "user").map((m) => m.content)).toEqual(["first steer", "second steer"]);
+  });
+
+  it("is a no-op (returns false, appends nothing) once the run has finished", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    await runSubagentTask(baseParams({ taskId: "steer-run-2", toolCallId: "call-steer-2" }));
+
+    expect(steerSubagentRun("steer-run-2", "too late")).toBe(false);
+    const run = selectSubagentRun("call-steer-2")(useSubagentStore.getState());
+    expect(run?.liveMessages.some((m) => m.content === "too late")).toBe(false);
+  });
+
+  it("returns false for a cancelId no run ever registered (e.g. a restored run's empty cancelId)", () => {
+    expect(steerSubagentRun("", "hello")).toBe(false);
+    expect(steerSubagentRun("never-registered", "hello")).toBe(false);
+  });
+
+  it("drops a steer queued during the run's final iteration — a later run reusing the id never inherits it", async () => {
+    let resolveFirst!: (value: unknown) => void;
+    attemptStreamMock.mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }));
+
+    const promise = runSubagentTask(baseParams({ taskId: "steer-run-3", toolCallId: "call-steer-3" }));
+    await vi.waitFor(() => expect(attemptStreamMock).toHaveBeenCalledTimes(1));
+
+    expect(steerSubagentRun("steer-run-3", "never seen")).toBe(true);
+    // Final answer — the loop returns without another iteration, so the
+    // queued steer must be cleared with the controller, not left behind.
+    resolveFirst({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    await promise;
+
+    attemptStreamMock.mockReset();
+    attemptStreamMock.mockResolvedValue({ content: "second run done", toolCalls: [], streamError: null, contentStarted: true });
+    await runSubagentTask(baseParams({ taskId: "steer-run-3", toolCallId: "call-steer-3b" }));
+
+    const wire = attemptStreamMock.mock.calls[0][1] as ChatMessage[];
+    expect(wire.some((m) => m.content === "never seen")).toBe(false);
   });
 });

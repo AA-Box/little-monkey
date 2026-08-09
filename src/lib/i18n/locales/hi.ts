@@ -1099,6 +1099,8 @@ export const hi: Record<string, string> = {
   "BackgroundTasksPanel.finishedHeading": "समाप्त",
   "BackgroundTasksPanel.clearButton": "साफ़ करें",
   "BackgroundTasksPanel.stopAriaLabel": "\"{{name}}\" रोकें",
+  "BackgroundTasksPanel.steerPlaceholder": "इस एजेंट को संदेश भेजें…",
+  "BackgroundTasksPanel.steerSendAriaLabel": "\"{{name}}\" को संदेश भेजें",
   "BackgroundTasksPanel.shellKindLabel": "शेल",
   "BackgroundTasksPanel.agentKindLabel": "एजेंट",
   "BackgroundTasksPanel.exitCode": "एग्ज़िट {{code}}",

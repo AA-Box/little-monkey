@@ -1100,6 +1100,8 @@ export const esES: Record<string, string> = {
   "BackgroundTasksPanel.finishedHeading": "Finalizadas",
   "BackgroundTasksPanel.clearButton": "Limpiar",
   "BackgroundTasksPanel.stopAriaLabel": "Detener \"{{name}}\"",
+  "BackgroundTasksPanel.steerPlaceholder": "Envía un mensaje a este agente…",
+  "BackgroundTasksPanel.steerSendAriaLabel": "Enviar mensaje a \"{{name}}\"",
   "BackgroundTasksPanel.shellKindLabel": "Shell",
   "BackgroundTasksPanel.agentKindLabel": "Agente",
   "BackgroundTasksPanel.exitCode": "salida {{code}}",

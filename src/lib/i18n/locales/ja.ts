@@ -1099,6 +1099,8 @@ export const ja: Record<string, string> = {
   "BackgroundTasksPanel.finishedHeading": "完了",
   "BackgroundTasksPanel.clearButton": "クリア",
   "BackgroundTasksPanel.stopAriaLabel": "「{{name}}」を停止",
+  "BackgroundTasksPanel.steerPlaceholder": "このエージェントにメッセージを送信…",
+  "BackgroundTasksPanel.steerSendAriaLabel": "「{{name}}」にメッセージを送信",
   "BackgroundTasksPanel.shellKindLabel": "シェル",
   "BackgroundTasksPanel.agentKindLabel": "エージェント",
   "BackgroundTasksPanel.exitCode": "終了コード {{code}}",

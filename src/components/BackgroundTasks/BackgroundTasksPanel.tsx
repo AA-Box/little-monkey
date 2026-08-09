@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { ChevronRight, Loader2, Square, TerminalSquare, X } from "lucide-react";
+import { ChevronRight, CornerDownLeft, Loader2, Square, TerminalSquare, X } from "lucide-react";
 
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
 import {
@@ -20,7 +20,7 @@ import {
 } from "../../store/subagentStore";
 import { useSessionStore } from "../../store/sessionStore";
 import { useT } from "../../lib/i18n";
-import { cancelSubagentRun } from "../../lib/subagent";
+import { cancelSubagentRun, steerSubagentRun } from "../../lib/subagent";
 import { formatCompactTokens, formatElapsed } from "../../lib/taskFormat";
 import { textContent, type ChatMessage } from "../../lib/llamaClient";
 import { ToolCallRow } from "../Chat/MessageList";
@@ -239,6 +239,45 @@ function TranscriptRowsView({ rows }: { rows: TranscriptRow[] }) {
   );
 }
 
+/** One-line mid-run composer for a live subagent run — queues a user message
+ * the child model sees at the top of its next loop iteration (see
+ * `steerSubagentRun` in subagent.ts). Rendered only while the run is
+ * `'running'`; additionally disabled when `cancelId` is empty (a restored
+ * run from a previous app session, which cannot be steered). */
+function SteerInput({ run }: { run: SubagentRun }) {
+  const { t } = useT();
+  const [text, setText] = useState("");
+  const disabled = run.cancelId === "";
+  const send = () => {
+    const trimmed = text.trim();
+    if (!trimmed || disabled) return;
+    if (steerSubagentRun(run.cancelId, trimmed)) setText("");
+  };
+  return (
+    <div className="mt-2 flex items-center gap-1.5">
+      <input
+        type="text"
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") send();
+        }}
+        placeholder={t("BackgroundTasksPanel.steerPlaceholder")}
+        disabled={disabled}
+        className="min-w-0 flex-1 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground placeholder:text-faint focus:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
+      />
+      <IconButton
+        size="sm"
+        aria-label={t("BackgroundTasksPanel.steerSendAriaLabel", { name: run.description })}
+        onClick={send}
+        disabled={disabled || text.trim().length === 0}
+      >
+        <CornerDownLeft size={12} />
+      </IconButton>
+    </div>
+  );
+}
+
 /**
  * One `task`-tool subagent run — the model's own delegated work. Same card
  * shape as `ShellTaskCard` above so the two kinds read as one list: title,
@@ -291,6 +330,7 @@ function AgentTaskCard({ run }: { run: SubagentRun }) {
         )}
       </div>
       {running && run.lastActivity && <div className="mt-1 truncate font-mono text-[11px] text-faint">{run.lastActivity}</div>}
+      {running && <SteerInput run={run} />}
       {showTranscript && (
         <div className="mt-2 space-y-1.5 border-t border-border pt-2">
           <TranscriptRowsView rows={transcriptRows} />
@@ -378,6 +418,7 @@ function AgentTable({ runs }: { runs: SubagentRun[] }) {
                       <div className="space-y-1.5 border-t border-border pt-2">
                         <TranscriptRowsView rows={buildTranscriptRows(run.liveMessages)} />
                       </div>
+                      {run.status === "running" && <SteerInput run={run} />}
                     </td>
                   </tr>
                 )}

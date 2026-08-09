@@ -1100,6 +1100,8 @@ export const id: Record<string, string> = {
   "BackgroundTasksPanel.finishedHeading": "Selesai",
   "BackgroundTasksPanel.clearButton": "Bersihkan",
   "BackgroundTasksPanel.stopAriaLabel": "Hentikan \"{{name}}\"",
+  "BackgroundTasksPanel.steerPlaceholder": "Kirim pesan ke agen ini…",
+  "BackgroundTasksPanel.steerSendAriaLabel": "Kirim pesan ke \"{{name}}\"",
   "BackgroundTasksPanel.shellKindLabel": "Shell",
   "BackgroundTasksPanel.agentKindLabel": "Agen",
   "BackgroundTasksPanel.exitCode": "exit {{code}}",

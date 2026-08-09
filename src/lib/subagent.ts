@@ -108,6 +108,28 @@ export function cancelSubagentRun(cancelId: string): boolean {
   return true;
 }
 
+/** Pending mid-run user messages per live run, keyed by the run's Rust-facing
+ * `taskId` — the exact same keying rule as `activeSubagentControllers` above,
+ * and for the same reason: `cancelId` is the only handle the Background-tasks
+ * drawer has that is guaranteed unique per concurrent run. Drained at the top
+ * of each `runSubagentTask` loop iteration; entries are cleared by the same
+ * `finish` that retires the controller, so the map only ever holds live runs. */
+const pendingSteerMessages = new Map<string, string[]>();
+
+/** Queues a user message for a live subagent run — the child model sees it as
+ * a `user` message at the top of its next loop iteration, after the current
+ * iteration's tool results. Returns `false` when the run isn't live (already
+ * finished, or restored from a previous app session), mirroring
+ * `cancelSubagentRun`'s contract. A message queued during the run's FINAL
+ * iteration (the one that produces the report) is dropped with the queue. */
+export function steerSubagentRun(cancelId: string, text: string): boolean {
+  if (!activeSubagentControllers.has(cancelId)) return false;
+  const queue = pendingSteerMessages.get(cancelId);
+  if (queue) queue.push(text);
+  else pendingSteerMessages.set(cancelId, [text]);
+  return true;
+}
+
 /** Whether a `write_file`/`edit_file` tool result string represents success
  * rather than the `{"error": ...}` shape `stringifyToolError` produces —
  * used only to decide whether to report a mutated path via
@@ -401,6 +423,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
    * after a restart wipes the transient store. */
   const finish = (status: 'done' | 'error' | 'cancelled', result: string): string => {
     activeSubagentControllers.delete(taskId);
+    pendingSteerMessages.delete(taskId);
     forgetPause(taskId);
     const live = useSubagentStore.getState().runs[storeKey];
     useSubagentStore.getState().finish(storeKey, status);
@@ -458,6 +481,19 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
     for (let iteration = 0; iteration < MAX_SUBAGENT_ITERATIONS; iteration++) {
       await honourPause(taskId, processIdPromise, signal);
       if (signal.aborted) return finish('cancelled', CANCELLED_TOOL_RESULT);
+
+      // Drain any user messages queued by `steerSubagentRun` since the last
+      // iteration — appended in queue order as plain `user` messages, so the
+      // child model sees them right after the tool results it just produced.
+      const steers = pendingSteerMessages.get(taskId);
+      if (steers && steers.length > 0) {
+        pendingSteerMessages.delete(taskId);
+        for (const text of steers) {
+          const steerMessage: ChatMessage = { role: 'user', content: text };
+          messages = [...messages, steerMessage];
+          useSubagentStore.getState().appendMessage(storeKey, steerMessage);
+        }
+      }
 
       const wireHistory: ChatMessage[] = [{ role: 'system', content: systemPrompt }, ...messages];
 

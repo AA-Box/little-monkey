@@ -1099,6 +1099,8 @@ export const ko: Record<string, string> = {
   "BackgroundTasksPanel.finishedHeading": "완료됨",
   "BackgroundTasksPanel.clearButton": "지우기",
   "BackgroundTasksPanel.stopAriaLabel": "\"{{name}}\" 중지",
+  "BackgroundTasksPanel.steerPlaceholder": "이 에이전트에게 메시지 보내기…",
+  "BackgroundTasksPanel.steerSendAriaLabel": "\"{{name}}\"에게 메시지 보내기",
   "BackgroundTasksPanel.shellKindLabel": "셸",
   "BackgroundTasksPanel.agentKindLabel": "에이전트",
   "BackgroundTasksPanel.exitCode": "종료 코드 {{code}}",
