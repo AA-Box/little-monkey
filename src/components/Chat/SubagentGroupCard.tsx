@@ -29,7 +29,9 @@ export function resolveGroupStatus(statuses: SubagentStatus[]): SubagentStatus {
   return "done";
 }
 
-function dotClass(status: SubagentStatus): string {
+/** Exported for the Background-tasks drawer's `AgentGroupCard`, which shows
+ * the same per-agent status dots this card's collapsed header does. */
+export function dotClass(status: SubagentStatus): string {
   switch (status) {
     case "running":
       return "animate-pulse bg-accent";
@@ -50,7 +52,19 @@ function dotClass(status: SubagentStatus): string {
  * Claude-Code-desktop-style: the transcript shows one card doing the work of
  * N spinners, and the per-agent detail is one click away.
  */
-const SubagentGroupCard = memo(function SubagentGroupCard({ sessionId, tasks }: { sessionId: string; tasks: SubagentGroupTask[] }) {
+const SubagentGroupCard = memo(function SubagentGroupCard({
+  sessionId,
+  tasks,
+  onOpenPanel,
+}: {
+  sessionId: string;
+  tasks: SubagentGroupTask[];
+  /** When provided, clicking the card opens the Background-tasks drawer
+   * (where `AgentGroupCard` shows this round's per-agent table) instead of
+   * expanding inline — Claude-Code-desktop-style. Hosts without the
+   * right-sidebar region omit it and keep the inline expansion. */
+  onOpenPanel?: () => void;
+}) {
   const { t } = useT();
   const [open, setOpen] = useState(false);
   const detailsId = useId();
@@ -96,12 +110,15 @@ const SubagentGroupCard = memo(function SubagentGroupCard({ sessionId, tasks }: 
       <div className="max-w-[85%] min-w-0 overflow-hidden rounded-md border border-border bg-surface-2">
         <button
           type="button"
-          aria-expanded={open}
-          aria-controls={detailsId}
-          onClick={() => setOpen((prev) => !prev)}
+          aria-expanded={onOpenPanel ? undefined : open}
+          aria-controls={onOpenPanel ? undefined : detailsId}
+          onClick={() => (onOpenPanel ? onOpenPanel() : setOpen((prev) => !prev))}
           className="flex min-h-11 w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-xs text-muted transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-inset motion-reduce:transition-none"
         >
-          <ChevronRight size={12} className={`shrink-0 text-faint transition-transform duration-150 motion-reduce:transition-none ${open ? "rotate-90" : ""}`} />
+          <ChevronRight
+            size={12}
+            className={`shrink-0 text-faint transition-transform duration-150 motion-reduce:transition-none ${open && !onOpenPanel ? "rotate-90" : ""}`}
+          />
           <Bot size={13} className="shrink-0 text-faint" />
           <span className="truncate font-medium text-foreground">{t("SubagentGroupCard.title", { count: tasks.length })}</span>
           <StatusPill tone={tone}>{t(statusLabelKey(groupStatus))}</StatusPill>
@@ -119,7 +136,7 @@ const SubagentGroupCard = memo(function SubagentGroupCard({ sessionId, tasks }: 
             ))}
           </span>
         </button>
-        {open && (
+        {open && !onOpenPanel && (
           <div id={detailsId} className="space-y-2 border-t border-border bg-background px-3 py-2">
             {tasks.map((task) => (
               <SubagentRow key={task.taskId} sessionId={sessionId} taskId={task.taskId} args={task.args} result={task.result} />

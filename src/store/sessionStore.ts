@@ -164,6 +164,9 @@ export interface ChatSession {
  * child transcript alone can't provide (tokens, timing, terminal status). */
 export interface SubagentRunMeta {
   status: "done" | "error" | "cancelled";
+  /** Parallel-round group id — see `SubagentRun.groupId`. Persisted so the
+   * Background-tasks drawer keeps grouping restored runs after a restart. */
+  groupId?: string;
   description: string;
   profile: "explore" | "code";
   startedAt: number;
