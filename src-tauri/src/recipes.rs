@@ -52,30 +52,61 @@ pub struct RecipeTarget {
     pub ollama: Option<String>,
     #[serde(default)]
     pub local_url: Option<String>,
+    /// A model id installed in **this machine's** managed runtime hub, served by
+    /// the app's own verified `llama-server` for the life of the run.
+    ///
+    /// # Why this is a fourth option rather than a `local_url`
+    ///
+    /// `local_url` names an origin that is *already listening*. The managed
+    /// runtime is not: it is started on a fresh loopback port when the run
+    /// starts and killed when it ends, so its origin does not exist at the time
+    /// the recipe is written. A recipe that tried to express it as a `local_url`
+    /// would have to invent a port and would be wrong by the time it ran.
+    ///
+    /// This is also what a run placed by another owned machine needs (roadmap
+    /// K17). A placed `ModelTargetSnapshot::ManagedLlama` names a model id and a
+    /// `model_path` **on the submitter's disk**; the path is meaningless here, so
+    /// the receiving node resolves the id against its own hub inventory and lets
+    /// the executing process start the runtime. Before this field existed there
+    /// was no recipe target that could say that, so placements naming the
+    /// managed runtime had to be refused outright.
+    #[serde(default)]
+    pub managed_model: Option<String>,
 }
 
 impl RecipeTarget {
     /// Enforces the design doc's XOR constraint: `provider: openrouter #
-    /// XOR ollama: "qwen2.5:14b" XOR local_url: "http://127.0.0.1:8090"`.
+    /// XOR ollama: "qwen2.5:14b" XOR local_url: "http://127.0.0.1:8090"` —
+    /// plus `managed_model: "<hub model id>"` as a fourth, mutually exclusive
+    /// option.
     pub fn validate(&self) -> Result<(), String> {
         let set_count = [
             self.provider.is_some(),
             self.ollama.is_some(),
             self.local_url.is_some(),
+            self.managed_model.is_some(),
         ]
         .iter()
         .filter(|set| **set)
         .count();
         if set_count == 0 {
             return Err(
-                "recipe target must set exactly one of provider, ollama, or local_url".to_string(),
+                "recipe target must set exactly one of provider, ollama, local_url, or managed_model"
+                    .to_string(),
             );
         }
         if set_count > 1 {
-            return Err("recipe target must set exactly one of provider, ollama, or local_url — not more than one".to_string());
+            return Err("recipe target must set exactly one of provider, ollama, local_url, or managed_model — not more than one".to_string());
         }
         if self.provider.is_some() && self.model.is_none() {
             return Err("recipe target with 'provider' must also set 'model'".to_string());
+        }
+        if self
+            .managed_model
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty() || value.len() > 512)
+        {
+            return Err("recipe target 'managed_model' must be a non-empty model id".to_string());
         }
         Ok(())
     }
@@ -701,9 +732,7 @@ pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
             // Both freeze the same four fields, and a recipe carrying both
             // would leave "which one wins" to the order of two `unwrap_or_else`
             // chains in `task.rs`. Refused here so that question never arises.
-            return Err(
-                "a recipe cannot be both a desktop turn and a placed run".to_string(),
-            );
+            return Err("a recipe cannot be both a desktop turn and a placed run".to_string());
         }
         placed.validate()?;
     }
@@ -1138,6 +1167,7 @@ mod tests {
             model: Some("anthropic/claude-sonnet".to_string()),
             ollama: None,
             local_url: None,
+            managed_model: None,
         }
     }
 
@@ -1443,6 +1473,7 @@ mod tests {
             model: Some("x".to_string()),
             ollama: Some("qwen2.5:14b".to_string()),
             local_url: None,
+            managed_model: None,
         };
         assert!(t.validate().is_err());
     }
@@ -1454,6 +1485,7 @@ mod tests {
             model: None,
             ollama: None,
             local_url: None,
+            managed_model: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("model"));
@@ -1466,8 +1498,37 @@ mod tests {
             model: None,
             ollama: Some("qwen2.5:14b".to_string()),
             local_url: None,
+            managed_model: None,
         };
         assert!(t.validate().is_ok());
+    }
+
+    /// The fourth option, and why it is one: `managed_model` names a model this
+    /// machine has installed rather than an origin that is already listening,
+    /// because the managed runtime is started on a fresh loopback port for the
+    /// life of the run. It is still mutually exclusive with the other three.
+    #[test]
+    fn target_accepts_a_managed_model_alone_and_never_beside_another() {
+        let managed = RecipeTarget {
+            provider: None,
+            model: None,
+            ollama: None,
+            local_url: None,
+            managed_model: Some("qwen3-8b".to_string()),
+        };
+        assert!(managed.validate().is_ok());
+
+        let both = RecipeTarget {
+            local_url: Some("http://127.0.0.1:8090".to_string()),
+            ..managed.clone()
+        };
+        assert!(both.validate().is_err());
+
+        let empty = RecipeTarget {
+            managed_model: Some("   ".to_string()),
+            ..managed
+        };
+        assert!(empty.validate().unwrap_err().contains("managed_model"));
     }
 
     #[test]
@@ -1477,6 +1538,7 @@ mod tests {
             model: None,
             ollama: None,
             local_url: Some("http://127.0.0.1:8090".to_string()),
+            managed_model: None,
         };
         assert!(t.validate().is_ok());
     }

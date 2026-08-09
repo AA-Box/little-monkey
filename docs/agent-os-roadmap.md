@@ -4726,14 +4726,37 @@ scoped capabilities, rotation and revocation.
   surface's invariant — no number is displayed that was not measured on the
   machine displaying it. The upgrade has a stated trigger rather than a plan.
 
-**What this does not do.** A placement must name a provider or an Ollama model:
-`monkey-cli`'s recipe target has no managed-runtime variant, so a
-`ManagedLlama` spec is refused with that reason rather than accepted and failed
-at spawn. `resident_models` lists the managed hub's inventory only — enumerating
-Ollama tags is an async call from a synchronous handler — so an Ollama placement
-falls through `select_node`'s resident-model key to the queue and memory keys.
-Run Center still shows nothing; the surface is the CLI
-(`node-refresh`, `node-list`, `place`, `placements`, `placement-sync`).
+**All three targets place, both inventories are advertised, and Run Center
+shows it.** The first cut of this entry shipped with three stated gaps; they are
+closed, and each is worth a line because the fix was structural rather than a
+flag.
+
+- **A `ManagedLlama` placement runs.** The gap was real: `RecipeTarget` had no
+  managed-runtime option, and the reason it could not simply reuse `local_url`
+  is that the managed runtime *is not listening* — it starts on a fresh loopback
+  port when the run starts, so any origin written at placement time would be
+  wrong by the time it ran. `RecipeTarget::managed_model` is that fourth,
+  mutually-exclusive option: it names a model id, the receiving node resolves it
+  against **its own** hub inventory (never the spec's `model_path`, which is a
+  location on the submitter's disk), and the executing process starts the app's
+  own verified `llama-server` for exactly the life of the run. A node without
+  that model refuses by name instead of failing at spawn. Hand-authored recipes
+  gain the same target, which was a genuine gap independent of placement.
+- **`resident_models` covers Ollama too.** Omitting it was not cosmetic:
+  `select_node`'s strongest key is "the model is already resident", and a node's
+  Ollama models are precisely the local weights a placement wants to avoid
+  re-pulling — so a whole class of placements ranked as if every node were cold.
+  The handler is synchronous, so the listing runs under `block_in_place`, guarded
+  on the runtime flavour; no runtime, or an Ollama that is not running, degrades
+  to hub-only rather than failing the description.
+- **Run Center shows the nodes and the placements**, with each node's liveness
+  and each placement's *deciding key* — why that node, not only which one. It is
+  read-only by design: placing a run means authoring a frozen `RunSpec`, and a
+  button that quietly composed one would invent the policy S3 exists to protect.
+  The two actions are the two that only ask — re-describe, and re-read.
+
+The CLI remains the full surface (`node-label`, `node-refresh`, `node-list`,
+`place`, `placements`, `placement-sync`).
 
 **And what a green run here does not mean.** Everything past S1 needs two
 machines. The routes are exercised through the real signed-request choke point —
