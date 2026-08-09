@@ -49,6 +49,7 @@ export const studioLocale: Record<string, string> = {
   "Studio.outpaint.right": "Extend to the right",
   "Studio.outpaint.up": "Extend upwards",
   "Studio.outpaint.down": "Extend downwards",
+  "Studio.outpaint.undo": "Undo the last extension",
 
   "Studio.preprocess.label": "Turn this photo into a hint map",
   "Studio.preprocess.placeholder": "Leave as it is",
