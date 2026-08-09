@@ -156,10 +156,12 @@ jobs:
         with:
           version: 9
 
+      # No `cache: pnpm` here, unlike the jobs above: this job audits the
+      # lockfile and never runs `pnpm install`, so the store directory the
+      # cache post-step wants to save does not exist and it fails the job.
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: pnpm
 
       - name: Audit npm dependencies
         # `--prod` because a vulnerable build-time devDependency is not shipped
