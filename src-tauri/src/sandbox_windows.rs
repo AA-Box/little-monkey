@@ -889,8 +889,20 @@ pub async fn run_confined(
     let reader = tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let _ = stdout_file.read_to_end(&mut out);
-        let _ = stderr_file.read_to_end(&mut err);
+        // Reported rather than swallowed. A failed read and a command that
+        // printed nothing produce the same empty `Vec`, and on a platform that
+        // can only be observed through a CI log that ambiguity is expensive: it
+        // is what made #290's windows-latest leg unreadable, where a script whose
+        // every step was guarded exited 0 — so it reached its trailing `dir /b`,
+        // which cannot print nothing — and still came back `stdout="" stderr=""`.
+        // Not an error path: a partial read is still the output we have, and the
+        // exit code is the run's real result.
+        if let Err(error) = stdout_file.read_to_end(&mut out) {
+            eprintln!("sandbox: reading the confined child's stdout failed: {error}");
+        }
+        if let Err(error) = stderr_file.read_to_end(&mut err) {
+            eprintln!("sandbox: reading the confined child's stderr failed: {error}");
+        }
         (out, err)
     });
 
@@ -1120,6 +1132,96 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    /// A confined run must return what the child printed.
+    ///
+    /// The assertion this module never made, and the one whose absence left #290
+    /// undiagnosable. Every test here reads a file or an exit code, so a run that
+    /// loses stdout entirely passes all of them — and that is what
+    /// windows-latest was doing: a script guarded step by step exited 0, meaning
+    /// it reached its trailing `dir /b` over two directories it had just written
+    /// into, and the run still reported `stdout="" stderr=""`.
+    ///
+    /// Two arms, and the pair is the point. The job-only arm is the control: it
+    /// shares every line of pipe plumbing with the container arm and differs only
+    /// in the `STARTUPINFOEX` attribute list and the token, so which arm fails
+    /// says where to look. Control red → the pipes were never right on either
+    /// path. Control green, container red → the AppContainer is what the
+    /// inherited write end does not survive, and the next question is the token,
+    /// not `CreatePipe`.
+    ///
+    /// Both streams in one run, so neither can pass by accident of the other:
+    /// `1>&2` puts the second `echo` on stderr.
+    #[tokio::test]
+    async fn a_confined_run_returns_what_the_child_printed() {
+        let root = std::env::temp_dir().join(format!("lm-ac-io-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("sandbox root");
+        let env = vec![(
+            "SystemRoot".to_string(),
+            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
+        )];
+        let command = "echo on-stdout & echo on-stderr 1>&2";
+
+        let control = run_confined(
+            None,
+            &create_job().expect("job"),
+            command,
+            &root,
+            &env,
+            false,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("the job-only run itself must work");
+        assert!(
+            String::from_utf8_lossy(&control.stdout).contains("on-stdout")
+                && String::from_utf8_lossy(&control.stderr).contains("on-stderr"),
+            "a job-only run lost the child's output, so the pipes are wrong before any \
+             container is involved: stdout={:?} stderr={:?} exit={:?}",
+            String::from_utf8_lossy(&control.stdout),
+            String::from_utf8_lossy(&control.stderr),
+            control.exit_code
+        );
+
+        // A machine without containers has only the control arm to offer, same as
+        // the boundary test above — but a skip and a pass are the same colour, and
+        // the conclusion drawn from a green run here is precisely "the container
+        // arm captured its output", so on CI the skip has to be the failure.
+        match create_app_container("iotest") {
+            Err(error) => assert!(
+                std::env::var_os("CI").is_none(),
+                "no AppContainer on this CI runner, so the arm this test exists for \
+                 never ran: {error}"
+            ),
+            Ok(container) => {
+                container.grant_tree_access(&root).expect("grant");
+                let confined = run_confined(
+                    Some(&container),
+                    &create_job().expect("job"),
+                    command,
+                    &root,
+                    &env,
+                    false,
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("the confined run itself must work");
+                assert!(
+                    String::from_utf8_lossy(&confined.stdout).contains("on-stdout")
+                        && String::from_utf8_lossy(&confined.stderr).contains("on-stderr"),
+                    "an AppContainer run lost the child's output while the job-only run \
+                     kept it, so the container is what the inherited pipe write end \
+                     does not survive: stdout={:?} stderr={:?} exit={:?}",
+                    String::from_utf8_lossy(&confined.stdout),
+                    String::from_utf8_lossy(&confined.stderr),
+                    confined.exit_code
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Network is denied unless the run asked for it, which for an AppContainer is
