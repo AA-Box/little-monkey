@@ -348,12 +348,21 @@ mod tests {
             &local,
         )
         .expect("re-rooting succeeds");
-        assert_eq!(landed.entries[0].path, "/target/work/src/main.rs");
+        // Built with `join` rather than written out, because the landed path is
+        // deliberately *native*: a checkpoint entry is what a revert on this
+        // machine opens, so it must carry this platform's separators.
+        assert_eq!(
+            landed.entries[0].path,
+            local.join("src").join("main.rs").to_string_lossy()
+        );
         let resume = landed.resume.expect("the image is still a freeze");
         // The local row's id, not the origin's — otherwise the desktop's resume
         // path would look for a process this machine does not have.
         assert_eq!(resume.process_id, "turn-local");
-        assert_eq!(resume.workspace.as_deref(), Some("/target/work"));
+        assert_eq!(
+            resume.workspace.as_deref(),
+            Some(local.to_string_lossy().as_ref())
+        );
     }
 
     #[test]

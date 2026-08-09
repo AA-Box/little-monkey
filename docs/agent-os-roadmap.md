@@ -4813,7 +4813,10 @@ that is why it is a separate type rather than another field on the manifest.
   checkpoints directory, `chat_sessions.json`, and `agent_processes` — with every
   path re-rooted at the local workspace and `resume.process_id` rewritten to the
   *local* row. A manifest whose entries cannot be re-rooted is refused rather
-  than landed half-translated.
+  than landed half-translated. Paths are re-rooted as *native* paths, which is
+  also the honest limit on a cross-OS move: an image whose entries are Windows
+  paths cannot be re-rooted under a POSIX workspace, and that is refused rather
+  than half-translated.
 - **Policy travels because the frozen `RunSpec` is what the target inserts.**
   Its `PermissionPolicySnapshot` and `RunBudgets` go into the target's own
   ledger unmodified, which is what `egress.rs` then resolves by run id — the run
