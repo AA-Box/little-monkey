@@ -1257,6 +1257,7 @@ fn event_type(event: &RunEvent) -> &'static str {
         RunEvent::ToolProposed { .. } => "tool_proposed",
         RunEvent::PermissionRequested { .. } => "permission_requested",
         RunEvent::PermissionDecided { .. } => "permission_decided",
+        RunEvent::RoutingDecided { .. } => "routing_decided",
         RunEvent::ToolStarted { .. } => "tool_started",
         RunEvent::ToolFinished { .. } => "tool_finished",
         RunEvent::ArtifactAdded { .. } => "artifact_added",

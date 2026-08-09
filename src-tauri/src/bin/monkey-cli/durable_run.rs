@@ -690,6 +690,13 @@ pub fn normalize_semantic_stream(events: &[RunEventEnvelope]) -> Vec<NormalizedS
                 match event {
                     RunEvent::Queued { .. } => normalized.push(semantic("queued", serde_json::json!({}))),
                     RunEvent::Started { .. } => normalized.push(semantic("started", serde_json::json!({}))),
+                    // The policy and the sentence, not the chosen key: this
+                    // normalization feeds a human-readable replay, and a target
+                    // key is an identifier the reader would have to resolve.
+                    RunEvent::RoutingDecided { policy_name, reason, .. } => normalized.push(semantic(
+                        "routing_decided",
+                        serde_json::json!({ "policy": policy_name, "reason": reason }),
+                    )),
                     RunEvent::ToolProposed { tool_name, arguments, mutation, .. } => normalized.push(semantic(
                         "tool_proposed",
                         serde_json::json!({ "tool": tool_name, "arguments": arguments.value, "mutation": mutation }),

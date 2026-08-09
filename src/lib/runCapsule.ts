@@ -246,6 +246,9 @@ function timelineSummary(envelope: RunEventEnvelopeWire): { title: string; summa
     };
     case "permission_requested": return { title: "Approval requested", summary: `${event.payload.tool_name}: ${shortText(event.payload.detail)}` };
     case "permission_decided": return { title: "Approval decided", summary: event.payload.decision.replace(/_/g, " ") };
+    // The reason is the whole point of the event: it is the sentence that names
+    // the policy, which is what "which policy chose this target" asks for.
+    case "routing_decided": return { title: "Dispatch decided", summary: shortText(event.payload.reason) };
     case "tool_started": return { title: "Tool started", summary: event.payload.tool_call_id };
     case "tool_finished": return { title: "Tool finished", summary: `${event.payload.outcome} in ${event.payload.duration_ms} ms` };
     case "artifact_added": return { title: "Artifact captured", summary: `${event.payload.name} · ${event.payload.media_type}` };

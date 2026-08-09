@@ -1554,6 +1554,28 @@ pub enum RunEvent {
         decision: PermissionDecision,
         decided_by: ClientIdentity,
     },
+    /// Which dispatch policy chose this run's target, and why (roadmap K9).
+    ///
+    /// The run's frozen `ModelTargetSnapshot` already records *what* ran. This
+    /// records *why* it was that one, on the same append-only, hash-chained
+    /// stream — so "which policy chose this run's target" survives a restart
+    /// instead of living only in the transcript and in session state.
+    ///
+    /// Every field is nullable where the honest answer is "no policy": a fresh
+    /// profile has none, and `reason` still says so rather than leaving the
+    /// event to be read as an absence.
+    RoutingDecided {
+        task_class: String,
+        policy_id: Option<String>,
+        policy_name: Option<String>,
+        /// The `ModelTargetSnapshot` key that won, or `None` when the caller
+        /// keeps its active target.
+        chosen_key: Option<String>,
+        /// False when a policy applied and the active target already satisfied
+        /// it — the steady state of a working conversation.
+        changed_from_active: bool,
+        reason: String,
+    },
     ToolStarted {
         tool_call_id: String,
     },
@@ -1710,6 +1732,15 @@ impl RunEvent {
                 validate_protocol_id("event.request_id", request_id)?;
                 validate_sha256("event.operation_sha256", operation_sha256)?;
                 decided_by.validate()?;
+            }
+            Self::RoutingDecided {
+                task_class, reason, ..
+            } => {
+                // Only the two fields a reader cannot do without. The policy
+                // id and name are legitimately absent when nothing matched, and
+                // the chosen key is absent when the active target stands.
+                validate_text("event.task_class", task_class, MAX_LABEL_BYTES, false)?;
+                validate_text("event.reason", reason, MAX_EVENT_TEXT_BYTES, false)?;
             }
             Self::ToolStarted { tool_call_id } => {
                 validate_protocol_id("event.tool_call_id", tool_call_id)?;
@@ -2268,6 +2299,48 @@ mod tests {
             reason: Some("waiting for user".to_string()),
         }
         .is_terminal());
+    }
+
+    /// Roadmap K9: the run already records *what* target ran (its frozen
+    /// `ModelTargetSnapshot`); this is the *why*.
+    ///
+    /// Every field but the two a reader cannot do without is nullable, because
+    /// "no policy matched" is the answer for a fresh profile and is worth being
+    /// able to produce. What must never be empty is the class that was asked
+    /// under and the sentence explaining the outcome — an event carrying
+    /// neither would record that a decision happened and nothing about it.
+    #[test]
+    fn a_routing_decision_may_name_no_policy_but_never_no_reason() {
+        let unrouted = RunEvent::RoutingDecided {
+            task_class: "subagent_explore".to_string(),
+            policy_id: None,
+            policy_name: None,
+            chosen_key: None,
+            changed_from_active: false,
+            reason: "No enabled policy covers this task class.".to_string(),
+        };
+        assert!(unrouted.validate().is_ok());
+        assert!(!unrouted.is_terminal(), "a dispatch decision ends nothing");
+
+        let blank_reason = RunEvent::RoutingDecided {
+            task_class: "chat".to_string(),
+            policy_id: Some("p-1".to_string()),
+            policy_name: Some("Cheap explorers".to_string()),
+            chosen_key: Some("provider:openrouter/cheap".to_string()),
+            changed_from_active: true,
+            reason: "   ".to_string(),
+        };
+        assert!(blank_reason.validate().is_err());
+
+        let blank_class = RunEvent::RoutingDecided {
+            task_class: String::new(),
+            policy_id: None,
+            policy_name: None,
+            chosen_key: None,
+            changed_from_active: false,
+            reason: "No policy.".to_string(),
+        };
+        assert!(blank_class.validate().is_err());
     }
 
     #[test]
