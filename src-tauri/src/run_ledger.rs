@@ -580,6 +580,29 @@ pub struct PermissionRequestRecord {
     pub expires_at_ms: u64,
 }
 
+/// One tool call in a run with no permission decision behind it (roadmap K12).
+///
+/// `mutation` is `None` when the run recorded a `ToolStarted` with no matching
+/// `ToolProposed` — the log does not say whether that call could change
+/// anything, and defaulting it to "read-only" is how an ungated write would slip
+/// past the check that exists to catch it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionGap {
+    pub tool_call_id: String,
+    pub tool_name: Option<String>,
+    pub mutation: Option<bool>,
+}
+
+impl PermissionGap {
+    /// Whether this gap is the bug the acceptance names, as opposed to an
+    /// ordinary ungated read. Unknown counts as a bug: see `mutation`.
+    #[must_use]
+    pub fn is_unauthorized_mutation(&self) -> bool {
+        self.mutation.unwrap_or(true)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredPermissionDecision {
@@ -1032,6 +1055,98 @@ impl RunLedger {
     /// Cannot detect: removal of the entire covered range, since a per-run chain
     /// has no anchor outside the database it lives in. Saying so is the point —
     /// an integrity claim that overstates itself is worse than none.
+    /// Every tool call in `run_id` whose authorizing permission decision cannot
+    /// be produced from the log (roadmap K12).
+    ///
+    /// # Why this exists when `permission_decisions_for_tool_call` already does
+    ///
+    /// The acceptance's sentence is "a tool call whose authorizing decision
+    /// cannot be produced from the log is a bug". Answering it one
+    /// `tool_call_id` at a time can only confirm a call somebody already
+    /// suspected; a bug nobody suspected is exactly the one that stays. This
+    /// asks the question of every call in a run at once, which is what turns
+    /// the sentence into something a check can fail on.
+    ///
+    /// # Mutation is the line, and it is read from the log rather than assumed
+    ///
+    /// Not every tool call is gated, and that is correct: reading a file is not
+    /// an authorization event. So an ungated read-only call is reported and not
+    /// counted against the run, while an ungated **mutating** call is the bug —
+    /// and `mutation` comes from the run's own `ToolProposed` event rather than
+    /// from a tool-name list here, which would be a second opinion about a fact
+    /// the log already records.
+    ///
+    /// A call with a `ToolStarted` and no `ToolProposed` is reported as
+    /// mutation-unknown rather than assumed harmless: the log genuinely does not
+    /// say, and guessing "read-only" is how an ungated write gets skipped.
+    pub fn permission_gaps(&self, run_id: &str) -> LedgerResult<Vec<PermissionGap>> {
+        if load_run_from(&self.connection, run_id)?.is_none() {
+            return Err(LedgerError::NotFound {
+                entity: "run",
+                id: run_id.to_string(),
+            });
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT envelope_json FROM run_events WHERE run_id = ?1 ORDER BY sequence ASC",
+        )?;
+        let mut rows = statement.query([run_id])?;
+
+        // Insertion-ordered so the report follows the run rather than a hash.
+        let mut order: Vec<String> = Vec::new();
+        let mut proposed: std::collections::HashMap<String, (String, bool)> =
+            std::collections::HashMap::new();
+        let mut started: Vec<String> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let bytes: Vec<u8> = row.get(0)?;
+            let Ok(envelope) = serde_json::from_slice::<RunEventEnvelope>(&bytes) else {
+                // A row this binary cannot parse is a finding for
+                // `verify_run_chain`, not for this pass — reporting it here as a
+                // permission gap would blame the wrong thing.
+                continue;
+            };
+            match envelope.event {
+                RunEvent::ToolProposed {
+                    tool_call_id,
+                    tool_name,
+                    mutation,
+                    ..
+                } => {
+                    if !proposed.contains_key(&tool_call_id) {
+                        order.push(tool_call_id.clone());
+                    }
+                    proposed.insert(tool_call_id, (tool_name, mutation));
+                }
+                RunEvent::ToolStarted { tool_call_id } => started.push(tool_call_id),
+                _ => {}
+            }
+        }
+        for tool_call_id in started {
+            if !proposed.contains_key(&tool_call_id) && !order.contains(&tool_call_id) {
+                order.push(tool_call_id);
+            }
+        }
+
+        let mut gaps = Vec::new();
+        for tool_call_id in order {
+            if !self
+                .permission_decisions_for_tool_call(&tool_call_id)?
+                .is_empty()
+            {
+                continue;
+            }
+            let (tool_name, mutation) = match proposed.get(&tool_call_id) {
+                Some((name, mutation)) => (Some(name.clone()), Some(*mutation)),
+                None => (None, None),
+            };
+            gaps.push(PermissionGap {
+                tool_call_id,
+                tool_name,
+                mutation,
+            });
+        }
+        Ok(gaps)
+    }
+
     pub fn verify_run_chain(&self, run_id: &str) -> LedgerResult<ChainVerification> {
         let claimed_last_sequence = self
             .connection
@@ -4543,6 +4658,90 @@ mod tests {
             ledger.load_run("run-order").unwrap().unwrap().last_sequence,
             2
         );
+    }
+
+    /// K12's acceptance in one sentence: "a tool call whose authorizing decision
+    /// cannot be produced from the log is a bug."
+    ///
+    /// `permission_decisions_for_tool_call` can only answer that for a call
+    /// somebody already suspected. This asks it of every call in a run, which is
+    /// the difference between a question and a check.
+    #[test]
+    fn a_runs_ungated_mutating_call_is_a_gap_and_an_ungated_read_is_not() {
+        let mut ledger = RunLedger::open_in_memory().unwrap();
+        ledger.submit_run(&spec("run-gaps", "submit/gaps")).unwrap();
+        ledger.append_event(&queued("run-gaps", 1)).unwrap();
+
+        let proposed = |sequence: u64, id: &str, tool: &str, mutation: bool| {
+            envelope(
+                "run-gaps",
+                sequence,
+                &format!("proposed-{id}"),
+                RunEvent::ToolProposed {
+                    tool_call_id: id.to_string(),
+                    tool_name: tool.to_string(),
+                    arguments: crate::run_protocol::RedactedPayload {
+                        value: serde_json::json!({}),
+                        redaction: crate::run_protocol::RedactionState::NotNeeded,
+                    },
+                    arguments_sha256: "b".repeat(64),
+                    mutation,
+                },
+            )
+        };
+        ledger
+            .append_event(&proposed(2, "tool-read", "read_file", false))
+            .unwrap();
+        ledger
+            .append_event(&proposed(3, "tool-write", "write_file", true))
+            .unwrap();
+        // A call that started with nothing proposing it: the log cannot say what
+        // it was allowed to do.
+        ledger
+            .append_event(&envelope(
+                "run-gaps",
+                4,
+                "started-orphan",
+                RunEvent::ToolStarted {
+                    tool_call_id: "tool-orphan".to_string(),
+                },
+            ))
+            .unwrap();
+
+        let gaps = ledger.permission_gaps("run-gaps").unwrap();
+        assert_eq!(
+            gaps.iter()
+                .map(|gap| gap.tool_call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool-read", "tool-write", "tool-orphan"],
+            "every ungated call is reported, in the run's own order"
+        );
+        assert_eq!(
+            gaps.iter()
+                .filter(|gap| gap.is_unauthorized_mutation())
+                .map(|gap| gap.tool_call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool-write", "tool-orphan"],
+            "reading a file is not an authorization event, but an unknown call \
+             counts as a bug rather than being waved through"
+        );
+
+        // Gate the write, and it stops being a gap — the check reads the log
+        // rather than a list of tool names.
+        let mut request = permission_request("req-write", PermissionAttribution::LedgerRun);
+        request.run_id = Some("run-gaps".to_string());
+        request.tool_call_id = "tool-write".to_string();
+        ledger.record_permission_request(&request).unwrap();
+        let after = ledger.permission_gaps("run-gaps").unwrap();
+        assert!(
+            !after.iter().any(|gap| gap.tool_call_id == "tool-write"),
+            "{after:?}"
+        );
+
+        assert!(matches!(
+            ledger.permission_gaps("run-missing"),
+            Err(LedgerError::NotFound { entity: "run", .. })
+        ));
     }
 
     #[test]

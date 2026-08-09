@@ -173,6 +173,21 @@ pub struct CheckpointManifest {
     /// one must not delete a guess.
     #[serde(default)]
     pub remembered_facts: Vec<RememberedFact>,
+    /// Ids of the follow-up chips `spawn_task` staged during this turn.
+    ///
+    /// Ids only, unlike `remembered_facts` — and the asymmetry is the point. A
+    /// forgotten fact has to be *re-added* on reapply, so its text has to
+    /// survive; a withdrawn chip is only marked `dismissed` and is still in the
+    /// store, so reapply has an id to un-dismiss and needs nothing else. Copying
+    /// the title and prompt here would be a second copy that could disagree with
+    /// the first.
+    ///
+    /// `serde(default)`, and empty means *unrecorded* exactly as it does for
+    /// `remembered_facts`: the compensator runs off this list rather than off
+    /// `ExternalEffectKind::TaskSuggestion` being present, so an older manifest
+    /// withdraws nothing rather than guessing.
+    #[serde(default)]
+    pub staged_task_suggestions: Vec<String>,
     /// What a suspended process needs to resume after a restart (roadmap K13).
     ///
     /// `None` on every checkpoint that was not a freeze, which is nearly all of
@@ -267,6 +282,14 @@ pub enum ExternalEffectKind {
     McpTool,
     /// This app's own persistent memory store was written (`remember`).
     Memory,
+    /// A follow-up task chip was staged (`spawn_task`).
+    ///
+    /// Outside the checkpointed workspace like the rest, and undoable like
+    /// `Memory`: the suggestion is this app's own record and it has an id.
+    /// Enumerated even though nothing *runs* until the user clicks the chip —
+    /// a turn that is reverted should not keep proposing work it proposed while
+    /// doing something the user has since taken back.
+    TaskSuggestion,
 }
 
 /// Whether reverting a checkpoint can undo an effect, and what does it.
@@ -300,6 +323,7 @@ impl ExternalEffectKind {
             ExternalEffectKind::Network => "network",
             ExternalEffectKind::McpTool => "mcp-tool",
             ExternalEffectKind::Memory => "memory",
+            ExternalEffectKind::TaskSuggestion => "task-suggestion",
         }
     }
 
@@ -340,6 +364,18 @@ impl ExternalEffectKind {
             ExternalEffectKind::Memory => Compensation::Undo {
                 action: "forget the facts this turn remembered",
             },
+            // The second real undo, and the one that shows `Compensation::Undo`
+            // does not promise *which process* performs it. A task suggestion
+            // lives in `taskSuggestionStore.ts`, so the frontend runs this
+            // compensator right after `checkpoint_revert` returns — exactly
+            // where it already refreshes the checkpoint timeline. What the
+            // variant states is what reverting does, which is true either way;
+            // the alternative was to call an undo this app owns end to end
+            // "unrecoverable" because of which side of the IPC boundary its
+            // store happens to sit on.
+            ExternalEffectKind::TaskSuggestion => Compensation::Undo {
+                action: "withdraw the follow-up task chips this turn proposed",
+            },
         }
     }
 }
@@ -357,6 +393,8 @@ pub struct ActiveCheckpoint {
     pub label: String,
     /// Facts this turn has remembered so far, in call order.
     pub remembered_facts: Vec<RememberedFact>,
+    /// Ids of the follow-up chips this turn has staged so far, in call order.
+    pub staged_task_suggestions: Vec<String>,
     /// Flipped by `record_shell` when `tool_run_shell` runs during the turn.
     /// Always `false` until then.
     pub shell_ran: bool,
@@ -600,6 +638,7 @@ pub fn begin_impl(
             id.clone(),
             ActiveCheckpoint {
                 remembered_facts: Vec::new(),
+                staged_task_suggestions: Vec::new(),
                 dir,
                 entries: Vec::new(),
                 created_at_ms: now_ms(),
@@ -842,6 +881,7 @@ pub fn freeze_live_impl(
         prev_id: active.prev_id.clone(),
         entries: active.entries.clone(),
         remembered_facts: active.remembered_facts.clone(),
+        staged_task_suggestions: active.staged_task_suggestions.clone(),
         resume: Some(resume),
     };
     // No `after/` snapshots, unlike `end_impl`. Those record what the turn
@@ -1027,6 +1067,72 @@ pub fn record_remembered_fact(
     Ok(())
 }
 
+/// Notes a follow-up chip `spawn_task` just staged, so reverting this turn can
+/// withdraw it.
+///
+/// Silently a no-op without a checkpoint id, like [`record_remembered_fact`]:
+/// a `spawn_task` outside a checkpointed turn has nothing to be reverted *by*.
+pub fn record_task_suggestion(
+    state: &AppState,
+    id: Option<&str>,
+    suggestion_id: String,
+) -> Result<(), String> {
+    let Some(id) = id else {
+        return Ok(());
+    };
+    let mut guard = state
+        .checkpoints
+        .lock()
+        .map_err(|_| "Checkpoint lock poisoned".to_string())?;
+    let Some(active) = guard.get_mut(id) else {
+        return Ok(());
+    };
+    // Deduplicated for `record_remembered_fact`'s reason: the same id must not
+    // queue two withdrawals of one chip.
+    if !active.staged_task_suggestions.contains(&suggestion_id) {
+        active.staged_task_suggestions.push(suggestion_id);
+    }
+    Ok(())
+}
+
+/// Records both halves of a staged chip: that this turn had a
+/// `TaskSuggestion` effect, and which chip to withdraw if it is reverted.
+///
+/// One command rather than two, so the enumerated effect and the id its
+/// compensator needs can never be recorded by halves — a manifest that knew a
+/// chip was staged but not which one would have to withdraw nothing, which is
+/// the same trap `remembered_facts` documents.
+#[tauri::command]
+pub fn checkpoint_record_task_suggestion(
+    state: tauri::State<'_, AppState>,
+    id: Option<String>,
+    suggestion_id: String,
+) -> Result<(), String> {
+    record_external_effect(
+        state.inner(),
+        id.as_deref(),
+        ExternalEffectKind::TaskSuggestion,
+    )?;
+    record_task_suggestion(state.inner(), id.as_deref(), suggestion_id)
+}
+
+/// The chips a checkpoint's turn staged, for the frontend compensator to
+/// withdraw on revert and restore on reapply.
+///
+/// Read back rather than returned by `checkpoint_revert`, because the revert
+/// rewrites the manifest and a caller that read it afterwards would find the
+/// list it needs already gone. See `checkpointReconciliation`'s own ordering
+/// note — this is the same hazard `forget_remembered` avoids by reading the
+/// manifest before `revert_impl` touches it.
+#[tauri::command]
+pub fn checkpoint_staged_task_suggestions(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<Vec<String>, String> {
+    validate_id(&id)?;
+    Ok(read_manifest(&checkpoints_base_dir(&app)?, &id)?.staged_task_suggestions)
+}
+
 /// Every external effect a manifest records, reconstructing what an older one
 /// could not say.
 ///
@@ -1080,6 +1186,7 @@ fn parse_manifest(raw: &str, dir: &Path, id: &str) -> Result<CheckpointManifest,
         // A v1 manifest predates both freezing and fact recording, so neither is
         // recoverable — empty and `None` are what say so.
         remembered_facts: Vec::new(),
+        staged_task_suggestions: Vec::new(),
         resume: None,
         reverted: false,
         prev_id: None,
@@ -1179,6 +1286,7 @@ pub fn end_impl(state: &AppState, id: &str) -> Result<CheckpointSummary, String>
         prev_id: active.prev_id,
         entries: entries.clone(),
         remembered_facts: active.remembered_facts.clone(),
+        staged_task_suggestions: active.staged_task_suggestions.clone(),
         // An ordinary turn checkpoint, not a freeze. `freeze_process` is what
         // fills this, and `restorability` refuses anything that has not been.
         resume: None,
@@ -2289,6 +2397,7 @@ mod tests {
     fn frozen(resume: Option<ResumeState>) -> CheckpointManifest {
         CheckpointManifest {
             remembered_facts: Vec::new(),
+            staged_task_suggestions: Vec::new(),
             version: MANIFEST_VERSION,
             created_at_ms: 1,
             session_id: "s-1".to_string(),
@@ -2435,6 +2544,7 @@ mod tests {
                 committed_effects: Default::default(),
                 prev_id: None,
                 remembered_facts: Vec::new(),
+                staged_task_suggestions: Vec::new(),
             },
         );
         let fact = RememberedFact {
@@ -2466,15 +2576,28 @@ mod tests {
         record_remembered_fact(&state, Some("nope"), fact).unwrap();
     }
 
-    /// Memory is the one effect of the four this app can take back, and the
-    /// compensator says what pressing revert will do rather than only that it
-    /// can. The other three still refuse, each with its own reason.
+    /// Two of the five effects this app can take back, and three it cannot —
+    /// which is what K14's acceptance means by `needs_reconciliation` becoming
+    /// the exception for an enumerated set rather than the default answer for
+    /// everything outside the workspace files.
+    ///
+    /// A compensated effect says what pressing revert will *do*, not merely that
+    /// something can be done. An uncompensated one says why nothing can, in its
+    /// own words rather than a shared caveat.
     #[test]
-    fn memory_is_compensated_and_the_other_three_still_are_not() {
-        assert!(matches!(
-            ExternalEffectKind::Memory.compensator(),
-            Compensation::Undo { .. }
-        ));
+    fn the_two_undoable_effects_are_compensated_and_the_other_three_say_why_not() {
+        for kind in [
+            ExternalEffectKind::Memory,
+            ExternalEffectKind::TaskSuggestion,
+        ] {
+            let Compensation::Undo { action } = kind.compensator() else {
+                panic!("{kind:?} has a real undo in this app and must name it");
+            };
+            assert!(
+                action.len() > 20,
+                "{kind:?} must say what reverting will do, not just that it will"
+            );
+        }
         for kind in [
             ExternalEffectKind::Shell,
             ExternalEffectKind::Network,
@@ -2485,6 +2608,41 @@ mod tests {
             };
             assert!(reason.len() > 20, "{kind:?} refuses without a reason");
         }
+    }
+
+    /// A turn whose only external effect is a staged chip no longer reports as
+    /// unreconcilable — the narrowing is derived from `Compensation::None`, so
+    /// adding the second undo needed no second place to update.
+    #[test]
+    fn a_turn_that_only_proposed_follow_up_work_needs_no_reconciliation() {
+        let state = AppState::default();
+        let base = TempDir::new("suggest");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("f.txt");
+        std::fs::write(&file, "v1").unwrap();
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "v2").unwrap();
+        record_external_effect(&state, Some(&id), ExternalEffectKind::TaskSuggestion).unwrap();
+        // Recorded twice, to pin that the id list deduplicates like the fact
+        // list does — two withdrawals of one chip is not an undo, it is a bug.
+        record_task_suggestion(&state, Some(&id), "chip-1".to_string()).unwrap();
+        record_task_suggestion(&state, Some(&id), "chip-1".to_string()).unwrap();
+        record_task_suggestion(&state, Some(&id), "chip-2".to_string()).unwrap();
+        end_impl(&state, &id).unwrap();
+
+        let sim = simulate_restore_impl(&base.path, &id).unwrap();
+        assert!(
+            !sim.needs_reconciliation,
+            "a proposed chip can be withdrawn, so there is nothing to reconcile"
+        );
+        assert_eq!(
+            read_manifest(&base.path, &id)
+                .unwrap()
+                .staged_task_suggestions,
+            vec!["chip-1".to_string(), "chip-2".to_string()]
+        );
     }
 
     /// The text is kept beside the id so a reapply can put the fact back. A

@@ -1755,6 +1755,7 @@ mod tests {
             "test-checkpoint".to_string(),
             checkpoints::ActiveCheckpoint {
                 remembered_facts: Vec::new(),
+                staged_task_suggestions: Vec::new(),
                 dir: checkpoint_dir,
                 entries: Vec::new(),
                 created_at_ms: 0,

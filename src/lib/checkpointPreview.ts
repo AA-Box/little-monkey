@@ -96,7 +96,7 @@ export interface RestorePlanEntry {
 
 /** One external effect the backend recorded, and what undoes it. */
 export interface ExternalEffectRecord {
-  kind: 'shell' | 'network' | 'mcp-tool' | 'memory';
+  kind: 'shell' | 'network' | 'mcp-tool' | 'memory' | 'task-suggestion';
   /** A tagged object rather than a bool, which is what made adding the first
    * real undo a compile error at every reader instead of a flag somebody
    * forgets to check.
