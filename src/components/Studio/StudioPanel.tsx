@@ -16,6 +16,7 @@ import {
   Sparkles,
   Square,
   Trash2,
+  Undo2,
   Upload,
   Wand2,
 } from "lucide-react";
@@ -33,6 +34,7 @@ import { useT } from "../../lib/i18n";
 import { describeWeightFile } from "../../lib/weightFileHints";
 import { PREPROCESSORS, runPreprocessor, type Preprocessor } from "../../lib/preprocess";
 import { NO_MARGINS, runOutpaint, type Margins } from "../../lib/outpaint";
+import { pickImageBase64 } from "../../lib/imageAttachment";
 import {
   componentFileName,
   editTaskFor,
@@ -174,7 +176,7 @@ function ConditioningImageField({
   label: string;
   hint: string;
   value: string | null;
-  onPick: (file: File) => void;
+  onPick: () => void;
   onClear: () => void;
   strength: number;
   onStrength: (value: number) => void;
@@ -186,24 +188,11 @@ function ConditioningImageField({
   onPreprocess?: (kind: Preprocessor) => void;
 }) {
   const { t } = useT();
-  const input = useRef<HTMLInputElement | null>(null);
   return (
     <SettingsCard title={label} hint={hint}>
       <div className="flex items-center gap-2">
-        <input
-          ref={input}
-          type="file"
-          accept="image/png,image/jpeg,image/webp"
-          className="hidden"
-          onChange={(event) => {
-            const file = event.target.files?.[0];
-            if (file) onPick(file);
-            // Cleared so re-picking the same file still fires a change event.
-            event.target.value = "";
-          }}
-        />
         {value && <Thumbnail base64={value} alt={label} />}
-        <Button size="sm" variant="secondary" onClick={() => input.current?.click()}>
+        <Button size="sm" variant="secondary" onClick={onPick}>
           <Upload size={13} />
           {t("Studio.chooseImage")}
         </Button>
@@ -254,13 +243,12 @@ function ReferenceImages({
   onNumberedChange,
 }: {
   images: string[];
-  onAdd: (file: File) => void;
+  onAdd: () => void;
   onRemove: (index: number) => void;
   numbered: boolean;
   onNumberedChange: (numbered: boolean) => void;
 }) {
   const { t } = useT();
-  const input = useRef<HTMLInputElement | null>(null);
   const full = images.length >= MAX_REF_IMAGES;
   // One reference has nothing to be told apart from, so the control only earns
   // its space once there are two. The badges are the point of showing it: they
@@ -298,23 +286,7 @@ function ReferenceImages({
             </IconButton>
           </span>
         ))}
-        <input
-          ref={input}
-          type="file"
-          accept="image/png,image/jpeg,image/webp"
-          className="hidden"
-          onChange={(event) => {
-            const file = event.target.files?.[0];
-            if (file) onAdd(file);
-            event.target.value = "";
-          }}
-        />
-        <Button
-          size="sm"
-          variant="secondary"
-          disabled={full}
-          onClick={() => input.current?.click()}
-        >
+        <Button size="sm" variant="secondary" disabled={full} onClick={onAdd}>
           <Plus size={13} />
           {t("Studio.reference.add")}
         </Button>
@@ -467,6 +439,12 @@ export function StudioPanel({ mode, railSlot }: Props) {
   const [maskImage, setMaskImage] = useState<string | null>(null);
   const [outpaintStep, setOutpaintStep] = useState<number>(OUTPAINT_STEPS[1]);
   const [extending, setExtending] = useState(false);
+  /** One entry per extension, so a mis-aimed arrow is undoable. The mask is not
+   *  kept: it was generated for the extension being undone, and the earlier
+   *  image is handed back unmasked. */
+  const [outpaintHistory, setOutpaintHistory] = useState<
+    { image: string; width: number; height: number }[]
+  >([]);
   /** Structure to follow — already a depth map, pose skeleton or edge map. The
    *  engine runs no detector, so a plain photo is followed as if it were one. */
   const [controlImage, setControlImage] = useState<string | null>(null);
@@ -503,7 +481,6 @@ export function StudioPanel({ mode, railSlot }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [previews, setPreviews] = useState<Record<string, string>>({});
   const [lightbox, setLightbox] = useState<GenerationEntry | null>(null);
-  const fileInput = useRef<HTMLInputElement>(null);
   const lightboxRef = useRef<HTMLDialogElement>(null);
 
   // `showModal` is the only way into the top layer, so open and close are
@@ -828,14 +805,13 @@ export function StudioPanel({ mode, railSlot }: Props) {
     }
   };
 
-  const pickImage = async (file: File, receive: (base64: string) => void) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result ?? "");
-      const comma = result.indexOf(",");
-      if (comma >= 0) receive(result.slice(comma + 1));
-    };
-    reader.readAsDataURL(file);
+  const pickImage = async (receive: (base64: string) => void) => {
+    try {
+      const base64 = await pickImageBase64();
+      if (base64) receive(base64);
+    } catch (cause) {
+      setError(String(cause));
+    }
   };
 
   /** Extends the source image on one side and marks the new ground for the
@@ -851,6 +827,11 @@ export function StudioPanel({ mode, railSlot }: Props) {
     setError(null);
     try {
       const result = await runOutpaint(initImage, { ...NO_MARGINS, [side]: outpaintStep });
+      if (settings)
+        setOutpaintHistory((current) => [
+          ...current,
+          { image: initImage, width: settings.width, height: settings.height },
+        ]);
       setInitImage(result.initImageBase64);
       setMaskImage(result.maskImageBase64);
       // Null only before a model is chosen, and the button that got here is
@@ -866,12 +847,27 @@ export function StudioPanel({ mode, railSlot }: Props) {
     }
   };
 
+  /** Steps back one extension, restoring the image and the size that went with
+   *  it. */
+  const undoExtend = () => {
+    const previous = outpaintHistory[outpaintHistory.length - 1];
+    if (!previous) return;
+    setOutpaintHistory((current) => current.slice(0, -1));
+    setInitImage(previous.image);
+    setMaskImage(null);
+    setSettings((current) =>
+      current ? { ...current, width: previous.width, height: previous.height } : current,
+    );
+  };
+
   /** Dropping the source image drops the mask with it: a mask addresses that
    *  image's pixels, so keeping it would silently repaint the wrong region of
-   *  whatever came next. */
+   *  whatever came next. The extension history goes too — it holds earlier
+   *  states of an image that is no longer loaded. */
   const changeInitImage = (next: string | null) => {
     setInitImage(next);
     setMaskImage(null);
+    setOutpaintHistory([]);
   };
 
   const generate = async () => {
@@ -1504,17 +1500,11 @@ export function StudioPanel({ mode, railSlot }: Props) {
 
           {needsInitImage(task) && (
             <div className="flex items-center gap-2">
-              <input
-                ref={fileInput}
-                type="file"
-                accept="image/png,image/jpeg,image/webp"
-                className="hidden"
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  if (file) void pickImage(file, changeInitImage);
-                }}
-              />
-              <Button size="sm" variant="secondary" onClick={() => fileInput.current?.click()}>
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => void pickImage(changeInitImage)}
+              >
                 <Upload size={13} />
                 {t("Studio.chooseImage")}
               </Button>
@@ -1535,30 +1525,46 @@ export function StudioPanel({ mode, railSlot }: Props) {
 
           {canMask && initImage && (
             <SettingsCard title={t("Studio.outpaint.title")} hint={t("Studio.outpaint.hint")}>
-              <div className="flex flex-wrap items-center gap-1.5">
-                {OUTPAINT_STEPS.map((step) => (
-                  <Button
-                    key={step}
-                    size="sm"
-                    variant={outpaintStep === step ? "primary" : "secondary"}
-                    onClick={() => setOutpaintStep(step)}
-                  >
-                    {step}
-                  </Button>
-                ))}
-                <span className="mx-1 text-[11px] text-faint">px</span>
-                {OUTPAINT_SIDES.map(({ side, labelKey, icon: Icon }) => (
+              {/* Two groups, each of which refuses to wrap inside itself: a
+                  narrow panel breaks between the sizes and the arrows rather
+                  than leaving one arrow stranded on a line of its own. */}
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                <div className="flex items-center gap-1.5">
+                  {OUTPAINT_STEPS.map((step) => (
+                    <Button
+                      key={step}
+                      size="sm"
+                      variant={outpaintStep === step ? "primary" : "secondary"}
+                      onClick={() => setOutpaintStep(step)}
+                    >
+                      {step}
+                    </Button>
+                  ))}
+                  <span className="text-[11px] text-faint">px</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  {OUTPAINT_SIDES.map(({ side, labelKey, icon: Icon }) => (
+                    <IconButton
+                      key={side}
+                      size="sm"
+                      aria-label={t(labelKey)}
+                      title={t(labelKey)}
+                      disabled={extending}
+                      onClick={() => void extend(side)}
+                    >
+                      <Icon size={13} />
+                    </IconButton>
+                  ))}
                   <IconButton
-                    key={side}
                     size="sm"
-                    aria-label={t(labelKey)}
-                    title={t(labelKey)}
-                    disabled={extending}
-                    onClick={() => void extend(side)}
+                    aria-label={t("Studio.outpaint.undo")}
+                    title={t("Studio.outpaint.undo")}
+                    disabled={extending || outpaintHistory.length === 0}
+                    onClick={undoExtend}
                   >
-                    <Icon size={13} />
+                    <Undo2 size={13} />
                   </IconButton>
-                ))}
+                </div>
               </div>
             </SettingsCard>
           )}
@@ -1594,7 +1600,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
               label={t("Studio.control.title")}
               hint={t("Studio.control.hint")}
               value={controlImage}
-              onPick={(file) => void pickImage(file, setControlImage)}
+              onPick={() => void pickImage(setControlImage)}
               onClear={() => setControlImage(null)}
               onPreprocess={(kind) => void preprocessInto(controlImage, kind, setControlImage)}
               strength={controlStrength}
@@ -1608,7 +1614,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
               label={t("Studio.ipAdapter.title")}
               hint={t("Studio.ipAdapter.hint")}
               value={ipAdapterImage}
-              onPick={(file) => void pickImage(file, setIpAdapterImage)}
+              onPick={() => void pickImage(setIpAdapterImage)}
               onClear={() => setIpAdapterImage(null)}
               strength={ipAdapterStrength}
               onStrength={setIpAdapterStrength}
@@ -1619,8 +1625,8 @@ export function StudioPanel({ mode, railSlot }: Props) {
           {conditioning.has("reference") && (
             <ReferenceImages
               images={refImages}
-              onAdd={(file) =>
-                void pickImage(file, (base64) =>
+              onAdd={() =>
+                void pickImage((base64) =>
                   setRefImages((current) =>
                     current.length >= MAX_REF_IMAGES ? current : [...current, base64],
                   ),
