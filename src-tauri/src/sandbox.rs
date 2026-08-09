@@ -2818,11 +2818,29 @@ mod tests {
         let expected_home = canonical_sandbox.join(SANDBOX_HOME_DIR);
         let expected_tmp = canonical_sandbox.join(SANDBOX_TMP_DIR);
 
+        // `fs::canonicalize` returns a verbatim `\\?\` path on Windows, and
+        // `cmd.exe` cannot use one: it treats the prefix as part of the filename,
+        // so every redirect and `type` against it fails. The other two platforms
+        // hand their canonical paths straight to `sh` because POSIX has no such
+        // form. Stripped only for the strings the shell sees — the assertions
+        // below still compare the canonical paths Rust produced.
+        fn plain(path: &Path) -> String {
+            let text = path.display().to_string();
+            text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+        }
+
         // One line, `&`-separated: `cmd /C` takes the remainder of the command
         // line verbatim and has no `set -eu`, so every step carries its own
-        // `exit /b`. The exit codes match the `sh` version's on purpose — 71 for
-        // a readable secret, 72 for a writable one — so a failure reads the same
-        // whichever platform reported it.
+        // `exit /b`. The two deny codes match the `sh` version's on purpose — 71
+        // for a readable secret, 72 for a writable one — so a failure reads the
+        // same whichever platform reported it. The allow codes (73-75) have no
+        // `sh` counterpart because there `set -eu` fails the script for us.
+        //
+        // Every step is checked, and the script does **not** end in a bare
+        // `exit /b 0`: `&` does not stop on failure, so an unchecked step would
+        // let a silent denial through and leave the exit code saying nothing.
+        // That is what a first draft of this test did, and the write it failed to
+        // notice only surfaced as an is_file() assertion with no reason attached.
         //
         // `type X > Y` creates Y and then fails, leaving errorlevel 1, so the
         // `&&` after it runs only when the read actually succeeded. Same for the
@@ -2830,16 +2848,16 @@ mod tests {
         let command = format!(
             "if /I not \"%USERPROFILE%\"==\"{home}\" exit /b 70 \
              & if /I not \"%TMP%\"==\"{tmp}\" exit /b 70 \
-             & type \"{allowed}\" > \"%TMP%\\allowed-copy\" || exit /b 73 \
+             & (type \"{allowed}\" > \"%TMP%\\allowed-copy\" || exit /b 73) \
              & (type \"{forbidden}\" > \"%TMP%\\forbidden-copy\" && exit /b 71) \
              & (echo overwritten> \"{forbidden}\" && exit /b 72) \
-             & echo home-ok> \"%USERPROFILE%\\probe\" \
-             & echo tmp-ok> \"%TMP%\\probe\" \
+             & (echo home-ok> \"%USERPROFILE%\\probe\" || exit /b 74) \
+             & (echo tmp-ok> \"%TMP%\\probe\" || exit /b 75) \
              & exit /b 0",
-            home = expected_home.display(),
-            tmp = expected_tmp.display(),
-            allowed = canonical_workspace.join("allowed.txt").display(),
-            forbidden = canonical_forbidden.display(),
+            home = plain(&expected_home),
+            tmp = plain(&expected_tmp),
+            allowed = plain(&canonical_workspace.join("allowed.txt")),
+            forbidden = plain(&canonical_forbidden),
         );
 
         for allow_network in [false, true] {
@@ -2865,6 +2883,10 @@ mod tests {
                 Isolation::OsSandboxed,
                 "the container was created, so the run must report the boundary it got"
             );
+            // Each code names its own step, so a red run says which half broke
+            // rather than only that something did: 70 wrong env, 71 the secret
+            // was readable, 72 it was writable, 73 its own copy was not readable,
+            // 74/75 the sandbox-owned home or tmp was not writable.
             assert_eq!(
                 outcome.exit_code,
                 Some(0),
