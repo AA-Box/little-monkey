@@ -227,7 +227,13 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
   };
 
   return (
-    <div className="flex flex-col gap-2">
+    // `min-w-0`: a grid or flex item's automatic minimum is its own min-content,
+    // and the brush row's is set by the range input — whose intrinsic width is
+    // around 130px whatever `min-width` says. Without this the whole painter
+    // refuses to go below roughly 330px, so in a narrower column the picture,
+    // `Clear` and the brush readout all hang past the right edge of every
+    // settings card beside them.
+    <div className="flex min-w-0 flex-col gap-2">
       {/* `overflow-auto` rather than a drag-to-pan mode: past 1× the content is
           wider than the box and the browser's own scrolling moves it, which
           costs no code and never competes with the brush for the pointer. */}
