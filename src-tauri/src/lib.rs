@@ -150,6 +150,7 @@ mod artifact_commands;
 pub mod chat_template_lab;
 pub mod checkpoints;
 pub mod compatibility_hub;
+pub mod conformance;
 // `pub` only for the doc-comment convention every sibling module below
 // follows (a future `monkey-cli` command could call `install_if_needed`
 // directly, though none exists yet — the CLI installing itself onto its own
@@ -1360,6 +1361,7 @@ pub fn run() {
             m3_commands::m3_api_dispatch,
             m3_commands::m3_api_cancel_inference,
             m3_commands::m3_compatibility_matrix,
+            m3_commands::run_conformance_suite,
             m3_commands::m3_lan_validate_policy,
             m3_commands::m3_lan_configure,
             m3_commands::m3_lan_disable,
