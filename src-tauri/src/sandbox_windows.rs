@@ -1186,30 +1186,39 @@ mod tests {
         );
 
         // A machine without containers has only the control arm to offer, same as
-        // the boundary test above.
-        if let Ok(container) = create_app_container("iotest") {
-            container.grant_tree_access(&root).expect("grant");
-            let confined = run_confined(
-                Some(&container),
-                &create_job().expect("job"),
-                command,
-                &root,
-                &env,
-                false,
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("the confined run itself must work");
-            assert!(
-                String::from_utf8_lossy(&confined.stdout).contains("on-stdout")
-                    && String::from_utf8_lossy(&confined.stderr).contains("on-stderr"),
-                "an AppContainer run lost the child's output while the job-only run kept \
-                 it, so the container is what the inherited pipe write end does not \
-                 survive: stdout={:?} stderr={:?} exit={:?}",
-                String::from_utf8_lossy(&confined.stdout),
-                String::from_utf8_lossy(&confined.stderr),
-                confined.exit_code
-            );
+        // the boundary test above — but a skip and a pass are the same colour, and
+        // the conclusion drawn from a green run here is precisely "the container
+        // arm captured its output", so on CI the skip has to be the failure.
+        match create_app_container("iotest") {
+            Err(error) => assert!(
+                std::env::var_os("CI").is_none(),
+                "no AppContainer on this CI runner, so the arm this test exists for \
+                 never ran: {error}"
+            ),
+            Ok(container) => {
+                container.grant_tree_access(&root).expect("grant");
+                let confined = run_confined(
+                    Some(&container),
+                    &create_job().expect("job"),
+                    command,
+                    &root,
+                    &env,
+                    false,
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("the confined run itself must work");
+                assert!(
+                    String::from_utf8_lossy(&confined.stdout).contains("on-stdout")
+                        && String::from_utf8_lossy(&confined.stderr).contains("on-stderr"),
+                    "an AppContainer run lost the child's output while the job-only run \
+                     kept it, so the container is what the inherited pipe write end \
+                     does not survive: stdout={:?} stderr={:?} exit={:?}",
+                    String::from_utf8_lossy(&confined.stdout),
+                    String::from_utf8_lossy(&confined.stderr),
+                    confined.exit_code
+                );
+            }
         }
 
         let _ = std::fs::remove_dir_all(&root);
