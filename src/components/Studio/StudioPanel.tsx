@@ -12,6 +12,7 @@ import {
   Plus,
   RectangleHorizontal,
   RectangleVertical,
+  Redo2,
   Shuffle,
   Sparkles,
   Square,
@@ -384,6 +385,16 @@ const MODE_TASKS: Record<Exclude<StudioMode, "models" | "tools">, GenerationTask
  *  margin would have it resize the result behind the user's back. */
 const OUTPAINT_STEPS = [64, 128, 256] as const;
 
+/** One point in the extension history: the picture and the size the form was
+ *  set to while it was the picture. Both, because an extension moves the
+ *  requested size with it and restoring one without the other hands the engine
+ *  a mismatch. */
+interface OutpaintState {
+  image: string;
+  width: number;
+  height: number;
+}
+
 const OUTPAINT_SIDES = [
   { side: "left", labelKey: "Studio.outpaint.left", icon: ArrowLeft },
   { side: "right", labelKey: "Studio.outpaint.right", icon: ArrowRight },
@@ -439,12 +450,15 @@ export function StudioPanel({ mode, railSlot }: Props) {
   const [maskImage, setMaskImage] = useState<string | null>(null);
   const [outpaintStep, setOutpaintStep] = useState<number>(OUTPAINT_STEPS[1]);
   const [extending, setExtending] = useState(false);
-  /** One entry per extension, so a mis-aimed arrow is undoable. The mask is not
-   *  kept: it was generated for the extension being undone, and the earlier
-   *  image is handed back unmasked. */
-  const [outpaintHistory, setOutpaintHistory] = useState<
-    { image: string; width: number; height: number }[]
-  >([]);
+  /** One entry per extension, so a mis-aimed arrow is undoable, and one per
+   *  undo so it is redoable. The mask is not kept in either: it was generated
+   *  for the step being stepped over, and the image is handed back unmasked.
+   *
+   *  A fresh extension drops the redo stack — the branch it belonged to is
+   *  gone, and offering to "redo" onto a different image would paste the wrong
+   *  picture back. */
+  const [outpaintHistory, setOutpaintHistory] = useState<OutpaintState[]>([]);
+  const [outpaintFuture, setOutpaintFuture] = useState<OutpaintState[]>([]);
   /** Structure to follow — already a depth map, pose skeleton or edge map. The
    *  engine runs no detector, so a plain photo is followed as if it were one. */
   const [controlImage, setControlImage] = useState<string | null>(null);
@@ -832,6 +846,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
           ...current,
           { image: initImage, width: settings.width, height: settings.height },
         ]);
+      setOutpaintFuture([]);
       setInitImage(result.initImageBase64);
       setMaskImage(result.maskImageBase64);
       // Null only before a model is chosen, and the button that got here is
@@ -847,27 +862,46 @@ export function StudioPanel({ mode, railSlot }: Props) {
     }
   };
 
-  /** Steps back one extension, restoring the image and the size that went with
-   *  it. */
-  const undoExtend = () => {
-    const previous = outpaintHistory[outpaintHistory.length - 1];
-    if (!previous) return;
-    setOutpaintHistory((current) => current.slice(0, -1));
-    setInitImage(previous.image);
+  /** Moves one step along the extension history, in either direction.
+   *
+   *  Undo and redo are the same move with the stacks swapped, so they are one
+   *  function: take the top of one stack, put where you were on the other, and
+   *  restore. Writing them apart is how the two drift. */
+  const stepExtension = (direction: "undo" | "redo") => {
+    if (!initImage || !settings) return;
+    const from = direction === "undo" ? outpaintHistory : outpaintFuture;
+    const target = from[from.length - 1];
+    if (!target) return;
+    const here: OutpaintState = {
+      image: initImage,
+      width: settings.width,
+      height: settings.height,
+    };
+    const drop = (current: OutpaintState[]) => current.slice(0, -1);
+    const push = (current: OutpaintState[]) => [...current, here];
+    if (direction === "undo") {
+      setOutpaintHistory(drop);
+      setOutpaintFuture(push);
+    } else {
+      setOutpaintFuture(drop);
+      setOutpaintHistory(push);
+    }
+    setInitImage(target.image);
     setMaskImage(null);
     setSettings((current) =>
-      current ? { ...current, width: previous.width, height: previous.height } : current,
+      current ? { ...current, width: target.width, height: target.height } : current,
     );
   };
 
   /** Dropping the source image drops the mask with it: a mask addresses that
    *  image's pixels, so keeping it would silently repaint the wrong region of
-   *  whatever came next. The extension history goes too — it holds earlier
-   *  states of an image that is no longer loaded. */
+   *  whatever came next. Both extension stacks go too — they hold states of an
+   *  image that is no longer loaded. */
   const changeInitImage = (next: string | null) => {
     setInitImage(next);
     setMaskImage(null);
     setOutpaintHistory([]);
+    setOutpaintFuture([]);
   };
 
   const generate = async () => {
@@ -1560,9 +1594,18 @@ export function StudioPanel({ mode, railSlot }: Props) {
                     aria-label={t("Studio.outpaint.undo")}
                     title={t("Studio.outpaint.undo")}
                     disabled={extending || outpaintHistory.length === 0}
-                    onClick={undoExtend}
+                    onClick={() => stepExtension("undo")}
                   >
                     <Undo2 size={13} />
+                  </IconButton>
+                  <IconButton
+                    size="sm"
+                    aria-label={t("Studio.outpaint.redo")}
+                    title={t("Studio.outpaint.redo")}
+                    disabled={extending || outpaintFuture.length === 0}
+                    onClick={() => stepExtension("redo")}
+                  >
+                    <Redo2 size={13} />
                   </IconButton>
                 </div>
               </div>
