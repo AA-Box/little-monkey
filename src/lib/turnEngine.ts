@@ -543,6 +543,16 @@ export async function executeToolCall(
       tldr: typeof args.tldr === 'string' ? args.tldr : '',
       prompt,
     });
+    // Recorded *after* the store assigned the id, for `tool_remember`'s reason:
+    // an id guessed beforehand could name a chip that was never created. One
+    // call rather than two, so the enumerated effect and the id it needs to
+    // withdraw can never be recorded by halves.
+    if (checkpointId) {
+      await invoke('checkpoint_record_task_suggestion', {
+        id: checkpointId,
+        suggestionId: suggestion.id,
+      }).catch(() => undefined);
+    }
     return stringifyToolResult({
       task_id: suggestion.id,
       status: 'suggested',

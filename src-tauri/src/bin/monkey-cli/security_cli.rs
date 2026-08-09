@@ -3,8 +3,8 @@ use std::path::Path;
 use clap::Subcommand;
 use little_monkey_lib::native_skills::{NativeSkillManager, SkillSource};
 use little_monkey_lib::run_ledger::{
-    ChainVerification, RunLedger, StoredPermissionDecision, StoredSubsystemEvent, Subsystem,
-    ToolCallOrigin,
+    ChainVerification, PermissionGap, RunLedger, StoredPermissionDecision, StoredSubsystemEvent,
+    Subsystem, ToolCallOrigin,
 };
 use little_monkey_lib::run_protocol::PermissionDecision;
 use little_monkey_lib::security_doctor::{
@@ -48,6 +48,21 @@ pub enum SecurityCmd {
         /// The tool call id to trace.
         tool_call_id: String,
         /// Print the versioned machine-readable trail.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask a whole run the question `permission-trail` asks one call.
+    ///
+    /// K12's acceptance says a tool call whose authorizing decision cannot be
+    /// produced from the log is a bug. Asking one id at a time can only confirm
+    /// a call somebody already suspected — this asks every call in the run, and
+    /// exits non-zero when a **mutating** one has no decision behind it. An
+    /// ungated read is listed and not counted: reading a file is not an
+    /// authorization event.
+    PermissionGaps {
+        /// The run to sweep.
+        run_id: String,
+        /// Print the versioned machine-readable report.
         #[arg(long)]
         json: bool,
     },
@@ -145,6 +160,30 @@ pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> R
             }
             Ok(())
         }
+        SecurityCmd::PermissionGaps { run_id, json } => {
+            let ledger = open_existing_ledger(data_dir)?;
+            let gaps = ledger
+                .permission_gaps(run_id)
+                .map_err(|error| error.to_string())?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&gaps).map_err(|error| error.to_string())?
+                );
+            } else {
+                print_permission_gaps(run_id, &gaps);
+            }
+            let unauthorized = gaps
+                .iter()
+                .filter(|gap| gap.is_unauthorized_mutation())
+                .count();
+            if unauthorized > 0 {
+                return Err(format!(
+                    "{unauthorized} mutating tool call(s) in run {run_id} have no permission decision in the log"
+                ));
+            }
+            Ok(())
+        }
         SecurityCmd::SubsystemEvents {
             subsystem,
             limit,
@@ -231,6 +270,26 @@ fn open_existing_ledger(data_dir: &Path) -> Result<RunLedger, String> {
         ));
     }
     RunLedger::open(&path).map_err(|error| error.to_string())
+}
+
+fn print_permission_gaps(run_id: &str, gaps: &[PermissionGap]) {
+    if gaps.is_empty() {
+        println!("Run {run_id}: every tool call has a permission decision behind it.");
+        return;
+    }
+    println!("Run {run_id}: {} tool call(s) with no decision", gaps.len());
+    for gap in gaps {
+        let tool = gap.tool_name.as_deref().unwrap_or("(never proposed)");
+        // Three states, not two. "The log does not say" is its own answer, and
+        // it counts as a bug rather than being waved through — see
+        // `PermissionGap::mutation`.
+        let verdict = match gap.mutation {
+            Some(true) => "MUTATING - nothing authorized it",
+            Some(false) => "read-only - no gate expected",
+            None => "unknown - no ToolProposed, so the log cannot say",
+        };
+        println!("  {} - {tool} - {verdict}", gap.tool_call_id);
+    }
 }
 
 fn print_permission_trail(tool_call_id: &str, trail: &[StoredPermissionDecision]) {

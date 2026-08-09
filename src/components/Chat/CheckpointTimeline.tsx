@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { reapplyCheckpoint, revertCheckpoint } from "../../lib/checkpointCompensation";
 import { Ban, Eye, FilePenLine, GitCompareArrows, History, MessageSquareX, RefreshCw, TerminalSquare, Undo2 } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
@@ -120,7 +120,7 @@ function TimelineRow({
 
   const restoreFiles = async (): Promise<boolean> => {
     try {
-      await invoke("checkpoint_revert", { id: info.id });
+      await revertCheckpoint(info.id);
       syncNoticeReverted(sessionId, info.id, true);
       return true;
     } catch (err) {
@@ -151,7 +151,7 @@ function TimelineRow({
     setBusy(true);
     setError(null);
     try {
-      await invoke("checkpoint_reapply", { id: info.id });
+      await reapplyCheckpoint(info.id);
       syncNoticeReverted(sessionId, info.id, false);
       onChanged();
     } catch (err) {
@@ -292,7 +292,7 @@ function RestoreToHereButton({
       const targetIndex = chain.findIndex((c) => c.id === info.id);
       if (targetIndex === -1) return;
       for (const step of chain.slice(0, targetIndex + 1)) {
-        await invoke("checkpoint_revert", { id: step.id });
+        await revertCheckpoint(step.id);
         syncNoticeReverted(sessionId, step.id, true);
       }
       onDone();
