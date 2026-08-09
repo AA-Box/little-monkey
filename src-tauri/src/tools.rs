@@ -449,11 +449,7 @@ fn persist_generated_image(
     let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f").to_string();
     let unique = uuid::Uuid::new_v4().simple().to_string();
     let suggested_name = generated_image_filename(filename, &timestamp, &unique[..8])?;
-    let bytes = crate::artifact_commands::decode_bounded(
-        content_base64,
-        IMAGE_MAX_BYTES,
-        "image",
-    )?;
+    let bytes = crate::artifact_commands::decode_bounded(content_base64, IMAGE_MAX_BYTES, "image")?;
     if !bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
         return Err("Generated image content is not a PNG (bad magic number)".to_string());
     }
@@ -916,12 +912,29 @@ pub async fn tool_run_shell(
         &mut command_builder,
     );
 
-    let child = command_builder
+    // Decided before the spawn, because it is now the *read* that is bounded
+    // rather than the returned string: the drain below needs to know its ceiling
+    // before the first byte arrives.
+    let cap = stream_cap(full_output);
+
+    let mut child = command_builder
         .spawn()
         .map_err(|e| format!("Failed to spawn shell: {}", e))?;
-    // Captured before `wait_with_output` consumes the child. With
+    // Captured before the capture future borrows the child. With
     // `process_group(0)` above, the child's own pid is also its group id.
     let child_pgid = child.id();
+    // Taken out of the child *before* the wait, so the two pipes can be drained
+    // concurrently with it. `Stdio::piped()` above guarantees both are `Some`;
+    // the `ok_or` is a refusal rather than an `expect` because a panic inside a
+    // Tauri command aborts the whole IPC task.
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Shell child had no stdout pipe".to_string())?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Shell child had no stderr pipe".to_string())?;
 
     // Each turn gets its own cancellation channel so Stop in one pane never
     // kills a command the other pane's turn is still running. Callers that
@@ -945,7 +958,7 @@ pub async fn tool_run_shell(
     });
 
     let outcome = tokio::select! {
-        result = child.wait_with_output() => {
+        result = capture_bounded(&mut child, stdout_pipe, stderr_pipe, cap) => {
             result.map_err(|e| format!("Failed to run command: {}", e))
         }
         _ = cancel.notified() => {
@@ -1023,9 +1036,11 @@ pub async fn tool_run_shell(
     // Deliberately a flag and not a byte count: nothing needs a *different*
     // ceiling, and `Some(0)` meaning "unlimited" would be exactly the
     // zero-versus-absent overloading this codebase avoids elsewhere.
-    let cap = stream_cap(full_output);
-    let (stdout, stdout_truncated) = cap_stream(&output.stdout, cap);
-    let (stderr, stderr_truncated) = cap_stream(&output.stderr, cap);
+    //
+    // The cap was applied *while reading* (see [`capture_bounded`]); by here both
+    // strings are already at or under it, and this is only the decode.
+    let (stdout, stdout_truncated) = output.stdout.into_string();
+    let (stderr, stderr_truncated) = output.stderr.into_string();
     Ok(serde_json::json!({
         "stdout": stdout,
         "stderr": stderr,
@@ -1053,21 +1068,137 @@ fn stream_cap(full_output: Option<bool>) -> Option<usize> {
     }
 }
 
-/// Decodes one captured stream and applies `cap`, if any.
+/// One captured stream, already held to its ceiling.
 ///
-/// `None` means the caller asked for the whole thing. Note what this does *not*
-/// fix: `wait_with_output` has already materialized both streams in full by the
-/// time this runs, so the app's own heap stays unbounded even when the returned
-/// tail is capped. Bounding the read itself means draining both pipes
-/// concurrently with the wait — which is the service `wait_with_output` currently
-/// performs, and getting it wrong deadlocks a chatty-stderr child once the pipe
-/// buffer fills. That is a separate change, not a line to smuggle in here.
-fn cap_stream(raw: &[u8], cap: Option<usize>) -> (String, bool) {
-    let decoded = String::from_utf8_lossy(raw).to_string();
-    match cap {
-        Some(cap) => crate::output_cap::cap_tail(decoded, cap),
-        None => (decoded, false),
+/// Bytes rather than a `String` because the cap is enforced during the read, when
+/// a chunk boundary can land inside a multi-byte character and there is no whole
+/// string to decode yet. [`Self::into_string`] does the one decode, at the end,
+/// over a buffer that is bounded by construction.
+#[derive(Debug, Default)]
+struct CappedStream {
+    /// The kept tail. At most `cap` bytes once a cap is in force.
+    bytes: Vec<u8>,
+    /// Whether anything was dropped from the front to stay inside the cap.
+    truncated: bool,
+}
+
+impl CappedStream {
+    /// Appends `chunk`, dropping whole bytes off the *front* once `cap` is
+    /// exceeded.
+    ///
+    /// Tail, not head, for the reason [`crate::output_cap::cap_tail`] gives: a
+    /// failing command prints its diagnostic last. Front-dropping is what makes
+    /// this bounded in the first place — a head-keeping cap could stop reading,
+    /// but then the child blocks forever on a full pipe instead of running to
+    /// completion, which turns a noisy command into a timeout.
+    fn push(&mut self, chunk: &[u8], cap: Option<usize>) {
+        self.bytes.extend_from_slice(chunk);
+        let Some(cap) = cap else { return };
+        if self.bytes.len() <= cap {
+            return;
+        }
+        let overflow = self.bytes.len() - cap;
+        self.bytes.drain(..overflow);
+        self.truncated = true;
     }
+
+    /// Decodes the kept tail, prefixing the shared truncation marker if the front
+    /// was dropped.
+    ///
+    /// The leading continuation bytes are shed first, so a cut that landed inside
+    /// a character widens the kept region forward to the next boundary instead of
+    /// decoding to a replacement character. That is exactly what `cap_tail` did
+    /// when it worked on a whole `String`, and keeping the behaviour identical is
+    /// why it is done here rather than left to `from_utf8_lossy`.
+    fn into_string(mut self) -> (String, bool) {
+        if self.truncated {
+            let keep = self
+                .bytes
+                .iter()
+                .position(|byte| (byte & 0b1100_0000) != 0b1000_0000)
+                .unwrap_or(self.bytes.len());
+            self.bytes.drain(..keep);
+        }
+        let decoded = String::from_utf8_lossy(&self.bytes).to_string();
+        if self.truncated {
+            (
+                format!("{}{decoded}", crate::output_cap::TRUNCATION_MARKER),
+                true,
+            )
+        } else {
+            (decoded, false)
+        }
+    }
+}
+
+/// What a finished `run_shell` child produced, with both streams already bounded.
+struct ShellCapture {
+    status: std::process::ExitStatus,
+    stdout: CappedStream,
+    stderr: CappedStream,
+}
+
+/// Reads one pipe to EOF, keeping at most `cap` bytes of its tail.
+///
+/// Reading to EOF rather than stopping at the cap is the whole point: an
+/// early-returning reader leaves the child blocked on a full pipe buffer, so a
+/// command that merely printed too much would report a timeout instead of its
+/// exit code.
+async fn drain_capped<R>(mut reader: R, cap: Option<usize>) -> std::io::Result<CappedStream>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut stream = CappedStream::default();
+    // 8 KiB: larger than the 64 KiB pipe buffer would not help (the kernel hands
+    // over what it has), and smaller would just mean more syscalls.
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(stream);
+        }
+        stream.push(&chunk[..read], cap);
+    }
+}
+
+/// Waits for `child` while draining both of its pipes, holding each to `cap`.
+///
+/// This is the fix for the last unbounded buffer on the shell path.
+/// `wait_with_output` materialized *both* streams in full before any cap applied,
+/// so `sh -c 'cat /dev/urandom | base64'` had the whole 120-second timeout to grow
+/// the app's own heap — the returned string was capped, the heap behind it was
+/// not.
+///
+/// The three futures are joined rather than sequenced, and that is the part with a
+/// failure mode: reading stdout to EOF *before* touching stderr deadlocks a child
+/// with a chatty stderr as soon as the 64 KiB stderr pipe buffer fills, and
+/// waiting for exit before reading either deadlocks on the first full pipe.
+/// `try_join!` polls all three, which is the service `wait_with_output` performed
+/// and the reason it could not simply be dropped.
+///
+/// Cancellation safety is inherited rather than argued: the caller races this
+/// whole future in a `tokio::select!`, and dropping it drops the two pipe readers
+/// (closing the read ends) and stops the wait. The child itself is killed by the
+/// caller's process-group terminate, with `kill_on_drop` as the backstop — the
+/// same two mechanisms as before this change.
+async fn capture_bounded(
+    child: &mut tokio::process::Child,
+    stdout_pipe: tokio::process::ChildStdout,
+    stderr_pipe: tokio::process::ChildStderr,
+    cap: Option<usize>,
+) -> std::io::Result<ShellCapture> {
+    let (status, stdout, stderr) = tokio::try_join!(
+        child.wait(),
+        drain_capped(stdout_pipe, cap),
+        drain_capped(stderr_pipe, cap),
+    )?;
+    Ok(ShellCapture {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Save a short durable fact about the current project/user preferences to
@@ -1433,7 +1564,11 @@ mod shell_suspend_tests {
 
         signal_turn_shells(&state, "turn-a", true);
         std::thread::sleep(Duration::from_millis(100));
-        assert!(is_stopped(paused_pgid), "ps said {}", process_state(paused_pgid));
+        assert!(
+            is_stopped(paused_pgid),
+            "ps said {}",
+            process_state(paused_pgid)
+        );
         assert!(
             !is_stopped(running_pgid),
             "the other pane's command must keep running"
@@ -1456,13 +1591,11 @@ mod shell_suspend_tests {
         };
 
         forget_shell_process_group(&state, "turn-3", pgid);
-        assert!(
-            !state
-                .shell_process_groups
-                .lock()
-                .expect("lock")
-                .contains_key("turn-3")
-        );
+        assert!(!state
+            .shell_process_groups
+            .lock()
+            .expect("lock")
+            .contains_key("turn-3"));
         assert_eq!(signal_turn_shells(&state, "turn-3", false), 0);
     }
 
@@ -1479,21 +1612,17 @@ mod shell_suspend_tests {
         };
         forget_shell_process_group(&state, "turn-4", pgid);
 
-        assert!(
-            state
-                .shell_process_groups
-                .lock()
-                .expect("lock")
-                .contains_key("turn-4")
-        );
+        assert!(state
+            .shell_process_groups
+            .lock()
+            .expect("lock")
+            .contains_key("turn-4"));
         signal_turn_shells(&state, "turn-4", false);
-        assert!(
-            !state
-                .shell_process_groups
-                .lock()
-                .expect("lock")
-                .contains_key("turn-4")
-        );
+        assert!(!state
+            .shell_process_groups
+            .lock()
+            .expect("lock")
+            .contains_key("turn-4"));
     }
 }
 
@@ -1522,22 +1651,31 @@ mod tests {
         assert_eq!(super::stream_cap(Some(true)), None);
     }
 
+    /// Fed one byte at a time, which is the case the old whole-buffer cap never
+    /// had to survive: the cap now has to hold across arbitrary chunk boundaries
+    /// rather than being applied once to a finished string.
     #[test]
     fn a_capped_stream_keeps_its_tail_and_reports_that_it_was_cut() {
-        let raw = b"0123456789";
+        let feed = |cap: Option<usize>| {
+            let mut stream = super::CappedStream::default();
+            for byte in b"0123456789" {
+                stream.push(&[*byte], cap);
+            }
+            stream.into_string()
+        };
 
-        let (value, truncated) = super::cap_stream(raw, Some(4));
+        let (value, truncated) = feed(Some(4));
         assert!(truncated, "a cut stream must say so on the wire");
         assert!(
             value.ends_with("6789"),
             "the tail is what a failing command puts its diagnostic in, got {value:?}"
         );
 
-        let (value, truncated) = super::cap_stream(raw, Some(64));
+        let (value, truncated) = feed(Some(64));
         assert_eq!(value, "0123456789");
         assert!(!truncated, "output inside the cap is not truncated");
 
-        let (value, truncated) = super::cap_stream(raw, None);
+        let (value, truncated) = feed(None);
         assert_eq!(value, "0123456789");
         assert!(
             !truncated,
@@ -1545,16 +1683,142 @@ mod tests {
         );
     }
 
+    /// The bound is on the *buffer*, not just on the returned string — that
+    /// distinction is the whole reason this slice exists, so it is asserted
+    /// directly rather than inferred from the output.
+    #[test]
+    fn the_kept_buffer_never_grows_past_the_cap_however_much_arrives() {
+        const CAP: usize = 1_024;
+        let mut stream = super::CappedStream::default();
+        // 4 MiB through a 1 KiB ceiling, in chunks that do not divide it.
+        for _ in 0..4_096 {
+            stream.push(&[b'x'; 1_000], Some(CAP));
+            assert!(
+                stream.bytes.len() <= CAP,
+                "the buffer grew to {} bytes past a {CAP}-byte cap",
+                stream.bytes.len()
+            );
+        }
+        let (value, truncated) = stream.into_string();
+        assert!(truncated);
+        assert!(value.len() <= CAP + super::super::output_cap::TRUNCATION_MARKER.len());
+    }
+
     /// Command output is bytes, not text, and a stream cut mid-codepoint by the
     /// child itself must not lose the rest of the output.
     #[test]
     fn invalid_utf8_in_a_stream_is_replaced_rather_than_dropped() {
-        let (value, truncated) = super::cap_stream(&[b'o', b'k', 0xff, b'!'], Some(64));
+        let mut stream = super::CappedStream::default();
+        stream.push(&[b'o', b'k', 0xff, b'!'], Some(64));
+        let (value, truncated) = stream.into_string();
         assert!(!truncated);
         assert!(
             value.starts_with("ok") && value.ends_with('!'),
             "the surrounding bytes must survive a lossy decode, got {value:?}"
         );
+    }
+
+    /// A front-drop that lands inside a character widens forward to the next
+    /// boundary, exactly as the whole-string `cap_tail` did. Getting this wrong
+    /// shows up as a stray replacement character at the head of every truncated
+    /// stream, which is small enough to ship unnoticed.
+    #[test]
+    fn a_front_drop_inside_a_character_widens_to_the_next_boundary() {
+        // Four bytes each, so a cap of 5 cannot fall on a boundary.
+        let mut stream = super::CappedStream::default();
+        stream.push("🙈🙉🙊".as_bytes(), Some(5));
+        let (value, truncated) = stream.into_string();
+        assert!(truncated);
+        assert_eq!(
+            value,
+            format!("{}🙊", super::super::output_cap::TRUNCATION_MARKER),
+            "a split codepoint must be dropped whole, not decoded to U+FFFD"
+        );
+    }
+
+    /// The deadlock this change had to avoid, run for real.
+    ///
+    /// A child that fills stderr while stdout is still open wedges any reader
+    /// that drains one pipe to EOF before touching the other: the 64 KiB stderr
+    /// pipe buffer fills, the child blocks writing to it, and stdout never sees
+    /// EOF. Both streams here are far past that buffer, and both are past the
+    /// cap, so this also proves the bounded read still lets the child *finish*
+    /// rather than stopping early and hanging it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_floods_both_pipes_still_exits_and_is_held_to_the_cap() {
+        use std::process::Stdio;
+
+        const CAP: usize = 4_096;
+
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            // ~200 KiB down each pipe, interleaved, so neither can be drained
+            // to completion before the other is read.
+            .arg(
+                "i=0; while [ $i -lt 200 ]; do \
+                   printf 'o%.0s' $(seq 1 1024); \
+                   printf 'e%.0s' $(seq 1 1024) >&2; \
+                   i=$((i+1)); \
+                 done; exit 3",
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the flooding child");
+
+        let stdout_pipe = child.stdout.take().expect("stdout pipe");
+        let stderr_pipe = child.stderr.take().expect("stderr pipe");
+
+        let captured = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            super::capture_bounded(&mut child, stdout_pipe, stderr_pipe, Some(CAP)),
+        )
+        .await
+        .expect("draining both pipes concurrently must not deadlock")
+        .expect("the child ran to completion");
+
+        assert_eq!(
+            captured.status.code(),
+            Some(3),
+            "the child's own exit code must survive a truncated capture"
+        );
+        assert!(captured.stdout.bytes.len() <= CAP);
+        assert!(captured.stderr.bytes.len() <= CAP);
+
+        let (stdout, stdout_truncated) = captured.stdout.into_string();
+        let (stderr, stderr_truncated) = captured.stderr.into_string();
+        assert!(stdout_truncated && stderr_truncated);
+        assert!(stdout.ends_with('o'), "the tail is what is kept");
+        assert!(stderr.ends_with('e'), "the tail is what is kept");
+    }
+
+    /// The uncapped path still returns the whole document, because
+    /// `securityAutofix.ts` `JSON.parse`s it and a truncated tail there reads as
+    /// zero vulnerabilities.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_uncapped_path_still_returns_the_whole_stream() {
+        use std::process::Stdio;
+
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("printf 'x%.0s' $(seq 1 100000)")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let stdout_pipe = child.stdout.take().expect("stdout pipe");
+        let stderr_pipe = child.stderr.take().expect("stderr pipe");
+
+        let captured = super::capture_bounded(&mut child, stdout_pipe, stderr_pipe, None)
+            .await
+            .expect("the child ran");
+        let (stdout, truncated) = captured.stdout.into_string();
+        assert_eq!(stdout.len(), 100_000);
+        assert!(!truncated);
     }
 
     use super::*;
@@ -1590,9 +1854,11 @@ mod tests {
         assert!(crate::artifact_commands::decode_bounded("aGVsbG8=", 4, "image").is_err());
         // Encoded length rejected before any decode allocation.
         let oversized = "A".repeat(64);
-        assert!(crate::artifact_commands::decode_bounded(&oversized, 4, "image")
-            .unwrap_err()
-            .contains("Encoded image exceeds"));
+        assert!(
+            crate::artifact_commands::decode_bounded(&oversized, 4, "image")
+                .unwrap_err()
+                .contains("Encoded image exceeds")
+        );
         assert!(crate::artifact_commands::decode_bounded("not base64", 128, "image").is_err());
     }
 

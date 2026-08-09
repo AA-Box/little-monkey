@@ -1356,7 +1356,8 @@ finished and its platform half has been re-scoped rather than skipped.
 What is enforced today: kernel-held `setrlimit` bounds on all four app-side spawn
 sites, process-group termination on every timeout, a sampling watchdog over daemon
 jobs that measures memory across the whole process group, a per-kind declared limit
-set, a bounded cap on the shell output that reaches a model, a browser-session
+set, a bounded *read* of the shell output that reaches a model — the cap holds the
+app's own heap, not just the returned string — a browser-session
 watchdog, and a wall-clock budget mechanism for the four WebView kinds. A limit kill
 records as `limit_exceeded` rather than as an indistinguishable cancel, on every
 host.
@@ -1795,15 +1796,26 @@ for that rather than against it — it took owning `CreateProcessW` to get there
 - The four WebView kinds' wall budget is **enforced but unset** (see below): the
   mechanism fires for nobody until a number is configured, and choosing that number
   is blocked on a precondition, not on effort.
-- The foreground shell's **intermediate heap buffer** is still unbounded even
-  though its returned output is now capped (see below): `wait_with_output`
-  materializes both streams in full before any cap applies, so
-  `sh -c 'cat /dev/urandom | base64'` still gets the whole 120 s timeout to grow
-  the app's own heap. Bounding the read means draining both pipes concurrently
-  with the wait, which is the service `wait_with_output` performs today — get it
-  wrong and a chatty-stderr child deadlocks once the 64 KiB pipe buffer fills,
-  turning a working command into a timeout. Its own slice, not a line to smuggle
-  into the cap.
+- ~~The foreground shell's **intermediate heap buffer**~~ — **closed.** The cap is
+  now applied to the *read* rather than to the returned string. `wait_with_output`
+  materialized both streams in full before any cap applied, so
+  `sh -c 'cat /dev/urandom | base64'` had the whole 120 s timeout to grow the
+  app's own heap while the string it returned was dutifully capped.
+  `capture_bounded` replaces it: `try_join!` over `child.wait()` and one
+  `drain_capped` per pipe, each keeping a `CappedStream` tail of at most
+  `MODEL_OUTPUT_CAP` bytes and dropping off the front as more arrives. Both pipes
+  are still read **to EOF** — an early-returning reader would leave the child
+  blocked on a full pipe, turning a noisy command into a timeout, which is the
+  same failure the sequential version has from the other direction. The
+  chatty-stderr deadlock this bullet warned about is the test that guards it:
+  `a_child_that_floods_both_pipes_still_exits_and_is_held_to_the_cap` runs a real
+  child pushing ~200 KiB down each pipe interleaved, far past the 64 KiB buffer,
+  and asserts both the exit code and the ceiling. Front-dropping widens forward to
+  a UTF-8 boundary, so a split codepoint is dropped whole rather than decoded to
+  U+FFFD — the behaviour `cap_tail` had when it worked on a finished `String`.
+  `full_output` still returns the whole document, unbounded and deliberately so:
+  `securityAutofix.ts` `JSON.parse`s it, where a truncated tail reads as zero
+  vulnerabilities.
 - The browser worker's **pid is still not recorded**, so nothing outside the owning
   process can name its Chromium — a crash still leaves an orphan that a startup
   sweep can collect the profile of but never kill. `browser_worker.rs` also remains
