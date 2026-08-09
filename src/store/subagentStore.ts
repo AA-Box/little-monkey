@@ -31,6 +31,13 @@ export interface SubagentRun {
    * two concurrent turns' subagents, and cancelling by a collided key would
    * abort the wrong run. */
   cancelId: string;
+  /** Shared id linking the parallel `task` calls of one assistant round —
+   * `undefined` for a lone call. Generated per round by `agentLoop.ts` (a
+   * fresh UUID, never a tool-call id: provider-fallback ids like `call_0`
+   * repeat across rounds and would merge unrelated groups). The
+   * Background-tasks drawer groups same-`groupId` runs into one card, the
+   * panel counterpart of the chat's `SubagentGroupCard`. */
+  groupId?: string;
   description: string;
   profile: "explore" | "code";
   status: SubagentStatus;
@@ -74,7 +81,7 @@ interface SubagentStoreState {
   runs: Record<string, SubagentRun>;
   /** Registers a new run as `'running'` with an empty activity log — called
    * once by `runSubagentTask` right before it starts the child's loop. */
-  start: (params: { sessionId: string; taskId: string; cancelId: string; description: string; profile: "explore" | "code" }) => void;
+  start: (params: { sessionId: string; taskId: string; cancelId: string; groupId?: string; description: string; profile: "explore" | "code" }) => void;
   /** Updates `lastActivity` and bumps `toolCallCount` by one — called once
    * per child tool call `runSubagentTask` is about to execute. No-ops if
    * `taskId` was never `start`-ed (defensive; should not happen). */
@@ -103,11 +110,11 @@ interface SubagentStoreState {
 export const useSubagentStore = create<SubagentStoreState>((set) => ({
   runs: {},
 
-  start: ({ sessionId, taskId, cancelId, description, profile }) => {
+  start: ({ sessionId, taskId, cancelId, groupId, description, profile }) => {
     set((state) => ({
       runs: {
         ...state.runs,
-        [taskId]: { sessionId, taskId, cancelId, description, profile, status: "running", startedAt: Date.now(), lastActivity: "", toolCallCount: 0, usage: undefined, liveMessages: [] },
+        [taskId]: { sessionId, taskId, cancelId, groupId, description, profile, status: "running", startedAt: Date.now(), lastActivity: "", toolCallCount: 0, usage: undefined, liveMessages: [] },
       },
     }));
   },
