@@ -168,6 +168,7 @@ use crate::http_model_sources::{
     StaticLoadedLlamaSnapshot,
 };
 use crate::http_policy::constant_time_eq;
+use crate::http_policy::MAX_REQUEST_BODY_BYTES;
 use crate::http_policy::{
     hold_admission_until_response_ends, BoxError, CappedBodyRejection, ResponseBody,
 };
@@ -201,18 +202,6 @@ const TOKEN_PREFIX: &str = "lmk-";
 /// Filename for the persisted server config under the app data directory —
 /// same file-per-feature pattern as `providers.json`/`web_settings.json`.
 const CONFIG_FILE: &str = "api_server.json";
-
-/// Hard cap on a request body this server will buffer into memory, enforced
-/// by [`read_capped_body`] as it streams frames in (never after the fact —
-/// buffering the whole thing first and checking the length would defeat the
-/// point). Chat-completion payloads can legitimately run to several MB
-/// (inline base64 image content for multimodal messages), so this is set
-/// generously rather than to a tight "small JSON payload" bound — it exists
-/// only to put a ceiling on a malicious or mistaken caller's memory impact,
-/// the same "streamed cap regardless of what Content-Length claims" stance
-/// `web.rs::MAX_BODY_BYTES` takes for fetched page bodies (see the
-/// security-review finding this addresses).
-const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// Slow or idle peers consume a connection task before they present a request
 /// that can enter [`RequestAdmission`]. Keep that earlier resource bounded as
@@ -1073,8 +1062,28 @@ pub struct ServerDeps {
 pub struct ServerRequest {
     pub method: Method,
     pub path: String,
+    /// The raw query string, without the `?`.
+    ///
+    /// Carried separately from `path` because every routing decision in this
+    /// tree is made on the path alone — `classify_request` and
+    /// `DENIED_SURFACES` both match path literals, and folding a query into
+    /// that string would let `?x=/v1/agent` near-miss a denial matcher. Only
+    /// `/v1/conformance` reads it (K21).
+    pub query: Option<String>,
     pub headers: HeaderMap,
     pub body: Bytes,
+}
+
+/// One query parameter's raw value, or `None`.
+///
+/// Hand-parsed rather than pulling in a form decoder: the one caller reads a
+/// single integer, and percent-decoding a value nobody percent-encodes would
+/// be ceremony.
+fn query_param<'query>(query: Option<&'query str>, name: &str) -> Option<&'query str> {
+    query?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then_some(value)
+    })
 }
 
 use crate::http_policy::{full_body, json_response};
@@ -1110,6 +1119,74 @@ fn health_response() -> Response<ResponseBody> {
 
 fn not_found_response() -> Response<ResponseBody> {
     error_response(StatusCode::NOT_FOUND, "Not Found", "not_found")
+}
+
+/// `GET /v1/conformance` — what this node claims to implement, and the live
+/// evidence a conformance run checks the claim against (roadmap K21).
+///
+/// # Why a read of this route is recorded in the subsystem stream
+///
+/// `http_action_worth_recording` filters `GET /v1/models` out as discovery,
+/// and this is a read too — so the filter's reasoning looks like it should
+/// apply. It does not, for two reasons. Asking a node to vouch for itself *is*
+/// an act worth an audit row: it is the request that precedes a compatibility
+/// claim being made about this machine. And the suite's append-only check
+/// needs one action it can perform against any node, including one with no
+/// model loaded; this is that action. Recording it is not an oversight, and a
+/// future filter line here would silently disable
+/// `ledger.append_only`.
+///
+/// # A ledger that cannot be read is not a node without a ledger
+///
+/// A read failure answers 503 rather than publishing `ledger: null`. The null
+/// means "this listener has no ledger behind it", which a conformance run
+/// reports as an honestly-skipped optional section; letting an unreadable
+/// database wear that same shape would turn a broken node into a compliant
+/// one.
+fn handle_conformance_attestation(
+    deps: &ServerDeps,
+    query: Option<&str>,
+) -> Response<ResponseBody> {
+    let after =
+        query_param(query, crate::conformance::LEDGER_AFTER_PARAM).map_or(Ok(0), str::parse::<u64>);
+    let Ok(after) = after else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "'{}' must be a non-negative integer sequence.",
+                crate::conformance::LEDGER_AFTER_PARAM
+            ),
+            "invalid_request_error",
+        );
+    };
+
+    let ledger = match deps
+        .audit
+        .chain_evidence(after, crate::conformance::MAX_LEDGER_LINKS)
+    {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("The event ledger could not be read: {error}"),
+                "ledger_unreadable",
+            )
+        }
+    };
+
+    let attestation =
+        crate::conformance::build_attestation(crate::conformance::AttestationInputs {
+            authentication_required: deps.require_token,
+            ledger,
+        });
+    match serde_json::to_value(&attestation) {
+        Ok(value) => json_response(StatusCode::OK, value),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("The conformance attestation could not be encoded: {error}"),
+            "attestation_encode_failed",
+        ),
+    }
 }
 
 /// A bare `204` with the CORS headers a preflight `OPTIONS /v1/*` needs —
@@ -2214,6 +2291,7 @@ pub async fn handle_request(
     let ServerRequest {
         method,
         path,
+        query,
         headers,
         body,
     } = req;
@@ -2252,6 +2330,9 @@ pub async fn handle_request(
     let matched_token_id = authed.as_ref().map(|a| a.id.clone());
 
     let response = match (&method, path.as_str()) {
+        (&Method::GET, crate::conformance::ATTESTATION_PATH) => {
+            handle_conformance_attestation(deps, query.as_deref())
+        }
         (&Method::GET, "/v1/models") => handle_models(deps, authed.as_ref()).await,
         (&Method::POST, "/v1/chat/completions") => {
             handle_chat_completions(deps, authed.as_ref(), &headers, body).await
@@ -2688,6 +2769,7 @@ where
 {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let query = req.uri().query().map(str::to_string);
     let headers = req.headers().clone();
     let auth_family = if primary_routes {
         classify_bearer_family(
@@ -2851,6 +2933,7 @@ where
         ServerRequest {
             method,
             path,
+            query,
             headers,
             body,
         },
@@ -5444,6 +5527,7 @@ mod tests {
         ServerRequest {
             method: Method::GET,
             path: path.to_string(),
+            query: None,
             headers: HeaderMap::new(),
             body: Bytes::new(),
         }
@@ -5453,6 +5537,7 @@ mod tests {
         ServerRequest {
             method: Method::POST,
             path: path.to_string(),
+            query: None,
             headers: HeaderMap::new(),
             body: Bytes::from(body.to_string()),
         }
@@ -6095,6 +6180,7 @@ mod tests {
         let req = ServerRequest {
             method: Method::OPTIONS,
             path: "/v1/chat/completions".to_string(),
+            query: None,
             headers: HeaderMap::new(),
             body: Bytes::new(),
         };

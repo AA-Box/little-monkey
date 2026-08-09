@@ -235,7 +235,7 @@ enum Compatibility {
 /// A tagged union rather than a `bool` plus fields, so a caller cannot read
 /// `covered_from` off a broken chain and present it as a verified range — the
 /// same reason the resource ledger's panel renders a tagged union.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum ChainVerification {
     Intact {
@@ -1882,6 +1882,49 @@ impl RunLedger {
             )?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter().map(decode_subsystem_event).collect()
+    }
+
+    /// The newest link in the subsystem chain, hashes included.
+    ///
+    /// `recent_subsystem_events` deliberately does not return hashes — the
+    /// panel that reads it shows what happened, not what vouches for it. The
+    /// K21 conformance suite needs the opposite: only the linkage, never the
+    /// contents, because a hash is safe to hand a caller and a `detail_json`
+    /// holding the user's own text is not.
+    pub fn subsystem_chain_head(&self) -> LedgerResult<Option<ChainLink>> {
+        self.connection
+            .query_row(
+                "SELECT sequence, event_hash, prev_event_hash
+                 FROM subsystem_events ORDER BY sequence DESC LIMIT 1",
+                [],
+                chain_link_columns,
+            )
+            .optional()?
+            .map(decode_chain_link)
+            .transpose()
+    }
+
+    /// Chain links after `after_sequence`, oldest first.
+    ///
+    /// A caller that saw an earlier head can ask for what followed it and
+    /// recompute the linkage itself: the first returned link's
+    /// `previous_hash` must equal the head it remembers, or the log was
+    /// rewritten between the two reads.
+    pub fn subsystem_chain_links(
+        &self,
+        after_sequence: u64,
+        limit: u32,
+    ) -> LedgerResult<Vec<ChainLink>> {
+        let after = to_sql_i64(after_sequence, "after_sequence")?;
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, event_hash, prev_event_hash
+             FROM subsystem_events WHERE sequence > ?1
+             ORDER BY sequence ASC LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![after, limit], chain_link_columns)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(decode_chain_link).collect()
     }
 
     pub fn applied_migrations(&self) -> LedgerResult<Vec<i64>> {
@@ -4457,6 +4500,39 @@ fn parse_run_status(value: &str) -> LedgerResult<RunStatus> {
             "unknown run status '{other}'"
         ))),
     }
+}
+
+/// One link of the subsystem chain: the sequence and the two hashes, and
+/// deliberately nothing else. See [`RunLedger::subsystem_chain_head`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainLink {
+    pub sequence: u64,
+    pub event_hash: String,
+    /// `None` only for the very first event in the stream.
+    pub previous_hash: Option<String>,
+}
+
+struct ChainLinkRow {
+    sequence: i64,
+    event_hash: String,
+    previous_hash: Option<String>,
+}
+
+fn chain_link_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChainLinkRow> {
+    Ok(ChainLinkRow {
+        sequence: row.get(0)?,
+        event_hash: row.get(1)?,
+        previous_hash: row.get(2)?,
+    })
+}
+
+fn decode_chain_link(row: ChainLinkRow) -> LedgerResult<ChainLink> {
+    Ok(ChainLink {
+        sequence: from_sql_u64(row.sequence, "sequence")?,
+        event_hash: row.event_hash,
+        previous_hash: row.previous_hash,
+    })
 }
 
 /// A `subsystem_events` row as SQLite hands it over, for the reason

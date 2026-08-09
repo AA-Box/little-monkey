@@ -4,6 +4,7 @@ import { StatusPill, type PillTone } from "../../ui";
 import type { M3CompatibilityMatrixRow, M3CompatibilityStatus } from "../../../lib/runtimeHubClient";
 import { useRuntimeHubStore } from "../../../store/runtimeHubStore";
 import { BusyButton, ErrorNotice, SectionHeading, labelize } from "./RuntimeHubShared";
+import { RuntimeHubConformance } from "./RuntimeHubConformance";
 
 const STATUS_TONE: Record<M3CompatibilityStatus, PillTone> = {
   pass: "success",
@@ -106,6 +107,8 @@ export function RuntimeHubCompatibilityMatrix() {
           </div>
         </section>
       ))}
+
+      <RuntimeHubConformance />
     </div>
   );
 }
