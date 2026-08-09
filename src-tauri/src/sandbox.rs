@@ -67,6 +67,42 @@ const MAX_ARTIFACT_BYTES_BUDGET: u64 = 128 * 1024 * 1024;
 const MAX_EVENT_TEXT_EXCERPT: usize = 4_096;
 const PROMOTE_PREVIEW_TTL_MS: u64 = 5 * 60 * 1_000;
 const MAX_PROMOTE_FILES: usize = 500;
+/// `fs::canonicalize` without the `\\?\` prefix Windows puts on the front.
+///
+/// Every path this module resolves ends up somewhere a child process has to
+/// use — its working directory, its `HOME`, its `TMP`, the arguments in its
+/// command line — and **cmd.exe cannot use a verbatim path**. It does not fail
+/// loudly either: given one as a working directory it prints "UNC paths are not
+/// supported. Defaulting to Windows directory." on stderr and runs anyway, in
+/// `C:\Windows`. So a sandboxed run would execute with the wrong cwd and a HOME
+/// it cannot write, and the only evidence would be a line on stderr nobody
+/// reads.
+///
+/// Canonicalization itself is still wanted — it is what makes the
+/// `starts_with(&sandbox_root)` containment checks below sound. Only the prefix
+/// goes.
+///
+/// A no-op on macOS and Linux, where canonical paths have no such prefix.
+fn plain_canonical(path: &Path) -> io::Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(canonical)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let text = canonical.to_string_lossy();
+        // Only the plain disk form. A true UNC share canonicalizes to
+        // `\\?\UNC\server\share`, and stripping to `UNC\server\share` would
+        // name a relative path that does not exist — left alone so it fails
+        // where it is used rather than silently pointing somewhere else.
+        match text.strip_prefix(r"\\?\") {
+            Some(rest) if !rest.starts_with("UNC\\") => Ok(PathBuf::from(rest)),
+            _ => Ok(canonical),
+        }
+    }
+}
+
 const SANDBOX_HOME_DIR: &str = "home";
 const SANDBOX_TMP_DIR: &str = "tmp";
 
@@ -935,9 +971,9 @@ pub async fn execute_in_sandbox(
     allow_network: bool,
     approved_env: &[String],
 ) -> io::Result<SandboxExecOutcome> {
-    let sandbox_root = fs::canonicalize(sandbox_root)?;
-    let workspace_dir = fs::canonicalize(workspace_dir)?;
-    let real_workspace_root = fs::canonicalize(real_workspace_root)?;
+    let sandbox_root = plain_canonical(sandbox_root)?;
+    let workspace_dir = plain_canonical(workspace_dir)?;
+    let real_workspace_root = plain_canonical(real_workspace_root)?;
     if !workspace_dir.starts_with(&sandbox_root) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2638,11 +2674,15 @@ mod tests {
         write(&allowed_file, "sandbox-visible");
         write(&forbidden_file, "must-stay-secret");
 
-        let canonical_sandbox = fs::canonicalize(&sandbox_root).expect("canonical sandbox");
+        // `plain_canonical`, not `fs::canonicalize`: the child is handed the
+        // prefix-free form, so comparing against the verbatim one would assert a
+        // path nothing uses. Using the product's own resolver is also what makes
+        // this test fail if that resolver ever stops stripping.
+        let canonical_sandbox = plain_canonical(&sandbox_root).expect("canonical sandbox");
         let canonical_workspace =
-            fs::canonicalize(&workspace_dir).expect("canonical sandbox workspace");
+            plain_canonical(&workspace_dir).expect("canonical sandbox workspace");
         let canonical_forbidden =
-            fs::canonicalize(&forbidden_file).expect("canonical forbidden file");
+            plain_canonical(&forbidden_file).expect("canonical forbidden file");
         let expected_home = canonical_sandbox.join(SANDBOX_HOME_DIR);
         let expected_tmp = canonical_sandbox.join(SANDBOX_TMP_DIR);
         let command = format!(
@@ -2818,17 +2858,6 @@ mod tests {
         let expected_home = canonical_sandbox.join(SANDBOX_HOME_DIR);
         let expected_tmp = canonical_sandbox.join(SANDBOX_TMP_DIR);
 
-        // `fs::canonicalize` returns a verbatim `\\?\` path on Windows, and
-        // `cmd.exe` cannot use one: it treats the prefix as part of the filename,
-        // so every redirect and `type` against it fails. The other two platforms
-        // hand their canonical paths straight to `sh` because POSIX has no such
-        // form. Stripped only for the strings the shell sees — the assertions
-        // below still compare the canonical paths Rust produced.
-        fn plain(path: &Path) -> String {
-            let text = path.display().to_string();
-            text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
-        }
-
         // One line, `&`-separated: `cmd /C` takes the remainder of the command
         // line verbatim and has no `set -eu`, so every step carries its own
         // `exit /b`. The two deny codes match the `sh` version's on purpose — 71
@@ -2854,10 +2883,10 @@ mod tests {
              & (echo home-ok> \"%USERPROFILE%\\probe\" || exit /b 74) \
              & (echo tmp-ok> \"%TMP%\\probe\" || exit /b 75) \
              & exit /b 0",
-            home = plain(&expected_home),
-            tmp = plain(&expected_tmp),
-            allowed = plain(&canonical_workspace.join("allowed.txt")),
-            forbidden = plain(&canonical_forbidden),
+            home = expected_home.display(),
+            tmp = expected_tmp.display(),
+            allowed = canonical_workspace.join("allowed.txt").display(),
+            forbidden = canonical_forbidden.display(),
         );
 
         for allow_network in [false, true] {
