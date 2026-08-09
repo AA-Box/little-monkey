@@ -62,7 +62,7 @@
     "@types/react-syntax-highlighter": "^15.5.13",
     "@types/sql.js": "^1.4.11",
     "@vitejs/plugin-react": "^4.6.0",
-    "jsdom": "^30.0.1",
+    "jsdom": "^26.1.0",
     "tailwindcss": "^4.3.2",
     "tauri-liquid-icon": "^1.1.0",
     "typescript": "~5.8.3",
