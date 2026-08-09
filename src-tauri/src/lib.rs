@@ -46,6 +46,7 @@ pub mod runtime_adapter;
 // stable-diffusion.cpp runtime. Tauri-free so the CLI can share it.
 pub mod generation;
 mod generation_commands;
+pub mod studio_tools;
 // The two generation backends the app talks to but never ships: a ComfyUI the
 // user installed, and hosted OpenAI-compatible image APIs. HTTP only.
 mod generation_remote;
@@ -401,6 +402,10 @@ pub struct AppState {
     /// weight set is bound at launch, so switching models restarts it; see
     /// `generation::GenerationEngineState`.
     pub generation_engine: generation::GenerationEngineState,
+    /// The one running Studio tool sidecar — a face swapper, a detector, a
+    /// segmenter. Not diffusion and not the engine: a separate program
+    /// speaking `studio_tools`' small HTTP contract.
+    pub studio_tool: studio_tools::StudioToolState,
     pub llama: std::sync::Mutex<llama::LlamaState>,
     /// The second, embeddings-only managed `llama-server` instance (port
     /// 8091, started with `--embeddings --pooling mean`) used by
@@ -675,6 +680,7 @@ impl Default for AppState {
     fn default() -> Self {
         AppState {
             generation_engine: Default::default(),
+            studio_tool: Default::default(),
             llama: Default::default(),
             embed_llama: std::sync::Mutex::new(llama::LlamaState::for_embeddings()),
             ollama: Default::default(),
@@ -1519,6 +1525,14 @@ pub fn run() {
             generation_commands::generation_media_data_url,
             generation_commands::generation_capabilities,
             generation_commands::generation_unload_engine,
+            generation_commands::studio_tools,
+            generation_commands::studio_tool_add,
+            generation_commands::studio_tool_remove,
+            generation_commands::studio_tool_manifest,
+            generation_commands::studio_tool_run,
+            generation_commands::studio_tool_stop,
+            generation_commands::studio_tools_running,
+            generation_commands::studio_tool_import_catalog,
             m7_companion::m7_image_generate,
             m7_companion::m7_image_gallery,
             m7_companion::m7_image_data_url,
