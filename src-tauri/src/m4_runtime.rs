@@ -50,7 +50,12 @@ use crate::workflow_core::{
 };
 
 const OAUTH_VAULT_ID: &str = "os-keychain";
-const OAUTH_KEYCHAIN_SERVICE: &str = "com.littlemonkey.m4-oauth";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static OAUTH_KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.m4-oauth"));
 const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
 const UI_APPROVAL_TTL_MS: u64 = 10 * 60 * 1_000;
 const WORKFLOW_APPROVAL_TTL_MS: u64 = 30 * 60 * 1_000;
@@ -244,7 +249,7 @@ pub struct KeychainOAuthVault;
 
 impl KeychainOAuthVault {
     fn entry(reference_id: &str) -> Result<keyring::Entry, String> {
-        keyring::Entry::new(OAUTH_KEYCHAIN_SERVICE, reference_id)
+        keyring::Entry::new(&OAUTH_KEYCHAIN_SERVICE, reference_id)
             .map_err(|e| format!("open OAuth keychain entry: {e}"))
     }
 

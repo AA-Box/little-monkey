@@ -16,6 +16,7 @@ use crate::run_protocol::{
     RunEventEnvelope, RunSpec, RunStatus, RUN_PROTOCOL_SCHEMA_VERSION,
 };
 use crate::AppState;
+use crate::profiles::ProfileScopedPaths;
 
 pub const RUNS_CHANGED_EVENT: &str = "runs://changed";
 pub const RUN_CANCELLATION_REQUESTED_EVENT: &str = "runs://cancellation-requested";
@@ -137,8 +138,7 @@ pub(crate) fn desktop_identity<R: tauri::Runtime>(
 /// than for the ledger alone. See `test_support`'s module docs.
 fn open_ledger<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<RunLedger, String> {
     let data_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data dir: {error}"))?;
 
     std::fs::create_dir_all(&data_dir)
@@ -913,8 +913,7 @@ mod tests {
         let app = crate::test_support::mock_app();
         let handle = app.handle().clone();
         let dir = handle
-            .path()
-            .app_data_dir()
+            .profile_data_dir()
             .expect("mock app resolves an app data dir");
 
         assert!(
@@ -940,7 +939,7 @@ mod tests {
         let other_state = AppState::default();
         with_ledger(other.handle(), &other_state, |_| Ok(())).expect("opening a second ledger");
         assert_ne!(
-            other.path().app_data_dir().expect("an app data dir"),
+            other.profile_data_dir().expect("an app data dir"),
             dir,
             "two mock apps shared one ledger"
         );

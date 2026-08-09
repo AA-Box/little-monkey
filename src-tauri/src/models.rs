@@ -8,12 +8,13 @@
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncWriteExt;
 
 use crate::model_sources::{self, ManagedModelProvenance};
 use crate::permissions;
 use crate::AppState;
+use crate::profiles::ProfileScopedPaths;
 
 /// Whether a `ModelInfo` is a chat (tool-calling instruct) model or an
 /// embedding model — added for the RAG/Knowledge Stacks feature so
@@ -164,8 +165,7 @@ pub fn curated_models() -> Vec<ModelInfo> {
 /// Resolves (and creates, if missing) `<app_data_dir>/models`.
 pub(crate) fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     let dir = base.join("models");
     if !dir.exists() {
@@ -339,8 +339,7 @@ struct ExternalModelEntry {
 /// app data directory if needed.
 fn external_registry_path(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     if !base.exists() {
         std::fs::create_dir_all(&base).map_err(|e| {

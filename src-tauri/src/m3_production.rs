@@ -87,7 +87,12 @@ const LLAMA_ENDPOINT: &str = "http://127.0.0.1:8090";
 const LLAMA_PORT: u16 = 8_090;
 const MAX_INFERENCE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_INFERENCE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-const KEYCHAIN_SERVICE: &str = "com.littlemonkey.m3-lan";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.m3-lan"));
 const KEYCHAIN_ACCOUNT: &str = "lan-state-hmac-v1";
 #[cfg(target_os = "macos")]
 const MLX_RELEASE_KEY_ID: &str = "release-2026-1";
@@ -960,7 +965,7 @@ pub struct KeychainLanStateProtector {
 
 impl KeychainLanStateProtector {
     pub fn load_or_create() -> M3HubResult<Self> {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+        let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
             .map_err(|error| M3HubError::State(format!("access M3 LAN keychain: {error}")))?;
         let key_bytes = match entry.get_password() {
             Ok(encoded) => base64::engine::general_purpose::STANDARD

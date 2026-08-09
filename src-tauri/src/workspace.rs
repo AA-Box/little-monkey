@@ -18,9 +18,9 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::MutexGuard;
 
-use tauri::Manager;
 
 use crate::{permissions, AppState};
+use crate::profiles::ProfileScopedPaths;
 
 /// One attached folder. `id` is the canonicalized path string — stable and
 /// unique for as long as the folder stays attached.
@@ -477,8 +477,7 @@ pub fn get_workspace_roots(
 
 fn app_data_file(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
     let dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {}", e))?;
     Ok(dir.join(name))

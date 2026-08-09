@@ -48,7 +48,12 @@ use crate::AppState;
 /// Same keychain service every credential in this app lives under (see
 /// `mcp_oauth.rs`/`mcp.rs`/`providers.rs`) — entries are disambiguated by
 /// *account*, not service.
-const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.app"));
 
 /// Public client ids — not secret, visible in every authorize URL a browser
 /// ever sends anyway. Only the matching `client_secret`s (held by the
@@ -113,7 +118,7 @@ struct StoredHostedCredentials {
 }
 
 fn load_credentials(server_id: &str) -> Result<Option<StoredHostedCredentials>, String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(server_id))
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     match entry.get_password() {
         Ok(json) => serde_json::from_str(&json)
@@ -125,7 +130,7 @@ fn load_credentials(server_id: &str) -> Result<Option<StoredHostedCredentials>, 
 }
 
 fn save_credentials(server_id: &str, credentials: &StoredHostedCredentials) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(server_id))
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     let json = serde_json::to_string(credentials)
         .map_err(|e| format!("Failed to serialize hosted-OAuth credentials: {e}"))?;
@@ -140,7 +145,7 @@ fn save_credentials(server_id: &str, credentials: &StoredHostedCredentials) -> R
 /// server id only ever uses one flow, but the check itself doesn't know
 /// which without trying both).
 pub fn has_oauth_credentials(server_id: &str) -> bool {
-    keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+    keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(server_id))
         .ok()
         .and_then(|e| e.get_password().ok())
         .is_some()
@@ -149,7 +154,7 @@ pub fn has_oauth_credentials(server_id: &str) -> bool {
 /// Clears server `id`'s saved hosted-OAuth credentials. A no-op success if
 /// none were saved.
 pub fn remove_oauth_credentials(server_id: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(server_id))
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     match entry.delete_credential() {
         Ok(()) => Ok(()),

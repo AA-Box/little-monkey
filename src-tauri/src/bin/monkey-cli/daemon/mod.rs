@@ -2126,6 +2126,23 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
     let mut shared = SharedLedger::open(&paths.ledger_db)?;
     reconcile_reserved_deliveries(&mut store, &mut shared)?;
     let owner_id = format!("daemon-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+    // The identity this daemon serves (K23). Its quota bounds what this profile
+    // may run at once, and its weight bounds the share of the machine it may
+    // claim when another profile's daemon is also running — the two identities
+    // have separate queues, so hardware is the only thing they contend for and
+    // the only place a cross-profile share can be enforced.
+    let profile_limits = match little_monkey_lib::app_paths::base_data_dir()
+        .ok_or_else(|| "Could not resolve the app data directory".to_string())
+        .and_then(|base| {
+            little_monkey_lib::profiles::ProfileLimits::for_active(&base)
+                .map_err(|error| error.to_string())
+        }) {
+        Ok(limits) => limits,
+        Err(error) => {
+            eprintln!("monkey daemon: running without profile limits: {error}");
+            little_monkey_lib::profiles::ProfileLimits::unbounded()
+        }
+    };
     let mut engine = DaemonEngine::new(
         store,
         shared,
@@ -2135,7 +2152,8 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
         OsNotificationAdapter,
         SystemClock,
         owner_id,
-    );
+    )
+    .with_profile_limits(profile_limits);
     engine.recover()?;
     reap_dead_workflow_hosts(&engine.shared);
     // One machine-wide desktop-control runtime, shared with the remote API so

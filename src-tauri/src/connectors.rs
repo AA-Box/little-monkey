@@ -61,7 +61,12 @@ use crate::AppState;
 /// disambiguated by *account* name, not service, so this module's
 /// `connector:<provider>:<id>` account prefix (see [`keychain_account`]) is
 /// what keeps every feature's keychain entries apart within one namespace.
-const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.app"));
 
 const CONFIG_FILE: &str = "connectors.json";
 const SCHEMA_VERSION: u8 = 1;
@@ -695,7 +700,7 @@ pub(crate) fn read_credential(account: &ConnectorAccount) -> Result<String, Stri
         .credential_ref
         .as_deref()
         .ok_or_else(|| format!("Connector '{}' has no stored credential", account.id))?;
-    keyring::Entry::new(KEYCHAIN_SERVICE, credential_ref)
+    keyring::Entry::new(&KEYCHAIN_SERVICE, credential_ref)
         .map_err(|e| format!("Failed to access keychain: {e}"))?
         .get_password()
         .map_err(|e| format!("Failed to read saved credential: {e}"))
@@ -895,7 +900,7 @@ async fn add_token_impl(
 
     let id = uuid::Uuid::new_v4().to_string();
     let credential_ref = keychain_account(provider, &id);
-    let keychain_entry = keyring::Entry::new(KEYCHAIN_SERVICE, &credential_ref)
+    let keychain_entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &credential_ref)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     keychain_entry
         .set_password(&token)
@@ -980,7 +985,7 @@ async fn add_s3_impl(
 
     let id = uuid::Uuid::new_v4().to_string();
     let credential_ref = keychain_account(ConnectorProvider::S3, &id);
-    let keychain_entry = keyring::Entry::new(KEYCHAIN_SERVICE, &credential_ref)
+    let keychain_entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &credential_ref)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     keychain_entry
         .set_password(&secret_key)
@@ -1065,7 +1070,7 @@ fn remove_impl(state: &AppState, path: &Path, id: &str) -> Result<(), String> {
     // the `NoEntry` no-op path — never fails the removal itself over
     // keychain cleanup.
     if let Some(credential_ref) = removed_credential_ref {
-        let _ = keyring::Entry::new(KEYCHAIN_SERVICE, &credential_ref)
+        let _ = keyring::Entry::new(&KEYCHAIN_SERVICE, &credential_ref)
             .and_then(|entry| entry.delete_credential());
     }
     Ok(())
@@ -1533,7 +1538,7 @@ mod tests {
         let state = AppState::default();
         let id = format!("test-{}", uuid::Uuid::new_v4());
         let credential_ref = keychain_account(ConnectorProvider::Slack, &id);
-        keyring::Entry::new(KEYCHAIN_SERVICE, &credential_ref)
+        keyring::Entry::new(&KEYCHAIN_SERVICE, &credential_ref)
             .unwrap()
             .set_password("test-secret")
             .unwrap();
@@ -1562,7 +1567,7 @@ mod tests {
         remove_impl(&state, &path, &id).unwrap();
 
         assert!(load_config_impl(&path).unwrap().accounts.is_empty());
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &credential_ref).unwrap();
+        let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &credential_ref).unwrap();
         match entry.get_password() {
             Ok(_) => panic!("expected the keychain secret to be deleted alongside the catalog entry"),
             Err(keyring::Error::NoEntry) => {}

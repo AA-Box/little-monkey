@@ -30,10 +30,11 @@
 
 use std::path::{Path, PathBuf};
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
 use crate::recipes::Recipe;
 use crate::AppState;
+use crate::profiles::ProfileScopedPaths;
 
 const CONFIG_FILE: &str = "local_apps.json";
 const APPS_DIR: &str = "local_apps";
@@ -147,8 +148,7 @@ pub fn is_valid_app_id(id: &str) -> bool {
 
 pub fn config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     if !base.exists() {
         std::fs::create_dir_all(&base)
@@ -342,8 +342,7 @@ pub fn publish_impl(
     param_bindings: std::collections::HashMap<String, String>,
 ) -> Result<LocalAppDefinition, String> {
     let app_data_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     let workspace_root = crate::workspace::primary_root_canon(state).ok();
     let (recipe, _path) = crate::recipes::resolve_recipe_with_path(
@@ -465,8 +464,7 @@ pub fn unpublish_impl(app: &AppHandle, state: &AppState, id: &str) -> Result<(),
 
     if is_valid_app_id(id) {
         let app_data_dir = app
-            .path()
-            .app_data_dir()
+            .profile_data_dir()
             .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
         let _ = std::fs::remove_dir_all(app_dir(&app_data_dir, id));
     }

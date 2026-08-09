@@ -47,7 +47,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::Manager;
 
 use crate::run_protocol::{
     ArtifactKind, CapabilityAssessment, CapabilityState, CheckpointKind, ClientIdentity,
@@ -56,6 +55,7 @@ use crate::run_protocol::{
     ToolPolicyDecision, UsageSnapshot, WorkspaceContext, RUN_PROTOCOL_SCHEMA_VERSION,
 };
 use crate::{permissions, workspace, AppState};
+use crate::profiles::ProfileScopedPaths;
 
 const SANDBOX_RUNS_DIR: &str = "sandbox-runs";
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
@@ -1318,8 +1318,7 @@ fn build_sandbox_run_spec(
 
 fn sandbox_run_dir(app: &tauri::AppHandle, run_id: &str) -> Result<PathBuf, String> {
     let data_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data dir: {error}"))?;
     Ok(data_dir.join(SANDBOX_RUNS_DIR).join(run_id))
 }
