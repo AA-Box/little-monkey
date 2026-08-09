@@ -668,6 +668,21 @@ const APP_CONTAINER_OVERWRITTEN_ENV_KEYS: &[&str] = &["TMP", "TEMP"];
 /// of the value, and it makes a path containing `&` literal instead of a command
 /// separator.
 ///
+/// # What this reaches, and the one thing it cannot
+///
+/// Every process the command starts reads the corrected value, because it is in
+/// the environment they inherit — which is what a sandboxed run is for, and what
+/// `a_confined_run_gets_the_sandbox_temp_directory_not_the_containers` asserts
+/// through `set TMP` rather than `%TMP%`.
+///
+/// A literal `%TMP%` written *in the caller's own command* is not corrected, and
+/// cannot be from here: cmd expands a command line once, when it parses it, so
+/// every `%TMP%` on the line was already substituted before this `set` ran.
+/// Reaching that too would mean running the caller's command from a batch file,
+/// which changes `exit /b`, `%0` and argument handling for every command the app
+/// runs — a worse trade than a documented narrowing. So a test that needs the
+/// sandbox temp directory should name it in full rather than ask cmd for it.
+///
 /// Applied whether or not a container is present. A job-only run is not rewritten
 /// and does not need this, but re-asserting a value it already has is a no-op —
 /// cheaper than a second command-line shape that only one of the two paths ever
