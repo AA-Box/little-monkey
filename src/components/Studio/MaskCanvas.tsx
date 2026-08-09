@@ -356,7 +356,12 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
             onChange={(event) => setBrush(Number(event.target.value))}
             className="min-w-0 flex-1"
           />
-          <span className="w-7 shrink-0 text-right font-mono text-[11px] text-faint">{brush}</span>
+          {/* Fixed at `3ch` — the widest value in a monospace font — so the
+              slider keeps its width as the number grows rather than resizing
+              under the cursor mid-drag. Aligned left, because right-aligning it
+              put that spare width between the slider and the digits, which read
+              as a wider gap there than the one before the slider. */}
+          <span className="w-[3ch] shrink-0 font-mono text-[11px] text-faint">{brush}</span>
         </label>
       </div>
       <p className="text-[11px] text-faint">
