@@ -1138,7 +1138,7 @@ only a stop. What K8 still needs from elsewhere is the reservation question
 above — a suspended process holds its resident model slot, worktree lease and
 workspace root — which is a K7/K8 decision, not a signals one.
 
-## K3. Isolation parity across platforms *(built)*
+## K3. Isolation parity across platforms *(built on all three; parity test owed on Windows)*
 
 **Today:** real Seatbelt (`sandbox-exec`) confinement on macOS, with an
 integration test asserting a sandboxed command cannot read or write the real
@@ -1276,31 +1276,37 @@ writing. So a network-allowed run on Windows reaches a public address but not `1
 where macOS and Linux reach both — stricter than those, never looser, so it cannot turn a
 denied run into an allowed one, and it is documented at the module rather than discovered.
 
-**Shipped — the third platform asserts the boundary instead of being argued about.**
-`app_container_cannot_read_or_write_real_workspace_with_or_without_network` makes the same
-claim the other two make: read your own copy, fail to read the real workspace, fail to
-overwrite it, write to the sandbox-owned home and tmp, with and without network.
+**Shipped — a real Windows bug the parity work found, and the parity test itself
+pulled back out.**
 
-- **A sibling, not a copy, and deliberately so.** macOS and Linux share one `sh` script
-  verbatim; Windows cannot — `cmd /C` takes one line, has no `set -eu`, and reads
-  `%USERPROFILE%`/`%TMP%` where the others read `$HOME`/`$TMPDIR`. What is shared is the
-  *claim*, which is what the acceptance is about. Forcing one string across three shells
-  would have meant a weaker assertion on all three. The exit codes match (71 for a readable
-  secret, 72 for a writable one) so a failure reads the same whichever platform reported it.
-- **The privilege warning this entry left was right for a capability check and backwards for
-  this one.** An AppContainer's filesystem check is against the container SID's ACE, not the
-  user's group membership: a process holding an administrator token *inside* a container
-  still cannot read a directory that grants the container nothing. So "denied while running
-  as an administrator" implies denied for a standard user, not the reverse — the hosted
-  runner is the **stronger** case for a deny assertion, not the weaker one. The direction
-  that would genuinely need an unprivileged context is the *allow* half, and that is granted
-  explicitly by `grant_tree_access`, which the test exercises.
-- **Skip locally, fail in CI**, the same rule the Landlock arm follows, because a skip and a
-  pass are the same colour.
+The assertion was written, run on CI, and found something before it could pass:
+`execute_in_sandbox` canonicalizes every path it resolves, and on Windows
+`fs::canonicalize` returns a verbatim `\\?\` path. **cmd.exe cannot use one, and
+does not say so loudly** — handed one as a working directory it prints "UNC paths
+are not supported. Defaulting to Windows directory." on stderr and runs anyway,
+in `C:\Windows`. So every sandboxed run on Windows executed with the wrong
+working directory and a `HOME` and `TMP` it could not write, and the only
+evidence was a line nobody reads. `plain_canonical` strips the prefix at the one
+place every path resolves through, keeping canonicalization itself — it is what
+makes the `starts_with(&sandbox_root)` containment checks sound — and leaving a
+true UNC share alone rather than turning it into a relative path that names
+nothing.
 
-**Honest limit on this one: CI is its first execution.** There is no Windows toolchain on the
-machine it was written on — not even a cross-compile check — so it was verified by parsing
-only. That is stated here rather than left for someone to discover from a red run.
+**The parity test is not in this change, and the reason is worth recording.** It
+took four CI rounds to get that far, because there is no Windows toolchain on the
+machine it was written on — not even a cross-compile check — so every iteration
+costs a full remote run and it was blocking two unrelated, verified items from
+landing. It is a good test: it earned its keep twice over on the run that found
+the bug above. It needs a machine that can run it, and it will land when it has
+one.
+
+**The privilege warning this entry left, resolved.** It said a hosted runner's
+account is an administrator, so CI is the privileged case. That is right for a
+capability check and backwards for this one: an AppContainer's filesystem check
+is against the container SID's ACE, not the user's group membership, so a
+process holding an administrator token *inside* a container still cannot read a
+directory that grants the container nothing. "Denied while running as an
+administrator" implies denied for a standard user, not the reverse.
 
 Also unbuilt on Linux: user namespaces. `unshare(CLONE_NEWNET)` needs `CLONE_NEWUSER` first
 for an unprivileged process, which changes uid semantics and is disabled outright in many
