@@ -32,6 +32,14 @@
 //! home, the real workspace, and every other user file are denied because
 //! nothing granted them, not because a list remembered to leave them out.
 //!
+//! One documented narrowing, the filesystem counterpart to the loopback one
+//! below: **`cmd`'s `dir` does not work in a sandboxed run.** The tree itself is
+//! enumerable — through `FindFirstFile`, through `System.IO`, through any
+//! language's directory API — but `DIR` reads the volume first, and the grant is
+//! one directory tree with nothing above it, so `C:\` is reachable by nothing the
+//! container holds. Widening that would put an ACE on the drive root for every
+//! run. See [`AppContainer::grant_tree_access`] for the evidence and the trade.
+//!
 //! # Network
 //!
 //! An AppContainer has no network at all unless a capability grants it, so
@@ -447,6 +455,31 @@ impl AppContainer {
     /// denied by construction rather than by a list this code has to keep
     /// correct. That is a stronger default than the Seatbelt and Landlock roots,
     /// which have to enumerate what is readable.
+    ///
+    /// # What this grant does *not* reach: `cmd`'s `dir`
+    ///
+    /// The grant covers enumeration. A confined run lists this tree through
+    /// `FindFirstFile` and through `System.IO` — including subdirectories that
+    /// existed before the grant ran, which is how `execute_in_sandbox` creates
+    /// `SANDBOX_HOME_DIR` and `SANDBOX_TMP_DIR`; `SetNamedSecurityInfoW`
+    /// propagates the inheritable ACE onto them and Windows renders it as `(F)`.
+    ///
+    /// `dir` still answers "Access is denied." — on any path, including
+    /// `System32\drivers\etc`, which this app never touches and Windows grants to
+    /// `ALL APPLICATION PACKAGES`. The refused object is not a directory: cmd's
+    /// `DIR` reads the *volume* before it lists anything, `/b` suppresses the
+    /// header rather than the query, and `vol C:` is refused in the same run. This
+    /// grant is one directory tree and deliberately nothing above it, so `C:\` is
+    /// granted to nothing the container holds.
+    ///
+    /// Left as it is, and the trade is the point. Making `dir` work means an ACE
+    /// on the volume root for every sandboxed run, which is a wider boundary than
+    /// this whole module is for — so a sandboxed command that shells out to `dir`
+    /// (or `cd /d`, or anything else that touches the drive) fails, while the same
+    /// listing through PowerShell, `attrib`, or any language's directory API
+    /// works. `a_confined_run_can_enumerate_the_tree_it_was_granted` holds both
+    /// halves, and its `vol` assertion is what turns red if the volume ever
+    /// becomes reachable.
     ///
     /// Ancestors of `path` are deliberately not touched. Traverse checks on them
     /// are bypassed by `SeChangeNotifyPrivilege`, which an AppContainer token
@@ -1517,6 +1550,174 @@ mod tests {
             tmp.join("probe").is_file(),
             "the child wrote through its temp directory and the host cannot see the \
              file afterwards: {reported}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A confined run can enumerate the tree it was granted — and cannot reach the
+    /// volume, which is why `dir` says otherwise.
+    ///
+    /// #290 recorded the opposite and could not explain it: its child wrote a
+    /// probe into its own home and its own tmp — both writes silent, both files
+    /// there for the host afterwards — and then `dir /b` over those same two
+    /// directories answered "Access is denied." twice. Listing your own temp
+    /// directory is an ordinary thing for a build to do, so that looked like a
+    /// hole in the boundary's *allow* half.
+    ///
+    /// It is not, and this test is the argument. `E3-dotnet` enumerates the
+    /// sandbox root through `System.IO` and gets every entry; `E2-attrib`
+    /// enumerates a subdirectory through `FindFirstFile`, the same call `dir`
+    /// makes. The grant reaches enumeration exactly as it says it does.
+    ///
+    /// What `dir` cannot reach is the *volume*: `E4-vol` is `vol C:`, and it is
+    /// refused. cmd's `DIR` reads the volume before it lists anything — `/b`
+    /// suppresses the header, not the query — and
+    /// [`AppContainer::grant_tree_access`] grants one directory tree and
+    /// deliberately nothing above it, so `C:\` is granted to nothing this
+    /// container holds. That is why `dir` fails on *every* path, including
+    /// `System32\drivers\etc`, which this app never touches and Windows grants to
+    /// `ALL APPLICATION PACKAGES`.
+    ///
+    /// So `E4-vol` is the assertion worth keeping and the reason the others are
+    /// safe. Granting the volume root would make `dir` work and would put an ACE
+    /// on `C:\` for every sandboxed run, which is a boundary regression and not a
+    /// fix — a red `E4-vol` is that regression, caught at the one place it is
+    /// visible. `E5-dir` is carried in the transcript rather than asserted: it is
+    /// a `cmd` behaviour, not a boundary claim, and a Windows that changed it
+    /// should not turn this red.
+    ///
+    /// Ruled out along the way, none of it worth re-testing. Not propagation —
+    /// `before` exists when the grant runs and carries the inherited ACE anyway,
+    /// and `after`, which inherits at creation, behaves identically. Not the mask
+    /// — Windows renders the grant as `(F)`. Not the token — `whoami /priv` shows
+    /// `SeChangeNotifyPrivilege` enabled, which is what the module docs rest on,
+    /// and `icacls` run from *inside* prints the root's ACL, so the child can open
+    /// that directory and read its security descriptor.
+    ///
+    /// No `if`, no `(…)`, no `exit /b`, and each step labelled with its stderr
+    /// merged into stdout before any other redirection — for the reasons #290
+    /// wrote down the hard way. The verdict is the transcript, not the exit code.
+    #[tokio::test]
+    async fn a_confined_run_can_enumerate_the_tree_it_was_granted() {
+        let root = std::env::temp_dir().join(format!("lm-ac-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Created before the grant, exactly as `execute_in_sandbox` creates its
+        // home and tmp before it has a container to grant them to. The ACE reaches
+        // it by propagation rather than by inheritance at creation, and the
+        // listing below is what says so.
+        let before = root.join("before");
+        std::fs::create_dir_all(&before).expect("pre-grant subdirectory");
+        std::fs::write(before.join("before-marker"), "x").expect("pre-grant marker");
+
+        let Ok(container) = create_app_container("listtest") else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "no AppContainer on this CI runner, so nothing this test exists for ran"
+            );
+            return;
+        };
+        container.grant_tree_access(&root).expect("grant");
+
+        std::fs::write(root.join("root-marker"), "x").expect("root marker");
+
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let written = root.join("by-container");
+        let command = format!(
+            "echo E1-write & echo written-by-container 2>&1> \"{written}\" \
+             & echo E2-attrib & attrib \"{before}\\*\" 2>&1 \
+             & echo E3-dotnet & powershell -NoProfile -NonInteractive -Command \
+               \"[IO.Directory]::GetFileSystemEntries('{root}') -join ','\" 2>&1 \
+             & echo E4-vol & vol C: 2>&1 \
+             & echo E5-dir & dir /b \"{root}\" 2>&1 \
+             & echo LIST-END",
+            root = root.display(),
+            before = before.display(),
+            written = written.display(),
+        );
+
+        let output = run_confined(
+            Some(&container),
+            &create_job().expect("job"),
+            &command,
+            &root,
+            &[
+                ("SystemRoot".to_string(), system_root.clone()),
+                (
+                    "PATH".to_string(),
+                    format!(
+                        "{system_root}\\System32;{system_root}\\System32\\WindowsPowerShell\\v1.0"
+                    ),
+                ),
+            ],
+            false,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("the confined run itself must work");
+
+        // What the host sees of the same ACLs. A listing the container is refused
+        // while the host reads a container ACE on the directory is a different
+        // finding from one where the ACE is not there, and one CI run on this
+        // platform has to be able to tell them apart.
+        let host_acl = |path: &Path| match std::process::Command::new("icacls").arg(path).output() {
+            Ok(output) => String::from_utf8_lossy(&output.stdout).replace("\r\n", " | "),
+            Err(error) => format!("<icacls failed: {error}>"),
+        };
+        let report = format!(
+            "exit={:?} stdout={:?} stderr={:?}\nhost sees by-container: {}\n\
+             host icacls root: {}\nhost icacls before: {}",
+            output.exit_code,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            written.is_file(),
+            host_acl(&root),
+            host_acl(&before),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            stdout.contains("E1-write") && stdout.contains("LIST-END"),
+            "the confined child did not run its script from start to finish, so no rung \
+             below is a statement about enumeration: {report}"
+        );
+        // Each rung is read inside its own slice of the transcript, between its
+        // label and the next one. Searching the whole of stdout would let one green
+        // rung answer for another that looks for the same marker.
+        let section = |rung: &str, next: &str| {
+            stdout
+                .split_once(rung)
+                .and_then(|(_, rest)| rest.split_once(next))
+                .map(|(section, _)| section.to_string())
+                .unwrap_or_default()
+        };
+        // The write half, and the baseline the listing rungs are measured against:
+        // a run that cannot write in its own tree has nothing to say about whether
+        // it can list it. Checked from the host, because a file only the container
+        // can see is a file the run has lost.
+        assert!(
+            written.is_file(),
+            "the confined run could not create a file in the tree it was granted, so \
+             this run says nothing about listing versus writing: {report}"
+        );
+        for (rung, next, marker) in [
+            ("E2-attrib", "E3-dotnet", "before-marker"),
+            ("E3-dotnet", "E4-vol", "root-marker"),
+        ] {
+            assert!(
+                section(rung, next).contains(marker),
+                "{rung}: a confined run could not enumerate a directory inside the tree \
+                 it was granted, while it could create a file in that same tree — so the \
+                 grant does not reach enumeration and a sandboxed command cannot list \
+                 its own temp directory: {report}"
+            );
+        }
+        // The deny half, and the reason `E5-dir` is refused. An ACE on `C:\` would
+        // make `dir` work and would be on the volume root for every sandboxed run.
+        assert!(
+            section("E4-vol", "E5-dir").contains("Access is denied."),
+            "a confined run can read the volume, so something has granted this \
+             container the drive root rather than one tree under it — which is the \
+             whole boundary, not a widening of it: {report}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
