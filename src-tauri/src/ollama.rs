@@ -15,10 +15,11 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use crate::AppState;
+use crate::profiles::ProfileScopedPaths;
 
 /// Base URL for Ollama's local daemon (native API + OpenAI-compatible
 /// `/v1/chat/completions`).
@@ -815,8 +816,7 @@ pub async fn ollama_import_model(app: AppHandle, name: String, path: String) -> 
         .map_err(|e| format!("Path not found: {path} ({e})"))?;
 
     let app_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     std::fs::create_dir_all(&app_dir).map_err(|e| {
         format!(
@@ -877,8 +877,7 @@ pub async fn ollama_create_from_modelfile(
     let rendered = resolved.render();
 
     let app_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     std::fs::create_dir_all(&app_dir).map_err(|e| {
         format!(

@@ -35,12 +35,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tauri::Manager;
 use tokio::sync::Notify;
 use url::Url;
 
 use crate::egress::{EgressDenial, EgressRule};
 use crate::{checkpoints, permissions, AppState};
+use crate::profiles::ProfileScopedPaths;
 
 /// Total request timeout (connect through full body read) for `tool_web_fetch`.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -63,7 +63,12 @@ const USER_AGENT: &str = "LittleMonkey/0.1";
 /// and `mcp.rs` use for their own secrets; keychain entries are disambiguated
 /// by *account* (see [`BRAVE_KEYCHAIN_ACCOUNT`]), not service, so this is
 /// fine to duplicate rather than export from `providers.rs`.
-const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.app"));
 
 /// Keychain account name the Brave API key is stored under. Namespaced with
 /// a `web:` prefix — same reasoning as `mcp.rs::keychain_account`'s `mcp:`
@@ -149,8 +154,7 @@ impl Default for WebSettings {
 /// `mcp.rs::config_file_path`.
 fn settings_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let base = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     if !base.exists() {
         std::fs::create_dir_all(&base).map_err(|e| {
@@ -236,7 +240,7 @@ fn normalize_and_validate_settings(mut settings: WebSettings) -> Result<WebSetti
 /// probe, never a persisted flag, mirroring `providers::has_key`'s stance
 /// exactly (never drifts from reality).
 pub fn has_brave_key() -> bool {
-    keyring::Entry::new(KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT)
+    keyring::Entry::new(&KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT)
         .and_then(|e| e.get_password())
         .is_ok()
 }
@@ -244,7 +248,7 @@ pub fn has_brave_key() -> bool {
 /// Reads the saved Brave API key, for `search_impl`'s Brave branch (via
 /// `tool_web_search`) and monkey-cli's shared `web::read_brave_key()` (phase 4).
 pub fn read_brave_key() -> Result<String, String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT)
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     entry.get_password().map_err(|e| match e {
         keyring::Error::NoEntry => {
@@ -258,7 +262,7 @@ pub fn read_brave_key() -> Result<String, String> {
 /// Core remove logic behind [`web_remove_brave_key`] — a missing entry is a
 /// no-op success, same stance as `providers::remove_key_impl`.
 fn remove_brave_key_impl() -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT)
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     match entry.delete_credential() {
         Ok(()) => Ok(()),
@@ -321,7 +325,7 @@ pub async fn web_set_brave_key(api_key: String) -> Result<(), String> {
 
     brave_search(&api_key, "test", 1).await?;
 
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT)
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     entry
         .set_password(&api_key)
