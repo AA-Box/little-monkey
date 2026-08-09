@@ -2,8 +2,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { setPendingUpdateForTests, useUpdateStore } from "./updateStore";
 
+const invoke = vi.fn();
+
 vi.mock("@tauri-apps/api/core", () => ({
   isTauri: () => true,
+  invoke: (...args: unknown[]) => invoke(...args),
 }));
 
 const check = vi.fn();
@@ -41,6 +44,16 @@ function fakeUpdate(chunks: ProgressEvent[] = [{ event: "Finished" }]) {
   };
 }
 
+const snapshot = {
+  version: "1.2.0",
+  kind: "macBundle" as const,
+  installRoot: "/Applications/Little Monkey.app",
+  payload: "/data/updates/rollback/payload",
+  relaunch: "/Applications/Little Monkey.app/Contents/MacOS/little-monkey",
+  createdAtMs: 1_700_000_000_000,
+  sizeBytes: 512,
+};
+
 function reset() {
   useUpdateStore.setState({
     status: "idle",
@@ -50,10 +63,15 @@ function reset() {
     contentLength: null,
     lastCheckedAt: null,
     lastError: null,
+    rollback: null,
+    rollbackError: null,
+    rollbackBusy: false,
   });
   setPendingUpdateForTests(null);
   check.mockReset();
   relaunch.mockReset();
+  invoke.mockReset();
+  invoke.mockResolvedValue(snapshot);
   installsWhileRunning.mockReturnValue(true);
 }
 
@@ -146,5 +164,59 @@ describe("updateStore", () => {
     expect(relaunch).toHaveBeenCalledTimes(1);
     expect(useUpdateStore.getState().status).toBe("ready");
     expect(useUpdateStore.getState().lastError).toContain("restart blocked");
+  });
+
+  it("snapshots the installed build before it is replaced, and keeps it after", async () => {
+    check.mockResolvedValue(fakeUpdate());
+    await useUpdateStore.getState().check("startup");
+
+    expect(invoke).toHaveBeenCalledWith("update_snapshot_create");
+    expect(useUpdateStore.getState().rollback).toEqual(snapshot);
+    expect(useUpdateStore.getState().rollbackError).toBeNull();
+  });
+
+  it("takes the Windows snapshot at the click, where the install actually happens", async () => {
+    installsWhileRunning.mockReturnValue(false);
+    check.mockResolvedValue(fakeUpdate());
+    await useUpdateStore.getState().check("startup");
+    expect(invoke).not.toHaveBeenCalled();
+
+    await useUpdateStore.getState().applyUpdate();
+    expect(invoke).toHaveBeenCalledWith("update_snapshot_create");
+  });
+
+  it("installs anyway when the snapshot fails — no rollback beats no update", async () => {
+    invoke.mockRejectedValue(new Error("disk full"));
+    const update = fakeUpdate();
+    check.mockResolvedValue(update);
+
+    await useUpdateStore.getState().check("startup");
+
+    expect(update.downloadAndInstall).toHaveBeenCalledTimes(1);
+    expect(useUpdateStore.getState().status).toBe("ready");
+    expect(useUpdateStore.getState().rollback).toBeNull();
+    expect(useUpdateStore.getState().rollbackError).toContain("disk full");
+  });
+
+  it("discards a snapshot through the backend and clears it locally", async () => {
+    useUpdateStore.setState({ rollback: snapshot });
+    invoke.mockResolvedValue(undefined);
+
+    await useUpdateStore.getState().discardRollback();
+
+    expect(invoke).toHaveBeenCalledWith("update_rollback_discard");
+    expect(useUpdateStore.getState().rollback).toBeNull();
+    expect(useUpdateStore.getState().rollbackBusy).toBe(false);
+  });
+
+  it("reports a rollback that could not start instead of pretending it did", async () => {
+    useUpdateStore.setState({ rollback: snapshot });
+    invoke.mockRejectedValue(new Error("no snapshot"));
+
+    await useUpdateStore.getState().applyRollback();
+
+    expect(invoke).toHaveBeenCalledWith("update_rollback_apply");
+    expect(useUpdateStore.getState().rollbackError).toContain("no snapshot");
+    expect(useUpdateStore.getState().rollbackBusy).toBe(false);
   });
 });

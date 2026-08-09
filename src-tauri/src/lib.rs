@@ -51,6 +51,10 @@ pub mod studio_tools;
 // user installed, and hosted OpenAI-compatible image APIs. HTTP only.
 mod generation_remote;
 pub mod managed_runtime;
+// K22: the startup self-integrity check every native launch path consults, and
+// the one-step rollback the in-app updater takes before it replaces the install.
+pub mod self_integrity;
+pub mod update_rollback;
 // The stack registry and the embedding path, shared by v1 Knowledge Stacks
 // (`stacks`) and Knowledge 2.0 (`knowledge_service`/`knowledge_pipeline`).
 // Extracted out of `stacks` so that nothing shared lives in the module the v1→v2
@@ -918,6 +922,29 @@ pub fn run() {
                 }
             }
 
+            // K22 startup self-integrity check. Runs *after* materialization on
+            // purpose: materialization is the repair pass — it replaces an
+            // invalid installed tree with the bundle it verified — so checking
+            // first would latch a refusal on a fault that was about to be
+            // fixed. Nothing here executes a runtime; the first thing that
+            // tries waits on this same verdict (see `self_integrity`'s doc).
+            tauri::async_runtime::spawn_blocking(|| {
+                let report = self_integrity::report();
+                if report.refused {
+                    // Loud, because from here on every native runtime launch
+                    // refuses and the panel is the only other place that says
+                    // why.
+                    eprintln!(
+                        "Startup integrity check FAILED; native runtimes will not be launched:"
+                    );
+                    for component in &report.components {
+                        if component.status == self_integrity::IntegrityStatus::Mismatch {
+                            eprintln!("  {}: {}", component.id, component.detail);
+                        }
+                    }
+                }
+            });
+
             // Finish or roll back any portable-profile transaction interrupted
             // between staged file publication and its durable commit marker.
             // This runs before session/prompt hydration and before the profile
@@ -1417,6 +1444,12 @@ pub fn run() {
             native_skill_commands::native_skills_rollback,
             native_skill_commands::native_skills_rollback_many,
             security_commands::security_audit,
+            self_integrity::self_integrity_report,
+            update_rollback::update_install_info,
+            update_rollback::update_snapshot_create,
+            update_rollback::update_rollback_status,
+            update_rollback::update_rollback_discard,
+            update_rollback::update_rollback_apply,
             diagnostics::diagnostics_run,
             diagnostics::diagnostics_apply_fix,
             diagnostics::diagnostics_export_bundle,

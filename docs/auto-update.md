@@ -11,11 +11,61 @@ background, with a single small card as the only interruption.
 | Stage | macOS/Linux: `downloadAndInstall()` — the new bundle replaces the old one on disk while the app keeps running. Windows: `download()` only. |
 | Notify | Only once the update is staged does the card appear at the bottom of the session sidebar: app icon, "Relaunch to update" (Windows: "Install update"), the version, an arrow (`src/components/Update/UpdateCard.tsx`). |
 | Apply | macOS/Linux: `relaunch()`, instant — the new version is already on disk. Windows: `install()` runs the NSIS installer, which closes and restarts the app itself. |
-| Failure | Silent. `updateStore.lastError` records it; the user sees nothing and the next scheduled check retries. |
+| Failure | Silent *in the app chrome*. `updateStore.lastError` records it, the next scheduled check retries, and Settings → Updates & integrity shows the failure and when the last check ran. |
 
 No modal, no "update available?" question, no dismiss button. The Windows
 split exists so an update never kills a running turn: the installer needs to
 close the app to replace locked files, so that step waits for the click.
+
+## Settings → Updates & integrity
+
+`src/components/Settings/UpdatesPanel.tsx` is the manual surface for all of
+this: a **Check now** button (the one trigger that ignores the poll interval),
+the current state and last check time, the last failure if there was one, the
+rollback controls below, and the startup integrity verdict below that. A Linux
+install that is not an AppImage says so instead of silently never updating —
+`update_install_info` reports whether this install shape can be replaced in
+place at all.
+
+## Rollback
+
+Every update replaces the installed app, so the version you were running stops
+existing anywhere on the machine — unless a copy was taken first. One is
+(`src-tauri/src/update_rollback.rs`):
+
+| Step | What happens |
+| --- | --- |
+| Snapshot | Taken immediately before the install replaces the app: `downloadAndInstall()` on macOS/Linux, the card click on Windows. Exactly one is kept, replacing any earlier one. |
+| Cost | A full copy of the install (`.app` bundle, install directory, or AppImage). The panel reports its size, and **Discard** deletes it. |
+| Restore | Writes a small script, starts it detached, and exits. The script waits for this pid to go, puts the copy back — moving the current install aside first, so a failed copy restores rather than destroys — and relaunches. |
+| Failure | A snapshot that cannot be taken never blocks the update: an un-rollback-able update still beats no update. The panel says the snapshot failed. |
+
+A rollback is a *local* restore, not a downgrade request to the endpoint: the
+updater serves one release (the latest) and has no way to ask for an older
+one, which is precisely why the copy exists.
+
+## Startup integrity check
+
+Before any native runtime is executed, the app verifies itself
+(`src-tauri/src/self_integrity.rs`): its own code signature, and every file of
+every managed runtime against the trusted manifest digest baked into the
+binary. The verdict is computed once per process and read by every path that
+resolves a runtime binary — `llama.rs`, the Studio image/video and speech
+engines, and `monkey-cli`.
+
+A **mismatch** — a signature that is present and invalid, or a file that
+disagrees with an authenticated manifest — refuses to launch any native
+runtime for the rest of the process, and says so in the panel. The three
+non-failures stay distinct from it: *absent* (nothing installed), *unsupported*
+(no build published for this target), and *unverified* (a source build with no
+signature, a `LITTLE_MONKEY_*_RUNTIME` developer override, or a tree staged
+with no trusted digest). Only the first refuses; treating "cannot verify" as
+"tampered" would mean nobody could run this app from source.
+
+The check runs *after* the launch-time materialization of the bundled runtimes,
+because materialization is the repair pass — it replaces an invalid installed
+tree with the bundle it verified — and checking first would latch a refusal on
+a fault that was about to be fixed.
 
 ## Turning it on
 
@@ -71,7 +121,7 @@ missing.
 | --- | --- | --- |
 | macOS | `Little.Monkey_{aarch64,x64}.app.tar.gz` | `.dmg` is install-only |
 | Windows | `Little.Monkey_{x64,arm64}-setup.exe` (NSIS) | `.msi` also works if preferred |
-| Linux | `Little.Monkey_{amd64,aarch64}.AppImage` | `.deb`/`.rpm` installs can never self-update |
+| Linux | `Little.Monkey_{amd64,aarch64}.AppImage` | `.deb`/`.rpm` installs can never self-update — the app detects this and says so rather than failing quietly |
 
 Each gets a matching `.sig` file once signing is on, and `latest.json` maps
 `{platform}-{arch}` to the artifact URL plus its signature.

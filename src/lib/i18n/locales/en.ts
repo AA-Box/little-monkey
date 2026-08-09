@@ -2039,5 +2039,51 @@ export const en: Record<string, string> = {
   "DesktopControlPanel.actionNotExecuted": "Action did not execute.",
   "Update.relaunchToUpdate": "Relaunch to update",
   "Update.installUpdate": "Install update",
-  "Update.applying": "Updating…"
+  "Update.applying": "Updating…",
+  "SettingsModal.tabUpdates": "Updates & integrity",
+  "UpdatesPanel.title": "Updates & integrity",
+  "UpdatesPanel.description":
+    "Check for a new build, roll back to the version you were running, and see what this install verified about itself at startup.",
+  "UpdatesPanel.checkNow": "Check now",
+  "UpdatesPanel.applyUpdate": "Install and relaunch",
+  "UpdatesPanel.cancel": "Cancel",
+  "UpdatesPanel.stateChecking": "Checking for updates…",
+  "UpdatesPanel.stateDownloading": "Downloading the update…",
+  "UpdatesPanel.stateDownloadingPercent": "Downloading the update… {{percent}}%",
+  "UpdatesPanel.stateReady": "Version {{version}} is staged and ready",
+  "UpdatesPanel.stateApplying": "Applying the update…",
+  "UpdatesPanel.stateUpToDate": "This is the latest version",
+  "UpdatesPanel.stateNeverChecked": "No update check has run yet",
+  "UpdatesPanel.lastChecked": "Last checked {{when}}",
+  "UpdatesPanel.neverChecked": "Never checked",
+  "UpdatesPanel.lastCheckFailed": "The last update check failed: {{error}}",
+  "UpdatesPanel.packageManagedInstall":
+    "This install came from a package manager, so in-app updates do not apply to it — update it the way you installed it. The AppImage build updates itself.",
+  "UpdatesPanel.rollbackTitle": "Rollback",
+  "UpdatesPanel.rollbackNone":
+    "No rollback point yet. One is taken automatically just before an update replaces this install.",
+  "UpdatesPanel.rollbackAvailable":
+    "Version {{version}} was saved on {{when}} and uses {{size}} of disk.",
+  "UpdatesPanel.rollbackAction": "Roll back to {{version}}",
+  "UpdatesPanel.rollbackConfirm": "Restore {{version}} and restart",
+  "UpdatesPanel.rollbackDiscard": "Discard",
+  "UpdatesPanel.rollbackRestartNote":
+    "Rolling back closes Little Monkey, restores the saved build, and reopens it.",
+  "UpdatesPanel.rollbackFailed": "The rollback point could not be handled: {{error}}",
+  "UpdatesPanel.integrityTitle": "Startup integrity",
+  "UpdatesPanel.integrityDescription":
+    "Checked once at launch: this app's own signature, and every file of every managed runtime against its trusted manifest. A mismatch refuses to load rather than warning.",
+  "UpdatesPanel.integrityLoading": "Verifying…",
+  "UpdatesPanel.refusedTitle": "Native runtimes are refused on this install",
+  "UpdatesPanel.refusedDescription":
+    "Something below does not match what was signed or published, so Little Monkey will not launch any local runtime. Reinstall from a trusted download to restore a verified install.",
+  "UpdatesPanel.statusVerified": "Verified",
+  "UpdatesPanel.statusMismatch": "Mismatch",
+  "UpdatesPanel.statusUnverified": "Unverified",
+  "UpdatesPanel.statusAbsent": "Not installed",
+  "UpdatesPanel.statusUnsupported": "Not available here",
+  "UpdatesPanel.componentApp": "Application signature",
+  "UpdatesPanel.componentLlama": "llama.cpp runtime",
+  "UpdatesPanel.componentLlamaTts": "Speech runtime",
+  "UpdatesPanel.componentSd": "Image and video runtime"
 };
