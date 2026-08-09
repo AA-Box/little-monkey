@@ -52,6 +52,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpError;
 use rmcp::RoleClient;
 use tauri::Emitter;
 
+use crate::config_revisions::{self, RecordRequest};
 use crate::profiles::ProfileScopedPaths;
 use crate::{permissions, AppState};
 
@@ -233,18 +234,158 @@ pub fn load_config_impl(path: &Path) -> Result<McpConfigFile, String> {
     }
 }
 
+/// Revision kind for the whole `mcp_servers.json` document (roadmap K24).
+pub const MCP_CONFIG_REVISION_KIND: &str = "mcp-config";
+
+/// The one entity the document is filed under — there is exactly one config
+/// file per profile, so a second entity id would only ever be an empty log.
+pub const MCP_CONFIG_REVISION_ENTITY: &str = "servers";
+
+/// Revision kind for one server definition, so a history panel can show "what
+/// changed about *this* server" rather than only "the file changed".
+///
+/// The same split `prompts.rs` makes between the library and its entries, and
+/// for the same reason: a save that touches one server appends one entry
+/// revision, because an unchanged snapshot dedupes inside
+/// [`config_revisions::record`].
+pub const MCP_SERVER_REVISION_KIND: &str = "mcp-server";
+
+/// Where this config's revision log lives.
+///
+/// Derived from the config file's own directory rather than passed in, so every
+/// caller of [`save_config_impl`] gets versioning without a signature they could
+/// forget to thread. The file is always `<profile_data>/mcp_servers.json`, so its
+/// parent is the profile data dir the revision root hangs off — which is also
+/// what keeps two profiles' histories separate.
+fn revision_root_for(path: &Path) -> PathBuf {
+    config_revisions::revision_root(path.parent().unwrap_or(Path::new(".")))
+}
+
+/// What "restore this server" puts back: the authored fields, and not the
+/// surrounding document.
+fn server_snapshot(entry: &McpServerEntry) -> String {
+    serde_json::to_string_pretty(entry).unwrap_or_default()
+}
+
 /// Core save logic: atomic sibling temp file + rename, same idiom as
 /// `sessions.rs`'s `save_to` / `memory.rs`'s `save_impl`, so a crash
 /// mid-write can never leave a truncated/corrupt config file behind.
-pub fn save_config_impl(path: &Path, config: &McpConfigFile) -> Result<(), String> {
+///
+/// # Versioning (K24)
+///
+/// Every MCP config write goes through here — add, update, remove, enable —
+/// which is why the revision is recorded *here* rather than at the four call
+/// sites: a fifth mutation cannot be added without versioning by forgetting a
+/// line. Before this, MCP definitions were the last-write-wins case the roadmap
+/// named: two windows editing the same server silently kept whichever saved
+/// second, with nothing recording that the other edit existed.
+///
+/// `base_revision_id` opts into the concurrent-edit check. The document revision
+/// is recorded **before** the file is written, because it is the only step that
+/// can reject the write and rejecting after the file is replaced would defeat
+/// the point of detecting the conflict at all.
+///
+/// Returns the new document revision id.
+pub fn save_config_impl(
+    path: &Path,
+    config: &McpConfigFile,
+    base_revision_id: Option<String>,
+) -> Result<String, String> {
     let payload = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize mcp_servers.json: {}", e))?;
+
+    let root = revision_root_for(path);
+    let revision = config_revisions::record(
+        &root,
+        MCP_CONFIG_REVISION_KIND,
+        MCP_CONFIG_REVISION_ENTITY,
+        RecordRequest {
+            branch: None,
+            base_revision_id,
+            label: "Saved".to_string(),
+            content: payload.clone(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Per server, best-effort: a snapshot that is somehow unstorable must not
+    // fail the config save that has already been accepted. Unchanged servers
+    // dedupe inside `record`, so a save touching one server appends one entry
+    // revision rather than one per server.
+    for entry in &config.servers {
+        if entry.id.trim().is_empty() {
+            continue;
+        }
+        let label = if entry.label.trim().is_empty() {
+            "Edited".to_string()
+        } else {
+            format!("Edited {}", entry.label.trim())
+        };
+        let _ = config_revisions::record(
+            &root,
+            MCP_SERVER_REVISION_KIND,
+            &entry.id,
+            RecordRequest {
+                branch: None,
+                base_revision_id: None,
+                label,
+                content: server_snapshot(entry),
+            },
+        );
+    }
+
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &payload)
         .map_err(|e| format!("Failed to write mcp_servers.json: {}", e))?;
     std::fs::rename(&tmp, path)
         .map_err(|e| format!("Failed to finalize mcp_servers.json: {}", e))?;
-    Ok(())
+    Ok(revision.revision_id)
+}
+
+/// The current MCP config revision id, so a window that just hydrated from disk
+/// knows what base to save against. `None` when nothing has been recorded yet.
+#[tauri::command]
+pub fn mcp_current_revision(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let path = config_file_path(&app)?;
+    config_revisions::head(
+        &revision_root_for(&path),
+        MCP_CONFIG_REVISION_KIND,
+        MCP_CONFIG_REVISION_ENTITY,
+        None,
+    )
+    .map(|head| head.map(|revision| revision.revision_id))
+    .map_err(|e| e.to_string())
+}
+
+/// Replace the whole config with a snapshot from its history (K24).
+///
+/// The restore path, and it goes through the ordinary save so the restore is
+/// itself recorded as a revision — the same rule `RevisionHistoryPanel` states
+/// for every other versioned store: the history store never writes the live
+/// document, because only the owning store knows how its content is parsed.
+///
+/// The snapshot is parsed and validated before anything is written, so a
+/// hand-edited or truncated revision is refused rather than installed.
+#[tauri::command(rename_all = "snake_case")]
+pub fn mcp_restore_config(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    snapshot: String,
+) -> Result<String, String> {
+    let config: McpConfigFile = serde_json::from_str(&snapshot)
+        .map_err(|e| format!("That revision is not a readable MCP config: {e}"))?;
+    for entry in &config.servers {
+        validate_entry(entry)?;
+    }
+    let path = config_file_path(&app)?;
+    let _guard = state
+        .mcp_config_lock
+        .lock()
+        .map_err(|_| "MCP config lock poisoned".to_string())?;
+    // No base revision: a restore is deliberately unconditional, exactly as
+    // `prompts_save`'s doc comment describes for the same operation. The user
+    // has looked at the history and chosen this one.
+    save_config_impl(&path, &config, None)
 }
 
 /// Validates an entry's shape (id format, non-empty transport fields) before
@@ -268,7 +409,11 @@ fn validate_entry(entry: &McpServerEntry) -> Result<(), String> {
 
 /// Core add-server logic behind `mcp_add_server`. Errors if `entry.id`
 /// already exists (use `mcp_update_server` to edit) or fails validation.
-pub fn add_server_impl(path: &Path, entry: McpServerEntry) -> Result<McpServerEntry, String> {
+pub fn add_server_impl(
+    path: &Path,
+    entry: McpServerEntry,
+    base_revision_id: Option<String>,
+) -> Result<McpServerEntry, String> {
     validate_entry(&entry)?;
 
     let mut config = load_config_impl(path)?;
@@ -281,14 +426,18 @@ pub fn add_server_impl(path: &Path, entry: McpServerEntry) -> Result<McpServerEn
 
     config.version = SCHEMA_VERSION;
     config.servers.push(entry.clone());
-    save_config_impl(path, &config)?;
+    save_config_impl(path, &config, base_revision_id)?;
     Ok(entry)
 }
 
 /// Core update-server logic behind `mcp_update_server`. Replaces the entry
 /// with a matching id in place (preserving list order); errors if no such
 /// server is configured.
-pub fn update_server_impl(path: &Path, entry: McpServerEntry) -> Result<McpServerEntry, String> {
+pub fn update_server_impl(
+    path: &Path,
+    entry: McpServerEntry,
+    base_revision_id: Option<String>,
+) -> Result<McpServerEntry, String> {
     validate_entry(&entry)?;
 
     let mut config = load_config_impl(path)?;
@@ -299,25 +448,34 @@ pub fn update_server_impl(path: &Path, entry: McpServerEntry) -> Result<McpServe
         .ok_or_else(|| format!("Unknown MCP server '{}'", entry.id))?;
     *slot = entry.clone();
 
-    save_config_impl(path, &config)?;
+    save_config_impl(path, &config, base_revision_id)?;
     Ok(entry)
 }
 
 /// Core remove-server logic behind `mcp_remove_server`. Removing an id
 /// that isn't present is a no-op success — the caller's desired end state
 /// (the server is gone) already holds, mirroring `memory.rs::delete_fact_impl`.
-pub fn remove_server_impl(path: &Path, id: &str) -> Result<(), String> {
+pub fn remove_server_impl(
+    path: &Path,
+    id: &str,
+    base_revision_id: Option<String>,
+) -> Result<(), String> {
     let mut config = load_config_impl(path)?;
     let before = config.servers.len();
     config.servers.retain(|s| s.id != id);
     if config.servers.len() != before {
-        save_config_impl(path, &config)?;
+        save_config_impl(path, &config, base_revision_id)?;
     }
     Ok(())
 }
 
 /// Core enable/disable logic behind `mcp_set_enabled`.
-pub fn set_enabled_impl(path: &Path, id: &str, enabled: bool) -> Result<McpServerEntry, String> {
+pub fn set_enabled_impl(
+    path: &Path,
+    id: &str,
+    enabled: bool,
+    base_revision_id: Option<String>,
+) -> Result<McpServerEntry, String> {
     let mut config = load_config_impl(path)?;
     let slot = config
         .servers
@@ -327,7 +485,7 @@ pub fn set_enabled_impl(path: &Path, id: &str, enabled: bool) -> Result<McpServe
     slot.enabled = enabled;
     let updated = slot.clone();
 
-    save_config_impl(path, &config)?;
+    save_config_impl(path, &config, base_revision_id)?;
     Ok(updated)
 }
 
@@ -1090,12 +1248,13 @@ fn add_server_with_state_impl(
     state: &AppState,
     path: &Path,
     entry: McpServerEntry,
+    base_revision_id: Option<String>,
 ) -> Result<McpServerEntry, String> {
     let _guard = state
         .mcp_config_lock
         .lock()
         .map_err(|_| "MCP config lock poisoned".to_string())?;
-    let saved = add_server_impl(path, entry)?;
+    let saved = add_server_impl(path, entry, base_revision_id)?;
     // Defensive: `add_server_impl` only succeeds for an id that isn't
     // currently configured, but if this id was just freed up by a
     // `mcp_remove_server` call, any "allow for session" grant approved for
@@ -1112,8 +1271,14 @@ pub fn mcp_add_server(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     entry: McpServerEntry,
+    base_revision_id: Option<String>,
 ) -> Result<McpServerEntry, String> {
-    add_server_with_state_impl(state.inner(), &config_file_path(&app)?, entry)
+    add_server_with_state_impl(
+        state.inner(),
+        &config_file_path(&app)?,
+        entry,
+        base_revision_id,
+    )
 }
 
 /// Core logic behind [`mcp_update_server`] — see
@@ -1123,12 +1288,13 @@ fn update_server_with_state_impl(
     state: &AppState,
     path: &Path,
     entry: McpServerEntry,
+    base_revision_id: Option<String>,
 ) -> Result<McpServerEntry, String> {
     let _guard = state
         .mcp_config_lock
         .lock()
         .map_err(|_| "MCP config lock poisoned".to_string())?;
-    let saved = update_server_impl(path, entry)?;
+    let saved = update_server_impl(path, entry, base_revision_id)?;
     // The transport this id points at may have just changed — any existing
     // "allow for session" grant for it was approved against whatever the
     // OLD prompt showed, which may no longer describe what this id now
@@ -1145,8 +1311,14 @@ pub fn mcp_update_server(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     entry: McpServerEntry,
+    base_revision_id: Option<String>,
 ) -> Result<McpServerEntry, String> {
-    update_server_with_state_impl(state.inner(), &config_file_path(&app)?, entry)
+    update_server_with_state_impl(
+        state.inner(),
+        &config_file_path(&app)?,
+        entry,
+        base_revision_id,
+    )
 }
 
 /// Core logic behind [`mcp_remove_server`]'s config mutation — see
@@ -1159,12 +1331,13 @@ fn remove_server_with_state_impl(
     state: &AppState,
     path: &Path,
     server_id: &str,
+    base_revision_id: Option<String>,
 ) -> Result<(), String> {
     let _guard = state
         .mcp_config_lock
         .lock()
         .map_err(|_| "MCP config lock poisoned".to_string())?;
-    remove_server_impl(path, server_id)?;
+    remove_server_impl(path, server_id, base_revision_id)?;
     // This id may be reused by a completely different server later (see
     // `AddMcpServerForm`'s label-to-id slugify) — any "allow for session"
     // grant approved for the server that just got removed must not silently
@@ -1180,11 +1353,17 @@ pub async fn mcp_remove_server(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     server_id: String,
+    base_revision_id: Option<String>,
 ) -> Result<(), String> {
     validate_id(&server_id)?;
     disconnect_impl(state.inner(), &server_id).await;
     emit_status(&app, &server_id, "disconnected", None, None);
-    remove_server_with_state_impl(state.inner(), &config_file_path(&app)?, &server_id)?;
+    remove_server_with_state_impl(
+        state.inner(),
+        &config_file_path(&app)?,
+        &server_id,
+        base_revision_id,
+    )?;
     // Best-effort: an HTTP server that never had a token saved (or a stdio
     // server, which never has one) hits the `NoEntry` no-op path — never
     // fails the removal itself over keychain cleanup.
@@ -1206,6 +1385,7 @@ pub async fn mcp_set_enabled(
     state: tauri::State<'_, AppState>,
     server_id: String,
     enabled: bool,
+    base_revision_id: Option<String>,
 ) -> Result<McpServerEntry, String> {
     validate_id(&server_id)?;
     let updated = {
@@ -1213,7 +1393,12 @@ pub async fn mcp_set_enabled(
             .mcp_config_lock
             .lock()
             .map_err(|_| "MCP config lock poisoned".to_string())?;
-        set_enabled_impl(&config_file_path(&app)?, &server_id, enabled)?
+        set_enabled_impl(
+            &config_file_path(&app)?,
+            &server_id,
+            enabled,
+            base_revision_id,
+        )?
     };
     if !enabled {
         disconnect_impl(state.inner(), &server_id).await;
@@ -1525,6 +1710,27 @@ mod tests {
         ))
     }
 
+    /// A unique *directory* for a test, unlike [`temp_path`]'s file in the
+    /// shared temp dir.
+    ///
+    /// The revision log hangs off the config file's own parent directory (see
+    /// `revision_root_for`), so a test using `temp_path` would put its history in
+    /// `/tmp` alongside every other test's. That is not a hypothetical: the whole
+    /// point of these tests is counting revisions.
+    fn temp_config_dir(name: &str) -> PathBuf {
+        let dir = temp_path(name);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// The stdio args of a saved entry, for asserting *which* version landed.
+    fn saved_args(entry: &McpServerEntry) -> Vec<String> {
+        match &entry.transport {
+            McpTransport::Stdio { args, .. } => args.clone(),
+            other => panic!("expected a stdio transport, got {other:?}"),
+        }
+    }
+
     fn stdio_entry(id: &str, command: &str, args: &[&str]) -> McpServerEntry {
         McpServerEntry {
             id: id.to_string(),
@@ -1703,7 +1909,7 @@ mod tests {
         let path = temp_path("add.json");
         let entry = stdio_entry("my-server", "echo", &[]);
 
-        add_server_impl(&path, entry.clone()).unwrap();
+        add_server_impl(&path, entry.clone(), None).unwrap();
 
         assert!(
             !path.with_extension("json.tmp").exists(),
@@ -1717,16 +1923,16 @@ mod tests {
     #[test]
     fn add_rejects_duplicate_id() {
         let path = temp_path("dup.json");
-        add_server_impl(&path, stdio_entry("dup", "echo", &[])).unwrap();
+        add_server_impl(&path, stdio_entry("dup", "echo", &[]), None).unwrap();
 
-        let err = add_server_impl(&path, stdio_entry("dup", "echo", &[])).unwrap_err();
+        let err = add_server_impl(&path, stdio_entry("dup", "echo", &[]), None).unwrap_err();
         assert!(err.contains("already exists"), "unexpected error: {err}");
     }
 
     #[test]
     fn add_rejects_invalid_id() {
         let path = temp_path("badid.json");
-        let err = add_server_impl(&path, stdio_entry("bad id!", "echo", &[])).unwrap_err();
+        let err = add_server_impl(&path, stdio_entry("bad id!", "echo", &[]), None).unwrap_err();
         assert!(
             err.contains("Invalid MCP server id"),
             "unexpected error: {err}"
@@ -1742,17 +1948,17 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
         };
-        let err = add_server_impl(&path, entry).unwrap_err();
+        let err = add_server_impl(&path, entry, None).unwrap_err();
         assert!(err.contains("non-empty command"), "unexpected error: {err}");
     }
 
     #[test]
     fn update_replaces_matching_entry() {
         let path = temp_path("update.json");
-        add_server_impl(&path, stdio_entry("srv", "echo", &["one"])).unwrap();
+        add_server_impl(&path, stdio_entry("srv", "echo", &["one"]), None).unwrap();
 
         let updated = stdio_entry("srv", "echo", &["two"]);
-        update_server_impl(&path, updated.clone()).unwrap();
+        update_server_impl(&path, updated.clone(), None).unwrap();
 
         let reloaded = load_config_impl(&path).unwrap();
         assert_eq!(reloaded.servers.len(), 1);
@@ -1762,7 +1968,7 @@ mod tests {
     #[test]
     fn update_errors_for_unknown_id() {
         let path = temp_path("update_missing.json");
-        let err = update_server_impl(&path, stdio_entry("ghost", "echo", &[])).unwrap_err();
+        let err = update_server_impl(&path, stdio_entry("ghost", "echo", &[]), None).unwrap_err();
         assert!(
             err.contains("Unknown MCP server"),
             "unexpected error: {err}"
@@ -1772,10 +1978,10 @@ mod tests {
     #[test]
     fn remove_deletes_the_matching_entry_only() {
         let path = temp_path("remove.json");
-        add_server_impl(&path, stdio_entry("a", "echo", &[])).unwrap();
-        add_server_impl(&path, stdio_entry("b", "echo", &[])).unwrap();
+        add_server_impl(&path, stdio_entry("a", "echo", &[]), None).unwrap();
+        add_server_impl(&path, stdio_entry("b", "echo", &[]), None).unwrap();
 
-        remove_server_impl(&path, "a").unwrap();
+        remove_server_impl(&path, "a", None).unwrap();
 
         let reloaded = load_config_impl(&path).unwrap();
         assert_eq!(reloaded.servers.len(), 1);
@@ -1785,9 +1991,9 @@ mod tests {
     #[test]
     fn remove_of_unknown_id_is_a_no_op_success() {
         let path = temp_path("remove_missing.json");
-        add_server_impl(&path, stdio_entry("a", "echo", &[])).unwrap();
+        add_server_impl(&path, stdio_entry("a", "echo", &[]), None).unwrap();
 
-        remove_server_impl(&path, "does-not-exist").unwrap();
+        remove_server_impl(&path, "does-not-exist", None).unwrap();
 
         assert_eq!(load_config_impl(&path).unwrap().servers.len(), 1);
     }
@@ -1795,9 +2001,9 @@ mod tests {
     #[test]
     fn set_enabled_toggles_the_flag() {
         let path = temp_path("enable.json");
-        add_server_impl(&path, stdio_entry("srv", "echo", &[])).unwrap();
+        add_server_impl(&path, stdio_entry("srv", "echo", &[]), None).unwrap();
 
-        let updated = set_enabled_impl(&path, "srv", false).unwrap();
+        let updated = set_enabled_impl(&path, "srv", false, None).unwrap();
         assert!(!updated.enabled);
         assert!(!load_config_impl(&path).unwrap().servers[0].enabled);
     }
@@ -1805,7 +2011,7 @@ mod tests {
     #[test]
     fn set_enabled_errors_for_unknown_id() {
         let path = temp_path("enable_missing.json");
-        let err = set_enabled_impl(&path, "ghost", true).unwrap_err();
+        let err = set_enabled_impl(&path, "ghost", true, None).unwrap_err();
         assert!(
             err.contains("Unknown MCP server"),
             "unexpected error: {err}"
@@ -2054,6 +2260,7 @@ mod tests {
                         state,
                         path,
                         stdio_entry(&format!("concurrent-{i}"), "echo", &[]),
+                        None,
                     )
                     .unwrap();
                 });
@@ -2073,7 +2280,8 @@ mod tests {
         let path = temp_path("update_revokes.json");
         let state = AppState::default();
 
-        add_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &["v1"])).unwrap();
+        add_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &["v1"]), None)
+            .unwrap();
         state
             .permissions
             .session_allow
@@ -2081,7 +2289,8 @@ mod tests {
             .unwrap()
             .insert("mcp:docs:search".to_string());
 
-        update_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &["v2"])).unwrap();
+        update_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &["v2"]), None)
+            .unwrap();
 
         assert!(
             !state
@@ -2099,7 +2308,7 @@ mod tests {
         let path = temp_path("remove_readd_revokes.json");
         let state = AppState::default();
 
-        add_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &[])).unwrap();
+        add_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &[]), None).unwrap();
         state
             .permissions
             .session_allow
@@ -2107,7 +2316,7 @@ mod tests {
             .unwrap()
             .insert("mcp:docs:search".to_string());
 
-        remove_server_with_state_impl(&state, &path, "docs").unwrap();
+        remove_server_with_state_impl(&state, &path, "docs", None).unwrap();
         assert!(
             !state
                 .permissions
@@ -2124,6 +2333,7 @@ mod tests {
             &state,
             &path,
             stdio_entry("docs", "curl", &["https://evil.example"]),
+            None,
         )
         .unwrap();
         assert!(
@@ -2134,6 +2344,146 @@ mod tests {
                 .unwrap()
                 .contains("mcp:docs:search"),
             "an id reused by a different server must not inherit the old server's grants"
+        );
+    }
+
+    /// The other half of what K24 named: MCP server definitions saved
+    /// last-write-wins. Every mutation now appends to the same log, and the
+    /// per-server history is what makes "what changed about *this* server"
+    /// answerable rather than only "the file changed".
+    #[test]
+    fn every_mcp_mutation_records_a_revision_for_the_document_and_the_server() {
+        let dir = temp_config_dir("revisions");
+        let path = dir.join("mcp_servers.json");
+        let revisions = crate::config_revisions::revision_root(&dir);
+
+        let doc_history = || {
+            crate::config_revisions::history(
+                &revisions,
+                MCP_CONFIG_REVISION_KIND,
+                MCP_CONFIG_REVISION_ENTITY,
+                None,
+            )
+            .unwrap()
+        };
+        let server_history = |id: &str| {
+            crate::config_revisions::history(&revisions, MCP_SERVER_REVISION_KIND, id, None)
+                .unwrap()
+        };
+
+        add_server_impl(&path, stdio_entry("docs", "echo", &["v1"]), None).unwrap();
+        assert_eq!(doc_history().len(), 1);
+        assert_eq!(server_history("docs").len(), 1);
+
+        update_server_impl(&path, stdio_entry("docs", "echo", &["v2"]), None).unwrap();
+        assert_eq!(doc_history().len(), 2);
+        assert_eq!(server_history("docs").len(), 2);
+
+        // A toggle is a change to the document *and* to that server.
+        set_enabled_impl(&path, "docs", false, None).unwrap();
+        assert_eq!(doc_history().len(), 3);
+        assert_eq!(server_history("docs").len(), 3);
+
+        // Adding a second server must not append a revision for the first,
+        // which is unchanged — that is `record`'s digest dedupe doing its job.
+        add_server_impl(&path, stdio_entry("other", "echo", &[]), None).unwrap();
+        assert_eq!(doc_history().len(), 4);
+        assert_eq!(
+            server_history("docs").len(),
+            3,
+            "an unchanged server must not gain a revision from its neighbour's save"
+        );
+        assert_eq!(server_history("other").len(), 1);
+
+        remove_server_impl(&path, "other", None).unwrap();
+        assert_eq!(doc_history().len(), 5);
+    }
+
+    /// A stale base is refused **and the config on disk is untouched**. Rejecting
+    /// after the write would report a conflict for an edit that already landed.
+    #[test]
+    fn an_mcp_save_against_a_stale_base_is_refused_and_changes_nothing_on_disk() {
+        let dir = temp_config_dir("stale-base");
+        let path = dir.join("mcp_servers.json");
+
+        let first = add_server_impl(&path, stdio_entry("docs", "echo", &["v1"]), None)
+            .map(|_| ())
+            .and_then(|_| {
+                let root = crate::config_revisions::revision_root(&dir);
+                crate::config_revisions::head(
+                    &root,
+                    MCP_CONFIG_REVISION_KIND,
+                    MCP_CONFIG_REVISION_ENTITY,
+                    None,
+                )
+                .map(|head| head.expect("a revision was recorded").revision_id)
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+
+        // Another window saves.
+        update_server_impl(
+            &path,
+            stdio_entry("docs", "echo", &["v2"]),
+            Some(first.clone()),
+        )
+        .unwrap();
+
+        // This one still believes `first` is current.
+        let error = update_server_impl(&path, stdio_entry("docs", "echo", &["v3"]), Some(first))
+            .unwrap_err();
+        assert!(error.to_lowercase().contains("conflict:"), "got {error:?}");
+
+        let config = load_config_impl(&path).unwrap();
+        assert_eq!(
+            saved_args(&config.servers[0]),
+            vec!["v2".to_string()],
+            "a refused save must not have already overwritten the config"
+        );
+    }
+
+    /// Restore goes through the ordinary save, so it is itself recorded — and a
+    /// snapshot that is not a readable config is refused before anything is
+    /// written, rather than installed and discovered at the next connect.
+    #[test]
+    fn restoring_a_snapshot_validates_it_before_writing_anything() {
+        let dir = temp_config_dir("restore");
+        let path = dir.join("mcp_servers.json");
+        add_server_impl(&path, stdio_entry("docs", "echo", &["v1"]), None).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // Not a config at all.
+        assert!(serde_json::from_str::<McpConfigFile>("not json").is_err());
+
+        // A well-formed snapshot round-trips through the ordinary save path.
+        let snapshot = serde_json::to_string_pretty(&McpConfigFile {
+            version: SCHEMA_VERSION,
+            servers: vec![stdio_entry("docs", "echo", &["restored"])],
+        })
+        .unwrap();
+        let config: McpConfigFile = serde_json::from_str(&snapshot).unwrap();
+        for entry in &config.servers {
+            validate_entry(entry).unwrap();
+        }
+        save_config_impl(&path, &config, None).unwrap();
+        assert_eq!(
+            saved_args(&load_config_impl(&path).unwrap().servers[0]),
+            vec!["restored".to_string()]
+        );
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // And the restore is itself in the history.
+        let root = crate::config_revisions::revision_root(&dir);
+        assert_eq!(
+            crate::config_revisions::history(
+                &root,
+                MCP_CONFIG_REVISION_KIND,
+                MCP_CONFIG_REVISION_ENTITY,
+                None,
+            )
+            .unwrap()
+            .len(),
+            2
         );
     }
 }

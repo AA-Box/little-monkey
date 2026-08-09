@@ -5438,9 +5438,37 @@ workflows the same refusal comes from the definition store's own version rule.
 Both the desktop and the CLI/daemon write the same history, because the store
 sits below the Tauri layer.
 
-**Remaining:** rules/memory files and MCP server definitions still save
-last-write-wins; the history is per-entity, so there is no cross-entity view of
-what a given change touched.
+**Shipped — rules/memory files and MCP server definitions now go through the
+same log.** Both were the last last-write-wins stores: two windows (or the
+desktop and the CLI) editing one `MONKEY.md` or one MCP server silently kept
+whichever saved second, with nothing recording that the other edit existed.
+
+- **Rules.** `write_rules_impl` records before it writes, in `prompts_save`'s
+  order and for its reason: recording is the only step that can *reject* the
+  write, and rejecting after the file is replaced would defeat the point of
+  detecting the conflict. The entity is keyed on the file's **resolved path**,
+  not its label — two attached roots can both be called `src`, and a
+  label-keyed history would merge them into one log where a restore puts one
+  repo's instructions into the other. `rules_current_revision` gives an editor
+  its base; a stale one is refused with `conflict:` and the file on disk is
+  untouched.
+- **MCP.** The record happens inside `save_config_impl`, which *every* mutation
+  — add, update, remove, enable — already goes through, so a fifth mutation
+  cannot skip versioning by forgetting a line. Two kinds are written: the whole
+  document (what a restore puts back, since restoring one server into a file
+  that has since gained and lost others would produce a state that never
+  existed) and one per server (what answers "what changed about *this* server").
+  An unchanged server dedupes on its digest, so a save touching one server
+  appends one entry revision rather than one per server.
+- **Restore is the owning store's job**, per `RevisionHistoryPanel`'s rule.
+  `mcp_restore_config` parses and validates the snapshot before writing anything
+  — a hand-edited revision is refused rather than installed and discovered at
+  the next connect — and then goes through the ordinary save, so the restore is
+  itself a revision. The rules editor loads a snapshot into the textarea rather
+  than writing it, so the user's own Save records it.
+
+**Remaining:** the history is per-entity, so there is still no cross-entity view
+of what a given change touched.
 
 *Maps to: ROADMAP #3.*
 

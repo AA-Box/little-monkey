@@ -1318,6 +1318,7 @@ export const en: Record<string, string> = {
   "RulesMemoryPanel.charCount": "{{count}} / {{max}} characters",
   "RulesMemoryPanel.truncatedWarning": "This file is longer than the 16,000-character limit — the part beyond it is not sent to the model.",
   "RulesMemoryPanel.saveButton": "Save",
+  "RulesMemoryPanel.historyButton": "History",
   "RulesMemoryPanel.createButton": "Create MONKEY.md",
   "RulesMemoryPanel.savingButton": "Saving…",
   "RulesMemoryPanel.savedStatus": "Saved",
@@ -1388,6 +1389,10 @@ export const en: Record<string, string> = {
   "McpPanel.sideEffectsNotice": "MCP tool calls are not checkpointed — reverting to an earlier checkpoint won't undo anything an MCP server's tool did (same as Run Shell).",
   "McpPanel.toolCountWarning": "{{count}} tools are currently offered to the model across connected servers — consider narrowing servers' tool allowlists to keep prompts lean.",
   "McpPanel.emptyState": "No MCP servers configured yet. Add one below.",
+  "McpPanel.historyHeading": "Server history",
+  "McpPanel.historyDescription":
+    "Every change to your MCP servers is recorded. Compare two versions, or put an earlier one back.",
+  "McpPanel.historyButton": "History",
   "McpPanel.status_connecting": "Connecting…",
   "McpPanel.status_connected": "Connected",
   "McpPanel.status_error": "Error",

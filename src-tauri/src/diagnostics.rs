@@ -823,8 +823,17 @@ pub async fn diagnostics_apply_fix(
     }
 
     if let Some(server_id) = finding_id.strip_prefix("mcp.") {
-        crate::mcp::mcp_set_enabled(app.clone(), state.clone(), server_id.to_string(), false)
-            .await?;
+        crate::mcp::mcp_set_enabled(
+            app.clone(),
+            state.clone(),
+            server_id.to_string(),
+            false,
+            // No base: a diagnostic quarantine is not a user edit racing another
+            // window, and refusing to disable a misbehaving server because the
+            // config changed elsewhere would be the wrong failure.
+            None,
+        )
+        .await?;
         return Ok(fixed_finding(
             &finding_id,
             "mcp",
