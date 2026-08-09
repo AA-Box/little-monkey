@@ -70,14 +70,21 @@ why the abandoned TypeScript prototype was audited and not salvaged.
 whose own text defers to this benchmark; replacing that prose with measurements is
 a separate change.
 
-## 3. Prompt and workflow version control
+## 3. Prompt and workflow version control *(built)*
 
-**Today:** last-write-wins everywhere. Only marketplace packages have a diff
-view.
+**Shipped:** personas, snippets, skills, and workflow definitions keep an
+append-only local revision history (`config-revisions/` in the app data
+directory). **Settings → Prompts** gives every entry a History button and the
+workflow editor gives every saved workflow one: list revisions, select any two
+— including two on different branches — to diff, restore an older snapshot
+back into the editor, and fork a named branch to keep a variant instead of
+overwriting it. A save that would clobber another window's (or the CLI's) is
+refused and surfaced with a choice — take theirs, or knowingly overwrite —
+rather than silently winning.
 
-**Acceptance:** prompts, personas, skills, and workflow definitions keep a
-local revision history with diff, restore, and branch/compare; a concurrent
-edit is detected and surfaced rather than silently overwritten.
+**Remaining:** rules/memory files and MCP server definitions are not versioned
+yet; the history is per-entity, with no cross-entity "what did this release
+change" view.
 
 ## 4. Cost attribution and budget enforcement *(built)*
 
