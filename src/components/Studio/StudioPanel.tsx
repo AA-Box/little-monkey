@@ -1535,30 +1535,38 @@ export function StudioPanel({ mode, railSlot }: Props) {
 
           {canMask && initImage && (
             <SettingsCard title={t("Studio.outpaint.title")} hint={t("Studio.outpaint.hint")}>
-              <div className="flex flex-wrap items-center gap-1.5">
-                {OUTPAINT_STEPS.map((step) => (
-                  <Button
-                    key={step}
-                    size="sm"
-                    variant={outpaintStep === step ? "primary" : "secondary"}
-                    onClick={() => setOutpaintStep(step)}
-                  >
-                    {step}
-                  </Button>
-                ))}
-                <span className="mx-1 text-[11px] text-faint">px</span>
-                {OUTPAINT_SIDES.map(({ side, labelKey, icon: Icon }) => (
-                  <IconButton
-                    key={side}
-                    size="sm"
-                    aria-label={t(labelKey)}
-                    title={t(labelKey)}
-                    disabled={extending}
-                    onClick={() => void extend(side)}
-                  >
-                    <Icon size={13} />
-                  </IconButton>
-                ))}
+              {/* Two rows, not one wrapping row. The seven controls do not fit
+                  the sidebar's width, so a single `flex-wrap` dropped the last
+                  arrow onto a line of its own — which reads as a broken layout
+                  rather than as three of one thing and four of another. */}
+              <div className="grid gap-1.5">
+                <div className="flex items-center gap-1.5">
+                  {OUTPAINT_STEPS.map((step) => (
+                    <Button
+                      key={step}
+                      size="sm"
+                      variant={outpaintStep === step ? "primary" : "secondary"}
+                      onClick={() => setOutpaintStep(step)}
+                    >
+                      {step}
+                    </Button>
+                  ))}
+                  <span className="text-[11px] text-faint">px</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  {OUTPAINT_SIDES.map(({ side, labelKey, icon: Icon }) => (
+                    <IconButton
+                      key={side}
+                      size="sm"
+                      aria-label={t(labelKey)}
+                      title={t(labelKey)}
+                      disabled={extending}
+                      onClick={() => void extend(side)}
+                    >
+                      <Icon size={13} />
+                    </IconButton>
+                  ))}
+                </div>
               </div>
             </SettingsCard>
           )}
