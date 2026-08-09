@@ -874,10 +874,11 @@ mod tests {
         use std::os::unix::process::CommandExt;
 
         let state = AppState::default();
-        // Pre-seed an in-memory ledger so `with_ledger` never resolves
-        // `mock_app()`'s real (unscoped) app-data directory on disk.
+        // Pre-seed an in-memory ledger: this test needs no durable rows,
+        // and an in-memory one keeps it off disk entirely. (The mock app's
+        // app-data directory is per-test either way — see `test_support`.)
         *state.run_ledger.lock().unwrap() = Some(RunLedger::open_in_memory().unwrap());
-        let handle = tauri::test::mock_app().handle().clone();
+        let handle = crate::test_support::mock_app().handle().clone();
 
         let shell_id = "bg-signal-test".to_string();
         let child = Command::new("sleep")

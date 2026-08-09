@@ -1730,6 +1730,11 @@ mod tests {
     /// Builds a mock Tauri app whose workspace root is `root`, with the
     /// permission mode preset so `edit_file`/`write_file` auto-approve
     /// instead of hanging on a prompt no one can answer in a test.
+    ///
+    /// Built through `test_support::build` rather than `tauri::test`'s own
+    /// context, so this app's app-data directory — and therefore the run
+    /// ledger every auto-approved permission decision is written to — belongs
+    /// to one test and no other.
     fn mock_app_with_workspace(root: &std::path::Path) -> tauri::App<tauri::test::MockRuntime> {
         let canonical = root.canonicalize().unwrap();
         let checkpoint_dir = canonical.join(".checkpoint");
@@ -1763,11 +1768,11 @@ mod tests {
             },
         );
 
-        tauri::test::mock_builder()
-            .invoke_handler(tauri::generate_handler![tool_edit_file])
-            .manage(state)
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .unwrap()
+        crate::test_support::build(
+            tauri::test::mock_builder()
+                .invoke_handler(tauri::generate_handler![tool_edit_file])
+                .manage(state),
+        )
     }
 
     fn edit_file_invoke_request(args: serde_json::Value) -> tauri::webview::InvokeRequest {

@@ -385,6 +385,11 @@ pub mod runtime_pr_watcher;
 pub mod approval_chains;
 pub mod local_apps;
 
+// Shared unit-test fixtures. Chiefly the mock app every test must build
+// through, so no two of them share an app-data directory (or a run ledger).
+#[cfg(test)]
+mod test_support;
+
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
 // `mcp::disconnect_all`.
