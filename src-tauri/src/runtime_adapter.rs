@@ -664,6 +664,94 @@ pub enum AcceleratorKind {
     Rocm,
     Vulkan,
     DirectMl,
+    /// Apple's Neural Engine.
+    ///
+    /// Present as a variant despite never being detected, and that is the
+    /// point: K16 asks that every backend resolve to *either* a runtime path
+    /// that executes on it *or* a stated reason it does not, and "absent from
+    /// the enum entirely" was the third state — the ambiguous one. A reader can
+    /// now ask [`execution_support`] about it and get a sentence instead of
+    /// finding nothing.
+    AppleNeuralEngine,
+}
+
+/// Whether anything in this app actually runs work on a backend, or it is
+/// detected (or merely known about) and nothing more (roadmap K16).
+///
+/// Detection has always been ahead of use here — five backends are probed and
+/// two ever reach the planner — and nothing in the codebase encoded that gap.
+/// `AcceleratorCapability::available` looked like it did and does not: it means
+/// "detected and reporting itself usable", and the planner treated that as
+/// permission to run.
+///
+/// A tagged union, so a caller cannot read "it executes" without also reading
+/// *what* executes on it, and cannot read "it does not" without a reason to
+/// show. Both arms carry `&'static str` because both are facts about this
+/// build, not about the machine it is running on.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum ExecutionSupport {
+    /// A runtime this app ships or drives runs work on this backend. `via`
+    /// names it, so "supported" is never a claim without a subject.
+    Executes { via: String },
+    /// Nothing here executes on it. The reason distinguishes the three ways
+    /// that happens — no build ships for it, the build that does is for another
+    /// workload, or there is no runtime to target it with at all — because they
+    /// call for different answers from whoever wants it working.
+    DetectionOnly { reason: String },
+}
+
+impl ExecutionSupport {
+    #[must_use]
+    pub fn executes(&self) -> bool {
+        matches!(self, ExecutionSupport::Executes { .. })
+    }
+}
+
+/// What actually runs on each backend, stated once (roadmap K16).
+///
+/// Every arm is a fact about the binaries this app ships and the runtimes it
+/// drives — checked against `scripts/lib/managedRuntimeManifest.mjs`, which is
+/// the manifest that decides what is downloaded — rather than about what the
+/// hardware could theoretically do.
+#[must_use]
+pub fn execution_support(kind: AcceleratorKind) -> ExecutionSupport {
+    match kind {
+        // Always true and worth stating: the CPU is the fallback every runtime
+        // lands on when no accelerator is usable, which is why a machine with
+        // none still runs.
+        AcceleratorKind::Cpu => ExecutionSupport::Executes {
+            via: "every bundled runtime; the fallback when no accelerator is usable".to_string(),
+        },
+        // The only backend with a bundled build for chat *and* for images, plus
+        // a second runtime that requires it.
+        AcceleratorKind::Metal => ExecutionSupport::Executes {
+            via: "the bundled llama.cpp and sd-server builds, and MLX".to_string(),
+        },
+        // Detected and it does reach the planner — but no bundled archive is a
+        // CUDA build, so execution depends on a binary the user supplied.
+        AcceleratorKind::Cuda => ExecutionSupport::Executes {
+            via: "a user-supplied llama.cpp or Ollama build; no bundled archive is compiled for CUDA".to_string(),
+        },
+        // Real execution, wrong workload. Saying "yes" here would imply a chat
+        // model can be placed on it, which `HardwareSnapshot` never offers.
+        AcceleratorKind::Vulkan => ExecutionSupport::DetectionOnly {
+            reason: "the bundled sd-server uses Vulkan for image and video generation, but no chat or embedding runtime here targets it, and it never enters the hardware snapshot the planner reads".to_string(),
+        },
+        AcceleratorKind::Rocm => ExecutionSupport::DetectionOnly {
+            reason: "no bundled archive is compiled for ROCm and it never enters the hardware snapshot, so it is reported for diagnosis only".to_string(),
+        },
+        AcceleratorKind::DirectMl => ExecutionSupport::DetectionOnly {
+            reason: "Windows device enumeration can confirm a display adapter but not a working DirectML path, and no runtime here targets DirectML".to_string(),
+        },
+        // The honest end of a question the roadmap asked directly. Not "not yet
+        // built": llama.cpp-family runtimes have no ANE backend to target, and
+        // reaching it at all would mean a Core ML runtime, which is a different
+        // execution engine rather than a flag on this one.
+        AcceleratorKind::AppleNeuralEngine => ExecutionSupport::DetectionOnly {
+            reason: "no runtime here targets the Neural Engine: the GGUF runtimes have no ANE backend, and reaching it would mean shipping a Core ML engine rather than configuring an existing one".to_string(),
+        },
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -785,6 +873,10 @@ impl PlatformCapabilities {
                 AcceleratorKind::Rocm => matches!(os.as_str(), "linux" | "windows"),
                 AcceleratorKind::Vulkan => matches!(os.as_str(), "linux" | "windows"),
                 AcceleratorKind::DirectMl => os == "windows",
+                // Never permitted into the snapshot, because nothing executes
+                // on it — see `execution_support`. It exists so the Driver
+                // Doctor can say so, not so a planner can pick it.
+                AcceleratorKind::AppleNeuralEngine => false,
             };
             if permitted {
                 by_kind.insert(capability.kind, capability);
@@ -4298,6 +4390,64 @@ mod tests {
             None,
             "empty means unenumerated, so nothing may compute a split from it"
         );
+    }
+
+    /// K16's acceptance, made a test rather than a claim: for each backend,
+    /// either a runtime path that executes on it or a stated reason it is
+    /// detection-only. Neither arm may be empty, and there is no third state.
+    ///
+    /// The `match` is exhaustive on purpose — a seventh backend cannot be added
+    /// without answering the question for it.
+    #[test]
+    fn every_backend_either_executes_or_says_why_it_does_not() {
+        use super::{execution_support, AcceleratorKind, ExecutionSupport};
+        for kind in [
+            AcceleratorKind::Cpu,
+            AcceleratorKind::Metal,
+            AcceleratorKind::Cuda,
+            AcceleratorKind::Rocm,
+            AcceleratorKind::Vulkan,
+            AcceleratorKind::DirectMl,
+            AcceleratorKind::AppleNeuralEngine,
+        ] {
+            match execution_support(kind) {
+                ExecutionSupport::Executes { via } => assert!(
+                    via.len() > 20,
+                    "{kind:?} claims execution without naming what runs it"
+                ),
+                ExecutionSupport::DetectionOnly { reason } => assert!(
+                    reason.len() > 20,
+                    "{kind:?} is detection-only without saying why"
+                ),
+            }
+        }
+    }
+
+    /// The two the roadmap named as ambiguous, pinned to the answer rather than
+    /// to a status that could be read either way.
+    ///
+    /// DirectML's own detector already refused to overclaim — it reports
+    /// `Available` with `confirmed: false` when Windows enumerates a display
+    /// adapter — but "unconfirmed detection" is a statement about the *probe*.
+    /// This is the statement about the *app*, and they are different facts.
+    #[test]
+    fn directml_and_the_neural_engine_are_answered_not_hedged() {
+        use super::{execution_support, AcceleratorKind};
+        for kind in [
+            AcceleratorKind::DirectMl,
+            AcceleratorKind::AppleNeuralEngine,
+        ] {
+            assert!(
+                !execution_support(kind).executes(),
+                "{kind:?} has no runtime here and must not claim one"
+            );
+        }
+        // Vulkan is the one that would be easy to get wrong in the other
+        // direction: sd-server really does execute on it, so a naive reading
+        // says "yes" — but no chat or embedding runtime targets it and it never
+        // reaches the planner, so a model can never be placed there.
+        assert!(!execution_support(AcceleratorKind::Vulkan).executes());
+        assert!(execution_support(AcceleratorKind::Metal).executes());
     }
 
     use super::*;

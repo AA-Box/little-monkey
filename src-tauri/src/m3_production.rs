@@ -223,6 +223,7 @@ fn unsupported_accelerator(
 ) -> M3AcceleratorCompatibility {
     M3AcceleratorCompatibility {
         kind,
+        execution: crate::runtime_adapter::execution_support(kind),
         status: M3AcceleratorStatus::Unsupported,
         summary: summary.into(),
         device_names: Vec::new(),
@@ -238,6 +239,7 @@ fn tool_missing_accelerator(
 ) -> M3AcceleratorCompatibility {
     M3AcceleratorCompatibility {
         kind,
+        execution: crate::runtime_adapter::execution_support(kind),
         status: M3AcceleratorStatus::ToolMissing,
         summary: summary.into(),
         device_names: Vec::new(),
@@ -253,6 +255,7 @@ fn not_detected_accelerator(
 ) -> M3AcceleratorCompatibility {
     M3AcceleratorCompatibility {
         kind,
+        execution: crate::runtime_adapter::execution_support(kind),
         status: M3AcceleratorStatus::NotDetected,
         summary: summary.into(),
         device_names: Vec::new(),
@@ -276,6 +279,25 @@ fn build_compatibility_report(snapshot: &HardwareSnapshot) -> M3HardwareCompatib
         rocm_compatibility(os),
         vulkan_compatibility(os),
         directml_compatibility(os),
+        // Never probed, and listed anyway (roadmap K16). Every other row here
+        // answers "is it there"; this one answers the question a user actually
+        // asks about the Neural Engine, which is "can it be used" — and the
+        // answer is no, for a reason that is about this app rather than about
+        // their Mac. Leaving it off the report was the ambiguous state K16
+        // asked to remove: absent reads as an oversight, not as an answer.
+        unsupported_accelerator(
+            AcceleratorKind::AppleNeuralEngine,
+            match crate::runtime_adapter::execution_support(AcceleratorKind::AppleNeuralEngine) {
+                crate::runtime_adapter::ExecutionSupport::DetectionOnly { reason } => reason,
+                // Unreachable while `execution_support` says what it says, and
+                // written as a match rather than an unwrap so that teaching this
+                // app a Core ML runtime is a compile-time prompt to revisit the
+                // row instead of a summary that contradicts the field beside it.
+                crate::runtime_adapter::ExecutionSupport::Executes { via } => {
+                    format!("Runs on the Neural Engine via {via}.")
+                }
+            },
+        ),
     ];
 
     let jetson = jetson_info(os);
@@ -384,6 +406,7 @@ fn metal_compatibility(os: &str) -> M3AcceleratorCompatibility {
             let metal_family = gpus.iter().find_map(|gpu| gpu.metal_family.clone());
             return M3AcceleratorCompatibility {
                 kind: AcceleratorKind::Metal,
+                execution: crate::runtime_adapter::execution_support(AcceleratorKind::Metal),
                 status: M3AcceleratorStatus::Available,
                 summary: match &metal_family {
                     Some(family) => format!("Metal is available ({family})."),
@@ -405,6 +428,7 @@ fn metal_compatibility(os: &str) -> M3AcceleratorCompatibility {
     if assumed_available {
         M3AcceleratorCompatibility {
             kind: AcceleratorKind::Metal,
+            execution: crate::runtime_adapter::execution_support(AcceleratorKind::Metal),
             status: M3AcceleratorStatus::Available,
             summary: "system_profiler was unavailable; assuming Metal is available because this is Apple Silicon macOS.".to_string(),
             device_names: vec!["Apple Silicon unified GPU (assumed)".to_string()],
@@ -415,6 +439,7 @@ fn metal_compatibility(os: &str) -> M3AcceleratorCompatibility {
     } else {
         M3AcceleratorCompatibility {
             kind: AcceleratorKind::Metal,
+            execution: crate::runtime_adapter::execution_support(AcceleratorKind::Metal),
             status: M3AcceleratorStatus::NotDetected,
             summary: "system_profiler was unavailable and this is not Apple Silicon; Metal support could not be confirmed.".to_string(),
             device_names: Vec::new(),
@@ -523,6 +548,7 @@ fn cuda_compatibility(os: &str) -> M3AcceleratorCompatibility {
                 if driver_too_old || compute_too_old {
                     M3AcceleratorCompatibility {
                         kind: AcceleratorKind::Cuda,
+                        execution: crate::runtime_adapter::execution_support(AcceleratorKind::Cuda),
                         status: M3AcceleratorStatus::DriverTooOld,
                         summary: format!(
                             "NVIDIA GPU detected, but {} below what this app expects (driver >= {MIN_CUDA_DRIVER_MAJOR}.x, compute capability >= {MIN_CUDA_COMPUTE_CAPABILITY:.1}). CUDA acceleration may fail or fall back to CPU.",
@@ -540,6 +566,7 @@ fn cuda_compatibility(os: &str) -> M3AcceleratorCompatibility {
                 } else {
                     M3AcceleratorCompatibility {
                         kind: AcceleratorKind::Cuda,
+                        execution: crate::runtime_adapter::execution_support(AcceleratorKind::Cuda),
                         status: M3AcceleratorStatus::Available,
                         summary: "CUDA is available.".to_string(),
                         device_names: info.device_names,
@@ -622,6 +649,7 @@ fn rocm_compatibility(os: &str) -> M3AcceleratorCompatibility {
             ),
             Some(info) => M3AcceleratorCompatibility {
                 kind: AcceleratorKind::Rocm,
+                execution: crate::runtime_adapter::execution_support(AcceleratorKind::Rocm),
                 status: M3AcceleratorStatus::Available,
                 summary: match &info.driver_version {
                     Some(version) => format!("ROCm is available (driver {version})."),
@@ -735,6 +763,7 @@ fn vulkan_compatibility(os: &str) -> M3AcceleratorCompatibility {
                 }
                 M3AcceleratorCompatibility {
                     kind: AcceleratorKind::Vulkan,
+                    execution: crate::runtime_adapter::execution_support(AcceleratorKind::Vulkan),
                     status: M3AcceleratorStatus::Available,
                     summary,
                     device_names,
@@ -787,6 +816,7 @@ fn directml_compatibility(os: &str) -> M3AcceleratorCompatibility {
             } else {
                 M3AcceleratorCompatibility {
                     kind: AcceleratorKind::DirectMl,
+                    execution: crate::runtime_adapter::execution_support(AcceleratorKind::DirectMl),
                     status: M3AcceleratorStatus::Available,
                     // Deliberately not overclaiming: only a display adapter's
                     // presence was confirmed, not that the DirectML runtime
@@ -5031,10 +5061,16 @@ GPU1:
         // rather than crashing.
         let snapshot = SystemM3HardwareProbe.snapshot().expect("hardware snapshot");
         let report = build_compatibility_report(&snapshot);
-        assert_eq!(report.accelerators.len(), 5);
+        assert_eq!(report.accelerators.len(), 6);
         for entry in &report.accelerators {
             match entry.kind {
                 AcceleratorKind::Metal => {}
+                // Never probed: it is on the report to state that nothing here
+                // executes on it, which is a fact about this build and the same
+                // on every machine.
+                AcceleratorKind::AppleNeuralEngine => {
+                    assert_eq!(entry.status, M3AcceleratorStatus::Unsupported);
+                }
                 AcceleratorKind::Cuda | AcceleratorKind::Rocm | AcceleratorKind::Vulkan => {
                     assert!(matches!(
                         entry.status,
@@ -5123,7 +5159,17 @@ GPU1:
         let probe = SystemM3HardwareProbe;
         let report = crate::m3_runtime_hub::M3HardwareProbe::compatibility_report(&probe)
             .expect("compatibility report");
-        assert_eq!(report.accelerators.len(), 5);
+        assert_eq!(report.accelerators.len(), 6);
+        // Roadmap K16: every backend resolves, and the row says so in its own
+        // field rather than leaving a reader to infer it from `status`.
+        for entry in &report.accelerators {
+            assert_eq!(
+                entry.execution,
+                crate::runtime_adapter::execution_support(entry.kind),
+                "{:?}'s execution support must be derived from its kind, never set by hand",
+                entry.kind
+            );
+        }
     }
 
     /// ROADMAP Phase 8 item 12 (Multimodal Projector and Vision Model

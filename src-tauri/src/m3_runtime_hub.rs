@@ -600,6 +600,17 @@ pub struct M3AcceleratorCompatibility {
     /// runtime path itself) and for the Metal OS/arch fallback used when
     /// `system_profiler` is unavailable.
     pub confirmed: bool,
+    /// Whether anything in this app actually runs work on this backend, or it
+    /// is reported for diagnosis only (roadmap K16).
+    ///
+    /// Distinct from `status` and from `confirmed`, and the distinction is the
+    /// whole point. `status` is about the *machine* — is the hardware there,
+    /// is the driver new enough. `confirmed` is about the *detection* — was
+    /// that answered by a direct query or inferred. This is about **this
+    /// build**: a backend can be present, confirmed, and still have nothing
+    /// here that executes on it, which was true of three of the five and said
+    /// nowhere.
+    pub execution: crate::runtime_adapter::ExecutionSupport,
 }
 
 /// NVIDIA Jetson (Tegra) detection result. Jetson devices share CUDA
@@ -642,12 +653,23 @@ pub struct M3HardwareCompatibilityReport {
 pub fn compatibility_report_from_snapshot(
     snapshot: &HardwareSnapshot,
 ) -> M3HardwareCompatibilityReport {
+    // Every backend this app has an opinion about, including the one it never
+    // probes: `AppleNeuralEngine` is on the list so the report *states* that
+    // nothing here executes on it (roadmap K16). It can never be `Available`
+    // — `PlatformCapabilities::from_host` refuses it into the snapshot — so the
+    // loop below resolves it to `NotDetected` with `execution` carrying the
+    // reason, which is the honest pair.
+    //
+    // Kept in step with `m3_production`'s richer builder by
+    // `system_hardware_probe_compatibility_report_matches_hub_accessor`, which
+    // is what caught this list when only the other one had grown.
     let backends = [
         AcceleratorKind::Metal,
         AcceleratorKind::Cuda,
         AcceleratorKind::Rocm,
         AcceleratorKind::Vulkan,
         AcceleratorKind::DirectMl,
+        AcceleratorKind::AppleNeuralEngine,
     ];
     let mut accelerators = Vec::with_capacity(backends.len());
     for kind in backends {
@@ -670,6 +692,7 @@ pub fn compatibility_report_from_snapshot(
         };
         accelerators.push(M3AcceleratorCompatibility {
             kind,
+            execution: crate::runtime_adapter::execution_support(kind),
             status,
             summary,
             device_names,

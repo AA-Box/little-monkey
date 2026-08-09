@@ -28,6 +28,7 @@ describe("riskyAccelerators", () => {
         driverVersion: null,
         computeCapability: null,
         confirmed: true,
+        execution: { state: "detectionOnly", reason: "fixture" },
       },
       {
         kind: "cuda",
@@ -37,6 +38,7 @@ describe("riskyAccelerators", () => {
         driverVersion: null,
         computeCapability: null,
         confirmed: true,
+        execution: { state: "detectionOnly", reason: "fixture" },
       },
     ]);
     expect(riskyAccelerators(report)).toEqual([]);
@@ -52,6 +54,7 @@ describe("riskyAccelerators", () => {
         driverVersion: "410.10",
         computeCapability: "7.5",
         confirmed: true,
+        execution: { state: "detectionOnly", reason: "fixture" },
       },
       {
         kind: "rocm",
@@ -61,6 +64,7 @@ describe("riskyAccelerators", () => {
         driverVersion: null,
         computeCapability: null,
         confirmed: true,
+        execution: { state: "detectionOnly", reason: "fixture" },
       },
       {
         kind: "direct_ml",
@@ -70,6 +74,7 @@ describe("riskyAccelerators", () => {
         driverVersion: null,
         computeCapability: null,
         confirmed: true,
+        execution: { state: "detectionOnly", reason: "fixture" },
       },
     ]);
     expect(riskyAccelerators(report).map((accelerator) => accelerator.kind)).toEqual([
