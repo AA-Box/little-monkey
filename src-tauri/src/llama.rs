@@ -194,6 +194,10 @@ impl LlamaState {
 /// `monkey-cli`'s `embed_cli::start` (RAG design doc slice 4 CLI parity) can
 /// resolve the same binary without re-implementing this search.
 pub fn find_llama_server_binary() -> Result<String, String> {
+    // K22: nothing native starts while the startup self-integrity check says a
+    // component is tampered with — including the PATH fallback below, which
+    // would otherwise be a way past a refused managed tree.
+    crate::self_integrity::ensure_loadable()?;
     if let Some(app_data_dir) = crate::app_paths::data_dir() {
         let _ = crate::managed_runtime::materialize_bundled_runtime(None, &app_data_dir);
         if let Some(path) = crate::managed_runtime::find_managed_llama_server(Some(&app_data_dir)) {

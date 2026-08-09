@@ -200,6 +200,9 @@ pub async fn pull(reference: &str, insecure: bool) -> Result<(), String> {
 }
 
 fn managed_llama_server(app_data: &Path) -> Result<PathBuf, String> {
+    // K22: the CLI shares the desktop app's runtime trees, so it runs the same
+    // startup integrity gate before spawning one of them.
+    little_monkey_lib::self_integrity::ensure_loadable()?;
     match little_monkey_lib::managed_runtime::materialize_bundled_runtime(None, app_data)? {
         Some(path) => Ok(path),
         None => little_monkey_lib::managed_runtime::find_managed_llama_server(Some(app_data))
