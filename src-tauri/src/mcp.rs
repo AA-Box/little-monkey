@@ -1694,33 +1694,36 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn temp_path(name: &str) -> PathBuf {
+    /// A unique, existing directory for one test.
+    ///
+    /// Every config path below lives inside one of these rather than directly in
+    /// the shared temp dir, and that is load-bearing rather than tidy: the
+    /// revision log hangs off the config file's *parent* (`revision_root_for`),
+    /// so a config written straight into `/tmp` would put every test's history —
+    /// and every concurrent `cargo test` on the machine — into one shared log.
+    /// Tests would then interfere through the revision store while looking
+    /// independent.
+    fn temp_config_dir(label: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().join(format!(
             "little_monkey_mcp_test_{}_{}_{}_{}",
             std::process::id(),
             n,
             nanos,
-            name
-        ))
-    }
-
-    /// A unique *directory* for a test, unlike [`temp_path`]'s file in the
-    /// shared temp dir.
-    ///
-    /// The revision log hangs off the config file's own parent directory (see
-    /// `revision_root_for`), so a test using `temp_path` would put its history in
-    /// `/tmp` alongside every other test's. That is not a hypothetical: the whole
-    /// point of these tests is counting revisions.
-    fn temp_config_dir(name: &str) -> PathBuf {
-        let dir = temp_path(name);
+            label
+        ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    /// A config path inside its own fresh directory — see [`temp_config_dir`].
+    fn temp_path(name: &str) -> PathBuf {
+        temp_config_dir(name).join(name)
     }
 
     /// The stdio args of a saved entry, for asserting *which* version landed.
