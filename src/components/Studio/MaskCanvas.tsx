@@ -15,7 +15,15 @@
  * thing that makes inpainting usable.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Eraser, Paintbrush, Trash2 } from "lucide-react";
+import {
+  Eraser,
+  Paintbrush,
+  Redo2,
+  Trash2,
+  Undo2,
+  ZoomIn,
+  ZoomOut,
+} from "lucide-react";
 
 import { Button, IconButton } from "../ui";
 import { useT } from "../../lib/i18n";
@@ -25,6 +33,22 @@ import { useT } from "../../lib/i18n";
 const MIN_BRUSH = 8;
 const MAX_BRUSH = 256;
 const DEFAULT_BRUSH = 64;
+
+/** How many strokes can be taken back. Bounded because each entry is a whole
+ *  PNG of the mask; twelve covers the mis-stroke this exists for without
+ *  holding a session's worth of images in memory. */
+const MAX_HISTORY = 12;
+/** Zoom stops. 1 fits the column; past that the container scrolls, which is
+ *  what gives panning for free rather than a drag mode that would fight the
+ *  brush for the same pointer. */
+const ZOOM_STOPS = [1, 2, 3, 4] as const;
+
+/** Steps between stops, clamping at each end. Written against the list so a
+ *  stop added or removed needs no other change. */
+export const nextStop = (current: number) =>
+  ZOOM_STOPS.find((stop) => stop > current) ?? ZOOM_STOPS[ZOOM_STOPS.length - 1];
+export const previousStop = (current: number) =>
+  [...ZOOM_STOPS].reverse().find((stop) => stop < current) ?? ZOOM_STOPS[0];
 
 interface Props {
   /** Bare base64 (no data URL prefix) of the image being painted over. */
@@ -44,11 +68,28 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
   const [brush, setBrush] = useState(DEFAULT_BRUSH);
   const [erasing, setErasing] = useState(false);
   const [size, setSize] = useState<{ width: number; height: number } | null>(null);
+  const [zoom, setZoom] = useState(1);
+  /** One entry per undoable state, oldest first. `empty` distinguishes an
+   *  all-black canvas — which means "repaint nothing" and must be reported as
+   *  no mask at all — from one the user painted black over deliberately. */
+  const [history, setHistory] = useState<{ data: string; empty: boolean }[]>([]);
+  const [historyAt, setHistoryAt] = useState(0);
 
   const source = `data:image/png;base64,${imageBase64}`;
 
+  /** The mask the parent is currently holding, read inside the load effect
+   *  without making it a dependency — see the effect's own note. */
+  const incoming = useRef(value);
+  incoming.current = value;
+
   // Sizing the canvas to the source resets it, which is correct: a mask drawn
   // over one image means nothing over another.
+  //
+  // Unless the parent supplied one *for this image*. Extending the picture
+  // hands over a new source and the mask marking the new margin in the same
+  // update, and clearing unconditionally threw that mask away — so the margin
+  // the user asked to be filled arrived at the engine unmarked, and the run
+  // repainted everything or nothing instead of the new ground.
   useEffect(() => {
     let cancelled = false;
     const image = new Image();
@@ -63,7 +104,23 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
       if (!context) return;
       context.fillStyle = "#000";
       context.fillRect(0, 0, element.width, element.height);
-      onChange(null);
+      setZoom(1);
+
+      const supplied = incoming.current;
+      if (!supplied) {
+        setHistory([{ data: element.toDataURL("image/png"), empty: true }]);
+        setHistoryAt(0);
+        onChange(null);
+        return;
+      }
+      const mask = new Image();
+      mask.onload = () => {
+        if (cancelled) return;
+        context.drawImage(mask, 0, 0, element.width, element.height);
+        setHistory([{ data: element.toDataURL("image/png"), empty: false }]);
+        setHistoryAt(0);
+      };
+      mask.src = `data:image/png;base64,${supplied}`;
     };
     image.src = source;
     return () => {
@@ -113,8 +170,39 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
   const commit = useCallback(() => {
     const element = canvas.current;
     if (!element) return;
-    onChange(element.toDataURL("image/png").split(",")[1] ?? null);
-  }, [onChange]);
+    const data = element.toDataURL("image/png");
+    onChange(data.split(",")[1] ?? null);
+    // Anything that was undone is dropped: painting after an undo forks from
+    // there, so keeping the old redo tail would offer a future that no longer
+    // follows from what is on the canvas.
+    setHistory((current) => {
+      const kept = [...current.slice(0, historyAt + 1), { data, empty: false }];
+      // Stored as PNG data URLs rather than raw pixels: a 2048px `ImageData`
+      // is 16 MB, and a mostly-black mask compresses to a few kilobytes.
+      const trimmed = kept.slice(-MAX_HISTORY);
+      setHistoryAt(trimmed.length - 1);
+      return trimmed;
+    });
+  }, [onChange, historyAt]);
+
+  /** Puts one history entry back on the canvas and tells the parent what the
+   *  mask now is — `null` for the blank state, so an all-black mask is never
+   *  sent as if it were a real selection. */
+  const restore = (index: number) => {
+    const entry = history[index];
+    const element = canvas.current;
+    const context = element?.getContext("2d");
+    if (!entry || !element || !context) return;
+    const image = new Image();
+    image.onload = () => {
+      context.fillStyle = "#000";
+      context.fillRect(0, 0, element.width, element.height);
+      context.drawImage(image, 0, 0, element.width, element.height);
+      setHistoryAt(index);
+      onChange(entry.empty ? null : entry.data.split(",")[1] ?? null);
+    };
+    image.src = entry.data;
+  };
 
   const clear = () => {
     const element = canvas.current;
@@ -123,15 +211,29 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
     context.fillStyle = "#000";
     context.fillRect(0, 0, element.width, element.height);
     onChange(null);
+    // Clearing is itself undoable — it is the one action that can throw away
+    // several minutes of painting in a single click.
+    setHistory((current) => {
+      const kept = [
+        ...current.slice(0, historyAt + 1),
+        { data: element.toDataURL("image/png"), empty: true },
+      ].slice(-MAX_HISTORY);
+      setHistoryAt(kept.length - 1);
+      return kept;
+    });
   };
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="relative max-h-80 w-fit overflow-hidden rounded-md border border-border">
-        <img src={source} alt="" className="block max-h-80 w-auto select-none" draggable={false} />
-        <canvas
-          ref={canvas}
-          className="absolute inset-0 h-full w-full cursor-crosshair opacity-50 mix-blend-screen"
+      {/* `overflow-auto` rather than a drag-to-pan mode: past 1× the content is
+          wider than the box and the browser's own scrolling moves it, which
+          costs no code and never competes with the brush for the pointer. */}
+      <div className="max-h-80 overflow-auto rounded-md border border-border">
+        <div className="relative w-fit" style={{ width: `${zoom * 100}%` }}>
+          <img src={source} alt="" className="block w-full select-none" draggable={false} />
+          <canvas
+            ref={canvas}
+            className="absolute inset-0 h-full w-full cursor-crosshair opacity-50 mix-blend-screen"
           onPointerDown={(event) => {
             event.currentTarget.setPointerCapture(event.pointerId);
             painting.current = true;
@@ -154,13 +256,54 @@ export function MaskCanvas({ imageBase64, value, onChange }: Props) {
           // A cancelled pointer still ends the stroke — and still commits it.
           // The paint is already on the canvas either way, so skipping the
           // commit here would leave the exported mask behind what is drawn.
-          onPointerCancel={() => {
-            if (!painting.current) return;
-            painting.current = false;
-            last.current = null;
-            commit();
-          }}
-        />
+            onPointerCancel={() => {
+              if (!painting.current) return;
+              painting.current = false;
+              last.current = null;
+              commit();
+            }}
+          />
+        </div>
+      </div>
+
+      <div className="flex items-center gap-1.5 text-xs">
+        <IconButton
+          size="sm"
+          aria-label={t("Studio.mask.undo")}
+          title={t("Studio.mask.undo")}
+          disabled={historyAt <= 0}
+          onClick={() => restore(historyAt - 1)}
+        >
+          <Undo2 size={12} />
+        </IconButton>
+        <IconButton
+          size="sm"
+          aria-label={t("Studio.mask.redo")}
+          title={t("Studio.mask.redo")}
+          disabled={historyAt >= history.length - 1}
+          onClick={() => restore(historyAt + 1)}
+        >
+          <Redo2 size={12} />
+        </IconButton>
+        <IconButton
+          size="sm"
+          aria-label={t("Studio.mask.zoomOut")}
+          title={t("Studio.mask.zoomOut")}
+          disabled={zoom <= ZOOM_STOPS[0]}
+          onClick={() => setZoom((current) => previousStop(current))}
+        >
+          <ZoomOut size={12} />
+        </IconButton>
+        <IconButton
+          size="sm"
+          aria-label={t("Studio.mask.zoomIn")}
+          title={t("Studio.mask.zoomIn")}
+          disabled={zoom >= ZOOM_STOPS[ZOOM_STOPS.length - 1]}
+          onClick={() => setZoom((current) => nextStop(current))}
+        >
+          <ZoomIn size={12} />
+        </IconButton>
+        <span className="w-8 shrink-0 text-right font-mono text-[11px] text-faint">{zoom}×</span>
       </div>
 
       <div className="flex items-center gap-2 text-xs">
