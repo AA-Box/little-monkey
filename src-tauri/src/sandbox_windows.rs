@@ -19,6 +19,13 @@
 //! `ALL APPLICATION PACKAGES` by Windows itself, which is how any packaged app
 //! loads anything.
 //!
+//! One thing the container takes back rather than grants: `TMP` and `TEMP` are
+//! rewritten to the container's own package temp on the way in, whatever the
+//! environment block says, so the sandbox-owned temp directory has to be restored
+//! from inside the child. See [`APP_CONTAINER_OVERWRITTEN_ENV_KEYS`] — and treat
+//! any *other* sandbox-owned variable that stops arriving as the same class of
+//! bug, not as a caller mistake.
+//!
 //! That inverts the shape of the other two platforms and is stronger for it.
 //! `build_seatbelt_profile` and `sandbox_linux` have to *enumerate* readable
 //! system roots and keep that list correct per distribution; here the user's
@@ -630,6 +637,54 @@ fn null_device() -> io::Result<OwnedHandle> {
 /// from the DACL, never from the environment.
 const APP_CONTAINER_ENV_KEYS: &[&str] = &["LOCALAPPDATA", "SystemRoot", "USERPROFILE"];
 
+/// The variables Windows overwrites on the way into an AppContainer, and which
+/// therefore cannot be delivered by the environment block alone.
+///
+/// A container child's `TMP` and `TEMP` come back as
+/// `%LOCALAPPDATA%\Packages\<container>\AC\Temp` — the container's own package
+/// temp — no matter what [`environment_block`] put there. That silently undoes
+/// the sandbox's promise that temporary files live under the sandbox root: they
+/// land outside the tree the caller cleans up, and inside the profile that
+/// [`AppContainer::drop`] deletes, so a run's temporary output is destroyed with
+/// the container that wrote it. Every `%TMP%` write in
+/// `sandbox::tests::app_container_cannot_read_or_write_real_workspace_with_or_without_network`
+/// went there, which is why the host kept finding the sandbox's `tmp` empty.
+///
+/// `USERPROFILE` survives, so it is not in this list; only the temp pair is
+/// rewritten. See [`temp_reassignment`] for how they are put back.
+const APP_CONTAINER_OVERWRITTEN_ENV_KEYS: &[&str] = &["TMP", "TEMP"];
+
+/// `set` statements that put [`APP_CONTAINER_OVERWRITTEN_ENV_KEYS`] back to what
+/// the caller asked for, prefixed to the child's command line.
+///
+/// The only place left to do it. The environment block is rewritten *during*
+/// process creation, so the value has to be restored from inside the child —
+/// which for `cmd.exe /C` means `set` before the caller's command, taking effect
+/// for it and for everything it spawns. Values come from the caller's own
+/// allowlist rather than a second copy of the sandbox layout, so this cannot
+/// drift from what `crate::sandbox` decided the sandbox temp directory is.
+///
+/// Quoted `set "K=V"` rather than bare `set K=V`: it keeps a trailing space out
+/// of the value, and it makes a path containing `&` literal instead of a command
+/// separator.
+///
+/// Applied whether or not a container is present. A job-only run is not rewritten
+/// and does not need this, but re-asserting a value it already has is a no-op —
+/// cheaper than a second command-line shape that only one of the two paths ever
+/// exercises.
+fn temp_reassignment(env: &[(String, String)]) -> String {
+    let mut prefix = String::new();
+    for key in APP_CONTAINER_OVERWRITTEN_ENV_KEYS {
+        if let Some((_, value)) = env
+            .iter()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(key))
+        {
+            prefix.push_str(&format!("set \"{key}={value}\"&"));
+        }
+    }
+    prefix
+}
+
 /// `KEY=VALUE\0…\0\0` in UTF-16, which is what `CREATE_UNICODE_ENVIRONMENT`
 /// expects. An empty block would give the child *this* process's environment,
 /// so the caller's allowlist is passed even when it is short.
@@ -793,7 +848,14 @@ fn spawn_confined(
     // rather than quoted on purpose: cmd's own quote handling after `/C` is not
     // MSVC's, and re-quoting here would change commands the user already types
     // successfully elsewhere in the app.
-    let mut command_line = wide(&format!("cmd.exe /C {shell_command}"));
+    //
+    // The `set` prefix goes before it because there is nowhere else to put it —
+    // see [`temp_reassignment`]. It ends in `&`, so the caller's command is still
+    // the last thing on the line and still decides the exit code.
+    let mut command_line = wide(&format!(
+        "cmd.exe /C {}{shell_command}",
+        temp_reassignment(env)
+    ));
     let application = wide(&format!(
         "{}\\System32\\cmd.exe",
         std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string())
@@ -1348,6 +1410,86 @@ mod tests {
                     .join(", "),
                 Err(error) => format!("<unreadable: {error}>"),
             }
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A confined run's temporary directory must be the sandbox's own.
+    ///
+    /// Windows rewrites `TMP` and `TEMP` on the way into an AppContainer to the
+    /// container's package temp, `…\Packages\<container>\AC\Temp`, whatever the
+    /// environment block says — so this is the one sandbox-owned path that cannot
+    /// be delivered by [`environment_block`] and is restored by
+    /// [`temp_reassignment`] instead.
+    ///
+    /// Worth its own test rather than a line in the ladder above, because the
+    /// failure it guards is silent in both directions. The child still gets a
+    /// writable temp directory, so nothing errors; the files simply land outside
+    /// the tree the caller cleans up and inside the profile [`AppContainer::drop`]
+    /// deletes, and are gone by the time anyone looks. Asserting the variable is
+    /// not enough on its own either — a run could report the right path and still
+    /// write somewhere else — so the write is followed from the host side.
+    #[tokio::test]
+    async fn a_confined_run_gets_the_sandbox_temp_directory_not_the_containers() {
+        let root = std::env::temp_dir().join(format!("lm-ac-tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tmp = root.join("tmp");
+        std::fs::create_dir_all(&tmp).expect("sandbox tmp");
+
+        let Ok(container) = create_app_container("tmptest") else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "no AppContainer on this CI runner, so the rewrite this test exists \
+                 for never happened"
+            );
+            return;
+        };
+        container.grant_tree_access(&root).expect("grant");
+
+        // Only the temp pair, so a pass cannot come from some other variable
+        // happening to name the right directory.
+        let env = vec![
+            (
+                "SystemRoot".to_string(),
+                std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
+            ),
+            ("TMP".to_string(), tmp.to_string_lossy().into_owned()),
+            ("TEMP".to_string(), tmp.to_string_lossy().into_owned()),
+        ];
+        let output = run_confined(
+            Some(&container),
+            &create_job().expect("job"),
+            "echo tmp=%TMP% & echo temp=%TEMP% & echo written> \"%TMP%\\probe\"",
+            &root,
+            &env,
+            false,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("the confined run itself must work");
+
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let reported = format!(
+            "exit={:?} stdout={stdout:?} stderr={:?}",
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(&format!("tmp={}", tmp.display()))
+                && stdout.contains(&format!("temp={}", tmp.display())),
+            "the child's temp directory is not the sandbox's — Windows rewrote it \
+             and it was not put back, so this run's temporary files are outside the \
+             sandbox tree and inside a profile that is about to be deleted: wanted \
+             {}; {reported}",
+            tmp.display()
+        );
+        // The claim the variable alone does not make: a write through it lands
+        // somewhere the host still has after the container is gone.
+        assert!(
+            tmp.join("probe").is_file(),
+            "the child wrote through its temp directory and the host cannot see the \
+             file afterwards: {reported}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
