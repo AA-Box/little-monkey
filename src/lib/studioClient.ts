@@ -330,6 +330,26 @@ export function launchArgValue(args: string[], flag: string): string | null {
 
 /** `args` with `flag` set to `value`, replacing an existing one in place, or
  *  removed entirely when `value` is null or blank. */
+/** Whether a valueless flag like `--vae-tiling` is present. */
+export function hasLaunchFlag(args: string[], flag: string): boolean {
+  return args.includes(flag);
+}
+
+/**
+ * Adds or removes a flag that carries no value.
+ *
+ * Separate from [`setLaunchArg`], which cannot express one: there, an empty
+ * value *means* remove, so there is no way to say "present, with nothing after
+ * it". Removal takes exactly one slot — a valueless flag has no argument, and
+ * taking two would swallow whatever the user typed next.
+ */
+export function setLaunchFlag(args: string[], flag: string, on: boolean): string[] {
+  const at = args.indexOf(flag);
+  if (on) return at >= 0 ? [...args] : [...args, flag];
+  if (at < 0) return [...args];
+  return [...args.slice(0, at), ...args.slice(at + 1)];
+}
+
 export function setLaunchArg(args: string[], flag: string, value: string | null): string[] {
   const at = args.indexOf(flag);
   const trimmed = value?.trim() ?? "";
