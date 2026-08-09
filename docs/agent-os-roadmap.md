@@ -1358,7 +1358,8 @@ sites, process-group termination on every timeout, a sampling watchdog over daem
 jobs that measures memory across the whole process group, a per-kind declared limit
 set, a bounded *read* of the shell output that reaches a model — the cap holds the
 app's own heap, not just the returned string — a browser-session
-watchdog, and a wall-clock budget mechanism for the four WebView kinds. A limit kill
+watchdog plus a recorded process group that survives the app that spawned it, and a
+wall-clock budget mechanism for the four WebView kinds. A limit kill
 records as `limit_exceeded` rather than as an indistinguishable cancel, on every
 host.
 
@@ -1816,17 +1817,36 @@ for that rather than against it — it took owning `CreateProcessW` to get there
   `full_output` still returns the whole document, unbounded and deliberately so:
   `securityAutofix.ts` `JSON.parse`s it, where a truncated tail reads as zero
   vulnerabilities.
-- The browser worker's **pid is still not recorded**, so nothing outside the owning
-  process can name its Chromium — a crash still leaves an orphan that a startup
-  sweep can collect the profile of but never kill. `browser_worker.rs` also remains
-  the one app-side spawn site with no `process_group(0)`, so Chromium's renderer and
-  GPU children are exactly the surviving-grandchild case the process-tree slices
-  claim to have closed. The watchdog below reclaims sessions this app still knows
-  about; it does not solve either of these.
-- **No `ProcessKind` for a foreground shell or a browser session**, so neither gets
-  a row and neither's per-call bounds can be declared in the table. Adding a
-  browser kind needs a numbered SQLite migration to relax the `CHECK` on
-  `agent_processes.kind`.
+- ~~The browser worker's **pid is still not recorded**~~ — **closed, with the
+  migration this bullet said it needed.** `browser_worker.rs` was the last
+  app-side spawn site without `process_group(0)`; it has one now, so a session's
+  pid names its whole Chromium tree rather than one process out of a fan-out of
+  renderer, GPU, network and utility children. That pid is written to
+  `agent_processes.native_pid` under a new `browser_session` kind, and it is the
+  only durable handle anything has on that tree: a *later* app process can read
+  it and kill what this one left behind.
+  `reclaim_orphaned_browser_sessions` is that path, and it runs at startup
+  **before** the reap, because the reap is what erases the evidence. Pid reuse is
+  bounded rather than solved — the signal goes to a group, so a recycled pid that
+  leads no group fails with `ESRCH`, and the row is consulted once and closed
+  immediately after, so a given pid is signalled at most once ever. Narrowing it
+  further needs a process start time, which has no portable source here; the same
+  limit `os_signal::process_is_alive` already records. The proof is a real
+  process group in the test: a `sh` that forks a grandchild, whose survival is the
+  whole point — a per-pid kill leaves it running.
+- **No `ProcessKind` for a foreground shell**, so it gets no row and its per-call
+  bounds cannot be declared in the table. ~~or a browser session~~ — the browser
+  half is done: `MIGRATION_V18` rebuilds `agent_processes` to widen the `CHECK` on
+  `kind` (SQLite has no `ALTER TABLE … DROP CONSTRAINT`, so the twelve-step
+  rebuild is the only correct route, and `PRAGMA writable_schema` was rejected as
+  a schema edit with no validation on the table holding every process this app has
+  run). It is the ladder's first `RequiresThisVersion` since V13, and deliberately
+  so: a V17 binary's `ProcessKind::parse` rejects a kind it does not know, so it
+  cannot read past these rows and an `Additive` claim would be a promise it could
+  not keep. `browser_session` is also the second kind — and the only desktop one —
+  with an *enforced* class wall bound, declaring the `max_session_ms` the
+  browser watchdog already sweeps on rather than inventing a second ceiling.
+
 - **Two acceptance resources are unachievable as written** and the criteria should
   be amended rather than left standing: "open files" has no Windows job-object
   equivalent, so it is permanently unix-only; and "disk written" cannot come from
