@@ -19,8 +19,14 @@ const ACTION_CLASSES =
  * timers, and no dependency on the browser's own slow, unstyled `title`
  * bubble, which these buttons deliberately no longer set (two tooltips for
  * one icon reads as a bug).
+ *
+ * Exported because every icon-only control in a message's footer needs it,
+ * not only the ones this file owns — `MessageBubble.tsx`'s translate, edit,
+ * and side-task buttons sit in the same row and would otherwise be the only
+ * ones falling back to `title`. Wrap the button in
+ * `<span className="group/action relative">` for the hover/focus target.
  */
-function Tooltip({ text }: { text: string }) {
+export function Tooltip({ text }: { text: string }) {
   return (
     <span
       role="tooltip"

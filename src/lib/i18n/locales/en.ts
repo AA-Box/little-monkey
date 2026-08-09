@@ -565,6 +565,7 @@ export const en: Record<string, string> = {
   "MessageBubble.copyButton": "Copy code",
   "MessageBubble.copiedLabel": "Copied",
   "MessageBubble.copyMessage": "Copy message",
+  "MessageBubble.startSideTask": "Start side task from this message",
   "MessageBubble.pinChapter": "Pin as chapter",
   "MessageBubble.unpinChapter": "Unpin chapter",
   "MessageBubble.readAloud": "Read aloud",

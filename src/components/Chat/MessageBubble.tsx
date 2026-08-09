@@ -7,7 +7,7 @@ import { textContent, type ChatContentPart, type ChatMessage } from "../../lib/l
 import { detectFenceKind, fingerprintArtifact, type ArtifactRef } from "../../lib/artifacts";
 import { isWorkspaceImageSrc } from "../../lib/imageGeneration";
 import WorkspaceImagePreview from "./WorkspaceImagePreview";
-import MessageActions from "./MessageActions";
+import MessageActions, { Tooltip } from "./MessageActions";
 import { useArtifactStore } from "../../store/artifactStore";
 import { useSessionStore } from "../../store/sessionStore";
 // Lazy: `CodeBlock` pulls in `react-syntax-highlighter`'s Prism bundle, the
@@ -303,26 +303,31 @@ function UserBubble({
           <div className="mt-1.5 flex shrink-0 items-center gap-0.5">
             {translationControls}
             {onStartSideTask && (
-              <button
-                type="button"
-                onClick={onStartSideTask}
-                aria-label="Start side task from this message"
-                title="Start side task from this message"
-                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
-              >
-                <Split size={13} />
-              </button>
+              <span className="group/action relative">
+                <button
+                  type="button"
+                  onClick={onStartSideTask}
+                  aria-label={t("MessageBubble.startSideTask")}
+                  className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
+                >
+                  <Split size={13} />
+                </button>
+                <Tooltip text={t("MessageBubble.startSideTask")} />
+              </span>
             )}
             {onEdit && (
-              <button
-                type="button"
-                onClick={() => setEditing(true)}
-                disabled={editDisabled}
-                aria-label={t("MessageBubble.editMessageAriaLabel")}
-                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100 disabled:cursor-not-allowed disabled:opacity-0"
-              >
-                <Pencil size={13} />
-              </button>
+              <span className="group/action relative">
+                <button
+                  type="button"
+                  onClick={() => setEditing(true)}
+                  disabled={editDisabled}
+                  aria-label={t("MessageBubble.editMessageAriaLabel")}
+                  className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100 disabled:cursor-not-allowed disabled:opacity-0"
+                >
+                  <Pencil size={13} />
+                </button>
+                <Tooltip text={t("MessageBubble.editMessageAriaLabel")} />
+              </span>
             )}
           </div>
         )}
@@ -388,15 +393,17 @@ function AssistantMessage({
           />
         </div>
         {onStartSideTask && (
-          <button
-            type="button"
-            onClick={onStartSideTask}
-            aria-label="Start side task from this message"
-            title="Start side task from this message"
-            className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
-          >
-            <Split size={13} />
-          </button>
+          <span className="group/action relative">
+            <button
+              type="button"
+              onClick={onStartSideTask}
+              aria-label={t("MessageBubble.startSideTask")}
+              className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
+            >
+              <Split size={13} />
+            </button>
+            <Tooltip text={t("MessageBubble.startSideTask")} />
+          </span>
         )}
       </div>
     </div>
@@ -496,21 +503,25 @@ function TranslationControls({
         }
       }}
     >
-      <button
-        type="button"
-        aria-label={running ? t("Translation.cancel") : t("Translation.translate")}
-        aria-haspopup="dialog"
-        aria-expanded={menuOpen}
-        title={running ? t("Translation.cancel") : t("Translation.translate")}
-        disabled={disabled && !running}
-        onClick={() => {
-          if (running) cancelTranslation(messageTranslationKey(sessionId, index));
-          else setMenuOpen((value) => !value);
-        }}
-        className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint transition-colors hover:bg-surface-2 hover:text-foreground focus-visible:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
-      >
-        {running ? <LoaderCircle size={13} className="animate-spin" /> : <Languages size={13} />}
-      </button>
+      <span className="group/action relative">
+        <button
+          type="button"
+          aria-label={running ? t("Translation.cancel") : t("Translation.translate")}
+          aria-haspopup="dialog"
+          aria-expanded={menuOpen}
+          disabled={disabled && !running}
+          onClick={() => {
+            if (running) cancelTranslation(messageTranslationKey(sessionId, index));
+            else setMenuOpen((value) => !value);
+          }}
+          className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint transition-colors hover:bg-surface-2 hover:text-foreground focus-visible:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {running ? <LoaderCircle size={13} className="animate-spin" /> : <Languages size={13} />}
+        </button>
+        {/* Hidden while the language dialog is open — the tooltip would sit
+            on top of the panel it just opened. */}
+        {!menuOpen && <Tooltip text={running ? t("Translation.cancel") : t("Translation.translate")} />}
+      </span>
 
       {available && (
         <button
