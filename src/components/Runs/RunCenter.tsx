@@ -33,6 +33,7 @@ import {
 import { useT } from "../../lib/i18n";
 import { initializeRunStore, useRunStore } from "../../store/runStore";
 import { Button, IconButton, StatusPill, Tabs, type PillTone } from "../ui";
+import { PlacedNodesPanel } from "./PlacedNodesPanel";
 import { RunCapsulePanel } from "./RunCapsulePanel";
 import { startRunCapsuleReplay } from "../../lib/runCapsuleReplay";
 import { errorMessage } from "../../lib/errors";
@@ -280,6 +281,8 @@ export function RunCenter({ onClose }: RunCenterProps) {
           </IconButton>
         </div>
       </header>
+
+      <PlacedNodesPanel />
 
       {(error || actionError) && (
         <div role="alert" className="flex items-start justify-between gap-3 border-b border-danger/30 bg-danger-soft px-4 py-2 text-xs text-danger">
