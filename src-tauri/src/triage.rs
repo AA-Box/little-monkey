@@ -1501,7 +1501,7 @@ mod tests {
         // the real "insert into `state.permissions.pending` and await a
         // oneshot" path, not an early `emit`-failure shortcut.
         let state = std::sync::Arc::new(AppState::default());
-        let handle = tauri::test::mock_app().handle().clone();
+        let handle = crate::test_support::mock_app().handle().clone();
 
         let task_state = state.clone();
         let task_path = path.clone();
@@ -1548,7 +1548,7 @@ mod tests {
         .unwrap();
 
         let state = AppState::default();
-        let handle = tauri::test::mock_app().handle().clone();
+        let handle = crate::test_support::mock_app().handle().clone();
         let error = triage_send_draft_impl(&handle, &state, &path, "github:acme/widgets#1")
             .await
             .unwrap_err();
