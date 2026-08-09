@@ -307,6 +307,23 @@ mod tests {
     use super::*;
     use little_monkey_lib::checkpoints::{CheckpointEntry, ResumeState};
 
+    /// The pretend origin's workspace root, built with `join` rather than
+    /// written as a literal.
+    ///
+    /// A hard-coded `"/origin/work/src/main.rs"` is not one path on both
+    /// platforms: Windows accepts `/` as a separator, so `strip_prefix` hands
+    /// back a *single* component spelled `src/main.rs`, and re-rooting it then
+    /// produces a path that names the right file with a spelling no assertion
+    /// written for POSIX matches. Building the fixture natively keeps the test
+    /// about re-rooting instead of about separators.
+    fn origin_root() -> PathBuf {
+        PathBuf::from("origin").join("work")
+    }
+
+    fn local_root() -> PathBuf {
+        PathBuf::from("target").join("work")
+    }
+
     fn manifest(workspace: Option<&str>, entry_path: &str) -> CheckpointManifest {
         CheckpointManifest {
             version: 3,
@@ -340,17 +357,20 @@ mod tests {
 
     #[test]
     fn landing_re_roots_every_path_at_the_local_workspace() {
-        let local = PathBuf::from("/target/work");
+        let origin = origin_root();
+        let local = local_root();
         let landed = localise_manifest(
-            &manifest(Some("/origin/work"), "/origin/work/src/main.rs"),
+            &manifest(
+                Some(&origin.to_string_lossy()),
+                &origin.join("src").join("main.rs").to_string_lossy(),
+            ),
             "turn-local",
-            Some("/origin/work"),
+            Some(&origin.to_string_lossy()),
             &local,
         )
         .expect("re-rooting succeeds");
-        // Built with `join` rather than written out, because the landed path is
-        // deliberately *native*: a checkpoint entry is what a revert on this
-        // machine opens, so it must carry this platform's separators.
+        // A checkpoint entry is what a revert on *this* machine opens, so the
+        // landed path is native — hence the expectation is joined, not spelled.
         assert_eq!(
             landed.entries[0].path,
             local.join("src").join("main.rs").to_string_lossy()
@@ -367,11 +387,16 @@ mod tests {
 
     #[test]
     fn a_path_outside_the_migrated_workspace_refuses_rather_than_landing_half_translated() {
+        let origin = origin_root();
+        let elsewhere = PathBuf::from("somewhere").join("else").join("notes.md");
         let error = localise_manifest(
-            &manifest(Some("/origin/work"), "/somewhere/else/notes.md"),
+            &manifest(
+                Some(&origin.to_string_lossy()),
+                &elsewhere.to_string_lossy(),
+            ),
             "turn-local",
-            Some("/origin/work"),
-            Path::new("/target/work"),
+            Some(&origin.to_string_lossy()),
+            &local_root(),
         )
         .expect_err("an unrelated path cannot be re-rooted");
         assert!(error.contains("outside the migrated workspace"), "{error}");
@@ -379,17 +404,18 @@ mod tests {
 
     #[test]
     fn a_model_only_turn_lands_with_no_workspace_to_re_root() {
+        let untouched = origin_root().join("src").join("main.rs");
         let landed = localise_manifest(
-            &manifest(None, "/origin/work/src/main.rs"),
+            &manifest(None, &untouched.to_string_lossy()),
             "turn-local",
             None,
-            Path::new("/target/work"),
+            &local_root(),
         )
         .expect("a workspace-less image still lands");
         assert!(landed.resume.expect("still a freeze").workspace.is_none());
         // Untouched: with no origin root there is nothing to rewrite against,
         // and guessing one would be inventing a mapping.
-        assert_eq!(landed.entries[0].path, "/origin/work/src/main.rs");
+        assert_eq!(landed.entries[0].path, untouched.to_string_lossy());
     }
 
     #[test]

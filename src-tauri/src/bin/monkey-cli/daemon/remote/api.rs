@@ -3385,7 +3385,7 @@ mod tests {
         ));
         let workspace = origin.join("work");
         std::fs::create_dir_all(workspace.join("src")).unwrap();
-        std::fs::write(workspace.join("src/main.rs"), b"fn main() {}").unwrap();
+        std::fs::write(workspace.join("src").join("main.rs"), b"fn main() {}").unwrap();
 
         let checkpoint_id = "cp-migrate-01".to_string();
         let checkpoint_dir = origin.join("checkpoints").join(&checkpoint_id);
@@ -3403,7 +3403,11 @@ mod tests {
             reverted: false,
             prev_id: None,
             entries: vec![CheckpointEntry {
-                path: workspace.join("src/main.rs").to_string_lossy().to_string(),
+                path: workspace
+                    .join("src")
+                    .join("main.rs")
+                    .to_string_lossy()
+                    .to_string(),
                 backup: Some("0.bak".to_string()),
                 redo: None,
                 after: None,
@@ -3571,7 +3575,9 @@ mod tests {
         assert_eq!(receipt.run_id, "run-migrated");
 
         // The workspace really crossed.
-        let landed_file = PathBuf::from(&receipt.workspace_root).join("src/main.rs");
+        let landed_file = PathBuf::from(&receipt.workspace_root)
+            .join("src")
+            .join("main.rs");
         assert_eq!(std::fs::read(&landed_file).unwrap(), b"fn main() {}");
 
         // The conversation crossed too — without it a resume would continue a
