@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::limits::Limit;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::run_protocol::{
     ArtifactKind, CheckpointKind, ClientIdentity, MutationKind, PermissionDecision, RiskLevel,
@@ -255,6 +255,98 @@ pub enum ChainVerification {
         sequence: u64,
         detail: String,
     },
+}
+
+/// The origin's side of a K18 handover: the chain tip the target must name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationDeparture {
+    pub run_id: String,
+    pub sequence: u64,
+    pub event_hash: String,
+    pub target_node_id: String,
+    pub payload_sha256: String,
+    pub checkpoint_id: String,
+}
+
+/// The target's side of a K18 handover, read back from its first event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationArrival {
+    pub run_id: String,
+    pub origin_node_id: String,
+    pub origin_last_sequence: u64,
+    pub origin_last_event_hash: String,
+    pub payload_sha256: String,
+    pub event_hash: String,
+}
+
+/// Whether two nodes' halves of one run are the same chain (roadmap K18).
+///
+/// A tagged union for [`ChainVerification`]'s reason: "the halves join" and
+/// "here is why they do not" must not be readable off the same value, or a
+/// caller shows a migration as audited when the link is broken.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum MigrationChainJoin {
+    Joined {
+        run_id: String,
+        origin_node_id: String,
+        target_node_id: String,
+        /// Last sequence the origin vouches for; the target's chain restarts at
+        /// 1 because its `runs` row is new, so the two numbers do not continue
+        /// one another and are reported separately rather than summed.
+        origin_last_sequence: u64,
+        payload_sha256: String,
+    },
+    Broken {
+        detail: String,
+    },
+}
+
+/// Joins the two halves of a migrated run, or says exactly which fact disagrees.
+///
+/// Pure, and takes both halves as values, because the whole point of K18's
+/// "single ledger event chain across both nodes" is that no one database holds
+/// them: an auditor gathers a departure from one machine and an arrival from
+/// the other and checks them here. Each half is separately verifiable by
+/// [`RunLedger::verify_run_chain`] on its own node; this is the seam between.
+#[must_use]
+pub fn join_migration_chain(
+    departure: &MigrationDeparture,
+    arrival: &MigrationArrival,
+) -> MigrationChainJoin {
+    let broken = |detail: String| MigrationChainJoin::Broken { detail };
+    if departure.run_id != arrival.run_id {
+        return broken(format!(
+            "the origin departed run '{}' but the target admitted run '{}'",
+            departure.run_id, arrival.run_id
+        ));
+    }
+    if arrival.origin_last_event_hash != departure.event_hash {
+        return broken(
+            "the target's arrival names a different origin event hash than the origin's departure"
+                .to_string(),
+        );
+    }
+    if arrival.origin_last_sequence != departure.sequence {
+        return broken(format!(
+            "the target's arrival names origin sequence {} but the departure is sequence {}",
+            arrival.origin_last_sequence, departure.sequence
+        ));
+    }
+    if arrival.payload_sha256 != departure.payload_sha256 {
+        return broken(
+            "the two nodes recorded different payload digests for the same move".to_string(),
+        );
+    }
+    MigrationChainJoin::Joined {
+        run_id: departure.run_id.clone(),
+        origin_node_id: arrival.origin_node_id.clone(),
+        target_node_id: departure.target_node_id.clone(),
+        origin_last_sequence: departure.sequence,
+        payload_sha256: departure.payload_sha256.clone(),
+    }
 }
 
 #[derive(Debug)]
@@ -1248,6 +1340,100 @@ impl RunLedger {
 
     pub fn load_run(&self, run_id: &str) -> LedgerResult<Option<StoredRun>> {
         load_run_from(&self.connection, run_id)
+    }
+
+    /// The origin's chain tip for a run whose newest event is a departure
+    /// (roadmap K18), or `None` when this run never left.
+    ///
+    /// Reads the *newest* event rather than searching for any departure on
+    /// purpose: a run that departed, was refused, and carried on locally has a
+    /// departure in its history that no longer describes where it is. The tip
+    /// is the only departure a join may be built from, because the tip's hash is
+    /// the only one the far side could have named.
+    pub fn migration_departure(&self, run_id: &str) -> LedgerResult<Option<MigrationDeparture>> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT sequence, envelope_json, event_hash FROM run_events
+                 WHERE run_id = ?1 ORDER BY sequence DESC LIMIT 1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((sequence, envelope_json, event_hash)) = row else {
+            return Ok(None);
+        };
+        let envelope: RunEventEnvelope = serde_json::from_slice(&envelope_json)?;
+        let RunEvent::MigrationDeparted {
+            target_node_id,
+            payload_sha256,
+            checkpoint_id,
+        } = envelope.event
+        else {
+            return Ok(None);
+        };
+        // An unchained departure cannot anchor a join: there would be nothing
+        // for the arrival to name. Reported as absent rather than as a
+        // departure with an empty hash, which a caller could pass on as if it
+        // linked something.
+        let Some(event_hash) = event_hash else {
+            return Ok(None);
+        };
+        Ok(Some(MigrationDeparture {
+            run_id: run_id.to_string(),
+            sequence: from_sql_u64(sequence, "sequence")?,
+            event_hash,
+            target_node_id,
+            payload_sha256,
+            checkpoint_id,
+        }))
+    }
+
+    /// The target's half of a migrated run, read from its first event.
+    ///
+    /// Sequence 1 and nowhere else: an arrival that is not the first event of
+    /// the local chain would mean this node was already running the run before
+    /// it was handed over, which is a different (and unsound) history.
+    pub fn migration_arrival(&self, run_id: &str) -> LedgerResult<Option<MigrationArrival>> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT envelope_json, event_hash FROM run_events
+                 WHERE run_id = ?1 AND sequence = 1",
+                [run_id],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let Some((envelope_json, event_hash)) = row else {
+            return Ok(None);
+        };
+        let envelope: RunEventEnvelope = serde_json::from_slice(&envelope_json)?;
+        let RunEvent::MigrationArrived {
+            origin_node_id,
+            origin_last_sequence,
+            origin_last_event_hash,
+            payload_sha256,
+        } = envelope.event
+        else {
+            return Ok(None);
+        };
+        let Some(event_hash) = event_hash else {
+            return Ok(None);
+        };
+        Ok(Some(MigrationArrival {
+            run_id: run_id.to_string(),
+            origin_node_id,
+            origin_last_sequence,
+            origin_last_event_hash,
+            payload_sha256,
+            event_hash,
+        }))
     }
 
     pub fn load_run_by_idempotency_key(
@@ -3847,6 +4033,14 @@ fn derive_event_effects(event: &RunEvent) -> EventEffects<'_> {
                 reason,
             },
         ),
+        // Neither half of a migration changes the run's status, and that is
+        // deliberate. A departure is an attempt the target can still refuse, so
+        // it must not close the run; an arrival re-opens nothing, because the
+        // target's `runs` row was just inserted from the frozen spec and is
+        // already `queued`. What both events carry is the chain link, which is
+        // in the envelope and therefore already covered by the row hash.
+        RunEvent::MigrationDeparted { .. } => ("migration_departed", None, Projection::None),
+        RunEvent::MigrationArrived { .. } => ("migration_arrived", None, Projection::None),
     };
     EventEffects {
         event_type,
@@ -5315,6 +5509,149 @@ mod tests {
     /// Editing any column of any event breaks the chain at that event. The
     /// pre-existing `load_events` revalidation only catches a payload that stops
     /// being *valid protocol*; this catches a replacement that parses perfectly.
+    /// The two halves of a migrated run are one chain, and the seam is a hash
+    /// inside a hashed envelope rather than a column spanning two databases.
+    #[test]
+    fn a_migrated_run_joins_its_two_halves_through_the_departure_hash() {
+        let mut origin = RunLedger::open_in_memory().unwrap();
+        origin.submit_run(&spec("run-move", "submit/move")).unwrap();
+        origin.append_event(&queued("run-move", 1)).unwrap();
+        origin
+            .append_event(&envelope(
+                "run-move",
+                2,
+                "event-depart",
+                RunEvent::MigrationDeparted {
+                    target_node_id: "node-b".to_string(),
+                    payload_sha256: "e".repeat(64),
+                    checkpoint_id: "cp-01".to_string(),
+                },
+            ))
+            .unwrap();
+        let departure = origin
+            .migration_departure("run-move")
+            .unwrap()
+            .expect("the tip is a departure");
+        assert_eq!(departure.sequence, 2);
+        assert_eq!(departure.target_node_id, "node-b");
+        // The origin's own half still verifies on its own machine.
+        assert!(matches!(
+            origin.verify_run_chain("run-move").unwrap(),
+            ChainVerification::Intact { .. }
+        ));
+
+        let mut target = RunLedger::open_in_memory().unwrap();
+        target.submit_run(&spec("run-move", "submit/move")).unwrap();
+        target
+            .append_event(&envelope(
+                "run-move",
+                1,
+                "event-arrive",
+                RunEvent::MigrationArrived {
+                    origin_node_id: "node-a".to_string(),
+                    origin_last_sequence: departure.sequence,
+                    origin_last_event_hash: departure.event_hash.clone(),
+                    payload_sha256: departure.payload_sha256.clone(),
+                },
+            ))
+            .unwrap();
+        let arrival = target
+            .migration_arrival("run-move")
+            .unwrap()
+            .expect("the target's half opens with an arrival");
+
+        match join_migration_chain(&departure, &arrival) {
+            MigrationChainJoin::Joined {
+                run_id,
+                origin_node_id,
+                target_node_id,
+                origin_last_sequence,
+                ..
+            } => {
+                assert_eq!(run_id, "run-move");
+                assert_eq!(origin_node_id, "node-a");
+                assert_eq!(target_node_id, "node-b");
+                assert_eq!(origin_last_sequence, 2);
+            }
+            other => panic!("expected a join, got {other:?}"),
+        }
+    }
+
+    /// Every disagreement between the halves is a break, not a warning — an
+    /// auditor must not be able to read "audited" off a chain that does not meet.
+    #[test]
+    fn a_half_that_does_not_meet_the_other_is_a_broken_join() {
+        let departure = MigrationDeparture {
+            run_id: "run-move".to_string(),
+            sequence: 4,
+            event_hash: "a".repeat(64),
+            target_node_id: "node-b".to_string(),
+            payload_sha256: "e".repeat(64),
+            checkpoint_id: "cp-01".to_string(),
+        };
+        let sound = MigrationArrival {
+            run_id: "run-move".to_string(),
+            origin_node_id: "node-a".to_string(),
+            origin_last_sequence: 4,
+            origin_last_event_hash: "a".repeat(64),
+            payload_sha256: "e".repeat(64),
+            event_hash: "f".repeat(64),
+        };
+        assert!(matches!(
+            join_migration_chain(&departure, &sound),
+            MigrationChainJoin::Joined { .. }
+        ));
+
+        for mutate in [
+            (|arrival: &mut MigrationArrival| arrival.run_id = "run-other".to_string())
+                as fn(&mut MigrationArrival),
+            |arrival| arrival.origin_last_event_hash = "b".repeat(64),
+            |arrival| arrival.origin_last_sequence = 5,
+            |arrival| arrival.payload_sha256 = "d".repeat(64),
+        ] {
+            let mut arrival = sound.clone();
+            mutate(&mut arrival);
+            assert!(
+                matches!(
+                    join_migration_chain(&departure, &arrival),
+                    MigrationChainJoin::Broken { .. }
+                ),
+                "a disagreeing half must not join"
+            );
+        }
+    }
+
+    /// A run that departed, was refused, and carried on locally has a departure
+    /// in its history that no longer describes where it is — so the tip, and
+    /// only the tip, may anchor a join.
+    #[test]
+    fn a_departure_that_is_no_longer_the_tip_cannot_anchor_a_join() {
+        let mut ledger = RunLedger::open_in_memory().unwrap();
+        ledger
+            .submit_run(&spec("run-stayed", "submit/stayed"))
+            .unwrap();
+        ledger
+            .append_event(&envelope(
+                "run-stayed",
+                1,
+                "event-depart",
+                RunEvent::MigrationDeparted {
+                    target_node_id: "node-b".to_string(),
+                    payload_sha256: "e".repeat(64),
+                    checkpoint_id: "cp-01".to_string(),
+                },
+            ))
+            .unwrap();
+        assert!(ledger.migration_departure("run-stayed").unwrap().is_some());
+
+        // The target refused, and the run continued here.
+        ledger.append_event(&queued("run-stayed", 2)).unwrap();
+        assert!(
+            ledger.migration_departure("run-stayed").unwrap().is_none(),
+            "a superseded departure is not a handover"
+        );
+    }
+
     #[test]
     fn editing_an_event_breaks_the_chain_at_that_event() {
         let mut ledger = RunLedger::open_in_memory().unwrap();

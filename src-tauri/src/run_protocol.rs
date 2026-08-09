@@ -1656,6 +1656,35 @@ pub enum RunEvent {
         mutation_id: String,
         reason: String,
     },
+    /// This run's frozen process image left for another owned node (roadmap
+    /// K18), recorded on the origin's half of the chain.
+    ///
+    /// Deliberately **not terminal**. A departure is an attempt, not an
+    /// outcome: the target can still refuse the image, and a run whose move was
+    /// refused has to be able to carry on here. What makes the move auditable
+    /// is not this event's status but its *hash* — it is the origin's chain tip
+    /// that [`RunEvent::MigrationArrived`] names on the far side, so the two
+    /// halves are one chain even though no database spans both machines.
+    MigrationDeparted {
+        target_node_id: String,
+        /// SHA-256 of the transferred file payload, repeated by the arrival so
+        /// a reader can tell that both nodes are talking about the same bytes.
+        payload_sha256: String,
+        checkpoint_id: String,
+    },
+    /// A frozen process image from another owned node arrived here and was
+    /// admitted (roadmap K18), recorded as the first event of the target's half.
+    ///
+    /// `origin_last_event_hash` is what joins the halves. It is inside the
+    /// envelope, which `event_chain_hash` covers, so the link cannot be edited
+    /// on the target without breaking the target's own chain — no schema column
+    /// and no second store needed to span two machines.
+    MigrationArrived {
+        origin_node_id: String,
+        origin_last_sequence: u64,
+        origin_last_event_hash: String,
+        payload_sha256: String,
+    },
 }
 
 impl RunEvent {
@@ -1876,6 +1905,31 @@ impl RunEvent {
             } => {
                 validate_protocol_id("event.mutation_id", mutation_id)?;
                 validate_text("event.reason", reason, MAX_EVENT_TEXT_BYTES, false)?;
+            }
+            Self::MigrationDeparted {
+                target_node_id,
+                payload_sha256,
+                checkpoint_id,
+            } => {
+                validate_protocol_id("event.target_node_id", target_node_id)?;
+                validate_sha256("event.payload_sha256", payload_sha256)?;
+                validate_protocol_id("event.checkpoint_id", checkpoint_id)?;
+            }
+            Self::MigrationArrived {
+                origin_node_id,
+                origin_last_sequence,
+                origin_last_event_hash,
+                payload_sha256,
+            } => {
+                validate_protocol_id("event.origin_node_id", origin_node_id)?;
+                if *origin_last_sequence == 0 {
+                    return Err(ProtocolValidationError::new(
+                        "event.origin_last_sequence",
+                        "must name a real event on the origin's chain",
+                    ));
+                }
+                validate_sha256("event.origin_last_event_hash", origin_last_event_hash)?;
+                validate_sha256("event.payload_sha256", payload_sha256)?;
             }
         }
         Ok(())

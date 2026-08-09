@@ -294,6 +294,12 @@ pub mod run_protocol;
 // idempotency, leases, triggers, and the migration-controlled profile schema.
 // Like the protocol module, this remains reusable by non-Tauri clients.
 pub mod run_ledger;
+// The portable form of K13's frozen process image, plus the target node's
+// admission decision over it (roadmap K18). Kept out of `checkpoints` because
+// nothing here needs an AppHandle and both halves of a migration — the desktop
+// that freezes and the daemon's remote runner that receives — have to build the
+// same types.
+pub mod migration;
 // The one place a run-less subsystem writes to the unified event stream
 // (`run_ledger`'s `subsystem_events`). Public because the three writing contexts
 // — desktop, a process that owns its data directory, and a disabled test — do

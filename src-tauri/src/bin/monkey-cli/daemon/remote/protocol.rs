@@ -75,6 +75,17 @@ pub enum DeviceCapability {
     /// its nearest neighbour and is not the same thing: that launches a workflow
     /// this node already holds, under this node's own policy.
     PlaceRuns,
+    /// Hand this node a *frozen process image* from another owned node and let
+    /// it resume the run (roadmap K18).
+    ///
+    /// Strictly more than [`Self::PlaceRuns`], which is why it is not folded
+    /// into it: placing a run submits a spec the node then executes under its
+    /// own workspace and its own conversation. A migration additionally writes a
+    /// workspace tree, a checkpoint and a *conversation* onto this machine —
+    /// into the same session list the local user reads. An operator who wanted a
+    /// scheduler to place work should not have granted, by implication, the
+    /// ability to add transcripts to their own chat history.
+    Migrate,
 }
 
 impl DeviceCapability {
@@ -134,6 +145,14 @@ pub fn validate_capabilities(
         && !capabilities.contains(&DeviceCapability::ViewRuns)
     {
         return Err("Placing runs on this node also requires view_runs".to_string());
+    }
+    // A migration *is* a placement — it hands this node a `RunSpec` it did not
+    // author — plus the image. Requiring the weaker grant keeps one answer to
+    // "may this device cause work here", instead of two that could disagree.
+    if capabilities.contains(&DeviceCapability::Migrate)
+        && !capabilities.contains(&DeviceCapability::PlaceRuns)
+    {
+        return Err("Migrating a process onto this node also requires place_runs".to_string());
     }
     Ok(())
 }
@@ -464,6 +483,41 @@ pub struct DesktopControlActionRequest {
 #[serde(deny_unknown_fields)]
 pub struct DesktopControlStopRequest {
     pub session_id: String,
+}
+
+/// Body of `POST /v1/remote/migration/preflight` — metadata only, so a target
+/// refuses before a byte of workspace crosses the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationPreflightRequest {
+    pub protocol_version: u32,
+    pub header: little_monkey_lib::migration::MigrationHeader,
+}
+
+/// Body of `POST /v1/remote/migration/accept` — the image itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationAcceptRequest {
+    pub protocol_version: u32,
+    pub image: little_monkey_lib::migration::MigrationImage,
+}
+
+/// What the target did, returned to the origin so the move is auditable from
+/// both ends without either node reading the other's database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationReceipt {
+    pub protocol_version: u32,
+    pub node_id: String,
+    pub run_id: String,
+    /// The process id the target admitted. Deliberately the target's own, not
+    /// the origin's: two nodes minting the same process id would make
+    /// `agent_processes` ambiguous on whichever one later received the other's
+    /// audit.
+    pub process_id: String,
+    pub workspace_root: String,
+    pub arrival_event_hash: String,
+    pub caveats: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

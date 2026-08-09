@@ -2779,6 +2779,27 @@ fn searchable_run_event(
             "mutation",
             format!("{mutation_id} {reason}"),
         ),
+        // Indexed under "node" rather than "run": what someone searches for
+        // after a migration is the machine, and the run id is already the
+        // column this row is keyed by.
+        RunEvent::MigrationDeparted {
+            target_node_id,
+            checkpoint_id,
+            ..
+        } => (
+            "migration_departed",
+            "node",
+            format!("{target_node_id} {checkpoint_id}"),
+        ),
+        RunEvent::MigrationArrived {
+            origin_node_id,
+            origin_last_sequence,
+            ..
+        } => (
+            "migration_arrived",
+            "node",
+            format!("{origin_node_id} {origin_last_sequence}"),
+        ),
     }
 }
 
