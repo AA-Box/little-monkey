@@ -1457,10 +1457,22 @@ mod tests {
             ("TMP".to_string(), tmp.to_string_lossy().into_owned()),
             ("TEMP".to_string(), tmp.to_string_lossy().into_owned()),
         ];
+        // `set TMP`, not `echo %TMP%`, and a path written out in full rather than
+        // through the variable. cmd expands `%VAR%` when it *parses the line*, so
+        // every `%TMP%` on this line is replaced before [`temp_reassignment`]'s
+        // own `set` at the front of it has run — the probe would report, and the
+        // write would use, exactly the value this test exists to prove is gone.
+        // `set <prefix>` has no such problem: it prints what the environment holds
+        // when it runs. (It also prints `TMPDIR` if the caller set one; harmless,
+        // and `TMP=` is not a substring of `TMPDIR=`.)
+        let command = format!(
+            "set TMP & set TEMP & echo written> \"{}\\probe\"",
+            tmp.display()
+        );
         let output = run_confined(
             Some(&container),
             &create_job().expect("job"),
-            "echo tmp=%TMP% & echo temp=%TEMP% & echo written> \"%TMP%\\probe\"",
+            &command,
             &root,
             &env,
             false,
@@ -1476,8 +1488,8 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            stdout.contains(&format!("tmp={}", tmp.display()))
-                && stdout.contains(&format!("temp={}", tmp.display())),
+            stdout.contains(&format!("TMP={}", tmp.display()))
+                && stdout.contains(&format!("TEMP={}", tmp.display())),
             "the child's temp directory is not the sandbox's — Windows rewrote it \
              and it was not put back, so this run's temporary files are outside the \
              sandbox tree and inside a profile that is about to be deleted: wanted \

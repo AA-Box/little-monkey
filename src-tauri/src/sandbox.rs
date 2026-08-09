@@ -2951,13 +2951,24 @@ mod tests {
         //
         // * `LM-BEGIN` and `LM-END` bracket the run, so "the script stopped early"
         //   is a distinguishable outcome rather than an empty string.
-        // * `home=` / `tmp=` replace the two `exit /b 70` guards.
+        // * `home=` and `set TMP` replace the two `exit /b 70` guards.
         // * `type "{allowed}"` replaces 73: its content on stdout *is* the read.
         // * the two `dir /b` replace 74/75 — what the container sees of its own
         //   writes, which the host listing in the assertions below cannot show.
         // * `type "{forbidden}"` replaces 71: the secret must not appear.
         // * the `echo` into `{forbidden}` replaces 72, and the host reads that
         //   file afterwards to check it did not land.
+        //
+        // `%USERPROFILE%` is read through the variable, `%TMP%` never is. Windows
+        // rewrites a container's `TMP` and `TEMP` on the way in, so the sandbox
+        // restores them with a `set` at the front of this very line (see
+        // `sandbox_windows::temp_reassignment`) — and cmd expands `%VAR%` when it
+        // *parses* the line, before any of it runs. Every `%TMP%` here would be
+        // the container's package temp, the value the `set` exists to replace.
+        // `set TMP` has no such problem: it prints what the environment holds when
+        // it runs. It also prints `TMPDIR`, which the allowlist sets to the same
+        // path; harmless, and `TMP=` is not a substring of `TMPDIR=`. The two
+        // writes and the listing use `{tmp}`, written out in full.
         //
         // The deny probes come last on purpose. They are the two steps expected to
         // fail, and a failed step is the one that might take the rest of the line
@@ -2967,16 +2978,17 @@ mod tests {
         let command = format!(
             "echo LM-BEGIN \
              & echo home=%USERPROFILE% \
-             & echo tmp=%TMP% \
+             & set TMP \
              & type \"{allowed}\" \
              & echo home-ok> \"%USERPROFILE%\\probe\" \
-             & echo tmp-ok> \"%TMP%\\probe\" \
+             & echo tmp-ok> \"{tmp}\\probe\" \
              & dir /b \"%USERPROFILE%\" \
-             & dir /b \"%TMP%\" \
+             & dir /b \"{tmp}\" \
              & type \"{forbidden}\" \
              & echo overwritten> \"{forbidden}\" \
              & echo LM-END",
             allowed = canonical_workspace.join("allowed.txt").display(),
+            tmp = expected_tmp.display(),
             forbidden = canonical_forbidden.display(),
         );
 
@@ -3025,12 +3037,14 @@ mod tests {
                  LM-BEGIN means it ran nothing at all, an absent LM-END means a \
                  step took the rest of the line with it: {ran}"
             );
-            // The two `exit /b 70` guards, moved out of `cmd`. A wrong `%TMP%` or
+            // The two `exit /b 70` guards, moved out of `cmd`. A wrong
             // `%USERPROFILE%` would make every path below name somewhere other
-            // than the directories the host checks afterwards.
+            // than the directory the host checks afterwards; a wrong `TMP` would
+            // leave the run's temporary files outside the sandbox tree, in a
+            // container profile that is deleted with the container.
             assert!(
                 stdout.contains(&format!("home={}", expected_home.display()))
-                    && stdout.contains(&format!("tmp={}", expected_tmp.display())),
+                    && stdout.contains(&format!("TMP={}", expected_tmp.display())),
                 "the child's sandbox-owned environment is not what this test \
                  expects, so its writes did not go where the assertions look: \
                  wanted home={} tmp={}; {ran}",
