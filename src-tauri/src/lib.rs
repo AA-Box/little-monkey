@@ -324,6 +324,12 @@ pub mod http_policy;
 // Pure, AppHandle-free allowlist and dispatch matrix shared by the legacy and
 // M3 HTTP implementations while D1 collapses them into one listener.
 pub mod http_route_registry;
+// The agent tool schemas. In the library rather than beside the agent loop
+// because `contract` generates the published tool contract from them.
+pub mod agent_tools;
+// The published, semver'd syscall ABI (K19), generated from the route table,
+// the remote plane's dispatch, the ACP methods and `agent_tools`.
+pub mod contract;
 // Pure union model catalog used by the same D1 HTTP merge.
 pub mod http_model_catalog;
 pub mod http_model_service;

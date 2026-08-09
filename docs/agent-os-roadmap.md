@@ -4881,12 +4881,74 @@ as a single ledger event chain across both nodes.
 
 ## K19. Versioned syscall ABI
 
-**Today:** 490 `#[tauri::command]` entry points, a large agent tool surface
-(`tools.rs`), an OpenAI/Anthropic/Ollama-compatible HTTP surface with a real
-route-level regression harness (`m3_compatibility_harness.rs`), and ACP v1
-over stdio. The HTTP and ACP surfaces are contracts; the internal command
-surface is not versioned, and the tool schemas are not published as a
-standalone artifact third parties can build against.
+**Shipped.** `contract/agent-os-contract.json` is a semver'd description of
+every externally reachable route, the signed remote plane, the ACP methods and
+the agent tool schemas; `GET /v1/contract` answers with the version, the digest
+and the manifest itself; and CI fails when the surface changes and
+`CONTRACT_VERSION` does not. `docs/contract-abi.md` is the policy and the
+publishing procedure.
+
+**The decision the whole entry follows from: generated means read from the
+table the running code dispatches from, not written next to it.** A published
+contract that is a second copy of the surface is worth less than no contract,
+because it is believed. So the HTTP section is built from
+`http_route_registry::ROUTES` — the same const the listener classifies against
+— and the tool section from `agent_tools.rs`, which is `tools_def.rs`'s
+definitions *moved into the library* rather than duplicated there. That move is
+the reason the contract can be generated at all: the schemas were in a binary
+crate the library cannot read, so publishing them would have meant hand-copying
+them into the generator. `tools_def.rs` now re-exports, and there is still
+exactly one definition of each tool.
+
+- **The two surfaces a table could not be read from are scanned out of their
+  own source.** The remote plane (K10–K18) dispatches from a 26-arm `match` and
+  ACP from another; turning either into a data table would have been a large
+  refactor of a working security boundary for a documentation benefit. Instead
+  `contract::REMOTE_ROUTES` and `contract::ACP_METHODS` are declared, and a test
+  in each of those files parses its *own* dispatch match — method, path shape,
+  and the exact `RemoteAction`/`DeviceCapability` variant each arm requires —
+  and fails on any disagreement. It is `egress.rs`'s bare-client ratchet applied
+  to a different defect of the same class. It earned itself immediately: the
+  first run found two routes whose grants had been recorded from memory
+  (`/events` requires `ViewEvents`, not `ViewRuns`; artifacts require
+  `ReadArtifacts`), which is exactly the drift a hand-maintained table produces.
+- **Two files, because one cannot gate anything.**
+  `contract/agent-os-contract.json` is regenerated from the code, so it always
+  tracks it; `contract/baseline.json` is what was last *published* and only
+  changes when a human publishes. With a single file, regenerating it would
+  silently accept the breaking change along with the edit that caused it. The
+  gate diffs the two, classifies every difference, derives the smallest version
+  that covers them, and fails naming the required version and each change that
+  forced it.
+- **The bump rules are executable rather than advisory.** Removing a route,
+  moving it, dropping a tool parameter, making one required, re-grading a remote
+  route's grant, changing a protocol version, or shortening the support window
+  are `Breaking`; additions and relaxations are `Additive`; wording is `Patch`.
+  A reviewer never has to decide which one an edit was.
+- **`GET /v1/contract` answers before authentication, on both listeners**, for
+  the reason `/health` does: a client negotiating an ABI has not necessarily got
+  a credential of the right shape yet, and one whose shape changed must still be
+  able to find out. The body is a pure function of the built binary — no
+  configuration, no model list, no credential state — and carries the whole
+  manifest, so a client needs neither a second request nor a shipped copy. The
+  endpoint is itself in the contract it publishes.
+- **The support window is a number in code.** 180 days from the release that
+  announces a deprecation, with removal a major bump on top of it, because K20's
+  resolver has to answer "is this still here next quarter?" without a human
+  reading a policy page.
+
+**What v1 does not publish, stated because it is a real limit.** The six
+desktop-only tools (`spawn_task`, `shell_output`, `shell_kill`, `skill`,
+`read_skill_resource`, `generate_image`) are defined in TypeScript and are not
+in the contract; a vitest pins that list *and* compares every published tool's
+schema against `tools.ts`, so the set cannot grow silently and the two surfaces
+cannot disagree about what a tool's arguments are. Descriptions deliberately
+differ per surface (the desktop tells the model about multi-root workspaces;
+the CLI has one root), so the drift test compares schemas rather than prose.
+The ~490 Tauri commands remain absent by design — they are the app's own
+webview IPC, and `DENIED_SURFACES`, published in the manifest, is the
+machine-readable statement that no HTTP caller reaches an agent, workspace,
+tool, file, git, MCP or recipe surface.
 
 **Acceptance:** a published, semver'd schema set for the agent tool contract
 and every external route, generated from the source of truth rather than

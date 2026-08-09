@@ -118,6 +118,7 @@ pub enum RouteId {
     ModelStatus,
     ModelDelete,
     RequestCancel,
+    Contract,
     LegacyV1Preflight,
 }
 
@@ -368,6 +369,18 @@ pub const ROUTES: &[RouteSpec] = &[
         family: RouteFamily::M3Lifecycle,
         path: PathMatcher::Exact("/v1/requests/cancel"),
         methods: m3_methods(POST_OPTIONS),
+    },
+    // The K19 contract introspection endpoint. Shared, and unauthenticated on
+    // both listeners for the same reason `/health` is: a client has to be able
+    // to ask which ABI this instance implements *before* it knows whether its
+    // credentials are still the right shape. It reports only what the built
+    // binary would answer with anyway — no configuration, no model list, no
+    // credential state — so it is a version negotiation surface, not a probe.
+    RouteSpec {
+        id: RouteId::Contract,
+        family: RouteFamily::Shared,
+        path: PathMatcher::Exact("/v1/contract"),
+        methods: shared_methods(GET_OPTIONS, GET_OPTIONS),
     },
     RouteSpec {
         id: RouteId::LegacyV1Preflight,
@@ -993,6 +1006,11 @@ mod tests {
             "/v1/models/status",
             "/v1/models/delete",
             "/v1/requests/cancel",
+            // Reviewed against DENIED_SURFACES: the K19 introspection endpoint
+            // reads no state at all — its body is a pure function of the built
+            // binary — so it exposes no agent, workspace, tool, file, git, MCP
+            // or recipe surface. It publishes the fact that those are denied.
+            "/v1/contract",
             "/v1/*",
         ];
         let actual: Vec<String> = ROUTES
@@ -1087,7 +1105,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(ids.len(), 20);
+        assert_eq!(ids.len(), 21);
     }
 
     #[test]
