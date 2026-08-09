@@ -29,7 +29,9 @@ export function resolveGroupStatus(statuses: SubagentStatus[]): SubagentStatus {
   return "done";
 }
 
-function dotClass(status: SubagentStatus): string {
+/** Exported for the Background-tasks drawer's `AgentGroupCard`, which shows
+ * the same per-agent status dots this card's collapsed header does. */
+export function dotClass(status: SubagentStatus): string {
   switch (status) {
     case "running":
       return "animate-pulse bg-accent";
