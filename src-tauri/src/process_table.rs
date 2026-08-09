@@ -80,6 +80,45 @@ pub enum ProcessKind {
     BrowserSession,
 }
 
+/// The wall-clock budget the four WebView kinds carry by default.
+///
+/// # Why this number, and why one number for all four
+///
+/// Six hours. A `chat_turn`, a `subagent`, a `crew_member` and a `side_task` are
+/// the same shape of process — a WebView agent loop issuing an unbounded number
+/// of bounded tool calls — so giving them four different numbers would be
+/// inventing policy where there is only one question: how long may a loop keep
+/// *starting new work* before something concludes it is not going to stop?
+///
+/// Six hours answers that and nothing else. The longest legitimate run this app
+/// produces is a long agentic session, which is minutes to an hour of wall time
+/// even with hundreds of tool calls; a runaway loop has no bound at all. Anything
+/// between those is unaffected, which is the property a default has to have.
+///
+/// # The precondition this had to clear
+///
+/// `processWallBudget.ts` shipped inert on a stated reason, not on timidity:
+/// [`ProcessState`] has no state for "parked waiting on a human". A turn blocked
+/// on an unanswered permission dialog reads as `Running` and its `started_at_ms`
+/// keeps ageing, so a *tight* default would kill a turn for the user's own
+/// slowness — "the app cancelled my work while I was reading the prompt", which
+/// is worse than an unbounded turn.
+///
+/// That argument is an argument against a tight default, and it is why this one is
+/// not tight. Six hours of an unanswered dialog is not a user reading a prompt; it
+/// is a session nobody came back to, and ending it is the correct outcome rather
+/// than the regrettable one. Suspended time counting against the budget (see
+/// `processWallBudget.ts`) is bounded by the same reasoning.
+///
+/// # It is a floor, not a ceiling
+///
+/// The latch is observed at a safe point, so the real bound is this plus the
+/// longest tool timeout in flight — 120 s for a shell, 300 s for a verify. This
+/// bounds how long a runaway keeps starting new work. It is not a hard kill and
+/// must not be documented as one: a hard kill needs an OS process to signal,
+/// which is exactly what these kinds do not have.
+pub const WEBVIEW_WALL_BUDGET_MS: u64 = 6 * 60 * 60 * 1_000;
+
 impl ProcessKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -384,19 +423,30 @@ impl ProcessKind {
             // projection anyway, so claiming one would only mislead a reader
             // between admission and the first tick.
             ProcessKind::DaemonJob => ProcessLimits::default(),
-            // Nothing bounds these per process. A chat turn, a subagent and a
-            // crew member each run an unbounded number of bounded tool calls; a
-            // workflow run and node carry the executor's own per-node budgets,
-            // which are not these fields; and a remote run records that a
-            // controller *asked* for work rather than the work itself, so the
-            // daemon job it spawns is what carries limits.
+            // The four WebView kinds. Each runs an unbounded number of *bounded*
+            // tool calls, so the tools were capped and the process issuing them
+            // was not — `processWallBudget.ts` built the enforcement and then
+            // shipped it inert, because nothing chose a number.
+            //
+            // This chooses one. [`WEBVIEW_WALL_BUDGET_MS`] explains the value; what
+            // matters here is that it is a *class* default, seeded into every row
+            // at admission, and that an explicit budget from the caller still wins
+            // — which is how the wall-budget setting overrides it, and how a
+            // caller turns it off entirely.
             ProcessKind::ChatTurn
             | ProcessKind::Subagent
             | ProcessKind::CrewMember
-            | ProcessKind::WorkflowRun
-            | ProcessKind::WorkflowNode
-            | ProcessKind::RemoteRun
-            | ProcessKind::SideTask => ProcessLimits::default(),
+            | ProcessKind::SideTask => ProcessLimits {
+                max_wall_ms: Some(WEBVIEW_WALL_BUDGET_MS),
+                ..ProcessLimits::default()
+            },
+            // Still nothing per process. A workflow run and node carry the
+            // executor's own per-node budgets, which are not these fields; and a
+            // remote run records that a controller *asked* for work rather than
+            // the work itself, so the daemon job it spawns is what carries limits.
+            ProcessKind::WorkflowRun | ProcessKind::WorkflowNode | ProcessKind::RemoteRun => {
+                ProcessLimits::default()
+            }
             // The second kind with a real, enforced wall bound, and the only
             // desktop one. `browser_worker`'s watchdog already reclaims a
             // session past `BrowserLimits::max_session_ms` on a 30-second sweep;
@@ -3871,7 +3921,14 @@ mod tests {
             .collect();
         assert_eq!(
             bounded,
-            vec![ProcessKind::BackgroundShell, ProcessKind::BrowserSession],
+            vec![
+                ProcessKind::ChatTurn,
+                ProcessKind::Subagent,
+                ProcessKind::CrewMember,
+                ProcessKind::BackgroundShell,
+                ProcessKind::SideTask,
+                ProcessKind::BrowserSession
+            ],
             "a kind gained or lost a class-level bound; if that is intended, the \
              field docs on ProcessLimits and the K4 roadmap entry have to move with it"
         );
@@ -3898,10 +3955,44 @@ mod tests {
         assert_eq!(shell.max_wall_ms, None);
         assert_eq!(shell.max_memory_bytes, None);
 
+        // The four WebView kinds all carry the same wall budget, and only that:
+        // one number for four kinds because they are the same shape of process,
+        // and four different numbers would be inventing policy.
+        for kind in [
+            ProcessKind::ChatTurn,
+            ProcessKind::Subagent,
+            ProcessKind::CrewMember,
+            ProcessKind::SideTask,
+        ] {
+            let limits = kind.default_limits();
+            assert_eq!(
+                limits.max_wall_ms,
+                Some(WEBVIEW_WALL_BUDGET_MS),
+                "{} must carry the WebView wall budget",
+                kind.as_str()
+            );
+            assert_eq!(
+                limits,
+                ProcessLimits {
+                    max_wall_ms: Some(WEBVIEW_WALL_BUDGET_MS),
+                    ..ProcessLimits::default()
+                },
+                "{} must declare the wall budget and nothing else — the other \
+                 resources still have no enforcer for this kind",
+                kind.as_str()
+            );
+        }
+        // Six hours, asserted rather than left to a reader to infer, because the
+        // *value* is the decision this slice made.
+        assert_eq!(WEBVIEW_WALL_BUDGET_MS, 6 * 60 * 60 * 1_000);
+
         // The daemon is bounded, but by its own per-job recipe rather than by its
         // class — a class default would be overwritten on the next projection and
         // would only mislead a reader in between.
         assert!(ProcessKind::DaemonJob.default_limits().is_unbounded());
+        // A workflow node and a remote run stay genuinely unbounded here.
+        assert!(ProcessKind::WorkflowNode.default_limits().is_unbounded());
+        assert!(ProcessKind::RemoteRun.default_limits().is_unbounded());
     }
 
     /// The seeding has to reach the stored row, not just the builder, and it has
@@ -3928,10 +4019,12 @@ mod tests {
             "the class limits must survive the round-trip through SQL"
         );
 
-        // A turn declares nothing, and that has to stay visible as nothing rather
-        // than inheriting another kind's ceiling.
+        // A turn declares its own class's wall budget and nothing else — it must
+        // not inherit another kind's ceiling on the way past.
         let turn = admit(&table, ProcessKind::ChatTurn, "turn-classlimits");
-        assert!(turn.limits.is_unbounded());
+        assert_eq!(turn.limits, ProcessKind::ChatTurn.default_limits());
+        assert_eq!(turn.limits.max_wall_ms, Some(WEBVIEW_WALL_BUDGET_MS));
+        assert_eq!(turn.limits.max_output_bytes, None);
 
         let explicit = ProcessLimits {
             max_wall_ms: Some(30_000),
@@ -3997,7 +4090,8 @@ mod tests {
         assert!(record.started_at_ms.is_none());
         assert!(record.exited_at_ms.is_none());
         assert_eq!(record.created_at_ms, T0);
-        assert!(record.limits.is_unbounded());
+        // Seeded from the class, which for a chat turn is the WebView wall budget.
+        assert_eq!(record.limits, ProcessKind::ChatTurn.default_limits());
         assert!(record.is_live());
     }
 

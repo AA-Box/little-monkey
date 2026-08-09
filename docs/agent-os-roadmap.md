@@ -1359,7 +1359,8 @@ jobs that measures memory across the whole process group, a per-kind declared li
 set, a bounded *read* of the shell output that reaches a model — the cap holds the
 app's own heap, not just the returned string — a browser-session
 watchdog plus a recorded process group that survives the app that spawned it, and a
-wall-clock budget mechanism for the four WebView kinds. A limit kill
+wall-clock budget for the four WebView kinds that is now set as well as enforced.
+A limit kill
 records as `limit_exceeded` rather than as an indistinguishable cancel, on every
 host.
 
@@ -1794,9 +1795,34 @@ for that rather than against it — it took owning `CreateProcessW` to get there
 
 ### Still genuinely missing, after the corrections above narrowed the list
 
-- The four WebView kinds' wall budget is **enforced but unset** (see below): the
-  mechanism fires for nobody until a number is configured, and choosing that number
-  is blocked on a precondition, not on effort.
+- ~~The four WebView kinds' wall budget is **enforced but unset**~~ — **closed,
+  and a second defect fell out of closing it.** `ProcessKind::default_limits` now
+  gives `chat_turn`, `subagent`, `crew_member` and `side_task` a six-hour
+  `WEBVIEW_WALL_BUDGET_MS`. One number for four kinds, because they are the same
+  shape of process — a WebView loop issuing an unbounded number of bounded tool
+  calls — and four different numbers would be inventing policy where there is one
+  question: how long may a loop keep *starting new work* before something concludes
+  it is not going to stop.
+
+  The blocking precondition was real and is answered rather than waived: a turn
+  parked on an unanswered permission dialog reads as `Running` and keeps ageing, so
+  a *tight* default would cancel work for the user's own slowness. That is an
+  argument against a tight default, which is why this one is not tight — six hours
+  of an unanswered dialog is a session nobody came back to, not a user reading a
+  prompt. `processWallBudgetEnabled`/`processWallBudgetHours` (1–72 h) make it the
+  user's call, and *off* means the row is admitted with **no** `maxWallMs` rather
+  than one nothing enforces: a flag, not a `maxWallMs: 0`, because the ledger's
+  `CHECK` refuses a non-positive value and a zero read as "unbounded" is the
+  zero-versus-absent overloading this codebase avoids.
+
+  **The second defect:** `process_admit` built its limit set from the arguments
+  alone rather than merging onto the class default, so *every* row admitted over
+  IPC was declared unbounded no matter what its kind said. A class default could
+  therefore have been set at any point and would still have fired for nobody. That
+  also silently cost `background_shell` the output ceiling its class declares. The
+  merge is now one tested function (`merged_limits`), and the setting is applied at
+  `admitProcess` — the single chokepoint all four surfaces already go through — so
+  a fifth WebView surface cannot be admitted unbudgeted by omission.
 - ~~The foreground shell's **intermediate heap buffer**~~ — **closed.** The cap is
   now applied to the *read* rather than to the returned string. `wait_with_output`
   materialized both streams in full before any cap applied, so

@@ -1015,6 +1015,16 @@ export const en: Record<string, string> = {
   "AutomationPanel.checkpointRetentionLabel": "Keep last",
   "AutomationPanel.checkpointRetentionDescription": "How many recent checkpoints to keep on disk before the oldest are pruned. Applies the next time a checkpoint is created.",
   "AutomationPanel.checkpointRetentionUnit": "checkpoints",
+  "AutomationPanel.processWallBudgetHeading": "Runaway protection",
+  "AutomationPanel.processWallBudgetIntro":
+    "A chat turn, subagent, crew member or side task runs an unbounded number of individually bounded tool calls, so nothing stops a loop that never finishes. This bounds how long one keeps starting new work.",
+  "AutomationPanel.processWallBudgetEnabledLabel": "Stop long-running work",
+  "AutomationPanel.processWallBudgetEnabledDescription":
+    "Ask a turn, subagent, crew member or side task to wind down once it has been running longer than the budget below. It stops at its next safe point, so a tool call already in flight finishes first.",
+  "AutomationPanel.processWallBudgetHoursLabel": "Budget",
+  "AutomationPanel.processWallBudgetHoursDescription":
+    "Applies to work started from now on. Long by design: work waiting on a permission prompt is still counted as running.",
+  "AutomationPanel.processWallBudgetHoursUnit": "hours",
   "ProviderCard.connected": "Connected",
   "ProviderCard.custom": "Custom",
   "ProviderCard.remove": "Remove",
