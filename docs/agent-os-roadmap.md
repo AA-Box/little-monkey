@@ -4504,7 +4504,7 @@ against independently.
 
 *Maps to: ROADMAP #7.*
 
-## K16. Driver coverage completion
+## K16. Driver coverage completion *(built; harness route owed)*
 
 **Today:** real detection of Metal, CUDA, ROCm, Vulkan, and best-effort
 DirectML, with per-backend `available` / `not_detected` / `driver_too_old` /
@@ -4516,6 +4516,52 @@ usable execution target.
 executes on it (with a passing compatibility-harness route) or a stated
 reason it is detection-only. Apple Neural Engine and Windows DirectML each
 resolve to one of those two states rather than remaining ambiguous.
+
+**Shipped — the gap this entry's own "Today" line named is now a typed field.**
+
+That line said "detection is ahead of use — a detected backend is not always a
+usable execution target", and **nothing in the code encoded it**. The nearest
+candidates each meant something else: `AcceleratorCapability.available` means
+"detected and reporting itself usable" and the planner read it as permission;
+`M3AcceleratorCompatibility.confirmed` means "obtained by direct query rather
+than inferred", which is a fact about the *probe*. Neither is a fact about
+*this build*, and that is the one a user needs.
+
+- **`ExecutionSupport` is a tagged union**, so a caller cannot read "it executes"
+  without also reading *what* executes on it, nor "it does not" without a reason
+  to show. `execution_support(kind)` is exhaustive over the enum: a seventh
+  backend cannot be added without answering the question for it, and a test
+  asserts neither arm is ever empty.
+- **Three of the six do not execute, and each says why differently.** ROCm has no
+  bundled archive. DirectML has no runtime targeting it, and Windows device
+  enumeration can confirm a display adapter but not a working DirectML path.
+  Vulkan is the one that reads "yes" if you skim: the bundled `sd-server`
+  genuinely uses it — **for image and video** — while no chat or embedding
+  runtime targets it and it never enters the snapshot the planner reads, so a
+  model can never be placed there.
+- **CUDA executes, with the qualification in the same breath**: no bundled
+  archive is compiled for it, so it runs on a binary the user supplied.
+- **The Neural Engine is a variant that is never detected**, and that is the
+  point. "Absent from the enum" was the third state — the ambiguous one this
+  entry asked to remove. It is now on the report with the honest answer: the
+  GGUF runtimes have no ANE backend, and reaching it would mean shipping a Core
+  ML engine rather than configuring an existing one.
+- **The Driver Doctor gained a column**, not a footnote. "Detected" and "this app
+  can use it" are different facts, and three of six are the first without being
+  the second, so folding it into the status pill would have hidden exactly the
+  case that needs explaining. The reason renders beside the summary, because the
+  summary describes the *hardware* and cannot give it.
+- **The row's field is derived from its own `kind`**, asserted by a test, so the
+  two report builders cannot drift — which is not hypothetical: the existing
+  cross-builder test caught the second list when only the first had grown.
+
+**Remaining: the acceptance's parenthetical, "with a passing
+compatibility-harness route".** The harness mocks at the runtime-driver boundary
+and never spawns a process, and its `ApiBackend` is an API family
+(`ManagedLocal`/`Ollama`/`Mlx`/`CloudProvider`) rather than a hardware
+accelerator — there is no accelerator-keyed route anywhere. Proving execution
+*per backend* means running real work on real hardware, which is a per-machine
+claim this repo's CI cannot make for any backend but its own.
 
 ## K17. Remote node as a scheduled device
 

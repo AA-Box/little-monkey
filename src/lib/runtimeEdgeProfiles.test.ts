@@ -83,6 +83,7 @@ describe("resolveEdgeRuntimeProfile", () => {
         driverVersion: "390",
         computeCapability: "5.0",
         confirmed: true,
+        execution: { state: "detectionOnly", reason: "fixture" },
       }],
     }));
     expect(result.kind).toBe("legacy_cuda");

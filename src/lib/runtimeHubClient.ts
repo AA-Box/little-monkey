@@ -1,7 +1,24 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type M3RuntimeKind = "ollama" | "llama_cpp" | "mlx";
-export type AcceleratorKind = "cpu" | "metal" | "cuda" | "rocm" | "vulkan" | "direct_ml";
+export type AcceleratorKind =
+  | "cpu"
+  | "metal"
+  | "cuda"
+  | "rocm"
+  | "vulkan"
+  | "direct_ml"
+  | "apple_neural_engine";
+
+/** Mirrors `ExecutionSupport` — whether anything in this app actually runs work
+ * on a backend, or it is reported for diagnosis only (roadmap K16).
+ *
+ * Distinct from the row's `status` and `confirmed`: `status` is about the
+ * machine, `confirmed` is about the detection, and this is about the build. A
+ * backend can be present, confirmed, and still have nothing here to run on it. */
+export type ExecutionSupport =
+  | { state: "executes"; via: string }
+  | { state: "detectionOnly"; reason: string };
 export type HardwareTier = "constrained" | "balanced" | "performance";
 export type ApiBackend = "managed_local" | "ollama" | "mlx" | "cloud_provider";
 export type ApiScope =
@@ -66,6 +83,7 @@ export interface M3AcceleratorCompatibility {
   driverVersion: string | null;
   computeCapability: string | null;
   confirmed: boolean;
+  execution: ExecutionSupport;
 }
 
 export interface M3JetsonInfo {

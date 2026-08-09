@@ -258,6 +258,7 @@ export function RuntimeHubOverview() {
               <tr className="border-b border-border">
                 <th className="px-2 py-2 font-medium">Backend</th>
                 <th className="px-2 py-2 font-medium">Status</th>
+                <th className="px-2 py-2 font-medium">Runs work here</th>
                 <th className="px-2 py-2 font-medium">Driver / compute</th>
                 <th className="px-2 py-2 font-medium">Details</th>
               </tr>
@@ -273,15 +274,35 @@ export function RuntimeHubOverview() {
                         {!accelerator.confirmed ? " (unconfirmed)" : ""}
                       </StatusPill>
                     </td>
+                    {/* Deliberately its own column rather than folded into the
+                        status pill: "detected" and "this app can use it" are
+                        different facts, and three of the six backends are the
+                        first without being the second. */}
+                    <td className="px-2 py-3">
+                      <StatusPill tone={accelerator.execution.state === "executes" ? "success" : "neutral"}>
+                        {accelerator.execution.state === "executes" ? "Yes" : "Detection only"}
+                      </StatusPill>
+                    </td>
                     <td className="px-2 py-3 text-muted">
                       {[accelerator.driverVersion, accelerator.computeCapability].filter(Boolean).join(" · ") || "—"}
                     </td>
-                    <td className="px-2 py-3 text-muted">{accelerator.summary}</td>
+                    <td className="px-2 py-3 text-muted">
+                      {accelerator.summary}
+                      {/* The reason, next to the claim it qualifies. A backend
+                          nothing runs on is the case a user most needs an
+                          explanation for, and it is the one the summary — which
+                          describes the *hardware* — cannot give. */}
+                      <span className="mt-1 block text-faint">
+                        {accelerator.execution.state === "executes"
+                          ? `Runs on ${accelerator.execution.via}.`
+                          : accelerator.execution.reason}
+                      </span>
+                    </td>
                   </tr>
                 ))
               ) : (
                 <tr>
-                  <td colSpan={4} className="px-2 py-3 text-muted">Detecting hardware compatibility…</td>
+                  <td colSpan={5} className="px-2 py-3 text-muted">Detecting hardware compatibility…</td>
                 </tr>
               )}
             </tbody>
