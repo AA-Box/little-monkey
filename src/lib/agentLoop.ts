@@ -36,6 +36,7 @@ import {
   CANCELLED_TOOL_RESULT,
   describeUsageTarget,
   executeToolCall,
+  isBlockedInPlanMode,
   isToolCallAllowed,
   PRESENT_PLAN_RESULT,
   stringifyToolError,
@@ -56,6 +57,8 @@ import { currentSystemPrompt, ULTRACODE_SYSTEM_SECTION, type AttachedStackPrompt
 import { composeSkillCatalog, composeSkillSystemPrompt, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
 import { composeSavedWorkflowCatalog } from './workflow';
 import { selectSavedWorkflowList, useSavedWorkflowStore } from '../store/savedWorkflowStore';
+import { composeCustomAgentCatalog } from './customAgents';
+import { selectCustomAgentList, useCustomAgentStore } from '../store/customAgentStore';
 import { collectUserPromptSubmitContext } from './userHooks';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { isBtwNotice } from './slashCommands';
@@ -427,7 +430,14 @@ export function toolCallPlanArgs(toolCall: ToolCall): { title: string; plan: str
  * function's output feeds into, alongside `toolsForSettings`).
  */
 export function toolsForMode(tools: ToolDef[], mode: PermissionMode): ToolDef[] {
-  return mode === 'plan' ? [...tools, PRESENT_PLAN_TOOL] : tools;
+  if (mode !== 'plan') return tools;
+  // Fail closed at the OFFER level too, not just at Rust's mode gate: a tool
+  // Plan Mode would refuse anyway (see `isBlockedInPlanMode` — mutating and
+  // permission-gated names, `shell_kill`, and every un-marked `mcp__` tool)
+  // is not even shown to the model, so a well-behaved model never wastes a
+  // round trip on a doomed call. `executeToolCall`'s own check remains the
+  // dispatch backstop for a model that emits one regardless.
+  return [...tools.filter((tool) => !isBlockedInPlanMode(tool.function.name)), PRESENT_PLAN_TOOL];
 }
 
 /** Prefix identifying a synthetic notice inserted right after a successful
@@ -2796,6 +2806,13 @@ async function runAgentTurnBody(
         // so the catalog rides the same `subagentsEnabled` gate.
         ...(settings.subagentsEnabled
           ? [composeSavedWorkflowCatalog(selectSavedWorkflowList(useSavedWorkflowStore.getState()))]
+          : []),
+        // Custom agents are `profile` values of TASK_TOOL/WORKFLOW_TOOL, so
+        // the catalog rides the same gate that offers those tools — which
+        // includes an Ultracode turn's force-offer (see `toolsForSettings`'s
+        // call above).
+        ...(settings.subagentsEnabled || ultracode
+          ? [composeCustomAgentCatalog(selectCustomAgentList(useCustomAgentStore.getState()))]
           : []),
         ...(userPromptHookContext ? [userPromptHookContext] : []),
       ]
