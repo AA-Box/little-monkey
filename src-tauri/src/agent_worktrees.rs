@@ -131,12 +131,34 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Strips Windows' extended-length (`\\?\C:\...`) prefix: git rejects such
+/// paths outright (`could not create leading directories of '//?/C:/...':
+/// Invalid argument`) — and since the canonical string is also the registry
+/// key, keeping the prefix would break every later `worktree_remove`/`apply`
+/// too. Drive-letter verbatim paths are rewritten to their plain form;
+/// verbatim UNC (`\\?\UNC\...`) is left alone (rewriting it changes meaning,
+/// and git cannot use it either way). Applied unconditionally rather than
+/// under `cfg(windows)`: no Unix path starts with `\\?\`, and portable code
+/// stays testable on every platform.
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
+/// `canonicalize` + [`strip_verbatim`] — every path that reaches git or the
+/// registry goes through here.
+fn canonicalize_for_git(path: &Path) -> std::io::Result<PathBuf> {
+    path.canonicalize().map(strip_verbatim)
+}
+
 /// Creates a managed worktree of `workspace_root` at `HEAD` on a fresh
 /// `agent/<uuid>` branch. Core function with explicit roots so the tests
 /// never touch the shared profile data dir.
 pub fn create(data_root: &Path, workspace_root: &Path) -> Result<AgentWorktreeRecord, String> {
-    let workspace_canon = workspace_root
-        .canonicalize()
+    let workspace_canon = canonicalize_for_git(workspace_root)
         .map_err(|e| format!("Workspace root is not accessible: {e}"))?;
     run_git_ok(&workspace_canon, &["rev-parse", "--is-inside-work-tree"]).map_err(|_| {
         "The workspace is not a git repository, so a worktree cannot be created.".to_string()
@@ -147,7 +169,10 @@ pub fn create(data_root: &Path, workspace_root: &Path) -> Result<AgentWorktreeRe
     let dir = base_dir(data_root);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create the agent-worktrees dir: {e}"))?;
-    let target = dir.join(format!("wt-{id}"));
+    // Stripped BEFORE the git call: the target does not exist yet (so
+    // `canonicalize_for_git` can't run), but a verbatim `data_root` would
+    // make `git worktree add` fail on the joined path just the same.
+    let target = strip_verbatim(dir.join(format!("wt-{id}")));
 
     run_git_ok(
         &workspace_canon,
@@ -161,8 +186,7 @@ pub fn create(data_root: &Path, workspace_root: &Path) -> Result<AgentWorktreeRe
         ],
     )?;
 
-    let path_canon = target
-        .canonicalize()
+    let path_canon = canonicalize_for_git(&target)
         .map_err(|e| format!("Failed to canonicalize the new worktree: {e}"))?;
     let record = AgentWorktreeRecord {
         path: path_canon.to_string_lossy().to_string(),
@@ -190,8 +214,7 @@ pub fn create(data_root: &Path, workspace_root: &Path) -> Result<AgentWorktreeRe
 /// canonicalize, be present in the registry, AND still carry the creation
 /// marker. Anything else is refused — see the module doc's deletion contract.
 pub fn require_registered(data_root: &Path, path: &str) -> Result<AgentWorktreeRecord, String> {
-    let canon = Path::new(path)
-        .canonicalize()
+    let canon = canonicalize_for_git(Path::new(path))
         .map_err(|_| format!("'{path}' is not a managed agent worktree."))?;
     let key = canon.to_string_lossy().to_string();
     let registry = load_registry(data_root);
@@ -473,6 +496,22 @@ mod tests {
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "init"]);
         repo
+    }
+
+    #[test]
+    fn strip_verbatim_rewrites_drive_letter_paths_and_nothing_else() {
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\C:\Users\x\wt-1")),
+            PathBuf::from(r"C:\Users\x\wt-1")
+        );
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\UNC\server\share\wt-1")),
+            PathBuf::from(r"\\?\UNC\server\share\wt-1")
+        );
+        assert_eq!(
+            strip_verbatim(PathBuf::from("/tmp/plain/unix")),
+            PathBuf::from("/tmp/plain/unix")
+        );
     }
 
     #[test]
