@@ -276,6 +276,7 @@ pub mod permissions;
 // `pub` (not `mod`, like `sessions`/`tools`/`system` above) so `monkey-cli`
 // (slice 5) can call `read_rules_impl`/`load_impl`/`add_fact_impl` directly
 // from `little_monkey_lib`, the same way it already reuses `checkpoints`.
+pub mod hooks;
 pub mod memory;
 pub mod rules;
 pub mod workspace;
@@ -1196,6 +1197,9 @@ pub fn run() {
             web::web_remove_brave_key,
             rules::rules_read,
             rules::rules_write,
+            hooks::hooks_load,
+            hooks::hooks_save,
+            hooks::hook_exec,
             memory::memory_list,
             memory::memory_add,
             memory::memory_delete,

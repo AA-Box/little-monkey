@@ -50,7 +50,7 @@ export const MAX_SUBAGENT_ITERATIONS = 15;
  * "a chatty subagent must never itself blow out the PARENT's context" risk
  * called out in the design doc, mirrored on `mentions.ts`'s
  * `MAX_MENTION_CONTENT_CHARS` precedent for a referenced file's content. */
-const MAX_REPORT_CHARS = 8_000;
+export const MAX_REPORT_CHARS = 8_000;
 
 function capReport(text: string): string {
   if (text.length <= MAX_REPORT_CHARS) return text;
