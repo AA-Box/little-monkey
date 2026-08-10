@@ -154,8 +154,8 @@ fn keychain_account(provider: ConnectorProvider, id: &str) -> String {
 /// `config_file_path`, this needs no `AppHandle` at all, so every command
 /// below (bar the ones that also need `AppState`) is a plain function.
 pub(crate) fn config_file_path() -> Result<PathBuf, String> {
-    let dir = crate::app_paths::data_dir()
-        .ok_or_else(|| "Failed to resolve app data dir".to_string())?;
+    let dir =
+        crate::app_paths::data_dir().ok_or_else(|| "Failed to resolve app data dir".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {e}"))?;
     Ok(dir.join(CONFIG_FILE))
 }
@@ -165,9 +165,7 @@ pub(crate) fn config_file_path() -> Result<PathBuf, String> {
 /// never an error — same stance as `mcp.rs::load_config_impl`.
 pub fn load_config_impl(path: &Path) -> Result<ConnectorCatalogFile, String> {
     match std::fs::read_to_string(path) {
-        Ok(raw) => {
-            serde_json::from_str(&raw).map_err(|e| format!("Corrupt connectors.json: {e}"))
-        }
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("Corrupt connectors.json: {e}")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ConnectorCatalogFile::default()),
         Err(e) => Err(format!("Failed to read connectors.json: {e}")),
     }
@@ -181,8 +179,7 @@ pub fn save_config_impl(path: &Path, config: &ConnectorCatalogFile) -> Result<()
         .map_err(|e| format!("Failed to serialize connectors.json: {e}"))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &payload).map_err(|e| format!("Failed to write connectors.json: {e}"))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| format!("Failed to finalize connectors.json: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("Failed to finalize connectors.json: {e}"))?;
     Ok(())
 }
 
@@ -373,8 +370,7 @@ async fn verified_call_within_scope(
 }
 
 async fn verify_slack(token: &str) -> Result<String, String> {
-    let url =
-        Url::parse("https://slack.com/api/auth.test").expect("hardcoded Slack URL is valid");
+    let url = Url::parse("https://slack.com/api/auth.test").expect("hardcoded Slack URL is valid");
     let body = verified_call(
         reqwest::Method::POST,
         &url,
@@ -394,14 +390,17 @@ async fn verify_slack(token: &str) -> Result<String, String> {
             .unwrap_or("unknown_error");
         return Err(format!("Slack rejected the token: {error}"));
     }
-    let team = json.get("team").and_then(Value::as_str).unwrap_or("workspace");
+    let team = json
+        .get("team")
+        .and_then(Value::as_str)
+        .unwrap_or("workspace");
     let user = json.get("user").and_then(Value::as_str).unwrap_or("bot");
     Ok(format!("{user} @ {team}"))
 }
 
 async fn verify_notion(token: &str) -> Result<String, String> {
-    let url = Url::parse("https://api.notion.com/v1/users/me")
-        .expect("hardcoded Notion URL is valid");
+    let url =
+        Url::parse("https://api.notion.com/v1/users/me").expect("hardcoded Notion URL is valid");
     let body = verified_call(
         reqwest::Method::GET,
         &url,
@@ -490,7 +489,9 @@ fn validate_s3_bucket(bucket: &str) -> Result<(), String> {
 fn validate_s3_region(region: &str) -> Result<(), String> {
     let valid = !region.is_empty()
         && region.len() <= 40
-        && region.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
     if valid {
         Ok(())
     } else {
@@ -573,9 +574,8 @@ pub(crate) fn sigv4_authorization(
     let date_stamp = &amz_date[..amz_date.len().min(8)];
     let payload_hash = sha256_hex(b"");
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-    let canonical_headers = format!(
-        "host:{host_header}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
-    );
+    let canonical_headers =
+        format!("host:{host_header}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
     let canonical_request = format!(
         "{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     );
@@ -584,7 +584,10 @@ pub(crate) fn sigv4_authorization(
         "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
         sha256_hex(canonical_request.as_bytes())
     );
-    let k_date = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), date_stamp.as_bytes());
+    let k_date = hmac_sha256(
+        format!("AWS4{secret_key}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, b"s3");
     let k_signing = hmac_sha256(&k_service, b"aws4_request");
@@ -724,7 +727,9 @@ pub(crate) fn jira_connection(account: &ConnectorAccount) -> Result<(String, Str
     Ok((site_url, email))
 }
 
-pub(crate) fn s3_connection(account: &ConnectorAccount) -> Result<(String, String, String, String), String> {
+pub(crate) fn s3_connection(
+    account: &ConnectorAccount,
+) -> Result<(String, String, String, String), String> {
     let connection = account
         .connection
         .as_ref()
@@ -736,7 +741,12 @@ pub(crate) fn s3_connection(account: &ConnectorAccount) -> Result<(String, Strin
             .map(str::to_string)
             .ok_or_else(|| format!("Missing S3 {key}"))
     };
-    Ok((get("endpoint")?, get("bucket")?, get("region")?, get("access_key")?))
+    Ok((
+        get("endpoint")?,
+        get("bucket")?,
+        get("region")?,
+        get("access_key")?,
+    ))
 }
 
 // --- commands ---------------------------------------------------------------
@@ -1307,13 +1317,22 @@ mod tests {
 
         let reloaded = load_config_impl(&path).unwrap();
         assert_eq!(reloaded.accounts.len(), 1);
-        assert_eq!(reloaded.accounts[0].credential_ref.as_deref(), Some(credential_ref.as_str()));
+        assert_eq!(
+            reloaded.accounts[0].credential_ref.as_deref(),
+            Some(credential_ref.as_str())
+        );
     }
 
     #[test]
     fn keychain_account_is_scoped_by_both_provider_and_id() {
-        assert_eq!(keychain_account(ConnectorProvider::Slack, "abc"), "connector:slack:abc");
-        assert_eq!(keychain_account(ConnectorProvider::Jira, "abc"), "connector:jira:abc");
+        assert_eq!(
+            keychain_account(ConnectorProvider::Slack, "abc"),
+            "connector:slack:abc"
+        );
+        assert_eq!(
+            keychain_account(ConnectorProvider::Jira, "abc"),
+            "connector:jira:abc"
+        );
         assert_ne!(
             keychain_account(ConnectorProvider::Slack, "abc"),
             keychain_account(ConnectorProvider::Notion, "abc")
@@ -1337,7 +1356,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(account.provider, ConnectorProvider::Github);
-        assert_eq!(account.credential_ref, None, "GitHub must never get a keychain entry");
+        assert_eq!(
+            account.credential_ref, None,
+            "GitHub must never get a keychain entry"
+        );
         assert_eq!(account.identity.as_deref(), Some("octocat"));
     }
 
@@ -1365,7 +1387,10 @@ mod tests {
             "ok",
         )
         .unwrap();
-        assert_eq!(first.id, second.id, "reconnecting the same gh login must not duplicate");
+        assert_eq!(
+            first.id, second.id,
+            "reconnecting the same gh login must not duplicate"
+        );
         let config = load_config_impl(&path).unwrap();
         assert_eq!(config.accounts.len(), 1);
     }
@@ -1380,17 +1405,13 @@ mod tests {
                 .unwrap_err();
         assert!(not_installed.contains("not installed"), "{not_installed}");
 
-        let not_authenticated = add_github_with_status_impl(
-            &state,
-            &path,
-            None,
-            true,
-            false,
-            None,
-            "token expired",
-        )
-        .unwrap_err();
-        assert!(not_authenticated.contains("token expired"), "{not_authenticated}");
+        let not_authenticated =
+            add_github_with_status_impl(&state, &path, None, true, false, None, "token expired")
+                .unwrap_err();
+        assert!(
+            not_authenticated.contains("token expired"),
+            "{not_authenticated}"
+        );
 
         assert!(load_config_impl(&path).unwrap().accounts.is_empty());
     }
@@ -1443,14 +1464,9 @@ mod tests {
 
     #[test]
     fn reverify_github_rejects_a_currently_authenticated_login_that_does_not_match_the_entry() {
-        let error = reverify_github_identity_impl(
-            Some("alice"),
-            true,
-            true,
-            Some("bob".to_string()),
-            "ok",
-        )
-        .unwrap_err();
+        let error =
+            reverify_github_identity_impl(Some("alice"), true, true, Some("bob".to_string()), "ok")
+                .unwrap_err();
         assert!(
             error.contains("alice") && error.contains("bob"),
             "error should name both the expected and current identity: {error}"
@@ -1459,12 +1475,13 @@ mod tests {
 
     #[test]
     fn reverify_github_surfaces_missing_or_expired_cli_auth_instead_of_a_stale_identity() {
-        let error = reverify_github_identity_impl(Some("alice"), true, false, None, "token expired")
-            .unwrap_err();
+        let error =
+            reverify_github_identity_impl(Some("alice"), true, false, None, "token expired")
+                .unwrap_err();
         assert!(error.contains("token expired"), "{error}");
 
-        let error = reverify_github_identity_impl(Some("alice"), false, false, None, "n/a")
-            .unwrap_err();
+        let error =
+            reverify_github_identity_impl(Some("alice"), false, false, None, "n/a").unwrap_err();
         assert!(error.contains("missing or expired"), "{error}");
     }
 
@@ -1489,7 +1506,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err(), "expected a blocked loopback Jira site to fail verification");
+        assert!(
+            result.is_err(),
+            "expected a blocked loopback Jira site to fail verification"
+        );
         let config = load_config_impl(&path).unwrap();
         assert!(
             config.accounts.is_empty(),
@@ -1569,7 +1589,9 @@ mod tests {
         assert!(load_config_impl(&path).unwrap().accounts.is_empty());
         let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &credential_ref).unwrap();
         match entry.get_password() {
-            Ok(_) => panic!("expected the keychain secret to be deleted alongside the catalog entry"),
+            Ok(_) => {
+                panic!("expected the keychain secret to be deleted alongside the catalog entry")
+            }
             Err(keyring::Error::NoEntry) => {}
             Err(other) => panic!("unexpected keychain error: {other}"),
         }
@@ -1598,7 +1620,9 @@ mod tests {
             created_at: 42,
             last_verified_at: Some(43),
             last_error: Some("expired".to_string()),
-            connection: Some(serde_json::json!({ "site_url": "https://acme.atlassian.net", "email": "jane@acme.example" })),
+            connection: Some(
+                serde_json::json!({ "site_url": "https://acme.atlassian.net", "email": "jane@acme.example" }),
+            ),
         };
         save_config_impl(
             &path,
@@ -1629,7 +1653,11 @@ mod tests {
 
     // --- SSRF / origin pinning for the verification HTTP call ---------------
 
-    fn spawn_fixture(status_line: &str, extra_headers: &str, body: &'static str) -> std::net::SocketAddr {
+    fn spawn_fixture(
+        status_line: &str,
+        extra_headers: &str,
+        body: &'static str,
+    ) -> std::net::SocketAddr {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -1686,11 +1714,16 @@ mod tests {
 
     #[tokio::test]
     async fn verified_call_refuses_to_follow_a_redirect() {
-        let addr = spawn_fixture("HTTP/1.1 302 Found", "Location: http://example.test/\r\n", "");
+        let addr = spawn_fixture(
+            "HTTP/1.1 302 Found",
+            "Location: http://example.test/\r\n",
+            "",
+        );
         let origin = format!("http://{addr}");
         let url = Url::parse(&format!("http://{addr}/")).unwrap();
 
-        let result = verified_call(reqwest::Method::GET, &url, &origin, true, &[], None, None).await;
+        let result =
+            verified_call(reqwest::Method::GET, &url, &origin, true, &[], None, None).await;
         match result {
             Ok(_) => panic!("expected the redirect to be refused"),
             Err(message) => assert!(
@@ -1724,10 +1757,14 @@ mod tests {
         let origin = format!("http://{addr}");
         let url = Url::parse(&format!("http://{addr}/")).unwrap();
 
-        let result = verified_call(reqwest::Method::GET, &url, &origin, true, &[], None, None).await;
+        let result =
+            verified_call(reqwest::Method::GET, &url, &origin, true, &[], None, None).await;
         match result {
             Ok(_) => panic!("expected the oversized response to be rejected"),
-            Err(message) => assert!(message.contains("size limit"), "unexpected error: {message}"),
+            Err(message) => assert!(
+                message.contains("size limit"),
+                "unexpected error: {message}"
+            ),
         }
     }
 
@@ -1856,7 +1893,10 @@ mod tests {
     #[test]
     fn hmac_sha256_matches_the_rfc_4231_test_case_2_vector() {
         let mac = hex_encode(&hmac_sha256(b"Jefe", b"what do ya want for nothing?"));
-        assert_eq!(mac, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+        assert_eq!(
+            mac,
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
     }
 
     #[test]
@@ -1876,7 +1916,11 @@ mod tests {
              SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="
         ));
         let signature = header.rsplit("Signature=").next().unwrap();
-        assert_eq!(signature.len(), 64, "signature must be 64 lowercase-hex characters: {signature}");
+        assert_eq!(
+            signature.len(),
+            64,
+            "signature must be 64 lowercase-hex characters: {signature}"
+        );
         assert!(signature.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 
@@ -1960,7 +2004,10 @@ mod tests {
             "us-east-1",
         );
         let names: Vec<&str> = headers.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, vec!["x-amz-date", "x-amz-content-sha256", "authorization"]);
+        assert_eq!(
+            names,
+            vec!["x-amz-date", "x-amz-content-sha256", "authorization"]
+        );
         assert!(headers[2].1.starts_with("AWS4-HMAC-SHA256 Credential="));
     }
 }

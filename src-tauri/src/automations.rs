@@ -14,10 +14,10 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use crate::profiles::ProfileScopedPaths;
 use chrono::Utc;
 use croner::Cron;
-use tauri::{Emitter};
-use crate::profiles::ProfileScopedPaths;
+use tauri::Emitter;
 
 const AUTOMATIONS_FILE: &str = "automations.json";
 

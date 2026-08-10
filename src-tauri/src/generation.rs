@@ -236,19 +236,16 @@ impl ModelComponent {
             ComponentSource::HuggingFace { file, .. } => {
                 file.rsplit('/').next().unwrap_or(file.as_str())
             }
-            ComponentSource::LocalFile { path } => path
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(path.as_str()),
+            ComponentSource::LocalFile { path } => {
+                path.rsplit(['/', '\\']).next().unwrap_or(path.as_str())
+            }
         }
     }
 
     /// Where this component actually lives once available.
     pub fn resolved_path(&self, model_root: &Path, model_id: &str) -> PathBuf {
         match &self.source {
-            ComponentSource::HuggingFace { .. } => {
-                model_root.join(model_id).join(self.file_name())
-            }
+            ComponentSource::HuggingFace { .. } => model_root.join(model_id).join(self.file_name()),
             ComponentSource::LocalFile { path } => PathBuf::from(path),
         }
     }
@@ -496,9 +493,7 @@ pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
         })
         .count();
     if denoisers != 1 {
-        return Err(
-            "Exactly one file must be the checkpoint or the diffusion model".to_string(),
-        );
+        return Err("Exactly one file must be the checkpoint or the diffusion model".to_string());
     }
     let mut slots = BTreeSet::new();
     let mut names = BTreeSet::new();
@@ -512,7 +507,10 @@ pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
         // Components land in one flat directory per model, so two files
         // sharing a basename would overwrite each other.
         if !names.insert(component.file_name().to_string()) {
-            return Err(format!("Two files are both named {}", component.file_name()));
+            return Err(format!(
+                "Two files are both named {}",
+                component.file_name()
+            ));
         }
         match &component.source {
             ComponentSource::HuggingFace { repo, file } => {
@@ -536,17 +534,18 @@ pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
     if spec.defaults.fps == 0 || spec.defaults.fps > MAX_FPS {
         return Err(format!("Frame rate must be between 1 and {MAX_FPS}"));
     }
-    if spec.defaults.sample_method.trim().is_empty()
-        || spec.defaults.sample_method.len() > 64
-    {
+    if spec.defaults.sample_method.trim().is_empty() || spec.defaults.sample_method.len() > 64 {
         return Err("A model needs a sampling method".to_string());
     }
     // The engine's own constraint: an IP-Adapter reads its reference image
     // through a CLIP vision tower, and `--ip-adapter` without `--clip_vision`
     // fails inside `sd-server` at load. Caught here so the model is rejected
     // while it is being added rather than the first time it is run.
-    let slots: BTreeSet<ComponentSlot> =
-        spec.components.iter().map(|component| component.slot).collect();
+    let slots: BTreeSet<ComponentSlot> = spec
+        .components
+        .iter()
+        .map(|component| component.slot)
+        .collect();
     if slots.contains(&ComponentSlot::IpAdapter) && !slots.contains(&ComponentSlot::ClipVision) {
         return Err("An IP-Adapter also needs a CLIP vision encoder".to_string());
     }
@@ -883,7 +882,11 @@ pub fn apply_component_overrides(
             .iter()
             .find(|entry| entry.slot == choice.slot && entry.path == choice.path)
             .ok_or_else(|| {
-                format!("{} is not a {} in your library", choice.path, choice.slot.flag())
+                format!(
+                    "{} is not a {} in your library",
+                    choice.path,
+                    choice.slot.flag()
+                )
             })?;
         // A denoiser is what the model *is*; replacing it from a per-run
         // dropdown would silently make this a different model.
@@ -1037,7 +1040,9 @@ pub fn validate_request(
         return Ok(normalized);
     }
     if !(1..=MAX_BATCH_COUNT).contains(&request.batch_count) {
-        return Err(format!("Batch size must be between 1 and {MAX_BATCH_COUNT}"));
+        return Err(format!(
+            "Batch size must be between 1 and {MAX_BATCH_COUNT}"
+        ));
     }
     if request.sample_method.len() > 64 || request.scheduler.len() > 64 {
         return Err("Sampler name is too long".to_string());
@@ -1062,8 +1067,7 @@ pub fn validate_request(
         if hires.steps > MAX_STEPS {
             return Err(format!("Upscale steps may not exceed {MAX_STEPS}"));
         }
-        if !hires.denoising_strength.is_finite()
-            || !(0.0..=1.0).contains(&hires.denoising_strength)
+        if !hires.denoising_strength.is_finite() || !(0.0..=1.0).contains(&hires.denoising_strength)
         {
             return Err("Upscale denoising strength must be between 0 and 1".to_string());
         }
@@ -1304,7 +1308,9 @@ pub struct GeneratedMedia {
 /// the UI can distinguish "waiting behind another job" from "sampling".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobProgress {
-    Running { queue_position: u32 },
+    Running {
+        queue_position: u32,
+    },
     /// Every artifact the job produced, in the engine's own order. One for a
     /// clip or a single image; `batch_count` of them for a batch.
     Completed(Vec<GeneratedMedia>),
@@ -1346,7 +1352,9 @@ pub fn decode_job_status(value: &Value) -> Result<JobProgress, String> {
         }),
         "cancelled" => Ok(JobProgress::Cancelled),
         "failed" => Ok(JobProgress::Failed(
-            engine_error_text(value).unwrap_or("Generation failed").to_string(),
+            engine_error_text(value)
+                .unwrap_or("Generation failed")
+                .to_string(),
         )),
         "completed" => {
             let result = value
@@ -1531,13 +1539,17 @@ fn drain_engine_output(
             let text = String::from_utf8_lossy(line).to_string();
             line.clear();
             if let Some(progress) = parse_sampling_progress(&text) {
-                let Ok(mut cell) = sampling.lock() else { return false };
+                let Ok(mut cell) = sampling.lock() else {
+                    return false;
+                };
                 *cell = Some(progress);
                 // A redrawn bar is noise in a failure message; the tail is for
                 // the lines a person reads.
                 return true;
             }
-            let Ok(mut buffer) = tail.lock() else { return false };
+            let Ok(mut buffer) = tail.lock() else {
+                return false;
+            };
             buffer.push_str(text.trim_end());
             buffer.push('\n');
             if buffer.len() > MAX_STDERR_TAIL {
@@ -1604,7 +1616,10 @@ struct EngineProcess {
 
 impl GenerationEngineState {
     pub fn loaded_model(&self) -> Option<String> {
-        self.inner.lock().ok().and_then(|state| state.model_id.clone())
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|state| state.model_id.clone())
     }
 
     /// Where the running instance is listening, if one is.
@@ -1690,7 +1705,11 @@ impl GenerationEngineState {
         let detail = state
             .stderr_tail
             .as_ref()
-            .and_then(|tail| tail.lock().ok().map(|value| engine_failure_detail(value.trim())))
+            .and_then(|tail| {
+                tail.lock()
+                    .ok()
+                    .map(|value| engine_failure_detail(value.trim()))
+            })
             .filter(|value| !value.is_empty());
         Ok(Some(match detail {
             Some(detail) => format!("{outcome}:\n{detail}"),
@@ -1788,8 +1807,8 @@ impl GenerationEngineState {
             let remaining = deadline
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_secs(1));
-            if let Ok(response) = crate::egress::send(client.get(&capabilities).timeout(remaining))
-                .await
+            if let Ok(response) =
+                crate::egress::send(client.get(&capabilities).timeout(remaining)).await
             {
                 // A foreign service could answer on this port while our child
                 // is losing the bind. Prove the child is still alive after the
@@ -2506,9 +2525,15 @@ mod tests {
             ("--audio-vae", "audio.safetensors"),
         ] {
             let at = args.iter().position(|arg| arg == flag).expect(flag);
-            assert_eq!(args[at + 1], under("/models", &["wan-mine", file]), "{flag}");
+            assert_eq!(
+                args[at + 1],
+                under("/models", &["wan-mine", file]),
+                "{flag}"
+            );
         }
-        assert!(args.windows(2).any(|pair| pair == ["--listen-port", "8092"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--listen-port", "8092"]));
         assert!(args.contains(&"--diffusion-fa".to_string()));
     }
 
@@ -2527,15 +2552,16 @@ mod tests {
             1,
         )];
         let before = launch_signature(&spec, root);
-        spec.components
-            .push(ModelComponent::huggingface(ComponentSlot::Vae, "r", "vae.safetensors", 1));
+        spec.components.push(ModelComponent::huggingface(
+            ComponentSlot::Vae,
+            "r",
+            "vae.safetensors",
+            1,
+        ));
         assert_ne!(before, launch_signature(&spec, root));
         // The port is the one thing that legitimately differs between two
         // launches of the same file set, so it must not be in the key.
-        assert_eq!(
-            launch_signature(&spec, root),
-            launch_args(&spec, root, 0),
-        );
+        assert_eq!(launch_signature(&spec, root), launch_args(&spec, root, 0),);
     }
 
     /// A checkpoint that needs a separate VAE does not name one, so the common
@@ -2578,9 +2604,15 @@ mod tests {
         // Swapped, not duplicated.
         assert_eq!(args.iter().filter(|arg| *arg == "--vae").count(), 1);
         // The model had no text encoder at all; choosing one adds it.
-        let t5 = args.iter().position(|arg| arg == "--t5xxl").expect("--t5xxl");
+        let t5 = args
+            .iter()
+            .position(|arg| arg == "--t5xxl")
+            .expect("--t5xxl");
         assert_eq!(args[t5 + 1], parts[1].path);
-        let unet = args.iter().position(|arg| arg == "--diffusion-model").unwrap();
+        let unet = args
+            .iter()
+            .position(|arg| arg == "--diffusion-model")
+            .unwrap();
         assert_eq!(args[unet + 1], under("/models", &["wan-mine", "unet.gguf"]));
 
         // A path the library does not hold is not loadable, whatever the UI says.
@@ -2642,7 +2674,10 @@ mod tests {
         assert_eq!(normalize_video_frames(DownTo4nPlus1, 34), 33);
         assert_eq!(normalize_video_frames(DownTo4nPlus1, 32), 29);
         assert_eq!(normalize_video_frames(DownTo4nPlus1, 4), 1);
-        assert_eq!(normalize_video_frames(DownTo4nPlus1, u32::MAX), MAX_VIDEO_FRAMES);
+        assert_eq!(
+            normalize_video_frames(DownTo4nPlus1, u32::MAX),
+            MAX_VIDEO_FRAMES
+        );
 
         assert_eq!(normalize_video_frames(UpTo17kPlus5, 56), 56);
         assert_eq!(normalize_video_frames(UpTo17kPlus5, 45), 56);
@@ -2670,7 +2705,11 @@ mod tests {
         assert_eq!(normalized.fps, 24);
 
         // The same 34 becomes 39 on an upward 17k+5 grid, not 33.
-        let h3 = model("h3-mine", vec![GenerationTask::TextToVideo], FrameGrid::UpTo17kPlus5);
+        let h3 = model(
+            "h3-mine",
+            vec![GenerationTask::TextToVideo],
+            FrameGrid::UpTo17kPlus5,
+        );
         let mut on_h3 = video_request(GenerationTask::TextToVideo);
         on_h3.model_id = h3.id.clone();
         assert_eq!(validate_request(&h3, &on_h3).unwrap().video_frames, 39);
@@ -2679,7 +2718,11 @@ mod tests {
         assert!(validate_request(&wan, &video_request(GenerationTask::ImageToVideo)).is_err());
 
         // A model that does not declare video must refuse a video task.
-        let stills = model("sd-mine", vec![GenerationTask::TextToImage], FrameGrid::DownTo4nPlus1);
+        let stills = model(
+            "sd-mine",
+            vec![GenerationTask::TextToImage],
+            FrameGrid::DownTo4nPlus1,
+        );
         assert!(validate_request(&stills, &video_request(GenerationTask::TextToVideo)).is_err());
 
         let mut blank = video_request(GenerationTask::TextToVideo);
@@ -2705,7 +2748,11 @@ mod tests {
         assert_eq!(body["sample_params"]["guidance"]["txt_cfg"], json!(6.0));
         assert!(body.get("init_image").is_none());
 
-        let mut stills = model("sd-mine", vec![GenerationTask::TextToImage], FrameGrid::DownTo4nPlus1);
+        let mut stills = model(
+            "sd-mine",
+            vec![GenerationTask::TextToImage],
+            FrameGrid::DownTo4nPlus1,
+        );
         stills.defaults.flow_shift = None;
         let mut image = video_request(GenerationTask::TextToImage);
         image.model_id = stills.id.clone();
@@ -2939,14 +2986,23 @@ mod tests {
             (ComponentSlot::PhotoMaker, "--photo-maker"),
             (ComponentSlot::PulidWeights, "--pulid-weights"),
             (ComponentSlot::LlmVision, "--llm_vision"),
-            (ComponentSlot::UncondDiffusionModel, "--uncond-diffusion-model"),
-            (ComponentSlot::EmbeddingsConnectors, "--embeddings-connectors"),
+            (
+                ComponentSlot::UncondDiffusionModel,
+                "--uncond-diffusion-model",
+            ),
+            (
+                ComponentSlot::EmbeddingsConnectors,
+                "--embeddings-connectors",
+            ),
             (ComponentSlot::MotionModule, "--motion-module"),
         ] {
             assert_eq!(slot.flag(), flag);
             // None of them belongs to `llama-tts`, so all of them reach the
             // `sd-server` command line rather than being skipped.
-            assert!(!slot.is_speech_only(), "{slot:?} was skipped as speech-only");
+            assert!(
+                !slot.is_speech_only(),
+                "{slot:?} was skipped as speech-only"
+            );
         }
 
         // Only the three that unlock a per-run image say so.
@@ -2993,7 +3049,10 @@ mod tests {
         let body = request_body(&wan, &normalized);
         let loras = body["lora"].as_array().expect("lora array");
         assert_eq!(loras.len(), 2);
-        assert_eq!(loras[0]["path"], json!(absolute(&["loras", "style.safetensors"])));
+        assert_eq!(
+            loras[0]["path"],
+            json!(absolute(&["loras", "style.safetensors"]))
+        );
         // Negative strengths are meaningful — they subtract a style.
         assert_eq!(loras[1]["multiplier"], json!(-0.4));
         assert_eq!(loras[1]["is_high_noise"], json!(true));
@@ -3173,7 +3232,11 @@ mod tests {
         assert_eq!(clip.batch_count, 1);
         assert!(request_body(&wan, &clip).get("batch_count").is_none());
 
-        let mut voice = model("voice", vec![GenerationTask::TextToSpeech], FrameGrid::default());
+        let mut voice = model(
+            "voice",
+            vec![GenerationTask::TextToSpeech],
+            FrameGrid::default(),
+        );
         voice.components = vec![ModelComponent::huggingface(
             ComponentSlot::Checkpoint,
             "r",
@@ -3241,9 +3304,11 @@ mod tests {
         let mut text_only = request.clone();
         text_only.task = GenerationTask::TextToVideo;
         text_only.init_image_base64 = None;
-        assert!(request_body(&wan, &validate_request(&wan, &text_only).unwrap())
-            .get("strength")
-            .is_none());
+        assert!(
+            request_body(&wan, &validate_request(&wan, &text_only).unwrap())
+                .get("strength")
+                .is_none()
+        );
 
         for spoil in [
             (|r: &mut GenerationRequest| r.clip_skip = MAX_CLIP_SKIP + 1) as fn(&mut _),
@@ -3280,7 +3345,10 @@ mod tests {
             parse_sampling_progress("  |####      | 212/686 - 647.34MB/s"),
             None
         );
-        assert_eq!(parse_sampling_progress("[INFO ] main.cpp:148 - listening"), None);
+        assert_eq!(
+            parse_sampling_progress("[INFO ] main.cpp:148 - listening"),
+            None
+        );
         assert_eq!(parse_sampling_progress("  |==| 4/0 - 1.0s/it"), None);
     }
 
@@ -3337,7 +3405,11 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
     /// flag, and one wav written straight to disk.
     #[test]
     fn speech_builds_its_own_command_line_and_skips_the_diffusion_bounds() {
-        let mut spec = model("voice", vec![GenerationTask::TextToSpeech], FrameGrid::default());
+        let mut spec = model(
+            "voice",
+            vec![GenerationTask::TextToSpeech],
+            FrameGrid::default(),
+        );
         spec.components = vec![
             ModelComponent::huggingface(ComponentSlot::Checkpoint, "r", "backbone.gguf", 1),
             ModelComponent::huggingface(ComponentSlot::Mmproj, "r", "mmproj.gguf", 1),
@@ -3357,7 +3429,10 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
             ("--model", under("/m", &["voice", "backbone.gguf"])),
             ("--mmproj", under("/m", &["voice", "mmproj.gguf"])),
             ("--prompt", "a lovely cat".to_string()),
-            ("--output", Path::new("/out.wav").to_string_lossy().to_string()),
+            (
+                "--output",
+                Path::new("/out.wav").to_string_lossy().to_string(),
+            ),
             ("--tts-speaker-file", absolute(&["reference.wav"])),
             ("--tts-lang", "en".to_string()),
         ] {
@@ -3375,7 +3450,8 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
         // last-one-wins parsing leaves the escape hatch open.
         let mut cpu_only = spec.clone();
         cpu_only.extra_launch_args = vec!["-ngl".to_string(), "0".to_string()];
-        let args = speech_args(&cpu_only, Path::new("/m"), &normalized, Path::new("/o.wav")).unwrap();
+        let args =
+            speech_args(&cpu_only, Path::new("/m"), &normalized, Path::new("/o.wav")).unwrap();
         assert_eq!(args.last().unwrap(), "0");
 
         // The projector is llama-tts's flag; sd-server would reject it outright.
@@ -3420,8 +3496,7 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
             let mut request = video_request(GenerationTask::TextToSpeech);
             request.model_id = spec.id.clone();
             request.prompt = "Little Monkey now speaks.".to_string();
-            request.speaker_file =
-                reference.map(|path| path.to_string_lossy().to_string());
+            request.speaker_file = reference.map(|path| path.to_string_lossy().to_string());
             let request = validate_request(&spec, &request).unwrap();
             let args = speech_args(&spec, Path::new("/unused"), &request, output).unwrap();
             let status = Command::new(&binary).args(&args).output().unwrap();
@@ -3447,16 +3522,24 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
     }
 
     fn model_spec_for_speech(backbone: &str, mmproj: &str) -> GenerationModelSpec {
-        let mut spec = model("voice", vec![GenerationTask::TextToSpeech], FrameGrid::default());
+        let mut spec = model(
+            "voice",
+            vec![GenerationTask::TextToSpeech],
+            FrameGrid::default(),
+        );
         spec.components = vec![
             ModelComponent {
                 slot: ComponentSlot::Checkpoint,
-                source: ComponentSource::LocalFile { path: backbone.to_string() },
+                source: ComponentSource::LocalFile {
+                    path: backbone.to_string(),
+                },
                 size_bytes: 0,
             },
             ModelComponent {
                 slot: ComponentSlot::Mmproj,
-                source: ComponentSource::LocalFile { path: mmproj.to_string() },
+                source: ComponentSource::LocalFile {
+                    path: mmproj.to_string(),
+                },
                 size_bytes: 0,
             },
         ];
@@ -3477,13 +3560,16 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
     #[test]
     #[ignore = "needs a local sd-server binary and checkpoint"]
     fn a_real_engine_reports_its_model_and_its_step_count() {
-        let (Ok(binary), Ok(checkpoint)) = (
-            std::env::var("SD_SERVER"),
-            std::env::var("SD_CHECKPOINT"),
-        ) else {
+        let (Ok(binary), Ok(checkpoint)) =
+            (std::env::var("SD_SERVER"), std::env::var("SD_CHECKPOINT"))
+        else {
             panic!("set SD_SERVER and SD_CHECKPOINT");
         };
-        let mut spec = model("live", vec![GenerationTask::TextToImage], FrameGrid::default());
+        let mut spec = model(
+            "live",
+            vec![GenerationTask::TextToImage],
+            FrameGrid::default(),
+        );
         spec.components = vec![ModelComponent {
             slot: ComponentSlot::Checkpoint,
             source: ComponentSource::LocalFile { path: checkpoint },
@@ -3540,7 +3626,8 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
             assert!(media.bytes.starts_with(b"\x89PNG"));
             // IHDR carries the real canvas: a 2× hires pass on 256 px has to
             // come back at 512, or the second pass never ran.
-            let dimension = |at: usize| u32::from_be_bytes(media.bytes[at..at + 4].try_into().unwrap());
+            let dimension =
+                |at: usize| u32::from_be_bytes(media.bytes[at..at + 4].try_into().unwrap());
             assert_eq!((dimension(16), dimension(20)), (512, 512));
             engine.stop().unwrap();
         });

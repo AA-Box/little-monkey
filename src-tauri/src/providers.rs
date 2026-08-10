@@ -25,9 +25,9 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Notify;
 
+use crate::profiles::ProfileScopedPaths;
 use crate::run_scope::{RunScope, Unattributed};
 use crate::AppState;
-use crate::profiles::ProfileScopedPaths;
 
 /// Profile-scoped (K23). The default profile keeps this exact service name, so
 /// every credential stored before profiles existed still resolves; any other

@@ -10,13 +10,13 @@ use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 
+use crate::profiles::ProfileScopedPaths;
 use crate::run_ledger::{AppendEventOutcome, RunLedger, StoredRun, SubmitRunOutcome};
 use crate::run_protocol::{
     ClientIdentity, ClientKind, ModelTargetSnapshot, PermissionDecision, RunEvent,
     RunEventEnvelope, RunSpec, RunStatus, RUN_PROTOCOL_SCHEMA_VERSION,
 };
 use crate::AppState;
-use crate::profiles::ProfileScopedPaths;
 
 pub const RUNS_CHANGED_EVENT: &str = "runs://changed";
 pub const RUN_CANCELLATION_REQUESTED_EVENT: &str = "runs://cancellation-requested";
@@ -549,6 +549,78 @@ fn drain_egress<R: tauri::Runtime>(
     }
 }
 
+/// How often unattributed destinations are moved from memory to the ledger.
+///
+/// Slower than [`EGRESS_DRAIN_INTERVAL`] by an order of magnitude, deliberately.
+/// A run's drain rides its own scope and has to keep a *live* row roughly current
+/// while a stream is in flight; this one writes traffic that belongs to no run and
+/// that nothing is watching in real time, so its only real obligation is to have
+/// written before the process exits. Thirty seconds keeps the transaction count
+/// negligible while bounding what a crash loses to half a minute of host names.
+pub(crate) const UNATTRIBUTED_DRAIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// Moves every unattributed destination noted since the last tick onto the ledger.
+///
+/// # Why this needs a ticker of its own
+///
+/// Attributed destinations are flushed by [`scoped_with_egress`], which exists
+/// because a run *has* a lifetime — it starts, it ends, and the drain rides that.
+/// Unattributed traffic has none by definition: it is the traffic that happened
+/// outside any run. Piggy-backing its flush on a run's drain would mean an app
+/// that only ever made unattributed requests — a `monkey` invocation, an update
+/// check, a startup fetch — never wrote a single destination, which is exactly the
+/// gap this closes.
+///
+/// Fail-soft with return-on-failure, like every other drain at this boundary: a
+/// write that fails hands the drain back so a transient error delays it to the
+/// next tick rather than destroying it.
+pub(crate) fn drain_unattributed_destinations<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+) {
+    let drained = crate::egress::take_unattributed_destinations();
+    if drained.is_empty() {
+        return;
+    }
+    let Ok(now) = unix_time_ms() else {
+        for (label, drain) in drained {
+            crate::egress::return_unattributed_destinations(label, drain);
+        }
+        return;
+    };
+    for (label, drain) in drained {
+        let named = drain.seen.len();
+        if let Err(error) = crate::process_commands::with_process_table(app, state, |table| {
+            table.add_unattributed_egress_destinations(label, &drain, now as i64)
+        }) {
+            crate::egress::return_unattributed_destinations(label, drain);
+            eprintln!(
+                "unattributed egress: could not record {named} destinations for {label}: {error}"
+            );
+        }
+    }
+}
+
+/// Drives [`drain_unattributed_destinations`] until `stop` is set.
+///
+/// Shaped like `run_browser_watchdog` — an injected interval and a stop flag —
+/// for the same reason: a loop that can only be ended by killing the process
+/// cannot be tested, and a test that waits out a production interval is a slow
+/// test that will eventually be deleted.
+pub(crate) async fn run_unattributed_egress_drain<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    interval: std::time::Duration,
+    stop: &'static std::sync::atomic::AtomicBool,
+) {
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        ticks.tick().await;
+        let state = app.state::<AppState>();
+        drain_unattributed_destinations(&app, state.inner());
+    }
+}
+
 fn emit_changed<R: tauri::Runtime>(app: &tauri::AppHandle<R>, outcome: &AppendEventOutcome) {
     let _ = app.emit(
         RUNS_CHANGED_EVENT,
@@ -1021,8 +1093,8 @@ mod tests {
         use crate::run_ledger::RunLedger;
         use crate::run_protocol::{
             CapabilityAssessment, CapabilityState, EgressAllowlist, ModelCapabilitiesSnapshot,
-            ModelTargetSnapshot, PermissionMode, PermissionPolicySnapshot,
-            RUN_PROTOCOL_SCHEMA_VERSION, RunBudgets, RunKind, RunSpec, ToolPolicyDecision,
+            ModelTargetSnapshot, PermissionMode, PermissionPolicySnapshot, RunBudgets, RunKind,
+            RunSpec, ToolPolicyDecision, RUN_PROTOCOL_SCHEMA_VERSION,
         };
         use crate::run_scope::{self, RunScope};
 

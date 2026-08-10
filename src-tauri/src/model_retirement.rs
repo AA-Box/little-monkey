@@ -239,9 +239,9 @@ pub struct CloudModelRetirementWarning {
 }
 
 fn find_entry(provider_id: &str, model_id: &str) -> Option<&'static RetiredCloudModelEntry> {
-    RETIRED_CLOUD_MODELS
-        .iter()
-        .find(|entry| entry.provider_id == provider_id && entry.model_id.eq_ignore_ascii_case(model_id))
+    RETIRED_CLOUD_MODELS.iter().find(|entry| {
+        entry.provider_id == provider_id && entry.model_id.eq_ignore_ascii_case(model_id)
+    })
 }
 
 fn is_known_retired(provider_id: &str, model_id: &str) -> bool {
@@ -384,7 +384,8 @@ mod tests {
 
     #[test]
     fn check_cloud_model_flags_known_retired_ids() {
-        let warning = check_cloud_model("openai", "text-davinci-003", &[]).expect("should be retired");
+        let warning =
+            check_cloud_model("openai", "text-davinci-003", &[]).expect("should be retired");
         assert_eq!(warning.provider_id, "openai");
         assert_eq!(warning.model_id, "text-davinci-003");
         assert!(warning.reason.contains("retired"));
@@ -420,14 +421,20 @@ mod tests {
         let warning = check_cloud_model("openai", "text-davinci-003", &available).unwrap();
         // Shortest matching "gpt-4o" family id wins — the bare alias, not a
         // longer dated snapshot.
-        assert_eq!(warning.suggested_replacement_model_id.as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            warning.suggested_replacement_model_id.as_deref(),
+            Some("gpt-4o")
+        );
     }
 
     #[test]
     fn never_suggests_a_replacement_that_is_itself_retired() {
         // A pathological live list that (somehow) still contains another
         // retired id sharing the family substring must never be suggested.
-        let available = vec!["claude-1".to_string(), "claude-3-5-sonnet-20241022".to_string()];
+        let available = vec![
+            "claude-1".to_string(),
+            "claude-3-5-sonnet-20241022".to_string(),
+        ];
         let warning = check_cloud_model("anthropic", "claude-1.0", &available).unwrap();
         assert_eq!(
             warning.suggested_replacement_model_id.as_deref(),
@@ -465,13 +472,37 @@ mod tests {
         let not_old_enough = now_ms - STALE_LOCAL_MODEL_THRESHOLD_MS + 1;
 
         // Different revision, old enough -> flagged.
-        assert!(check_local_model_staleness("asset-1", "rev-1", old_enough, "rev-2", "Newer Model", now_ms).is_some());
+        assert!(check_local_model_staleness(
+            "asset-1",
+            "rev-1",
+            old_enough,
+            "rev-2",
+            "Newer Model",
+            now_ms
+        )
+        .is_some());
 
         // Different revision, but recently installed -> not flagged yet.
-        assert!(check_local_model_staleness("asset-1", "rev-1", not_old_enough, "rev-2", "Newer Model", now_ms).is_none());
+        assert!(check_local_model_staleness(
+            "asset-1",
+            "rev-1",
+            not_old_enough,
+            "rev-2",
+            "Newer Model",
+            now_ms
+        )
+        .is_none());
 
         // Same revision, however old -> nothing to migrate to.
-        assert!(check_local_model_staleness("asset-1", "rev-1", old_enough, "rev-1", "Same Model", now_ms).is_none());
+        assert!(check_local_model_staleness(
+            "asset-1",
+            "rev-1",
+            old_enough,
+            "rev-1",
+            "Same Model",
+            now_ms
+        )
+        .is_none());
     }
 
     #[test]
@@ -490,7 +521,10 @@ mod tests {
         assert_eq!(warning.asset_id, "ollama:llama3:8b");
         assert_eq!(warning.installed_revision, "rev-old");
         assert_eq!(warning.latest_revision, "rev-new");
-        assert_eq!(warning.suggested_replacement_display_name, "Llama 3.1 8B Instruct (Q4_K_M)");
+        assert_eq!(
+            warning.suggested_replacement_display_name,
+            "Llama 3.1 8B Instruct (Q4_K_M)"
+        );
         assert!(warning.age_ms >= STALE_LOCAL_MODEL_THRESHOLD_MS);
     }
 }

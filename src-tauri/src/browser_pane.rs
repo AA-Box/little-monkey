@@ -123,7 +123,10 @@ fn find_pane_webview<R: Runtime>(app: &AppHandle<R>, label: &str) -> Result<Webv
 
 fn apply_bounds<R: Runtime>(webview: &Webview<R>, bounds: PaneBounds) {
     let _ = webview.set_position(LogicalPosition::new(bounds.x, bounds.y));
-    let _ = webview.set_size(LogicalSize::new(bounds.width.max(1.0), bounds.height.max(1.0)));
+    let _ = webview.set_size(LogicalSize::new(
+        bounds.width.max(1.0),
+        bounds.height.max(1.0),
+    ));
 }
 
 fn emit_tab_event<R: Runtime>(app: &AppHandle<R>, payload: TabEventPayload) {
@@ -142,10 +145,17 @@ pub async fn browser_pane_open_tab(
     let window = main_window(&app)?;
 
     let (label, bounds, previous) = {
-        let mut inner = state.inner.lock().map_err(|_| "browser pane state poisoned")?;
+        let mut inner = state
+            .inner
+            .lock()
+            .map_err(|_| "browser pane state poisoned")?;
         inner.next_id += 1;
         let label = format!("{LABEL_PREFIX}{}", inner.next_id);
-        (label, inner.bounds.unwrap_or_default(), inner.active.clone())
+        (
+            label,
+            inner.bounds.unwrap_or_default(),
+            inner.active.clone(),
+        )
     };
 
     let nav_app = app.clone();
@@ -196,7 +206,12 @@ pub async fn browser_pane_open_tab(
         })
         .on_new_window(move |url, _| {
             if matches!(url.scheme(), "http" | "https") {
-                let _ = popup_app.emit(NEW_WINDOW_EVENT, NewWindowPayload { url: url.to_string() });
+                let _ = popup_app.emit(
+                    NEW_WINDOW_EVENT,
+                    NewWindowPayload {
+                        url: url.to_string(),
+                    },
+                );
             }
             NewWindowResponse::Deny
         });
@@ -217,7 +232,10 @@ pub async fn browser_pane_open_tab(
     }
 
     {
-        let mut inner = state.inner.lock().map_err(|_| "browser pane state poisoned")?;
+        let mut inner = state
+            .inner
+            .lock()
+            .map_err(|_| "browser pane state poisoned")?;
         inner.tabs.push(label.clone());
         inner.active = Some(label.clone());
         inner.visible = true;
@@ -236,7 +254,10 @@ pub async fn browser_pane_close_tab(
     webview
         .close()
         .map_err(|err| format!("failed to close browser tab: {err}"))?;
-    let mut inner = state.inner.lock().map_err(|_| "browser pane state poisoned")?;
+    let mut inner = state
+        .inner
+        .lock()
+        .map_err(|_| "browser pane state poisoned")?;
     inner.tabs.retain(|tab| tab != &label);
     if inner.active.as_deref() == Some(label.as_str()) {
         inner.active = None;
@@ -256,7 +277,10 @@ pub async fn browser_pane_select_tab(
     require_pane_label(&label)?;
     let window = main_window(&app)?;
     let (bounds, visible) = {
-        let mut inner = state.inner.lock().map_err(|_| "browser pane state poisoned")?;
+        let mut inner = state
+            .inner
+            .lock()
+            .map_err(|_| "browser pane state poisoned")?;
         inner.active = Some(label.clone());
         (inner.bounds.unwrap_or_default(), inner.visible)
     };
@@ -288,7 +312,10 @@ pub async fn browser_pane_set_bounds(
     bounds: PaneBounds,
 ) -> Result<(), String> {
     {
-        let mut inner = state.inner.lock().map_err(|_| "browser pane state poisoned")?;
+        let mut inner = state
+            .inner
+            .lock()
+            .map_err(|_| "browser pane state poisoned")?;
         inner.bounds = Some(bounds);
     }
     let window = main_window(&app)?;
@@ -308,7 +335,10 @@ pub async fn browser_pane_set_visible(
     visible: bool,
 ) -> Result<(), String> {
     let active = {
-        let mut inner = state.inner.lock().map_err(|_| "browser pane state poisoned")?;
+        let mut inner = state
+            .inner
+            .lock()
+            .map_err(|_| "browser pane state poisoned")?;
         inner.visible = visible;
         inner.active.clone()
     };
@@ -324,7 +354,11 @@ pub async fn browser_pane_set_visible(
 }
 
 #[tauri::command]
-pub async fn browser_pane_navigate(app: AppHandle, label: String, url: String) -> Result<(), String> {
+pub async fn browser_pane_navigate(
+    app: AppHandle,
+    label: String,
+    url: String,
+) -> Result<(), String> {
     let parsed = parse_pane_url(&url)?;
     let webview = find_pane_webview(&app, &label)?;
     webview
@@ -369,7 +403,10 @@ pub async fn browser_pane_favicon(
         return Ok(None);
     };
     {
-        let inner = state.inner.lock().map_err(|_| "browser pane state poisoned")?;
+        let inner = state
+            .inner
+            .lock()
+            .map_err(|_| "browser pane state poisoned")?;
         if let Some(cached) = inner.favicons.get(&host) {
             return Ok(cached.clone());
         }
@@ -419,7 +456,10 @@ pub async fn browser_pane_favicon(
         break;
     }
 
-    let mut inner = state.inner.lock().map_err(|_| "browser pane state poisoned")?;
+    let mut inner = state
+        .inner
+        .lock()
+        .map_err(|_| "browser pane state poisoned")?;
     inner.favicons.insert(host, favicon.clone());
     Ok(favicon)
 }

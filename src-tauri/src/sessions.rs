@@ -15,8 +15,8 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use tauri::{Emitter};
 use crate::profiles::ProfileScopedPaths;
+use tauri::Emitter;
 
 const SESSIONS_FILE: &str = "chat_sessions.json";
 

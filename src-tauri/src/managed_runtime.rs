@@ -545,10 +545,7 @@ fn bundled_runtime_near_current_exe(spec: &ManagedRuntimeSpec) -> Option<PathBuf
     None
 }
 
-pub fn bundled_runtime_in_for(
-    spec: &ManagedRuntimeSpec,
-    resource_dir: &Path,
-) -> Option<PathBuf> {
+pub fn bundled_runtime_in_for(spec: &ManagedRuntimeSpec, resource_dir: &Path) -> Option<PathBuf> {
     runtime_candidates(spec, resource_dir)
         .into_iter()
         .find(|candidate| candidate.join(MANIFEST_FILE).is_file())
@@ -802,7 +799,11 @@ mod tests {
         let installed = managed_runtime_dir_for(&STABLE_DIFFUSION, &root);
         fs::create_dir_all(&installed).unwrap();
 
-        fs::write(installed.join(STABLE_DIFFUSION.executable()), b"not really a binary").unwrap();
+        fs::write(
+            installed.join(STABLE_DIFFUSION.executable()),
+            b"not really a binary",
+        )
+        .unwrap();
         assert!(managed_server_present(&STABLE_DIFFUSION, Some(&root)));
         // Same directory, and verification refuses it: there is no manifest
         // and the bytes are not a runtime. That gap is the whole point —
@@ -877,8 +878,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn concurrent_materialization_serializes_invalid_runtime_repair() {
-        let (source, trusted_manifest_sha256) =
-            runtime_fixture(&LLAMA, "concurrent-repair-source");
+        let (source, trusted_manifest_sha256) = runtime_fixture(&LLAMA, "concurrent-repair-source");
         let app_data = std::env::temp_dir().join(format!(
             "little-monkey-managed-runtime-concurrent-app-{}",
             Uuid::new_v4().simple()
@@ -941,8 +941,7 @@ mod tests {
     #[test]
     fn the_llama_tree_carries_the_speech_binary() {
         let (directory, digest) = runtime_fixture(&LLAMA, "tts-sibling");
-        let server =
-            verify_runtime_directory_with_digest(&LLAMA, &directory, &digest).unwrap();
+        let server = verify_runtime_directory_with_digest(&LLAMA, &directory, &digest).unwrap();
         assert_eq!(
             server.with_file_name(llama_tts_filename()).file_name(),
             Some(std::ffi::OsStr::new(llama_tts_filename()))
@@ -980,7 +979,9 @@ mod tests {
         let root = Path::new("/tmp/little-monkey-test-data");
         assert_eq!(
             managed_runtime_dir_for(&LLAMA, root),
-            root.join("runtimes").join("llama").join(MANAGED_LLAMA_VERSION)
+            root.join("runtimes")
+                .join("llama")
+                .join(MANAGED_LLAMA_VERSION)
         );
         assert_eq!(
             managed_runtime_dir_for(&STABLE_DIFFUSION, root),
@@ -1031,7 +1032,9 @@ mod tests {
             return;
         }
         let (directory, digest) = runtime_fixture(&STABLE_DIFFUSION, "cross-runtime");
-        assert!(verify_runtime_directory_with_digest(&STABLE_DIFFUSION, &directory, &digest).is_ok());
+        assert!(
+            verify_runtime_directory_with_digest(&STABLE_DIFFUSION, &directory, &digest).is_ok()
+        );
         assert!(
             verify_runtime_directory_with_digest(&LLAMA, &directory, &digest)
                 .unwrap_err()

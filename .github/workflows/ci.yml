@@ -45,8 +45,26 @@ jobs:
       - name: Frontend tests
         run: pnpm test
 
-      - name: i18n key-lint
+      - name: i18n key-lint and locale key-set sync
+        # Two gates, not one. `keyLint` fails on a key used but absent from the
+        # base; `localeSync` fails when a locale's key set, placeholders, or
+        # values drift from it. The second is what the base's own warning could
+        # never be — the gap it warned about grew from ~650 to 1,468 keys per
+        # locale while the warning printed on every run.
         run: pnpm i18n:lint
+
+      - name: Accessibility audit
+        # Runs after the production build above, so the built shell is what is
+        # audited rather than a dev-server page. A named rule set over jsdom
+        # (see `src/lib/a11yAudit.ts`) — not a full WCAG audit, and documented
+        # there as not being one.
+        run: pnpm a11y
+
+      - name: Install/upgrade smoke-test logic
+        # The decision logic only. The install itself runs in `release.yml`,
+        # where there are installers to install; this holds the rule that a leg
+        # which cannot run reports SKIPPED with a reason and never a pass.
+        run: pnpm test:install-smoke
 
   rust-tests:
     # Real per-OS compilation + test coverage for `#[cfg(target_os = ...)]`

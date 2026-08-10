@@ -172,6 +172,53 @@ pub struct ProcessAdmitArgs {
     pub max_child_processes: Option<u32>,
     #[serde(default)]
     pub max_context_tokens: Option<u64>,
+    /// Drop this kind's class wall budget for this process, rather than replacing
+    /// it with a number.
+    ///
+    /// A flag and not a `maxWallMs: 0`, deliberately. The ledger's own `CHECK`
+    /// forbids a non-positive `max_wall_ms`, so zero cannot be stored — and
+    /// reading a zero as "unbounded" would be exactly the zero-versus-absent
+    /// overloading this codebase avoids elsewhere. `None`/`false` means "use the
+    /// class default", which is what every existing caller already sends.
+    #[serde(default)]
+    pub unbounded_wall: Option<bool>,
+}
+
+/// The limit set an admission ends up with: the kind's class defaults, with each
+/// stated argument overriding its own field.
+///
+/// **Merged, not substituted, and that was the bug.** `process_admit` built this
+/// from the arguments alone, so every row admitted over IPC was declared
+/// unbounded regardless of what its kind said it was subject to. That is why
+/// `ProcessKind::default_limits` could be given a wall budget and still fire for
+/// nobody: the four kinds it applies to are admitted exactly here, and this
+/// overwrote it with `None` on the way past. `AdmitProcess::new` has always
+/// seeded from the class for native callers; this is the same rule for the IPC
+/// path.
+///
+/// Split out of the command so it can be asserted without an `AppHandle`, the
+/// same reason `verify.rs` tests `run_command_impl` rather than its wrapper.
+fn merged_limits(
+    kind: ProcessKind,
+    args: &ProcessAdmitArgs,
+) -> crate::process_table::ProcessLimits {
+    let class = kind.default_limits();
+    crate::process_table::ProcessLimits {
+        // The one field with an explicit opt-out, because it is the one with a
+        // class default a user can turn off. `unbounded_wall` beats a stated
+        // `max_wall_ms` too: a caller that says both has contradicted itself, and
+        // "no budget" is the safer of the two readings — it declares less rather
+        // than enforcing something nobody asked for.
+        max_wall_ms: if args.unbounded_wall.unwrap_or(false) {
+            None
+        } else {
+            args.max_wall_ms.or(class.max_wall_ms)
+        },
+        max_memory_bytes: args.max_memory_bytes.or(class.max_memory_bytes),
+        max_output_bytes: args.max_output_bytes.or(class.max_output_bytes),
+        max_child_processes: args.max_child_processes.or(class.max_child_processes),
+        max_context_tokens: args.max_context_tokens.or(class.max_context_tokens),
+    }
 }
 
 /// Admit a process. Called by the frontend surfaces — a chat turn, a subagent,
@@ -190,6 +237,9 @@ pub fn process_admit(
     // less than refusing to record the process at all, and the alternative would
     // make a subagent's admission depend on its parent's record having landed
     // first.
+    // Computed before `args` starts being moved from, one line below.
+    let limits = merged_limits(kind, &args);
+
     let parent_process_id = match (args.parent_process_id, args.parent_external_id) {
         (Some(explicit), _) => Some(explicit),
         (None, Some(external)) => {
@@ -212,13 +262,7 @@ pub fn process_admit(
         run_id: args.run_id,
         workspace: args.workspace,
         profile: args.profile,
-        limits: crate::process_table::ProcessLimits {
-            max_wall_ms: args.max_wall_ms,
-            max_memory_bytes: args.max_memory_bytes,
-            max_output_bytes: args.max_output_bytes,
-            max_child_processes: args.max_child_processes,
-            max_context_tokens: args.max_context_tokens,
-        },
+        limits,
     };
 
     let record = with_process_table(&app, state.inner(), |table| table.admit(&request, now))?;
@@ -793,5 +837,106 @@ pub(crate) fn reap_desktop_processes_at_startup<R: tauri::Runtime>(
         }
         Ok(_) => {}
         Err(error) => eprintln!("process table: host-liveness reap failed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process_table::WEBVIEW_WALL_BUDGET_MS;
+
+    fn args(kind: &str) -> ProcessAdmitArgs {
+        ProcessAdmitArgs {
+            kind: kind.to_string(),
+            external_id: "ext-1".to_string(),
+            parent_process_id: None,
+            parent_external_id: None,
+            parent_kind: None,
+            run_id: None,
+            workspace: None,
+            profile: None,
+            max_wall_ms: None,
+            max_memory_bytes: None,
+            max_output_bytes: None,
+            max_child_processes: None,
+            max_context_tokens: None,
+            unbounded_wall: None,
+        }
+    }
+
+    /// The defect this slice fixed: a caller that states nothing used to get an
+    /// all-`None` limit set, which is how a class default could exist and still
+    /// fire for nobody.
+    #[test]
+    fn an_admission_that_states_nothing_still_carries_its_class_limits() {
+        for kind in [
+            ProcessKind::ChatTurn,
+            ProcessKind::Subagent,
+            ProcessKind::CrewMember,
+            ProcessKind::SideTask,
+        ] {
+            let merged = merged_limits(kind, &args(kind.as_str()));
+            assert_eq!(
+                merged,
+                kind.default_limits(),
+                "{} lost its class limits at the IPC boundary",
+                kind.as_str()
+            );
+            assert_eq!(merged.max_wall_ms, Some(WEBVIEW_WALL_BUDGET_MS));
+        }
+
+        // Not only the kinds this slice added a budget for: a background shell's
+        // output ceiling reached the row the same way, and did not before.
+        assert_eq!(
+            merged_limits(
+                ProcessKind::BackgroundShell,
+                &args(ProcessKind::BackgroundShell.as_str())
+            ),
+            ProcessKind::BackgroundShell.default_limits()
+        );
+    }
+
+    #[test]
+    fn a_stated_value_wins_over_the_class_default_field_by_field() {
+        let mut stated = args("chat_turn");
+        stated.max_wall_ms = Some(30_000);
+        let merged = merged_limits(ProcessKind::ChatTurn, &stated);
+        assert_eq!(merged.max_wall_ms, Some(30_000));
+
+        // …and only that field. A stated context budget must not wipe the class
+        // wall budget beside it, which is exactly what substitution used to do.
+        let mut tokens_only = args("chat_turn");
+        tokens_only.max_context_tokens = Some(8_192);
+        let merged = merged_limits(ProcessKind::ChatTurn, &tokens_only);
+        assert_eq!(merged.max_context_tokens, Some(8_192));
+        assert_eq!(merged.max_wall_ms, Some(WEBVIEW_WALL_BUDGET_MS));
+    }
+
+    /// The opt-out has to produce an *absent* budget rather than a zero, because
+    /// the ledger's `CHECK` refuses a non-positive `max_wall_ms` and a declared
+    /// limit nothing enforces is worse than an honest absence.
+    #[test]
+    fn the_opt_out_drops_the_budget_rather_than_zeroing_it() {
+        let mut off = args("chat_turn");
+        off.unbounded_wall = Some(true);
+        assert_eq!(merged_limits(ProcessKind::ChatTurn, &off).max_wall_ms, None);
+
+        // A caller that says both has contradicted itself; "no budget" is the
+        // reading that declares less.
+        let mut both = args("chat_turn");
+        both.unbounded_wall = Some(true);
+        both.max_wall_ms = Some(30_000);
+        assert_eq!(
+            merged_limits(ProcessKind::ChatTurn, &both).max_wall_ms,
+            None
+        );
+
+        // And `false` is not an opt-out.
+        let mut on = args("chat_turn");
+        on.unbounded_wall = Some(false);
+        assert_eq!(
+            merged_limits(ProcessKind::ChatTurn, &on).max_wall_ms,
+            Some(WEBVIEW_WALL_BUDGET_MS)
+        );
     }
 }

@@ -62,9 +62,8 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-
-use crate::{workspace, AppState};
 use crate::profiles::ProfileScopedPaths;
+use crate::{workspace, AppState};
 
 const MEMORIES_FILE: &str = "memories.json";
 
@@ -504,7 +503,11 @@ pub fn list_all_impl(path: &Path) -> Result<Vec<MemoryEntry>, String> {
         .iter()
         .flat_map(|(root, project)| project.facts.iter().map(move |f| to_entry(root, f)))
         .collect();
-    entries.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
+    entries.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     Ok(entries)
 }
 
@@ -815,7 +818,8 @@ pub fn memory_import(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<MemoryImportSummary, String> {
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("Failed to read import file: {}", e))?;
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read import file: {}", e))?;
     let file: MemoryExportFile = serde_json::from_str(&raw)
         .map_err(|e| format!("That file doesn't look like a Memory Studio export: {}", e))?;
     let store_path = memories_file_path(&app)?;
@@ -867,8 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn fact_without_enabled_or_turn_id_defaults_to_enabled_true_none(
-    ) {
+    fn fact_without_enabled_or_turn_id_defaults_to_enabled_true_none() {
         // A `memories.json` written before this slice never had `enabled`/
         // `source_turn_id` at all — must still deserialize, defaulting to
         // "enabled" (never silently disable pre-existing facts) and no turn.
@@ -889,7 +892,8 @@ mod tests {
     #[test]
     fn add_then_load_roundtrips_and_persists_atomically() {
         let path = temp_path();
-        let fact = add_fact_impl(&path, "/ws/project", "Uses pnpm, not npm.", "agent", None).unwrap();
+        let fact =
+            add_fact_impl(&path, "/ws/project", "Uses pnpm, not npm.", "agent", None).unwrap();
 
         assert_eq!(fact.text, "Uses pnpm, not npm.");
         assert_eq!(fact.source, "agent");
@@ -912,8 +916,14 @@ mod tests {
     #[test]
     fn add_fact_records_the_given_source_turn_id() {
         let path = temp_path();
-        let fact = add_fact_impl(&path, "/ws/project", "turn-scoped fact", "agent", Some("turn-42"))
-            .unwrap();
+        let fact = add_fact_impl(
+            &path,
+            "/ws/project",
+            "turn-scoped fact",
+            "agent",
+            Some("turn-42"),
+        )
+        .unwrap();
         assert_eq!(fact.source_turn_id.as_deref(), Some("turn-42"));
 
         let reloaded = load_impl(&path).unwrap();
@@ -930,10 +940,22 @@ mod tests {
     #[test]
     fn exact_duplicate_text_is_a_silent_success_not_a_second_copy() {
         let path = temp_path();
-        let first =
-            add_fact_impl(&path, "/ws/project", "Build with `make build`.", "agent", None).unwrap();
-        let second =
-            add_fact_impl(&path, "/ws/project", "Build with `make build`.", "agent", None).unwrap();
+        let first = add_fact_impl(
+            &path,
+            "/ws/project",
+            "Build with `make build`.",
+            "agent",
+            None,
+        )
+        .unwrap();
+        let second = add_fact_impl(
+            &path,
+            "/ws/project",
+            "Build with `make build`.",
+            "agent",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             first.id, second.id,
@@ -968,10 +990,18 @@ mod tests {
     fn project_at_the_fact_cap_rejects_a_new_distinct_fact() {
         let path = temp_path();
         for n in 0..MAX_FACTS_PER_PROJECT {
-            add_fact_impl(&path, "/ws/project", &format!("fact number {n}"), "agent", None).unwrap();
+            add_fact_impl(
+                &path,
+                "/ws/project",
+                &format!("fact number {n}"),
+                "agent",
+                None,
+            )
+            .unwrap();
         }
 
-        let err = add_fact_impl(&path, "/ws/project", "one fact too many", "agent", None).unwrap_err();
+        let err =
+            add_fact_impl(&path, "/ws/project", "one fact too many", "agent", None).unwrap_err();
         assert!(err.contains("100"), "unexpected error: {err}");
         assert_eq!(
             load_impl(&path).unwrap().projects["/ws/project"]
@@ -1118,8 +1148,14 @@ mod tests {
     #[test]
     fn remember_with_no_workspace_saves_under_the_global_scope() {
         let path = temp_path();
-        let fact =
-            add_fact_impl(&path, GLOBAL_SCOPE_KEY, "User's name is Ahmad.", "agent", None).unwrap();
+        let fact = add_fact_impl(
+            &path,
+            GLOBAL_SCOPE_KEY,
+            "User's name is Ahmad.",
+            "agent",
+            None,
+        )
+        .unwrap();
 
         let reloaded = load_impl(&path).unwrap();
         let facts = &reloaded.projects[GLOBAL_SCOPE_KEY].facts;
@@ -1132,7 +1168,8 @@ mod tests {
     #[test]
     fn owning_scope_finds_a_fact_in_the_global_bucket_even_with_a_project_open() {
         let path = temp_path();
-        let global_fact = add_fact_impl(&path, GLOBAL_SCOPE_KEY, "global fact", "agent", None).unwrap();
+        let global_fact =
+            add_fact_impl(&path, GLOBAL_SCOPE_KEY, "global fact", "agent", None).unwrap();
         add_fact_impl(&path, "/ws/project", "project fact", "agent", None).unwrap();
 
         let memories = load_impl(&path).unwrap();
@@ -1217,7 +1254,8 @@ mod tests {
         let kept = add_fact_impl(&path, "/ws/project", "keep me", "agent", None).unwrap();
         let disabled = add_fact_impl(&path, "/ws/project", "disable me", "agent", None).unwrap();
         let deleted = add_fact_impl(&path, "/ws/project", "delete me", "agent", None).unwrap();
-        let global_kept = add_fact_impl(&path, GLOBAL_SCOPE_KEY, "global keep me", "agent", None).unwrap();
+        let global_kept =
+            add_fact_impl(&path, GLOBAL_SCOPE_KEY, "global keep me", "agent", None).unwrap();
         let global_disabled =
             add_fact_impl(&path, GLOBAL_SCOPE_KEY, "global disable me", "agent", None).unwrap();
 
@@ -1228,15 +1266,31 @@ mod tests {
         let facts = list_impl(&path, Some("/ws/project")).unwrap();
         let ids: Vec<&str> = facts.iter().map(|f| f.id.as_str()).collect();
 
-        assert!(ids.contains(&kept.id.as_str()), "enabled project fact must still be injected");
-        assert!(ids.contains(&global_kept.id.as_str()), "enabled global fact must still be injected");
-        assert!(!ids.contains(&disabled.id.as_str()), "disabled fact must not enter a future prompt");
-        assert!(!ids.contains(&deleted.id.as_str()), "deleted fact must not enter a future prompt");
+        assert!(
+            ids.contains(&kept.id.as_str()),
+            "enabled project fact must still be injected"
+        );
+        assert!(
+            ids.contains(&global_kept.id.as_str()),
+            "enabled global fact must still be injected"
+        );
+        assert!(
+            !ids.contains(&disabled.id.as_str()),
+            "disabled fact must not enter a future prompt"
+        );
+        assert!(
+            !ids.contains(&deleted.id.as_str()),
+            "deleted fact must not enter a future prompt"
+        );
         assert!(
             !ids.contains(&global_disabled.id.as_str()),
             "disabled global fact must not enter a future prompt"
         );
-        assert_eq!(facts.len(), 2, "only the two still-enabled facts should be returned");
+        assert_eq!(
+            facts.len(),
+            2,
+            "only the two still-enabled facts should be returned"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1263,7 +1317,11 @@ mod tests {
         set_enabled_impl(&path, "/ws/a", &a.id, false).unwrap();
 
         let entries = list_all_impl(&path).unwrap();
-        assert_eq!(entries.len(), 3, "list_all_impl must include disabled facts too");
+        assert_eq!(
+            entries.len(),
+            3,
+            "list_all_impl must include disabled facts too"
+        );
 
         let global = entries.iter().find(|e| e.text == "global fact").unwrap();
         assert_eq!(global.scope, "global");
@@ -1338,7 +1396,9 @@ mod tests {
         assert_eq!(second_summary.added, 0);
         assert_eq!(second_summary.skipped_duplicate, 2);
         assert_eq!(
-            load_impl(&path).unwrap().projects["/ws/imported"].facts.len(),
+            load_impl(&path).unwrap().projects["/ws/imported"]
+                .facts
+                .len(),
             1
         );
 
@@ -1396,13 +1456,30 @@ mod tests {
     #[test]
     fn list_all_impl_output_round_trips_through_import_impl_on_a_fresh_store() {
         let source_path = temp_path();
-        add_fact_impl(&source_path, "/ws/project", "round trip me", "agent", Some("turn-1")).unwrap();
-        add_fact_impl(&source_path, GLOBAL_SCOPE_KEY, "global round trip", "user", None).unwrap();
+        add_fact_impl(
+            &source_path,
+            "/ws/project",
+            "round trip me",
+            "agent",
+            Some("turn-1"),
+        )
+        .unwrap();
+        add_fact_impl(
+            &source_path,
+            GLOBAL_SCOPE_KEY,
+            "global round trip",
+            "user",
+            None,
+        )
+        .unwrap();
 
         let listed = list_all_impl(&source_path).unwrap();
         let entries: Vec<MemoryExportEntry> = listed
             .into_iter()
-            .map(|entry| MemoryExportEntry { entry, redacted: false })
+            .map(|entry| MemoryExportEntry {
+                entry,
+                redacted: false,
+            })
             .collect();
 
         let dest_path = temp_path();

@@ -2,8 +2,11 @@ use std::path::{Path, PathBuf};
 
 use little_monkey_lib::run_ledger::RunLedger;
 use little_monkey_lib::run_protocol::RunStatus;
+use little_monkey_lib::runtime_adapter::AcceleratorKind;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+
+use super::admission::DeviceClaim;
 
 pub const DEFAULT_MAX_QUEUE: u32 = 128;
 pub const DEFAULT_CONCURRENCY: u32 = 4;
@@ -573,8 +576,13 @@ impl DaemonStore {
         model_key: &str,
         ram_bytes: u64,
         vram_bytes: u64,
+        devices: &[DeviceClaim],
     ) -> Result<(), String> {
-        self.connection
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
             .execute(
                 "UPDATE daemon_jobs
                  SET reservation_model_key=?2, reservation_ram_bytes=?3,
@@ -583,13 +591,43 @@ impl DaemonStore {
                 params![job_id, model_key, to_i64(ram_bytes)?, to_i64(vram_bytes)?],
             )
             .map_err(|error| error.to_string())?;
+        // Replaced rather than merged: a re-record is a *restatement* of what
+        // this job holds (a resume re-books the same claim), and merging would
+        // double it every time a suspended job came back.
+        transaction
+            .execute(
+                "DELETE FROM daemon_job_device_reservations WHERE job_id=?1",
+                [job_id],
+            )
+            .map_err(|error| error.to_string())?;
+        for claim in devices {
+            transaction
+                .execute(
+                    "INSERT INTO daemon_job_device_reservations
+                         (job_id, accelerator, device_index, bytes)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        job_id,
+                        accelerator_token(claim.device.kind),
+                        // -1 is "no device enumerated" — see `DAEMON_V4_SQL`.
+                        claim.device.index.map(i64::from).unwrap_or(-1),
+                        to_i64(claim.bytes)?,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
 
     /// Give the claim back. Idempotent, because more than one exit path reaches
     /// it for the same job.
     pub fn release_reservation(&mut self, job_id: &str) -> Result<(), String> {
-        self.connection
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
             .execute(
                 "UPDATE daemon_jobs
                  SET reservation_model_key=NULL, reservation_ram_bytes=NULL,
@@ -598,7 +636,122 @@ impl DaemonStore {
                 [job_id],
             )
             .map_err(|error| error.to_string())?;
+        // The device rows go back on the *same* paths and in the same
+        // transaction, so a release cannot leave a card booked by a job that is
+        // gone. Both `finish_active` and `reconcile_interrupted` reach here —
+        // the clean exit and the crash funnel — which is what makes that true of
+        // every exit rather than of the tidy ones.
+        transaction
+            .execute(
+                "DELETE FROM daemon_job_device_reservations WHERE job_id=?1",
+                [job_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    /// `job_id -> device claims`, for every job currently holding one (K15).
+    ///
+    /// Per job rather than per device, which is the opposite of
+    /// [`Self::committed_device_reservations`] and deliberately so, for exactly
+    /// the reason [`Self::job_reservations`] gives: the committed total asks "how
+    /// much is held on this card", and preemption asks "who is holding it".
+    pub fn job_device_reservations(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<DeviceClaim>>, String> {
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "SELECT d.job_id, d.accelerator, d.device_index, d.bytes
+                   FROM daemon_job_device_reservations d
+                   JOIN daemon_jobs j ON j.job_id = d.job_id
+                  WHERE j.reservation_model_key IS NOT NULL
+                    AND j.state IN {DAEMON_ACTIVE_STATES}"
+            ))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    from_i64(row.get(3)?)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut claims: std::collections::HashMap<String, Vec<DeviceClaim>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (job_id, token, index, bytes) = row.map_err(|error| error.to_string())?;
+            let Some(kind) = accelerator_from_token(&token) else {
+                continue;
+            };
+            let index = if index < 0 {
+                None
+            } else {
+                u32::try_from(index).ok()
+            };
+            claims.entry(job_id).or_default().push(DeviceClaim {
+                device: super::admission::DeviceId { kind, index },
+                bytes,
+            });
+        }
+        Ok(claims)
+    }
+
+    /// What each accelerator device holds right now, deduplicated by resident
+    /// model exactly as [`Self::committed_reservations`] is (K15).
+    ///
+    /// `(kind, device_index, bytes)`, with `None` for a machine that enumerated
+    /// no device. The two-level grouping is the point: `MAX` within a model —
+    /// two holders of one model recorded marginally different claims and the
+    /// larger is the conservative one — then `SUM` across *distinct* models,
+    /// which is what a card actually has to hold.
+    pub fn committed_device_reservations(
+        &self,
+    ) -> Result<Vec<(AcceleratorKind, Option<u32>, u64)>, String> {
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "SELECT accelerator, device_index, SUM(bytes) FROM (
+                     SELECT d.accelerator AS accelerator,
+                            d.device_index AS device_index,
+                            MAX(d.bytes) AS bytes
+                       FROM daemon_job_device_reservations d
+                       JOIN daemon_jobs j ON j.job_id = d.job_id
+                      WHERE j.reservation_model_key IS NOT NULL
+                        AND j.state IN {DAEMON_ACTIVE_STATES}
+                      GROUP BY j.reservation_model_key, d.accelerator, d.device_index
+                 )
+                 GROUP BY accelerator, device_index"
+            ))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    from_i64(row.get(2)?)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut committed = Vec::new();
+        for row in rows {
+            let (token, index, bytes) = row.map_err(|error| error.to_string())?;
+            // An unreadable accelerator token is skipped rather than guessed at:
+            // charging bytes to the wrong card is worse than not charging them.
+            let Some(kind) = accelerator_from_token(&token) else {
+                continue;
+            };
+            let index = if index < 0 {
+                None
+            } else {
+                u32::try_from(index).ok()
+            };
+            committed.push((kind, index, bytes));
+        }
+        Ok(committed)
     }
 
     /// One row per *resident model*, not per job: `(model_key, ram, vram)`.
@@ -646,7 +799,26 @@ impl DaemonStore {
     /// only thing that would notice a row whose job reached a terminal state by
     /// some path that never released it. Returns how many were swept.
     pub fn sweep_stale_reservations(&mut self) -> Result<usize, String> {
-        self.connection
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        // Device rows first, because the `UPDATE` below is what makes the jobs
+        // stop looking stale — doing it after would leave nothing to select on.
+        transaction
+            .execute(
+                &format!(
+                    "DELETE FROM daemon_job_device_reservations
+                      WHERE job_id IN (
+                          SELECT job_id FROM daemon_jobs
+                           WHERE reservation_model_key IS NOT NULL
+                             AND state NOT IN {DAEMON_ACTIVE_STATES}
+                      )"
+                ),
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        let swept = transaction
             .execute(
                 &format!(
                     "UPDATE daemon_jobs
@@ -657,7 +829,9 @@ impl DaemonStore {
                 ),
                 [],
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(swept)
     }
 
     /// `(job_id, model_key, ram, vram)` for every job currently holding a claim.
@@ -1349,6 +1523,75 @@ CREATE INDEX IF NOT EXISTS daemon_scheduler_decisions_job_idx
     ON daemon_scheduler_decisions(job_id, decision_id DESC);
 "#;
 
+/// The stored token for an accelerator kind.
+///
+/// Its own function rather than serde, because this string is a *database* value
+/// and must never change when a serde attribute is reworded. Round-tripped by
+/// [`accelerator_from_token`], and pinned by a test.
+fn accelerator_token(kind: AcceleratorKind) -> &'static str {
+    match kind {
+        AcceleratorKind::Cpu => "cpu",
+        AcceleratorKind::Metal => "metal",
+        AcceleratorKind::Cuda => "cuda",
+        AcceleratorKind::Rocm => "rocm",
+        AcceleratorKind::Vulkan => "vulkan",
+        AcceleratorKind::DirectMl => "directml",
+        AcceleratorKind::AppleNeuralEngine => "apple-neural-engine",
+    }
+}
+
+/// The inverse. `None` for a token this build does not know, which is a row
+/// written by a newer daemon — skipped rather than guessed at, because charging
+/// bytes to the wrong card is worse than not charging them.
+fn accelerator_from_token(token: &str) -> Option<AcceleratorKind> {
+    Some(match token {
+        "cpu" => AcceleratorKind::Cpu,
+        "metal" => AcceleratorKind::Metal,
+        "cuda" => AcceleratorKind::Cuda,
+        "rocm" => AcceleratorKind::Rocm,
+        "vulkan" => AcceleratorKind::Vulkan,
+        "directml" => AcceleratorKind::DirectMl,
+        "apple-neural-engine" => AcceleratorKind::AppleNeuralEngine,
+        _ => return None,
+    })
+}
+
+const DAEMON_V4: i64 = 4;
+const DAEMON_V4_CHECKSUM: &str = "daemon-jobs-v4-device-reservations";
+
+/// Each accelerator device as a thing the scheduler reserves against (K15).
+///
+/// `reservation_vram_bytes` is one number per job, so two 24 GB cards read as one
+/// 48 GB pool and a second job was admitted against capacity the first had
+/// already exhausted on one card. That figure stays — it is the pooled total a
+/// caller with nothing to say about devices still reads — and this table is what
+/// nothing may sum: one row per (job, device).
+///
+/// # Why a table rather than three more columns
+///
+/// A column can hold one device. A split model holds bytes on several, and the
+/// count is a property of the machine rather than of the schema, so columns would
+/// have to be widened by whoever first plugs in a fourth card.
+///
+/// `device_index` is the *runtime's* ordinal — what `--main-gpu` and a position
+/// in `--tensor-split` mean — and `-1` stands for "this machine advertised
+/// accelerator memory but enumerated no device". A sentinel rather than NULL
+/// because it is half of the primary key, and SQLite permits NULLs in the columns
+/// of a non-`INTEGER` primary key, which would stop it deduplicating.
+///
+/// `ON DELETE CASCADE` on the job, unlike the rest of this schema: these rows are
+/// not a record in their own right, they are a property of the reservation, and
+/// a job that is ever pruned should take them with it.
+const DAEMON_V4_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS daemon_job_device_reservations (
+    job_id TEXT NOT NULL REFERENCES daemon_jobs(job_id) ON DELETE CASCADE,
+    accelerator TEXT NOT NULL CHECK (length(accelerator) > 0),
+    device_index INTEGER NOT NULL CHECK (device_index >= -1),
+    bytes INTEGER NOT NULL CHECK (bytes >= 0),
+    PRIMARY KEY(job_id, accelerator, device_index)
+) STRICT;
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -1363,12 +1606,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V1, DAEMON_V1_CHECKSUM, DAEMON_V1_SQL),
     (DAEMON_V2, DAEMON_V2_CHECKSUM, DAEMON_V2_SQL),
     (DAEMON_V3, DAEMON_V3_CHECKSUM, DAEMON_V3_SQL),
+    (DAEMON_V4, DAEMON_V4_CHECKSUM, DAEMON_V4_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V3;
+const DAEMON_LATEST: i64 = DAEMON_V4;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
@@ -1496,7 +1740,7 @@ mod tests {
                 .transition(id, JobState::Running, 2, Some(7), None)
                 .unwrap();
             store
-                .record_reservation(id, "shared-model", 1_024, 512)
+                .record_reservation(id, "shared-model", 1_024, 512, &[])
                 .unwrap();
         }
         assert_eq!(
@@ -1703,5 +1947,170 @@ mod tests {
             .unwrap();
         assert_eq!(stored, ("submitted".to_string(), None));
         assert!(store.pending_delivery_payloads(1).unwrap().is_empty());
+    }
+
+    /// Per-device reservations, and the two properties that make them safe: they
+    /// are grouped by *resident model* like the pooled figures beside them, and
+    /// every release path takes them with it.
+    #[test]
+    fn device_reservations_group_by_model_and_come_back_on_every_release_path() {
+        use super::super::admission::{DeviceClaim, DeviceId};
+
+        let mut store = DaemonStore::open_in_memory().unwrap();
+        let card0 = DeviceId::device(AcceleratorKind::Cuda, 0);
+        let card1 = DeviceId::device(AcceleratorKind::Cuda, 1);
+
+        for id in ["job-a", "job-b", "job-c"] {
+            store.insert_preparing(&new_job(id, 1), 8).unwrap();
+            store.mark_queued(id, &format!("run-{id}"), 1).unwrap();
+            store
+                .transition(id, JobState::Running, 2, Some(7), None)
+                .unwrap();
+        }
+
+        // Two jobs against ONE resident model, and a third against another. The
+        // model is loaded once, so the card must be charged once for it.
+        for id in ["job-a", "job-b"] {
+            store
+                .record_reservation(
+                    id,
+                    "model-shared",
+                    1_024,
+                    4_096,
+                    &[DeviceClaim {
+                        device: card0.clone(),
+                        bytes: 4_096,
+                    }],
+                )
+                .unwrap();
+        }
+        store
+            .record_reservation(
+                "job-c",
+                "model-other",
+                1_024,
+                3_000,
+                &[
+                    DeviceClaim {
+                        device: card0.clone(),
+                        bytes: 1_000,
+                    },
+                    DeviceClaim {
+                        device: card1.clone(),
+                        bytes: 2_000,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let committed = |store: &DaemonStore| {
+            let mut rows = store.committed_device_reservations().unwrap();
+            rows.sort();
+            rows
+        };
+        assert_eq!(
+            committed(&store),
+            vec![
+                (AcceleratorKind::Cuda, Some(0), 5_096),
+                (AcceleratorKind::Cuda, Some(1), 2_000),
+            ],
+            "card 0 holds one copy of the shared model plus the other model, not two copies"
+        );
+
+        // Per job, for preemption: this is who is holding what.
+        let per_job = store.job_device_reservations().unwrap();
+        assert_eq!(per_job["job-a"].len(), 1);
+        assert_eq!(per_job["job-c"].len(), 2);
+
+        // The clean exit path. One of two holders leaving frees nothing: the
+        // model is still resident for the other.
+        store.release_reservation("job-a").unwrap();
+        store
+            .transition("job-a", JobState::Succeeded, 3, None, None)
+            .unwrap();
+        assert_eq!(
+            committed(&store),
+            vec![
+                (AcceleratorKind::Cuda, Some(0), 5_096),
+                (AcceleratorKind::Cuda, Some(1), 2_000),
+            ],
+            "the bytes come back when the LAST holder exits, not the first"
+        );
+
+        // The last holder of the shared model leaves, and its card 0 bytes go.
+        store.release_reservation("job-b").unwrap();
+        store
+            .transition("job-b", JobState::Succeeded, 4, None, None)
+            .unwrap();
+        assert_eq!(
+            committed(&store),
+            vec![
+                (AcceleratorKind::Cuda, Some(0), 1_000),
+                (AcceleratorKind::Cuda, Some(1), 2_000),
+            ],
+        );
+
+        // The crash funnel: a job that reached a terminal state without ever
+        // releasing. The sweep has to take its device rows too, or a card stays
+        // booked by a job that is gone.
+        store
+            .transition("job-c", JobState::Failed, 5, None, Some("crashed"))
+            .unwrap();
+        assert!(store.sweep_stale_reservations().unwrap() >= 1);
+        assert!(
+            committed(&store).is_empty(),
+            "a swept reservation must leave no device rows behind"
+        );
+        assert!(store.job_device_reservations().unwrap().is_empty());
+    }
+
+    /// A re-record restates what a job holds rather than adding to it — a resume
+    /// re-books the same claim, and merging would double it every time.
+    #[test]
+    fn re_recording_a_reservation_replaces_its_device_rows() {
+        use super::super::admission::{DeviceClaim, DeviceId};
+
+        let mut store = DaemonStore::open_in_memory().unwrap();
+        store
+            .insert_preparing(&new_job("job-resume", 1), 8)
+            .unwrap();
+        store.mark_queued("job-resume", "run-resume", 1).unwrap();
+        store
+            .transition("job-resume", JobState::Running, 2, Some(7), None)
+            .unwrap();
+
+        let claim = [DeviceClaim {
+            device: DeviceId::device(AcceleratorKind::Cuda, 0),
+            bytes: 2_048,
+        }];
+        for _ in 0..3 {
+            store
+                .record_reservation("job-resume", "model", 1_024, 2_048, &claim)
+                .unwrap();
+        }
+        assert_eq!(
+            store.committed_device_reservations().unwrap(),
+            vec![(AcceleratorKind::Cuda, Some(0), 2_048)]
+        );
+    }
+
+    /// The stored accelerator tokens are database values and must round-trip
+    /// exactly. A reworded serde attribute must not silently re-key every row.
+    #[test]
+    fn accelerator_tokens_round_trip_and_are_stable() {
+        for kind in [
+            AcceleratorKind::Cpu,
+            AcceleratorKind::Metal,
+            AcceleratorKind::Cuda,
+            AcceleratorKind::Rocm,
+            AcceleratorKind::Vulkan,
+            AcceleratorKind::DirectMl,
+            AcceleratorKind::AppleNeuralEngine,
+        ] {
+            assert_eq!(accelerator_from_token(accelerator_token(kind)), Some(kind));
+        }
+        assert_eq!(accelerator_token(AcceleratorKind::Cuda), "cuda");
+        // A token from a newer daemon is skipped, never guessed at.
+        assert_eq!(accelerator_from_token("tensor-thing"), None);
     }
 }

@@ -155,7 +155,9 @@ pub struct LlamaCppLiveContextState {
 }
 
 fn as_u32(value: Option<&Value>) -> Option<u32> {
-    value.and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok())
+    value
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
 }
 
 /// Parses a `llama-server` `GET /props` response body. Returns
@@ -186,8 +188,8 @@ pub fn parse_llama_slots_body(body: &[u8]) -> Option<Vec<LlamaCppSlotState>> {
             .iter()
             .map(|entry| {
                 let params = entry.get("params");
-                let context_tokens =
-                    as_u32(entry.get("n_ctx")).or_else(|| params.and_then(|params| as_u32(params.get("n_ctx"))));
+                let context_tokens = as_u32(entry.get("n_ctx"))
+                    .or_else(|| params.and_then(|params| as_u32(params.get("n_ctx"))));
                 let tokens_in_use = as_u32(entry.get("n_past"))
                     .or_else(|| as_u32(entry.get("tokens_evaluated")))
                     .or_else(|| as_u32(entry.get("n_ctx_used")));
@@ -333,7 +335,10 @@ pub struct ContextFailureInput {
 }
 
 fn contains_any(haystack: &str, needles: &'static [&'static str]) -> Option<&'static str> {
-    needles.iter().find(|needle| haystack.contains(**needle)).copied()
+    needles
+        .iter()
+        .find(|needle| haystack.contains(**needle))
+        .copied()
 }
 
 const CONTEXT_SHIFT_PHRASES: &[&str] = &[
@@ -389,8 +394,14 @@ const RUNTIME_LIMITATION_PHRASES: &[&str] = &[
 /// the available evidence gives no reason to believe context/cache/memory
 /// was the cause (so callers should leave an unrelated error message
 /// untouched rather than force a misleading label onto it).
-pub fn classify_context_failure(input: &ContextFailureInput) -> Option<ContextFailureClassification> {
-    let lower = input.error_text.as_deref().map(str::to_lowercase).unwrap_or_default();
+pub fn classify_context_failure(
+    input: &ContextFailureInput,
+) -> Option<ContextFailureClassification> {
+    let lower = input
+        .error_text
+        .as_deref()
+        .map(str::to_lowercase)
+        .unwrap_or_default();
 
     // 1. Cache exhausted / context shift: the conversation outgrew the
     //    window and the runtime rolled it, with or without a hard error.
@@ -422,7 +433,10 @@ pub fn classify_context_failure(input: &ContextFailureInput) -> Option<ContextFa
     if prompt_exceeds_numeric {
         return Some(ContextFailureClassification {
             class: ContextFailureClass::PromptTooLong,
-            explanation: prompt_too_long_explanation(input.prompt_tokens, input.configured_context_tokens),
+            explanation: prompt_too_long_explanation(
+                input.prompt_tokens,
+                input.configured_context_tokens,
+            ),
             evidence: vec![format!(
                 "prompt is {} tokens, at or beyond the configured {} token context window",
                 input.prompt_tokens.unwrap_or_default(),
@@ -433,7 +447,10 @@ pub fn classify_context_failure(input: &ContextFailureInput) -> Option<ContextFa
     if let Some(phrase) = contains_any(&lower, PROMPT_TOO_LONG_PHRASES) {
         return Some(ContextFailureClassification {
             class: ContextFailureClass::PromptTooLong,
-            explanation: prompt_too_long_explanation(input.prompt_tokens, input.configured_context_tokens),
+            explanation: prompt_too_long_explanation(
+                input.prompt_tokens,
+                input.configured_context_tokens,
+            ),
             evidence: vec![format!("error text matched \"{phrase}\"")],
         });
     }
@@ -456,7 +473,9 @@ pub fn classify_context_failure(input: &ContextFailureInput) -> Option<ContextFa
                 input.available_vram_bytes,
                 input.required_vram_bytes,
             ),
-            evidence: vec!["available memory is below what the configured context requires".to_string()],
+            evidence: vec![
+                "available memory is below what the configured context requires".to_string(),
+            ],
         });
     }
     if let Some(phrase) = contains_any(&lower, MEMORY_PRESSURE_PHRASES) {
@@ -474,9 +493,10 @@ pub fn classify_context_failure(input: &ContextFailureInput) -> Option<ContextFa
 
     // 4. Model metadata limit: the model's own advertised max context is
     //    smaller than what was requested.
-    if let (Some(requested), Some(model_max)) =
-        (input.requested_context_tokens, input.model_metadata_max_context_tokens)
-    {
+    if let (Some(requested), Some(model_max)) = (
+        input.requested_context_tokens,
+        input.model_metadata_max_context_tokens,
+    ) {
         if requested > model_max {
             return Some(ContextFailureClassification {
                 class: ContextFailureClass::ModelMetadataLimit,
@@ -519,7 +539,10 @@ fn context_shift_explanation(configured_context_tokens: Option<u32>) -> String {
     }
 }
 
-fn prompt_too_long_explanation(prompt_tokens: Option<u64>, configured_context_tokens: Option<u32>) -> String {
+fn prompt_too_long_explanation(
+    prompt_tokens: Option<u64>,
+    configured_context_tokens: Option<u32>,
+) -> String {
     match (prompt_tokens, configured_context_tokens) {
         (Some(prompt), Some(configured)) => format!(
             "The prompt itself is about {prompt} tokens, at or beyond the {configured}-token configured context window. Shorten the prompt or increase the context size for this model."
@@ -606,18 +629,24 @@ pub fn resolve_effective_context(input: &EffectiveContextInput) -> EffectiveCont
         if max < tokens {
             tokens = max;
             capped_by.push("runtime_setting_max".to_string());
-            rationale.push(format!("Reduced to {tokens} tokens, the runtime's configured maximum."));
+            rationale.push(format!(
+                "Reduced to {tokens} tokens, the runtime's configured maximum."
+            ));
         }
     }
     if let Some(min) = input.runtime_setting_min_tokens {
         if min > tokens {
             tokens = min;
             capped_by.push("runtime_setting_min".to_string());
-            rationale.push(format!("Raised to {tokens} tokens, the runtime's configured minimum."));
+            rationale.push(format!(
+                "Raised to {tokens} tokens, the runtime's configured minimum."
+            ));
         }
     }
     if capped_by.is_empty() {
-        rationale.push(format!("Using the requested {tokens} tokens; no known bound reduced it further."));
+        rationale.push(format!(
+            "Using the requested {tokens} tokens; no known bound reduced it further."
+        ));
     }
 
     EffectiveContextResolution {
@@ -930,7 +959,10 @@ pub fn configured_context_key_candidates(kind: ContextRuntimeKind) -> &'static [
 
 /// Builds the honest, non-fabricated per-runtime notes describing what live
 /// data is and is not available, given what was actually observed.
-pub fn context_cache_notes(kind: ContextRuntimeKind, live: Option<&LlamaCppLiveContextState>) -> Vec<String> {
+pub fn context_cache_notes(
+    kind: ContextRuntimeKind,
+    live: Option<&LlamaCppLiveContextState>,
+) -> Vec<String> {
     match kind {
         ContextRuntimeKind::Mlx => vec![
             "The MLX runtime does not expose a configurable context window or live KV-cache state today; only generation token counts are available per request.".to_string(),
@@ -986,7 +1018,10 @@ mod tests {
     fn resolve_configured_context_prefers_persisted_value_over_default() {
         let schema = vec![capability("context_size", 4_096, 128, 1_048_576)];
         let mut persisted = BTreeMap::new();
-        persisted.insert("context_size".to_string(), SettingValue::Integer { value: 16_384 });
+        persisted.insert(
+            "context_size".to_string(),
+            SettingValue::Integer { value: 16_384 },
+        );
         let resolved = resolve_configured_context(&schema, Some(&persisted), &["context_size"]);
         assert_eq!(resolved.tokens, Some(16_384));
         assert_eq!(resolved.source, ContextLimitSource::RuntimeConfigured);
@@ -1085,12 +1120,26 @@ mod tests {
             request: HttpRequest,
             _cancellation: &'a CancellationToken,
         ) -> RuntimeFuture<'a, crate::runtime_adapter::HttpResponse> {
-            let path = request.url.rsplit_once('/').map(|(_, tail)| format!("/{tail}"));
-            let found = path.and_then(|path| self.by_path.lock().expect("lock fixture transport").get(&path).cloned());
+            let path = request
+                .url
+                .rsplit_once('/')
+                .map(|(_, tail)| format!("/{tail}"));
+            let found = path.and_then(|path| {
+                self.by_path
+                    .lock()
+                    .expect("lock fixture transport")
+                    .get(&path)
+                    .cloned()
+            });
             Box::pin(async move {
                 match found {
-                    Some((status, body)) => Ok(crate::runtime_adapter::HttpResponse { status, body }),
-                    None => Ok(crate::runtime_adapter::HttpResponse { status: 404, body: b"not found".to_vec() }),
+                    Some((status, body)) => {
+                        Ok(crate::runtime_adapter::HttpResponse { status, body })
+                    }
+                    None => Ok(crate::runtime_adapter::HttpResponse {
+                        status: 404,
+                        body: b"not found".to_vec(),
+                    }),
                 }
             })
         }
@@ -1104,8 +1153,13 @@ mod tests {
             200,
             br#"{"default_generation_settings":{"n_ctx":8192},"total_slots":1}"#,
         );
-        transport.respond("/slots", 200, br#"[{"id":0,"n_ctx":8192,"n_past":100,"truncated":false}]"#);
-        let endpoint = EndpointOrigin::parse("http://127.0.0.1:8090", EndpointPolicy::LoopbackOnly).expect("endpoint");
+        transport.respond(
+            "/slots",
+            200,
+            br#"[{"id":0,"n_ctx":8192,"n_past":100,"truncated":false}]"#,
+        );
+        let endpoint = EndpointOrigin::parse("http://127.0.0.1:8090", EndpointPolicy::LoopbackOnly)
+            .expect("endpoint");
         let cancellation = CancellationToken::new();
         let state = fetch_llama_cpp_live_context_state(&endpoint, &transport, &cancellation).await;
         assert_eq!(state.reported_context_tokens, Some(8_192));
@@ -1125,7 +1179,8 @@ mod tests {
             br#"{"default_generation_settings":{"n_ctx":4096},"total_slots":1}"#,
         );
         transport.respond("/slots", 501, b"Not Implemented");
-        let endpoint = EndpointOrigin::parse("http://127.0.0.1:8090", EndpointPolicy::LoopbackOnly).expect("endpoint");
+        let endpoint = EndpointOrigin::parse("http://127.0.0.1:8090", EndpointPolicy::LoopbackOnly)
+            .expect("endpoint");
         let cancellation = CancellationToken::new();
         let state = fetch_llama_cpp_live_context_state(&endpoint, &transport, &cancellation).await;
         assert_eq!(state.reported_context_tokens, Some(4_096));
@@ -1137,7 +1192,8 @@ mod tests {
     async fn fetch_llama_cpp_live_context_state_all_unavailable_when_unreachable() {
         let transport = FixtureTransport::default();
         // No fixtures registered at all: every request 404s.
-        let endpoint = EndpointOrigin::parse("http://127.0.0.1:8090", EndpointPolicy::LoopbackOnly).expect("endpoint");
+        let endpoint = EndpointOrigin::parse("http://127.0.0.1:8090", EndpointPolicy::LoopbackOnly)
+            .expect("endpoint");
         let cancellation = CancellationToken::new();
         let state = fetch_llama_cpp_live_context_state(&endpoint, &transport, &cancellation).await;
         assert_eq!(state, LlamaCppLiveContextState::default());
@@ -1167,7 +1223,10 @@ mod tests {
         };
         let classification = classify_context_failure(&input).expect("should classify");
         assert_eq!(classification.class, ContextFailureClass::PromptTooLong);
-        assert!(classification.explanation.contains("9000") || classification.explanation.contains("9,000"));
+        assert!(
+            classification.explanation.contains("9000")
+                || classification.explanation.contains("9,000")
+        );
     }
 
     #[test]
@@ -1178,7 +1237,10 @@ mod tests {
             ..Default::default()
         };
         let classification = classify_context_failure(&input).expect("should classify");
-        assert_eq!(classification.class, ContextFailureClass::CacheExhaustedContextShift);
+        assert_eq!(
+            classification.class,
+            ContextFailureClass::CacheExhaustedContextShift
+        );
         assert!(classification.explanation.contains("8192"));
     }
 
@@ -1211,7 +1273,10 @@ mod tests {
             ..Default::default()
         };
         let classification = classify_context_failure(&input).expect("should classify");
-        assert_eq!(classification.class, ContextFailureClass::ModelMetadataLimit);
+        assert_eq!(
+            classification.class,
+            ContextFailureClass::ModelMetadataLimit
+        );
     }
 
     #[test]
@@ -1256,7 +1321,10 @@ mod tests {
             ..Default::default()
         };
         let classification = classify_context_failure(&input).expect("should classify");
-        assert_eq!(classification.class, ContextFailureClass::CacheExhaustedContextShift);
+        assert_eq!(
+            classification.class,
+            ContextFailureClass::CacheExhaustedContextShift
+        );
     }
 
     // -- resolve_effective_context --------------------------------------
@@ -1317,7 +1385,10 @@ mod tests {
         };
         let resolution = resolve_effective_context(&input);
         assert_eq!(resolution.effective_tokens, 128);
-        assert_eq!(resolution.capped_by, vec!["runtime_setting_min".to_string()]);
+        assert_eq!(
+            resolution.capped_by,
+            vec!["runtime_setting_min".to_string()]
+        );
     }
 
     // -- context_cache_notes ---------------------------------------------

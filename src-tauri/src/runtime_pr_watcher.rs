@@ -586,7 +586,9 @@ pub async fn check_now_core(
             state.last_checked_at_ms = Some(now_ms);
             state.last_check_error = None;
             for entry in newly_relevant.iter().rev() {
-                state.relevant_prs.retain(|existing| existing.number != entry.number);
+                state
+                    .relevant_prs
+                    .retain(|existing| existing.number != entry.number);
                 state.relevant_prs.insert(0, entry.clone());
             }
             if state.relevant_prs.len() > MAX_ACCUMULATED_RELEVANT {
@@ -739,7 +741,10 @@ mod tests {
     #[test]
     fn classify_pr_matches_kv_cache_context_on_a_synthetic_title() {
         assert_eq!(
-            classify_pr("Increase default context window and fix context shift bug", None),
+            classify_pr(
+                "Increase default context window and fix context shift bug",
+                None
+            ),
             Some(PrTopic::KvCacheContext)
         );
     }
@@ -747,7 +752,10 @@ mod tests {
     #[test]
     fn classify_pr_matches_model_manifest_registry_on_a_real_pr_title() {
         assert_eq!(
-            classify_pr("add support for pulling models from a private registry", None),
+            classify_pr(
+                "add support for pulling models from a private registry",
+                None
+            ),
             Some(PrTopic::ModelManifestRegistry)
         );
     }
@@ -774,7 +782,10 @@ mod tests {
     #[test]
     fn classify_pr_returns_none_for_an_unrelated_synthetic_title() {
         assert_eq!(
-            classify_pr("Fix a typo in the contributing guide", Some("Just a docs fix.")),
+            classify_pr(
+                "Fix a typo in the contributing guide",
+                Some("Just a docs fix.")
+            ),
             None
         );
     }
@@ -849,7 +860,11 @@ mod tests {
             .expect("fetch should succeed");
 
         assert_eq!(result.len(), 4);
-        assert_eq!(transport.requested_count(), 2, "should stop after page 2, never requesting page 3");
+        assert_eq!(
+            transport.requested_count(),
+            2,
+            "should stop after page 2, never requesting page 3"
+        );
     }
 
     #[tokio::test]
@@ -880,7 +895,11 @@ mod tests {
             .await
             .expect("fetch should succeed");
 
-        assert_eq!(result.len(), 3, "should stop at MAX_PAGES even with no last_seen baseline");
+        assert_eq!(
+            result.len(),
+            3,
+            "should stop at MAX_PAGES even with no last_seen baseline"
+        );
         assert_eq!(transport.requested_count(), 3);
     }
 
@@ -899,7 +918,11 @@ mod tests {
             .expect_err("a 403 should surface as an error, not a crash");
 
         assert!(matches!(error, PrWatcherError::RateLimited));
-        assert_eq!(transport.requested_count(), 1, "must not retry-loop into the rate limit");
+        assert_eq!(
+            transport.requested_count(),
+            1,
+            "must not retry-loop into the rate limit"
+        );
     }
 
     #[tokio::test]

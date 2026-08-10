@@ -52,9 +52,9 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-use tauri::{AppHandle};
 use crate::profiles::ProfileScopedPaths;
+use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
 
 /// Default target chunk size (characters), per `KnowledgeStack::chunk_chars`.
 pub(crate) const DEFAULT_CHUNK_CHARS: usize = 1600;

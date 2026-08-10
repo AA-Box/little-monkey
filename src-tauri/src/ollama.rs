@@ -18,8 +18,8 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::AppState;
 use crate::profiles::ProfileScopedPaths;
+use crate::AppState;
 
 /// Base URL for Ollama's local daemon (native API + OpenAI-compatible
 /// `/v1/chat/completions`).
@@ -279,7 +279,9 @@ struct RawShowResponse {
 /// images when it can't would be a worse failure mode than the reverse.
 async fn check_capabilities(client: &reqwest::Client, name: &str) -> (bool, bool) {
     let resp = crate::egress::send(
-        client.post(format!("{OLLAMA_BASE_URL}/api/show")).json(&json!({ "model": name })),
+        client
+            .post(format!("{OLLAMA_BASE_URL}/api/show"))
+            .json(&json!({ "model": name })),
     )
     .await;
 
@@ -468,7 +470,9 @@ pub async fn ollama_unload_model(model: String) -> Result<(), String> {
     }
 
     let resp = crate::egress::send(
-        client.post(format!("{OLLAMA_BASE_URL}/api/chat")).json(&unload_request_body(&model)),
+        client
+            .post(format!("{OLLAMA_BASE_URL}/api/chat"))
+            .json(&unload_request_body(&model)),
     )
     .await
     .map_err(|e| format!("Failed to reach Ollama while unloading '{model}': {e}"))?;
@@ -505,11 +509,10 @@ pub async fn list_tag_names_at(
     client: &reqwest::Client,
     base_url: &str,
 ) -> Result<Vec<String>, String> {
-    let resp = crate::egress::send(
-        client.get(format!("{}/api/tags", base_url.trim_end_matches('/'))),
-    )
-    .await
-    .map_err(|_| "Ollama isn't running — start it first".to_string())?;
+    let resp =
+        crate::egress::send(client.get(format!("{}/api/tags", base_url.trim_end_matches('/'))))
+            .await
+            .map_err(|_| "Ollama isn't running — start it first".to_string())?;
 
     if !resp.status().is_success() {
         return Err("Ollama isn't running — start it first".to_string());
@@ -922,7 +925,9 @@ pub async fn ollama_remove_model(tag: String) -> Result<(), String> {
     // answers, and a large model's blobs are large files.
     let client = ollama_client(Duration::from_secs(60))?;
     let resp = crate::egress::send(
-        client.delete(format!("{OLLAMA_BASE_URL}/api/delete")).json(&json!({ "model": tag })),
+        client
+            .delete(format!("{OLLAMA_BASE_URL}/api/delete"))
+            .json(&json!({ "model": tag })),
     )
     .await
     .map_err(|e| format!("Failed to reach Ollama: {e}"))?;

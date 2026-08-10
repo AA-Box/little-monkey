@@ -38,7 +38,9 @@ pub async fn run(
     cancellation: &CancellationToken,
 ) -> Result<GeneratedMedia, String> {
     let (bytes, media_type) = match backend.kind {
-        RemoteBackendKind::ComfyUi => run_comfy(backend, model, request, job_id, cancellation).await,
+        RemoteBackendKind::ComfyUi => {
+            run_comfy(backend, model, request, job_id, cancellation).await
+        }
         RemoteBackendKind::OpenAiCompatible => {
             run_openai_compatible(backend, model, request, cancellation).await
         }

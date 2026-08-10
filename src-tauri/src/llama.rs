@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::AppState;
 use crate::profiles::ProfileScopedPaths;
+use crate::AppState;
 
 /// Port the managed chat `llama-server` instance listens on.
 pub(crate) const CHAT_PORT: u16 = 8090;
@@ -305,14 +305,11 @@ pub async fn server_reports_alias(
     expected_alias: &str,
 ) -> bool {
     let models_url = format!("http://127.0.0.1:{port}/v1/models");
-    let mut response = match crate::egress::send(
-        client.get(models_url).timeout(Duration::from_secs(2)),
-    )
-    .await
-    {
-        Ok(response) if response.status().is_success() => response,
-        _ => return false,
-    };
+    let mut response =
+        match crate::egress::send(client.get(models_url).timeout(Duration::from_secs(2))).await {
+            Ok(response) if response.status().is_success() => response,
+            _ => return false,
+        };
     if response
         .content_length()
         .is_some_and(|length| length > MAX_MODELS_RESPONSE_BYTES as u64)
@@ -442,10 +439,8 @@ async fn spawn_and_wait_healthy(
             break;
         }
 
-        if let Ok(resp) = crate::egress::send(
-            client.get(&health_url).timeout(Duration::from_secs(2)),
-        )
-        .await
+        if let Ok(resp) =
+            crate::egress::send(client.get(&health_url).timeout(Duration::from_secs(2))).await
         {
             if resp.status().is_success()
                 && server_reports_alias(&client, port, expected_alias).await
@@ -825,7 +820,11 @@ mod tests {
     /// `quantization::sniff_gguf_file` to parse, mirroring
     /// `quantization::tests::build_minimal_gguf_full` without depending on
     /// that module's private test helpers.
-    fn write_minimal_gguf_with_context_length(path: &std::path::Path, architecture: &str, context_length: u32) {
+    fn write_minimal_gguf_with_context_length(
+        path: &std::path::Path,
+        architecture: &str,
+        context_length: u32,
+    ) {
         let mut buffer = Vec::new();
         buffer.extend_from_slice(b"GGUF");
         buffer.extend_from_slice(&3_u32.to_le_bytes()); // version

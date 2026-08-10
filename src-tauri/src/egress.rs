@@ -33,6 +33,7 @@
 //! mid-run. See [`check_run_allowlist`] for which absences fail open and which fail
 //! closed, and `PinnedResolver` for what pinning costs a rotating CDN.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -1351,27 +1352,166 @@ impl Charge {
     /// Notes where an allowed request went, so the ledger records destinations
     /// and not only volume.
     ///
-    /// Only the attributed case is recorded, and that is the same split
-    /// [`Self::add`] makes: an unattributed byte has a *reason* to be charged to
-    /// but no row to hang a destination list off. `UNATTRIBUTED_EGRESS` is a
-    /// fixed array of counters precisely because it must not allocate per
-    /// request; a per-reason destination map would be a global lock on the hot
-    /// path, which is what `run_scope` put the counter in the scope to avoid.
+    /// Both cases are recorded now. The attributed one hangs off the process row;
+    /// the unattributed one goes to [`UNATTRIBUTED_DESTINATIONS`], keyed by the
+    /// same reason its bytes are already counted under, so "how much" and "where"
+    /// for a given reason are two readings of one vocabulary rather than two
+    /// vocabularies.
     ///
-    /// ponytail: so unattributed egress still reports volume by reason and no
-    /// destinations. Upgrade path is a bounded global map behind the same cap, if
-    /// "which hosts does the app itself reach outside a run" turns out to be a
-    /// question anyone asks.
+    /// # The lock this takes, and why it is affordable
+    ///
+    /// `UNATTRIBUTED_EGRESS` is a fixed array of atomics precisely because
+    /// [`Self::add`] runs **per body frame** — an SSE stream calls it thousands of
+    /// times — and a map there would be a global lock on the hottest path in the
+    /// app. This is not that path: a destination is noted **once per request**,
+    /// beside a DNS lookup and a TLS handshake, and the map is bounded at
+    /// [`run_scope::MAX_DESTINATIONS`] so the critical section is a `BTreeMap`
+    /// probe over at most 128 entries. The split is deliberate rather than
+    /// incidental: volume stays lock-free, destinations pay a lock they can
+    /// afford.
     fn note_destination(&self, url: &Url) {
-        let Charge::Process(process) = self else {
-            return;
-        };
         // Both are absent for the same kind of url — one with no authority, like
         // `data:` — and neither names a destination on its own.
         let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
             return;
         };
-        process.note_destination(url.scheme(), &host.to_ascii_lowercase(), port);
+        let host = host.to_ascii_lowercase();
+        match self {
+            Charge::Process(process) => process.note_destination(url.scheme(), &host, port),
+            Charge::Unattributed(bucket) => {
+                note_unattributed_destination(*bucket, url.scheme(), &host, port)
+            }
+        }
+    }
+}
+
+/// Where egress that belongs to no run went, by the reason it had none.
+///
+/// One log per [`UNATTRIBUTED_EGRESS`] bucket, so the destination list and the
+/// byte tally are indexed the same way and a reader correlating them never has to
+/// map between two orders.
+///
+/// A `Mutex` rather than atomics, unlike the byte tallies beside it, because a set
+/// of hosts is not a number. See [`Charge::note_destination`] for why the lock is
+/// affordable here and would not be there.
+static UNATTRIBUTED_DESTINATIONS: std::sync::Mutex<Option<Box<UnattributedDestinations>>> =
+    std::sync::Mutex::new(None);
+
+/// The per-bucket logs, boxed so the static costs one pointer until first use.
+///
+/// Allocated lazily for that reason and no other: a `monkey` subcommand that makes
+/// no unattributed request should not pay for 7 maps to prove it.
+struct UnattributedDestinations {
+    seen: [BTreeMap<run_scope::Destination, u64>; UNATTRIBUTED_BUCKETS],
+    overflowed: [u64; UNATTRIBUTED_BUCKETS],
+}
+
+impl Default for UnattributedDestinations {
+    fn default() -> Self {
+        UnattributedDestinations {
+            seen: std::array::from_fn(|_| BTreeMap::new()),
+            overflowed: [0; UNATTRIBUTED_BUCKETS],
+        }
+    }
+}
+
+/// Adds one request to `bucket`'s log, or to its overflow once the cap is reached.
+///
+/// The cap is [`run_scope::MAX_DESTINATIONS`] — the *same* ceiling a process gets,
+/// and shared rather than re-picked, because the thing being bounded is the same
+/// thing: a caller with no declared allowlist can be walked across arbitrarily many
+/// hosts by the content it fetches. Requests past it are counted and not named,
+/// never dropped: a truncated list that does not say it is truncated reads as a
+/// complete one.
+///
+/// Poisoning is absorbed with `into_inner`, matching every other lock in this tree:
+/// a panic elsewhere must not turn bookkeeping into a second panic.
+fn note_unattributed_destination(bucket: usize, scheme: &str, host: &str, port: u16) {
+    let Ok(mut guard) = UNATTRIBUTED_DESTINATIONS
+        .lock()
+        .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
+    else {
+        return;
+    };
+    let logs = guard.get_or_insert_with(Box::<UnattributedDestinations>::default);
+    let key = run_scope::Destination {
+        scheme: scheme.to_string(),
+        host: host.to_string(),
+        port,
+    };
+    if let Some(requests) = logs.seen[bucket].get_mut(&key) {
+        *requests += 1;
+        return;
+    }
+    if logs.seen[bucket].len() >= run_scope::MAX_DESTINATIONS {
+        logs.overflowed[bucket] += 1;
+        return;
+    }
+    logs.seen[bucket].insert(key, 1);
+}
+
+/// Takes every unattributed destination noted since the last call, with its label.
+///
+/// A drain rather than a read, for [`run_scope::ProcessScope::take_destinations`]'s
+/// reason: the ledger writer is additive, so a read that left the counts behind
+/// would write them again on the next flush.
+///
+/// Buckets with nothing to report are absent rather than present and empty, so a
+/// caller can skip a transaction entirely on the overwhelmingly common tick where
+/// the app talked to nobody outside a run.
+#[must_use]
+pub fn take_unattributed_destinations() -> Vec<(&'static str, run_scope::DestinationDrain)> {
+    let Ok(mut guard) = UNATTRIBUTED_DESTINATIONS
+        .lock()
+        .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
+    else {
+        return Vec::new();
+    };
+    let Some(logs) = guard.as_mut() else {
+        return Vec::new();
+    };
+    let mut drained = Vec::new();
+    for bucket in 0..UNATTRIBUTED_BUCKETS {
+        let seen: Vec<_> = std::mem::take(&mut logs.seen[bucket]).into_iter().collect();
+        let overflowed = std::mem::replace(&mut logs.overflowed[bucket], 0);
+        if seen.is_empty() && overflowed == 0 {
+            continue;
+        }
+        drained.push((
+            unattributed_label(bucket),
+            run_scope::DestinationDrain { seen, overflowed },
+        ));
+    }
+    drained
+}
+
+/// Puts a drain back, for a caller whose write of it failed.
+///
+/// The mirror of [`run_scope::ProcessScope::return_destinations`] and it inherits
+/// that method's rule: a returned destination past the cap becomes overflow rather
+/// than being silently dropped, because the cap is the invariant and a returned
+/// count must not be able to breach it.
+pub fn return_unattributed_destinations(label: &str, drain: run_scope::DestinationDrain) {
+    let Some(bucket) = (0..UNATTRIBUTED_BUCKETS).find(|index| unattributed_label(*index) == label)
+    else {
+        return;
+    };
+    let Ok(mut guard) = UNATTRIBUTED_DESTINATIONS
+        .lock()
+        .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
+    else {
+        return;
+    };
+    let logs = guard.get_or_insert_with(Box::<UnattributedDestinations>::default);
+    logs.overflowed[bucket] += drain.overflowed;
+    for (destination, requests) in drain.seen {
+        if let Some(existing) = logs.seen[bucket].get_mut(&destination) {
+            *existing += requests;
+        } else if logs.seen[bucket].len() < run_scope::MAX_DESTINATIONS {
+            logs.seen[bucket].insert(destination, requests);
+        } else {
+            logs.overflowed[bucket] += requests;
+        }
     }
 }
 
@@ -2782,6 +2922,184 @@ mod tests {
             assert_eq!(process.take_egress(), 2);
         }
 
+        /// Serializes the tests that touch [`UNATTRIBUTED_DESTINATIONS`].
+        ///
+        /// It is process-wide state by design — unattributed traffic has no scope
+        /// to hang a log off, which is the whole reason this exists — so tests
+        /// that drain it would otherwise take each other's rows under cargo's
+        /// default parallelism. Poisoning is absorbed so one failing test reports
+        /// its own assertion rather than poisoning every sibling into a second,
+        /// misleading failure.
+        static UNATTRIBUTED_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        fn exclusive_log() -> std::sync::MutexGuard<'static, ()> {
+            let guard = UNATTRIBUTED_LOG_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Start from a known state rather than from whatever ran before.
+            let _ = take_unattributed_destinations();
+            guard
+        }
+
+        /// The gap this slice closed, end to end: a request made under a *reason*
+        /// rather than a run now names where it went.
+        ///
+        /// Before this, `UNATTRIBUTED_EGRESS` reported "how much, by reason" and
+        /// nothing at all about "where", so "which hosts does the app itself
+        /// reach outside a run" had no answer. This runs a real request under
+        /// `Unattributed::UserAction` and reads the host back out of the same
+        /// table the attributed case writes to.
+        #[tokio::test]
+        async fn a_request_with_no_run_records_its_destination_under_its_reason() {
+            use crate::process_table::ProcessTable;
+            use crate::run_ledger::RunLedger;
+
+            let _guard = exclusive_log();
+
+            let host = FakeHost::start(vec![ok_body("hi")]);
+            let client = hardened().build().expect("client builds");
+            run_scope::scoped(RunScope::Unattributed(Unattributed::UserAction), async {
+                send(client.get(&host.origin))
+                    .await
+                    .expect("the peer answers")
+                    .text()
+                    .await
+                    .expect("body reads");
+            })
+            .await;
+
+            let drained = take_unattributed_destinations();
+            let (label, drain) = drained
+                .iter()
+                .find(|(label, _)| *label == Unattributed::UserAction.code())
+                .expect("the request was logged under the reason it had no run");
+            assert_eq!(drain.seen.len(), 1);
+            assert_eq!(drain.overflowed, 0);
+
+            let ledger = RunLedger::open_in_memory().expect("an in-memory ledger opens");
+            let table = ProcessTable::new(ledger.connection());
+            table
+                .add_unattributed_egress_destinations(label, drain, 2_000)
+                .expect("the destination lands");
+
+            let stored = table
+                .unattributed_egress_destinations()
+                .expect("the ledger reads back");
+            let recorded = stored
+                .get(Unattributed::UserAction.code())
+                .expect("the reason has a destination list");
+            assert_eq!(recorded.destinations.len(), 1);
+            assert_eq!(recorded.destinations[0].host, "127.0.0.1");
+            assert_eq!(recorded.destinations[0].scheme, "http");
+            assert_eq!(recorded.destinations[0].requests, 1);
+            assert_eq!(recorded.dropped, 0);
+
+            // The drain is a drain: a second one reports nothing *for this
+            // reason*, so the additive writer cannot double-count. Scoped to the
+            // reason rather than asserting global emptiness, because other tests
+            // in this binary make scope-less requests into the same
+            // process-wide log — which is exactly the property that makes it
+            // useful in production and awkward in a test.
+            assert!(
+                take_unattributed_destinations()
+                    .iter()
+                    .all(|(label, _)| *label != Unattributed::UserAction.code()),
+                "a drained reason must not report its destinations twice"
+            );
+        }
+
+        /// The two vocabularies are one vocabulary. A reader correlating "how
+        /// much left under this reason" with "where it went" must be matching on
+        /// the same strings, or the correlation is a guess.
+        #[test]
+        fn destinations_and_byte_tallies_share_the_same_reason_labels() {
+            let _guard = exclusive_log();
+            for bucket in 0..UNATTRIBUTED_BUCKETS {
+                note_unattributed_destination(bucket, "https", "example.test", 443);
+            }
+            let drained = take_unattributed_destinations();
+            let destination_labels: Vec<&str> = drained.iter().map(|(label, _)| *label).collect();
+            let tally_labels: Vec<&str> = unattributed_egress_bytes()
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect();
+            assert_eq!(
+                destination_labels, tally_labels,
+                "every tally must have a destination log under the same label, in the same order"
+            );
+            // And they are the persisted `Unattributed` codes, not a second set
+            // invented here.
+            for reason in Unattributed::ALL {
+                assert!(
+                    destination_labels.contains(&reason.code()),
+                    "{} is missing from the destination labels",
+                    reason.code()
+                );
+            }
+        }
+
+        /// The cap is the same one a process gets, and past it requests are
+        /// counted rather than dropped: a truncated list that does not say it is
+        /// truncated reads as a complete one.
+        #[test]
+        fn the_unattributed_log_is_bounded_and_counts_what_it_could_not_name() {
+            let _guard = exclusive_log();
+            let bucket = 0;
+            for index in 0..run_scope::MAX_DESTINATIONS + 7 {
+                note_unattributed_destination(bucket, "https", &format!("host-{index}.test"), 443);
+            }
+            let drained = take_unattributed_destinations();
+            let (_, drain) = drained
+                .iter()
+                .find(|(label, _)| *label == unattributed_label(bucket))
+                .expect("the bucket reported");
+            assert_eq!(drain.seen.len(), run_scope::MAX_DESTINATIONS);
+            assert_eq!(drain.overflowed, 7, "the excess is counted, never dropped");
+        }
+
+        /// A failed write must delay the destinations to the next tick rather than
+        /// destroy them — the same contract `ProcessScope::return_destinations`
+        /// has, including that a return cannot breach the cap.
+        #[test]
+        fn a_returned_drain_is_recounted_and_still_respects_the_cap() {
+            let _guard = exclusive_log();
+            let label = Unattributed::Startup.code();
+            let bucket = (0..UNATTRIBUTED_BUCKETS)
+                .find(|index| unattributed_label(*index) == label)
+                .expect("startup has a bucket");
+
+            note_unattributed_destination(bucket, "https", "a.test", 443);
+            note_unattributed_destination(bucket, "https", "a.test", 443);
+            let drained = take_unattributed_destinations();
+            let (_, drain) = drained
+                .into_iter()
+                .find(|(candidate, _)| *candidate == label)
+                .expect("the bucket reported");
+            assert_eq!(drain.seen[0].1, 2);
+
+            return_unattributed_destinations(label, drain);
+            let again = take_unattributed_destinations();
+            let (_, drain) = again
+                .into_iter()
+                .find(|(candidate, _)| *candidate == label)
+                .expect("the returned drain is there to take again");
+            assert_eq!(drain.seen[0].1, 2, "a return must not lose the counts");
+
+            // A return into a full log becomes overflow rather than breaching the
+            // ceiling the cap exists to hold.
+            for index in 0..run_scope::MAX_DESTINATIONS {
+                note_unattributed_destination(bucket, "https", &format!("full-{index}.test"), 443);
+            }
+            return_unattributed_destinations(label, drain);
+            let final_drain = take_unattributed_destinations();
+            let (_, drain) = final_drain
+                .into_iter()
+                .find(|(candidate, _)| *candidate == label)
+                .expect("the bucket reported");
+            assert_eq!(drain.seen.len(), run_scope::MAX_DESTINATIONS);
+            assert_eq!(drain.overflowed, 2);
+        }
+
         /// The whole path, ending in the column: bytes counted off a socket reach
         /// `agent_processes.bytes_egressed` through the additive writer, and a row
         /// nobody reported egress for keeps its `NULL`.
@@ -3014,7 +3332,9 @@ mod tests {
                 // The trip: spec -> snapshot -> the recipe JSON the node writes
                 // -> the snapshot the executing child reads back.
                 let snapshot = crate::node_placement::PlacedRunSnapshot::from_spec(&spec);
-                snapshot.validate().expect("a placed snapshot must validate");
+                snapshot
+                    .validate()
+                    .expect("a placed snapshot must validate");
                 let wire = serde_json::to_vec(&snapshot).expect("the snapshot serializes");
                 let arrived: crate::node_placement::PlacedRunSnapshot =
                     serde_json::from_slice(&wire).expect("the snapshot survives the trip");

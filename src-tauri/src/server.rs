@@ -178,12 +178,12 @@ use crate::http_route_registry::{
 };
 use crate::m3_http_server::{M3HttpModelExtensions, M3HttpRequestService, M3HttpServiceRequest};
 use crate::m3_runtime_hub::{M3OperationContext, M3RuntimeHub};
+use crate::profiles::ProfileScopedPaths;
 use crate::unified_http_server::{
     EndpointTransport, PrimaryServiceConfig, RunningEndpoint, UnifiedEndpoint,
     UnifiedGenerationSpec, UnifiedHttpServerState,
 };
 use crate::{ollama, providers, AppState};
-use crate::profiles::ProfileScopedPaths;
 
 /// LM Studio-compatible default port, so drop-in clients that hardcode 1234
 /// need no configuration at all.

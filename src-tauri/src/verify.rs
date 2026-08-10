@@ -37,8 +37,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-use crate::{workspace, AppState};
 use crate::profiles::ProfileScopedPaths;
+use crate::{workspace, AppState};
 
 const VERIFY_CONFIGS_FILE: &str = "verify_configs.json";
 

@@ -28,16 +28,17 @@ use crate::m3_runtime_hub::{
     M3ApiDispatchRequest, M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch,
     M3CleanupReport, M3CompatibilityMatrixReport, M3ComponentCatalogEntry, M3ComponentHub,
     M3ComponentUpdateCheck, M3DeleteModelRequest, M3DownloadRequest, M3HardwareCompatibilityReport,
-    M3HubError, M3InstallComponentRequest, M3InstalledComponentView,
-    M3InstalledModelView, M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest,
-    M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeKind, M3RuntimeMetricsView,
-    M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3SettingCapabilitiesView, M3StorageStatus,
-    M3UnloadModelRequest, M3VerifyProjectorRequest,
+    M3HubError, M3InstallComponentRequest, M3InstalledComponentView, M3InstalledModelView,
+    M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest, M3RuntimeCapabilityView,
+    M3RuntimeHub, M3RuntimeKind, M3RuntimeMetricsView, M3RuntimeStatusView,
+    M3SetRuntimeConfigRequest, M3SettingCapabilitiesView, M3StorageStatus, M3UnloadModelRequest,
+    M3VerifyProjectorRequest,
 };
 // Only `m3_mlx_install_component` inspects a component kind, and that
 // command exists only in the macOS build.
 #[cfg(target_os = "macos")]
 use crate::m3_runtime_hub::M3ComponentKind;
+use crate::profiles::ProfileScopedPaths;
 use crate::quantization::{
     BackendDescriptor, ConversionReport, ConversionRequest, DeclaredLicense, GgufQuantType,
     QuantizationWorkbench,
@@ -57,7 +58,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
-use crate::profiles::ProfileScopedPaths;
 
 /// Bounded per-runtime max for the runtime log tails a support bundle can
 /// embed — mirrors `M3RuntimeHub::runtime_logs`'s own cap on a single

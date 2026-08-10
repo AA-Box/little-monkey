@@ -982,9 +982,7 @@ impl OwnedBrowser {
         let Some(projector) = self.projector.as_ref() else {
             return;
         };
-        use crate::process_table::{
-            ProcessExit, ProcessKind, ProcessProjection, ProcessProjector, ProcessState,
-        };
+        use crate::process_table::{ProcessExit, ProcessKind, ProcessProjection, ProcessProjector};
 
         let mut projection =
             ProcessProjection::new(ProcessKind::BrowserSession, self.session_id.clone(), state)

@@ -256,9 +256,7 @@ fn condense_porcelain_code(x: char, y: char) -> String {
 /// List every changed path (staged, unstaged, and untracked) relative to
 /// HEAD, in porcelain order. Backs the diff panel's file list.
 #[tauri::command]
-pub fn git_changed_files(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<GitChangedFile>, String> {
+pub fn git_changed_files(state: tauri::State<'_, AppState>) -> Result<Vec<GitChangedFile>, String> {
     let root = workspace_root(state.inner())?;
 
     let output = run_git(&root, &["status", "--porcelain", "-z"])?;
@@ -322,9 +320,12 @@ pub fn git_file_diff(
     // the command surface shouldn't rely on that.)
     let rel = Path::new(&path);
     if rel.is_absolute()
-        || rel
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::Prefix(_)))
+        || rel.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
     {
         return Err("Path must be relative to the workspace root".to_string());
     }
@@ -453,16 +454,31 @@ const MAX_REVIEW_FILES: usize = 300;
 /// Resolves the branch's comparison target: its configured upstream if any,
 /// otherwise the remote's default branch (`origin/HEAD`), otherwise `None`.
 fn review_target(root: &Path) -> Option<String> {
-    let upstream = run_git(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).ok()?;
+    let upstream = run_git(
+        root,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .ok()?;
     if upstream.status.success() {
         let name = String::from_utf8_lossy(&upstream.stdout).trim().to_string();
         if !name.is_empty() {
             return Some(name);
         }
     }
-    let origin_head = run_git(root, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).ok()?;
+    let origin_head = run_git(
+        root,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .ok()?;
     if origin_head.status.success() {
-        let name = String::from_utf8_lossy(&origin_head.stdout).trim().to_string();
+        let name = String::from_utf8_lossy(&origin_head.stdout)
+            .trim()
+            .to_string();
         if !name.is_empty() {
             return Some(name);
         }
@@ -486,7 +502,9 @@ fn compare_url(remote: &str, target: &str, branch: &str) -> Option<String> {
     let base = https.trim_end_matches('/').trim_end_matches(".git");
     // Strip the remote name off the target ("origin/develop" -> "develop").
     let target_branch = target.split_once('/').map_or(target, |(_, b)| b);
-    Some(format!("{base}/compare/{target_branch}...{branch}?expand=1"))
+    Some(format!(
+        "{base}/compare/{target_branch}...{branch}?expand=1"
+    ))
 }
 
 /// Full-content review snapshot. `mode` is `"branch"` (merge-base of the
@@ -495,7 +513,10 @@ fn compare_url(remote: &str, target: &str, branch: &str) -> Option<String> {
 /// only). Like [`git_status`], a direct human-initiated UI read, not an
 /// agent tool — no permission gate.
 #[tauri::command]
-pub fn git_review(state: tauri::State<'_, AppState>, mode: String) -> Result<ReviewPayload, String> {
+pub fn git_review(
+    state: tauri::State<'_, AppState>,
+    mode: String,
+) -> Result<ReviewPayload, String> {
     let root = workspace_root(state.inner())?;
 
     let empty = ReviewPayload {
@@ -516,8 +537,14 @@ pub fn git_review(state: tauri::State<'_, AppState>, mode: String) -> Result<Rev
     }
 
     let branch_output = run_git(&root, &["branch", "--show-current"])?;
-    let branch_name = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
-    let branch = if branch_name.is_empty() { None } else { Some(branch_name.clone()) };
+    let branch_name = String::from_utf8_lossy(&branch_output.stdout)
+        .trim()
+        .to_string();
+    let branch = if branch_name.is_empty() {
+        None
+    } else {
+        Some(branch_name.clone())
+    };
 
     let target = review_target(&root);
 
@@ -536,7 +563,9 @@ pub fn git_review(state: tauri::State<'_, AppState>, mode: String) -> Result<Rev
             Some(target_ref) => {
                 let merge_base = run_git(&root, &["merge-base", target_ref, "HEAD"])?;
                 if merge_base.status.success() {
-                    String::from_utf8_lossy(&merge_base.stdout).trim().to_string()
+                    String::from_utf8_lossy(&merge_base.stdout)
+                        .trim()
+                        .to_string()
                 } else {
                     "HEAD".to_string()
                 }
@@ -565,7 +594,9 @@ pub fn git_review(state: tauri::State<'_, AppState>, mode: String) -> Result<Rev
         }
         let record = String::from_utf8_lossy(record);
         let mut parts = record.splitn(3, '\t');
-        let (Some(added_raw), Some(deleted_raw), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+        let (Some(added_raw), Some(deleted_raw), Some(path)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
             continue;
         };
         let added = added_raw.parse::<u32>().unwrap_or(0);
@@ -575,7 +606,11 @@ pub fn git_review(state: tauri::State<'_, AppState>, mode: String) -> Result<Rev
         total_deleted += deleted;
 
         let old_output = run_git(&root, &["show", &format!("{base}:{path}")])?;
-        let old_bytes = if old_output.status.success() { old_output.stdout } else { Vec::new() };
+        let old_bytes = if old_output.status.success() {
+            old_output.stdout
+        } else {
+            Vec::new()
+        };
         let new_bytes = std::fs::read(root.join(path)).unwrap_or_default();
 
         let binary = numstat_binary
@@ -586,8 +621,16 @@ pub fn git_review(state: tauri::State<'_, AppState>, mode: String) -> Result<Rev
 
         files.push(ReviewFilePayload {
             path: path.to_string(),
-            old_content: if binary { String::new() } else { String::from_utf8_lossy(&old_bytes).to_string() },
-            new_content: if binary { String::new() } else { String::from_utf8_lossy(&new_bytes).to_string() },
+            old_content: if binary {
+                String::new()
+            } else {
+                String::from_utf8_lossy(&old_bytes).to_string()
+            },
+            new_content: if binary {
+                String::new()
+            } else {
+                String::from_utf8_lossy(&new_bytes).to_string()
+            },
             added,
             deleted,
             binary,
@@ -609,7 +652,11 @@ pub fn git_review(state: tauri::State<'_, AppState>, mode: String) -> Result<Rev
             files.push(ReviewFilePayload {
                 path,
                 old_content: String::new(),
-                new_content: if binary { String::new() } else { String::from_utf8_lossy(&bytes).to_string() },
+                new_content: if binary {
+                    String::new()
+                } else {
+                    String::from_utf8_lossy(&bytes).to_string()
+                },
                 added,
                 deleted: 0,
                 binary,
@@ -623,7 +670,11 @@ pub fn git_review(state: tauri::State<'_, AppState>, mode: String) -> Result<Rev
         (Some(target_ref), Some(branch_ref)) => {
             let remote = run_git(&root, &["remote", "get-url", "origin"])?;
             if remote.status.success() {
-                compare_url(&String::from_utf8_lossy(&remote.stdout), target_ref, branch_ref)
+                compare_url(
+                    &String::from_utf8_lossy(&remote.stdout),
+                    target_ref,
+                    branch_ref,
+                )
             } else {
                 None
             }

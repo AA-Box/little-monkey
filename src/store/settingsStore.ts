@@ -116,6 +116,24 @@ export interface SettingsState {
    * rather than a three-way target-kind picker for a minor v1 win (see the
    * design doc's "keep this genuinely optional... don't force a UI" note). */
   subagentProfileModels: Partial<Record<'explore' | 'code', SubagentModelOverride>>;
+  /** Whether the four WebView process kinds (`chat_turn`, `subagent`,
+   * `crew_member`, `side_task`) carry a wall-clock budget at all — see
+   * `processWallBudget.ts` for the enforcement and
+   * `ProcessKind::default_limits` for the class default this overrides.
+   * Default true. Off means the row is admitted with **no** `maxWallMs`
+   * rather than with one nothing enforces: a declared limit that does not
+   * fire is worse than an honest absence, which is why this is a flag and
+   * not a `processWallBudgetHours` of 0. */
+  processWallBudgetEnabled: boolean;
+  /** Hours a WebView process may keep *starting new work* before a stop is
+   * latched for it. Range 1-72, default 6 (mirrors the Rust
+   * `WEBVIEW_WALL_BUDGET_MS`, which is the authority — this setting only
+   * overrides it). It is a floor, not a ceiling: the latch is observed at a
+   * safe point, so the real bound is this plus the longest tool timeout in
+   * flight. Long by design — a turn parked on an unanswered permission dialog
+   * still ages, so a tight budget would cancel work for the user's own
+   * slowness. */
+  processWallBudgetHours: number;
   /** Whether the Safe Desktop Control settings panel (see
    * `src-tauri/src/desktop_control.rs` and `docs/safe-desktop-control-design.md`)
    * is reachable at all. Default false — same "disabled = not offered"
@@ -148,6 +166,8 @@ export interface SettingsState {
   ) => void;
   clearProviderModelSelection: (providerId: string) => void;
   setCheckpointRetention: (value: number) => void;
+  setProcessWallBudgetEnabled: (value: boolean) => void;
+  setProcessWallBudgetHours: (value: number) => void;
   setMemoryEnabled: (value: boolean) => void;
   setWebToolsEnabled: (value: boolean) => void;
   setVerifyEnabled: (value: boolean) => void;
@@ -207,6 +227,11 @@ const DEFAULT_CONTEXT_TRIM_THRESHOLD = 85;
 /** Mirrors `MAX_CHECKPOINTS` in src-tauri/src/checkpoints.rs — the backend's
  * own fallback when no `max_keep` is supplied, kept in sync here so the
  * setting's default matches pre-existing behavior. */
+/** Mirrors `WEBVIEW_WALL_BUDGET_MS` in `process_table.rs`, which is the authority. */
+export const DEFAULT_PROCESS_WALL_BUDGET_HOURS = 6;
+export const MIN_PROCESS_WALL_BUDGET_HOURS = 1;
+export const MAX_PROCESS_WALL_BUDGET_HOURS = 72;
+
 const DEFAULT_CHECKPOINT_RETENTION = 20;
 export const MIN_CHECKPOINT_RETENTION = 5;
 export const MAX_CHECKPOINT_RETENTION = 100;
@@ -233,6 +258,8 @@ interface PersistedShape {
   visionOverrides: Record<string, boolean>;
   providerModelFilters: Record<string, ProviderModelFilter>;
   checkpointRetention: number;
+  processWallBudgetEnabled: boolean;
+  processWallBudgetHours: number;
   memoryEnabled: boolean;
   webToolsEnabled: boolean;
   verifyEnabled: boolean;
@@ -265,6 +292,8 @@ function defaults(): PersistedShape {
     visionOverrides: {},
     providerModelFilters: {},
     checkpointRetention: DEFAULT_CHECKPOINT_RETENTION,
+    processWallBudgetEnabled: true,
+    processWallBudgetHours: DEFAULT_PROCESS_WALL_BUDGET_HOURS,
     memoryEnabled: true,
     webToolsEnabled: true,
     verifyEnabled: false,
@@ -365,6 +394,16 @@ function hydrate(): PersistedShape {
         parsed.checkpointRetention <= MAX_CHECKPOINT_RETENTION
           ? Math.round(parsed.checkpointRetention)
           : fallback.checkpointRetention,
+      processWallBudgetEnabled:
+        typeof parsed.processWallBudgetEnabled === "boolean"
+          ? parsed.processWallBudgetEnabled
+          : fallback.processWallBudgetEnabled,
+      processWallBudgetHours:
+        typeof parsed.processWallBudgetHours === "number" &&
+        parsed.processWallBudgetHours >= MIN_PROCESS_WALL_BUDGET_HOURS &&
+        parsed.processWallBudgetHours <= MAX_PROCESS_WALL_BUDGET_HOURS
+          ? Math.round(parsed.processWallBudgetHours)
+          : fallback.processWallBudgetHours,
       memoryEnabled: typeof parsed.memoryEnabled === "boolean" ? parsed.memoryEnabled : fallback.memoryEnabled,
       webToolsEnabled: typeof parsed.webToolsEnabled === "boolean" ? parsed.webToolsEnabled : fallback.webToolsEnabled,
       verifyEnabled: typeof parsed.verifyEnabled === "boolean" ? parsed.verifyEnabled : fallback.verifyEnabled,
@@ -548,6 +587,20 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   setCheckpointRetention: (value) => {
     const clamped = Math.min(MAX_CHECKPOINT_RETENTION, Math.max(MIN_CHECKPOINT_RETENTION, Math.round(value)));
     set({ checkpointRetention: clamped });
+    persist({ ...get() });
+  },
+
+  setProcessWallBudgetEnabled: (value) => {
+    set({ processWallBudgetEnabled: value });
+    persist({ ...get() });
+  },
+
+  setProcessWallBudgetHours: (value) => {
+    const clamped = Math.min(
+      MAX_PROCESS_WALL_BUDGET_HOURS,
+      Math.max(MIN_PROCESS_WALL_BUDGET_HOURS, Math.round(value)),
+    );
+    set({ processWallBudgetHours: clamped });
     persist({ ...get() });
   },
 

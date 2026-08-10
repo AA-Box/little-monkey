@@ -25,13 +25,13 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use sha2::{Digest, Sha256};
-use tauri::{Emitter};
+use tauri::Emitter;
 
+use crate::profiles::ProfileScopedPaths;
 use crate::run_protocol::{
     ModelTargetSnapshot, PermissionMode as RunPermissionMode, PermissionPolicySnapshot,
     WorkspaceContext,
 };
-use crate::profiles::ProfileScopedPaths;
 
 /// Current (and, so far, only) recipe schema version.
 pub const RECIPE_SCHEMA_VERSION: u32 = 1;
