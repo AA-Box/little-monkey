@@ -1202,7 +1202,7 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&created)
                 .expect("workspace write")
-                .trim_end_matches(['\r', '\n']),
+                .trim_end(),
             "created-ok"
         );
         assert_eq!(
