@@ -428,7 +428,11 @@ fn acquire_dacl_mutation_lock_with_timeout(timeout: Duration) -> io::Result<Owne
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
-                0,
+                // Attribute-only access (`0`) does not participate in the
+                // read/write/delete share checks, so two nominally exclusive
+                // opens can coexist. Request one real file right to make a
+                // zero-share handle a kernel lock.
+                FILE_GENERIC_READ,
                 0,
                 std::ptr::null(),
                 OPEN_ALWAYS,
@@ -1717,6 +1721,7 @@ pub fn app_containers_are_enforceable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Security::{GetAce, ACCESS_ALLOWED_ACE, ACE_HEADER, INHERITED_ACE};
 
     fn sid_access_entries(path: &Path, sid: PSID) -> io::Result<Vec<(u32, u32)>> {
         let _mutation = acquire_dacl_mutation_lock()?;
@@ -1781,6 +1786,53 @@ mod tests {
             .collect())
     }
 
+    fn sid_raw_access_entries(path: &Path, sid: PSID) -> io::Result<Vec<(u32, u8)>> {
+        let _mutation = acquire_dacl_mutation_lock()?;
+        let object = wide_path(path);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let read = unsafe {
+            GetNamedSecurityInfoW(
+                object.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if read != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(read as i32));
+        }
+        if dacl.is_null() {
+            unsafe { LocalFree(descriptor.cast()) };
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "NULL DACL"));
+        }
+
+        let mut access = Vec::new();
+        for index in 0..unsafe { (*dacl).AceCount } {
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            if unsafe { GetAce(dacl, u32::from(index), &mut raw) } == 0 {
+                let error = io::Error::last_os_error();
+                unsafe { LocalFree(descriptor.cast()) };
+                return Err(error);
+            }
+            let header = unsafe { &*raw.cast::<ACE_HEADER>() };
+            // ACCESS_ALLOWED_ACE_TYPE is zero. Object-specific ACEs are not
+            // emitted by this module and have a different layout.
+            if header.AceType == 0 {
+                let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
+                if unsafe { EqualSid((&raw const ace.SidStart).cast_mut().cast(), sid) } != 0 {
+                    access.push((ace.Mask, ace.Header.AceFlags));
+                }
+            }
+        }
+        unsafe { LocalFree(descriptor.cast()) };
+        Ok(access)
+    }
+
     #[test]
     fn scoped_tree_grant_removes_its_ace_from_the_existing_tree() {
         let root = std::env::temp_dir().join(format!("lm-ac-scoped-{}", uuid::Uuid::new_v4()));
@@ -1807,17 +1859,20 @@ mod tests {
                 sid_permissions(&root, container.sid).unwrap(),
                 [WORKSPACE_TREE_ACCESS]
             );
-            let child_permissions = sid_permissions(&child, container.sid).unwrap();
+            let child_permissions = sid_raw_access_entries(&child, container.sid).unwrap();
             assert!(
                 !child_permissions.is_empty()
                     && child_permissions
                         .iter()
-                        .all(|mask| *mask == WORKSPACE_TREE_ACCESS),
+                        .all(|(mask, flags)| *mask == WORKSPACE_TREE_ACCESS
+                            && u32::from(*flags) & INHERITED_ACE != 0),
                 "unexpected inherited masks: {child_permissions:?}"
             );
         }
         assert!(sid_permissions(&root, container.sid).unwrap().is_empty());
-        assert!(sid_permissions(&child, container.sid).unwrap().is_empty());
+        assert!(sid_raw_access_entries(&child, container.sid)
+            .unwrap()
+            .is_empty());
 
         {
             let _grant = container

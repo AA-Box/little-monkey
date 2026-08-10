@@ -1176,8 +1176,8 @@ mod tests {
         );
         #[cfg(target_os = "windows")]
         let command = format!(
-            "type \"{}\" & <nul set /p \"=created-ok\">\"{}\" & \
-             (type \"{}\" >nul 2>&1 && echo ESCAPE_READ) || echo DENIED_READ & \
+            "type \"{}\" & echo created-ok>\"{}\" & \
+             (type \"{}\" && echo ESCAPE_READ) || echo DENIED_READ & \
              (echo hacked>\"{}\" && echo ESCAPE_WRITE) || echo DENIED_WRITE",
             inside.display(),
             created.display(),
@@ -1200,7 +1200,9 @@ mod tests {
         assert!(stdout.contains("DENIED_WRITE"), "stdout={stdout}");
         assert!(!stdout.contains("outside-secret"), "stdout={stdout}");
         assert_eq!(
-            fs::read_to_string(&created).expect("workspace write"),
+            fs::read_to_string(&created)
+                .expect("workspace write")
+                .trim_end_matches(['\r', '\n']),
             "created-ok"
         );
         assert_eq!(
