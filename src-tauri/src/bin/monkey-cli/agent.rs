@@ -897,6 +897,16 @@ async fn execute_tool_call(
             .unwrap_or("(untitled subtask)")
             .to_string();
         let prompt = args["prompt"].as_str().unwrap_or_default().to_string();
+        // The contract publishes `isolation` (the desktop runs such agents in
+        // a managed git worktree — see the app's `agent_worktrees.rs`), but
+        // the CLI has no worktree runtime: refusing loudly beats silently
+        // running "isolated" work directly in the shared checkout.
+        if args["isolation"].as_str() == Some("worktree") {
+            return serde_json::json!({
+                "error": "Worktree isolation is not supported by the CLI — drop \"isolation\" and the subagent will run in the workspace directly."
+            })
+            .to_string();
+        }
         let profile = match CliSubagentProfile::parse(args["profile"].as_str().unwrap_or("explore"))
         {
             Ok(profile) => profile,

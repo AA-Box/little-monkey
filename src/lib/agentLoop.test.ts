@@ -572,11 +572,37 @@ describe("toolsForMode", () => {
 
   const base = [toolDef("read_file"), toolDef("write_file")];
 
-  it("appends present_plan only in plan mode", () => {
-    expect(toolsForMode(base, "plan").map((t) => t.function.name)).toEqual(["read_file", "write_file", "present_plan"]);
+  it("appends present_plan and drops the write tool in plan mode", () => {
+    expect(toolsForMode(base, "plan").map((t) => t.function.name)).toEqual(["read_file", "present_plan"]);
   });
 
-  it("returns the tool list unchanged (same reference) in every other mode", () => {
+  it("excludes every Plan-Mode-blocked name from the offer: mutating, gated, shell_kill, and all mcp__ tools", () => {
+    const wide = [
+      toolDef("read_file"),
+      toolDef("list_dir"),
+      toolDef("glob"),
+      toolDef("grep"),
+      toolDef("write_file"),
+      toolDef("edit_file"),
+      toolDef("run_shell"),
+      toolDef("shell_output"),
+      toolDef("shell_kill"),
+      toolDef("remember"),
+      toolDef("web_fetch"),
+      toolDef("web_search"),
+      toolDef("mcp__srv__anything"),
+    ];
+    expect(toolsForMode(wide, "plan").map((t) => t.function.name)).toEqual([
+      "read_file",
+      "list_dir",
+      "glob",
+      "grep",
+      "shell_output",
+      "present_plan",
+    ]);
+  });
+
+  it("returns the tool list unchanged (same reference) in every other mode — approving a plan re-offers the mutating tools", () => {
     for (const mode of ["manual", "acceptEdits", "smart", "auto", "bypass"] as const) {
       expect(toolsForMode(base, mode)).toBe(base);
     }

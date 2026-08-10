@@ -45,7 +45,7 @@ use crate::http_route_registry::{
 /// * **minor**: anything additive — a new route, method, tool, or optional
 ///   parameter.
 /// * **patch**: descriptions and other non-structural wording.
-pub const CONTRACT_VERSION: &str = "1.1.0";
+pub const CONTRACT_VERSION: &str = "1.2.0";
 
 /// How long a surface stays after it is announced deprecated.
 ///

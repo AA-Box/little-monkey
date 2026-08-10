@@ -61,14 +61,26 @@ beforeEach(() => {
 });
 
 describe("parseWorkflowSpec", () => {
-  it("normalizes a valid spec and defaults profile to explore", () => {
+  it("normalizes a valid spec, passing unknown profiles through for dispatch to validate", () => {
     const parsed = parseWorkflowSpec({
       name: " audit ",
       description: " d ",
-      phases: [{ title: "P", agents: [{ description: "a", prompt: "p", profile: "bogus" }] }],
+      phases: [{ title: "P", agents: [{ description: "a", prompt: "p", profile: "docs-writer" }] }],
     });
     expect(parsed.name).toBe("audit");
     expect(parsed.description).toBe("d");
+    // A custom agent name is valid (customAgents.ts); an unknown one fails
+    // at dispatch with an error naming the known profiles, not a silent
+    // coercion here.
+    expect(parsed.phases[0].agents[0].profile).toBe("docs-writer");
+  });
+
+  it("defaults a missing or blank profile to explore", () => {
+    const parsed = parseWorkflowSpec({
+      name: "audit",
+      description: "d",
+      phases: [{ title: "P", agents: [{ description: "a", prompt: "p" }] }],
+    });
     expect(parsed.phases[0].agents[0].profile).toBe("explore");
   });
 
@@ -465,5 +477,25 @@ describe("runWorkflow / resume (v2)", () => {
     expect(results[workflowAgentTaskId("call_journal", 0, 1)]?.status).toBe("done");
     expect(results[workflowAgentTaskId("call_journal", 0, 1)]?.report).toBe("good report");
     expect(results[workflowAgentTaskId("call_journal", 0, 1)]?.promptHash).toBe(promptHash("Audit part B."));
+  });
+});
+
+describe("parseWorkflowSpec / isolation", () => {
+  it("passes 'worktree' through and drops anything else", () => {
+    const parsed = parseWorkflowSpec({
+      name: "n",
+      description: "",
+      phases: [
+        {
+          title: "P",
+          agents: [
+            { description: "a", prompt: "p", profile: "code", isolation: "worktree" },
+            { description: "b", prompt: "p", profile: "code", isolation: "container" },
+          ],
+        },
+      ],
+    });
+    expect(parsed.phases[0].agents[0].isolation).toBe("worktree");
+    expect(parsed.phases[0].agents[1].isolation).toBeUndefined();
   });
 });

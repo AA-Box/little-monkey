@@ -475,7 +475,13 @@ export const TASK_TOOL: ToolDef = {
           type: 'string',
           enum: ['explore', 'code'],
           description:
-            "Tool access profile for the subagent. 'explore' gives read-only tools (read_file, list_dir, glob, grep) — use it for research and investigation. 'code' additionally allows write_file, edit_file, and run_shell — its edits land in this turn's own checkpoint and go through the same permission prompts as your own edits — use it for an independent, disjoint implementation subtask.",
+            "Tool access profile for the subagent. 'explore' gives read-only tools (read_file, list_dir, glob, grep) — use it for research and investigation. 'code' additionally allows write_file, edit_file, and run_shell — its edits land in this turn's own checkpoint and go through the same permission prompts as your own edits — use it for an independent, disjoint implementation subtask. A custom agent name from the system prompt's \"## Custom agents\" section is also accepted and runs that agent's declared tool set and instructions.",
+        },
+        isolation: {
+          type: 'string',
+          enum: ['worktree'],
+          description:
+            "Optional, only valid with a mutating (code-class) profile: 'worktree' runs the subagent in a fresh git worktree of the workspace, so parallel code agents can never collide on files. Its changes stay in the worktree — the user applies or discards them afterwards — so use it for parallel or experimental edits, not for changes this conversation needs on disk immediately.",
         },
       },
       required: ['description', 'prompt', 'profile'],
@@ -544,12 +550,17 @@ export const WORKFLOW_TOOL: ToolDef = {
                     profile: {
                       type: 'string',
                       enum: ['explore', 'code'],
-                      description: "Tool access profile — same meaning as the task tool's profile.",
+                      description: "Tool access profile — same meaning as the task tool's profile, including custom agent names from the \"## Custom agents\" section.",
                     },
                     effort: {
                       type: 'string',
                       enum: ['low', 'medium', 'high'],
                       description: 'Optional reasoning-effort override for this one agent — omit to inherit the turn\'s effort. Use "low" for cheap mechanical work, "high" only for the hardest verify/judge agents.',
+                    },
+                    isolation: {
+                      type: 'string',
+                      enum: ['worktree'],
+                      description: "Optional — same meaning as the task tool's isolation: run this (code-class) agent in its own git worktree so parallel agents never collide on files.",
                     },
                   },
                   required: ['description', 'prompt', 'profile'],
