@@ -752,21 +752,27 @@ pub async fn run_to_output(
 }
 
 #[cfg(all(test, unix))]
-pub(crate) fn posix_spawn_inheriting_shell_for_test(shell_command: &str) -> io::Result<bool> {
+pub(crate) fn posix_spawn_inheriting_fd_probe_for_test(fd: libc::c_int) -> io::Result<bool> {
     use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
 
-    let path = CString::new("/bin/sh").expect("static shell path has no NUL");
-    let arg0 = CString::new("sh").expect("static argv has no NUL");
-    let arg1 = CString::new("-c").expect("static argv has no NUL");
-    let arg2 = CString::new(shell_command)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "shell command contains NUL"))?;
+    let executable = std::env::current_exe()?;
+    let path = CString::new(executable.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "test path contains NUL"))?;
+    let exact = CString::new("--exact").expect("static argv has no NUL");
+    let probe = CString::new("workspace_shell::tests::inherited_fd_probe_child")
+        .expect("static argv has no NUL");
+    let one_thread = CString::new("--test-threads=1").expect("static argv has no NUL");
     let mut argv = [
-        arg0.as_ptr().cast_mut(),
-        arg1.as_ptr().cast_mut(),
-        arg2.as_ptr().cast_mut(),
+        path.as_ptr().cast_mut(),
+        exact.as_ptr().cast_mut(),
+        probe.as_ptr().cast_mut(),
+        one_thread.as_ptr().cast_mut(),
         std::ptr::null_mut(),
     ];
-    let mut envp = [std::ptr::null_mut()];
+    let probe_env = CString::new(format!("LITTLE_MONKEY_INHERITED_FD_PROBE={fd}"))
+        .expect("numeric fd environment has no NUL");
+    let mut envp = [probe_env.as_ptr().cast_mut(), std::ptr::null_mut()];
     let mut pid = 0;
     let spawned = unsafe {
         libc::posix_spawn(
@@ -1072,12 +1078,24 @@ mod tests {
         let workspace = tree.0.join("workspace");
         fs::create_dir(&workspace).expect("create workspace");
         let workspace = crate::sandbox::plain_canonical(&workspace).expect("canonical workspace");
+        let probe_executable = workspace.join("inherited-fd-probe");
+        let current_executable = std::env::current_exe().expect("current test executable");
+        fs::hard_link(&current_executable, &probe_executable)
+            .or_else(|_| fs::copy(&current_executable, &probe_executable).map(|_| ()))
+            .expect("place fd probe inside selected workspace");
+        let inside_probe = workspace.join("inside-probe.txt");
+        fs::write(&inside_probe, "inside-probe").expect("write inside probe");
         // Configure first: on macOS this prepares the /dev/fd handle and
         // buffer, so only child-side enumeration can see the later descriptor.
         let runtime = ShellRuntime::create(&workspace, &workspace).expect("create shell runtime");
         let mut command = configure_tokio(
             &runtime,
-            "eval \"/bin/cat <&$LATE_FD\" >\"$TMPDIR/inherited\" 2>/dev/null && printf ESCAPE_FD || printf DENIED_FD",
+            &format!(
+                "if LITTLE_MONKEY_FD_PROBE_PATH={} {} --exact workspace_shell::tests::inherited_fd_probe_child --test-threads=1 >/dev/null 2>&1; then printf PROBE_OK:; else printf PROBE_BROKEN:; fi; LITTLE_MONKEY_INHERITED_FD_PROBE=\"$LATE_FD\" {} --exact workspace_shell::tests::inherited_fd_probe_child --test-threads=1 >/dev/null 2>&1 && printf ESCAPE_FD || printf DENIED_FD",
+                quote(&inside_probe),
+                quote(&probe_executable),
+                quote(&probe_executable),
+            ),
         )
         .expect("configure confined inherited-descriptor probe");
         let outside = tree.0.join("outside-secret.txt");
@@ -1093,8 +1111,7 @@ mod tests {
         };
         assert_ne!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, -1);
         assert!(
-            posix_spawn_inheriting_shell_for_test(&format!("/bin/cat <&{fd} >/dev/null"))
-                .expect("run inherited-fd control"),
+            posix_spawn_inheriting_fd_probe_for_test(fd).expect("run inherited-fd control"),
             "the control must inherit and read the descriptor"
         );
 
@@ -1102,7 +1119,32 @@ mod tests {
             .output()
             .await
             .expect("run confined descriptor probe");
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "DENIED_FD");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "PROBE_OK:DENIED_FD"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inherited_fd_probe_child() {
+        if let Some(path) = std::env::var_os("LITTLE_MONKEY_FD_PROBE_PATH") {
+            assert_eq!(fs::read_to_string(path).unwrap(), "inside-probe");
+            return;
+        }
+        let Some(fd) = std::env::var("LITTLE_MONKEY_INHERITED_FD_PROBE")
+            .ok()
+            .and_then(|value| value.parse::<libc::c_int>().ok())
+        else {
+            return;
+        };
+        let mut byte = 0_u8;
+        assert_eq!(
+            unsafe { libc::pread(fd, (&mut byte as *mut u8).cast(), 1, 0) },
+            1,
+            "inheritable fd probe could not read fd {fd}: {}",
+            io::Error::last_os_error(),
+        );
     }
 
     #[tokio::test]

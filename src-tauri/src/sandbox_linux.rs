@@ -537,11 +537,14 @@ mod tests {
             }
         }
 
-        let null = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/null")
-            .expect("open /dev/null");
-        let inherited = RawFd(unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, 3) });
+        let fixture_path = std::env::temp_dir().join(format!(
+            "little-monkey-inherited-fd-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&fixture_path, b"x").expect("write fd fixture");
+        let fixture = std::fs::File::open(&fixture_path).expect("open fd fixture");
+        std::fs::remove_file(&fixture_path).expect("unlink fd fixture");
+        let inherited = RawFd(unsafe { libc::fcntl(fixture.as_raw_fd(), libc::F_DUPFD, 3) });
         assert!(
             inherited.0 >= 3,
             "F_DUPFD failed: {}",
@@ -549,17 +552,20 @@ mod tests {
         );
         let flags = unsafe { libc::fcntl(inherited.0, libc::F_GETFD) };
         assert_eq!(flags & libc::FD_CLOEXEC, 0, "test fd was not inheritable");
-        let script = format!("printf inherited >&{}", inherited.0);
-
         assert!(
-            crate::workspace_shell::posix_spawn_inheriting_shell_for_test(&script)
+            crate::workspace_shell::posix_spawn_inheriting_fd_probe_for_test(inherited.0)
                 .expect("baseline shell"),
             "baseline shell did not inherit the test fd"
         );
 
-        let mut strict = Command::new("/bin/sh");
+        let mut strict = Command::new(std::env::current_exe().expect("current test executable"));
         strict
-            .args(["-c", &script])
+            .args([
+                "--exact",
+                "workspace_shell::tests::inherited_fd_probe_child",
+                "--test-threads=1",
+            ])
+            .env("LITTLE_MONKEY_INHERITED_FD_PROBE", inherited.0.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         install(&mut strict, None, None, true);
