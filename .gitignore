@@ -20,6 +20,7 @@ dist-ssr
 *.tsbuildinfo
 graphify-out/
 AGENTS.md
+CLAUDE.md
 vite.config.js
 vite.config.d.ts
 

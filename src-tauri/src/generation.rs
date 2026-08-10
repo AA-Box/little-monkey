@@ -1448,7 +1448,7 @@ const MAX_STDERR_TAIL: usize = 4_000;
 const ENGINE_FAILURE_HINTS: &[(&str, &str)] = &[
     (
         "get sd version from file failed",
-        "The engine could not read that file as a bare diffusion model. An all-in-one checkpoint belongs on --model; --diffusion-model is for a UNet on its own.",
+        "The engine could not detect a model version in that file. A standalone UNet or DiT belongs on --diffusion-model; only an all-in-one checkpoint belongs on --model. Check which slot the file is on — either direction produces this error.",
     ),
     (
         "wrong shape in model metadata",
