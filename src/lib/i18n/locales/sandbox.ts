@@ -9,7 +9,11 @@ export const sandboxLocale: Record<string, string> = {
   "SandboxPanel.running": "Running in the sandbox…",
   "SandboxPanel.allowNetwork": "Allow network access",
   "SandboxPanel.isolation.os_sandboxed": "OS-sandboxed (macOS Seatbelt)",
+  "SandboxPanel.isolation.process_contained":
+    "Process tree contained (Windows job object, no filesystem boundary)",
   "SandboxPanel.isolation.process_only": "Process isolation only (no OS sandbox on this platform)",
+  "SandboxPanel.enforcement.process_contained":
+    "A job object bounds this run's process count, its committed memory and its reach across the window station, and kills the whole tree when the run ends. It is not a filesystem boundary: the command can still read or write your real files by absolute path. Review the command before running it.",
   "SandboxPanel.enforcement.process_only": "No OS sandbox on this platform. The command gets a copied workspace, a restricted working directory and a scrubbed environment, but nothing stops it reading or writing your real files by absolute path. Review the command before running it.",
   "SandboxPanel.enforcement.unavailable": "This platform sandboxes through /usr/bin/sandbox-exec and it is missing, so the run will fail to start rather than run unconfined.",
   "SandboxPanel.exitCode": "Exit code",

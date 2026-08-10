@@ -94,11 +94,41 @@ export interface RestorePlanEntry {
   drifted: boolean;
 }
 
+/** One external effect the backend recorded, and what undoes it. */
+export interface ExternalEffectRecord {
+  kind: 'shell' | 'network' | 'mcp-tool' | 'memory' | 'task-suggestion';
+  /** A tagged object rather than a bool, which is what made adding the first
+   * real undo a compile error at every reader instead of a flag somebody
+   * forgets to check.
+   *
+   * `undo` exists for `memory`: a remembered fact is this app's own record, and
+   * reverting the turn forgets exactly the facts that turn added. The other
+   * three are still `none`, each with its own reason — a shell command can
+   * change anything, a request cannot be un-sent, an MCP server is outside this
+   * app. */
+  compensation: { kind: 'none'; reason: string } | { kind: 'undo'; action: string };
+  /** How far the effect got through the declare-then-commit contract.
+   *
+   * `declared` is not "it failed" — the declaration is written before the call
+   * on purpose, so a permitted request that then timed out still counts. Only
+   * `committed` means the app watched it finish; `unobserved` is a checkpoint
+   * written before the commit phase existed and has no signal either way. */
+  status: 'committed' | 'declared' | 'unobserved';
+}
+
 export interface RestoreSimulation {
   id: string;
   alreadyReverted: boolean;
   files: RestorePlanEntry[];
+  /** True when any recorded effect has no compensator. Derived from
+   * `externalEffects`, not from `shellRan` — a turn that only made a network
+   * call used to report `false` here and read as "nothing to reconcile". */
   needsReconciliation: boolean;
+  /** Recorded in the manifest when each effect happened, so — unlike
+   * `classifyTurnToolCalls`'s transcript-derived list, which is finer-grained
+   * but only survives while the messages do — this is still here after a
+   * context compaction. */
+  externalEffects: ExternalEffectRecord[];
 }
 
 /** Fetches checkpoint `id`'s per-file diff/status preview. Read-only. */

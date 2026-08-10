@@ -72,6 +72,11 @@ interface TaskSuggestionStoreState {
   create: (params: CreateTaskSuggestionParams) => TaskSuggestion;
   markStarted: (id: string, spawnedSessionId: string) => void;
   dismiss: (id: string) => void;
+  /** Puts a dismissed chip back, for `checkpoint_reapply` — see
+   * `checkpointCompensation.ts`. Deliberately refuses a chip the user has
+   * already *started*: that spun off a real session, and quietly reverting its
+   * status would misreport work that actually happened. */
+  restore: (id: string) => void;
   clearForSession: (sessionId: string) => void;
 }
 
@@ -113,6 +118,13 @@ export const useTaskSuggestionStore = create<TaskSuggestionStoreState>((set) => 
       const existing = state.suggestions[id];
       if (!existing) return state;
       return { suggestions: { ...state.suggestions, [id]: { ...existing, status: "dismissed" } } };
+    }),
+
+  restore: (id) =>
+    set((state) => {
+      const existing = state.suggestions[id];
+      if (!existing || existing.status !== "dismissed") return state;
+      return { suggestions: { ...state.suggestions, [id]: { ...existing, status: "pending" } } };
     }),
 
   clearForSession: (sessionId) =>

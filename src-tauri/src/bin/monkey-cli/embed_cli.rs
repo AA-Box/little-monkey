@@ -30,7 +30,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use little_monkey_lib::llama;
+use little_monkey_lib::{egress, llama};
 use serde::{Deserialize, Serialize};
 
 const PROCESS_RECORD_SCHEMA_VERSION: u32 = 1;
@@ -368,11 +368,8 @@ pub async fn start(model_path: String) -> Result<(), String> {
             }
         }
 
-        if let Ok(resp) = client
-            .get(&health_url)
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await
+        if let Ok(resp) =
+            egress::send(client.get(&health_url).timeout(Duration::from_secs(2))).await
         {
             if resp.status().is_success()
                 && llama::server_reports_alias(&client, llama::EMBED_PORT, &startup_alias).await
@@ -408,15 +405,16 @@ pub async fn start(model_path: String) -> Result<(), String> {
         );
     }
 
-    let verify = client
-        .post(format!(
-            "http://127.0.0.1:{}/v1/embeddings",
-            llama::EMBED_PORT
-        ))
-        .json(&serde_json::json!({ "model": &startup_alias, "input": ["ready check"] }))
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await;
+    let verify = egress::send(
+        client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/embeddings",
+                llama::EMBED_PORT
+            ))
+            .json(&serde_json::json!({ "model": &startup_alias, "input": ["ready check"] }))
+            .timeout(Duration::from_secs(10)),
+    )
+    .await;
     if !matches!(verify, Ok(resp) if resp.status().is_success()) {
         let _ = child.kill();
         let _ = child.wait();

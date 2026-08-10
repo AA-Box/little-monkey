@@ -32,6 +32,20 @@ pub enum PermissionMode {
 }
 
 impl PermissionMode {
+    /// The flag spelling of this mode — what `--permission-mode` would take
+    /// to reproduce the current session, so the REPL banner and the
+    /// launcher's settings screen name it the same way.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::AcceptEdits => "acceptEdits",
+            Self::Smart => "smart",
+            Self::Plan => "plan",
+            Self::Auto => "auto",
+            Self::Bypass => "bypass",
+        }
+    }
+
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "manual" => Ok(Self::Manual),

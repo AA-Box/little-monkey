@@ -27,6 +27,81 @@ export const studioLocale: Record<string, string> = {
   "Studio.video.title": "Video",
   "Studio.video.subtitle": "Generate video on this machine. No account, no upload.",
   "Studio.models": "Models",
+
+  // Control-image preprocessors. ControlNet wants a hint map, not a
+  // photograph; before this the user had to make one elsewhere.
+  // The prompt fields had no label at all — a placeholder is not one, because
+  // it vanishes on the first keystroke.
+  "Studio.prompt": "Prompt",
+  "Studio.negativePrompt": "Negative prompt",
+  "Studio.speechText": "Text to speak",
+  // Weighting is parsed by the engine itself, not by this app.
+  "Studio.promptWeighting":
+    "Weight a word with (word:1.3) to strengthen it, or (word:0.6) to weaken it. 1.0 is neutral.",
+
+  // Outpainting. Presented as extending rather than as a canvas, because that
+  // is what the buttons do: each press grows one side and asks the model to
+  // fill it.
+  "Studio.mask.zoomIn": "Zoom in",
+  "Studio.mask.zoomOut": "Zoom out",
+
+  "Studio.outpaint.title": "Extend the picture",
+  "Studio.outpaint.hint":
+    "Grows the image by the chosen number of pixels on one side and fills the new space to match. Press again to keep going. The seam is blended by letting the model repaint a thin strip of the existing picture.",
+  "Studio.outpaint.left": "Extend to the left",
+  "Studio.outpaint.right": "Extend to the right",
+  "Studio.outpaint.up": "Extend upwards",
+  "Studio.outpaint.down": "Extend downwards",
+  "Studio.outpaint.undo": "Undo the last extension",
+  "Studio.outpaint.redo": "Redo the undone extension",
+
+  "Studio.preprocess.label": "Turn this photo into a hint map",
+  "Studio.preprocess.placeholder": "Leave as it is",
+  "Studio.preprocess.canny": "Edges (Canny)",
+  "Studio.preprocess.grayscale": "Greyscale",
+  "Studio.preprocess.invert": "Invert",
+
+  // Tools — the sidecar tier. A tool is a separate program, not a model and
+  // not part of the engine, and the copy says so: what the user installs here
+  // runs beside the app rather than inside it.
+  "Studio.tab.tools": "Tools",
+  "Studio.tools.title": "Tools",
+  "Studio.tools.subtitle":
+    "Extra operations that are not generation — face swap, detectors, segmenters. Each runs as its own program beside the app, never as code inside it.",
+  "Studio.tools.library": "Installed",
+  "Studio.tools.available": "Available",
+  "Studio.tools.empty":
+    "No tools installed. Install a published one below, or point at a binary you already have.",
+  "Studio.tools.noneAvailable":
+    "No tools are published for this app version yet.",
+  "Studio.tools.install": "Install",
+  "Studio.tools.installing": "Installing…",
+  "Studio.tools.installed": "Installed",
+  "Studio.tools.remove": "Remove this tool",
+  "Studio.tools.addLocal": "Add your own binary",
+  "Studio.tools.addLocalHint":
+    "A program that speaks the tool contract on 127.0.0.1. Nothing checks these bytes for you — only add one you built or trust.",
+  "Studio.tools.managed": "Verified",
+  "Studio.tools.managedHint":
+    "Downloaded through the Runtime Hub and checked against a published SHA-256 before it was activated.",
+  "Studio.tools.unmanaged": "Your own",
+  "Studio.tools.unmanagedHint":
+    "A binary you pointed at yourself. It was not downloaded or digest-checked by the app.",
+  "Studio.tools.select": "Choose a tool to see what it does.",
+  "Studio.tools.starting": "Starting the tool…",
+  "Studio.tools.settings": "Settings",
+  "Studio.tools.run": "Run",
+  "Studio.tools.running": "Running…",
+  "Studio.tools.stop": "Release memory",
+  "Studio.tools.stopAll": "Release all {count}",
+  "Studio.tools.importCatalog": "Import a catalog",
+  "Studio.tools.missing": "Fill in {fields} first",
+  "Studio.tools.pickImage": "Choose an image",
+  "Studio.tools.clearImage": "Remove this image",
+  "Studio.tools.fromGallery": "Use the newest result",
+  "Studio.tools.results": "Results",
+  "Studio.tools.version": "Version {version}",
+
   "Studio.noneForTab": "No model in your library can do this yet",
   "Studio.notDownloaded": "not downloaded",
   "Studio.browserOnly.title": "Studio runs in the desktop app",
@@ -49,7 +124,7 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.repoFilePlaceholder": "split_files/vae/wan2.2_vae.safetensors",
   "Studio.add.namePlaceholder": "Wan 2.2 TI2V 5B",
   "Studio.add.familyPlaceholder": "Wan",
-  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --offload-to-cpu",
+  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --threads 8 --offload-to-cpu",
   "Studio.speakerPlaceholder": "/Users/you/voices/narrator.wav",
   "Studio.languagePlaceholder": "en",
   "Studio.add.name": "Name",
@@ -66,7 +141,42 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.frameGrid": "Frame grid",
   "Studio.add.grid4n1": "Round down to 4n+1 (Wan, most video)",
   "Studio.add.grid17k5": "Round up to 17k+5 (MiniMax H3)",
+  "Studio.adetailer.title": "Re-detail",
+  "Studio.adetailer.hint":
+    "The detector finds each face or hand and the model repaints that region on its own, at full resolution. Leave the prompts empty to reuse the ones above.",
+  "Studio.adetailer.prompt": "Re-detail prompt",
+  "Studio.adetailer.promptPlaceholder": "Same as the main prompt",
+  "Studio.adetailer.negative": "Re-detail negative prompt",
+  "Studio.adetailer.negativePlaceholder": "Same as the main negative prompt",
+  "Studio.add.upscalersDir": "Upscalers folder",
+  "Studio.add.upscalersDirHint":
+    "ESRGAN and other upscale models found here join the upscaler list, alongside the built-in ones.",
+  "Studio.add.embeddingsDir": "Embeddings folder",
+  "Studio.add.embeddingsDirHint":
+    "Textual-inversion embeddings found here can be named in a prompt.",
+  "Studio.add.chooseFolder": "Choose folder…",
+  "Studio.add.clearFolder": "Clear folder",
+  "Studio.add.noFolder": "None",
+  // Launch-time engine switches. Each hint says what it costs as well as what
+  // it buys — every one of these is a trade, and a checkbox that only promises
+  // the upside gets turned on by everybody and blamed for the downside.
+  "Studio.add.engineOptions": "Engine options",
+  "Studio.add.vaeTiling": "Decode the image in tiles",
+  "Studio.add.vaeTilingHint":
+    "Uses far less memory at the final decode, which is what usually fails on a large image. Slightly slower, and very occasionally leaves a faint seam.",
+  "Studio.add.offloadToCpu": "Keep weights in system memory",
+  "Studio.add.offloadToCpuHint":
+    "Holds the model in RAM and moves each part to the GPU as it is needed, so a model larger than the card can still run. Noticeably slower.",
+  "Studio.add.flashAttention": "Flash attention",
+  "Studio.add.flashAttentionHint":
+    "Faster and lighter on memory in the diffusion model. Not supported by every backend — turn it off if generation fails at startup.",
+  "Studio.add.seamless": "Tileable output",
+  "Studio.add.seamlessHint":
+    "Makes the result repeat without a visible join, for textures and patterns. Set per model rather than per image, because the engine takes it at startup.",
+
   "Studio.add.engineArgs": "Extra engine arguments",
+  "Studio.add.engineArgsHint":
+    "Passed to the engine as typed — no shell, so quote any path with spaces. This is how flags without their own field are reached: --vae-format, --model-args.",
   "Studio.add.save": "Add to library",
   "Studio.lora.title": "LoRAs",
   "Studio.lora.add": "Add LoRA",
@@ -91,6 +201,28 @@ export const studioLocale: Record<string, string> = {
   "Studio.partsForget": "Remove from library",
   "Studio.partsLibraryEmpty":
     "None yet. A checkpoint that needs a separate VAE or text encoder does not name one — add the file here and pick it when you generate.",
+  "Studio.backends": "Remote backends",
+  "Studio.backendAdd": "Add a backend",
+  "Studio.backendsEmpty":
+    "None. The managed engine runs the weight files above. Add a backend to reach a ComfyUI you run yourself, or a hosted image API when this machine has no GPU.",
+  "Studio.backendModelCount": "{count} models",
+  "Studio.backend.title": "Add a remote backend",
+  "Studio.backend.hint":
+    "Nothing is installed here. Studio only stores the address, and for a hosted endpoint which saved provider key to use — no key is entered on this form.",
+  "Studio.backend.kind": "Kind",
+  "Studio.backend.kindComfy": "ComfyUI",
+  "Studio.backend.kindOpenAi": "OpenAI-compatible",
+  "Studio.backend.label": "Name",
+  "Studio.backend.labelPlaceholder": "ComfyUI on the desktop",
+  "Studio.backend.id": "Id",
+  "Studio.backend.idPlaceholder": "comfy",
+  "Studio.backend.baseUrl": "Base URL",
+  "Studio.backend.provider": "Provider whose key this uses",
+  "Studio.backend.editing": "This endpoint accepts a source image (/images/edits)",
+  "Studio.backend.models": "Model names, one per line",
+  "Studio.backend.workflow": "API-format workflow",
+  "Studio.backend.badWorkflow": "Workflow JSON: {detail}",
+  "Studio.backend.save": "Save backend",
   "Studio.slot.checkpoint": "Checkpoint",
   "Studio.slot.diffusion_model": "Diffusion model",
   "Studio.slot.high_noise_diffusion_model": "Diffusion model, high noise",
@@ -99,9 +231,17 @@ export const studioLocale: Record<string, string> = {
   "Studio.slot.clip_vision": "CLIP vision encoder",
   "Studio.slot.t5xxl": "T5 text encoder",
   "Studio.slot.llm": "LLM text encoder",
+  "Studio.slot.llm_vision": "LLM vision tower",
+  "Studio.slot.uncond_diffusion_model": "Diffusion model, unconditional",
+  "Studio.slot.embeddings_connectors": "Embeddings connectors",
+  "Studio.slot.motion_module": "Motion module",
   "Studio.slot.vae": "VAE",
   "Studio.slot.audio_vae": "Audio VAE",
   "Studio.slot.taesd": "TAESD preview decoder",
+  "Studio.slot.control_net": "ControlNet",
+  "Studio.slot.ip_adapter": "IP-Adapter",
+  "Studio.slot.photo_maker": "PhotoMaker",
+  "Studio.slot.pulid_weights": "PuLID",
   "Studio.slot.mmproj": "Speech projector",
   "Studio.slot.vocoder": "Vocoder",
   "Studio.installed": "Installed",
@@ -121,6 +261,36 @@ export const studioLocale: Record<string, string> = {
   "Studio.chooseImage": "Choose image",
   "Studio.imageReady": "Image ready",
   "Studio.clearImage": "Remove image",
+
+  "Studio.mask.title": "Repaint area",
+  "Studio.mask.brush": "Brush",
+  "Studio.mask.paint": "Paint",
+  "Studio.mask.erase": "Erase",
+  "Studio.mask.clear": "Clear",
+  "Studio.mask.undo": "Undo the last stroke",
+  "Studio.mask.redo": "Redo the undone stroke",
+  "Studio.mask.loading": "Loading the source image…",
+  "Studio.mask.hint":
+    "Paint over what should be redrawn; everything unpainted is kept. Mask is {{width}}×{{height}}, matching the source.",
+
+  "Studio.control.title": "Control image",
+  "Studio.control.strength": "Control strength",
+  "Studio.control.hint":
+    "Already a depth map, pose skeleton or edge map — no detector runs here, so a plain photo is followed as though it were one.",
+
+  "Studio.ipAdapter.title": "Style reference",
+  "Studio.ipAdapter.strength": "Reference strength",
+  "Studio.ipAdapter.hint": "The look to borrow, read through the IP-Adapter.",
+
+  "Studio.reference.title": "Reference images",
+  "Studio.reference.add": "Add reference",
+  "Studio.reference.remove": "Remove reference",
+  "Studio.reference.hint": "Photographs of the subject to keep consistent.",
+  "Studio.reference.full": "At most {{max}} reference images per run.",
+  "Studio.reference.numbered": "Number them so the prompt can tell them apart",
+  "Studio.reference.numberedHint":
+    "Each reference is numbered in the order shown, so a prompt can say \"the jacket from image 2\".",
+  "Studio.reference.numberedAlt": "Reference image {{index}}",
   "Studio.duration": "Duration",
   "Studio.frames": "{{frames}} frames · {{fps}} fps",
   "Studio.settings": "Settings",
@@ -131,6 +301,7 @@ export const studioLocale: Record<string, string> = {
   "Studio.width": "Width",
   "Studio.height": "Height",
   "Studio.steps": "Sampling steps",
+  "Studio.batch": "Images per run",
   "Studio.guidance": "CFG scale",
   "Studio.sampler": "Sampling method",
   "Studio.denoise": "Denoising strength",

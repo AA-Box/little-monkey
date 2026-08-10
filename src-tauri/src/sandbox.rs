@@ -10,10 +10,12 @@
 //! the command additionally runs under a generated
 //! Seatbelt (`sandbox-exec`) profile that limits reads to the sandbox and
 //! explicit system/toolchain roots, denies writes outside the ephemeral run
-//! directory, and denies network access unless it was explicitly enabled;
-//! every other platform gets the restricted-cwd/env isolation only. Every
-//! run reports which of the two actually applied (see [`Isolation`]) — never
-//! more than what was really enforced.
+//! directory, and denies network access unless it was explicitly enabled. On
+//! Linux the equivalent boundary is a Landlock filesystem ruleset plus a
+//! seccomp-BPF network filter installed in `pre_exec` (see
+//! `crate::sandbox_linux`); Windows gets the restricted-cwd/env isolation
+//! only. Every run reports which of the two actually applied (see
+//! [`Isolation`]) — never more than what was really enforced.
 //!
 //! Nothing the sandboxed command writes ever reaches the real workspace
 //! automatically. Copying files back out is a separate, explicit two-phase
@@ -43,10 +45,10 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::Manager;
 
+use crate::profiles::ProfileScopedPaths;
 use crate::run_protocol::{
     ArtifactKind, CapabilityAssessment, CapabilityState, CheckpointKind, ClientIdentity,
     ModelCapabilitiesSnapshot, ModelTargetSnapshot, MutationKind, PermissionMode,
@@ -65,6 +67,42 @@ const MAX_ARTIFACT_BYTES_BUDGET: u64 = 128 * 1024 * 1024;
 const MAX_EVENT_TEXT_EXCERPT: usize = 4_096;
 const PROMOTE_PREVIEW_TTL_MS: u64 = 5 * 60 * 1_000;
 const MAX_PROMOTE_FILES: usize = 500;
+/// `fs::canonicalize` without the `\\?\` prefix Windows puts on the front.
+///
+/// Every path this module resolves ends up somewhere a child process has to
+/// use — its working directory, its `HOME`, its `TMP`, the arguments in its
+/// command line — and **cmd.exe cannot use a verbatim path**. It does not fail
+/// loudly either: given one as a working directory it prints "UNC paths are not
+/// supported. Defaulting to Windows directory." on stderr and runs anyway, in
+/// `C:\Windows`. So a sandboxed run would execute with the wrong cwd and a HOME
+/// it cannot write, and the only evidence would be a line on stderr nobody
+/// reads.
+///
+/// Canonicalization itself is still wanted — it is what makes the
+/// `starts_with(&sandbox_root)` containment checks below sound. Only the prefix
+/// goes.
+///
+/// A no-op on macOS and Linux, where canonical paths have no such prefix.
+fn plain_canonical(path: &Path) -> io::Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(canonical)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let text = canonical.to_string_lossy();
+        // Only the plain disk form. A true UNC share canonicalizes to
+        // `\\?\UNC\server\share`, and stripping to `UNC\server\share` would
+        // name a relative path that does not exist — left alone so it fails
+        // where it is used rather than silently pointing somewhere else.
+        match text.strip_prefix(r"\\?\") {
+            Some(rest) if !rest.starts_with("UNC\\") => Ok(PathBuf::from(rest)),
+            _ => Ok(canonical),
+        }
+    }
+}
+
 const SANDBOX_HOME_DIR: &str = "home";
 const SANDBOX_TMP_DIR: &str = "tmp";
 
@@ -104,6 +142,10 @@ const SANDBOX_OWNED_ENV_KEYS: &[&str] = &["HOME", "USERPROFILE", "TMPDIR", "TMP"
 /// also contains `/System/Volumes/Data`), `/usr`, `/Library`, `/private`,
 /// and the user's home. Additional executable roots come only from PATH and
 /// are filtered against the real workspace and whole-home roots below.
+///
+/// `cfg`-gated (with `test`, which [`readable_roots`]' own test needs) so the
+/// platform that cannot use a list is not left holding it as dead code.
+#[cfg(any(target_os = "macos", test))]
 const MACOS_SYSTEM_READ_ROOTS: &[&str] = &[
     "/System/Library",
     "/System/Cryptexes/App/usr",
@@ -131,6 +173,56 @@ const MACOS_SYSTEM_READ_ROOTS: &[&str] = &[
     "/dev/urandom",
 ];
 
+/// The same policy as [`MACOS_SYSTEM_READ_ROOTS`], entry for entry, expressed in
+/// Linux's layout: executable and library roots, the dynamic loader's cache
+/// (`/etc/ld.so.*`, whose macOS counterpart is `/private/var/db/dyld`), the
+/// resolver/TLS/timezone configuration a network-enabled command needs, and the
+/// three character devices. `/etc/passwd`, `/etc/group` and `/etc/nsswitch.conf`
+/// stand in for the macOS profile's `(allow mach-lookup)` — they are how
+/// `getpwuid` answers on Linux — and `/etc/shadow` is deliberately not among
+/// them.
+///
+/// Not here, deliberately: `/proc`, `/sys`, `/tmp`, `/var`, `/home`, `/root`,
+/// and `/etc` as a whole. `/usr/local` is absent for the same reason
+/// `/opt/homebrew` is absent from the macOS list — [`readable_roots`] adds its
+/// executable/library subdirectories only when PATH actually points there. See
+/// `sandbox_linux`'s module docs for why `/proc` in particular stays out.
+#[cfg(target_os = "linux")]
+const LINUX_SYSTEM_READ_ROOTS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/lib",
+    "/usr/lib32",
+    "/usr/lib64",
+    "/usr/libexec",
+    "/usr/share",
+    "/usr/include",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/alternatives",
+    "/etc/ssl/certs",
+    "/etc/ssl/openssl.cnf",
+    "/etc/pki/tls/certs",
+    "/etc/ca-certificates",
+    "/etc/nsswitch.conf",
+    "/etc/passwd",
+    "/etc/group",
+    "/etc/hosts",
+    "/etc/resolv.conf",
+    "/etc/services",
+    "/etc/protocols",
+    "/etc/localtime",
+    "/dev/null",
+    "/dev/random",
+    "/dev/urandom",
+];
+
 /// Per-process, in-memory registry of prepared-but-not-yet-confirmed promote
 /// previews, keyed by digest. Unlike `m5_delivery`'s durable SQLite preview
 /// store, this is deliberately not persisted: the ephemeral sandbox copy a
@@ -151,11 +243,21 @@ struct PendingPromote {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Isolation {
-    /// The command ran under a generated macOS Seatbelt profile
-    /// (`sandbox-exec`) in addition to the restricted cwd/env.
+    /// A kernel-enforced filesystem boundary applied in addition to the
+    /// restricted cwd/env: a generated macOS Seatbelt profile (`sandbox-exec`),
+    /// or a Landlock ruleset on Linux.
     OsSandboxed,
-    /// Only the restricted cwd + allowlisted env applied — no OS-level
-    /// sandbox exists for this platform.
+    /// The kernel bounded the process *tree* but not its filesystem: a Windows
+    /// job object confined the run's process count, committed memory and
+    /// window-station reach, and killed the whole tree on exit.
+    ///
+    /// Deliberately not [`Isolation::OsSandboxed`], because the real workspace is
+    /// still reachable by absolute path. Windows has no filesystem boundary this
+    /// app can reach without owning its own `CreateProcess` — see
+    /// `crate::sandbox_windows`.
+    ProcessContained,
+    /// Only the restricted cwd + allowlisted env applied — either no OS-level
+    /// sandbox exists for this platform, or this kernel could not enforce one.
     ProcessOnly,
 }
 
@@ -168,19 +270,37 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// [`Isolation`] reports what a run got, which is honest but arrives too late to
 /// inform the decision to start one. The Sandbox panel offers the same button on
 /// every platform, and `probeGeneratedMcpArtifact` sends **model-authored MCP
-/// server code** through it — so on Windows and Linux that code runs with a
-/// restricted cwd and a scrubbed environment and no kernel boundary, free to read
-/// or write the real workspace by absolute path. That is worth knowing first.
+/// server code** through it — so on Windows, and on a Linux kernel without
+/// Landlock, that code runs with a restricted cwd and a scrubbed environment and
+/// no kernel boundary, free to read or write the real workspace by absolute
+/// path. That is worth knowing first.
 ///
 /// `Unavailable` is a third state, not a pessimistic reading of `ProcessOnly`: on
 /// macOS `execute_in_sandbox` spawns `sandbox-exec` unconditionally, so if the
 /// binary is missing the run fails outright rather than degrading. A user who sees
 /// only "no OS sandbox" would go looking for the wrong problem.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+///
+/// `Unavailable` has no meaning on Linux, and forcing the symmetry would be a
+/// lie in the other direction. There is no separate binary to be missing: the
+/// mechanism is a syscall, and when the kernel does not have it
+/// `crate::sandbox_linux` installs no ruleset and the run proceeds with the
+/// restricted-cwd/env isolation. Nothing fails, so `ProcessOnly` — the state
+/// that means "this ran without a kernel boundary" — is the whole truth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxEnforcement {
-    /// A kernel-enforced boundary applies: macOS Seatbelt via `sandbox-exec`.
+    /// A kernel-enforced boundary applies: macOS Seatbelt via `sandbox-exec`, or
+    /// Landlock on Linux.
     OsEnforced,
+    /// A Windows job object will bound the run's process tree, committed memory
+    /// and window-station reach, and kill the tree when the run ends — but no
+    /// filesystem or network boundary applies, so the real workspace stays
+    /// reachable by absolute path.
+    ///
+    /// Between [`SandboxEnforcement::OsEnforced`] and
+    /// [`SandboxEnforcement::ProcessOnly`] on purpose, and closer to the latter
+    /// for any decision about running untrusted code.
+    ProcessContained,
     /// Restricted cwd and allowlisted environment only. No kernel boundary.
     ProcessOnly,
     /// This platform has an enforcement mechanism and it is not usable here, so a
@@ -191,9 +311,12 @@ pub enum SandboxEnforcement {
 /// This machine's enforcement capability.
 ///
 /// Deliberately a probe rather than a constant. On macOS the answer depends on
-/// `sandbox-exec` being present, which a `cfg!` cannot know — and reporting
+/// `sandbox-exec` being present, and on Linux on whether this kernel can enforce
+/// the Landlock baseline — neither of which a `cfg!` can know, and reporting
 /// `OsEnforced` from the target triple alone is exactly the kind of claim this
-/// function exists to stop making.
+/// function exists to stop making. A kernel built without Landlock, booted with
+/// it disabled, or running inside a container whose own policy blocks the
+/// syscall all answer `ProcessOnly` here.
 pub fn sandbox_enforcement() -> SandboxEnforcement {
     #[cfg(target_os = "macos")]
     {
@@ -203,11 +326,38 @@ pub fn sandbox_enforcement() -> SandboxEnforcement {
             SandboxEnforcement::Unavailable
         }
     }
-    // Windows and Linux have no enforcement path in this app at all — no
-    // Landlock, seccomp, namespace, job object, restricted token or AppContainer
-    // anywhere in the crate — so there is nothing to probe for. `Unavailable`
-    // would imply a mechanism that failed; `ProcessOnly` is the accurate answer.
-    #[cfg(not(target_os = "macos"))]
+    // Only the filesystem boundary is reported. A network-denied run on a kernel
+    // without Landlock still gets the seccomp filter, so its egress is denied
+    // even here — but its filesystem is not, and this answer is about the
+    // boundary that keeps the real workspace out of reach.
+    #[cfg(target_os = "linux")]
+    {
+        if crate::sandbox_linux::landlock_is_enforceable() {
+            SandboxEnforcement::OsEnforced
+        } else {
+            SandboxEnforcement::ProcessOnly
+        }
+    }
+    // `Unavailable` is wrong here for the reason it is wrong on Linux: there is no
+    // separate binary to be missing, and a machine that can create neither
+    // mechanism degrades to `ProcessOnly` rather than failing.
+    //
+    // Two mechanisms, so three answers. An AppContainer is the filesystem
+    // boundary and earns `OsEnforced` alongside Seatbelt and Landlock; a machine
+    // that can only give us a job object gets `ProcessContained`; one that can
+    // give neither gets `ProcessOnly`. Probed rather than assumed from the target
+    // triple, because group policy can refuse either one.
+    #[cfg(target_os = "windows")]
+    {
+        if crate::sandbox_windows::app_containers_are_enforceable() {
+            SandboxEnforcement::OsEnforced
+        } else if crate::sandbox_windows::job_objects_are_enforceable() {
+            SandboxEnforcement::ProcessContained
+        } else {
+            SandboxEnforcement::ProcessOnly
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         SandboxEnforcement::ProcessOnly
     }
@@ -215,9 +365,91 @@ pub fn sandbox_enforcement() -> SandboxEnforcement {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CopyStats {
+    /// Every file placed in the sandbox, however its bytes got there.
+    ///
+    /// Deliberately still the total rather than "files copied the slow way":
+    /// callers and the ledger label have always read it as "how big is this
+    /// sandbox", and narrowing it now would silently change what an existing
+    /// record means.
     pub files_copied: u64,
     pub bytes_copied: u64,
     pub skipped: u64,
+    /// Of [`Self::files_copied`], how many were copy-on-write clones rather
+    /// than byte copies. Zero on a filesystem or platform that cannot clone —
+    /// see [`clone_file`].
+    pub files_cloned: u64,
+}
+
+impl CopyStats {
+    /// How the bytes got in, for a ledger label a human reads.
+    ///
+    /// Three states and not two, because "nothing was cloned" and "there was
+    /// nothing to clone" are different facts: an empty workspace must not read
+    /// as a filesystem that refused to clone.
+    #[must_use]
+    pub fn placement_mode(&self) -> &'static str {
+        match (self.files_copied, self.files_cloned) {
+            (0, _) => "no files",
+            (total, cloned) if cloned == total => "copy-on-write",
+            (_, 0) => "full copy",
+            _ => "copy-on-write where the filesystem allowed it",
+        }
+    }
+}
+
+/// Clones one file copy-on-write, or reports that this platform could not.
+///
+/// # Why per file rather than per tree
+///
+/// macOS `clonefile` can clone a whole directory in one call, and it is
+/// tempting. It would also clone the two things
+/// [`copy_workspace_into_sandbox`] exists to leave out — `.env` files and
+/// `node_modules`-shaped directories — and deleting them afterwards is a
+/// strictly worse version of never copying them: the window in which a secret
+/// exists inside the sandbox would be real, and a crash inside that window
+/// leaves it there. Keeping the walk and swapping only the per-file placement
+/// means the skip rules, the symlink handling and the resulting tree are
+/// unchanged by construction, which is what makes "byte-for-byte identical to
+/// the copy implementation" true rather than tested-and-hoped.
+///
+/// # Failure is never an error
+///
+/// Returns `false` for every refusal — a filesystem without copy-on-write, a
+/// cross-device destination, a destination that already exists — because each
+/// one means "copy it the ordinary way", not "fail the run". The caller falls
+/// back to `fs::copy`, so the only thing lost is the saving.
+#[cfg(target_os = "macos")]
+fn clone_file(src: &Path, dest: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (Ok(source), Ok(destination)) = (
+        CString::new(src.as_os_str().as_bytes()),
+        CString::new(dest.as_os_str().as_bytes()),
+    ) else {
+        // An interior NUL, which no path this walk produced can contain.
+        return false;
+    };
+    // SAFETY: both pointers are NUL-terminated C strings that outlive the call,
+    // and `clonefile` neither retains them nor writes through them.
+    unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) == 0 }
+}
+
+/// Every other platform copies, and says so rather than pretending.
+///
+/// Linux reflink (`FICLONE`, on btrfs and XFS) and Windows ReFS block cloning
+/// are both real and both deliberately absent: neither can be exercised on this
+/// project's machines, and an untested ioctl that silently degrades to a copy
+/// would look identical to this in every test while being harder to read.
+/// Overlayfs, which the roadmap names for Linux, needs mount privileges a
+/// desktop application does not have.
+///
+/// Hard-linking a staging tree is not a substitute on any platform and is not a
+/// deferral: a write through a hard link mutates the workspace file itself,
+/// which is the one thing an ephemeral sandbox exists to prevent.
+#[cfg(not(target_os = "macos"))]
+fn clone_file(_src: &Path, _dest: &Path) -> bool {
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -360,7 +592,9 @@ fn confirmation_phrase_for(digest: &str) -> String {
 /// True for directory names that are never worth copying wholesale into the
 /// ephemeral sandbox (see [`SKIP_DIR_NAMES`]).
 fn is_skippable_dir_name(name: &str) -> bool {
-    SKIP_DIR_NAMES.iter().any(|skip| skip.eq_ignore_ascii_case(name))
+    SKIP_DIR_NAMES
+        .iter()
+        .any(|skip| skip.eq_ignore_ascii_case(name))
 }
 
 /// True for files whose content is secret-shaped (currently: `.env*`, via
@@ -419,7 +653,17 @@ pub fn copy_workspace_into_sandbox(root: &Path, dest: &Path) -> io::Result<CopyS
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let bytes = fs::copy(path, &dest_path)?;
+        // Cloned where the filesystem allows it, copied where it does not. The
+        // resulting file is the same either way — `bytes_copied` stays the size
+        // of the tree, not the number of bytes the disk actually wrote, because
+        // it is read as "how big is this sandbox" and a clone does not make the
+        // sandbox smaller.
+        let bytes = if clone_file(path, &dest_path) {
+            stats.files_cloned += 1;
+            entry.metadata().map_err(io::Error::other)?.len()
+        } else {
+            fs::copy(path, &dest_path)?
+        };
         stats.files_copied += 1;
         stats.bytes_copied += bytes;
     }
@@ -538,7 +782,7 @@ fn insert_existing_read_root(
     real_home: Option<&Path>,
     real_workspace: &Path,
 ) {
-    let Ok(candidate) = fs::canonicalize(candidate) else {
+    let Ok(candidate) = plain_canonical(candidate) else {
         return;
     };
     if readable_root_is_safe(&candidate, real_home, real_workspace) {
@@ -546,16 +790,27 @@ fn insert_existing_read_root(
     }
 }
 
-fn macos_readable_roots(
+/// The read boundary for one platform, given that platform's system roots
+/// ([`MACOS_SYSTEM_READ_ROOTS`] or [`LINUX_SYSTEM_READ_ROOTS`]).
+///
+/// Shared rather than one function per platform because everything interesting
+/// here is platform-independent policy — PATH entries become roots, Homebrew and
+/// rustup get narrowed to their executable/library subtrees, and the real
+/// workspace and whole-home roots are filtered out — and two copies of that
+/// would be two chances for one of them to drift wider than the other.
+fn readable_roots(
+    system_roots: &[&str],
     path_env: Option<&OsStr>,
     real_home: Option<&Path>,
     real_workspace: &Path,
 ) -> Vec<PathBuf> {
-    let canonical_home = real_home.and_then(|path| fs::canonicalize(path).ok());
+    // Both sides of every `starts_with` below resolve through the same helper,
+    // so a verbatim path can never be compared against a stripped one.
+    let canonical_home = real_home.and_then(|path| plain_canonical(path).ok());
     let real_home = canonical_home.as_deref().or(real_home);
     let canonical_workspace =
-        fs::canonicalize(real_workspace).unwrap_or_else(|_| real_workspace.to_path_buf());
-    let mut candidates: Vec<PathBuf> = MACOS_SYSTEM_READ_ROOTS.iter().map(PathBuf::from).collect();
+        plain_canonical(real_workspace).unwrap_or_else(|_| real_workspace.to_path_buf());
+    let mut candidates: Vec<PathBuf> = system_roots.iter().map(PathBuf::from).collect();
     let path_entries: Vec<PathBuf> = path_env
         .map(std::env::split_paths)
         .into_iter()
@@ -596,6 +851,10 @@ fn macos_readable_roots(
     roots.into_iter().collect()
 }
 
+/// Gated because only the macOS branch sets `RUSTUP_HOME`. The Linux branch
+/// still picks up `~/.rustup/toolchains` as a read root through
+/// [`readable_roots`], but it does not point a sandboxed Cargo at it.
+#[cfg(target_os = "macos")]
 fn macos_path_uses_rustup(path_env: Option<&OsStr>, real_home: &Path) -> bool {
     let cargo_bin = real_home.join(".cargo/bin");
     path_env
@@ -716,9 +975,9 @@ pub async fn execute_in_sandbox(
     allow_network: bool,
     approved_env: &[String],
 ) -> io::Result<SandboxExecOutcome> {
-    let sandbox_root = fs::canonicalize(sandbox_root)?;
-    let workspace_dir = fs::canonicalize(workspace_dir)?;
-    let real_workspace_root = fs::canonicalize(real_workspace_root)?;
+    let sandbox_root = plain_canonical(sandbox_root)?;
+    let workspace_dir = plain_canonical(workspace_dir)?;
+    let real_workspace_root = plain_canonical(real_workspace_root)?;
     if !workspace_dir.starts_with(&sandbox_root) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -738,7 +997,10 @@ pub async fn execute_in_sandbox(
             "Seatbelt profile must have a parent directory",
         )
     })?;
-    let profile_parent = fs::canonicalize(profile_parent)?;
+    // `plain_canonical`, like the three above: this is compared against
+    // `sandbox_root` on the next line, and comparing a verbatim path with a
+    // stripped one is a containment check that can only ever fail.
+    let profile_parent = plain_canonical(profile_parent)?;
     if !profile_parent.starts_with(&sandbox_root) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -755,7 +1017,9 @@ pub async fn execute_in_sandbox(
 
     #[cfg(target_os = "macos")]
     let mut env = env;
-    #[cfg(target_os = "macos")]
+    // Needed by both OS boundaries: it is the one path that must never become a
+    // read root, and the anchor for the toolchain roots that may.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let real_home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .and_then(|path| fs::canonicalize(path).ok());
@@ -784,8 +1048,12 @@ pub async fn execute_in_sandbox(
             .iter()
             .find(|(key, _)| key == "PATH")
             .map(|(_, value)| OsStr::new(value));
-        let readable_roots =
-            macos_readable_roots(path_env, real_home.as_deref(), &real_workspace_root);
+        let readable_roots = readable_roots(
+            MACOS_SYSTEM_READ_ROOTS,
+            path_env,
+            real_home.as_deref(),
+            &real_workspace_root,
+        );
         let profile = build_seatbelt_profile(&sandbox_root, &readable_roots, allow_network);
         fs::write(profile_path, profile)?;
         (
@@ -802,12 +1070,67 @@ pub async fn execute_in_sandbox(
         )
     };
 
+    // Windows leaves the shared `Command` path entirely: an AppContainer's
+    // capabilities can only be handed to `CreateProcessW` through a
+    // `STARTUPINFOEX` attribute list, which `Command` cannot build. So the whole
+    // spawn, wait and timeout live in `sandbox_windows::run_confined`, and this
+    // returns from here rather than falling through to code that would spawn a
+    // second, unconfined child.
     #[cfg(target_os = "windows")]
-    let (program, args, isolation) = (
-        "cmd".to_string(),
-        vec!["/C".to_string(), shell_command.to_string()],
-        Isolation::ProcessOnly,
-    );
+    {
+        let job = crate::sandbox_windows::create_job()?;
+        // The container is the filesystem boundary; the job is the process-tree
+        // one. A machine that cannot give us the container still gets the job,
+        // and says so, rather than failing the run or overstating it.
+        // A fresh name per run, so two concurrent sandboxed runs never share a
+        // container and one finishing never deletes the other's profile.
+        let container = crate::sandbox_windows::create_app_container(
+            &uuid::Uuid::new_v4().simple().to_string(),
+        );
+        let container = match container {
+            Ok(container) => {
+                // The single grant that makes the sandbox copy reachable. Fatal:
+                // without it the child is inside a container that cannot read its
+                // own working directory, which is a broken run, not a confined
+                // one.
+                container.grant_tree_access(&sandbox_root)?;
+                Some(container)
+            }
+            Err(error) => {
+                // Degrade rather than fail, matching the Linux path on a kernel
+                // without Landlock: the job still holds the process tree, and
+                // `ProcessContained` is the honest name for that.
+                eprintln!(
+                    "sandbox: no AppContainer for this run, continuing without a \
+                     filesystem boundary: {error}"
+                );
+                None
+            }
+        };
+        let isolation = match container.is_some() {
+            true => Isolation::OsSandboxed,
+            false => Isolation::ProcessContained,
+        };
+        let output = crate::sandbox_windows::run_confined(
+            container.as_ref(),
+            &job,
+            shell_command,
+            &workspace_dir,
+            &env,
+            allow_network,
+            timeout,
+        )
+        .await?;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        return Ok(SandboxExecOutcome {
+            isolation,
+            exit_code: output.exit_code,
+            timed_out: output.timed_out,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            duration_ms,
+        });
+    }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let (program, args, isolation) = (
@@ -816,61 +1139,99 @@ pub async fn execute_in_sandbox(
         Isolation::ProcessOnly,
     );
 
-    let mut command = tokio::process::Command::new(&program);
-    command
-        .args(&args)
-        .current_dir(&workspace_dir)
-        .env_clear()
-        .envs(env.iter().cloned())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // Its own process group, so the timeout below ends the whole tree. Without it
-    // `kill_on_drop` reaps only `sandbox-exec` (or the bare `sh` on the platforms
-    // with no Seatbelt), and a sandboxed command that spawns a build leaves that
-    // build running — with write access to the sandbox copy of the workspace and
-    // no remaining supervisor.
-    #[cfg(unix)]
-    command.process_group(0);
-    // Kernel-held bounds, which matter most here: on the platforms with no
-    // Seatbelt this is `Isolation::ProcessOnly`, so `os_limits` is the only
-    // enforcement the OS applies to the child at all. Inherited across the
-    // `sandbox-exec` exec, so it reaches the sandboxed program itself.
-    crate::os_limits::apply(crate::os_limits::ChildLimits::baseline(), &mut command);
+    // Every platform but Windows spawns through `tokio::process` from here.
+    // Windows returned above from its own `CreateProcessW` path, and this is
+    // `cfg`-gated rather than left unreachable so that `program`, `args` and
+    // `isolation` — none of which the Windows arm defines — are not even named
+    // there.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut command = tokio::process::Command::new(&program);
+        command
+            .args(&args)
+            .current_dir(&workspace_dir)
+            .env_clear()
+            .envs(env.iter().cloned())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        // Its own process group, so the timeout below ends the whole tree. Without it
+        // `kill_on_drop` reaps only `sandbox-exec` (or the bare `sh` on the platforms
+        // with no Seatbelt), and a sandboxed command that spawns a build leaves that
+        // build running — with write access to the sandbox copy of the workspace and
+        // no remaining supervisor.
+        #[cfg(unix)]
+        command.process_group(0);
+        // Kernel-held bounds, which matter most here: on the platforms with no
+        // Seatbelt this is `Isolation::ProcessOnly`, so `os_limits` is the only
+        // enforcement the OS applies to the child at all. Inherited across the
+        // `sandbox-exec` exec, so it reaches the sandboxed program itself.
+        crate::os_limits::apply(crate::os_limits::ChildLimits::baseline(), &mut command);
+        // Linux's boundary is installed the same way, and *after* `os_limits` on
+        // purpose: `pre_exec` closures run in registration order, so the `setrlimit`
+        // bounds are already in place before anything starts denying syscalls.
+        // Reported from `confine`'s own answer rather than from the target triple —
+        // a kernel without Landlock keeps the `ProcessOnly` the branch above chose.
+        #[cfg(target_os = "linux")]
+        let isolation = {
+            let path_env = env
+                .iter()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| OsStr::new(value));
+            let readable_roots = readable_roots(
+                LINUX_SYSTEM_READ_ROOTS,
+                path_env,
+                real_home.as_deref(),
+                &real_workspace_root,
+            );
+            match crate::sandbox_linux::confine(
+                &mut command,
+                &sandbox_root,
+                &readable_roots,
+                allow_network,
+            )? {
+                true => Isolation::OsSandboxed,
+                false => isolation,
+            }
+        };
 
-    let child = command.spawn()?;
-    // Captured before `wait_with_output` consumes the child; with
-    // `process_group(0)` the child's own pid is also its group id.
-    let child_pgid = child.id();
-    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    if result.is_err() {
-        if let Some(pgid) = child_pgid {
-            if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
-                eprintln!("sandbox: could not terminate process group {pgid}: {error}");
+        // Windows never reaches here — it returned above, from its own
+        // `CreateProcessW` path.
+        let child = command.spawn()?;
+
+        // Captured before `wait_with_output` consumes the child; with
+        // `process_group(0)` the child's own pid is also its group id.
+        let child_pgid = child.id();
+        let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if result.is_err() {
+            if let Some(pgid) = child_pgid {
+                if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
+                    eprintln!("sandbox: could not terminate process group {pgid}: {error}");
+                }
             }
         }
-    }
 
-    match result {
-        Ok(Ok(output)) => Ok(SandboxExecOutcome {
-            isolation,
-            exit_code: output.status.code(),
-            timed_out: false,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            duration_ms,
-        }),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Ok(SandboxExecOutcome {
-            isolation,
-            exit_code: None,
-            timed_out: true,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            duration_ms,
-        }),
+        match result {
+            Ok(Ok(output)) => Ok(SandboxExecOutcome {
+                isolation,
+                exit_code: output.status.code(),
+                timed_out: false,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                duration_ms,
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Ok(SandboxExecOutcome {
+                isolation,
+                exit_code: None,
+                timed_out: true,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                duration_ms,
+            }),
+        }
     }
 }
 
@@ -940,6 +1301,7 @@ fn build_sandbox_run_spec(
             tool_rules: Vec::new(),
             allow_network: request.allow_network,
             allow_external_mutations: false,
+            egress_allowlist: None,
         },
         budgets: RunBudgets {
             wall_time_ms: request.timeout().as_millis() as u64,
@@ -959,8 +1321,7 @@ fn build_sandbox_run_spec(
 
 fn sandbox_run_dir(app: &tauri::AppHandle, run_id: &str) -> Result<PathBuf, String> {
     let data_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data dir: {error}"))?;
     Ok(data_dir.join(SANDBOX_RUNS_DIR).join(run_id))
 }
@@ -984,7 +1345,10 @@ fn require_sandboxed_run(
     Ok(run)
 }
 
-fn expect_matching_root(run: &crate::run_ledger::StoredRun, current_root: &Path) -> Result<(), String> {
+fn expect_matching_root(
+    run: &crate::run_ledger::StoredRun,
+    current_root: &Path,
+) -> Result<(), String> {
     let recorded = run
         .spec
         .workspace
@@ -993,9 +1357,7 @@ fn expect_matching_root(run: &crate::run_ledger::StoredRun, current_root: &Path)
         .map(|root| root.canonical_path.as_str())
         .ok_or_else(|| "Sandboxed run has no recorded workspace root".to_string())?;
     if recorded != current_root.to_string_lossy() {
-        return Err(
-            "The primary workspace has changed since this sandbox run started".to_string(),
-        );
+        return Err("The primary workspace has changed since this sandbox run started".to_string());
     }
     Ok(())
 }
@@ -1028,7 +1390,10 @@ fn compute_promote_digest(run_id: &str, files: &[PromoteFileEntry]) -> String {
     sorted.sort_by(|a, b| a.path.cmp(&b.path));
     let mut buffer = format!("run:{run_id}\n");
     for file in &sorted {
-        buffer.push_str(&format!("{}:{}:{}\n", file.path, file.sha256, file.size_bytes));
+        buffer.push_str(&format!(
+            "{}:{}:{}\n",
+            file.path, file.sha256, file.size_bytes
+        ));
     }
     sha256_hex_bytes(buffer.as_bytes())
 }
@@ -1063,9 +1428,7 @@ pub fn build_promote_preview(
         }
         let absolute = sandbox_workspace_dir.join(&relative);
         if !absolute.is_file() {
-            return Err(format!(
-                "'{normalized}' was not found in the sandbox copy"
-            ));
+            return Err(format!("'{normalized}' was not found in the sandbox copy"));
         }
         let (sha256, size_bytes) = hash_file(&absolute).map_err(|error| {
             format!("Failed to read '{normalized}' from the sandbox copy: {error}")
@@ -1143,7 +1506,10 @@ fn verify_unchanged_since_preview(
 
 fn atomic_write(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = dest.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent directory")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination has no parent directory",
+        )
     })?;
     fs::create_dir_all(parent)?;
     let file_name = dest
@@ -1174,7 +1540,10 @@ pub fn promote_files(
         let relative = validate_relative_promote_path(&file.path)?;
         let source = sandbox_workspace_dir.join(&relative);
         let bytes = fs::read(&source).map_err(|error| {
-            format!("Failed to read '{}' from the sandbox copy: {error}", file.path)
+            format!(
+                "Failed to read '{}' from the sandbox copy: {error}",
+                file.path
+            )
         })?;
         if sha256_hex_bytes(&bytes) != file.sha256 {
             return Err(format!(
@@ -1262,10 +1631,16 @@ async fn run_sandboxed_body(
         RunEvent::CheckpointLinked {
             checkpoint_id: format!("sandbox-copy-{run_id}"),
             kind: CheckpointKind::Workspace,
+            // The placement mode is part of the record, not decoration: two runs
+            // with the same file and byte counts can have cost wildly different
+            // amounts of disk, and the ledger is where that is answerable later.
             label: bounded(
                 &format!(
-                    "Ephemeral copy: {} file(s), {} byte(s)",
-                    stats.files_copied, stats.bytes_copied
+                    "Ephemeral copy: {} file(s), {} byte(s), {} ({} cloned)",
+                    stats.files_copied,
+                    stats.bytes_copied,
+                    stats.placement_mode(),
+                    stats.files_cloned
                 ),
                 1_024,
             ),
@@ -1288,8 +1663,12 @@ async fn run_sandboxed_body(
     .map_err(|error| format!("Failed to execute the sandboxed command: {error}"))?;
 
     let store = crate::artifact_commands::store_for(app, state)?;
-    let stdout_blob = store.put(&outcome.stdout).map_err(|error| error.to_string())?;
-    let stderr_blob = store.put(&outcome.stderr).map_err(|error| error.to_string())?;
+    let stdout_blob = store
+        .put(&outcome.stdout)
+        .map_err(|error| error.to_string())?;
+    let stderr_blob = store
+        .put(&outcome.stderr)
+        .map_err(|error| error.to_string())?;
 
     crate::run_commands::append_event_as(
         app,
@@ -1354,8 +1733,14 @@ async fn run_sandboxed_body(
         duration_ms: outcome.duration_ms,
         stdout_artifact_id: stdout_blob.id,
         stderr_artifact_id: stderr_blob.id,
-        stdout_excerpt: bounded(&String::from_utf8_lossy(&outcome.stdout), MAX_EVENT_TEXT_EXCERPT),
-        stderr_excerpt: bounded(&String::from_utf8_lossy(&outcome.stderr), MAX_EVENT_TEXT_EXCERPT),
+        stdout_excerpt: bounded(
+            &String::from_utf8_lossy(&outcome.stdout),
+            MAX_EVENT_TEXT_EXCERPT,
+        ),
+        stderr_excerpt: bounded(
+            &String::from_utf8_lossy(&outcome.stderr),
+            MAX_EVENT_TEXT_EXCERPT,
+        ),
         files_copied: stats.files_copied,
     })
 }
@@ -1512,7 +1897,8 @@ pub fn sandbox_prepare_promote(
     expect_matching_root(&run, &root)?;
     let workspace_dir = sandbox_run_dir(&app, &run_id)?.join("workspace");
     let now = crate::run_commands::unix_time_ms()?;
-    let preview = build_promote_preview(&run_id, &workspace_dir, &files, now, PROMOTE_PREVIEW_TTL_MS)?;
+    let preview =
+        build_promote_preview(&run_id, &workspace_dir, &files, now, PROMOTE_PREVIEW_TTL_MS)?;
 
     {
         let mut guard = state
@@ -1626,7 +2012,11 @@ pub fn sandbox_execute_promote(
         None,
         RunEvent::Completed {
             summary: Some(bounded(
-                &format!("Promoted {} file(s): {}", promoted.len(), promoted.join(", ")),
+                &format!(
+                    "Promoted {} file(s): {}",
+                    promoted.len(),
+                    promoted.join(", ")
+                ),
                 MAX_EVENT_TEXT_EXCERPT,
             )),
             result_artifact_ids: Vec::new(),
@@ -1716,13 +2106,160 @@ mod tests {
 
     // --- copy_workspace_into_sandbox -----------------------------------
 
+    /// The acceptance clause this whole change has to earn: a cloned sandbox is
+    /// byte-for-byte the tree the copy implementation produced.
+    ///
+    /// Asserted against a copy made from the *same* fixture rather than against
+    /// a written-down expectation, so the two implementations are compared to
+    /// each other and not to somebody's idea of what they do. On a filesystem
+    /// that cannot clone, the two are the same code path and the test still
+    /// holds — it just stops proving anything new, which is why the clone count
+    /// is reported rather than asserted.
+    #[test]
+    fn a_cloned_sandbox_is_byte_for_byte_the_tree_a_copy_produces() {
+        let root = temp_dir("clone-src");
+        let cloned = temp_dir("clone-dest");
+
+        write(&root.join("src/main.rs"), "fn main() { println!(\"hi\"); }");
+        write(&root.join("src/nested/deep/file.txt"), "deep content");
+        write(&root.join("package.json"), "{\"name\":\"fixture\"}");
+        write(&root.join(".env"), "API_KEY=super-secret");
+        write(
+            &root.join("node_modules/pkg/index.js"),
+            "module.exports = {};",
+        );
+        // An empty file and a large-ish one: clonefile's edge is zero-length
+        // extents, and a multi-block file is the case a clone actually saves on.
+        write(&root.join("empty"), "");
+        write(&root.join("big.bin"), &"x".repeat(1_000_000));
+
+        let stats = copy_workspace_into_sandbox(&root, &cloned).expect("the sandbox is created");
+
+        // The same fixture through `fs::copy` alone, for comparison.
+        let copied = temp_dir("clone-reference");
+        for relative in [
+            "src/main.rs",
+            "src/nested/deep/file.txt",
+            "package.json",
+            "empty",
+            "big.bin",
+        ] {
+            let destination = copied.join(relative);
+            fs::create_dir_all(destination.parent().expect("a parent")).expect("create parent");
+            fs::copy(root.join(relative), &destination).expect("reference copy");
+        }
+
+        let listing = |base: &Path| {
+            let mut found: Vec<(String, Vec<u8>)> = walkdir::WalkDir::new(base)
+                .min_depth(1)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| {
+                    (
+                        entry
+                            .path()
+                            .strip_prefix(base)
+                            .expect("under the base")
+                            .to_string_lossy()
+                            .into_owned(),
+                        fs::read(entry.path()).expect("the file reads"),
+                    )
+                })
+                .collect();
+            found.sort();
+            found
+        };
+
+        assert_eq!(
+            listing(&cloned),
+            listing(&copied),
+            "a cloned sandbox must contain exactly the files a copy would, with exactly the same bytes"
+        );
+        assert_eq!(stats.files_copied, 5, "every non-skipped file is placed");
+        assert!(stats.files_cloned <= stats.files_copied);
+        // On macOS this is the assertion that the clone path is reached at all:
+        // every temp directory this test uses is on the APFS data volume, so a
+        // zero here means `clone_file` stopped working, not that the filesystem
+        // declined. Left as an inequality elsewhere, where copying is the only
+        // implemented path and asserting otherwise would fail honestly-written
+        // code.
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            stats.files_cloned, stats.files_copied,
+            "APFS clones every file, so a copy here means the clone path was skipped"
+        );
+        assert_eq!(
+            stats.placement_mode(),
+            if stats.files_cloned == stats.files_copied {
+                "copy-on-write"
+            } else if stats.files_cloned == 0 {
+                "full copy"
+            } else {
+                "copy-on-write where the filesystem allowed it"
+            },
+            "the ledger label must describe what actually happened"
+        );
+
+        // The saving is real only if the clone is independent: writing through
+        // the sandbox copy must not reach back into the workspace. This is the
+        // property a hard-linked staging tree would fail.
+        fs::write(cloned.join("src/main.rs"), "fn main() {}")
+            .expect("the sandbox file is writable");
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).expect("the original reads"),
+            "fn main() { println!(\"hi\"); }",
+            "a write inside the sandbox must never mutate the workspace"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&cloned);
+        let _ = fs::remove_dir_all(&copied);
+    }
+
+    /// An empty workspace must not read as a filesystem that refused to clone.
+    #[test]
+    fn placement_mode_separates_nothing_to_clone_from_nothing_cloned() {
+        assert_eq!(CopyStats::default().placement_mode(), "no files");
+        assert_eq!(
+            CopyStats {
+                files_copied: 3,
+                files_cloned: 0,
+                ..CopyStats::default()
+            }
+            .placement_mode(),
+            "full copy"
+        );
+        assert_eq!(
+            CopyStats {
+                files_copied: 3,
+                files_cloned: 3,
+                ..CopyStats::default()
+            }
+            .placement_mode(),
+            "copy-on-write"
+        );
+        assert_eq!(
+            CopyStats {
+                files_copied: 3,
+                files_cloned: 1,
+                ..CopyStats::default()
+            }
+            .placement_mode(),
+            "copy-on-write where the filesystem allowed it"
+        );
+    }
+
     #[test]
     fn copy_excludes_git_node_modules_target_and_secrets() {
         let root = temp_dir("copy-src");
         let dest = temp_dir("copy-dest");
 
         write(&root.join(".git/HEAD"), "ref: refs/heads/main");
-        write(&root.join("node_modules/pkg/index.js"), "module.exports = {};");
+        write(
+            &root.join("node_modules/pkg/index.js"),
+            "module.exports = {};",
+        );
         write(&root.join("target/debug/app"), "binary");
         write(&root.join(".env"), "API_KEY=super-secret");
         write(&root.join("src/main.rs"), "fn main() {}");
@@ -1731,10 +2268,16 @@ mod tests {
         let stats = copy_workspace_into_sandbox(&root, &dest).expect("copy succeeds");
 
         assert!(!dest.join(".git").exists(), ".git must never be copied");
-        assert!(!dest.join("node_modules").exists(), "node_modules must never be copied");
+        assert!(
+            !dest.join("node_modules").exists(),
+            "node_modules must never be copied"
+        );
         assert!(!dest.join("target").exists(), "target must never be copied");
         assert!(!dest.join(".env").exists(), "secrets must never be copied");
-        assert!(dest.join("src/main.rs").is_file(), "ordinary source files must be copied");
+        assert!(
+            dest.join("src/main.rs").is_file(),
+            "ordinary source files must be copied"
+        );
         assert!(
             dest.join("package.json").is_file(),
             "manifests must still be copied so the sandbox copy can actually build/test"
@@ -1852,6 +2395,57 @@ mod tests {
         let _ = fs::remove_dir_all(&real_workspace);
     }
 
+    /// The Windows arm of [`execute_in_sandbox`] must return what the child
+    /// printed.
+    ///
+    /// The test above is this one's counterpart and is `cfg`-gated away from
+    /// Windows, which left the entire Windows arm of `execute_in_sandbox` with no
+    /// end-to-end assertion of any kind. `sandbox_windows`' own tests cover
+    /// `run_confined`, so the untested part is exactly this caller: the working
+    /// directory it picks, the environment `allowlisted_env` builds, and the
+    /// order in which it creates directories and asks for the grant.
+    ///
+    /// Deliberately the most trivial command that can prove the path end to end.
+    /// A boundary assertion belongs in the boundary test; what this one answers is
+    /// narrower and has to stay answerable when that test is red — does anything
+    /// the child prints reach the caller at all.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn a_windows_sandboxed_run_returns_what_the_child_printed() {
+        let sandbox_root = temp_dir("win-exec-output");
+        let workspace_dir = sandbox_root.join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("create sandbox workspace");
+        let real_workspace = temp_dir("win-exec-output-real");
+        let profile_path = sandbox_root.join("unused.sb");
+
+        let outcome = execute_in_sandbox(
+            &sandbox_root,
+            &workspace_dir,
+            &real_workspace,
+            &profile_path,
+            "echo marker",
+            Duration::from_secs(30),
+            false,
+            &[],
+        )
+        .await
+        .expect("the sandbox launches");
+
+        assert!(
+            String::from_utf8_lossy(&outcome.stdout).contains("marker"),
+            "a sandboxed Windows run lost the child's output, which `sandbox_windows` \
+             proves `run_confined` does not do — so the loss is in this caller: \
+             isolation={:?} exit={:?} stdout={:?} stderr={:?}",
+            outcome.isolation,
+            outcome.exit_code,
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+
+        let _ = fs::remove_dir_all(&sandbox_root);
+        let _ = fs::remove_dir_all(&real_workspace);
+    }
+
     // --- build_seatbelt_profile ------------------------------------------
 
     #[test]
@@ -1908,7 +2502,7 @@ mod tests {
         );
     }
 
-    /// The network clause, actually exercised.
+    /// The network denial, actually exercised.
     ///
     /// Everything else about `(deny network*)` was asserted as profile *text*: the
     /// sibling test above compares two generated strings, and the live Seatbelt
@@ -1927,18 +2521,16 @@ mod tests {
     /// internet would make a unit test depend on egress, and loopback is the
     /// stricter check anyway: a boundary that stops a connection to `127.0.0.1`
     /// is not merely failing to resolve DNS.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn seatbelt_denies_a_real_connection_when_network_is_not_allowed() {
-        if !Path::new(SANDBOX_EXEC).is_file() {
-            eprintln!("skipping Seatbelt network test: sandbox-exec is unavailable");
-            return;
-        }
-        if !Path::new("/usr/bin/nc").is_file() {
-            eprintln!("skipping Seatbelt network test: /usr/bin/nc is unavailable");
-            return;
-        }
-
+    ///
+    /// Shared by every platform with a network boundary, so the contrast is
+    /// asserted once and cannot drift into two differently-rigorous versions.
+    /// `connect_command` is the only platform-specific part: what to run to make
+    /// one TCP connection to a loopback port and exit non-zero if it fails.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn assert_loopback_is_reachable_only_when_network_is_allowed(
+        label: &str,
+        connect_command: impl Fn(u16) -> String,
+    ) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("listener address").port();
         let accepting = std::thread::spawn(move || {
@@ -1952,13 +2544,11 @@ mod tests {
             }
         });
 
-        let sandbox_root = temp_dir("seatbelt-network");
+        let sandbox_root = temp_dir(&format!("{label}-network"));
         let workspace_dir = sandbox_root.join("workspace");
         fs::create_dir_all(&workspace_dir).expect("create sandbox workspace");
-        let real_workspace = temp_dir("seatbelt-network-real");
-        // `-z` scans without sending data and `-w 2` bounds the wait, so a denied
-        // connection fails fast instead of hanging until the run times out.
-        let command = format!("/usr/bin/nc -w 2 -z 127.0.0.1 {port}");
+        let real_workspace = temp_dir(&format!("{label}-network-real"));
+        let command = connect_command(port);
 
         let mut outcomes = Vec::new();
         for allow_network in [true, false] {
@@ -1974,7 +2564,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("sandbox-exec launches");
+            .expect("the sandbox launches");
             outcomes.push((allow_network, outcome));
         }
 
@@ -1990,15 +2580,64 @@ mod tests {
         assert_ne!(
             denied.exit_code,
             Some(0),
-            "`(deny network*)` did not stop a connection the same sandbox makes \
+            "denying network did not stop a connection the same sandbox makes \
              successfully when network is allowed; stderr={}",
             String::from_utf8_lossy(&denied.stderr)
         );
-        assert!(!denied.timed_out, "the denied connection hung instead of failing");
+        assert!(
+            !denied.timed_out,
+            "the denied connection hung instead of failing"
+        );
 
         drop(accepting);
         let _ = fs::remove_dir_all(&sandbox_root);
         let _ = fs::remove_dir_all(&real_workspace);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_denies_a_real_connection_when_network_is_not_allowed() {
+        if !Path::new(SANDBOX_EXEC).is_file() {
+            eprintln!("skipping Seatbelt network test: sandbox-exec is unavailable");
+            return;
+        }
+        if !Path::new("/usr/bin/nc").is_file() {
+            eprintln!("skipping Seatbelt network test: /usr/bin/nc is unavailable");
+            return;
+        }
+        // `-z` scans without sending data and `-w 2` bounds the wait, so a denied
+        // connection fails fast instead of hanging until the run times out.
+        assert_loopback_is_reachable_only_when_network_is_allowed("seatbelt", |port| {
+            format!("/usr/bin/nc -w 2 -z 127.0.0.1 {port}")
+        })
+        .await;
+    }
+
+    /// The Linux arm of the contrast above, denied by the seccomp filter rather
+    /// than by `(deny network*)`.
+    ///
+    /// Bash's `/dev/tcp` rather than `nc`, because `nc` is not installed by
+    /// default on every distribution while `bash` effectively is, and because it
+    /// removes a variable: the redirection is a plain `socket(2)` + `connect(2)`
+    /// in the shell itself, which is exactly the pair the filter denies. There is
+    /// no timeout flag to pass because there is nothing to wait for — the allow
+    /// arm connects to a listening loopback socket immediately, and the deny arm
+    /// fails at `socket(2)` with `EACCES` before any connect is attempted.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn seccomp_denies_a_real_connection_when_network_is_not_allowed() {
+        if !Path::new("/bin/bash").is_file() {
+            skip_locally_but_fail_in_ci(
+                "bash",
+                "/bin/bash is unavailable, and its `/dev/tcp` is what opens the \
+                 socket this filter has to deny",
+            );
+            return;
+        }
+        assert_loopback_is_reachable_only_when_network_is_allowed("seccomp", |port| {
+            format!("exec /bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}'")
+        })
+        .await;
     }
 
     #[test]
@@ -2017,17 +2656,51 @@ mod tests {
             };
             assert_eq!(enforcement, expected);
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            // Same distinction, different mechanism: the answer tracks what this
+            // kernel can enforce, and never `Unavailable` — a kernel without
+            // Landlock degrades to the restricted-cwd/env isolation instead of
+            // failing the run, so there is no "mechanism exists but is unusable"
+            // state to report.
+            let expected = if crate::sandbox_linux::landlock_is_enforceable() {
+                SandboxEnforcement::OsEnforced
+            } else {
+                SandboxEnforcement::ProcessOnly
+            };
+            assert_eq!(enforcement, expected);
+            assert_ne!(enforcement, SandboxEnforcement::Unavailable);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // Same shape again: tracks what this machine can hold rather than the
+            // target triple, and never `Unavailable`, because a machine that
+            // cannot create a container or a job degrades instead of failing.
+            let expected = if crate::sandbox_windows::app_containers_are_enforceable() {
+                SandboxEnforcement::OsEnforced
+            } else if crate::sandbox_windows::job_objects_are_enforceable() {
+                SandboxEnforcement::ProcessContained
+            } else {
+                SandboxEnforcement::ProcessOnly
+            };
+            assert_eq!(enforcement, expected);
+            assert_ne!(enforcement, SandboxEnforcement::Unavailable);
+            // `OsEnforced` here is a claim about a filesystem boundary, so it may
+            // only be reported when a container is actually creatable.
+            if enforcement == SandboxEnforcement::OsEnforced {
+                assert!(crate::sandbox_windows::app_containers_are_enforceable());
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             // Not `Unavailable`: that would imply a mechanism this app has and
-            // could not use, and there is no Landlock, seccomp, job object or
-            // restricted token anywhere in the crate.
+            // could not use, and this platform has none.
             assert_eq!(enforcement, SandboxEnforcement::ProcessOnly);
         }
     }
 
     #[test]
-    fn macos_read_roots_reject_whole_home_and_real_workspace() {
+    fn read_roots_reject_whole_home_and_real_workspace() {
         let fixture = temp_dir("read-roots");
         let home = fixture.join("user-home");
         let workspace = home.join("Documents/project");
@@ -2045,11 +2718,20 @@ mod tests {
         ])
         .expect("join PATH");
 
-        let roots = macos_readable_roots(Some(&joined), Some(&home), &workspace);
-        let canonical_home = fs::canonicalize(&home).expect("canonical home");
-        let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
-        let canonical_cargo = fs::canonicalize(&cargo_bin).expect("canonical cargo bin");
-        let canonical_external = fs::canonicalize(&external_bin).expect("canonical external bin");
+        let roots = readable_roots(
+            MACOS_SYSTEM_READ_ROOTS,
+            Some(&joined),
+            Some(&home),
+            &workspace,
+        );
+        // `plain_canonical`, matching what `readable_roots` now resolves with.
+        // On Windows `fs::canonicalize` returns a verbatim `\\?\` path and the
+        // roots do not, so comparing the two forms asserts a mismatch that has
+        // nothing to do with what this test is about.
+        let canonical_home = plain_canonical(&home).expect("canonical home");
+        let canonical_workspace = plain_canonical(&workspace).expect("canonical workspace");
+        let canonical_cargo = plain_canonical(&cargo_bin).expect("canonical cargo bin");
+        let canonical_external = plain_canonical(&external_bin).expect("canonical external bin");
 
         assert!(!roots.iter().any(|root| root == &canonical_home));
         assert!(
@@ -2063,33 +2745,41 @@ mod tests {
         let _ = fs::remove_dir_all(&fixture);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn sh_quote(path: &Path) -> String {
         format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
     }
 
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn sandbox_exec_cannot_read_or_write_real_workspace_with_or_without_network() {
-        if !Path::new("/usr/bin/sandbox-exec").is_file() {
-            eprintln!("skipping Seatbelt integration test: sandbox-exec is unavailable");
-            return;
-        }
-
-        let sandbox_root = temp_dir("seatbelt-integration");
+    /// The workspace boundary, exercised for real: one command that reads its own
+    /// copy, fails to read the real workspace, fails to overwrite it, and writes
+    /// to the sandbox-owned HOME and TMP — run once with network and once without,
+    /// because a boundary that only holds in one of those states is not a
+    /// boundary.
+    ///
+    /// Shared verbatim by macOS and Linux, which is the point: the two platforms
+    /// enforce it with completely different kernel machinery (a Seatbelt profile
+    /// versus a Landlock ruleset) and the assertion is that this is not
+    /// observable from inside. Only the `label` differs.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn assert_real_workspace_stays_out_of_reach(label: &str) {
+        let sandbox_root = temp_dir(&format!("{label}-integration"));
         let workspace_dir = sandbox_root.join("workspace");
         fs::create_dir_all(&workspace_dir).expect("create sandbox workspace");
-        let real_workspace = temp_dir("seatbelt-real-workspace");
+        let real_workspace = temp_dir(&format!("{label}-real-workspace"));
         let allowed_file = workspace_dir.join("allowed.txt");
         let forbidden_file = real_workspace.join("secret.txt");
         write(&allowed_file, "sandbox-visible");
         write(&forbidden_file, "must-stay-secret");
 
-        let canonical_sandbox = fs::canonicalize(&sandbox_root).expect("canonical sandbox");
+        // `plain_canonical`, not `fs::canonicalize`: the child is handed the
+        // prefix-free form, so comparing against the verbatim one would assert a
+        // path nothing uses. Using the product's own resolver is also what makes
+        // this test fail if that resolver ever stops stripping.
+        let canonical_sandbox = plain_canonical(&sandbox_root).expect("canonical sandbox");
         let canonical_workspace =
-            fs::canonicalize(&workspace_dir).expect("canonical sandbox workspace");
+            plain_canonical(&workspace_dir).expect("canonical sandbox workspace");
         let canonical_forbidden =
-            fs::canonicalize(&forbidden_file).expect("canonical forbidden file");
+            plain_canonical(&forbidden_file).expect("canonical forbidden file");
         let expected_home = canonical_sandbox.join(SANDBOX_HOME_DIR);
         let expected_tmp = canonical_sandbox.join(SANDBOX_TMP_DIR);
         let command = format!(
@@ -2110,9 +2800,9 @@ mod tests {
 
         for allow_network in [false, true] {
             let profile_path = sandbox_root.join(if allow_network {
-                "seatbelt-network.sb"
+                "boundary-network.sb"
             } else {
-                "seatbelt-offline.sb"
+                "boundary-offline.sb"
             });
             let outcome = execute_in_sandbox(
                 &sandbox_root,
@@ -2125,11 +2815,11 @@ mod tests {
                 &[],
             )
             .await
-            .expect("sandbox-exec launches");
+            .expect("the sandbox launches");
             assert_eq!(
                 outcome.exit_code,
                 Some(0),
-                "Seatbelt boundary failed (network={allow_network}); stderr={}",
+                "{label} boundary failed (network={allow_network}); stderr={}",
                 String::from_utf8_lossy(&outcome.stderr)
             );
             assert_eq!(
@@ -2144,22 +2834,396 @@ mod tests {
         let _ = fs::remove_dir_all(&real_workspace);
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_exec_cannot_read_or_write_real_workspace_with_or_without_network() {
+        if !Path::new(SANDBOX_EXEC).is_file() {
+            skip_locally_but_fail_in_ci(
+                "Seatbelt",
+                "sandbox-exec is unavailable, and it is the only thing enforcing \
+                 confinement on this platform",
+            );
+            return;
+        }
+        assert_real_workspace_stays_out_of_reach("seatbelt").await;
+    }
+
+    /// The Linux arm of the same test.
+    ///
+    /// Skips rather than fails when the kernel cannot enforce Landlock — a
+    /// developer on a kernel built without it, or a container whose own policy
+    /// blocks the syscall, is not a regression in this code. On CI it fails
+    /// instead, via `skip_locally_but_fail_in_ci`: green has to mean the
+    /// assertions ran, and a captured `println!` cannot carry that difference.
+    /// Skip locally, fail in CI — because a skip and a pass are the same colour.
+    ///
+    /// An earlier version of the two tests below claimed that printing the reason
+    /// was enough to keep "green because it asserted" distinct from "green because
+    /// it asserted nothing". That was wrong: `cargo test` captures a *passing*
+    /// test's stdout and stderr, so the print never reaches the log that anyone
+    /// reads. The distinction matters more here than anywhere else in this file,
+    /// since the thing that would quietly stop being tested is a security
+    /// boundary — so on CI the absence of the mechanism is a failure. A runner
+    /// image that stops shipping Landlock must turn this red rather than silently
+    /// stop enforcing it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn skip_locally_but_fail_in_ci(mechanism: &str, reason: &str) {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{mechanism} is unavailable on this CI runner, so the isolation it \
+             enforces went untested: {reason}"
+        );
+        eprintln!("skipping {mechanism} integration test: {reason}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn landlock_cannot_read_or_write_real_workspace_with_or_without_network() {
+        if !crate::sandbox_linux::landlock_is_enforceable() {
+            skip_locally_but_fail_in_ci(
+                "Landlock",
+                "this kernel cannot enforce the Landlock ABI v1 baseline (not built \
+                 in, disabled at boot, or the syscall is blocked by an outer sandbox)",
+            );
+            return;
+        }
+        assert_real_workspace_stays_out_of_reach("landlock").await;
+    }
+
+    /// The Windows arm of the same boundary, and the third platform finally
+    /// joins the assertion rather than being argued about.
+    ///
+    /// # It is a sibling, not a copy
+    ///
+    /// macOS and Linux share `assert_real_workspace_stays_out_of_reach`
+    /// verbatim because both run the same `sh` script. Windows cannot: `cmd /C`
+    /// takes one line, has no `set -eu`, and reads `%USERPROFILE%`/`%TMP%` where
+    /// the others read `$HOME`/`$TMPDIR`. The deeper split is where the
+    /// assertions live. The `sh` version can hold its own, because `set -eu` plus
+    /// a distinct `exit` per step makes the exit code a verdict; a `cmd`
+    /// one-liner cannot, so this version's script only *reports* and every
+    /// assertion is made in Rust against its stdout. See the comment on the
+    /// command for the two ways the other arrangement lied. What is shared is
+    /// the *claim* — read
+    /// your own copy, fail to read the real workspace, fail to overwrite it,
+    /// write to the sandbox-owned home and tmp, with and without network — and
+    /// the claim is what the acceptance is about. Forcing one string across
+    /// three shells would have meant a weaker assertion on all three.
+    ///
+    /// # CI is the privileged case, and for a *deny* assertion that is the
+    /// stronger one
+    ///
+    /// The entry that deferred this warned that a hosted runner's account is an
+    /// administrator, so a green CI run would not prove the mechanism works for
+    /// a standard user. That is right for a capability check and backwards for
+    /// this one. An AppContainer's filesystem check is against the container
+    /// SID's ACE, not the user's group membership: a process with an
+    /// administrator token inside a container still cannot read a directory that
+    /// grants the container nothing. So "denied while running as an
+    /// administrator" implies denied for a standard user, not the other way
+    /// round. The direction that would genuinely need an unprivileged context is
+    /// the *allow* half — reading its own sandbox copy — and that is granted
+    /// explicitly by `grant_tree_access`, which is exercised here too.
+    ///
+    /// Skips rather than fails when the machine cannot create a container, for
+    /// the reason the Linux arm skips without Landlock — and fails on CI for the
+    /// same reason, since a skip and a pass are the same colour.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn app_container_cannot_read_or_write_real_workspace_with_or_without_network() {
+        if !crate::sandbox_windows::app_containers_are_enforceable() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "AppContainers are unavailable on this CI runner, so the filesystem \
+                 boundary they enforce went untested"
+            );
+            eprintln!(
+                "skipping AppContainer integration test: this machine cannot create a \
+                 container profile (group policy, or a locked-down registry hive)"
+            );
+            return;
+        }
+
+        let sandbox_root = temp_dir("appcontainer-integration");
+        let workspace_dir = sandbox_root.join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("create sandbox workspace");
+        let real_workspace = temp_dir("appcontainer-real-workspace");
+        let allowed_file = workspace_dir.join("allowed.txt");
+        let forbidden_file = real_workspace.join("secret.txt");
+        write(&allowed_file, "sandbox-visible");
+        write(&forbidden_file, "must-stay-secret");
+
+        // `plain_canonical`, not `fs::canonicalize`, for the reason the shared
+        // arm gives above — and Windows is the platform that reason is about.
+        // `execute_in_sandbox` resolves through it and hands the child the
+        // prefix-free `C:\...` form, so `%USERPROFILE%` never equals a verbatim
+        // `\\?\C:\...`. Comparing against the verbatim one fails the environment
+        // assertion below and nothing after it means anything.
+        let canonical_sandbox = plain_canonical(&sandbox_root).expect("canonical sandbox");
+        let canonical_workspace =
+            plain_canonical(&workspace_dir).expect("canonical sandbox workspace");
+        let canonical_forbidden =
+            plain_canonical(&forbidden_file).expect("canonical forbidden file");
+        let expected_home = canonical_sandbox.join(SANDBOX_HOME_DIR);
+        let expected_tmp = canonical_sandbox.join(SANDBOX_TMP_DIR);
+
+        // Straight line, and **no `if`, no `(…)`, no `exit /b`** — every claim is
+        // printed here and asserted in Rust below. That is not a style choice; a
+        // one-liner cannot carry its own assertions on this platform.
+        //
+        // Two earlier drafts encoded them in `cmd` control flow and both were
+        // reporting nothing. `exit /b` inside `(…)` leaves the block rather than
+        // `cmd`, so the deny guards could not fail and the trailing `exit /b 0`
+        // overwrote their errorlevel. Removing the parentheses left the harder
+        // one: the whole `&`-chain trails a leading `if`, and cmd took the chain
+        // for that `if`'s command, so once the environment check finally *passed*
+        // — `not` false — it skipped the entire rest of the line and exited 0
+        // having done nothing. The history is the tell. An earlier run returned
+        // this script's own `exit /b 70`, which is the branch *taken*; fixing the
+        // paths is what made the run silent.
+        //
+        // So the exit code stops being the verdict, and `dir /b` and `type` stop
+        // being decoration. The one-liner's whole job is to say what the container
+        // saw, on stdout, where the host can read it:
+        //
+        // * `LM-BEGIN` and `LM-END` bracket the run, so "the script stopped early"
+        //   is a distinguishable outcome rather than an empty string.
+        // * `home=` and `set TMP` replace the two `exit /b 70` guards.
+        // * `type "{allowed}"` replaces 73: its content on stdout *is* the read.
+        // * the two `dir /b` replace 74/75 — what the container sees of its own
+        //   writes, which the host listing in the assertions below cannot show.
+        // * `type "{forbidden}"` replaces 71: the secret must not appear.
+        // * the `echo` into `{forbidden}` replaces 72, and the host reads that
+        //   file afterwards to check it did not land.
+        //
+        // `%USERPROFILE%` is read through the variable, `%TMP%` never is. Windows
+        // rewrites a container's `TMP` and `TEMP` on the way in, so the sandbox
+        // restores them with a `set` at the front of this very line (see
+        // `sandbox_windows::temp_reassignment`) — and cmd expands `%VAR%` when it
+        // *parses* the line, before any of it runs. Every `%TMP%` here would be
+        // the container's package temp, the value the `set` exists to replace.
+        // `set TMP` has no such problem: it prints what the environment holds when
+        // it runs. It also prints `TMPDIR`, which the allowlist sets to the same
+        // path; harmless, and `TMP=` is not a substring of `TMPDIR=`. The two
+        // writes and the listing use `{tmp}`, written out in full.
+        //
+        // The deny probes come last on purpose. They are the two steps expected to
+        // fail, and a failed step is the one that might take the rest of the line
+        // with it — after them there is nothing left to lose but `LM-END`, whose
+        // absence is then itself the finding.
+        //
+        // Each step is labelled and sends its stderr to stdout, `2>&1` before any
+        // `>` so the diagnostic goes to the pipe and not into the file being
+        // written. stdout is one ordered stream, so every "Access is denied."
+        // arrives under the label of the step that earned it. Without that the two
+        // streams cannot be lined up: a run that printed four denials against six
+        // steps that could each produce one is not enough to say which four, and
+        // every consistent guess contradicted another part of the same output.
+        let command = format!(
+            "echo LM-BEGIN \
+             & echo home=%USERPROFILE% \
+             & set TMP \
+             & echo S1-read-own & type \"{allowed}\" 2>&1 \
+             & echo S2-write-home & echo home-ok 2>&1> \"%USERPROFILE%\\probe\" \
+             & echo S3-write-tmp & echo tmp-ok 2>&1> \"{tmp}\\probe\" \
+             & echo S4-list-home & dir /b \"%USERPROFILE%\" 2>&1 \
+             & echo S5-list-tmp & dir /b \"{tmp}\" 2>&1 \
+             & echo S6-read-real & type \"{forbidden}\" 2>&1 \
+             & echo S7-write-real & echo overwritten 2>&1> \"{forbidden}\" \
+             & echo LM-END",
+            allowed = canonical_workspace.join("allowed.txt").display(),
+            tmp = expected_tmp.display(),
+            forbidden = canonical_forbidden.display(),
+        );
+
+        // What the container reported about its own filesystem, kept past the
+        // loop: a failed write says "Access is denied." on stderr, and the
+        // trailing `dir /b` says what the container could see. Without these the
+        // probe assertions below can only report the host's half.
+        let mut container_view = String::new();
+        for allow_network in [false, true] {
+            let profile_path = sandbox_root.join(if allow_network {
+                "boundary-network.sb"
+            } else {
+                "boundary-offline.sb"
+            });
+            let outcome = execute_in_sandbox(
+                &sandbox_root,
+                &workspace_dir,
+                &real_workspace,
+                &profile_path,
+                &command,
+                Duration::from_secs(30),
+                allow_network,
+                &[],
+            )
+            .await
+            .expect("the sandbox launches");
+            assert_eq!(
+                outcome.isolation,
+                Isolation::OsSandboxed,
+                "the container was created, so the run must report the boundary it got"
+            );
+            let stdout = String::from_utf8_lossy(&outcome.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&outcome.stderr).into_owned();
+            // Everything below reads this run's own report, so first establish
+            // there is one. Asserted before anything else, including the exit
+            // code: a script that never ran exits 0 too, and that is precisely how
+            // this test used to pass its way into a misleading failure.
+            let ran = format!(
+                "(network={allow_network}) exit={:?} stdout={stdout:?} stderr={stderr:?}",
+                outcome.exit_code
+            );
+            assert!(
+                stdout.contains("LM-BEGIN") && stdout.contains("LM-END"),
+                "the confined child did not run its script from start to finish, so \
+                 nothing below is a statement about the boundary — an absent \
+                 LM-BEGIN means it ran nothing at all, an absent LM-END means a \
+                 step took the rest of the line with it: {ran}"
+            );
+            // The two `exit /b 70` guards, moved out of `cmd`. A wrong
+            // `%USERPROFILE%` would make every path below name somewhere other
+            // than the directory the host checks afterwards; a wrong `TMP` would
+            // leave the run's temporary files outside the sandbox tree, in a
+            // container profile that is deleted with the container.
+            assert!(
+                stdout.contains(&format!("home={}", expected_home.display()))
+                    && stdout.contains(&format!("TMP={}", expected_tmp.display())),
+                "the child's sandbox-owned environment is not what this test \
+                 expects, so its writes did not go where the assertions look: \
+                 wanted home={} tmp={}; {ran}",
+                expected_home.display(),
+                expected_tmp.display()
+            );
+            // The allow half: its own copy of the workspace is readable, and its
+            // own home and tmp are writable. The write is asserted after the loop,
+            // from the host, which is the stronger half of the claim anyway — the
+            // file being there is the write having landed, and landing where the
+            // sandbox says.
+            //
+            // The two `dir /b` are not asserted on. Labelling every step settled
+            // what four denials against six candidates could not: `S2-write-home`
+            // and `S3-write-tmp` are silent, which is a write that worked, and the
+            // denials land under `S4-list-home` and `S5-list-tmp`.
+            //
+            // Those two denials are not this boundary. The container enumerates
+            // its own directories perfectly well through `FindFirstFile` and
+            // through `System.IO`; `dir` is a `cmd` builtin that reads the volume
+            // first, and the volume root is granted to nothing here, so it is
+            // refused on every path — including ones this app has no ACL on. See
+            // `sandbox_windows::AppContainer::grant_tree_access` for the evidence
+            // and `a_confined_run_can_enumerate_the_tree_it_was_granted` for the
+            // assertions. Leaving them unasserted here is therefore right for a
+            // second reason: they would be measuring `cmd`, not the sandbox. This
+            // test is about the *real* workspace, and making it fail on the
+            // listing means asserting a proxy for the write in place of the write,
+            // which the host checks directly after the loop. The labels and their
+            // output stay in `ran`, so the fact is in the failure message of every
+            // assertion below rather than lost with the assertion.
+            assert!(
+                stdout.contains("sandbox-visible"),
+                "the container could not read its own workspace copy, so this run \
+                 proves nothing about what it cannot read: {ran}"
+            );
+            // The deny half. `type` printing the secret is the read succeeding,
+            // which is the boundary gone — and the file's content on the host is
+            // the write half, checked here so a clobber is reported against the
+            // run that did it.
+            assert!(
+                !stdout.contains("must-stay-secret"),
+                "the container read a file outside the sandbox: {ran}"
+            );
+            assert_eq!(
+                fs::read_to_string(&forbidden_file).expect("read real file after run"),
+                "must-stay-secret",
+                "the container overwrote a file outside the sandbox: {ran}"
+            );
+            container_view = ran;
+        }
+        // The write half, and the only place it is asserted: the host sees both
+        // probes after the container is gone. That is what "the container writes
+        // into its own home and tmp" has to mean — a file the container alone can
+        // see is a file the run has lost. When it fails, say what is on disk
+        // rather than only that something is not.
+        let listing = |dir: &Path| match fs::read_dir(dir) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", "),
+            Err(error) => format!("<unreadable: {error}>"),
+        };
+        assert!(
+            expected_home.join("probe").is_file(),
+            "the container wrote a probe under {} and exited 0, but the host cannot \
+             see it afterwards; home contains [{}], tmp contains [{}]; the \
+             container reported {}",
+            expected_home.display(),
+            listing(&expected_home),
+            listing(&expected_tmp),
+            container_view
+        );
+        assert!(
+            expected_tmp.join("probe").is_file(),
+            "the container wrote a probe under {} and exited 0, but the host cannot \
+             see it afterwards; tmp contains [{}]",
+            expected_tmp.display(),
+            listing(&expected_tmp)
+        );
+
+        let _ = fs::remove_dir_all(&sandbox_root);
+        let _ = fs::remove_dir_all(&real_workspace);
+    }
+
+    /// The network filter has to compile on the machine that will install it:
+    /// [`crate::sandbox_linux::network_denial_filter`] fails on an architecture
+    /// seccompiler has no audit value for, and that failure turns into a failed
+    /// run rather than a network-allowed one. Cheap to assert, and it is the only
+    /// part of the filter that can be checked without spawning anything.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_network_denial_filter_compiles_for_this_architecture() {
+        let program =
+            crate::sandbox_linux::network_denial_filter().expect("filter compiles for this arch");
+        assert!(
+            !program.is_empty(),
+            "an empty BPF program is rejected by `apply_filter`, so it would fail the spawn"
+        );
+    }
+
     // --- promote digest / confirmation -----------------------------------
 
     #[test]
     fn promote_digest_changes_with_content_and_is_order_independent() {
         let a = vec![
-            PromoteFileEntry { path: "a.txt".into(), sha256: "1".repeat(64), size_bytes: 1 },
-            PromoteFileEntry { path: "b.txt".into(), sha256: "2".repeat(64), size_bytes: 2 },
+            PromoteFileEntry {
+                path: "a.txt".into(),
+                sha256: "1".repeat(64),
+                size_bytes: 1,
+            },
+            PromoteFileEntry {
+                path: "b.txt".into(),
+                sha256: "2".repeat(64),
+                size_bytes: 2,
+            },
         ];
         let shuffled = vec![a[1].clone(), a[0].clone()];
-        assert_eq!(compute_promote_digest("run-1", &a), compute_promote_digest("run-1", &shuffled));
+        assert_eq!(
+            compute_promote_digest("run-1", &a),
+            compute_promote_digest("run-1", &shuffled)
+        );
 
         let mut changed = a.clone();
         changed[0].sha256 = "3".repeat(64);
-        assert_ne!(compute_promote_digest("run-1", &a), compute_promote_digest("run-1", &changed));
+        assert_ne!(
+            compute_promote_digest("run-1", &a),
+            compute_promote_digest("run-1", &changed)
+        );
 
-        assert_ne!(compute_promote_digest("run-1", &a), compute_promote_digest("run-2", &a));
+        assert_ne!(
+            compute_promote_digest("run-1", &a),
+            compute_promote_digest("run-2", &a)
+        );
     }
 
     #[test]
@@ -2167,7 +3231,8 @@ mod tests {
         let dir = temp_dir("preview-src");
         write(&dir.join("kept.txt"), "hello");
 
-        let traversal = build_promote_preview("run-1", &dir, &["../escape.txt".to_string()], 0, 1_000);
+        let traversal =
+            build_promote_preview("run-1", &dir, &["../escape.txt".to_string()], 0, 1_000);
         assert!(traversal.is_err());
 
         let missing = build_promote_preview("run-1", &dir, &["missing.txt".to_string()], 0, 1_000);
@@ -2186,7 +3251,11 @@ mod tests {
     fn validate_promote_confirmation_rejects_wrong_phrase_without_touching_anything() {
         let pending = PendingPromote {
             run_id: "run-1".to_string(),
-            files: vec![PromoteFileEntry { path: "a.txt".into(), sha256: "a".repeat(64), size_bytes: 1 }],
+            files: vec![PromoteFileEntry {
+                path: "a.txt".into(),
+                sha256: "a".repeat(64),
+                size_bytes: 1,
+            }],
             expires_at_ms: now_ms() + 60_000,
         };
         let digest = compute_promote_digest("run-1", &pending.files);
@@ -2210,7 +3279,10 @@ mod tests {
         assert!(wrong_run.is_err());
 
         let expired = validate_promote_confirmation(
-            Some(&PendingPromote { expires_at_ms: 0, ..pending.clone() }),
+            Some(&PendingPromote {
+                expires_at_ms: 0,
+                ..pending.clone()
+            }),
             "run-1",
             &digest,
             &confirmation_phrase_for(&digest),
@@ -2218,7 +3290,13 @@ mod tests {
         );
         assert!(expired.is_err());
 
-        let missing = validate_promote_confirmation(None, "run-1", &digest, &confirmation_phrase_for(&digest), now_ms());
+        let missing = validate_promote_confirmation(
+            None,
+            "run-1",
+            &digest,
+            &confirmation_phrase_for(&digest),
+            now_ms(),
+        );
         assert!(missing.is_err());
 
         let ok = validate_promote_confirmation(

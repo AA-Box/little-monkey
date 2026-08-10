@@ -16,20 +16,28 @@
 //! module the roadmap intends to delete. Extracting it here breaks that
 //! dependency *structurally*: nothing in this module needs v1.
 //!
-//! It does **not** yet break it in fact, and the distinction matters to whoever
-//! reads this next. v2's own call sites still spell `crate::stacks::…` and reach
-//! this code through the re-export at the top of `stacks.rs` — 16 sites in
-//! `knowledge_service.rs`, 11 in `portability_commands.rs`, 1 in `diagnostics.rs`
-//! and ~17 across `monkey-cli`. Deleting `stacks.rs` today would break v2 in
-//! every one of them. Repointing those is the next step; only after it can v1 be
-//! deleted without the registry and the embedding path going with it.
+//! It now breaks it in fact too, for the shared items: every call site that
+//! wanted the registry or the embedding path spells `crate::knowledge_core::…` /
+//! `little_monkey_lib::knowledge_core::…` directly, so `stacks.rs`'s re-export
+//! block is no longer load-bearing for any of them. What still reaches through
+//! it is v1 *index* behaviour — `ChunkMeta` (v1's `chunks.jsonl` row type, and
+//! the importer's input type), `query_impl`, `reindex_impl`, `stacks_reindex` —
+//! which is exactly the set that dies with `stacks.rs` rather than moving here.
 //!
 //! What is deliberately NOT here: everything that is an artefact of v1's
 //! *index format* rather than of the registry — `chunks.jsonl`/`vectors.bin`
 //! I/O, the character-boundary chunker, brute-force dot-product ranking, the
-//! incremental-reindex planner, the staleness check, the `LoadedStack` cache.
-//! Those stay in `stacks.rs` and die with it. v2 has its own equivalents in
+//! incremental-reindex planner, the `LoadedStack` cache. Those stay in
+//! `stacks.rs` and die with it. v2 has its own equivalents in
 //! `knowledge_pipeline.rs` and never called v1's.
+//!
+//! The one later addition is the local-source staleness walk at the bottom of
+//! this file ([`source_has_newer_mtime`]). It arrived here rather than staying
+//! in `stacks.rs` because v2 grew a staleness probe of its own
+//! (`knowledge_service::v2_staleness_impl`) and "has a local file changed since
+//! we indexed?" is a question about the *registry's* sources, not about either
+//! index format — two implementations of it would have drifted on exactly the
+//! extension/size exclusions that keep the badge from lying.
 //!
 //! This module is Tauri-*light*, not Tauri-free: [`stacks_base_dir`] resolves
 //! the app-data path from an `AppHandle` exactly as it did in `stacks.rs`, and
@@ -44,8 +52,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::profiles::ProfileScopedPaths;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 /// Default target chunk size (characters), per `KnowledgeStack::chunk_chars`.
 pub(crate) const DEFAULT_CHUNK_CHARS: usize = 1600;
@@ -145,15 +154,22 @@ pub struct StackQueryResult {
 // Registry I/O
 // ---------------------------------------------------------------------
 
+/// The app-data directory both index generations hang off of: v1's registry and
+/// `chunks.jsonl`/`vectors.bin` live under `<app_data>/stacks`, v2's catalog and
+/// generations under `<app_data>/knowledge-v2`. `monkey-cli` resolves the same
+/// path `AppHandle`-free via `app_paths::data_dir`, which is why every `*_impl`
+/// and `*_at` entry point takes a plain `&Path` and only the thin Tauri wrappers
+/// call this.
+pub(crate) fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    app.profile_data_dir()
+        .map_err(|e| format!("Failed to resolve app data dir: {e}"))
+}
+
 /// Resolves (and creates) `<app_data>/stacks`, the directory every `*_impl`
-/// here takes as its `base`. The one `AppHandle`-dependent function in this
-/// module — see the module doc for why the split is drawn here.
+/// here takes as its `base`. One of the two `AppHandle`-dependent functions in
+/// this module — see the module doc for why the split is drawn here.
 pub(crate) fn stacks_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to resolve app data dir: {e}"))?
-        .join("stacks");
+    let dir = app_data_dir(app)?.join("stacks");
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create stacks dir: {e}"))?;
     Ok(dir)
 }
@@ -197,13 +213,6 @@ pub(crate) fn save_registry(base: &Path, stacks: &[KnowledgeStack]) -> Result<()
     std::fs::rename(&tmp, &path)
         .map_err(|e| format!("Failed to finalize {}: {e}", path.display()))?;
     Ok(())
-}
-
-pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------
@@ -516,15 +525,6 @@ pub fn resolve_search_stack_ids(
 // Embedding core
 // ---------------------------------------------------------------------
 
-/// True if two `EmbeddingSpec`s are compatible for reuse (same backend,
-/// same model/tag, same dimensionality) — the cheap check backing the
-/// design doc's #1 risk ("embedding-spec drift"): a spec change anywhere
-/// along this triple must hard-fail to "reindex required" rather than let a
-/// cached/loaded stack silently mix vectors from two different models.
-pub(crate) fn spec_matches(a: &EmbeddingSpec, b: &EmbeddingSpec) -> bool {
-    a.backend == b.backend && a.model_id_or_tag == b.model_id_or_tag && a.dim == b.dim
-}
-
 fn l2_normalize(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
@@ -536,13 +536,14 @@ fn l2_normalize(v: &mut [f32]) {
 
 async fn embed_via_llama(model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://127.0.0.1:{}/v1/embeddings", crate::llama::EMBED_PORT))
-        .json(&serde_json::json!({ "model": model, "input": texts }))
-        .timeout(std::time::Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|e| {
+    let resp = crate::egress::send(
+        client
+            .post(format!("http://127.0.0.1:{}/v1/embeddings", crate::llama::EMBED_PORT))
+            .json(&serde_json::json!({ "model": model, "input": texts }))
+            .timeout(std::time::Duration::from_secs(60)),
+    )
+    .await
+    .map_err(|e| {
             format!(
                 "Failed to reach the embedding server: {e} — start it first from the desktop app's Settings > \
                  Knowledge tab, or (from a terminal) `monkey stacks embed-server start --model-path <path>`."
@@ -631,6 +632,118 @@ pub async fn embed_batch(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------
+// Local-source staleness probe
+// ---------------------------------------------------------------------
+
+/// Files larger than this are skipped during indexing (silently, like a
+/// binary file) — a single huge log/data file shouldn't dominate a stack's
+/// chunk budget or indexing time.
+pub(crate) const MAX_FILE_BYTES: u64 = 5_000_000;
+
+/// Extension allowlist for indexable files — text formats plus common code
+/// files. Matched case-insensitively.
+const ALLOWED_EXTENSIONS: &[&str] = &[
+    "md", "markdown", "txt", "rst", "json", "yaml", "yml", "toml", "csv", "html", "htm", "rs",
+    "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "cc", "h", "hpp", "cs", "rb", "php",
+    "swift", "kt", "sh", "sql",
+];
+
+/// True for an extension v1's `read_indexable_file` would ever actually read
+/// (`.pdf` when the `pdf-extraction` feature is compiled in, or anything in
+/// [`ALLOWED_EXTENSIONS`]) — factored out so [`source_has_newer_mtime`] can
+/// apply the exact same extension gate without duplicating (and risking
+/// drifting from) `read_indexable_file`'s own check.
+pub(crate) fn is_indexable_extension(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext = ext.to_lowercase();
+
+    #[cfg(feature = "pdf-extraction")]
+    if ext == "pdf" {
+        return true;
+    }
+
+    ALLOWED_EXTENSIONS.contains(&ext.as_str())
+}
+
+pub(crate) fn mtime_ms(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
+/// True if `path` itself (a file source) or any file reachable under it (a
+/// folder source, walked the same way `collect_source_files` does) has an
+/// mtime after `indexed_at_ms`.
+///
+/// Shared by both index generations: v1's `stacks::is_stale_impl` (per stack,
+/// against `KnowledgeStack::indexed_at`) and v2's
+/// `knowledge_service::v2_staleness_impl` (per local connector, against the
+/// active generation's `created_unix_ms`). It is `stat`-only on purpose —
+/// both callers fan it out across every indexed stack on panel mount, so it
+/// must never read file contents or touch the network.
+pub(crate) fn source_has_newer_mtime(path: &Path, indexed_at_ms: u64) -> bool {
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return true,
+    };
+
+    if !metadata.is_dir() {
+        return mtime_ms(&metadata)
+            .map(|mtime| mtime > indexed_at_ms)
+            .unwrap_or(true);
+    }
+
+    let walker = walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() > 0 && entry.file_type().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    return !crate::tools::MENTION_SKIP_DIRS.contains(&name);
+                }
+            }
+            true
+        });
+    for entry in walker {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        // Match `collect_source_files`/`read_indexable_file`'s own
+        // extension-allowlist and size-cap gates — a touched file that
+        // indexing would never actually look at (wrong extension, an
+        // oversized log file, etc.) must not flip the stale badge, or
+        // reindexing would be "recommended" for a change that produces zero
+        // new/changed chunks. Skipped here on metadata alone (no content
+        // read), so this stays a cheap `stat`-only check like the rest of
+        // this function; the binary-content-sniff/UTF-8-validity gates
+        // `read_indexable_file` also applies aren't replicated since those
+        // require reading the file, which this check deliberately doesn't do.
+        if !is_indexable_extension(entry.path()) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.len() == 0 || metadata.len() > MAX_FILE_BYTES {
+            continue;
+        }
+        if mtime_ms(&metadata)
+            .map(|mtime| mtime > indexed_at_ms)
+            .unwrap_or(true)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,30 +802,6 @@ mod tests {
     }
 
     // --- embedding-spec mismatch hard-fails ---
-
-    #[test]
-    fn spec_matches_true_for_identical_specs() {
-        assert!(spec_matches(&test_spec(768), &test_spec(768)));
-    }
-
-    #[test]
-    fn spec_matches_false_when_dim_changes() {
-        assert!(!spec_matches(&test_spec(768), &test_spec(1024)));
-    }
-
-    #[test]
-    fn spec_matches_false_when_model_changes() {
-        let mut other = test_spec(768);
-        other.model_id_or_tag = "different-model".to_string();
-        assert!(!spec_matches(&test_spec(768), &other));
-    }
-
-    #[test]
-    fn spec_matches_false_when_backend_changes() {
-        let mut other = test_spec(768);
-        other.backend = EmbeddingBackend::Ollama;
-        assert!(!spec_matches(&test_spec(768), &other));
-    }
 
     // --- registry CRUD ---
 

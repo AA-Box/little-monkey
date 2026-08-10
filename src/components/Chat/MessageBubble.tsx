@@ -7,7 +7,9 @@ import { textContent, type ChatContentPart, type ChatMessage } from "../../lib/l
 import { detectFenceKind, fingerprintArtifact, type ArtifactRef } from "../../lib/artifacts";
 import { isWorkspaceImageSrc } from "../../lib/imageGeneration";
 import WorkspaceImagePreview from "./WorkspaceImagePreview";
+import MessageActions, { Tooltip } from "./MessageActions";
 import { useArtifactStore } from "../../store/artifactStore";
+import { useSessionStore } from "../../store/sessionStore";
 // Lazy: `CodeBlock` pulls in `react-syntax-highlighter`'s Prism bundle, the
 // same heavy dependency `ArtifactPane.tsx` keeps out of the main entry chunk
 // via `lazyComponents.tsx` — see `CodeBlock.tsx`'s doc comment.
@@ -200,7 +202,7 @@ function buildAssistantMarkdownComponents(
               <button
                 type="button"
                 onClick={() => useArtifactStore.getState().open(sessionId, ref)}
-                className="flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-xs text-white/50 transition-colors hover:bg-white/10 hover:text-white"
+                className="flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-xs text-muted transition-colors hover:bg-foreground/10 hover:text-foreground"
               >
                 <Eye size={12} />
                 {t("MessageBubble.previewButton")}
@@ -301,26 +303,31 @@ function UserBubble({
           <div className="mt-1.5 flex shrink-0 items-center gap-0.5">
             {translationControls}
             {onStartSideTask && (
-              <button
-                type="button"
-                onClick={onStartSideTask}
-                aria-label="Start side task from this message"
-                title="Start side task from this message"
-                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
-              >
-                <Split size={13} />
-              </button>
+              <span className="group/action relative">
+                <button
+                  type="button"
+                  onClick={onStartSideTask}
+                  aria-label={t("MessageBubble.startSideTask")}
+                  className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
+                >
+                  <Split size={13} />
+                </button>
+                <Tooltip text={t("MessageBubble.startSideTask")} />
+              </span>
             )}
             {onEdit && (
-              <button
-                type="button"
-                onClick={() => setEditing(true)}
-                disabled={editDisabled}
-                aria-label={t("MessageBubble.editMessageAriaLabel")}
-                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100 disabled:cursor-not-allowed disabled:opacity-0"
-              >
-                <Pencil size={13} />
-              </button>
+              <span className="group/action relative">
+                <button
+                  type="button"
+                  onClick={() => setEditing(true)}
+                  disabled={editDisabled}
+                  aria-label={t("MessageBubble.editMessageAriaLabel")}
+                  className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100 disabled:cursor-not-allowed disabled:opacity-0"
+                >
+                  <Pencil size={13} />
+                </button>
+                <Tooltip text={t("MessageBubble.editMessageAriaLabel")} />
+              </span>
             )}
           </div>
         )}
@@ -348,34 +355,57 @@ function AssistantMessage({
   content,
   sessionId,
   index,
+  at,
+  chapter,
   translationControls,
   onStartSideTask,
 }: {
   content: string;
   sessionId: string;
   index: number;
+  at?: number;
+  chapter?: string;
   translationControls?: ReactNode;
   onStartSideTask?: () => void;
 }) {
   const { t } = useT();
   const components = buildAssistantMarkdownComponents(sessionId, index, t);
+  const pinned = chapter !== undefined;
   return (
-    <div className="group relative w-full min-w-0">
-      {onStartSideTask && (
-        <button
-          type="button"
-          onClick={onStartSideTask}
-          aria-label="Start side task from this message"
-          title="Start side task from this message"
-          className="absolute -top-1 right-0 flex h-5 w-5 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
-        >
-          <Split size={12} />
-        </button>
-      )}
+    <div className="group w-full min-w-0">
       <div className={PROSE_CLASSES}>
         <ReactMarkdown components={components}>{content}</ReactMarkdown>
       </div>
-      {translationControls && <div className="absolute -bottom-5 left-0 z-10">{translationControls}</div>}
+      <div className="mt-1 flex items-center gap-0.5">
+        {translationControls}
+        {/* A pinned answer keeps its footer visible: the filled bookmark is
+            the only place the chapter's own state shows on the message. */}
+        <div
+          className={`flex items-center gap-0.5 transition-opacity duration-150 ${pinned ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"}`}
+        >
+          <MessageActions
+            text={content}
+            at={at}
+            chapter={chapter}
+            onToggleChapter={(title) =>
+              useSessionStore.getState().updateMessageAt(sessionId, index, { chapter: title })
+            }
+          />
+        </div>
+        {onStartSideTask && (
+          <span className="group/action relative">
+            <button
+              type="button"
+              onClick={onStartSideTask}
+              aria-label={t("MessageBubble.startSideTask")}
+              className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
+            >
+              <Split size={13} />
+            </button>
+            <Tooltip text={t("MessageBubble.startSideTask")} />
+          </span>
+        )}
+      </div>
     </div>
   );
 }
@@ -473,21 +503,25 @@ function TranslationControls({
         }
       }}
     >
-      <button
-        type="button"
-        aria-label={running ? t("Translation.cancel") : t("Translation.translate")}
-        aria-haspopup="dialog"
-        aria-expanded={menuOpen}
-        title={running ? t("Translation.cancel") : t("Translation.translate")}
-        disabled={disabled && !running}
-        onClick={() => {
-          if (running) cancelTranslation(messageTranslationKey(sessionId, index));
-          else setMenuOpen((value) => !value);
-        }}
-        className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint transition-colors hover:bg-surface-2 hover:text-foreground focus-visible:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
-      >
-        {running ? <LoaderCircle size={13} className="animate-spin" /> : <Languages size={13} />}
-      </button>
+      <span className="group/action relative">
+        <button
+          type="button"
+          aria-label={running ? t("Translation.cancel") : t("Translation.translate")}
+          aria-haspopup="dialog"
+          aria-expanded={menuOpen}
+          disabled={disabled && !running}
+          onClick={() => {
+            if (running) cancelTranslation(messageTranslationKey(sessionId, index));
+            else setMenuOpen((value) => !value);
+          }}
+          className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint transition-colors hover:bg-surface-2 hover:text-foreground focus-visible:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {running ? <LoaderCircle size={13} className="animate-spin" /> : <Languages size={13} />}
+        </button>
+        {/* Hidden while the language dialog is open — the tooltip would sit
+            on top of the panel it just opened. */}
+        {!menuOpen && <Tooltip text={running ? t("Translation.cancel") : t("Translation.translate")} />}
+      </span>
 
       {available && (
         <button
@@ -618,6 +652,8 @@ function MessageBubble({
         content={displayedTranslation?.translatedText ?? textContent(message.content)}
         sessionId={sessionId}
         index={index}
+        at={message.at}
+        chapter={message.chapter}
         translationControls={controls}
         onStartSideTask={startSideTask}
       />

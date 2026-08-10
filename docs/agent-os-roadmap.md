@@ -157,18 +157,89 @@ message bytes, `owned_by` values, raw SSE passthrough, and `OPTIONS /v1/*` → 2
   `port == DEFAULT_HTTP_PORT` to name the other listener, so a listener holding
   its own copy could be moved off 1234 and silently make that diagnosis wrong.
 
-**Remaining — and why it is not one more coding session.** Three parts of this
-merge are blocked on decisions or on a release cycle, not on effort:
+**Since the section below was written, three of its four blockers shipped and the
+merge itself landed.** `unified_http_server.rs` is now the lifecycle authority and
+`server.rs` is its transport — the production bind is `bind_candidate`, the accept
+task is `run_unified_endpoint`, and every entry point (autostart, exit hook, the two
+`api_server_*` commands, `m3_http_server_start`, LAN policy configure/disable) funnels
+through one reconciler. `m3_http_server.rs`'s own listener is now explicitly
+**test-only**. Route authority is the typed `http_route_registry.rs`: one ordered
+table, a five-variant matcher, first-match-wins, plus a negative `DENIED_SURFACES`
+tier — so **the host-route prefix tier landed without weakening the invariant**, and
+the guard the doc named is now a real test under that name. It is a table-level guard
+rather than a behavioural one, deliberately: the defect it must catch is a *newly
+added* route, which no test over today's routes can see.
 
-- **Token unification cannot be a cutover.** Legacy tokens are `lmk-` + 32 hex;
-  the pairing store's are `lmk-lan-` + 64 hex and shape-checked, so it rejects a
-  legacy token before any lookup. Plaintexts are unrecoverable — only digests
-  reach disk — and `mint_local_app_token` tokens are **already baked into
-  published Local App HTML on users' machines**. The only safe path is: accept
-  both (pairing store first, legacy digest list as fallback, rate limiter on
-  both), deprecate the legacy mint flow in the UI, then delete the legacy branch
-  *a release later*. That last step is a calendar dependency.
-- **Model-id resolution is mutually exclusive** — *decided, implementation reverted.*
+Dual-accept is live on one socket and tested end-to-end (both families, each routed
+to its owner, each debited against its own limiter). `read_capped_body` was two
+independent implementations and is now one in `http_policy.rs`, with the wire
+rendering — which genuinely differed — expressed as a typed rejection each router
+renders itself, rather than silently picking one. `now_ms`, `full_body` and
+`json_response` merged; **`error_response` deliberately did not** (different `type`
+discriminator, different field order), and neither did the four shared handlers, for
+the reason the byte-compatibility bullet below gives. That reason is now written at
+the fork point so the next reader does not "clean it up" and turn every browser
+client into a 403.
+
+One security finding came out of writing the dual-accept test, and it was the
+mirror image of a fix the legacy path already had: **an expired paired token
+answered 403 "token is expired" while an unknown one answered 401** — an existence
+oracle telling a caller whether a secret was ever issued. The legacy path had
+deliberately routed expiry into the same generic 401 years earlier. The fix could
+not be "collapse Forbidden into Unauthorized", which would have destroyed every
+legitimate scope-denial 403; the rule is **before the caller has proven possession
+of a live credential every failure must be indistinguishable — including in quota
+consumed, since a 429 reachable only by a token that exists is the same oracle in a
+different costume — and after it has, real reasons are safe and useful.** Unknown,
+expired, revoked and unpaired-peer now answer byte-identically; scope, model,
+backend and confirmation denials keep their 403s.
+
+**Remaining.** An earlier revision of this heading said what was left was "a calendar
+dependency, not effort". Both halves were wrong, and the bullet below replaces them: the
+wait was unnecessary, and what actually remains is a capability that has to be built.
+
+- **Token unification is not a calendar dependency — and, on reading the two stores, is
+  not the right goal either.** This entry twice described the same plan: accept both,
+  deprecate the legacy mint flow, delete the legacy branch "*a release later*", because
+  `mint_local_app_token` tokens are "already baked into published Local App HTML on users'
+  machines". The schedule half is dead for D2's reason (20 downloads across three releases;
+  see D2). The rest did not survive tracing the code.
+
+  **What is actually there.** Legacy tokens (`lmk-` + 32 hex, digests in `api_server.json`)
+  carry scopes, *backends*, expiry, and `bound_local_app_id` — the binding that makes a
+  published Local App's token able to run that one app and nothing else. Pairing tokens
+  (`lmk-lan-` + 64 hex, in `compatibility_hub.rs`) carry an `ApiScope` set plus device
+  identity, rotation, revocation, replay protection and audit history. **Each store holds
+  something the other has no concept of.** "Delete the legacy branch" therefore means
+  building backends, non-interactive minting and app binding *inside* the pairing store —
+  re-implementing one credential model in the other, for a system whose two credential
+  types serve genuinely different callers (an OpenAI-compatible client on loopback; a paired
+  device on the LAN). That is migration for its own sake, and it is a migration of
+  user-visible credentials whose plaintexts are unrecoverable.
+
+  **What D1 actually wanted is already true.** One socket, one dispatcher, one typed route
+  registry, and `classify_bearer_family` as the single point where a bearer is routed to its
+  owner. Two credential types behind one funnel is an ordinary design, not a duplication —
+  the same shape as session cookies beside API keys.
+
+  **What *was* duplication, and is now fixed.** `constant_time_eq` existed twice, in
+  `server.rs` and `compatibility_hub.rs`, byte-identical — a security primitive with two
+  copies, which is one copy that can be corrected while the other keeps the defect. It now
+  lives once in `http_policy.rs`, the module both listeners already share, and its two tests
+  moved with it: they had been sitting beside one copy, which is precisely the arrangement
+  that lets the second go untested. `server.rs` also carried the bearer→token scan twice
+  (`authenticate_credential` and `authenticate_local_app_token`), each with its own expiry
+  check; both now call one `find_live_token`, which answers `None` for an expired match so
+  neither caller *can* leak "existed but expired" through its 401. A scope or binding denial
+  after that still names its reason, which is the rule this item already settled: before
+  possession of a live credential is proven every failure must be indistinguishable, after
+  it is proven real reasons are safe.
+
+  **So the remaining item is retired rather than deferred.** If the legacy store is ever
+  removed it should be because user-issued API tokens are being redesigned, not to reach a
+  single-store count.
+
+- **Model-id resolution is mutually exclusive** — *decided, reverted once, now shipped.*
   `server.rs` treats any unknown non-empty model id as an Ollama tag; m3 404s unless the
   model is installed or an explicit runtime header is present.
 
@@ -206,21 +277,46 @@ merge are blocked on decisions or on a release cycle, not on effort:
   security-state writes behind a global mutex; and the same oracle still exists at
   `discover_models` and three lifecycle paths, so this is a shared-helper fix rather than
   a per-call-site one.
+
+  **The second attempt shipped it**, as `http_model_catalog.rs` (the pure engine),
+  `http_model_service.rs` (the façade) and `http_model_sources.rs` (the adapters:
+  m3 runtimes, legacy llama, OpenAI-compatible, Ollama, cloud providers). Listing and
+  resolution both run over the union, deduped by `(model_id, runtime_id)` and sorted
+  deterministically, with `x-little-monkey-runtime-id` as the explicit override and a
+  404 only when nothing has the id.
+
+  **The trap that killed the first attempt is now structural rather than remembered.**
+  Authorization strictly precedes resolution on both paths, and the gate is enforced
+  twice on purpose: `HttpModelService::resolve` runs `preflight_gate` before it will so
+  much as *construct* a source, and `UnifiedModelCatalog::resolve` repeats
+  `effective_backends` before `collect_effective` makes the first network touch. So an
+  unauthenticated caller cannot cause an outbound `/api/tags` probe, cannot enumerate
+  runtime ids from an error body, and cannot use 404-vs-401 as a per-model existence
+  oracle — a disabled runtime override is `Forbidden` without probing the others, and a
+  known-but-disallowed provider prefix is `Forbidden` rather than a synthesized 404. The
+  end-to-end test asserts an invalid bearer produces zero llama requests *and* zero
+  ollama requests, which is the only form of that assertion that would have caught the
+  original defect.
 - **Byte-level compatibility is load-bearing.** `Access-Control-Allow-Origin: *`
   on every legacy response versus m3's deny-all default; `/health` returning
   exactly `{"status":"ok"}`; the OpenAI error envelope real SDKs branch on;
   `owned_by` values clients filter on; raw SSE passthrough versus m3's re-framed
   frames; `OPTIONS` on `/v1/*` returning 204. A naive merge turns every
-  browser-based client into a 403. This needs the byte-level harness for the
-  legacy routes that does not exist yet — the one thing that would make the rest
-  of the merge safe to attempt.
+  browser-based client into a 403. **The harness exists now** and it is what made
+  the merge safe to attempt — it caught every byte question above, and the four
+  shared routes were left deliberately unmerged because of what it pins. One gap
+  it had is closed: `/v1/embeddings` appeared nowhere in it, so its fork was
+  protected only by generic assertions on other routes. It is now byte-pinned like
+  the other three, against a fixture written to be wrong in three ways a
+  re-serializer would silently fix.
 
 Also still open: `monkey-cli api-serve` is deliberately `AppHandle`-free while
-the merged server needs an `M3RuntimeHub` that today only exists under Tauri;
-and the five host routes (`/v1/knowledge/query`, `/v1/local-apps/{id}/run`,
-`/v1/artifacts/{id}`, `/v1/workflows/runs/{id}`, `/local-apps/{id}`) need m3's
-exact-match allowlist to grow a prefix tier without weakening the invariant
-`route_allowlist_never_exposes_agent_or_workspace_tools` asserts.
+the merged server needs an `M3RuntimeHub` that today only exists under Tauri.
+The five host routes (`/v1/knowledge/query`, `/v1/local-apps/{id}/run`,
+`/v1/artifacts/{id}`, `/v1/workflows/runs/{id}`, `/local-apps/{id}`) are done —
+they are in the typed registry, loopback-scoped, with the prefix tier landed and
+the invariant `route_allowlist_never_exposes_agent_or_workspace_tools` now an
+actual test rather than a name in this file.
 
 **Blocks:** K7 still.
 
@@ -234,10 +330,12 @@ attach a policy later — useful, and not the same as unblocking.
 
 *Maps to: ROADMAP #9.*
 
-## D2. One knowledge index *(partially built)*
+## D2. One knowledge index *(built)*
 
-**Today:** `stacks.rs` v1 (11 commands, still invoked) runs alongside
-Knowledge 2.0 (16 `knowledge_v*` commands in `knowledge_service.rs`).
+**Today:** one index. `knowledge_service.rs`'s Knowledge 2.0 generation answers every
+query, from the desktop panel, the agent's `search_docs`, and `monkey-cli` alike.
+`stacks.rs` is 2,538 lines lighter and now holds only the Tauri command layer over the
+shared registry plus the retrieval path all three callers share.
 
 **Shipped — the divergence no longer produces wrong answers:**
 
@@ -271,8 +369,16 @@ migration over users' existing embedded vectors**:
   sites, not ~9** (16 `knowledge_service.rs`, 11 `portability_commands.rs`, 1
   `diagnostics.rs`, ~17 `monkey-cli`). Harmless for the move itself, since they all
   resolve through the re-export — but that is the size of the repointing below.
-- Port the two v1-only capabilities v2 lacks: source staleness, and the
-  query-path hot cache that keeps the test-search box at keystroke latency.
+- ~~Port the one v1-only capability v2 genuinely lacks: **source staleness**.~~ **Done** —
+  `v2_staleness_impl`, built exactly as this line specified: a free tier (pipeline
+  fingerprint changed), a cheap tier for local connectors (the same mtime walk v1 does,
+  against the generation's creation time), and **`Unknown` for remote connectors**, because
+  any design that answers synchronously for those either does network I/O inside a badge
+  render or makes something up. `Unknown` must render as unknown and never as fresh.
+
+  It sat unwired in the UI for a release, which is its own lesson and is recorded in the
+  panel-collapse entry below. The second capability this line used to name, a query hot
+  cache, should not be ported at all; see the correction below.
 - ~~**Synthesize a v2 generation from each v1 index without re-embedding.**~~ **Done**,
   and the entry understated the hard part. Every factual claim in it held — the vectors
   are reusable as-is, and all thirteen `validate_chunk`/`validate_generation_contents`
@@ -293,13 +399,133 @@ migration over users' existing embedded vectors**:
   between a real fix and a cosmetic one. All-or-nothing under the `catalog_lock`:
   stage → `save_catalog` → activate, with a rollback to `previous_catalog` if activation
   fails.
-- Port the remaining work: repoint the ~45 call sites off the re-export, route every
-  read through v2, delete the v1 index, and collapse the two panels. `stacks.rs` still
-  registers **12 Tauri commands**, so v1 is still live and this item is still
-  *partially built*.
 
-**Blocks:** K11 — context accounting cannot be honest while two systems
-produce context by different rules.
+  **"Done" was true of the function and false of the feature, and the gap is the whole
+  lesson.** `knowledge_v2_import_from_v1` was implemented, correct, and backed by 19
+  tests — and **never registered in `lib.rs`'s `invoke_handler`**. No frontend `invoke`,
+  no CLI subcommand; `grep -rn import_from_v1` returned one hit, its own definition. So
+  the population of users holding an un-imported v1 index was not "some hold-outs", it
+  was **everyone who had ever indexed a stack**, with no affordance anywhere to fix it.
+  Nineteen passing tests were exercising a code path no shipped build could reach, which
+  is exactly the failure mode a test suite cannot see: every assertion about the import's
+  behaviour held, and none of them asked whether anything could call it.
+
+  A crate-wide audit while fixing it found **531 `#[tauri::command]` declarations and 530
+  registrations** — this was the only miss, so it was one command rather than a pattern.
+  It is now registered, offered in the v2 panel for a stack that has a v1 index and no v2
+  generation, exposed as `monkey-cli stacks import-v1`, and wired as the diagnostics safe
+  fix. The fix that matters more than the registration is
+  `every_tauri_command_is_reachable_from_the_invoke_handler`, which scans the source for
+  every declared command and asserts both directions — declared-but-unregistered *and*
+  registered-but-undeclared, the second so the scan cannot quietly stop matching and
+  report success. A test naming only this one command would not have caught this one, and
+  would not catch the next.
+
+  `audit_knowledge_index` now emits `knowledge_index.v1_import.<stack_id>` for each
+  un-imported stack, so a support bundle answers "how many users still hold a v1 index?"
+  with a number. That number is the precondition for deleting anything.
+- ~~Repoint the call sites off the re-export, and route every read through v2.~~ **Done.**
+  The final count is **57 references**, of which 47 were repointed at `knowledge_core` and
+  ten genuinely need v1: `ChunkMeta` ×7 — the *importer's* input type, so deleting it as
+  cruft would delete the migration path — plus `reindex_impl`, `query_impl` and
+  `stacks_reindex`. An earlier revision of this line estimated 53/42/11 before the work;
+  57/47/10 is what the repointing actually found, and both the re-export's comment and
+  `knowledge_core.rs`'s module doc asserted the opposite of the `ChunkMeta` fact and were
+  corrected.
+
+  Routing found a real divergence rather than a tidy-up: **the CLI could not read v2 at
+  all.** `monkey stacks search` and the CLI agent's `search_docs` answered from v1 while
+  the GUI preferred v2 — same query, same stack, different answers — and `agent.rs`
+  carried a comment asserting the two produce identically shaped results. All three callers
+  now share `query_stacks_v2_first`, so that parity is structural rather than a comment.
+- ~~Collapse the two panels' duplicated stack selection.~~ **Done**, and it found another
+  command implemented, tested, registered and never called: `knowledge_v2_is_stale`. Its
+  doc comment says it reads the manifest through `active_manifest` rather than `active`
+  *because the panel fans it out across every indexed stack on mount* — and the panel never
+  did. Two consequences, both user-visible: **a native v2 stack could never report as
+  stale at all**, and the badge that did render was v1's, describing the freshness of an
+  index that stack is no longer answered from. Wiring it also gives each row a "which index
+  answers this?" badge for free, because `NotIndexed` *is* the predicate the read path
+  branches on. Same class of finding as the unregistered import above, which is now twice
+  in this item — the guard test catches unregistered commands, not unused ones.
+
+  The selection itself is now single: the expanded stack row *is* the stack the Knowledge
+  2.0 section configures, derived from one piece of state rather than synchronised by an
+  effect. Before, the two halves could sit on different stacks, so a stack's v1 sources and
+  some other stack's v2 sources were on screen together with nothing saying so.
+- ~~**Remaining, and gated on a release rather than a merge:** deleting v1.~~ **Done, and
+  the gate was measured rather than assumed — which is the whole correction.** This entry
+  argued deletion "cannot be one change" because shipping it alongside the import would
+  "require every affected user to have opened the app and run the action in between… a race
+  against the user". That reasoning is sound and its premise was never checked. Checked:
+  three published releases (v1.0.0, v1.1.0, v1.2.0) have **20 asset downloads between
+  them**, GitHub Releases is the only distribution channel — no brew tap, winget, flatpak
+  or snap — and the machine this was written on holds no `chunks.jsonl` or `vectors.bin` at
+  all. The population the staged migration protects is small enough to name individually.
+
+  So the release-cadence discipline was correct practice applied to the wrong project size,
+  and paying it would have meant carrying `stacks.rs`'s 2.5k lines and a second read path
+  through all of Phase 3 — which is exactly the "a kernel change has to be made twice" tax
+  Phase 0 exists to remove. **An honest roadmap has to be able to retire its own caution
+  when the thing it was protecting turns out not to exist**; that is the same rule as every
+  other correction in this file, applied to a schedule rather than to a claim.
+
+  What went, in one change: v1's `chunks.jsonl`/`vectors.bin` format, its chunker,
+  brute-force dot-product ranking, the incremental reindex planner, the `LoadedStack` cache,
+  the staleness check, four Tauri commands (`stacks_reindex`, `stacks_cancel_index`,
+  `stacks_is_stale`, and the `stacks://index-progress` event behind them), two `AppState`
+  fields, `monkey-cli stacks import-v1`, and the `KnowledgePanel.*` strings across all ten
+  locales. **The v1→v2 importer went with it**, which is the one deletion worth defending:
+  it existed to carry users across, and with no user holding a v1 index there is nobody to
+  carry. Net −4,278 lines against +258.
+
+  Three things the deletion had to preserve rather than drop, each found by a test failing:
+
+  - **`merge_stack_results` survives.** It was introduced to stop v1 cosine scores being
+    sorted against v2 RRF scores, so the obvious reading is that it dies with v1. Wrong:
+    two *stacks* are still not a common scoring currency, and round-robin interleaving is
+    still what stops one starving another. It keeps its tests, reframed off the v1/v2
+    framing.
+  - **Six of the eleven commands were never v1's.** `stacks_list`/`create`/`delete`/
+    `rename`/`add_source`/`remove_source` are registry CRUD that Knowledge 2.0 needs as
+    much as v1 did, and `stacks_query` is the shared read path. Only four were the index.
+  - **The staleness tests were seeding their fixtures *through* the importer**, so deleting
+    it made every one of them pass vacuously — `v2_staleness_impl` walks the v2 catalog's
+    enabled local sources, and a fixture that seeds only the stack registry reports `Fresh`
+    forever. They now publish a generation and seed the catalog directly.
+
+  `audit_knowledge_index` now asks one store instead of two, and the `knowledge_index.v1_import.*`
+  finding that existed to count the un-migrated population is gone with the population.
+
+  One claim in this section stands unchanged and was not what forced the staging: **v1's
+  query cache was never worth porting** — the test-search box fires on Enter, not per
+  keystroke, and `LoadedStack` was an unbounded `HashMap` holding every parsed chunk and
+  vector.
+
+  **The v2 regression this named is closed.** `HybridIndex::open` re-digested and
+  re-validated every chunk on *every query*, so a warm v1 query did zero deserialization
+  passes where v2 did three. The two O(all chunks) passes — re-deriving the content
+  digest, and the FTS mirror set-difference — now run once per *file version*.
+
+  The cache is keyed on the file's identity: device, inode, size and mtime, together
+  with the digest stored inside it. A path alone would be wrong (a prune replaces
+  `index.sqlite3` under a stable path) and the digest alone would be wrong for the
+  opposite reason — it is read *out of* the file, so it is the claim being checked
+  rather than evidence about it. A generation is immutable, so a match on all four
+  means the bytes are the ones that were validated.
+
+  **What it deliberately does not claim.** Corruption detection stays where it belongs,
+  at write and at import, and the first open of any file version still pays the full
+  check. A rewrite preserving device, inode, size and mtime to the nanosecond would be
+  skipped — an accepted limit, because an actor able to do that can also rewrite the
+  `index_digest` this check compares against, so the check was never the defence against
+  them. What it does defend is the ordinary case: a truncated write, a bit-rotted page, a
+  partially copied file, each of which changes size or mtime and re-validates. A test
+  corrupts a chunk *after* a successful open has already cached a verdict and asserts the
+  refusal, which is the case a path-keyed cache would have served happily.
+
+**Blocks:** nothing now. K11's precondition was that two systems stopped producing
+context by different rules; one index is one rule.
 
 *Maps to: ROADMAP #9.*
 
@@ -931,7 +1157,7 @@ only a stop. What K8 still needs from elsewhere is the reservation question
 above — a suspended process holds its resident model slot, worktree lease and
 workspace root — which is a K7/K8 decision, not a signals one.
 
-## K3. Isolation parity across platforms *(partially built)*
+## K3. Isolation parity across platforms *(built on all three; parity test owed on Windows)*
 
 **Today:** real Seatbelt (`sandbox-exec`) confinement on macOS, with an
 integration test asserting a sandboxed command cannot read or write the real
@@ -979,36 +1205,163 @@ enforcement claim that had no test now has one.**
   succeeding. The answer, for the record: Seatbelt does deny it, loopback
   included.
 
-**Remaining — and it is platform work, not reporting work.** Platform-enforced
-confinement on all three. Linux: Landlock filesystem rules plus a seccomp-BPF
-syscall filter, with user namespaces where available. Windows: a restricted token
-with a job object, and AppContainer where the payload allows it. Each platform
-needs the *same* integration test as macOS — a command that tries to read and
-write the real workspace, with and without network, and fails — plus the network
-contrast test above. None of those primitives exists anywhere in the crate today
-and no dependency supplies one, so this is genuinely unbuilt rather than
-half-built.
+**Shipped — the Linux leg, and it is kernel-enforced rather than reported.**
+`sandbox_linux.rs`. Landlock filesystem rules and a seccomp filter are installed in
+`pre_exec`, so they are inherited across the exec and cannot be dropped by the
+payload — the same seam `os_limits` already uses for `setrlimit`, composed with it
+rather than replacing it. The ruleset grants read+write beneath the sandbox root and
+read+execute on `LINUX_SYSTEM_READ_ROOTS`; `macos_readable_roots` became
+`readable_roots(system_roots, …)` so both platforms now share **one** implementation
+of the PATH-entry, toolchain, never-whole-home and never-the-real-workspace filters,
+which is the part that keeps the two policies from drifting.
 
-Also open, and deliberately **not** treated as a quick win after checking it: the
-agent's own shell tool has no `env_clear()` on any platform, so a tool call
-inherits the app's full parent environment. The tempting framing is "it leaks
-secrets", and that overstates it — there is no production `std::env::set_var`
-anywhere in the crate and no provider key is injected into any child's
-environment, so what a tool call inherits is whatever launched the app: close to
-nothing from Finder, and a developer's own exports when started from a terminal.
+`/proc` is granted nothing, deliberately: it would hand the child
+`/proc/<pid>/environ` for every same-uid process including the app's own, which is
+precisely what `env_clear()` exists to prevent.
 
-The reason this is not a one-line fix is that the obvious fix is wrong. A blanket
-`env_clear()` would strip `PATH`, `HOME`, toolchain and proxy variables from every
-tool call, and an allowlist narrow enough to be safe breaks the same commands —
-`sandbox.rs`'s `allowlisted_env` can be that strict only because it serves a
-disposable probe, not the user's real workspace. What tool calls should inherit is
-a policy decision that belongs with K5's egress work, not a hardening tweak to
-smuggle in here.
+ABI v1 rights are a hard requirement, so a kernel with no usable Landlock reports
+`ProcessOnly` rather than pretending; everything above v1 degrades best-effort,
+which is narrower but still real. One functional cost is known and not papered
+over: on 5.13–5.18 there is no `Refer`, so the kernel denies cross-directory rename
+while a domain is in force, and a build that renames into a sibling directory inside
+the sandbox fails there. `sandbox_enforcement()` stays a runtime probe for the
+reason stated above, and Linux never answers `Unavailable` — there is no binary to
+be missing and the mechanism degrades instead of failing, so forcing symmetry with
+macOS would have been a worse answer than asymmetry.
 
-**Blocks:** the claim itself. An OS whose isolation is advisory on two of
-three platforms is a framework. Also K21 concretely — its conformance suite must
-cover the isolation guarantees, which cannot be asserted uniformly while two
-platforms have none.
+seccomp is scoped narrowly and installed only when network is denied: `socket(2)`
+for `AF_INET`/`AF_INET6`/`AF_PACKET`, plus `io_uring_setup(2)`, because
+`IORING_OP_SOCKET` creates an inet socket without ever entering `socket(2)` and is
+the documented way around a filter of this shape. Denying socket *creation* rather
+than `connect` leaves one choke point with nothing to reach around, and denies
+loopback, which is what parity with Seatbelt's `(deny network*)` requires. The
+reasoning for keeping it this narrow is that Landlock understands paths and so
+confines the filesystem better than a syscall filter can; everything a broader
+filter would add is a build command that stops working. Known gap: `AF_UNIX` stays
+allowed where Seatbelt denies it, because denying it breaks Python
+`multiprocessing`, syslog and NSS.
+
+**Verified on a real kernel, which is worth separating from "it compiles".** The
+two macOS live tests were factored into shared helpers so both platforms enter the
+same assertions rather than two lookalikes, contrast test included. On
+`ubuntu-22.04` all four Linux tests run and pass: the real workspace is denied for
+read *and* write, the positive half passes (so `LINUX_SYSTEM_READ_ROOTS` is
+genuinely sufficient for glibc to load `sh`), and the network contrast holds with
+its allow arm actually connecting.
+
+That last claim needed a fix before it meant anything. **The tests skip when the
+mechanism is absent, and an earlier version of this section's own reasoning — that
+printing the reason keeps "green because it asserted" distinct from "green because
+it asserted nothing" — was wrong**, because `cargo test` captures a *passing*
+test's output and the print never reaches the log anyone reads. A runner without
+Landlock produced exactly the same green as one that enforced it. Under `CI` the
+absence of the mechanism is now a failure, so green means the assertions ran; the
+skip survives only for a developer whose kernel lacks Landlock, which is not a
+regression in this code.
+
+**Shipped — the Windows leg, and the entry below it predicted the cost correctly while
+predicting the outcome wrongly.** `sandbox_windows.rs`. An **AppContainer** is the
+filesystem and network boundary, so a run that gets one reports `Isolation::OsSandboxed`
+like Seatbelt and Landlock do, and `sandbox_enforcement()` answers `OsEnforced`. A job
+object underneath it bounds the process tree, its memory and its window-station reach; a
+machine that can create a job but not a container degrades to `ProcessContained`, and one
+that can create neither to `ProcessOnly`. Three answers from two mechanisms, probed rather
+than read off the target triple, because group policy can refuse either.
+
+**The filesystem boundary inverts the other two platforms' shape and is stronger for it.**
+An AppContainer process can reach an object only if its DACL grants that container's SID or
+`ALL APPLICATION PACKAGES`, so the grant is a single ACE on the sandbox root and nothing
+else. `build_seatbelt_profile` and `sandbox_linux` have to *enumerate* readable system roots
+and keep that list correct per distribution; here the user's home, the real workspace and
+every other user file are denied because nothing granted them, not because a list remembered
+to leave them out.
+
+**Every cost this entry named was real, and paid rather than avoided.** It said
+AppContainer needs `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` through a process attribute
+list, that `spawn_with_attributes` is nightly-only, and that reaching it means hand-rolled
+FFI re-implementing the UTF-16 environment block, three pipe pairs with concurrent draining,
+`kill_on_drop` and the timeout path — "several hundred lines of unsafe on a security
+boundary". That is exactly what the module is: it owns `CreateProcessW` and rebuilds what
+`tokio::process` was doing. Two of its own findings are the ones that entry could not have
+had: the parent's copies of the child's pipe *write* ends must close the moment the child
+holds its own, or every run blocks until its timeout instead of until the command finishes;
+and the timeout kills through `TerminateJobObject` rather than the process, so it takes the
+whole tree.
+
+**Its two warnings for whoever picked it up were both correct.** Loopback does not port:
+Windows blocks it from an AppContainer unless the container SID holds a machine-wide
+`CheckNetIsolation` exemption, which is an admin-level setting this app has no business
+writing. So a network-allowed run on Windows reaches a public address but not `127.0.0.1`,
+where macOS and Linux reach both — stricter than those, never looser, so it cannot turn a
+denied run into an allowed one, and it is documented at the module rather than discovered.
+
+**Shipped — a real Windows bug the parity work found, and the parity test itself
+pulled back out.**
+
+The assertion was written, run on CI, and found something before it could pass:
+`execute_in_sandbox` canonicalizes every path it resolves, and on Windows
+`fs::canonicalize` returns a verbatim `\\?\` path. **cmd.exe cannot use one, and
+does not say so loudly** — handed one as a working directory it prints "UNC paths
+are not supported. Defaulting to Windows directory." on stderr and runs anyway,
+in `C:\Windows`. So every sandboxed run on Windows executed with the wrong
+working directory and a `HOME` and `TMP` it could not write, and the only
+evidence was a line nobody reads. `plain_canonical` strips the prefix at the one
+place every path resolves through, keeping canonicalization itself — it is what
+makes the `starts_with(&sandbox_root)` containment checks sound — and leaving a
+true UNC share alone rather than turning it into a relative path that names
+nothing.
+
+**The parity test is not in this change, and the reason is worth recording.** It
+took four CI rounds to get that far, because there is no Windows toolchain on the
+machine it was written on — not even a cross-compile check — so every iteration
+costs a full remote run and it was blocking two unrelated, verified items from
+landing. It is a good test: it earned its keep twice over on the run that found
+the bug above. It needs a machine that can run it, and it will land when it has
+one.
+
+**The privilege warning this entry left, resolved.** It said a hosted runner's
+account is an administrator, so CI is the privileged case. That is right for a
+capability check and backwards for this one: an AppContainer's filesystem check
+is against the container SID's ACE, not the user's group membership, so a
+process holding an administrator token *inside* a container still cannot read a
+directory that grants the container nothing. "Denied while running as an
+administrator" implies denied for a standard user, not the reverse.
+
+Also unbuilt on Linux: user namespaces. `unshare(CLONE_NEWNET)` needs `CLONE_NEWUSER` first
+for an unprivileged process, which changes uid semantics and is disabled outright in many
+container and CI environments, so seccomp on socket creation was taken instead. Landlock plus
+that filter covers what the acceptance asks of the Linux leg; namespaces would add a stronger
+network boundary and a mount view, and the latter is K10's business rather than this item's.
+
+**The two caveats that outlived the platform work, and are now the whole of this item.**
+Both were true when the sandbox was macOS-only and are unchanged by having three legs:
+
+- **The sandbox is still opt-in, with exactly one non-test caller.** `execute_in_sandbox` is
+  reached only from `sandbox_run`, behind the Sandbox panel and `probeGeneratedMcpArtifact`.
+  Kernel-enforced confinement on every desktop platform describes one *feature*, not how
+  agent tools run.
+- **The agent's own shell tool is not routed through it on any platform**, and has no
+  `env_clear()` — it spawns `sh -c` / `cmd /C` with the workspace as cwd, inheriting whatever
+  launched the app. The tempting framing is "it leaks secrets", and that overstates it: there
+  is no production `std::env::set_var` anywhere in the crate and no provider key is injected
+  into any child's environment, so what a tool call inherits is close to nothing from Finder
+  and a developer's own exports from a terminal.
+
+  This is not a one-line fix because the obvious fix is wrong. A blanket `env_clear()` would
+  strip `PATH`, `HOME`, toolchain and proxy variables from every tool call, and an allowlist
+  narrow enough to be safe breaks the same commands — `sandbox.rs`'s `allowlisted_env` can be
+  that strict only because it serves a disposable probe, not the user's real workspace. Nor
+  is pointing the shell tool at `execute_in_sandbox` the answer: the sandbox denies the real
+  workspace by design and the agent's job is to edit it. What tool calls should be allowed to
+  reach is a policy question, and it belongs with K5.
+
+**Blocks:** no longer the platform half of the claim — isolation is kernel-enforced on
+macOS, Linux and Windows. What it still blocks is narrower and stated above: the sandbox is
+opt-in and the agent's shell tool does not go through it, so "enforced by the platform" is
+true of a feature rather than of how agent tools run. K21 concretely: its conformance suite
+must cover the isolation guarantees, and Windows has the mechanism but not yet the shared
+assertion body, so a suite written today could certify two platforms by test and the third
+by argument.
 
 ## K4. Enforced per-process resource limits *(userspace built; platform legs deferred)*
 
@@ -1022,8 +1375,11 @@ finished and its platform half has been re-scoped rather than skipped.
 What is enforced today: kernel-held `setrlimit` bounds on all four app-side spawn
 sites, process-group termination on every timeout, a sampling watchdog over daemon
 jobs that measures memory across the whole process group, a per-kind declared limit
-set, a bounded cap on the shell output that reaches a model, a browser-session
-watchdog, and a wall-clock budget mechanism for the four WebView kinds. A limit kill
+set, a bounded *read* of the shell output that reaches a model — the cap holds the
+app's own heap, not just the returned string — a browser-session
+watchdog plus a recorded process group that survives the app that spawned it, and a
+wall-clock budget for the four WebView kinds that is now set as well as enforced.
+A limit kill
 records as `limit_exceeded` rather than as an indistinguishable cancel, on every
 host.
 
@@ -1436,43 +1792,106 @@ about whether the app can obtain a cgroup; a probe-and-skip test would be green 
 asserting nothing, which reads as coverage. **If wanted, file the transient-scope
 route as its own item with an `Unavailable(reason)` surfaced to the user.**
 
-**Windows job objects — real and CI-testable, but the sharpest asymmetric hazard in
-this item.** `KILL_ON_JOB_CLOSE` makes a dropped guard tear down the whole tree on
-Windows while being a silent no-op on macOS: invisible on the machine the code is
-written on, fatal on the platform that cannot be typechecked there (Homebrew rustc,
-`aarch64-apple-darwin` only). `background_shell.rs` is exactly the wrong-owner case —
-its child is *meant* to outlive the spawning call — so a misplaced guard would kill
-every Windows background shell instantly. It also needs a signature change, since
-`apply` returns `()` while a job handle is an owned resource whose lifetime must span
-the child, plus four call-site changes. **It is not the fill-in-the-no-op the
-acceptance wording implies, and it should be built with CI in the loop from the first
-commit rather than written blind.**
+**Windows job objects — now built for one owner, and still deferred for the rest, which
+is the distinction this entry was written to protect.** K3's Windows sandbox
+(`sandbox_windows.rs`) puts every *sandboxed* run in a job object with
+`JOB_OBJECT_LIMIT_ACTIVE_PROCESS`, `JOB_OBJECT_LIMIT_JOB_MEMORY` and
+`KILL_ON_JOB_CLOSE`, and the committed-memory bound there is strictly better than the
+per-process `setrlimit` unix gets: a tree of small processes cannot add up to an unbounded
+total. That is one caller, chosen because a sandboxed run is exactly the case whose tree
+*should* die with its guard.
+
+**The hazard this entry named is why it stops there.** `KILL_ON_JOB_CLOSE` makes a dropped
+guard tear down the whole tree on Windows while being a silent no-op on macOS: invisible on
+the machine the code is written on, fatal on the platform that cannot be typechecked there
+(Homebrew rustc, `aarch64-apple-darwin` only). `background_shell.rs` is the wrong-owner
+case — its child is *meant* to outlive the spawning call — and it still has no job object,
+deliberately: a misplaced guard would kill every Windows background shell instantly. The
+signature problem is unchanged too, since a job handle is an owned resource whose lifetime
+must span the child. **Extending job objects to the process table's other kinds is still
+not the fill-in-the-no-op the acceptance wording implies**, and the sandbox leg is evidence
+for that rather than against it — it took owning `CreateProcessW` to get there.
 
 ### Still genuinely missing, after the corrections above narrowed the list
 
-- The four WebView kinds' wall budget is **enforced but unset** (see below): the
-  mechanism fires for nobody until a number is configured, and choosing that number
-  is blocked on a precondition, not on effort.
-- The foreground shell's **intermediate heap buffer** is still unbounded even
-  though its returned output is now capped (see below): `wait_with_output`
-  materializes both streams in full before any cap applies, so
-  `sh -c 'cat /dev/urandom | base64'` still gets the whole 120 s timeout to grow
-  the app's own heap. Bounding the read means draining both pipes concurrently
-  with the wait, which is the service `wait_with_output` performs today — get it
-  wrong and a chatty-stderr child deadlocks once the 64 KiB pipe buffer fills,
-  turning a working command into a timeout. Its own slice, not a line to smuggle
-  into the cap.
-- The browser worker's **pid is still not recorded**, so nothing outside the owning
-  process can name its Chromium — a crash still leaves an orphan that a startup
-  sweep can collect the profile of but never kill. `browser_worker.rs` also remains
-  the one app-side spawn site with no `process_group(0)`, so Chromium's renderer and
-  GPU children are exactly the surviving-grandchild case the process-tree slices
-  claim to have closed. The watchdog below reclaims sessions this app still knows
-  about; it does not solve either of these.
-- **No `ProcessKind` for a foreground shell or a browser session**, so neither gets
-  a row and neither's per-call bounds can be declared in the table. Adding a
-  browser kind needs a numbered SQLite migration to relax the `CHECK` on
-  `agent_processes.kind`.
+- ~~The four WebView kinds' wall budget is **enforced but unset**~~ — **closed,
+  and a second defect fell out of closing it.** `ProcessKind::default_limits` now
+  gives `chat_turn`, `subagent`, `crew_member` and `side_task` a six-hour
+  `WEBVIEW_WALL_BUDGET_MS`. One number for four kinds, because they are the same
+  shape of process — a WebView loop issuing an unbounded number of bounded tool
+  calls — and four different numbers would be inventing policy where there is one
+  question: how long may a loop keep *starting new work* before something concludes
+  it is not going to stop.
+
+  The blocking precondition was real and is answered rather than waived: a turn
+  parked on an unanswered permission dialog reads as `Running` and keeps ageing, so
+  a *tight* default would cancel work for the user's own slowness. That is an
+  argument against a tight default, which is why this one is not tight — six hours
+  of an unanswered dialog is a session nobody came back to, not a user reading a
+  prompt. `processWallBudgetEnabled`/`processWallBudgetHours` (1–72 h) make it the
+  user's call, and *off* means the row is admitted with **no** `maxWallMs` rather
+  than one nothing enforces: a flag, not a `maxWallMs: 0`, because the ledger's
+  `CHECK` refuses a non-positive value and a zero read as "unbounded" is the
+  zero-versus-absent overloading this codebase avoids.
+
+  **The second defect:** `process_admit` built its limit set from the arguments
+  alone rather than merging onto the class default, so *every* row admitted over
+  IPC was declared unbounded no matter what its kind said. A class default could
+  therefore have been set at any point and would still have fired for nobody. That
+  also silently cost `background_shell` the output ceiling its class declares. The
+  merge is now one tested function (`merged_limits`), and the setting is applied at
+  `admitProcess` — the single chokepoint all four surfaces already go through — so
+  a fifth WebView surface cannot be admitted unbudgeted by omission.
+- ~~The foreground shell's **intermediate heap buffer**~~ — **closed.** The cap is
+  now applied to the *read* rather than to the returned string. `wait_with_output`
+  materialized both streams in full before any cap applied, so
+  `sh -c 'cat /dev/urandom | base64'` had the whole 120 s timeout to grow the
+  app's own heap while the string it returned was dutifully capped.
+  `capture_bounded` replaces it: `try_join!` over `child.wait()` and one
+  `drain_capped` per pipe, each keeping a `CappedStream` tail of at most
+  `MODEL_OUTPUT_CAP` bytes and dropping off the front as more arrives. Both pipes
+  are still read **to EOF** — an early-returning reader would leave the child
+  blocked on a full pipe, turning a noisy command into a timeout, which is the
+  same failure the sequential version has from the other direction. The
+  chatty-stderr deadlock this bullet warned about is the test that guards it:
+  `a_child_that_floods_both_pipes_still_exits_and_is_held_to_the_cap` runs a real
+  child pushing ~200 KiB down each pipe interleaved, far past the 64 KiB buffer,
+  and asserts both the exit code and the ceiling. Front-dropping widens forward to
+  a UTF-8 boundary, so a split codepoint is dropped whole rather than decoded to
+  U+FFFD — the behaviour `cap_tail` had when it worked on a finished `String`.
+  `full_output` still returns the whole document, unbounded and deliberately so:
+  `securityAutofix.ts` `JSON.parse`s it, where a truncated tail reads as zero
+  vulnerabilities.
+- ~~The browser worker's **pid is still not recorded**~~ — **closed, with the
+  migration this bullet said it needed.** `browser_worker.rs` was the last
+  app-side spawn site without `process_group(0)`; it has one now, so a session's
+  pid names its whole Chromium tree rather than one process out of a fan-out of
+  renderer, GPU, network and utility children. That pid is written to
+  `agent_processes.native_pid` under a new `browser_session` kind, and it is the
+  only durable handle anything has on that tree: a *later* app process can read
+  it and kill what this one left behind.
+  `reclaim_orphaned_browser_sessions` is that path, and it runs at startup
+  **before** the reap, because the reap is what erases the evidence. Pid reuse is
+  bounded rather than solved — the signal goes to a group, so a recycled pid that
+  leads no group fails with `ESRCH`, and the row is consulted once and closed
+  immediately after, so a given pid is signalled at most once ever. Narrowing it
+  further needs a process start time, which has no portable source here; the same
+  limit `os_signal::process_is_alive` already records. The proof is a real
+  process group in the test: a `sh` that forks a grandchild, whose survival is the
+  whole point — a per-pid kill leaves it running.
+- **No `ProcessKind` for a foreground shell**, so it gets no row and its per-call
+  bounds cannot be declared in the table. ~~or a browser session~~ — the browser
+  half is done: `MIGRATION_V18` rebuilds `agent_processes` to widen the `CHECK` on
+  `kind` (SQLite has no `ALTER TABLE … DROP CONSTRAINT`, so the twelve-step
+  rebuild is the only correct route, and `PRAGMA writable_schema` was rejected as
+  a schema edit with no validation on the table holding every process this app has
+  run). It is the ladder's first `RequiresThisVersion` since V13, and deliberately
+  so: a V17 binary's `ProcessKind::parse` rejects a kind it does not know, so it
+  cannot read past these rows and an `Additive` claim would be a promise it could
+  not keep. `browser_session` is also the second kind — and the only desktop one —
+  with an *enforced* class wall bound, declaring the `max_session_ms` the
+  browser watchdog already sweeps on rather than inventing a second ceiling.
+
 - **Two acceptance resources are unachievable as written** and the criteria should
   be amended rather than left standing: "open files" has no Windows job-object
   equivalent, so it is permanently unix-only; and "disk written" cannot come from
@@ -2378,6 +2797,100 @@ allowlist would need a context-propagation layer this app does not have. That la
 now **D3**, its own item, because K6's per-process resource ledger turns out to need
 the same thing — two dependents make it a prerequisite rather than a footnote here.
 
+*Superseded by the entry below.* D3 shipped that layer — `run_scope.rs` is a real
+`tokio::task_local!` and `egress::send` is a real choke point — so the premise of this
+correction ("a run id can only reach an egress site as an explicit parameter") no
+longer holds. What stays true is every *other* observation in it, and each is now a
+documented limit of the allowlist rather than a reason not to build one:
+`browser_worker.rs` still makes its own subresource decisions outside `send`, `mcp.rs`
+still shares one transport across runs, and run-less egress is still permitted rather
+than refused.
+
+**Shipped — the run's own host/port/protocol allowlist, frozen at submission and
+enforced where every request converges.** `PermissionPolicySnapshot` carries an
+`Option<EgressAllowlist>`; `egress::send` reads the ambient run from `run_scope`,
+loads that run's frozen list and refuses a host, port or protocol it does not name.
+
+- **Absent, empty and present are three states, and that distinction is the whole
+  safety property.** *Absent* is what every run row already on disk says, and it means
+  today's behaviour — `allow_network` alone governs. Reading those rows as deny-all
+  would have refused every existing and in-flight run. *Present and empty* is a
+  declaration that permits nothing, so a submitter has a way to say "this run sends
+  nothing" that is not spelled the same way as saying nothing. *Present and populated*
+  is deny-by-default within it, on all three dimensions conjunctively. Making a
+  declaration mandatory is a later release's job — the staged shape D1 used for token
+  families — because the alternative is rewriting frozen specs, and they are frozen for
+  a reason.
+- **`serde(default)` is only half of the compatibility property; `skip_serializing_if`
+  is the other half.** `run_ledger` compares the serialized spec byte-for-byte to
+  decide whether a resubmission is the same run, so emitting `"egress_allowlist":null`
+  would have turned every idempotent resubmit of an existing run into a conflict. The
+  test that pins this is a **verbatim JSON string**, not a `json!` fixture: a fixture
+  built from this build's own idea of the shape would keep passing after a change that
+  broke every stored row.
+- **A wildcard host entry matches at a label boundary or not at all.**
+  `*.example.com` covers `api.example.com`, does not cover `example.com` (the apex is
+  named in its own right), and does not cover `evil-example.com` — the classic
+  `ends_with` bypass, which `http_route_registry`'s `ExactOrDescendant` already had the
+  shape for.
+- **Fail-closed and fail-open are split deliberately, and the split is per absence.**
+  No run in scope, or a run whose spec declares nothing, behaves exactly as before —
+  scheduled knowledge refresh, connector verification and model downloads legitimately
+  have no run, and refusing them would be the clause disabling features rather than
+  protecting anything. A run whose frozen policy **cannot be read** is refused: the
+  spec lives in the same ledger the run appends its events to, so a run that cannot
+  read its own spec cannot record anything either, and refusing its egress is a symptom
+  of that failure rather than a new one. A run id the ledger has never heard of is
+  *permitted*, because `browser_worker` and `m4_runtime` both scope work under ids that
+  are not ledger runs.
+- **No ledger read on the hot path.** The frozen spec is immutable — written once, no
+  update path — so it is cached per run behind the same process-wide-install pattern
+  `denial_sink` uses, bounded at 256 runs and cleared wholesale at the bound. Dropping
+  a cache entry costs one re-read and cannot widen a policy. Loopback is checked
+  *before* the read, so a local-inference run never reads a row to be told what it may
+  do on its own machine.
+- **The refusal is a `reqwest::Error` carrying the denial, and that took a trick worth
+  writing down.** `reqwest::Error` has no public constructor, so a refusal reaches the
+  caller the one way reqwest will carry someone else's error: a throwaway request
+  through a `dns_resolver` that refuses, aimed at a reserved `.invalid` name with
+  `.no_proxy()` set. Nothing leaves the process, and the rule survives to the far side
+  as itself rather than as a sentence — same property the redirect policy's refusals
+  already had.
+- **The check runs on the redirect hop too**, and not out of symmetry: `hardened`'s
+  policy deliberately follows an `http` → `https` upgrade on the same authority, and
+  that changes the effective port from 80 to 443, so a hop can otherwise reach a
+  protocol and a port the original request never asked for.
+
+**Shipped — DNS answers are pinned for the run's lifetime.** `hardened()` now installs
+a resolver that resolves an allowed name once per run and returns the same addresses
+afterwards, so the address the connection uses is the address the check passed.
+
+- **Check-equals-connect, not check-then-cache.** The pin *is* the answer reqwest
+  connects to, not a value compared against a later lookup, so there is no second
+  resolution left for a rebinding attacker to race. Proven by a test that makes two
+  real connections through a resolver which answers with a live fixture once and with
+  `240.0.0.1` every time after: the second request reaches the fixture, the fixture
+  accepted two connections, and the counter-test with no run in scope shows the same
+  rebind being followed. Sabotage-verified in both directions — deleting the pin lookup
+  fails with `tcp connect error, 240.0.0.1`.
+- **A pin binds an address, not an endpoint.** reqwest replaces a resolved address's
+  port with the URL's own (its `Resolve` doc says so), which is also why the rebinding
+  test has to move the *address* rather than the port.
+- **The cost is real and is the point.** A long run against a rotating CDN keeps the
+  address it first saw; if that address is withdrawn mid-run the run's requests fail
+  rather than following the rotation, and the fix is a new run, since nothing outlives
+  one. Two further honest limits: a **pooled** connection is not re-resolved at all, so
+  a request reusing another run's connection travels to that run's pin (both runs had
+  to allow the same host, and the address was a pinned answer for it either way); and
+  the pin table is bounded at 512 and cleared wholesale, so a dropped pin reopens the
+  window for that name until it is re-pinned.
+- **Four new rule codes and no migration.** `egress.run-host-not-allowlisted`,
+  `egress.run-port-not-allowlisted`, `egress.run-protocol-not-allowlisted` and
+  `egress.run-policy-unavailable` are new *data* in `denial_sink`'s existing
+  `rule_code` column, not a new fact about a denial — the ladder is for the latter,
+  which is what V2's `unattributed_reason` was. A column per rule family would buy
+  nothing and cost the one-way-door problem that file exists to avoid.
+
 **Shipped — every blocked attempt is written down with the rule that blocked it.**
 `denial_sink.rs` is an append-only store in its **own database file**
 (`egress-denials-v1.sqlite3`), written at the raise site by all four guards.
@@ -2448,6 +2961,98 @@ second Rust bypass of the Privacy Firewall, which no longer follows from the cli
 being bare: hardened defaults decide *where* a request may go, and say nothing about
 what is in its body.
 
+**Shipped — the ledger now records where *allowed* egress went, not only what was
+refused.** `denial_sink` answers "what was blocked and by which rule" and V8's
+`bytes_egressed` answers "how much got out". Neither answered **where**, so a run
+that was never denied anything left no record of its network activity at all —
+the half `denial_sink`'s own module doc names as still missing. Migration V14
+adds `egress_destinations`, keyed `(process_id, scheme, host, port)`, written
+from `egress::send`.
+
+- **The first migration to spend what V13 bought.** V14 is declared `Additive`,
+  so it does not raise the reader floor: a V13 binary opens a V14 database
+  unchanged and its writes stay correct, because `add_egress_bytes` touches
+  neither the new table nor the new column. Before V13 this table would have been
+  a one-way door for the whole run history, which is precisely why the equivalent
+  observability table went into a separate file instead.
+- **A counter table, and it does not claim to be tamper-evident.** Deliberately
+  not part of V9's or V12's hash chains. `requests` is incremented in place,
+  because the alternative — one immutable row per request — is a per-request
+  append to a serialized chain for the highest-frequency thing this app does. A
+  summary keyed by destination is bounded by how many distinct places a process
+  talked to, which does not grow with how much it said. The chained streams keep
+  their job: a decision (V11) and a subsystem action (V12) are events and are
+  chained; this is an aggregate beside them.
+- **Recorded at the choke point, after the guard.** One line in `egress::send`,
+  which every outbound request in the crate already passes through for byte
+  counting and the allowlist check. Placed after `check_run_allowlist` so it
+  records what was *allowed* and never doubles up with `denial_sink`; placed
+  before the send, because a request that was permitted and then failed to
+  connect still reached for that host. Both halves are pinned by one test.
+- **Accumulated in the scope, not written per request.** The destination log
+  rides on `ProcessScope` beside the byte counter and drains through the same
+  `drain_egress` the bytes already use. A lock is affordable here where the byte
+  counter could not afford one, and the reason is the rate: a body delivers
+  thousands of frames, but it is one request.
+- **The cap is counted, not silent.** `run_scope::MAX_DESTINATIONS` is 128 —
+  far above any ordinary run, and needed because a run that declares no allowlist
+  can be walked across arbitrarily many hosts by the content it fetches, so "one
+  row per distinct destination" is unbounded in the case that matters. Requests
+  past the cap land in `agent_processes.egress_destinations_dropped` and the panel
+  says so, for the same reason a partial total is never shown without its
+  coverage.
+- **A failed flush loses nothing and double-counts nothing.** The write is one
+  transaction, so a half-landed flush cannot happen; on failure the drain goes
+  back to the scope and is summed with whatever arrived meanwhile.
+- **Read all the way to the surface.** `process_usage_ledger` returns the
+  destinations for the page of processes it already selected — one batched query,
+  not one per row — and the Resource Ledger panel renders them per process. A
+  process the ledger recorded nothing for renders nothing at all, rather than an
+  empty list: "reached nowhere" and "this build recorded nothing" are the same
+  absence here, and an empty list on screen would claim the first.
+
+**Shipped — unattributed egress now names its destinations.** This was the last
+split in the record: an unattributed byte had a *reason* to be charged to and no
+row to hang a destination list off, so "which hosts does the app itself reach
+outside a run" had no answer at all. It is answered by the upgrade path this entry
+named — a bounded global map behind the same cap — and it lands in the *same*
+table the attributed case writes to, because "which hosts did this app reach" is
+one question and splitting its answer by whether a run happened to be in scope
+would make every reader join twice to ask it.
+
+- **The vocabulary is the existing one, not a second one.** Rows are keyed by
+  `Unattributed::code()` — the same strings `UNATTRIBUTED_EGRESS`'s tallies
+  already carry — plus `egress.no-scope` and `egress.run-without-process`, the two
+  cases that enum does not cover. A test pins the two label lists as equal and in
+  the same order, so correlating "how much left under this reason" with "where it
+  went" is a match rather than a guess.
+- **The lock this entry worried about is real and is paid on the right path.**
+  Volume is counted per body *frame* — an SSE stream calls it thousands of times —
+  so `UNATTRIBUTED_EGRESS` stays a lock-free array of atomics. A destination is
+  noted once per *request*, beside a DNS lookup and a TLS handshake, and the map
+  is bounded at the same `MAX_DESTINATIONS` a process gets, so the critical
+  section is a probe over at most 128 entries. The split is deliberate: volume
+  stays lock-free, destinations pay a lock they can afford.
+- **Migration V19 relaxes rather than adds**, and is `Additive` on that basis:
+  `egress_destinations.process_id` becomes nullable beside a new
+  `unattributed_reason`, under a `CHECK` that exactly one is present — "neither"
+  is a destination charged to nothing, which is the failure this item is about,
+  and "both" is a row two readers would each count once. The primary key becomes a
+  unique index over `COALESCE`d attribution columns, because SQLite permits NULLs
+  in a non-`INTEGER` primary key and the old key would have silently stopped
+  deduplicating. A V18 binary reads exactly the attributed rows it always did.
+- **The overflow count gets its own small table** rather than a sentinel row,
+  which V14's own note rejects: the attributed count lives on `agent_processes`
+  because it is a property of that process, and an unattributed overflow has no
+  process. A reason that overflowed while naming nothing is still reported —
+  the case a reader would most easily mistake for "reached nowhere".
+- **It needs a drain of its own**, on a 30-second tick, because unattributed
+  traffic has no lifetime to ride: piggy-backing on a run's drain would mean an app
+  that only ever made unattributed requests — a `monkey` invocation, an update
+  check — wrote no destinations at all, which is the gap itself. Fail-soft with
+  return-on-failure like every other drain here, and a returned drain past the cap
+  becomes overflow rather than breaching it.
+
 **Blocks:** K17 — placing a run on a remote node is only safe if the run's
 egress travels with it.
 
@@ -2458,7 +3063,13 @@ egress travels with it.
 Measure first, then arbitrate. Building the scheduler before K6 produces a
 scheduler that optimizes numbers nobody measured.
 
-## K6. Measured resource accounting
+That ordering was followed and it paid: K8's fair-share reads `cpu_time_ms` out of
+K6's ledger, and K7's admission refuses to report an unmeasured footprint as
+fitting. The one thing that would have gone unnoticed without measuring first is
+recorded under K6 — a CPU reading that was wrong by 42× on Apple Silicon and
+exactly right on Intel.
+
+## K6. Measured resource accounting *(built)*
 
 **Today:** the Telemetry tab captures real per-load and per-request traces —
 load timing, memory/VRAM headroom, offload placement, sampler stats, token
@@ -2474,11 +3085,181 @@ with wall time, CPU time, peak RSS, GPU-resident bytes and device-seconds
 where the runtime reports them, bytes read/written, bytes egressed, and tokens
 in/out — each field either measured or marked `unavailable`, never inferred.
 
-**Blocks:** K7, K8. Also the honesty of every claim Phase 2 makes.
+**Shipped — (b), the ledger. The load-bearing clause is "never inferred", and it
+is enforced in three places rather than asserted once.** `process_usage.rs` samples
+a live pid: `proc_pid_rusage` with `RUSAGE_INFO_V4` on macOS, `/proc/<pid>/{stat,
+status,io}` on Linux, `GetProcessTimes` on Windows. Migration V8 adds nine nullable
+columns to `agent_processes` plus `usage_unavailable_json`, where **NULL means
+unavailable and every NULL carries the reason it is NULL**. `ProcessUsage::new`
+refuses to construct a value whose `None` field has no note; a SQL trigger,
+`agent_processes_close_out_states_its_gaps`, aborts any transition to `exited`
+whose reasons column is NULL, so the invariant survives a direct-SQL writer that
+never goes through Rust. Close-out is derived inside `ProcessTable::transition` —
+the one UPDATE every terminal path already funnels through — so its signature is
+unchanged and no caller, reaper, or test had to learn the ledger exists.
+
+**The interesting correction is one only measuring could have found.**
+`ri_user_time` and `ri_system_time` are **mach absolute time units, not
+nanoseconds**. Dividing by 1,000,000 under-reported CPU by ~42× on Apple Silicon
+— and would have been exactly *correct* on Intel, where the timebase is 1/1. That
+is the shape of error that survives review forever: plausible, documented-looking,
+and right on the machine the reviewer happens to own. A `mach_timebase_info`
+conversion fixed it; a 1168ms busy loop now reads 1156ms against 1157ms wall, and
+a regression test bounds the reading below by wall/4 and above by wall × cores, so
+it cannot flake in a parallel test binary.
+
+**Bytes egressed was the one field with no measurement code anywhere in the tree,
+and it needed new plumbing rather than a new reader.** `egress::Counted<B>` is a
+frame-by-frame `http_body::Body` passthrough — it forwards the frame, adds
+`data.remaining()`, retains nothing, and forwards `size_hint`/`is_end_stream` so
+nothing downstream can tell it is there. That property is load-bearing: buffering
+to count would break SSE and blow memory on a multi-GB model pull, so a test
+proves the first frame arrives before the last one is produced. **Unit: HTTP
+entity-body bytes as they crossed the socket, undecoded** — a property of this
+crate's build (none of reqwest's decompression features are enabled), documented
+at `egress::send` including the warning that enabling one silently changes the
+number's meaning. Adopted at 79 call sites. The connector was tried first and
+cannot work: `connector_layer` must return reqwest's `Conn`, a private type that
+cannot be constructed or unwrapped.
+
+Attribution needed a **process** identity where `run_scope.rs` only had a run id.
+`ProcessScope` now rides the same `tokio::task_local!` — the D3 primitive, kept for
+the D3 reason — and `run_commands::scoped_with_egress` drains it into
+`add_egress_bytes` every 5s and at teardown, so a long run's bytes are neither
+invisible until it ends nor lost if it is killed. A run with no row, or several
+rows claiming one run, falls back to a named unattributed tally rather than
+guessing; bytes are never dropped and never charged to a bystander.
+
+**What is honestly unavailable, and stays that way.** GPU-resident bytes and
+device-seconds: nothing in this tree measures per-process GPU residency, so both
+columns record that reason and invent no number. Peak RSS and disk I/O on Windows:
+the windows-sys feature modules this crate enables do not cover them. Tokens for
+`subagent`, `side_task` and the m4 workflow kinds: `agent_processes.run_id` is NULL
+for those kinds *by design*, so a token count sourced from the run's event stream
+is structurally unavailable — an honest gap, not a bug to paper over. The `mcp.rs`
+rmcp transport owns its own client inside spawned workers and never surfaces a
+`RequestBuilder`, so it is the one place a count is genuinely *missing* rather than
+merely unattributed.
+
+`ResourceLedgerPanel` surfaces it, and the render path is a tagged union: an
+unmeasured field has no `.text` to read, so the only compilable branch is the one
+that prints the backend's reason. Totals report how many rows could not
+contribute. No chart — a zero-height bar cannot say "unknown" rather than "idle",
+which is the exact lie the item exists to prevent.
+
+**Shipped — (a), the benchmark surface. `benchmark.rs` measures a real streamed
+generation, and the constraint that shaped every decision is ROADMAP #2's own
+sentence: "no number is displayed that was not measured on the machine displaying
+it."**
+
+- **Time-to-first-token did not exist anywhere in the tree**, and could not have,
+  because the only in-process generation path the hub exposed for this
+  (`M3InferenceEngine::complete`) rejects `stream: true`. It is measured now by a
+  third canonical-sink decorator alongside `ProtocolEncodingSink` and
+  `MlxCanonicalSink` — forward, observe, retain nothing — stamping one `Instant`
+  on the **first non-empty `TextDelta`**. Not `ResponseStart`, which a runtime may
+  emit before doing any prefill work, and not `TextStart`, which announces a
+  content block rather than content.
+- **The existing `tokensPerSecond` is a different quantity wearing the same name.**
+  `runtime_telemetry.rs` computes `output_tokens / total_wall_time`, prefill
+  included, so it is an end-to-end rate rather than a decode rate. The benchmark
+  reports decode throughput over the window that opens at the first token, and its
+  numerator is `output_tokens - 1`: the first token's cost is already reported as
+  time-to-first-token, and charging it to the decode window counts it twice. At a
+  128-token budget that is a ~0.8% overstatement — the size of error that survives
+  review forever.
+- **The traces' clock could not carry a benchmark.** Durations came from the
+  frontend's `Date.now()` across the IPC boundary, so they included IPC and JSON
+  cost and could go *backwards* under an NTP adjustment, which `saturating_sub`
+  then rendered as `0`. Everything here is `Instant`, which is monotonic.
+- **Peak memory needed a distinction, not a reading.** `process_usage::sample`
+  reports the process *lifetime* high-water mark, which is right for a process the
+  ledger owns end to end and wrong here: a model server resident for an hour
+  already carries a peak somebody else's request set. The mark is read before and
+  after, and `run_peak_bytes` is populated **only when it rose** — the one case
+  where this run is what set it. Otherwise the lifetime mark is reported as an
+  upper bound with that stated, because collapsing the two would attribute an
+  earlier request's memory to the benchmark.
+- **Variance is the sample standard deviation, and it is `None` for one repeat
+  rather than `0.0`** — one observation has no spread, and zero reads as
+  "perfectly repeatable". The first repeat is discarded as warm-up, since a cold
+  request pays to load the weights and charging that to time-to-first-token
+  reports load time as prefill.
+- **Two refusals rather than two weak numbers.** A request under 32 output tokens
+  or under 2 repeats is rejected, not clamped — clamping would return a report
+  whose `maxOutputTokens` disagreed with what was asked. And a model the runtime
+  inventory marks `is_cloud` is refused outright: timing it measures a network
+  round trip to hardware the user does not own, which is precisely what the
+  acceptance clause rules out.
+
+**An honest gap that is worth naming rather than papering over.** The acceptance
+asks for a **model + runtime + quantization** triple, and this tree can identify
+two-thirds of it. No runtime here reports a quantization *scheme* for a loaded
+model — the inventory carries only `is_cloud`, and a GGUF's own
+`general.quantization_version` is a **format version ("2"), not a scheme
+("Q4_K_M")**, which is exactly the misreading a caller would make of it. So
+`quantization` is `None` with that reason attached, rather than sniffed out of a
+filename.
+
+**Prior art was audited and deliberately not salvaged.** An abandoned branch
+(`codex/model-benchmark-advisor`, 1977 lines, never merged) had built this surface
+in TypeScript against Ollama's HTTP API. It measures one of the four required
+numbers, and the reasons it cannot be repaired in place are structural rather than
+stylistic: every request sets `stream: false`, so TTFT is unobservable by
+construction; nothing samples any process, so its "memory analysis" compares the
+model's *on-disk file size* to RAM; each task runs exactly once, so variance is not
+merely missing but impossible without changing its result types; and being
+Ollama-only it cannot express the runtime axis at all. It also displayed cloud
+models' tokens/sec unlabelled, and rendered a failed task's fabricated
+`tokensPerSecond: 0` as "0.0 tok/s", indistinguishable from a genuine measurement
+of a very slow model. Two of its files carry comments claiming a sibling test
+"proves — mechanically, not just by convention" a property; neither test file was
+ever written.
+
+**Then shipped — the measurement now survives the session that produced it, and
+the prose stops deferring.** A benchmark that is measured and thrown away cannot
+inform anything, and that is what the surface did: the report lived in React
+component state and was gone on unmount, so `runtimeEdgeProfiles.ts`'s seven
+deferrals to "the local benchmark" stayed unanswerable no matter how many times
+you ran one.
+
+- Each report is persisted to `benchmarks.json` under the app data dir, the same
+  file-per-feature pattern as `web_settings.json`. **Not** a ledger table: a
+  benchmark measures *this machine*, not a run, and hanging it off the ledger's
+  run-shaped schema is the category error `permission_decisions` had to work
+  around.
+- **Stored with the machine it ran on, and that is what makes showing it safe.**
+  A whole `HardwareSnapshot` cannot be compared — `captured_at_ms` and
+  `available_ram_bytes` move second to second, so equality on it would call every
+  stored report stale a moment after writing it. `MachineIdentity` is the stable
+  part: OS, arch, fitted RAM, logical CPUs, sorted accelerator names. Deliberately
+  not `supported_runtimes`, which is derived from OS/arch and would invalidate
+  every report the day a build learns a new runtime, for no physical reason.
+- `BenchmarkFreshness` is a tagged union for the reason `ChainVerification` is
+  one: a caller cannot read the differences off a report measured elsewhere and
+  still render its numbers. The panel shows *what changed* instead of numbers,
+  and the edge profile ignores the entry entirely.
+- Re-running a model on a runtime **replaces** that pair's entry rather than
+  appending. Two reports for one pair differ only by when they ran, and keeping
+  both invites a reader to treat them as a time series they were never meant to
+  be. Capped at 32.
+- The edge profile now *appends* the measurement to its own prose rather than
+  replacing it — the caveat about context length and concurrency is still true,
+  and the measurement adds evidence rather than overriding advice it does not
+  cover. It reports the fastest measured pair, since the question that line
+  answers is what this machine is capable of.
+
+**Remaining.** Cost still comes from typed rates, which is ROADMAP #4's item rather
+than this one. The eight profiles' *other* fields — recommended model class,
+context tokens, process slots — are still hardcoded prose; only the throughput
+line reads a measurement.
+
+**Blocks:** nothing now. K7 and K8 both shipped on top of it, and K8's fair-share
+reads `cpu_time_ms` out of this ledger rather than deriving a number of its own.
 
 *Maps to: ROADMAP #2.*
 
-## K7. Resource-aware admission control
+## K7. Resource-aware admission control *(built)*
 
 **Today:** the daemon admits work by a fixed integer concurrency
 (`DEFAULT_CONCURRENCY: u32 = 4`, clamped 1–32) ordered by
@@ -2494,10 +3275,54 @@ alongside what is already resident. Reservations are released on exit,
 including on crash. A process that can never fit on this machine is rejected
 at enqueue with the specific shortfall, not started and killed later.
 
-**Blocks:** K8 — a scheduler is admission plus arbitration; this is the half
-that can ship first and independently.
+**Shipped — `daemon/admission.rs` (pure) with the I/O in `engine.rs`.** `fit`
+returns `Fits` / `Hold{resource, shortfall}` / `Never{resource, shortfall}`, both
+refusals naming which resource fell short and by how much, and both propagating
+into the log line and the ledger rejection reason. `installed_model_footprint(app_data_dir,
+model_id) -> M3ModelFootprint::{Known, Unknown}` is the public model-id→footprint
+function that did not previously exist anywhere — `evaluate_hardware_fit` was
+private and took a catalog record rather than an id.
 
-## K8. A real scheduler
+**Four things the first cut got wrong, each worth recording:**
+
+- **It was inert on the CLI path.** `snapshot_target` hardcoded
+  `estimated_memory_bytes: None`, so `reservation_bytes` was 0 and every job from
+  `monkey daemon queue <recipe>` short-circuited to `Fits` — the feature was live,
+  tested, and did nothing for one of its two producers. The CLI path now freezes a
+  real footprint. **An unknown footprint is a third case, `Unmeasured`, not zero**:
+  such a job is started (refusing every unmeasured model would refuse every
+  pre-estimate spec) but reserves nothing and is *never reported as fitting*, so the
+  tick's bound is recorded as taken on faith rather than laundered into a measurement.
+- **It was RAM-only.** The fit now plans with `LocalOffloadPlanner::plan` and splits
+  the model's two estimates along the planned placement. The subtlety is that it
+  plans against an **idle** machine on purpose: the planner's job is to make anything
+  fit by spilling, so planning against current load answers "fits" at every load
+  level and the accelerator leg could never hold. Metal and CPU take no VRAM leg at
+  all — unified memory charged twice would cap every Mac at half its capacity.
+- **Two jobs on one model each paid full price.** Reservations are keyed by
+  `ModelTargetSnapshot::target_id()` and totalled with a SQL `GROUP BY`, so N turns
+  against one local model — the common case — are charged once, and the
+  release-on-last-holder rule falls out of the grouping instead of needing its own
+  bookkeeping.
+- **Reservations lived in a `HashMap` that died with the daemon process.** Harmless
+  by accident while nothing else read them, load-bearing the moment anything did.
+  They are now durable in `daemon_jobs`, released in `finish_active` *and*
+  `reconcile_interrupted` (the crash funnel: dead child, lapsed lease, restarted
+  daemon), and swept in `recover`. This required giving the daemon db the migration
+  framework `engine.rs` had already flagged as debt, mirroring `denial_sink.rs`'s
+  `(version, checksum, sql)` ladder.
+
+A held job reports **why** in a dedicated `hold_reason` column rather than a new
+`JobState` variant — `process_state_for` already maps `Queued → ProcessState::Admitted`,
+so the unified process table reported the roadmap's `admitted` correctly all along,
+and a state name cannot answer the question an operator actually has ("why, and by
+how much"). Not `last_error`: `transition` writes that with `COALESCE`, so a hold
+parked there would still be present when the job later succeeded and would read back
+as that success's exit reason.
+
+**Blocks:** nothing now.
+
+## K8. A real scheduler *(built)*
 
 **Today:** priority-ordered FIFO with a fixed worker count. No preemption, no
 fair-share, no starvation guarantee, no distinction between an interactive
@@ -2514,19 +3339,278 @@ delay is stated and testable; and a backpressure signal every producer
 decision is inspectable after the fact: which process was chosen, what it was
 chosen over, and which measurement decided it.
 
-**Blocks:** the claim. This is the single largest gap between "agent runtime"
-and "agent OS".
+**Shipped — `daemon/scheduler.rs`, pure, with the I/O in `engine.rs`.** Arbitration
+is six ordered keys: effective class (interactive → batch → background →
+maintenance, promoted one level per aging interval spent queued), then aging steps
+descending, then fair-share deficit, then declared priority, then queue age, then
+job id so the order is total and two ticks never disagree. The engine walks that
+order and admits what fits, *holding* rather than stopping at what does not — so
+the ranking decides who gets first refusal, never who is allowed to be considered.
 
-## K9. Dispatch policy (model routing)
+Class comes from the run's frozen `RunKind`, **not from `priority`** — otherwise
+`--priority 9` becomes a self-service interactive badge. A desktop turn is
+interactive because `task.rs` already writes `RunKind::Interactive`; a
+`monkey daemon run <recipe>` is `Workflow`, i.e. batch. Priority cannot promote a
+class; a negative priority may demote one.
 
-**Today:** one hardcoded fallback toggle; provider failover follows a fixed
-sequence.
+**Starvation bound, stated and tested:**
+`T_head = (CLASS_COUNT − 1) × AGING_INTERVAL_MS` = 3 minutes, and
+`delay_until_dispatch ≤ T_head + max(max_runtime_ms of the running jobs)`. Rank key
+two is what makes it a bound rather than a hope: after three promotions a
+maintenance job is at the head and **no later arrival can overtake it**. The
+dispatch term is deliberately not tightened — a free slot is still needed, and that
+wait is bounded only by the watchdog's own ceiling. What the bound guarantees is
+that the wait stops depending on what arrives after the job did. The test asserts
+*not* first at `T_head − 1`, first at `T_head` against 32 interactive arrivals, and
+still first after ten more intervals of fresh ones.
+
+**Fair-share reads K6's measurements rather than deriving its own** —
+`usage_totals(workspace).cpu_time_ms` over the workspace's 64 most recent
+processes, compared in 30s buckets so a 1ms difference does not reorder. That is
+why K6 came first: one workspace running a single six-hour job is not equal to one
+running 720 short turns, and only a measured number can tell them apart. **Two
+approximations, named rather than hidden:** it is CPU-only, so a job blocked on a
+remote provider is charged almost nothing while holding a slot, and a
+GPU-saturating job is charged only for the CPU feeding it (`gpu_device_ms` exists
+in the ledger but no runtime here reports it — the upgrade is purely additive); and
+it ranks across workspaces only, because a queue can only rank what is in it.
+**Profiles are shared at a different layer, and K23 says why:** each profile has
+its own ledger and its own daemon, so no queue ever holds two profiles' jobs;
+what they contend for is the machine, so a profile's weight sets its fraction of
+system memory at admission instead of its position in a ranking.
+
+**Preemption suspends, never kills**, via K2's durable latch — writing
+`ProcessSignal::Suspend` rather than setting `pause_requested`, because
+`apply_signal_intent` is level-triggered table→daemon and a bare flag would be
+cleared on the very next tick. The reservation is released on suspend and
+reacquired on resume, and **the interesting case is that reacquisition can fail**: a
+resumed job whose memory is no longer available goes back to held with a reason and
+delivers zero signals to its child, rather than thrashing. Only a strictly lower
+class is ever a victim (equal classes would livelock), only the sole holder of a
+resident model (suspending one of two holders frees nothing), and only one victim
+per tick. Honest ceiling, recorded in the code: `SIGSTOP` returns no pages to the
+OS and a local model's weights live in a model server outside the process group, so
+releasing the claim is an **accounting** decision that trades possible swap for
+interactive latency. Actually reclaiming those bytes needs a runtime-hub unload the
+engine has no seam for; the accounting is already correct for it.
+
+**Decisions are inspectable, and cite a real reading.**
+`daemon_scheduler_decisions`, bounded to 512 rows, records the outcome, the class,
+what it was passed over, and the measurement that decided it — where
+`measured_at_ms` is **the cited reading's own observation time, not the write
+time**, which is the whole substance of the clause. Which measurement gets cited
+depends on the outcome, and for an admission it is the ranking key that actually
+put the job first, computed by `deciding_key` walking `rank`'s keys in the same
+order so the explanation cannot drift from the decision. Held decisions are written
+only when the reason changes — admission re-evaluates four times a second, and a
+row per evaluation would churn the whole log every two minutes. Surfaced by
+`monkey daemon decisions` and by `ResourceLedgerPanel`.
+
+**A starvation bug the first cut left behind is fixed:** the candidate window was
+only as wide as the free slot count, so a small job queued behind `concurrency`
+larger *held* jobs was never even considered until one left. It is now the queue
+bound, affordable because a `JobFacts` cache reads each run's immutable spec once
+rather than once per tick.
+
+**Backpressure** is a typed signal on `daemon status --json` —
+`state: accepting|slow|closed`, a stable `reason` token, a human `detail` nothing
+branches on, and an advisory `retry_after_ms`. `closed` is enforced at the single
+`enqueue` chokepoint *before* a worktree or snapshot is created, so every producer
+that routes through the CLI gets a hard error rather than a silently overfull
+queue. `slow` is advisory and honored asymmetrically on purpose: **an interactive
+producer proceeds** — a person waiting on a turn has nothing to defer to, so
+deferring is a refusal they did not ask for — **and a batch producer defers**. A
+missing signal is treated as accepting; a safety signal that goes absent must not
+brick the app. The desktop's deserializer was silently dropping the field until a
+test fed it verbatim CLI JSON: the nested block needs a split
+`rename_all(serialize = "camelCase", deserialize = "snake_case")`, and the naive
+camelCase every sibling struct uses loses exactly the fields whose absence still
+lets `state` work.
+
+The two HTTP listeners honor nothing, **with evidence rather than by omission**:
+`m3_http_server.rs` contains no reference to the daemon at all, and every
+`server.rs` route is inference proxy, model lifecycle, cancellation, or read-only
+state — `POST /v1/local-apps/{id}/run` emits an event and returns 202 without
+touching the queue. Gating inference would mean spawning a status subprocess on the
+hot path of every chat completion to refuse work that never enters the queue being
+measured. A test trips if an enqueueing route is ever added. Note also that
+scheduler backpressure and the per-listener `RequestAdmission` bound are different
+things and stay distinguishable: `503`/`server_busy` means requests in flight,
+`429` + `Retry-After` means the work queue behind them.
+
+**Shipped — cascade preemption, and the reason it was deferred did not survive
+being written down.** `preemption_victim` returned at most one job and required
+that job's claim to cover the whole shortfall by itself, so two `background`
+jobs that would together have freed enough freed nothing and the claimant sat
+behind a pair it could have displaced. Its own `ponytail:` comment named the
+upgrade path — "return a `Vec` from this function" — and named the blocker as a
+missing cost model for "how much work is being parked".
+
+That blocker dissolves with one guard. Victims are accumulated in the existing
+preference order and the set is returned **only if it actually covers the
+shortfall**; a set that would fall short is discarded whole and nobody is
+suspended. So the failure the cost model was wanted for — parking real work and
+still not admitting the claimant — cannot happen, and what remains is the same
+judgement the single-victim rule already made, applied more than once.
+
+- **`preemption_victim` is gone rather than kept beside the new form.** The set
+  version returns exactly that one job when one job covers it, so keeping both
+  would have been two rules that can disagree about who goes first. The
+  eligibility test and the ordering are now one `eligible` and one `preference`,
+  shared by construction.
+- **Greedy in preference order**, which is also what keeps the set small: lowest
+  class first, then largest claim, so the biggest contributors are consumed
+  before the small ones are reached.
+- **The hold reason names each suspended job** rather than counting them —
+  "suspended 2 jobs" is not something an operator can act on.
+- Zero shortfall suspends nobody, and the accumulation saturates rather than
+  wrapping, since a total that overflowed would silently stop covering a
+  shortfall it had already exceeded.
+
+**Correction: the second half of the old "Remaining" above described something
+that is not in the code.** `ready_jobs` takes no slot availability into account
+and has no parameter that could carry it — `schedule` calls
+`ready_jobs(self.config.max_queue)`, the whole queue. Free slots bound
+*admissions* further down the same pass, which is not the same thing and is
+correct: a pass must not admit more than there is room for. The claim appears to
+have outlived the change that widened the candidate window.
+
+**Blocks:** nothing now.
+
+## K9. Dispatch policy (model routing) *(built)*
 
 **Acceptance:** ROADMAP #1 — user-authored named routing policies by task
 class, cost ceiling, latency target, data sensitivity, or tool requirement;
 per-turn inspection of which policy chose the target and why; reorder and
 disable without editing code. A policy can never widen a permission, bypass
 the Privacy Firewall, or widen a run's egress policy (K5).
+
+**Shipped.** `modelRouting.ts` is the engine and is pure — candidates, the
+active target and the turn's own hard requirements are all arguments, so the
+whole decision is testable without a provider or a model.
+`routingPolicyStore.ts` persists the authored list, `routeFromActive` /
+`routeTarget` in `agentLoop.ts` is the one place that reads live stores, and
+**Settings → Automation → Dispatch policies** authors, reorders, enables and
+deletes them. All five criteria the acceptance names are real: task class, a
+cost ceiling, a latency target, data sensitivity, and a tool requirement.
+
+Two of them needed a decision about what the number even means, and both
+decisions are narrower than the acceptance line sounds:
+
+- **The cost ceiling is a *rate* ceiling** (USD per million input or output
+  tokens, against the rates the user entered themselves in
+  `costControlStore.rates`), not a per-turn cost ceiling. A turn's token count
+  is not known before the turn runs, so "max $ per turn" could only have been
+  enforced against a guess — and this file's own rule is that no number is
+  displayed or acted on that was not measured.
+- **The latency target needed a measurement that did not exist.** Nothing
+  recorded per-target first-token latency: `benchmark.rs` measures TTFT for
+  *local* runtimes only, and no cloud target had a number at all. So
+  `attemptStream` now records milliseconds-to-first-fragment onto the
+  per-request entry `costControlStore` was already writing (one optional
+  field, no new store, no new retention rule), and
+  `observedTimeToFirstTokenMs` takes the **median** of a target's recent
+  samples — one cold start or one rate-limited retry would otherwise
+  disqualify a target that normally meets its ceiling.
+
+**"Provider failover follows a fixed sequence" is also answered**, which was
+the other half of the old "Today". A matched policy supplies the whole ordered
+attempt sequence, so it replaces `buildFailoverChain` for that turn rather than
+being overruled on the second attempt. It is still gated on the same
+`autoFailoverEnabled` toggle, and it is ignored when the Privacy Firewall
+redirected the turn.
+
+**Why it cannot widen anything, structurally rather than by intention:**
+
+- **It selects, it never invents.** Every key it can return came in as a
+  candidate, and candidates are built from `buildModelTargetInventory` — the
+  same inventory the model picker shows. A policy cannot name a provider the
+  user has not configured or reach a model their own credentials do not cover.
+- **Routing strictly precedes the Privacy Firewall gate** at all three call
+  sites, so a routed target is gated exactly like a hand-picked one and the
+  firewall's own switch-to-local still overrides a policy. The engine takes no
+  permission, privacy or egress input at all — there is nothing in it to widen.
+- **A policy cannot break a turn.** One that matches but excludes everything
+  keeps the active target and says so in the decision reason. Routing is
+  allowed to be unhelpful; it is not allowed to leave a turn with nowhere to
+  run.
+
+**Two defects found while building it, both recorded because the shape of each
+is the interesting part:**
+
+- **The default configuration had undefined ranking order.** The candidate
+  comparator mapped an unknown rate or latency to `POSITIVE_INFINITY` and then
+  *subtracted*, and `Infinity - Infinity` is `NaN` — a comparator returning
+  `NaN` means "unordered", so `sort` was free to do anything. This was not an
+  edge case: a fresh profile has no rates and no latency samples for anything,
+  so the common path was the broken one. It compares rather than subtracts now.
+  A determinism test over a two-way tie is what caught it, which is the only
+  form of assertion that could have.
+- **"Requires tools" would have matched nothing.** `modelTargets.ts` records
+  `unknown` tool-calling and vision for *every* provider model, so a filter
+  written as `!== "yes"` excludes all of them — a criterion the user could
+  enable and silently never route with. Only an explicit `"no"` excludes now:
+  unknown means the request is attempted and the provider answers, which is
+  what happens with no policy at all. Vision is resolved through
+  `resolvedTargetSupportsVision` — the same predicate the turn itself uses —
+  rather than the snapshot's `unknown`, so a policy cannot route an image to a
+  model `stripImagesForTextOnlyTarget` then strips it for.
+
+**Per-turn inspection** is a `[Model switch]`-prefixed transcript note naming
+the policy and why that target won, plus the last decision (including every
+rejected candidate and its reason) in the Settings panel. The note fires only
+when the choice actually moves off the active target — an enabled policy that
+the current model already satisfies is a no-op, not an announcement every turn.
+
+**Shipped — subagents route, and the decision outlives the session.** The two
+gaps this entry named as remaining were a refactor and a missing event; both are
+in. The third was never a gap and is restated below as the settled call it is.
+
+- **The layering rule was real, and the fix was to delete the reason for it.**
+  `subagent.ts` still must not import `agentLoop.ts` — `turnEngine.ts` imports
+  `subagent.ts`, so that edge closes a cycle — but target resolution had no
+  business being in the agent loop. `targetRouting.ts` now holds `resolveTarget`,
+  the inventory, `routeFromActive` and the rest, lifted **verbatim**; nothing
+  there needs the loop, and everything it needs is a store or a pure function.
+  The dependency was never real, only co-located. `agentLoop.ts` re-exports the
+  four names its callers already import, so the ~70 modules that read target
+  resolution through it are untouched by the move.
+- **Two subagent classes, not one.** `explore` reads and reports, `code` mutates
+  a workspace; a user who wants a cheap model for the first and a careful one for
+  the second cannot say that with a single "subagent" class. Both appear in the
+  policy editor with no change to it — the class list drives the UI.
+- **A pinned model still wins.** `settingsStore.subagentProfileModels` is a
+  target the user chose by hand for that profile, and a policy is a rule about
+  work nobody pinned. A policy that quietly overrode it would make the setting a
+  suggestion. The pinned path still produces a decision, whose reason says a
+  policy was never consulted — an event that is absent cannot be told apart from
+  one that was never written.
+- **`RunEvent::RoutingDecided` makes the *why* durable**, on the same
+  append-only hash-chained stream K12 built, beside the frozen
+  `ModelTargetSnapshot` that already recorded the *what*. No migration:
+  `run_events.event_type` carries no `CHECK`, so a new variant is additive by
+  construction.
+
+  It is deliberately **not** a `subsystem_events` row. That table's vocabulary is
+  `CHECK`-constrained, and widening it means a table rebuild — of a hash-chained,
+  append-only log whose whole value is that its rows cannot be rewritten. A
+  migration that rewrites every row of a tamper-evident stream is
+  indistinguishable from tampering with it.
+- **A subagent's decision lands on the parent's run**, because a subagent has no
+  durable run of its own — it already borrows the parent's id for permission and
+  cancellation audit. Delivered by a callback (`SubagentContext.onRoutingDecision`)
+  for the same reason `onMutatedPath` is one: the recorder lives in the module
+  `subagent.ts` cannot import.
+- **Recorded even when no policy matched.** "Nothing routed this" is the answer
+  for a fresh profile and is worth being able to produce.
+
+**Settled, not remaining: managed llama.cpp is not a routable target.**
+`applyTargetSwitch` has no `local` arm, for the reason `buildFailoverChain` and
+`findLocalOnlyTarget` already document — making it the active target is not
+something an automatic switch has a basis to do unattended. So `local_only`
+policies are served by non-cloud Ollama, exactly as the Privacy Firewall's own
+local fallback is. The upgrade path is recorded at `resolvedFromSnapshot` if it
+is ever wanted.
 
 **Note:** in OS terms K8 decides *when* a process runs and K9 decides *which
 device* executes it. They are separable and K8 is the harder half. Shipping
@@ -2554,17 +3638,57 @@ identical outcomes verified against the copy implementation. Full copy remains
 the fallback when the filesystem cannot clone, and the mode used is recorded
 in the ledger.
 
+**Shipped — the macOS leg, copy-on-write per file, with the mode in the ledger.**
+`copy_workspace_into_sandbox` now clones each file through APFS `clonefile`
+where the filesystem allows it and copies it where it does not, so a sandbox on
+a large workspace costs metadata rather than bytes.
+
+- **Per file, not per tree, and that is the correctness argument rather than a
+  performance one.** `clonefile` can clone a whole directory in one call. It
+  would also clone the two things this function exists to leave out — `.env`
+  files and `node_modules`-shaped directories — and deleting them afterwards is
+  a strictly worse version of never copying them: the window in which a secret
+  exists inside the sandbox would be real, and a crash inside that window leaves
+  it there. Keeping the walk and swapping only the per-file placement means the
+  skip rules, the symlink handling and the resulting tree are unchanged **by
+  construction**, which is what makes the acceptance's "byte-for-byte identical
+  outcomes verified against the copy implementation" true rather than
+  tested-and-hoped. It is also tested: one test builds the same fixture both
+  ways and compares every path and every byte.
+- **A refusal is never an error.** No copy-on-write on this filesystem, a
+  cross-device destination, a destination that already exists — each means "copy
+  it the ordinary way", so full copy is the fallback at the granularity of a
+  single file rather than of the whole run.
+- **The mode is in the ledger**, on the `CheckpointLinked` event the sandbox
+  already appends, with the clone count beside the file and byte counts. Three
+  states and not two: an empty workspace reads as "no files", never as a
+  filesystem that refused to clone.
+- **A clone is independent, and the test says so.** Writing through the sandbox
+  copy must not reach back into the workspace. This is the property that rules
+  out the acceptance's own suggestion of a hard-linked staging tree on Windows:
+  a write through a hard link mutates the workspace file itself, which is the
+  one thing an ephemeral sandbox exists to prevent. It is not a deferral — it is
+  wrong for this use.
+
+**Remaining, and deliberately not guessed at.** Linux reflink (`FICLONE`, on
+btrfs and XFS) and Windows ReFS block cloning are both real and both absent:
+neither can be exercised on this project's machines, and an untested ioctl that
+silently degrades to a copy would look identical to the current code in every
+test while being harder to read. Overlayfs, which this acceptance names for
+Linux, needs mount privileges a desktop application does not have. The disk
+quota clause is K4's and is untouched here.
+
 **Blocks:** K8 in practice — preempting and resuming runs is only affordable
 if their namespaces are cheap.
 
-## K11. Context memory manager
+## K11. Context memory manager *(built)*
 
 **Today:** `context_cache.rs` is honest observability — configured vs. live
 context from a managed `llama.cpp` process's `/props`/`/slots`, headroom,
 a safe effective-context preview, and a five-way classification of long-context
 failures. Compaction exists in the chat path. What does not exist is
-*management*: no eviction policy, no measured reuse, no sharing of an
-identical prompt prefix between two processes using the same resident model.
+*management*: no eviction policy, no sharing of an identical prompt prefix
+between two processes using the same resident model.
 
 **Acceptance:** a stated eviction and compaction policy per process class,
 with measured cache hit rate and measured tokens saved (not estimated);
@@ -2576,24 +3700,578 @@ a failure.
 **Blocks:** nothing hard — but without it "context" is the one resource the
 system does not manage, and it is the resource agents consume most.
 
-## K12. Tamper-evident unified event log
+**Shipped — the measurement, and it is the runtime's rather than this app's.**
+Migration V16 adds `context_tokens_reused` and `context_tokens_evaluated` to
+`agent_processes`, fed from `timings.cache_n` / `timings.prompt_n` on every
+completion, drained onto the row beside the egress counters, and rendered per
+process in the resource ledger panel.
 
-**Today:** `run_ledger.rs` (~3k lines) records run events, checkpoints record
-mutating turns, Run Capsules export redacted replayable records, Security
-Doctor audits local posture, and periodic screenshots land in the ledger for
-Control Desktop sessions. Coverage is broad but per-subsystem, and the log is
-append-only by convention rather than by construction.
+- **"Measured, not estimated" is the whole constraint, and it rules out the
+  obvious implementation.** The app cannot see inside the runtime's KV cache, so
+  an app-side hit rate would be "how much of this prompt looks like the last
+  one" — a guess about a cache it has no handle on. Checked against the pinned
+  `llama.cpp` (`MANAGED_LLAMA_VERSION`, b9637) with a real 8B model: a repeated
+  prefix reports `cache_n = 9, prompt_n = 1` where the guess says 10 of 10,
+  because llama-server always re-evaluates the last prompt token. The
+  fixtures in the tests are that binary's own response bodies, copied rather
+  than composed.
+- **A streamed response reports it in a second place, and the fallback is not a
+  bug fix.** llama-server always puts token accounting in `timings` on the final
+  SSE chunk, and adds a `usage` object only when the caller asked for
+  `stream_options.include_usage`. This app does ask, so the pre-existing stream
+  path's counts were right — an earlier draft of this entry claimed it reported
+  every streamed completion as zero tokens, which was measured against a request
+  that omitted that option rather than against the one the app sends. Reading
+  `timings` as well is what makes the reuse figure available without depending on
+  an optional field, and it covers the callers that do omit it —
+  `chat_template_lab`'s synthetic lines, and any third-party OpenAI-compatible
+  server that ignores `include_usage`.
+- **`None` and `0` are different columns' worth of difference.** Ollama and MLX
+  report no reuse figure, so their processes stay NULL rather than being
+  credited with a measured zero — a zero would enter a denominator and pull a
+  real hit rate down with it. `CanonicalUsage::cached_input_tokens` is an
+  `Option` for that reason, `contextReuseFor` returns `null`, and the panel
+  renders nothing at all rather than "0%".
+- **Two counters, never a stored ratio.** A rate cannot be accumulated: the
+  mean of each turn's own rate weighs a ten-token turn the same as a
+  thousand-token one. `9 / 1010` over a process and "45% average" are different
+  numbers about the same two turns, and only the first says what the cache
+  saved.
+- **A measured verification, not just a fixture one.** A real two-turn
+  conversation against that binary reused 75 of 91 prompt tokens on turn two —
+  an 82.4% hit rate and 75 tokens saved — and
+  `usage.prompt_tokens_details.cached_tokens` agreed with `timings.cache_n`,
+  which is what makes the OpenAI-shaped fallback safe for a runtime that reports
+  only that.
+
+Two corrections to this entry's own text came out of the work. It claimed "no
+measured reuse" as a *gap in the app*; the figures were being reported by the
+runtime on every response all along and simply thrown away. And
+`context_cache.rs` said `/slots` "requires `--slots` and is off by default",
+which was true of an older `llama.cpp` — the pinned build enables it by default,
+checked against that binary's `--help` rather than assumed.
+
+**Shipped — the stated policy per process class, and one `ProcessClass`
+instead of two vocabularies.**
+
+`ProcessClass` and `classify` moved from the daemon scheduler into
+`run_protocol`, beside the `RunKind` that decides a class. That is the join this
+clause needed, and it is a deletion rather than an addition: the desktop, the
+ledger and the scheduler now get the same answer from the same four-arm enum,
+where a second copy would have drifted. A process's class comes from its run's
+own frozen kind through the scheduler's own `classify` — never a second opinion.
+
+**The policy, and the argument for each arm.** Every one is read off that class's
+existing definition rather than chosen as a preference, which is the whole reason
+this is per class and not a global setting:
+
+| class | when the context fills | why |
+| --- | --- | --- |
+| Interactive | **compact** | "Something is blocked on the answer: a person at a desktop turn." Refusing throws away a conversation the person is in the middle of and can still see; compacting costs them the oldest detail. They are present to notice a bad summary, which is what nobody downstream of the other three can do. |
+| Batch | **compact** | "Submitted work that wants throughput." Finishing is what the class is for. But nobody is watching this turn either, so the compaction is recorded on the run rather than left silent. |
+| Background | **refuse** | "Opportunistic … the first thing asked to step aside." Work already first to yield should not spend a scarce window on a degraded answer, and stopping is cheap here in a way it is nowhere else. |
+| Maintenance | **refuse** | "May always be deferred, because the next occurrence will come around anyway." Its own definition is the argument: a compacted pass writes a worse result where a later whole one would have written a good one. |
+
+- **Two outcomes, not three.** Once the context is full the honest options are
+  continue with less of the conversation, or stop. The third — carry on and let
+  the runtime silently drop the oldest turns — is exactly what
+  `ContextFailureClass::CacheExhaustedContextShift` exists to *report*, and it is
+  what this policy replaces.
+- **The policy is what the budget's refusal *means*.** V17's pre-flight decides
+  *when* a request is over; the class decides what being over implies, and
+  `refusal_under` carries the rationale into the message so a caller can act
+  rather than only report. With no run to derive a class from, the refusal stays
+  bare rather than assuming a policy.
+- Reachable as `m3_context_policies`, which returns all four together: the policy
+  is only meaningful as a comparison, and one class alone reads like a global
+  setting.
+
+**Shipped — the policy reaches whoever can act on it, and the refusal stopped
+claiming to be a runtime failure.** An earlier draft of this line said
+auto-compacting on a `Compact` class was frontend work "and the compaction it
+would call already exists". Both halves turned out to be wrong, and tracing it
+is what produced the actual answer:
+
+- **The desktop chat loop never sees this refusal.** The budget guards
+  `M3RuntimeHub::dispatch_api` — this app's own OpenAI-compatible server. A chat
+  turn streams through `providers.rs` under `RunScope::Unattributed`, with no
+  process row attached and therefore no budget to exceed.
+- **The loop that *is* budgeted has nothing to compact.** A crew actor's history
+  is one user message plus its own tool round trips, and
+  `applyContextCompaction` refuses to touch a history with fewer than two user
+  turns — deliberately, since trimming a single ongoing turn destroys the only
+  context the model has. A compaction retry there would have been dead code.
+- **So the party that can compact is the API client**, which owns the
+  conversation this app is declining to forward. What it needs is not a
+  compaction it cannot be given, but the policy in a form it can branch on.
+
+`ContextPolicy::code()` is that form — `context_budget_compact` /
+`context_budget_refuse`, or a bare `context_budget` when the process has no run
+to derive a class from, which says *a limit was hit* and refuses to guess at the
+rest. It rides in `error.code`, where an API client already looks.
+
+**And the status code was wrong in a way that mattered.** The refusal was an
+`M3HubError::Runtime`, which renders as **502** — a client reading that has been
+told the upstream broke, and the correct response to a 502 is to retry the
+identical request. Retrying is the one thing that cannot work here. It is now
+its own error variant and a **413**, which asks for the shortening that actually
+helps. Nothing on this side failed: the request was never forwarded.
+**Shipped — the context budget as a K4 limit, enforced before the request.**
+
+Migration V17 adds `max_context_tokens` to `agent_processes`, the fifth `max_*`
+column beside V5's four. `ProcessScope` carries it, and `m3_production` refuses
+an over-budget request before sending it.
+
+- **The obstacle was a token count, and it turned out not to be one.** This app
+  has no tokenizer — the only counter in the tree is `crewRunner.ts`'s
+  `length / 4` — and enforcing a *context* limit against an estimate would refuse
+  real work for a made-up reason, strictly worse than today's honest
+  classification of the runtime's own refusal. But llama-server answers
+  `POST /apply-template` with the exact prompt a completion would send (template
+  included, and the template alone is tens of tokens) and `POST /tokenize` with
+  its exact tokens. Measured against the pinned b9637: `/tokenize` answered in
+  **0.5 ms** on loopback. The count is the runtime's own, and a pre-flight is
+  affordable per turn.
+- **"Enforced as a limit rather than discovered as a failure" is the assertion,
+  not the error text.** Discovering it means the prompt is evaluated, the runtime
+  refuses or shifts its context, and `classify_context_failure` explains what
+  already happened. Enforcing it means the request never leaves — so the test
+  asserts that `/v1/chat/completions` was never reached, and that the only paths
+  touched were the two pre-flight calls.
+- **Fail-closed, deliberately, and only where a budget exists.** A process with
+  no budget — every process today — returns before sending anything, so a limit
+  nobody set costs nothing, and a test pins that too. When a budget *is* set and
+  no count can be produced, the request is refused with that reason rather than
+  sent unchecked: "I set a limit and it silently did nothing" is the outcome this
+  direction exists to prevent. `ContextBudgetEnforcement` is the tagged union that
+  carries it, and the Runtime Hub prints the `unenforceable` reason.
+- **`> 0`, and `>` not `>=`.** V17's `CHECK` refuses a zero budget because no
+  request could satisfy one — the chat template alone is tokens, so a zero would
+  refuse every turn while reading like a configured limit. And a prompt landing
+  exactly *on* the budget fits, or the configured number would mean one less than
+  it says.
+- **It ships enforced and unset**, like the wall budget and for the reason
+  `processWallBudget.ts` records: `default_limits` returns `None` for every kind
+  and no admit call site passes one. Picking the number is a judgement about what
+  a conversation is *for* — too low silently ends long sessions that were working
+  — and that belongs to settings, not to a constant.
+- **It refuses rather than compacting.** Compaction exists in the chat path and
+  the user can invoke it; a limit that quietly rewrites the conversation instead
+  of reporting that it was reached is not a limit.
+
+**Shipped — read-only prefix sharing, and this clause was already satisfied by
+the runtime rather than missing.**
+
+The plan for this clause was to wire `--slot-save-path` or `--cache-reuse`. That
+was based on a wrong picture of what the pinned runtime does, and running it
+settled the question:
+
+- With **no** `--parallel` argument — which is what `llama_args` passes today —
+  b9637 resolves `n_parallel` to `auto`, reporting `total_slots = 4` with a
+  unified KV cache. The app was never limited to one sequence.
+- It routes each request to the slot whose cached prefix matches best — "selected
+  slot by LCP similarity, sim_best = 0.993" in its own log — and
+  `--cache-idle-slots` saves an idle slot's KV into a server-wide RAM pool
+  (`--cache-ram`, 8192 MiB by default).
+- **Measured:** two different conversations sharing a 454-token prefix. The
+  second reused **451 of 456** prompt tokens, on a slot the first had warmed. The
+  sharing is read-only by construction — no KV is copied between sequences; the
+  *request* is routed to where the prefix already lives.
+
+So there was nothing to build, and one thing to protect. **The app gets this by
+not doing two things**, and either would cost the whole feature with nothing
+failing: pinning `id_slot`, and sending `cache_prompt: false`. A test on
+`openai_request_body` asserts both absences, in streaming and non-streaming form.
+
+That guard is not hypothetical. The first probe of this pinned `id_slot` and
+measured **zero** reuse of the same 454-token prefix — which read as "the runtime
+cannot share across slots" until it turned out to be the pin defeating the
+router. `--cache-reuse` stays at its default 0: it shifts KV to reuse a prefix
+that changed in the *middle*, which is a different (and behaviour-changing)
+feature from the one this clause asks for.
+
+`PrefixSharing` is a tagged union for `RenderedMeasurement`'s reason — a caller
+cannot render "supported" without the mechanism, or "unsupported" without the
+reason. Ollama is `unsupported` because its API exposes no slot or prompt-cache
+surface at all, so whatever its server does internally this app cannot observe or
+claim it; MLX because it keeps no prompt cache between requests. Neither is
+"unimplemented" dressed up as a refusal.
+
+## K12. Tamper-evident unified event log *(built)*
 
 **Acceptance:** one event stream every subsystem writes to — desktop, daemon,
 HTTP, ACP, MCP, browser, remote node — hash-chained so a deleted or edited
 event is detectable, with each event naming the process (K1) and, for anything
 gated, the exact policy decision that permitted it. A tool call whose
 authorizing decision cannot be produced from the log is a bug. Redaction
-happens on export, never on write.
+happens on export, never on write — **amended**, see the redaction entry below:
+an authorizing *fact* may never be redacted on write, but a secret-bearing
+payload may be when a digest of the original is recorded alongside it.
+
+**This entry's own premise was wrong, and correcting it is what made the work
+tractable.** It said the log is "append-only by convention rather than by
+construction". It is not: migration V1 installs `run_events_forbid_update` and
+`run_events_forbid_delete`, both `RAISE(ABORT, 'run events are append-only')`,
+and four tables hold `ON DELETE RESTRICT` references *into* the event table.
+Nothing in production code ever updates or deletes a run event — the only such
+statements in the tree are inside a `#[cfg(test)]` block that drops a trigger on
+purpose. So the precondition for a hash chain was already satisfied; what was
+missing was detection for the case that survives the triggers, which is a holder
+of the connection dropping them.
+
+**Shipped — migration V9 hash-chains the run event stream.**
+
+- Each event's hash covers **every column** of its row bound to its
+  predecessor's hash, so editing any field breaks the chain at that event. The
+  pre-existing `load_events` revalidation only catches a payload that stops being
+  *valid protocol*; a plausible, well-formed replacement — an event's timestamp
+  moved by a minute — passed it silently and does not now.
+- Fields are **length-prefixed, not concatenated**. Concatenation is ambiguous:
+  `("ab", "c")` and `("a", "bc")` are the same bytes, so a naive join would let
+  one event be rewritten as a different event with an unchanged hash. An absent
+  optional field and an empty one likewise carry a presence tag, so `actor_id =
+  NULL` cannot be rewritten to `actor_id = ''` for free.
+- **Deliberately no backfill, and this is the load-bearing decision.** Hashing
+  the rows already on disk would compute a chain over whatever they currently say
+  and then certify it — laundering an edit made *before* chaining existed into a
+  valid chain, and asserting an integrity property the feature does not have. Both
+  columns are nullable, `NULL` means "outside the chain's coverage", and the
+  verifier reports where coverage begins instead of implying sequence 1.
+- **Two SQL triggers make the linkage structural**, so it holds against a writer
+  that never goes through Rust: an event must carry its predecessor's hash, and a
+  chained run cannot append an unchained event. SQLite cannot compute SHA-256, so
+  the hash's *content* is the verifier's job; "points at its predecessor" is the
+  database's.
+- **Tail truncation is caught by a second, independent route.** Deleting the
+  newest events leaves every surviving hash correct and every link intact, so the
+  chain alone cannot see it — but `runs.last_sequence` is maintained by the
+  `run_events_project_run` trigger, so the run still claims events that are gone,
+  and concealing that requires a second edit to a different table.
+- **What it cannot detect, stated rather than glossed:** removal of the entire
+  covered range. A per-run chain has no anchor outside the database that holds it.
+  An integrity claim that overstates itself is worse than none, so
+  `ChainVerification` is a tagged union — a caller cannot read a coverage range
+  off a broken chain and present it as verified.
+
+Reachable as `monkey security verify-run-chain <run-id>`, which exits non-zero on
+a broken chain so a scripted check cannot pass by printing bad news.
+
+**Remaining, and the recon turned up more than the entry implied:**
+
+- **"One event stream every subsystem writes to" — the stream now exists, and MCP
+  writes to it.** Migration V12 adds `subsystem_events`: run-optional,
+  hash-chained, append-only.
+
+  **The fork this settles.** `run_events.run_id` is `NOT NULL REFERENCES
+  runs(run_id)`, its insert trigger demands contiguous per-run sequences, and its
+  chain is per run — all three are run-shaped. So the acceptance had exactly two
+  readings: manufacture a `runs` row per HTTP request, MCP call and browser
+  action, or have a stream that does not need one. The first makes runs
+  high-volume and changes the runs list, admission control and archival to buy a
+  label; `run_scope`'s module doc argues the case against inventing an identity at
+  length. This is the second, and it generalizes what V11 already did for
+  permissions rather than introducing a third discipline.
+
+  - **It does not restate the authorization.** A gated action's decision is
+    already in `permission_decisions`, written *before* the action runs and for
+    every caller, so an event points back at it by `request_id`. That closes "for
+    anything gated, the exact policy decision that permitted it" with one join, in
+    the direction the question is actually asked — and `request_permission` now
+    returns that id so the caller can carry it. Widening the return type changed
+    no existing call site: `request_permission(..).await?;` in statement position
+    drops the value.
+  - **One global chain**, not one per subsystem: there is no per-run sequence to
+    hang a chain off, and a per-subsystem chain would let a whole subsystem's tail
+    be removed without breaking any other. Unlike V9 there is **no unchained era
+    to tolerate** — the table is new, so `event_hash` is `NOT NULL` from the first
+    row and there is nothing to backfill and therefore nothing to launder.
+  - **One row per completed action, deliberately — there is no "started" row.**
+    The permission row already proves the action was authorized before it ran, so
+    a second row would restate it. An action that never finishes leaves an open
+    permission and no event, which reads correctly as "authorized, never
+    completed".
+  - **What it cannot detect, stated rather than glossed:** a removed tail. The run
+    stream has `runs.last_sequence` as a second witness; this stream has no
+    counter outside itself to contradict one, and the CLI says so.
+
+  Reachable as `monkey security subsystem-events [--subsystem mcp]`, which exits
+  non-zero on a broken chain.
+
+  **HTTP writes to it too, through a recorder the remaining subsystems share.**
+  `subsystem_audit.rs` exists because the writers do not share a context: desktop
+  has a `tauri::AppHandle` and reaches the ledger through `AppState`, while the
+  CLI-hosted API server, the daemon and ACP have no `AppState` at all — only a
+  data directory. Four hand-rolled copies of "mint an id, read the clock, resolve
+  the attribution, append without breaking the action" would drift, and the field
+  most likely to drift is the attribution, which is the field the audit exists
+  for. The attribution *rule* is now one function, `permissions::attribution_for`,
+  with "is this run in the ledger" supplied by whichever ledger the context can
+  reach.
+
+  - **A third target, `disabled`, carries a reason** — and the reason is printed
+    at listener startup rather than living as a comment. "This subsystem wrote no
+    events" must never be indistinguishable from "this subsystem was never wired
+    up", which is the same ambiguity `run_scope`'s two-arm design exists to
+    prevent.
+  - **Not every request is recorded, and the rule is a pure function.**
+    `/health`, a CORS preflight and `GET /v1/models` carry no effect and are the
+    calls every client makes *before* acting; recording them would double the
+    stream and bury the rows that matter. Anything that runs a model, reads the
+    knowledge base or returns an artifact is recorded.
+  - **Status, never body or headers.** `detail_json` is covered by the chain and
+    therefore permanent, and a body may hold the user's own text.
+  - HTTP records no `permission_request_id` because nothing on those routes goes
+    through `request_permission` — it is bearer-token authenticated. `NULL` there
+    is the honest answer and the CLI prints it as "nothing gated this action".
+
+  **HTTP is now complete, and the browser worker writes too.** The M3 routes and
+  the desktop-only extended routes return early from the dispatcher rather than
+  falling through to `handle_request`, so each got its own call to the same
+  filter — `LocalAppRun` above all, since it is the one HTTP route that *is*
+  permission-gated and leaving it out would have missed the request most worth
+  having.
+
+  The browser worker's twelve `browser_*` commands share no parameter but their
+  state, so the audit lives on `BrowserCommandState` (which already knows the
+  data directory) and every acting command routes through one `audited` helper.
+  That is deliberate: instrumenting twelve call sites by hand means the
+  thirteenth is forgotten. Resolving the session happens *inside* the audited
+  region, so "this action named a session that does not exist" is an event rather
+  than a reason to record nothing. `browser_list` is skipped under the same rule
+  as `GET /v1/models` — a read of local state that takes no action.
+
+  ~~**A finding the stream surfaced rather than fixed:** browser actions are
+  ungated, which the acceptance calls a bug.~~ **That claim was written here and
+  it overstated the gap — correcting it before somebody builds a prompt nobody
+  needs.** It is true that no browser command calls `request_permission`, and
+  true that every browser row therefore records `permission_request_id = NULL`.
+  It is *not* true that this is the acceptance's bug. That clause is about a
+  **tool call** whose authorizing decision cannot be produced from the log, and
+  every browser path is user-initiated or user-configured: `BrowserWorkbench`,
+  `VisualEditModePanel`, `BrowserVerificationPanel`, and workflow replay, which
+  the user starts. No agent tool reaches them — `tools.rs` has no browser entry,
+  and `BrowserWorkerAdapter` (the workflow-side entry, capability-gated by
+  `WorkflowNodeKind::Browser`'s declared `EffectClass`) has no production caller
+  at all.
+
+  A per-action prompt for a button the user just clicked is the wrong feature, in
+  the same way `browser_list` needs no gate. So `NULL` here is the correct value
+  and not a missing one. What *is* worth saying: user-configured synthetic
+  monitors navigate on a timer with nobody at the keyboard, and the policy that
+  covers that is K5's per-run egress allowlist, not the permission prompt.
+
+  Detail columns stay narrow on purpose: HTTP records the status and nothing
+  else, browser records the session id and never a URL, selector or typed text.
+  `detail_json` is covered by the hash chain and therefore permanent, and typed
+  text is exactly where a password would be.
+
+  **ACP writes to it now, through the choke point rather than the arms.** Every
+  ACP response leaves through one `send`, so that is where the event is recorded
+  — the dispatch loop's arms each have their own error branches, and
+  instrumenting arms is how one branch stays silent forever. A JSON-RPC response
+  carries only the request `id`, so the loop remembers `id → method` when it
+  dispatches and `send` consumes it; a `session/update` notification has a method
+  and no id, never matches, and never floods the stream. `initialize` is skipped
+  under the same rule as `GET /v1/models`.
+
+  The audit is process-global there, deliberately: `monkey-cli acp` serves one
+  stdio connection for its whole lifetime, so there is exactly one, and threading
+  it through seventeen `send` call sites plus the spawned relay tasks that
+  outlive the loop would buy nothing.
+
+  **The remote node writes to it too, and it needed no id bookkeeping.** Unlike
+  ACP, every path through `RemoteApi` returns one `ApiResponse` from one
+  `handle`, so wrapping that is already a choke point with the request and its
+  response in scope together. An unauthenticated request — the one that never
+  reaches a route at all — is therefore still an event, which is the property the
+  wrapper buys over instrumenting routes.
+
+  This does **not** replace `remote_audit`. That table holds the protocol-level
+  denial detail this stream deliberately does not; what was missing was a row
+  readable alongside everything else, and that is what the join now gives.
+
+  One consequence worth noting: `server.rs` and `RemoteApi` both answer HTTP, so
+  the status-to-outcome rule moved into `subsystem_audit::outcome_for_status`.
+  Two copies would have drifted, and the drift would stay invisible until
+  somebody counted failures and got refusals.
+
+  **Every subsystem the acceptance names now writes to the stream** — desktop and
+  daemon through `run_events`, and HTTP, MCP, browser, ACP and the remote node
+  through `subsystem_events`. Separate stores still hold gating-relevant records
+  with no join to either stream: `daemon_scheduler_decisions` and `remote_audit` in their own database
+  files, and `egress_denials`, which records denials only — **an allowed egress
+  produces no row anywhere** — and ring-buffers itself on every insert.
+- **A schema bump was a one-way door, and that is why the audit is scattered
+  across three databases.** `denial_sink.rs` says it outright: the ledger's
+  forward-only guard refused any database whose `MAX(version)` exceeded the
+  binary's, so shipping one observability table meant a user who rolls back —
+  which the in-app updater makes ordinary — gets a binary that cannot open its
+  own run history at all. Not a degraded feature: no runs, no events, no
+  approvals. That is the real reason `egress_denials` lives in its own file, and
+  it is the reason every future joinable store would have too.
+
+  **Migration V13 removes the premise.** `schema_migrations` gains
+  `min_reader_version`, and the guard compares against the newest *breaking*
+  migration rather than the newest migration. Most migrations here only add — a
+  table an older binary never queries, a nullable column its inserts omit — and
+  those are invisible to it. What genuinely breaks an older binary is a migration
+  that makes the database reject writes it used to accept.
+
+  - **V1–V8 are marked breaking without re-deriving each one, deliberately.**
+    They shipped under the old blanket rule, so calling them breaking preserves
+    exactly today's behaviour and claims nothing new. Claiming compatibility
+    wrongly is far worse than claiming it too little — it hands an older binary a
+    database it corrupts — so compatibility is asserted only where it was
+    checked.
+  - **V9 is genuinely breaking**, and this is the concrete case:
+    `run_events_chain_must_not_stop` aborts an insert whose `event_hash` is NULL
+    into an already-chained run, which is every insert a pre-V9 binary makes.
+  - **V10–V12 are additive**, each checked. V10's nullable `process_id` is
+    omitted by a V9 binary's inserts, and V9's hash contributes nothing for an
+    absent process id — the same property that let V10 ship without invalidating
+    V9's rows now lets a V9 binary keep writing. V11 and V12 add tables nothing
+    older queries.
+  - **V13 must require itself**, and the entry says so rather than glossing it: a
+    V12 binary applies the *old* blanket guard and refuses a V13 database no
+    matter what the column says. The fix cannot reach backwards; it stops the
+    bleeding from here on.
+
+  **`egress_denials` stays in its own file anyway, for a better reason than the
+  original one.** Its volume is attacker-influenced — a remote page causes
+  denials as fast as it can request subresources — and the ring buffer that
+  bounds them is a poor neighbour for a hash-chained, strictly append-only stream
+  that must never drop a row. Moving those rows in would mean either giving the
+  stream an eviction policy or letting a remote party grow it without limit.
+  What *does* belong in the ledger is the half that is still missing entirely —
+  an **allowed** egress produces no row anywhere — because its volume is the
+  app's own.
+- ~~**Per-event process identity does not exist.**~~ **Done** — migration V10 adds
+  `run_events.process_id`, populated from the ambient `ProcessScope` (the D3
+  `tokio::task_local!`) inside `append_event`. That is the single place all 46
+  production call sites funnel through, so no caller changed. `NULL` means "this
+  event names no process" rather than a guess — and a guess is all a join could
+  ever be, since `agent_processes.run_id` is not unique because a run legitimately
+  owns many processes. `verify_run_chain` reports `events_naming_a_process` as a
+  fraction of `events_seen`, so how far attribution actually reaches is a number
+  rather than an assumption.
+
+  **The interesting part is the interaction with V9's chain, which covers every
+  column.** Adding a column after a chain ships is a dilemma: fold it in
+  unconditionally and every row written before it existed stops verifying; leave
+  it out and it is the one column an attacker may rewrite for free. The escape is
+  that `process_id` contributes **nothing to the digest when absent** — so a row
+  with no process hashes byte-identically to what V9 produced, while setting,
+  changing or clearing a present id all break the chain. A test spells out V9's
+  field list explicitly, because a silent change there would invalidate every
+  chain already on disk. Any future column can be added the same way.
+- ~~**Redaction happens on write, contradicting the acceptance.**~~ **This entry
+  was wrong, and the acceptance clause is what should change.** The claim was
+  literally true and materially misleading: `redacted_tool_arguments` computes
+  `arguments_sha256` over `canonical_argument_bytes(raw)` — the **original**
+  arguments, before redaction — so the log already proves *which* operation was
+  authorized without storing the secret. `permissions.rs` likewise drops only
+  free-form classifier prose while keeping `operation_sha256`, `risk_level` and
+  the decision itself.
+
+  Taken literally, "redaction happens on export, never on write" would require
+  storing plaintext credentials in a local SQLite file to gain evidence the digest
+  already provides. The clause's *intent* — that the log must be able to prove
+  what happened — is satisfied by a digest of the original plus a redacted
+  payload, which is strictly better. **Amended acceptance: an authorizing fact may
+  never be redacted on write; a secret-bearing payload may be, provided a digest
+  of the original is recorded alongside it.**
+- ~~**Every permission event is gated on `durable_run_exists`.**~~ **Fixed —
+  migration V11 adds `permission_decisions`, which every permission is written to
+  whether or not a run holds it.** This was the acceptance's own named bug, live
+  in the tree: `run_events.run_id` is a foreign key onto `runs`, so a permission
+  raised outside a ledger-registered run had nowhere to go and simply wrote
+  nothing. Four call sites hard-code `None` for the run — deleting a model from
+  Settings, running a local app definition over HTTP, and the two triage paths
+  that post to Slack — and all four were gated, security-relevant approvals
+  leaving no record anywhere.
+
+  - **Registering a `runs` row for that work was the obvious fix and the wrong
+    one.** A run carries a spec, an idempotency key, an event budget and a status
+    lifecycle, and it appears in the runs list. Manufacturing one so a Settings
+    click has somewhere to write is inventing an identity, which is what `run_scope`'s
+    module doc argues against at length. So the attribution is recorded as what it
+    actually is: a closed `attribution` column covering both arms of `RunScope`
+    plus the two states a scope cannot express — a run id that is real but was
+    never registered, and nobody having said either way. "Not instrumented" never
+    reads as "background work".
+  - **The responder is recorded, not just the verdict.** Stop withdrawing a
+    prompt and a person refusing it were both a bare `false` on the resolution
+    channel, and three responders — `deny_pending`, the Stop path, and the expiry
+    check — recorded nothing at all. The channel now carries the decision and who
+    made it, which moves recording to the *awaiting* task: the one place every
+    outcome funnels through, instead of each responder having to remember.
+  - **Expiry is now decided outside the durable branch.** It was computed only
+    when a run held the permission, so a stale prompt outside one could still be
+    answered.
+  - Two triggers hold the table's shape against any writer: a decision is final,
+    the request half is immutable once recorded — an approval cannot be
+    relabelled onto a different operation after the fact — and rows cannot be
+    deleted. This mirrors `run_events`' append-only triggers rather than inventing
+    a second discipline.
+
+  Reachable as `monkey security permission-trail <tool-call-id>`, which exits
+  non-zero when nothing gated the call, since that is the bug rather than an
+  empty report.
+- Approvals *are* joinable at event granularity — three FKs onto
+  `run_events(run_id, sequence)` — but `approval_chain_stage_decisions` is not
+  (deliberately: a chain can gate a future action with no run yet). The join
+  exists in the other direction — `permission_decisions.tool_call_id`.
+
+  **A forward pointer on `ToolStarted` was the obvious completion and the wrong
+  one.** The gate runs *inside* the Rust tool command, after the frontend has
+  already emitted that event, so at write time the `request_id` does not exist.
+  The two ways to get one there are both worse than the gap: mint it in the
+  frontend and every ungated read (`read_file`, `grep`) carries a pointer to a row
+  that will never be written, or reorder the event stream around a value only one
+  side holds.
+
+  **So the acceptance's sentence was made enforceable instead of decorated.** It
+  says "a tool call whose authorizing decision cannot be produced from the log is a
+  bug" — `permission-trail` could only answer that for a call somebody already
+  suspected, and a bug nobody suspects is the one that stays. `permission_gaps`
+  asks it of *every* call in a run, reachable as `monkey security permission-gaps
+  <run-id>`, which exits non-zero when a **mutating** call has no decision behind
+  it. Mutation is read from the run's own `ToolProposed` event rather than from a
+  tool-name list, which would be a second opinion about a fact the log already
+  records. A `ToolStarted` with no `ToolProposed` is reported as
+  mutation-*unknown* and counted as a bug: the log genuinely does not say, and
+  defaulting it to "read-only" is how an ungated write slips past the check that
+  exists to catch it.
+- **Correction to the line above: that reverse join was quietly answering the
+  wrong question for some rows, and V15 is the fix.** Found by reading
+  `request_permission` rather than by reading this file again.
+  `permission_decisions.tool_call_id` is `NOT NULL`, so a caller with no tool
+  call in hand had one **invented** — `format!("tool-{uuid}")`. Two production
+  call sites pass `None` outright (deleting a model from Settings, running a
+  local app definition over HTTP) and every other site passes an `Option` that
+  can be `None` at runtime. The generated id is shaped exactly like a real one
+  and joins to nothing, so `monkey security permission-trail <id>` returned
+  "no permission decision was ever recorded" — the bug this acceptance names —
+  for decisions that were recorded correctly and simply were not about a tool
+  call.
+
+  V15 adds `tool_call_origin`, a closed set of `caller` / `synthesized` /
+  `unknown`. It is the same distinction the `attribution` column already draws
+  for the run, drawn for the tool call: absence with a stated reason instead of
+  a plausible-looking value. `unknown` is the default rather than `caller`,
+  which is the one piece of care in the migration — every row written before the
+  column existed had its origin unrecorded, and defaulting them to `caller`
+  would assert something nobody checked about precisely the rows most likely to
+  be synthesized. The ids *could* be pattern-matched, and a heuristic that
+  mislabels one real tool call is worse than an honest `unknown`.
+
+  Additive, so it costs a rollback nothing. `permission-trail` prints the
+  distinction only when there is one — a trail reached *by* an id and then told
+  the id is synthetic reads as a contradiction, so `caller` says nothing.
 
 **Blocks:** K21 — conformance needs evidence that cannot be quietly edited.
 
-## K13. Freeze and restore a live process
+## K13. Freeze and restore a live process *(built)*
 
 **Today:** checkpoints capture mutating turns with per-file diff, artifacts,
 screenshots, verification state, read-only compare of any two, and a rollback
@@ -2609,7 +4287,109 @@ is not reproducible.
 
 **Blocks:** K18.
 
-## K14. Transactional external effects
+**Shipped — the durable image, its restore gate, and the determinism
+statement.** The loop re-entry that acts on all three is the entry below this
+one.
+
+The image is a **checkpoint**, not a new store. A checkpoint is already a
+durable, versioned manifest of a turn's conversation anchor and workspace files;
+`resume` is one more `serde(default)` section on it holding what a checkpoint
+does not already have. Inventing a second store would have meant a second copy
+of the conversation and the files that could disagree with the first — and the
+disagreement would surface at restore, the moment it can least be dealt with.
+
+- **It references rather than copies.** The conversation is in the profile
+  store, the files are in the checkpoint's own entries, an approval is a
+  `permission_decisions` row. `resume` holds the process id, the model and
+  runtime, the K10 workspace path, and the outstanding `request_id`s.
+  `restorability` is what checks they still resolve.
+- **A restore refuses rather than substituting.** A missing workspace took the
+  process's uncommitted work with it, so resuming into a fresh one would silently
+  lose it. A model that is no longer resident would continue the conversation in
+  another model's voice. An approval that has expired would carry on past a
+  permission nobody currently grants. Each is a named `RestoreBlocker` with its
+  reason, and `Restorability` is a tagged union so a caller cannot offer Resume
+  without holding the state that says it is safe.
+- **Every blocker at once, not the first.** A user told the workspace is gone,
+  who fixes it and is then told the model is missing, has been made to discover
+  the refusals one at a time.
+- **Freezing twice is refused.** A second freeze would replace the image's
+  process id and approvals while the entries beneath it still describe the first
+  turn, so a restore would resume one process into another's files.
+- **The determinism statement ships beside the verdict**, not in a doc, because
+  the reader who needs it is whoever is deciding to press Resume.
+  `DETERMINISM_CAVEATS` enumerates only what is *not* reproduced — sampling, the
+  prompt cache, wall-clock time, external effects already taken, and everything
+  outside the recorded workspace. There is deliberately no balancing "reproduced"
+  list: the conversation, the files and the approvals are reproduced *because the
+  restore refuses when they cannot be*, and a second list asserting it would be
+  prose restating a guard.
+- **"Resource reservations" is in the acceptance and not in the image, on
+  purpose.** There is no per-process resource reservation to capture: searching
+  for one finds `workflow_core`'s token-budget reservation and the daemon's
+  delivery-payload reservation, neither of which is a K7 admission hold on memory
+  or a device. A field for it would be empty in every image ever written, which
+  reads as "this process reserved nothing" rather than "this system does not
+  reserve". The field arrives when the thing it names does.
+
+**Shipped — the loop re-entry, which closes K13. It also closes a lie the
+storage half left standing.**
+
+A chat turn suspended and then carried across a restart has a `suspended` process
+row and no loop behind it. `deliverPause`'s resume arm cleared an in-memory latch
+nobody was holding and answered `"resumed"` — so the two-second sweep reported a
+resume every tick, forever, while nothing continued. The Resume button in the
+Processes panel did the same. The image existed and nothing read it.
+
+- **`freeze_impl` could not have served this, and the reason is structural.** It
+  reads a manifest, and a manifest only exists after `checkpoint_end`. So it can
+  only freeze a turn that already finished — a turn with nothing left to resume.
+  A process worth freezing is by definition mid-flight: its checkpoint is open in
+  `AppState::checkpoints` and *nothing of it is on disk*, which is exactly the
+  state a quit destroys. `freeze_live_impl` writes the manifest early, from the
+  open checkpoint, and leaves the checkpoint open.
+- **The image is written on the way *into* the park, not out of it.** The agent
+  loop's own safe point — the tool boundary the acceptance names — freezes first
+  and parks second. Writing it on the way out would write it at the one moment it
+  is already too late.
+- **The entries recorded so far travel with it, and no `after/` snapshots do.**
+  The conversation and the files have to describe the same instant; restoring
+  files from a later one would be a state the process was never in. `after/`
+  records what a turn *produced*, and this turn has not produced it yet.
+- **The turn's own end overwrites the image with `resume: None`.** A turn that
+  reached its end has nothing to resume, and an entry-less one has its directory
+  removed — taking the stale image with it. Nothing sweeps; the existing
+  lifecycle already disposes of it.
+- **`pending_approvals` is empty, and that is a fact rather than a shortcut.** A
+  cooperative loop parks at a round boundary, after the previous round's tool
+  calls and their permission prompts have resolved. There is no outstanding
+  approval to record, so `ApprovalExpired` cannot fire on this path.
+- **Resident models is the one target the app would run right now**, not what is
+  installed. `ModelNotResident`'s own words are that resuming against a different
+  model "would continue the conversation in another model's voice" — so the
+  question is what the next round trip would actually reach.
+- **A resume starts a new turn and exits the frozen row.** Re-admitting the
+  original `externalId` would put two rows on one id, and the ledger's rule is
+  that a run claimed by two rows is claimed by neither. The image is the link,
+  which is what an image is for.
+- **The image is cleared before the loop starts, not after.** Cleared afterwards,
+  it would briefly describe a turn that is already running — and the next restart
+  would offer to resume it a second time.
+- **A refused restore is answered once and the row retired.** The blockers'
+  explanations go into the session's own transcript, because the person who
+  pressed Resume is the only one who can fix a missing workspace or load a model;
+  leaving the row suspended would append that same refusal every two seconds.
+- **The determinism caveats are written into the transcript beside the
+  continuation**, which is why `checkpoint_restorability` returns them rather
+  than a doc holding them: a resumed turn is a fresh generation from the frozen
+  point, not a replay of the one that was interrupted, and the transcript is
+  where the reader is.
+
+No UI was added. Suspend and Resume already existed in the Processes panel and
+already wrote durable intent; what changed is that the resume now reaches
+something.
+
+## K14. Transactional external effects *(built)*
 
 **Today:** the rollback simulation distinguishes file, artifact,
 conversation, and external (shell/network/MCP) state and honestly marks what
@@ -2623,15 +4403,244 @@ explicit, enumerated set where none does. `needs_reconciliation` becomes the
 exception for the enumerated set, not the default answer for everything
 external.
 
+**Shipped — the enumerated set, and it closes a live bug rather than only naming
+a shape.** `RestoreSimulation.needs_reconciliation` was `manifest.shell_ran`,
+full stop. Every finer external effect — a network call, an MCP tool, a
+`remember` — was derived on the frontend from the turn's own transcript
+messages, and `checkpointReconciliation.ts`'s own module doc says why that is
+not enough: the manifest flag "survives even if the transcript's tool-call
+messages are later dropped by context compaction". That was true of `shell_ran`
+and of nothing else. **So after a compaction, a turn that made a network call
+reverted with no warning at all** — and not merely a missing one: a
+`needs_reconciliation: false` reads as "nothing outside the files".
+
+- **Recorded when the effect happens, not derived afterwards.** A closed
+  `ExternalEffectKind` — `shell`, `network`, `mcp-tool`, `memory` — written into
+  the manifest by `record_external_effect` at the moment the tool runs, so it
+  outlives the transcript it could otherwise be read from. `record_shell` is now
+  one caller of it.
+- **`Compensation` is an enum with one variant, on purpose.** Every kind is
+  `None { reason }` today, and that is the honest state rather than an
+  oversight: this app has no compensator for any of the four. Making it a type
+  rather than a bool means adding a real one — the acceptance names a Git
+  worktree revert and closing an owned draft PR — is a new variant and a compile
+  error at every match, instead of a flag somebody forgets to flip. Workspace
+  files are absent from the enum entirely because they *are* compensated, by the
+  restore plan itself.
+- **The reason is per kind, not generic.** "A shell command can change anything
+  on this machine" and "the request was already sent and cannot be un-sent" call
+  for different judgement from whoever reconciles, so the preview shows each
+  effect's own reason instead of one caveat covering all of them.
+- **One choke point on the frontend.** `turnEngine.ts` injected `checkpoint_id`
+  for the three mutating tools; it now also injects it for anything
+  `classifyExternalTool` recognises — the same classifier the transcript path
+  already used. `web_fetch`, `web_search`, `mcp_call_tool` and `remember` accept
+  it and record.
+- **`remember`'s refusal of `checkpoint_id` was corrected in place rather than
+  reversed silently.** Its doc argued that a remembered fact is not a workspace
+  file, so there is nothing to snapshot or revert. The first half is still true
+  and the conclusion no longer follows: the checkpoint does not snapshot it, but
+  it does now enumerate it, because "nothing here can undo this" is exactly the
+  fact a rollback needs.
+- **An older manifest reports what it can and does not invent the rest.** An
+  empty effect list on a manifest written before the field existed means
+  *unrecorded*, not *none*, so `shell_ran` is reconstructed into the list while
+  the other three kinds stay absent. Pinned by a test that strips the field back
+  out of a real manifest.
+
+**Shipped — the first real compensating action, and the enum was built for
+exactly this.**
+
+`Compensation` was an enum with one variant so that adding a real undo would be
+"a new variant and a compile error at every match, instead of a flag somebody
+forgets to flip". That is what happened: adding `Undo { action }` broke one
+`let`-binding, which is the whole return on having made it a type.
+
+**Memory is the one of the four this app can genuinely take back**, and the old
+reason for saying otherwise was a non-sequitur worth naming. It read "remembered
+facts are not part of the checkpointed workspace" — still true, and never the
+question. Not being *snapshotted* is not the same as not being *undoable*, and
+conflating the two left the arm reading as unrecoverable when the app already
+had `delete_fact_impl`.
+
+- **The checkpoint records which facts, not just that some.** `tool_remember`
+  notes the id and text the store actually assigned, after the write —
+  `add_fact_impl` returns the *pre-existing* fact on duplicate text, so an id
+  guessed beforehand could name a fact that was never created. Recording is
+  deduplicated by id for the same reason.
+- **The text is kept beside the id**, for the reason `redo/` keeps a file's
+  post-turn bytes: revert deletes the fact, and without the text a reapply could
+  not put it back. An undo that cannot itself be undone is data loss with a
+  friendly name.
+- **The compensator runs off the recorded list, not off the effect kind.** A
+  manifest that knows a fact was remembered but not *which* one deletes nothing,
+  because an empty list there means unrecorded rather than none — the same rule
+  `external_effects` already follows. A manifest written before this existed
+  therefore compensates nothing and says so, rather than deleting a guess.
+- **A fact already gone is not an error.** The user may have pressed Forget on it
+  themselves, and reporting that as a failed revert would send them chasing a
+  problem they had already fixed.
+- **`needs_reconciliation` narrowed on its own.** It is derived from
+  `Compensation::None`, so an effect gaining an undo drops out of it with no
+  second place to update — which is what the acceptance means by the flag
+  becoming "the exception for the enumerated set, not the default answer for
+  everything external". A turn whose only external effect was a `remember` no
+  longer reports as unreconcilable, and the preview shows what reverting will do
+  instead of colouring it as a warning nothing can fix.
+
+**Shipped — declare then commit, and it separates two things the record used to
+say identically.** Every effect was already declared *before* its call and after
+the permission gate, deliberately: a request that is permitted and then times out
+may still have reached the network, so recording afterwards would lose exactly
+the effects worth warning about. The cost of that pessimism was that the record
+could not tell a cancelled call from a completed one — a `web_fetch` the user
+stopped before a single byte left the machine reverted with the same warning as
+one that posted a form.
+
+- **The commit phase is the success path, and only the success path.**
+  `commit_external_effect` runs where the call returned: after
+  `wait_with_output`, after the fetch resolved, after the MCP server answered,
+  after `add_fact_impl` returned the fact. An error or a timeout leaves the
+  declaration standing alone, which is the safe direction — "we did not see a
+  response" is not "the server saw nothing".
+- **Three states, not a `committed` bool.** `EffectStatus::Unobserved` is what a
+  checkpoint written before this change reports, because it carries no
+  completion signal either way. Collapsing it into "declared" would make every
+  historical turn's shell command read as abandoned — a downgrade invented by
+  the reader rather than recorded by the writer, the same mistake an empty
+  `external_effects` list would be if it were trusted to mean *none*.
+- **`Option<Vec<_>>` on the manifest, for that reason.** `None` is "nothing
+  observed this", `Some([])` is "this build watched, and nothing completed".
+  A new checkpoint always writes `Some`, even when empty.
+- **Committing declares.** The two lists are a subset relation by construction,
+  so no reader that iterates the declarations can miss a kind that only ever
+  reached the commit call.
+- **Status informs, it does not excuse.** `needs_reconciliation` is unchanged: a
+  declared-but-unfinished effect is still an effect that may have landed, and
+  the preview says so in its own words rather than quietly dropping the warning.
+
+**Shipped — the second compensator, and the enumeration is now complete over the
+effects a turn can actually produce.**
+
+The acceptance names a Git worktree revert and closing an owned draft PR. **Neither
+has a caller in this app**: no chat tool creates a worktree or opens a PR — delivery
+is panel-driven (`issue_to_pr.rs`, `m5_delivery`) and never part of a chat turn's
+checkpoint. Building either would be a compensator for an effect a turn cannot have.
+So the question was answered by enumerating what a turn *can* do, and one of those
+had a real undo nobody had claimed: `spawn_task`.
+
+- **A staged chip is this app's own record with an id**, exactly like a remembered
+  fact. Nothing *runs* until the user clicks it — but the chip outlives the turn, and
+  a reverted turn that keeps proposing work is proposing it on the strength of
+  something the user took back.
+- **Ids only, no titles.** The asymmetry with `remembered_facts` is deliberate: a
+  forgotten fact must be re-*added* on reapply so its text has to survive, while a
+  withdrawn chip is only marked `dismissed` and is still in the store, so reapply has
+  an id to un-dismiss and needs nothing else. Copying the title here would be a second
+  copy that could disagree with the first.
+- **`Compensation::Undo` states what reverting does, not which process does it.** The
+  chip store is frontend state, so this compensator runs in `checkpointCompensation.ts`
+  rather than in `checkpoint_revert`. Calling an undo this app owns end to end
+  "unrecoverable" because its store sits on the far side of the IPC boundary would
+  repeat the mistake the memory arm already corrected — not being snapshotted is not
+  the same as not being undoable, and neither is not being in Rust.
+- **The compensator is attached to the operation, not to the four buttons.** All six
+  revert/reapply call sites now route through one helper; nothing outside it invokes
+  those commands. A caller that skipped it would skip the chip half, which is exactly
+  why the helper exists.
+- **The read comes before the revert**, mirroring `forget_remembered`'s own ordering:
+  the revert rewrites the manifest, and a caller reading it afterwards could find the
+  list it needs already changed.
+- **A chip the user already started is never resurrected.** That spun off a real
+  session, and reverting its status would misreport work that actually happened.
+
+`needs_reconciliation` narrowed again with no second place to update, because it is
+still derived from `Compensation::None`.
+
+**Remaining: nothing this app can reach.** The three effects without a compensator —
+shell, network, MCP — keep their own reasons, and those are unchanged and still
+honest. The acceptance's two named undos stay a `Compensation` variant away, to be
+added when a tool that produces the effect exists.
+
 ---
 
 # Phase 4 — Devices and nodes
 
-## K15. Multi-GPU as schedulable devices
+## K15. Multi-GPU as schedulable devices *(built)*
 
 **Today:** a single `gpu_layers` count. Hybrid and multi-GPU hardware is
 detected by the Hardware Compatibility Matrix and never used as more than one
 device.
+
+**Shipped — per-device memory, the split it makes possible, the refusal when a
+runtime cannot take it, and the per-device admission reservation.**
+
+The entry read as a missing feature. It was also a live bug, and finding it is
+what set the shape of the fix: `parse_nvidia_smi` **summed** each card's memory
+into one figure at the moment of detection, so two 24 GB cards became one 48 GB
+pool — the exact number that makes a 40 GB model look like it fits when neither
+card can hold it. Two surfaces had drifted apart: the Driver Doctor enumerated
+multiple devices but carried no memory, and the snapshot the planner reads
+carried memory but had summed the devices away.
+
+- **`AcceleratorDevice`, one row per card**, with its own memory, in the ordinal
+  order `--main-gpu` and `--tensor-split` index by. The aggregate stays, marked
+  display-only in its own doc — it is not a budget.
+- **The budget asks the right question.** A runtime that cannot split gets the
+  *largest single device*, never the sum. A capability that enumerated no
+  devices keeps its aggregate, because with devices unenumerated the sum is
+  indistinguishable from one device's own memory — refusing there would silently
+  drop a GPU the planner used yesterday, which a regression test now pins.
+- **`DeviceSplit` is a tagged union**, so a caller cannot read a split without
+  also reading whether there is one. A model that fits one card is not spread
+  across two: that buys cross-device traffic for nothing.
+- **Weights follow free memory**, so the smaller card is not handed a share it
+  cannot hold, and only a real split may spend the sum as its budget.
+- **The refusal is per runtime, not per split.** `llama.cpp` takes
+  `--main-gpu`/`--tensor-split`; Ollama's HTTP surface has nothing that names a
+  device, so it errors with `UnsupportedCapability` rather than dropping the
+  split — a dropped split loads the model on one card with a budget computed for
+  several and dies at load time with an out-of-memory error that names nothing
+  about the cause.
+
+**Shipped — "each device is a schedulable resource K7 reserves against
+independently."** `Resource` was `Ram | Vram`, so a second job was admitted
+against an aggregate the first may have exhausted on one card: two 24 GB cards
+read as one 48 GB pool, two 20 GB models were both admitted, and the second died
+at load time with an out-of-memory error naming nothing about the cause. That is
+the same shape as the detection bug above, one layer down.
+
+- **`Resource::Accelerator(DeviceId)`.** A shortfall names the card, and the
+  `DeviceId` carries the runtime's own ordinal — what `--main-gpu` and a position
+  in `--tensor-split` mean, not an index into any local vector. `index: None` is
+  kept as a case for a machine that advertised accelerator memory without
+  enumerating a device, on the same grounds `DeviceSplit::budget_bytes` gives:
+  inventing device 0 would make a reservation no runtime flag could honour.
+- **Claims are per device and are never summed.** `Fit::Fits` carries a
+  `Vec<DeviceClaim>` alongside the pooled `MemoryRequirement`, distributed by the
+  plan's own `DeviceSplit` — `SingleDevice` puts it on one card, `Across` splits
+  it by the same weights `--tensor-split` will receive, each rounded **up** so the
+  busiest card is never under-booked.
+- **`Never` measures against the largest single device**, so a model no one card
+  can hold is refused rather than started, even when the cards sum to more than
+  it needs.
+- **Reservations are rows, not columns.** `daemon_job_device_reservations` (V4),
+  because a column holds one device and a split model holds several. Grouped
+  `MAX` within a resident model then `SUM` across models, which is what a card
+  actually has to hold — two turns against one loaded model still pay once.
+- **Every release path covers them.** `release_reservation` deletes the device
+  rows in the same transaction as it clears the columns, and both `finish_active`
+  (the clean exit) and `reconcile_interrupted` (the crash funnel) reach it;
+  `sweep_stale_reservations` takes them too.
+- **Preemption follows the device.** `Running::claim` answers a device shortfall
+  from that device's bytes and not from the pooled figure. Otherwise a job holding
+  8 GB on card 0 would look able to relieve card 1, the victim set would pass the
+  covers-the-shortfall guard, and real work would be parked while the claimant
+  stayed held — the exact outcome the set-based rule exists to rule out.
+
+What still needs multi-GPU hardware is *confidence*, not code: the arithmetic is
+asserted against enumerated two-card fixtures, and nothing here has been watched
+against two real cards.
 
 **Acceptance:** ROADMAP #7 — an explicit per-device split chosen from the real
 hardware snapshot, the offload planner accounting for each device's own
@@ -2641,7 +4650,7 @@ against independently.
 
 *Maps to: ROADMAP #7.*
 
-## K16. Driver coverage completion
+## K16. Driver coverage completion *(built; harness route owed)*
 
 **Today:** real detection of Metal, CUDA, ROCm, Vulkan, and best-effort
 DirectML, with per-backend `available` / `not_detected` / `driver_too_old` /
@@ -2654,7 +4663,53 @@ executes on it (with a passing compatibility-harness route) or a stated
 reason it is detection-only. Apple Neural Engine and Windows DirectML each
 resolve to one of those two states rather than remaining ambiguous.
 
-## K17. Remote node as a scheduled device
+**Shipped — the gap this entry's own "Today" line named is now a typed field.**
+
+That line said "detection is ahead of use — a detected backend is not always a
+usable execution target", and **nothing in the code encoded it**. The nearest
+candidates each meant something else: `AcceleratorCapability.available` means
+"detected and reporting itself usable" and the planner read it as permission;
+`M3AcceleratorCompatibility.confirmed` means "obtained by direct query rather
+than inferred", which is a fact about the *probe*. Neither is a fact about
+*this build*, and that is the one a user needs.
+
+- **`ExecutionSupport` is a tagged union**, so a caller cannot read "it executes"
+  without also reading *what* executes on it, nor "it does not" without a reason
+  to show. `execution_support(kind)` is exhaustive over the enum: a seventh
+  backend cannot be added without answering the question for it, and a test
+  asserts neither arm is ever empty.
+- **Three of the six do not execute, and each says why differently.** ROCm has no
+  bundled archive. DirectML has no runtime targeting it, and Windows device
+  enumeration can confirm a display adapter but not a working DirectML path.
+  Vulkan is the one that reads "yes" if you skim: the bundled `sd-server`
+  genuinely uses it — **for image and video** — while no chat or embedding
+  runtime targets it and it never enters the snapshot the planner reads, so a
+  model can never be placed there.
+- **CUDA executes, with the qualification in the same breath**: no bundled
+  archive is compiled for it, so it runs on a binary the user supplied.
+- **The Neural Engine is a variant that is never detected**, and that is the
+  point. "Absent from the enum" was the third state — the ambiguous one this
+  entry asked to remove. It is now on the report with the honest answer: the
+  GGUF runtimes have no ANE backend, and reaching it would mean shipping a Core
+  ML engine rather than configuring an existing one.
+- **The Driver Doctor gained a column**, not a footnote. "Detected" and "this app
+  can use it" are different facts, and three of six are the first without being
+  the second, so folding it into the status pill would have hidden exactly the
+  case that needs explaining. The reason renders beside the summary, because the
+  summary describes the *hardware* and cannot give it.
+- **The row's field is derived from its own `kind`**, asserted by a test, so the
+  two report builders cannot drift — which is not hypothetical: the existing
+  cross-builder test caught the second list when only the first had grown.
+
+**Remaining: the acceptance's parenthetical, "with a passing
+compatibility-harness route".** The harness mocks at the runtime-driver boundary
+and never spawns a process, and its `ApiBackend` is an API family
+(`ManagedLocal`/`Ollama`/`Mlx`/`CloudProvider`) rather than a hardware
+accelerator — there is no accelerator-keyed route anywhere. Proving execution
+*per backend* means running real work on real hardware, which is a per-machine
+claim this repo's CI cannot make for any backend but its own.
+
+## K17. Remote node as a scheduled device *(built)*
 
 **Today:** a paired user-owned runner over direct/Tailscale/SSH-forwarded
 HTTPS with pinned TLS, scoped credentials, rotation/revocation, replay
@@ -2669,9 +4724,297 @@ assumed; and a node going away is a process-level failure with a defined
 restart policy (K2), not a lost run. No relay, consistent with the existing
 non-goal — placement is between machines the user owns.
 
+**Scoped, not started.** Five slices, in dependency order, each shipping
+something on its own. Written down because this is the first entry in the
+roadmap that is a subsystem rather than a task, and starting it from the
+acceptance downward is how it becomes a six-week branch.
+
+### The inversion this rests on, and it is the first decision
+
+What exists is a **remote-control plane for one runner**: the node is the
+server, the paired device is a *controller*, and the direction of authority
+runs controller → runner. Every route reflects it — approve, cancel, pause,
+resume, kill, a chat prompt, a capture, and a workflow launch that takes only
+an id the node already holds. **No route accepts a `RunSpec`, a policy, or a
+budget.** The run is authored on the node, not shipped to it.
+
+K17 needs the other direction: a scheduler holding a list of nodes it can place
+work on. That is not an extension of the control plane, it is a second plane
+beside it, and the two share only the transport (pinned TLS, signed +
+replay-proof requests, scoped capabilities, rotation/revocation) — which is the
+part already built and worth reusing untouched.
+
+**A naming trap to note before anyone greps for groundwork:** `admission.rs`'s
+`Placement` / `placement()` mean *RAM-vs-VRAM placement of model layers on the
+local box*, not machine selection. And `Reservation::Remote` is an accounting
+exemption for provider HTTP, not a node. Neither is K17 groundwork.
+
+### S1 — Node identity and capability advertisement
+
+A node can describe itself: its `HardwareSnapshot`, its runtimes, which models
+are resident, and a data-residency label the operator sets. A `nodes` table on
+the asking side; a signed read route on the answering side. `HardwareSnapshot`
+appears **zero times** under `remote/` today.
+
+*Ships alone:* Run Center can show what each paired node actually is, which is
+useful before any placement exists.
+
+### S2 — Submit a run to a node
+
+A route that accepts a frozen `RunSpec` — carrying its
+`PermissionPolicySnapshot` and `RunBudgets` — instead of a workflow id. This is
+where policy travel starts, and both types are already `Serialize` with
+`deny_unknown_fields`, so the wire shape is not the work; the receiving,
+validating and *owning* of a foreign spec is.
+
+*Ships alone:* an operator can start real work on a node, which today they
+cannot.
+
+### S3 — The node enforces what it received
+
+**Not optional, and not a slice that may be deferred behind S2.** A policy that
+travels and is not enforced is worse than one that never travelled: it reads as
+a guarantee. `egress.rs`'s `RunEgressPolicy` is a process-global `OnceLock`
+source that resolves a run id against the **local** ledger, so a foreign run's
+policy has to be installed locally *before* the run starts or the allowlist
+silently covers nothing. Same for `RunBudgets` and the daemon's own
+`max_runtime_ms` / `max_memory_bytes`.
+
+*Acceptance for this slice alone:* a run placed with a host allowlist is
+refused by the node when it reaches outside it, proven by the node's own denial
+record — not by the submitter's.
+
+### S4 — Liveness, and what a vanished node means
+
+There is no heartbeat, no reachability probe, and no failure semantics, because
+there is no placed work to lose: `ProcessKind::RemoteRun` is
+`RestartPolicy::Never` and terminal from birth, and its doc says why — *"a
+remote run records that a remote controller asked for work, not the work
+itself."* That is correct today and stops being correct the moment S2 lands.
+
+Needs: a heartbeat, a real restart policy for the placed process, and a
+"node vanished" arm on `reconcile_interrupted` — which today handles a dead
+child, a lapsed lease and a restarted daemon, and routes to `Queued`,
+`NeedsReconciliation`, `Cancelled` or `Failed`.
+
+### S5 — Placement in the scheduler
+
+Only here does `rank()` gain a *where* axis. `Candidate` has no node, host or
+device field, and neither does `Running`; `rank` sorts in place by six keys and
+`fit` reserves against one machine's snapshot.
+
+**Decide this before writing it — the acceptance contains a collision.** It asks
+for placement by *measured throughput*, and the benchmark surface is built on
+the opposite invariant: **"no number is displayed that was not measured on the
+machine displaying it"**, with `BenchmarkFreshness::DifferentMachine` existing
+precisely to refuse another machine's numbers. Two honest ways out:
+
+- **Place by capability and the node's own admission verdict only**, and say
+  throughput is not an input. Cheap, needs no change to the benchmark's
+  invariant, and is very likely enough — a node that admits the job can run it.
+- **Import the node's measurement tagged with its own `MachineIdentity`**, and
+  keep it out of every surface that displays local numbers. Strictly more
+  faithful to the acceptance and strictly more machinery.
+
+The first is the recommended start. The second is an upgrade with a stated
+trigger: when two nodes both admit a job and the choice between them measurably
+matters.
+
+### What none of this can prove here
+
+Every slice past S1 needs **two machines**. Nothing in this repo's CI has a
+second node, so the honest bar is: pure functions (ranking, capability
+matching, policy validation) unit-tested, and the wire path exercised against a
+loopback node in an integration test that is explicitly *not* a substitute for
+two real hosts. State that in the PR rather than letting a green run imply it.
+
+### Built
+
+**The second plane exists.** `node_placement.rs` is the contract and the four
+decisions — does a node qualify, which qualifying node wins, is a node alive,
+and what a vanished node means for the work on it — with no I/O and no Tauri, so
+both binaries read the same rules and every rule is testable on one machine.
+The transport is reused untouched: pinned TLS, signed and replay-proof requests,
+scoped capabilities, rotation and revocation.
+
+- **S1.** `GET /v1/remote/node` answers with the `HardwareSnapshot`, the
+  backends, the resident models, and an **operator-set** data-residency label
+  (`monkey daemon remote node-label`). Nothing infers residency; an unset label
+  is `unspecified` and never satisfies a rule naming a real zone. Each backend
+  carries K16's `execution_support` rather than the detector's `available`, so a
+  node that merely *detects* ROCm advertises exactly that and is refused for a
+  run requiring it. `GET /v1/remote/node/health` is the cheap half, because a
+  placer polling every node every 30 s must not make each one fork `nvidia-smi`.
+- **S2.** `POST /v1/remote/node/runs` takes a frozen `RunSpec`. The node mints
+  its **own** run id — adopting a foreign one would let a submitter choose a
+  local identity — and both ids travel back. It re-checks the residency rule and
+  the runner identity rather than trusting the placer's word, and a spec it has
+  already placed resolves to the same placement instead of a second run.
+- **S3.** The travelled policy is enforced, and two things had to be true for
+  that. The spec's `PermissionPolicySnapshot` and `RunBudgets` ride verbatim in
+  `recipe.placed_run`, because a recipe has nowhere to put an egress allowlist
+  and a re-derived policy would silently be the *node's*. And
+  `monkey-cli task run` now installs an egress policy source from the spec it
+  froze and runs the turn inside `RunScope::run` — before this, a frozen
+  allowlist was enforced in the desktop app and ignored in every headless run,
+  placed or local. `bypass` is refused on arrival: a placed run is unattended
+  here by definition.
+- **S4.** The placing daemon heartbeats every node it has placed work on, every
+  `HEARTBEAT_INTERVAL_MS`, from its own serve loop — every machine is both a
+  node and a placer, so there is no separate controller process to put it in.
+  Three missed beats drop a node from ranking; ten declare its work lost.
+  Re-placement is **not** automatic: a vanished node's run may have completed
+  its external side effects and this machine cannot know, which is the same rule
+  `reconcile_interrupted` already holds to for confirmed mutations.
+- **S5.** `select_node` places by capability and the node's own admission
+  verdict, and **says that measured throughput is not an input**. That is the
+  documented resolution of the acceptance's collision with the benchmark
+  surface's invariant — no number is displayed that was not measured on the
+  machine displaying it. The upgrade has a stated trigger rather than a plan.
+
+**All three targets place, both inventories are advertised, and Run Center
+shows it.** The first cut of this entry shipped with three stated gaps; they are
+closed, and each is worth a line because the fix was structural rather than a
+flag.
+
+- **A `ManagedLlama` placement runs.** The gap was real: `RecipeTarget` had no
+  managed-runtime option, and the reason it could not simply reuse `local_url`
+  is that the managed runtime *is not listening* — it starts on a fresh loopback
+  port when the run starts, so any origin written at placement time would be
+  wrong by the time it ran. `RecipeTarget::managed_model` is that fourth,
+  mutually-exclusive option: it names a model id, the receiving node resolves it
+  against **its own** hub inventory (never the spec's `model_path`, which is a
+  location on the submitter's disk), and the executing process starts the app's
+  own verified `llama-server` for exactly the life of the run. A node without
+  that model refuses by name instead of failing at spawn. Hand-authored recipes
+  gain the same target, which was a genuine gap independent of placement.
+- **`resident_models` covers Ollama too.** Omitting it was not cosmetic:
+  `select_node`'s strongest key is "the model is already resident", and a node's
+  Ollama models are precisely the local weights a placement wants to avoid
+  re-pulling — so a whole class of placements ranked as if every node were cold.
+  The handler is synchronous, so the listing runs under `block_in_place`, guarded
+  on the runtime flavour; no runtime, or an Ollama that is not running, degrades
+  to hub-only rather than failing the description.
+- **Run Center shows the nodes and the placements**, with each node's liveness
+  and each placement's *deciding key* — why that node, not only which one. It is
+  read-only by design: placing a run means authoring a frozen `RunSpec`, and a
+  button that quietly composed one would invent the policy S3 exists to protect.
+  The two actions are the two that only ask — re-describe, and re-read.
+
+The CLI remains the full surface (`node-label`, `node-refresh`, `node-list`,
+`place`, `placements`, `placement-sync`).
+
+**And what a green run here does not mean.** Everything past S1 needs two
+machines. The routes are exercised through the real signed-request choke point —
+signature verification, replay reservation, capability gate — with a fake
+placement queue, and the enforcement of a travelled allowlist is proven end to
+end *within one process*. Neither is a substitute for two real hosts, and no
+test here claims to be one.
+
 ## K18. Live migration
 
-**Today:** nothing. Requires K13 and K17.
+**Shipped.** `monkey daemon remote migrate <alias> --checkpoint <id>` moves a frozen
+process image to a paired node, that node refuses it when it cannot satisfy the
+process's requirements, and the move is one hash chain across both machines.
+
+**The inversion K18 makes, and it is the one decision everything else follows
+from.** K13's image *references* rather than copies — the conversation is in the
+profile store, the files are in the checkpoint's entries, an approval is a
+`permission_decisions` row — because on one machine a second copy could only
+disagree with the first. Across two machines there is no first copy to disagree
+with: the target has none of the workspace, none of the backups, no session and
+no run row. So `migration::MigrationImage` copies exactly where K13 points, and
+that is why it is a separate type rather than another field on the manifest.
+
+- **The refusal is K13's, reused rather than restated.** `admit` calls
+  `checkpoints::restorability` and adds only what is specific to a *move*:
+  `ProtocolUnsupported`, `RuntimeMissing`, `RunAlreadyPresent`, `ImageTooLarge`,
+  `DataResidencyRefused`. `WorkspaceGone` is deliberately unreachable — the image
+  carries the workspace, so the target creates it and it cannot be the thing that
+  is missing. Every blocker is reported at once, for `restorability`'s reason
+  doubled: across two machines each round of "fix one, discover the next" is a
+  transfer.
+- **A preflight refuses before a byte of workspace crosses.**
+  `POST /v1/remote/node/migration/preflight` answers from the header alone. It is an
+  optimisation and never the authority: `accept` runs the *same* `admit` against
+  the same header, because a target that trusted a preflight would be trusting
+  the sender's copy of facts about itself.
+- **The cross-node chain is a hash inside a hashed envelope, not a column.**
+  `run_events` chains per run on one machine, and no database spans both. The
+  origin appends `MigrationDeparted`; its event hash *is* the origin's tip; the
+  target's first event is `MigrationArrived`, which names that hash. Because
+  `envelope_json` is already covered by `event_chain_hash`, the seam cannot be
+  edited on the target without breaking the target's own chain.
+  `join_migration_chain` is what an auditor holding both halves runs, and it is a
+  tagged union so "joined" cannot be read off a chain that does not meet.
+- **The departure is appended before the image is sent, and a refused departure
+  stays in history.** The arrival has to name a tip that already exists. A
+  departure is therefore an *attempt*: it is not terminal and changes no status,
+  so a run the target refused carries on at home — and only the chain *tip* may
+  anchor a join, so a superseded departure cannot be passed off as a handover.
+- **Landing aims at the desktop's own K13 re-entry, and adds no second resume
+  path.** `frozenTurn.ts` already resumes a frozen turn: it finds the checkpoint
+  whose `resume.process_id` matches a suspended `chat_turn` row and continues the
+  conversation. So landing writes exactly the three places that path reads — the
+  checkpoints directory, `chat_sessions.json`, and `agent_processes` — with every
+  path re-rooted at the local workspace and `resume.process_id` rewritten to the
+  *local* row. A manifest whose entries cannot be re-rooted is refused rather
+  than landed half-translated. Paths are re-rooted as *native* paths, which is
+  also the honest limit on a cross-OS move: an image whose entries are Windows
+  paths cannot be re-rooted under a POSIX workspace, and that is refused rather
+  than half-translated.
+- **Policy travels because the frozen `RunSpec` is what the target inserts.**
+  Its `PermissionPolicySnapshot` and `RunBudgets` go into the target's own
+  ledger unmodified, which is what `egress.rs` then resolves by run id — the run
+  is governed on the new node by what the origin declared, not by the target's
+  defaults. This is K17's S2/S3 as far as a migrated run needs them.
+- **`MIGRATION_CAVEATS` ships beside the verdict**, appended to K13's
+  `DETERMINISM_CAVEATS`, for the same reason K13 gives: the reader who needs it
+  is whoever is deciding to press Migrate. It names only what is *not* preserved
+  — the machine changed, absolute paths moved, nothing outside the workspace
+  travelled, credentials were never in the image, and the origin still holds its
+  copy.
+- **It sits on K17's placement plane rather than beside it.** A migration *is*
+  a placement — a `RunSpec` this node did not author — plus the frozen image
+  that turns it into a continuation, so the routes are
+  `POST /v1/remote/node/migration/{preflight,accept}`, the target is chosen from
+  the `GET /v1/remote/node` descriptor K17 already serves, and admission reads
+  that descriptor rather than probing a second time. There is no second node
+  route, no second residency rule and no second hardware probe.
+- **`Migrate` is its own capability and requires `place_runs`.** Folding it into
+  `place_runs` would have been smaller and wrong: placing a run submits a spec
+  the node executes under its own workspace and its own conversation, while a
+  migration additionally writes a workspace tree, a checkpoint and a
+  *conversation* onto the machine — into the same session list the local user
+  reads. An operator who wanted a scheduler to place work did not thereby agree
+  to transcripts appearing in their chat history.
+- **Residency is K17's rule, unchanged.** The origin states the residency it
+  required and the node checks it against its own label rather than trusting it,
+  because a rule only the sender enforces is not enforced — and across two owned
+  machines an alias really can start pointing at a different host.
+
+**One honest widening, stated because it is a real difference from K13.** The
+node descriptor's `resident_models` is the managed hub's installed inventory. K13's
+`ModelNotResident` asks what the next round trip would reach, which on the
+machine running the turn is what is loaded; a target is idle by definition, so
+asking the same question there would refuse every migration to every idle node.
+What a target can promise is that the model is here and will load; what it still
+refuses is a model it does not have at all.
+
+**One unrelated bug this had to fix to be usable at all.** `pair-create` took
+`--workspace` for a workspace *id* while the CLI's global `--workspace` is a
+filesystem path declared `global = true`, so the two collided on clap's own
+uniqueness assert and the subcommand aborted before parsing anything. It is now
+`--workspace-id`. Nothing could have depended on the old spelling: the command
+panicked.
+
+**What none of this proves.** Every path past the image itself needs two
+machines, and this repository's CI has one. Pure functions — admission, the
+chain join, path re-rooting, digests — are unit-tested; the wire path is
+exercised end to end against a **loopback node** through the real signed
+transport, the real routes, the real ledger and real files on disk. That is not
+a substitute for two hosts: nothing here exercises a network, clock skew between
+machines, or a partial transfer.
 
 **Acceptance:** a frozen process image moves to another owned node and resumes
 there, with a stated list of what does not survive the move and a refusal when
@@ -2684,12 +5027,74 @@ as a single ledger event chain across both nodes.
 
 ## K19. Versioned syscall ABI
 
-**Today:** 490 `#[tauri::command]` entry points, a large agent tool surface
-(`tools.rs`), an OpenAI/Anthropic/Ollama-compatible HTTP surface with a real
-route-level regression harness (`m3_compatibility_harness.rs`), and ACP v1
-over stdio. The HTTP and ACP surfaces are contracts; the internal command
-surface is not versioned, and the tool schemas are not published as a
-standalone artifact third parties can build against.
+**Shipped.** `contract/agent-os-contract.json` is a semver'd description of
+every externally reachable route, the signed remote plane, the ACP methods and
+the agent tool schemas; `GET /v1/contract` answers with the version, the digest
+and the manifest itself; and CI fails when the surface changes and
+`CONTRACT_VERSION` does not. `docs/contract-abi.md` is the policy and the
+publishing procedure.
+
+**The decision the whole entry follows from: generated means read from the
+table the running code dispatches from, not written next to it.** A published
+contract that is a second copy of the surface is worth less than no contract,
+because it is believed. So the HTTP section is built from
+`http_route_registry::ROUTES` — the same const the listener classifies against
+— and the tool section from `agent_tools.rs`, which is `tools_def.rs`'s
+definitions *moved into the library* rather than duplicated there. That move is
+the reason the contract can be generated at all: the schemas were in a binary
+crate the library cannot read, so publishing them would have meant hand-copying
+them into the generator. `tools_def.rs` now re-exports, and there is still
+exactly one definition of each tool.
+
+- **The two surfaces a table could not be read from are scanned out of their
+  own source.** The remote plane (K10–K18) dispatches from a 26-arm `match` and
+  ACP from another; turning either into a data table would have been a large
+  refactor of a working security boundary for a documentation benefit. Instead
+  `contract::REMOTE_ROUTES` and `contract::ACP_METHODS` are declared, and a test
+  in each of those files parses its *own* dispatch match — method, path shape,
+  and the exact `RemoteAction`/`DeviceCapability` variant each arm requires —
+  and fails on any disagreement. It is `egress.rs`'s bare-client ratchet applied
+  to a different defect of the same class. It earned itself immediately: the
+  first run found two routes whose grants had been recorded from memory
+  (`/events` requires `ViewEvents`, not `ViewRuns`; artifacts require
+  `ReadArtifacts`), which is exactly the drift a hand-maintained table produces.
+- **Two files, because one cannot gate anything.**
+  `contract/agent-os-contract.json` is regenerated from the code, so it always
+  tracks it; `contract/baseline.json` is what was last *published* and only
+  changes when a human publishes. With a single file, regenerating it would
+  silently accept the breaking change along with the edit that caused it. The
+  gate diffs the two, classifies every difference, derives the smallest version
+  that covers them, and fails naming the required version and each change that
+  forced it.
+- **The bump rules are executable rather than advisory.** Removing a route,
+  moving it, dropping a tool parameter, making one required, re-grading a remote
+  route's grant, changing a protocol version, or shortening the support window
+  are `Breaking`; additions and relaxations are `Additive`; wording is `Patch`.
+  A reviewer never has to decide which one an edit was.
+- **`GET /v1/contract` answers before authentication, on both listeners**, for
+  the reason `/health` does: a client negotiating an ABI has not necessarily got
+  a credential of the right shape yet, and one whose shape changed must still be
+  able to find out. The body is a pure function of the built binary — no
+  configuration, no model list, no credential state — and carries the whole
+  manifest, so a client needs neither a second request nor a shipped copy. The
+  endpoint is itself in the contract it publishes.
+- **The support window is a number in code.** 180 days from the release that
+  announces a deprecation, with removal a major bump on top of it, because K20's
+  resolver has to answer "is this still here next quarter?" without a human
+  reading a policy page.
+
+**What v1 does not publish, stated because it is a real limit.** The six
+desktop-only tools (`spawn_task`, `shell_output`, `shell_kill`, `skill`,
+`read_skill_resource`, `generate_image`) are defined in TypeScript and are not
+in the contract; a vitest pins that list *and* compares every published tool's
+schema against `tools.ts`, so the set cannot grow silently and the two surfaces
+cannot disagree about what a tool's arguments are. Descriptions deliberately
+differ per surface (the desktop tells the model about multi-root workspaces;
+the CLI has one root), so the drift test compares schemas rather than prose.
+The ~490 Tauri commands remain absent by design — they are the app's own
+webview IPC, and `DENIED_SURFACES`, published in the manifest, is the
+machine-readable statement that no HTTP caller reaches an agent, workspace,
+tool, file, git, MCP or recipe surface.
 
 **Acceptance:** a published, semver'd schema set for the agent tool contract
 and every external route, generated from the source of truth rather than
@@ -2697,16 +5102,22 @@ hand-written; a deprecation policy with a stated support window; an
 introspection endpoint that reports the contract version a running instance
 implements; and a CI check that fails on an unversioned breaking change.
 
-**Blocks:** K20, K21.
+**Blocks:** nothing now. K21's conformance suite consumes this directly: its
+attestation carries `contract::manifest()` verbatim rather than deriving a
+second route table, and `contract.abi_version` reads `GET /v1/contract` as a
+client would and fails when the two published surfaces of one instance
+disagree about the version, the manifest digest, or the support window. K20's
+hard gate still ships against `AGENT_CONTRACT_VERSION`, a number this crate
+declares alongside the schema set that documents it.
 
-## K20. Package dependency resolution
+## K20. Package dependency resolution *(built)*
 
 **Today:** signed declarative packages with install/update permission
 previews, pins, enable/disable, rollback, revocation state, uninstall, offline
 cache, and portable export/import — plus digest-approved skills that fail
 closed on symlinks, mutable refs, command collisions, oversized trees, and
-unmet OS/binary/environment requirements. Each package is resolved on its own;
-there is no dependency graph between packages and no compatibility gate
+unmet OS/binary/environment requirements. Each package was resolved on its own;
+there was no dependency graph between packages and no compatibility gate
 against the contract version.
 
 **Acceptance:** declared inter-package dependencies with version constraints,
@@ -2715,9 +5126,64 @@ a generic failure, detection of two packages claiming the same command or
 tool, and a hard gate on the K19 contract version so a package built against
 an older ABI is refused with the version it needs.
 
-## K21. Conformance suite
+**Shipped — `resolve_install` in `package_ecosystem.rs`, on the path every
+install already takes.**
 
-**Today:** the M3 compatibility harness spins up the real server and
+- **`dependencies` and `compatibility.contract` are manifest fields that
+  cannot change a byte of an existing signing payload.** Both are
+  `#[serde(default, skip_serializing_if = …)]`, so a manifest that declares
+  neither serializes exactly as it did before they existed. That is not a
+  style choice: the shipped first-party catalog's ten Ed25519 signatures are
+  over those exact bytes and are hardcoded hex, so any field that serialized
+  unconditionally would have invalidated the release catalog on first launch.
+- **An unsatisfiable set is a typed `DependencyProblem`, not a message.** Each
+  variant carries the ids, every accumulated constraint *with the package that
+  imposed it*, and the versions that actually existed — so the refusal reads
+  "no version of `…skill.review` satisfies `…assistant → >=2.0.0`; available:
+  1.0.0" rather than "install failed". The same values render in the install
+  dialog and in `PackageError::Unresolvable`, because both come off the plan.
+- **Constraints accumulate and selection re-runs until it is stable.** A
+  worklist re-selects a package whenever a new requirer narrows it, which is
+  what makes a two-requirer conflict a *conflict* rather than whichever
+  requirement happened to be walked first. Constraints only ever grow, so it
+  converges; `MAX_RESOLUTION_ROUNDS` is a runaway guard and reports itself
+  rather than silently truncating a set that would have failed.
+- **A dependency is resolved, never fetched.** Acquiring a package is its own
+  trust decision — signature, registry catalog match, permission preview — so
+  a missing dependency is reported with an install order, not downloaded
+  behind the approval the user gave for something else. It also keeps the
+  approval honest: nothing installs permissions the previewed diff did not
+  show.
+- **Collision detection keys by what the runtime keys by.** `skill_command`
+  now has one implementation, in `package_ecosystem.rs`, used by the resolver,
+  the runtime skill table and the plugin health view alike — a collision found
+  at install time is the same ambiguity `active_skills` would have refused at
+  run time. Connectors claim their slug rather than each operation id, because
+  the slug is what OAuth binding and every operation address live under.
+- **An assistant's `skill_package_ids` resolve as unconstrained
+  dependencies.** They already *were* dependencies — the plugin health view
+  reported them missing after install — so the composition is now checked
+  before the install rather than diagnosed after it, with no new field for a
+  publisher to remember.
+- **Disabled is not satisfied.** An installed-but-disabled or revoked package
+  cannot satisfy a requirement, because nothing loads it; disabling a
+  dependency makes the next resolution of its dependent fail by name.
+- **The contract gate sits in `verify_package`, not only in the resolver**, so
+  an import cannot walk past it — a bundle declaring a contract this build
+  does not implement is refused at verification with the range it needs.
+  `AGENT_CONTRACT_VERSION` lives in `package_ecosystem.rs` until K19 generates
+  the schema set that documents it; K20 needs the number, not the schemas.
+
+**What this does not do.** It does not fetch, and it does not auto-install a
+resolved dependency: the plan names what to install and in what order, and the
+user installs each one through the same preview. There is no downgrade path
+either — the store only moves a package forward — so a requirement that could
+only be met by an older version than the one installed is reported as
+unsatisfiable rather than quietly rolling back.
+
+## K21. Conformance suite *(built)*
+
+**Was:** the M3 compatibility harness spins up the real server and
 exercises every advertised route, and Runtime Hub → Compatibility shows a
 live per-route/per-backend/per-model status derived from the same capability
 state that gates real requests. That certifies *this* implementation. There is
@@ -2731,19 +5197,174 @@ against the live pipeline rather than a mirror of it, reports which optional
 sections an implementation skipped, and a "compatible" claim means a named
 suite revision passed.
 
-**Blocks:** the word "OS" in the strongest sense — an OS is a specification
-other people implement against, not a single binary.
+**Shipped.** `docs/conformance-suite.md` is the specification; `conformance.rs`
+is the catalog, the attestation, the runner and the verdict rules; and
+`monkey-cli conformance --base-url … --token …` is the thing a third party
+actually runs. Exit `0` means compatible with the named revision, `1` means
+not — the CI contract. The same run is in the desktop app under Runtime Hub →
+Compatibility, and over IPC as `run_conformance_suite`. All three call one
+function, so there is no second implementation that could disagree.
+
+- **It runs against the live pipeline because it has no other way in.** The
+  runner is a `reqwest` client and a base URL. It never constructs a hub, never
+  imports a handler, and never opens the ledger — the only thing it can do is
+  send requests to whatever is listening. `tests/conformance_suite.rs` starts
+  the real `run_cli_server_with_m3_hub_and_endpoints` accept loop over a real
+  run ledger in a temp data directory and calls the same `run_suite` the CLI
+  calls; the only fakes are the two loopback *runtimes*, following
+  `legacy_route_compatibility.rs`'s convention, because no model process exists
+  in CI and the boundary being mocked is a model rather than the HTTP, auth,
+  routing or ledger layers being graded.
+
+- **`GET /v1/conformance` is the attestation, and it is loopback-only.** A
+  node publishes what it implements — the route table, the denied-capability
+  list, whether it requires a token, which optional sections it claims — plus
+  the live evidence a run checks those claims against: the isolation mechanism
+  this machine can actually apply (a probe, not a `cfg!`), the limits it
+  enforces, and the current head of its subsystem chain. The route is
+  `RouteFamily::LegacyHost`, so `owner_for` refuses it on a LAN exposure
+  without a second check having to remember to; a LAN caller gets
+  `Denied(LoopbackOnly(Conformance))`. The attestation carries isolation
+  posture and chain hashes, and nothing about a conformance run needs to be
+  readable from the network.
+
+- **The four sections, and why exactly one is required.** `contract` (K19) is
+  required: an implementation that cannot answer for its own route surface is
+  not implementing the contract at all. `isolation` (K3), `limits` (K4/K5) and
+  `ledger` (K12) are optional because they name guarantees a node may honestly
+  not offer — a runtime driver inside someone else's process has no sandbox of
+  its own to attest, and a listener with no ledger has nothing to prove
+  append-only about.
+
+- **Three ways a section can fail to run, kept apart.** `skipped` (the node did
+  not claim it, or the caller did not select it) never counts against a node,
+  and is named in `skippedOptionalSections` in both output formats. `failed` is
+  a check that ran and disagreed. `incomplete` is the state that exists because
+  of the failure mode this whole item is about: every check that ran passed,
+  *because most of them never ran*. A required section that is incomplete is
+  not compatible. A node with no models loaded lands there — the two inference
+  checks skip — and reports "not compatible", because a compatibility claim
+  that never exercised inference is not one.
+
+- **`ledger.append_only` is checked over the wire, not asserted.** Take the
+  chain head; perform an action the node records; ask for the links after the
+  head you saw. The first must name your head as its predecessor and each link
+  must name the one before it, so a rewrite between the two reads is visible to
+  a caller who holds nothing but two HTTP responses. Reading the attestation is
+  itself a recorded action — deliberately not filtered out the way `GET
+  /v1/models` is, and the reason is written at the handler: asking a node to
+  vouch for itself is the request that precedes a claim about the machine, and
+  it is the one recorded action the suite can perform against *any* node,
+  including one with no model. Hashes only ever leave the ledger; `detail_json`
+  can hold the user's own text and is covered by the chain, so it is permanent.
+
+- **A kernel without a boundary is a skip, not a failure.** `sandbox_enforcement()`
+  is a probe, so a Linux kernel built without Landlock, or a container whose
+  policy blocks the syscall, answers `ProcessOnly` — and such a node does not
+  *claim* the isolation section. It reports a named skip. Claiming it and then
+  failing `isolation.mechanism` would report a Landlock-less kernel as a defect
+  in the software running on it, which is the wrong finding. Where the section
+  does run, `isolation.denied_surfaces` probes every path in the node's own
+  denied-capability list and requires 404 from each — indistinguishable from
+  unknown, so the surface is not even enumerable.
+
+- **`limits.oversized_body` requires 413 specifically**, not "any 4xx". A 400
+  would be a refusal of the *content*, and a client could not tell a too-large
+  body from a malformed one. Making that check possible meant the 32 MiB cap —
+  which had been declared twice, once per listener — moving to
+  `http_policy::MAX_REQUEST_BODY_BYTES`, since a value a client is told and a
+  value a listener enforces must be one constant.
+
+- **The contract it grades is K19's, not a second copy of it.** The attestation
+  carries `contract::manifest()` verbatim — the generated one, read from
+  `ROUTES` and the tool definitions the running code dispatches from — because
+  a conformance attestation that re-derived the route table would be exactly
+  the believable-but-wrong artifact K19 exists to prevent. On top of that,
+  `contract.abi_version` fetches `GET /v1/contract` the way a client
+  negotiating an ABI would and compares it against the attestation: version,
+  manifest digest and support window. One instance publishing two surfaces that
+  disagree about which ABI it implements is a defect a client discovers the
+  hard way, and no check that reads only one of them can see it. Adding
+  `/v1/conformance` to `ROUTES` moved the generated manifest, so K19's gate
+  refused the commit until `CONTRACT_VERSION` went to 1.1.0 and the baseline
+  was republished — which is the gate working, on the first outside change to
+  land after it shipped.
+
+**Blocks:** nothing. There is a specification, a runnable suite behind it, a
+claim that names a revision, and a versioned ABI underneath it that the suite
+checks an instance against. An OS is a specification other people implement
+against; this is now the thing they run to find out whether they did.
 
 ## K22. Verified boot and updater
 
 **Today:** the in-app updater ships on all three desktop platforms and releases
-publish themselves once every matrix target has uploaded; rollback, a manual
-check control, a visible failed check, and Linux coverage beyond the AppImage
-are still missing. Signing is macOS-only. Managed runtime components install
-with digest verification and macOS notarization codesigning, and installed
-models carry content-addressed, digest-verified manifests that never trust a
-corrupt local copy for reuse. Ten locales are each missing ~650 of 1,726 keys.
-No dependency scanning, SBOM, accessibility CI, or penetration test.
+publish themselves once every matrix target has uploaded. Rollback exists on
+every platform (`update_rollback.rs`: one snapshot of the install taken before
+an update replaces it, restored by a detached script that waits for this
+process to exit), and Settings → Updates & integrity carries the manual check,
+the last check time, and the failure a background check keeps quiet. A Linux
+install the updater cannot replace — anything that is not an AppImage — is
+reported as such rather than failing silently. **The startup self-integrity
+check is in** (`self_integrity.rs`): the app's own code signature plus every
+file of every managed runtime against the trusted manifest digest compiled into
+the binary, computed once per process and consulted by every path that resolves
+a native binary (`llama.rs`, the Studio image/video and speech engines,
+`monkey-cli`). A mismatch refuses to load them; "cannot verify" — an unsigned
+source build, a developer runtime override, a tree staged with no trusted
+digest — is reported honestly and does not refuse, because treating absence of
+evidence as evidence of tampering would make the app unrunnable from source.
+Managed runtime components install with digest verification and macOS
+notarization codesigning, and installed models carry content-addressed,
+digest-verified manifests that never trust a corrupt local copy for reuse. CI
+runs dependency review plus Rust/npm advisory audits and publishes a CycloneDX
+SBOM, attached to each release as an asset.
+
+**Shipped since — the three CI-shaped gaps.**
+
+- **An accessibility audit in CI** (`src/lib/a11yAudit.ts`), over the built
+  shell and over rendered screens, in the existing frontend job. It is a
+  **named rule set, not a WCAG audit, and says so**: eleven rules, each
+  decidable from the DOM alone and each a defect this codebase can actually
+  introduce — an icon-only button one `aria-label` away from being unusable is
+  the one it exists for. Contrast, focus order, live-region timing and reading
+  order are *not* covered and are stated as not covered. axe-core is the better
+  tool; it needs a browser in CI, which is a larger change than the check
+  itself, and the upgrade path is to swap `auditDom`'s body for `axe.run` with
+  the call sites and the job unchanged.
+- **A clean-machine install/upgrade smoke test** in release CI, between the
+  build matrix and publish, so a release that cannot be installed is never
+  published. It unpacks the real `.deb`/`.dmg`/NSIS payload into a scratch
+  prefix, asserts the binaries a user would get are there, runs the installed
+  CLI and compares its version to the release, then installs over the previous
+  release and asserts a file under the data directory survived. **Every leg
+  reports PASS, FAIL, or SKIPPED with its reason** — a hosted runner cannot
+  exercise an MSI without elevation, and the first release ever has nothing to
+  upgrade from, so "not covered here" is often the honest answer and is written
+  to the job summary rather than left as silence. Only a real failure is fatal.
+  What extraction does *not* cover — post-install scripts, registry and desktop
+  entries — is named in the runner rather than implied to be tested.
+- **The locale key sets are equal, and now enforced.** The gap was not ~650: it
+  had grown to **1,468 keys per locale across ten locales** while `keyLint`'s
+  warning printed on every run, because a warning is not a gate. Each locale now
+  spreads `en` as its base, so the sets are identical *by construction* rather
+  than by a batch pass that would drift again by the next feature. No
+  user-visible text changes — `useT()` already fell back to English for a
+  missing key — and there is no bundle cost, because `index.ts` imports `en`
+  unconditionally as that fallback. `localeSync.test.ts` then holds three
+  properties as a **failing** check: identical key sets, identical
+  `{{placeholder}}` sets per key (a dropped brace renders as literal text and is
+  invisible to everyone who does not read that language), and no empty values.
+  Completing the sets did not hide the real gap: each locale exports the keys it
+  genuinely translates, so coverage is an exact number rather than one inferred
+  from "the string differs from English" — which plenty of real translations do
+  not.
+
+**Still open:** signing beyond macOS (Windows needs a code-signing certificate
+this project does not have; Linux has no OS-level binary signature to verify,
+which is why the integrity check reports the runtime digests as the whole of
+the evidence there), a release penetration test, and the translation of those
+1,468 keys per locale — the key sets are complete and enforced, the *words* are
+still English, and the coverage number says so.
 
 **Acceptance:** ROADMAP #8 in full, plus a startup self-integrity check that
 verifies the app's own binary signature and the digests of every managed
@@ -2752,7 +5373,7 @@ refusal to load rather than a warning.
 
 *Maps to: ROADMAP #8.*
 
-## K23. Local multi-profile identity
+## K23. Local multi-profile identity *(built)*
 
 **Today:** `profile_store.rs` handles profile payloads, migration, and scoped
 global search; credentials live in the OS keychain; the app is otherwise
@@ -2766,22 +5387,169 @@ test that asserts one profile cannot read another's artifacts, credentials, or
 run history. This is local isolation only; it does not introduce a hosted
 identity plane and does not conflict with the stated non-goal.
 
-## K24. Configuration and definition versioning
+**Shipped — the boundary is the data root, not a predicate.** `profiles.rs`
+owns one rule: a profile *is* a directory, and every store in this app —
+the run ledger, the artifact store, sessions, prompts, stacks, the package
+set, the daemon's queue and its snapshots — is a file under it. So "one
+profile cannot read another's run history" holds for the same reason it cannot
+read an unrelated SQLite file on the disk, and there is no shared table on
+which a `WHERE profile_id = ?` could be forgotten. The alternative — one
+database with an owner column — was rejected on exactly that point: it makes
+isolation a property of every query ever written rather than of the layout.
 
-**Today:** last-write-wins for prompts, personas, skills, and workflow
-definitions. Only marketplace packages have a diff view.
+**The chokepoint is a single path resolution, and that is why the diff reaches
+every subsystem.** The desktop asked Tauri for `app_data_dir()` in 63 places
+and `monkey-cli` asked `app_paths::data_dir()`; both now resolve through the
+active profile (`ProfileScopedPaths::profile_data_dir` and `data_dir`
+respectively), so a store added next year is profile-scoped by construction
+rather than by remembering. The registry itself lives at the *unscoped* base —
+it is the file that decides which root the rest resolve to, so it is the one
+thing that cannot live inside one.
 
-**Acceptance:** ROADMAP #3 — local revision history with diff, restore, and
-branch/compare; concurrent edits detected and surfaced rather than silently
-overwritten. In OS terms this is a versioned system configuration store, and
-it is what makes a scheduling or policy change auditable after the fact.
+**The default profile keeps the legacy layout, so nothing is migrated.**
+`default` resolves to the app data directory itself and every other profile to
+`<app data>/profiles/<id>`. An existing installation *is* the default profile
+on first launch after upgrade: no data moves, no path changes, and the failure
+mode a migration would have introduced — a half-moved data root — does not
+exist. Non-default roots nest under the default's directory, which is
+deliberate and only safe because nothing sweeps that directory recursively;
+the backup/export path enumerates named files and a prefix-filtered set of
+transaction directories, never the tree.
+
+**Credentials needed a second mechanism, because the keychain is not a
+directory.** Path scoping cannot reach an OS keychain item, so
+`profiles::keychain_service` suffixes the *service* name with the profile id
+(`com.littlemonkey.app.profile.work`) at all thirteen service definitions
+across the app and the CLI. A second profile's secrets are a different keychain
+item that the first profile's code never names. `default` is unsuffixed, so
+every credential stored before this existed still resolves. Honest ceiling,
+recorded in the code: deleting a profile *orphans* its keychain items rather
+than deleting them — the `keyring` crate cannot enumerate a service's contents,
+so there is no list to walk, and reaching them again would need a profile
+recreated under the identical id.
+
+**Switching restarts the app, and the restart is the switch.** Nothing caches
+the active id; what is cached is everything built *from* a path — an open
+ledger connection, the artifact store handle, a spawned daemon, an MCP server's
+environment. Swapping the registry entry underneath those live handles is
+precisely how a cross-profile write gets committed, so `profiles_switch`
+records the choice atomically and then restarts. A new process holds none of
+the old profile's handles. The Settings panel confirms first, because a silent
+restart in the middle of a chat is not a settings toggle.
+
+**Quota (K4) and machine share (K8) are enforced, not merely stored.** The
+daemon reads the active profile's `ProfileLimits` once at startup:
+
+- **Concurrency** is `min(configured, quota.max_concurrent_runs)` — a quota
+  bounds, it never grants. Tested against four remote jobs, `concurrency: 4`
+  and a two-run quota: two run.
+- **Memory** enters `admission::fit` as a ceiling, so a profile holds its own
+  bound even on an idle machine. A claim larger than the ceiling is `Never`
+  rather than a hold, because a hold for memory that will never be released is
+  the starvation K8 spent a bound ruling out.
+- **Wall clock** clamps each job's own budget at the watchdog, and the kill
+  message says which of the two numbers tripped.
+
+**What the share weight can and cannot be, given separate queues.** K8 noted
+that fair-share covered workspaces only, "because `RunSpec` carries no profile
+field to read". Adding one would not have helped: with a ledger per profile,
+one daemon never sees another profile's jobs, so there is no queue in which to
+rank them against each other. What two profiles *do* contend for is the
+machine. So the weight sets each profile's fraction of system memory at
+admission — 1.0 and 3.0 split it 25/75 — and a single-profile installation is
+exactly 1.0, i.e. unchanged. **Named rather than hidden: this is a ceiling, not
+a work-conserving share.** An idle profile's fraction is not lent to a busy
+one, because neither daemon can see that the other is idle; lending it — and
+cross-profile arbitration inside one queue generally — needs an arbiter above
+both daemons, which is a different item than this one.
+
+**The acceptance test is the clause, against the real stores.** It writes a run
+and an artifact as `default`, switches, and then — through a `RunLedger` and an
+`ArtifactStore` opened exactly the way the app opens them — asserts the second
+profile lists no runs, cannot load the first profile's run by naming its id,
+cannot resolve its artifact by the content-addressed digest (guessable on
+purpose: knowing the id must not be access), and addresses a different keychain
+service. The first profile's history is then re-read to confirm the second
+profile's run did not land in it either.
+
+**Naming, so two things called "profile" stay distinct.** `team_mode.rs`'s
+members and the process table's `profile` column are *personas* — attribution
+for who is driving, explicitly not an authentication boundary. K23's profiles
+are data roots. They compose without interacting: a persona is recorded inside
+whichever profile's ledger is open.
+
+*Surfaces:* Settings → Profiles; `monkey profiles list|create|switch|rename|limits|delete|current`;
+`--profile <id>` / `LITTLE_MONKEY_PROFILE` to run one command as another
+identity without changing the app's.
+
+## K24. Configuration and definition versioning *(met)*
+
+**Today:** every persona, snippet, skill, and workflow definition is written
+through an append-only revision log (`config_revisions.rs`, one JSONL file per
+entity under `<app_data>/config-revisions/`). Each revision is a full snapshot
+with a parent, a branch, and a content digest; an unchanged save records
+nothing, so the log is a history of edits rather than of keystrokes. The UI
+lists revisions, diffs any two — including across branches — restores an older
+snapshot through the owning store's normal save path, and forks named
+branches. A save carrying a stale base revision is refused with a `conflict:`
+error the UI turns into a choice (take theirs, or overwrite knowingly); for
+workflows the same refusal comes from the definition store's own version rule.
+Both the desktop and the CLI/daemon write the same history, because the store
+sits below the Tauri layer.
+
+**Shipped — rules/memory files and MCP server definitions now go through the
+same log.** Both were the last last-write-wins stores: two windows (or the
+desktop and the CLI) editing one `MONKEY.md` or one MCP server silently kept
+whichever saved second, with nothing recording that the other edit existed.
+
+- **Rules.** `write_rules_impl` records before it writes, in `prompts_save`'s
+  order and for its reason: recording is the only step that can *reject* the
+  write, and rejecting after the file is replaced would defeat the point of
+  detecting the conflict. The entity is keyed on the file's **resolved path**,
+  not its label — two attached roots can both be called `src`, and a
+  label-keyed history would merge them into one log where a restore puts one
+  repo's instructions into the other. `rules_current_revision` gives an editor
+  its base; a stale one is refused with `conflict:` and the file on disk is
+  untouched.
+- **MCP.** The record happens inside `save_config_impl`, which *every* mutation
+  — add, update, remove, enable — already goes through, so a fifth mutation
+  cannot skip versioning by forgetting a line. Two kinds are written: the whole
+  document (what a restore puts back, since restoring one server into a file
+  that has since gained and lost others would produce a state that never
+  existed) and one per server (what answers "what changed about *this* server").
+  An unchanged server dedupes on its digest, so a save touching one server
+  appends one entry revision rather than one per server.
+- **Restore is the owning store's job**, per `RevisionHistoryPanel`'s rule.
+  `mcp_restore_config` parses and validates the snapshot before writing anything
+  — a hand-edited revision is refused rather than installed and discovered at
+  the next connect — and then goes through the ordinary save, so the restore is
+  itself a revision. The rules editor loads a snapshot into the textarea rather
+  than writing it, so the user's own Save records it.
+
+**Remaining:** the history is per-entity, so there is still no cross-entity view
+of what a given change touched.
 
 *Maps to: ROADMAP #3.*
 
-## K25. Resource attribution completion
+## K25. Resource attribution completion — **met**
 
-**Today:** per-request cost against user-entered rates, daily and monthly
-budgets, and a warn/pause check before every provider request.
+**Today:** every recorded provider call carries the workspace that was open
+when it went out and the project folder its conversation belongs to, and
+**Settings → Usage** breaks spend down by workspace, project, session, or
+model. The workspace key is the path the K6 process ledger already stamps on
+processes, so the two ledgers join: a workspace's measured wall, CPU, and GPU
+time sits beside its token bill, and an unmeasured field renders as the
+backend's own reason rather than a zero. Warnings are multi-tier (default
+50/80/95%) and report the highest tier crossed. Provider billing is
+reconcilable: estimates are labelled as estimates, unpriced calls stay visibly
+unpriced, and an entered monthly invoice total is shown against the estimate as
+a drift — without ever rewriting the per-call figures, which a monthly total
+cannot honestly be split back across.
+
+Two limits stated rather than papered over: what the app cannot attribute goes
+to an explicit *Unattributed* bucket instead of being charged to whichever
+folder is open, and process rows carry only a workspace, so the project
+breakdown shows token spend alone.
 
 **Acceptance:** ROADMAP #4 — per-workspace and per-project attribution,
 multi-tier thresholds, and honest handling of providers whose real billing
@@ -2831,3 +5599,37 @@ claim is already strong and already true. "Agent OS" invites a reader to look
 for a process table, enforced isolation on their platform, and a scheduler
 that measured something — and the README's whole voice is that a reader who
 looks will find what was promised.
+
+**Three of those four now survive that reader.** There is a process table with a
+parent/child tree, nine kinds, a validated transition table and three reapers (K1,
+K2). There is a scheduler that arbitrates by documented classes, preempts by
+suspend-and-resume, states a starvation bound as a formula with a test behind it,
+and shares fairly on CPU milliseconds it measured itself (K6–K8). Resource
+arbitration is real: admission consults live hardware and the offload plan, holds
+what does not fit, and rejects at enqueue what can never fit.
+
+**Isolation (K3) is the clause that decided the name, and the platform half of it is
+now met on all three.** Seatbelt on macOS, Landlock plus seccomp on Linux, AppContainer
+plus a job object on Windows — so "enforced by the platform, not requested politely by the
+program", the definition this file opens with, is true wherever this app runs. Two of those
+three are exercised against a real kernel in CI by a shared assertion body; Windows has the
+mechanism and its own enforcement test but has not joined that body, and K3 states why
+widening the `cfg` would not be honest (a hosted runner's account is an administrator, so
+CI is the privileged case).
+
+**What still decides the name is no longer a platform, and that is a sharper problem
+rather than a smaller one.** The sandbox is **opt-in**, with exactly one non-test caller,
+and **the agent's own shell tool is not routed through it on any platform** — it spawns
+`sh -c` / `cmd /C` with the workspace as cwd. So the honest sentence has changed from
+"advisory on Windows" to something less comfortable: confinement is real and available on
+every platform, and the agent does not use it. That is not fixed by pointing the shell tool
+at `execute_in_sandbox`, because the sandbox denies the real workspace by design and the
+agent's job is to edit it; what tool calls should be allowed to reach is a policy question,
+and it belongs with K5.
+
+So the name does not change yet, and the reasons have moved rather than shrunk: the
+sandbox is opt-in and unused by the agent's own tools, and Phase 3 (copy-on-write namespace
+— now started on macOS under K10 — tamper-evident log chaining, freeze/restore,
+transactional effects) is still largely ahead. Platform isolation is no longer one of them,
+which means the next honest step is a policy decision about what tool calls may reach, not
+another platform leg.

@@ -1,6 +1,8 @@
+mod admission;
 mod engine;
 mod ledger;
 mod remote;
+mod scheduler;
 mod service;
 mod store;
 mod trigger;
@@ -46,8 +48,17 @@ pub enum DaemonCmd {
     Install(DaemonInstallArgs),
     /// Start the previously installed user service.
     Start,
-    /// Show service, heartbeat, kill-switch, queue, and active-run state.
+    /// Show service, heartbeat, kill-switch, queue, backpressure, and
+    /// active-run state.
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show recent scheduling decisions: what was chosen, over what, and which
+    /// measurement decided it.
+    Decisions {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
         #[arg(long)]
         json: bool,
     },
@@ -347,6 +358,37 @@ struct DaemonStatus {
     paused: u32,
     managed_run_ids: Vec<String>,
     platform: service::ServicePlatform,
+    /// The K8 backpressure signal. Added to *this* payload rather than given its
+    /// own command because this is already the thing every producer polls — the
+    /// desktop reads it through `daemon_desktop_status`, which shells out to
+    /// `monkey daemon status --json`, so the JSON shape is the API.
+    ///
+    /// Producers should branch on `backpressure.state` (`accepting` / `slow` /
+    /// `closed`) or, if they only care about the hard case, on
+    /// `backpressure.accepting`. A `closed` signal is already enforced by
+    /// `enqueue`, so a producer that ignores it gets an error instead of a
+    /// silently overfull queue; `slow` is advisory and only a producer can honour
+    /// it, because only a producer knows whether its work can wait.
+    backpressure: scheduler::Backpressure,
+}
+
+/// The backpressure signal, composed once (K8).
+///
+/// One function so the signal a producer polls on `status` and the refusal
+/// `enqueue` returns cannot disagree about which counters feed it. Everything it
+/// needs is already a cheap indexed count on the daemon's own database.
+pub(crate) fn backpressure_for(
+    store: &DaemonStore,
+    config: &DaemonConfig,
+) -> Result<scheduler::Backpressure, String> {
+    Ok(scheduler::backpressure(
+        store.kill_switch()?,
+        store.nonterminal_count()?,
+        config.max_queue,
+        store.queued_count()?,
+        store.held_count()?,
+        config.poll_interval_ms,
+    ))
 }
 
 pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
@@ -356,6 +398,7 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
             ServiceManager::<service::RealCommandRunner>::real()?.start(&DaemonPaths::resolve()?)
         }
         DaemonCmd::Status { json } => status(*json),
+        DaemonCmd::Decisions { limit, json } => decisions(*limit, *json),
         DaemonCmd::Stop => stop().await,
         DaemonCmd::Uninstall { purge_state } => uninstall(*purge_state),
         DaemonCmd::Run(args) => queue_command(cli, args),
@@ -418,9 +461,17 @@ fn status(json: bool) -> Result<(), String> {
     let mut heartbeat = None;
     let mut pid = None;
     let mut managed_run_ids = Vec::new();
+    let mut held = 0;
+    let mut nonterminal = 0;
+    // The installed config when there is one, defaults otherwise: an uninstalled
+    // daemon still has to report a coherent capacity rather than zero, or every
+    // producer reads "queue full" before the daemon exists.
+    let config = DaemonConfig::load(&paths).unwrap_or_default();
     if paths.state_db.is_file() {
         let store = DaemonStore::open(&paths)?;
         kill_switch = store.kill_switch()?;
+        held = store.held_count()?;
+        nonterminal = store.nonterminal_count()?;
         heartbeat = store
             .get_meta("heartbeat_ms")?
             .and_then(|value| value.parse::<u64>().ok());
@@ -452,6 +503,14 @@ fn status(json: bool) -> Result<(), String> {
         paused,
         managed_run_ids,
         platform: manager.platform(),
+        backpressure: scheduler::backpressure(
+            kill_switch,
+            nonterminal,
+            config.max_queue,
+            queued,
+            held,
+            config.poll_interval_ms,
+        ),
     };
     if json {
         println!(
@@ -460,7 +519,7 @@ fn status(json: bool) -> Result<(), String> {
         );
     } else {
         println!(
-            "installed={} service={} heartbeat={} pid={} kill_switch={} queued={} active={} waiting_approval={} paused={}",
+            "installed={} service={} heartbeat={} pid={} kill_switch={} queued={} active={} waiting_approval={} paused={} backpressure={} held={}",
             result.installed,
             result.service_running,
             result.heartbeat_fresh,
@@ -470,6 +529,54 @@ fn status(json: bool) -> Result<(), String> {
             result.active,
             result.waiting_approval,
             result.paused,
+            result.backpressure.state.token(),
+            result.backpressure.held,
+        );
+    }
+    Ok(())
+}
+
+/// `monkey daemon decisions` — the scheduling decision log, newest first.
+///
+/// Its own command rather than more fields on `status`, which the desktop polls
+/// several times a second: a decision log is read when somebody is asking why,
+/// not continuously.
+fn decisions(limit: u32, json: bool) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    if !paths.state_db.is_file() {
+        return Err("Daemon has no state to inspect".to_string());
+    }
+    let entries = DaemonStore::open(&paths)?.recent_decisions(limit)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&entries).unwrap_or_default()
+        );
+        return Ok(());
+    }
+    if entries.is_empty() {
+        println!("No scheduling decisions recorded yet.");
+        return Ok(());
+    }
+    for entry in entries {
+        println!(
+            "{} {} {} class={}/{} over=[{}] {}={} @{} — {}",
+            entry.decided_at_ms,
+            entry.outcome,
+            entry.job_id,
+            entry.process_class,
+            entry.effective_class,
+            entry.passed_over.join(","),
+            entry.measurement,
+            entry
+                .measured_value
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
+            entry
+                .measured_at_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
+            entry.detail,
         );
     }
     Ok(())
@@ -673,6 +780,284 @@ impl remote::api::MobileChatQueue for DaemonMobileChatQueue {
     }
 }
 
+/// Where a node keeps the frozen recipes it built from foreign specs.
+///
+/// Beside `paths.snapshots` rather than in it: `enqueue` writes the queue's own
+/// immutable copy into `snapshots/<job_id>.json`, and these are the *sources* it
+/// copies from. Two directories so a placement source can never be mistaken for
+/// the queue snapshot the executing child actually reads.
+fn placements_dir(paths: &DaemonPaths) -> PathBuf {
+    paths.root.join("placements")
+}
+
+/// **Roadmap K17 S2/S3: a foreign `RunSpec` becomes work on this machine.**
+///
+/// # Why this is a conversion and not a hand-off
+///
+/// The daemon's unit of work is a recipe; the run protocol's unit is a
+/// `RunSpec`, and the `RunSpec` for a queued job is built *downstream*, by the
+/// `monkey-cli task run` child. So a spec cannot simply be handed to the queue —
+/// it has to arrive at that child, and the only thing that reaches it is the
+/// recipe snapshot.
+///
+/// The conversion therefore has two halves that must not be confused. The
+/// **execution** half (target, workspace, permission mode, prompt) becomes
+/// ordinary recipe fields, because that is what the executor reads. The
+/// **policy** half rides verbatim in `recipe.placed_run`, because a recipe has
+/// nowhere to put an egress allowlist or a token budget and re-deriving them
+/// here would silently substitute this node's defaults for the submitter's — the
+/// exact failure S3 exists to prevent.
+///
+/// Everything this node cannot satisfy is refused here, before anything is
+/// written, and each refusal names the fact that is missing rather than saying
+/// the placement failed.
+pub(crate) struct DaemonPlacementQueue {
+    paths: DaemonPaths,
+}
+
+impl DaemonPlacementQueue {
+    pub(crate) fn new(paths: DaemonPaths) -> Self {
+        Self { paths }
+    }
+}
+
+/// The recipe target this node will execute a placed spec through.
+///
+/// A `ManagedLlama` placement is resolved against **this node's** runtime hub,
+/// never against the spec's `model_path`: that path is a location on the
+/// submitter's disk and means nothing here. The model id is the portable half,
+/// so a node that has the same model installed can run the placement and one
+/// that has not refuses it by name — which is the answer an operator can act on,
+/// unlike a spawn failure later.
+fn placed_recipe_target(
+    target: &little_monkey_lib::run_protocol::ModelTargetSnapshot,
+    app_data: &Path,
+) -> Result<little_monkey_lib::recipes::RecipeTarget, String> {
+    use little_monkey_lib::run_protocol::ModelTargetSnapshot;
+    match target {
+        // The provider *identity* travels; the credential never does. This node
+        // resolves the endpoint and key from its own configuration, which is
+        // what keeps "keys stay on the runner" true for placed work too.
+        ModelTargetSnapshot::Provider {
+            provider_id, model, ..
+        } => Ok(little_monkey_lib::recipes::RecipeTarget {
+            provider: Some(provider_id.clone()),
+            model: Some(model.clone()),
+            ollama: None,
+            local_url: None,
+            managed_model: None,
+        }),
+        ModelTargetSnapshot::Ollama { model, .. } => {
+            Ok(little_monkey_lib::recipes::RecipeTarget {
+                provider: None,
+                model: None,
+                ollama: Some(model.clone()),
+                local_url: None,
+                managed_model: None,
+            })
+        }
+        ModelTargetSnapshot::ManagedLlama { model_id, .. } => {
+            if little_monkey_lib::m3_runtime_hub::installed_model_artifact(app_data, model_id)
+                .is_none()
+            {
+                return Err(format!(
+                    "this node has no managed model '{model_id}' installed; install it here or place the run on a node that advertises it"
+                ));
+            }
+            Ok(little_monkey_lib::recipes::RecipeTarget {
+                provider: None,
+                model: None,
+                ollama: None,
+                local_url: None,
+                // The origin deliberately is not named here: the managed runtime
+                // is started on a fresh loopback port when the run starts, so
+                // any port written now would be wrong by then.
+                managed_model: Some(model_id.clone()),
+            })
+        }
+    }
+}
+
+fn placed_permission_mode(
+    mode: &little_monkey_lib::run_protocol::PermissionMode,
+) -> Result<String, String> {
+    use little_monkey_lib::run_protocol::PermissionMode;
+    Ok(match mode {
+        PermissionMode::Manual => "manual",
+        PermissionMode::AcceptEdits => "acceptEdits",
+        PermissionMode::Smart => "smart",
+        PermissionMode::Plan => "plan",
+        PermissionMode::Auto => "auto",
+        // The one mode a foreign spec may never buy on this machine. A placed
+        // run is unattended here by definition — nobody on this node is watching
+        // its prompts — and `bypass` auto-approves every tool including
+        // `run_shell`. `validate_recipe` refuses it too; this refuses it earlier
+        // and with a sentence the submitter can act on.
+        PermissionMode::Bypass => {
+            return Err(
+                "this node refuses a placed run in 'bypass' permission mode: it auto-approves every tool, including shell, with nobody here to catch it"
+                    .to_string(),
+            )
+        }
+    }
+    .to_string())
+}
+
+/// The deterministic job id for a placement, so a resubmitted spec resolves to
+/// the job it already has rather than starting a second one.
+fn placed_job_id(submitted_run_id: &str) -> String {
+    format!(
+        "job-{}",
+        &sha256_hex(format!("placed-run:{submitted_run_id}").as_bytes())[..32]
+    )
+}
+
+/// The frozen recipe a placed spec becomes on this node.
+///
+/// Extracted from [`DaemonPlacementQueue::place`] because it is the whole of
+/// S3's node half and the only part of the placement path that can be exercised
+/// without a running daemon: everything after it opens the queue database and
+/// spawns a submission child. Every refusal this node owns is decided here, and
+/// the four frozen fields are attached here rather than re-derived downstream.
+fn placed_recipe(
+    spec: &little_monkey_lib::run_protocol::RunSpec,
+) -> Result<little_monkey_lib::recipes::Recipe, String> {
+    spec.validate().map_err(|error| error.to_string())?;
+    let snapshot = little_monkey_lib::node_placement::PlacedRunSnapshot::from_spec(spec);
+    snapshot.validate()?;
+    let app_data = crate::app_data_dir().ok_or("Could not resolve app data directory")?;
+    let target = placed_recipe_target(&spec.target, &app_data)?;
+    let permission_mode = placed_permission_mode(&spec.permission_policy.mode)?;
+
+    // The workspace is checked against this machine's filesystem before
+    // anything is written. A placed run whose root does not exist here is
+    // refused rather than silently rehomed onto the daemon's working directory,
+    // which would run the submitter's task against the wrong files — the
+    // quietest possible way to get this wrong.
+    let workspace = match snapshot.primary_root() {
+        Some(root) => {
+            let canonical = PathBuf::from(root).canonicalize().map_err(|error| {
+                format!("this node cannot resolve the placed workspace root '{root}': {error}")
+            })?;
+            if !canonical.is_dir() {
+                return Err(format!(
+                    "the placed workspace root '{root}' is not a directory on this node"
+                ));
+            }
+            Some(canonical.to_string_lossy().to_string())
+        }
+        None => None,
+    };
+
+    let recipe = little_monkey_lib::recipes::Recipe {
+        version: little_monkey_lib::recipes::RECIPE_SCHEMA_VERSION,
+        // Recipe names are slugs and a run id is not guaranteed to be one, so
+        // the name is derived from its digest.
+        name: format!("placed-{}", &sha256_hex(spec.run_id.as_bytes())[..16]),
+        description: Some(format!(
+            "Run {} placed on this node by an owned machine",
+            spec.run_id
+        )),
+        target,
+        workspace,
+        permission_mode,
+        // The submitter's `instructions` are the system prompt, used verbatim:
+        // the placement is enqueued with `snapshot_is_frozen`, which stops this
+        // node's own rules from being merged into another machine's run.
+        system: spec.instructions.clone(),
+        prompt: spec.task.clone(),
+        params: Default::default(),
+        max_iterations: usize::try_from(spec.budgets.max_iterations).ok(),
+        timeout_seconds: Some(spec.budgets.wall_time_ms.div_ceil(1_000).max(1)),
+        output: little_monkey_lib::recipes::RecipeOutput { json: true },
+        desktop_turn: None,
+        placed_run: Some(snapshot),
+    };
+    little_monkey_lib::recipes::validate_recipe(&recipe)
+        .map_err(|error| format!("the placed spec does not form a runnable recipe: {error}"))?;
+    Ok(recipe)
+}
+
+impl remote::api::PlacementQueue for DaemonPlacementQueue {
+    fn place(
+        &self,
+        spec: &little_monkey_lib::run_protocol::RunSpec,
+    ) -> Result<remote::api::PlacedJob, String> {
+        let recipe = placed_recipe(spec)?;
+
+        let config = DaemonConfig::load(&self.paths)
+            .map_err(|error| format!("this node's background runner is not configured: {error}"))?;
+        let mut store = DaemonStore::open(&self.paths)?;
+        if store.kill_switch()? {
+            return Err("this node's global kill switch is engaged".to_string());
+        }
+        let mut shared = SharedLedger::open(&self.paths.ledger_db)?;
+
+        let directory = placements_dir(&self.paths);
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("could not create the placement directory: {error}"))?;
+        let source = directory.join(format!("{}.json", placed_job_id(&spec.run_id)));
+        write_snapshot(&source, &recipe)?;
+
+        let options = QueueOptions {
+            recipe: source.to_string_lossy().into_owned(),
+            params: Vec::new(),
+            origin: QueueOrigin::Remote {
+                request_id: spec.run_id.clone(),
+            },
+            deterministic_job_id: Some(placed_job_id(&spec.run_id)),
+            priority: 0,
+            // A placed run is not retried on this node. A submitter that wants
+            // another attempt places it again — possibly somewhere else — which
+            // is the decision `node_placement::reconcile_placement` makes with
+            // information this node does not have.
+            max_attempts: 1,
+            // The submitter's wall-time budget, enforced here as the node's own
+            // job ceiling as well. Two independent enforcements of one number:
+            // this one kills the process group, and the child's own
+            // `tokio::time::timeout` ends the turn. Neither is a substitute for
+            // the other — the first survives a wedged child.
+            max_runtime_ms: spec.budgets.wall_time_ms,
+            max_memory_bytes: None,
+            owned_worktree: false,
+            repository: None,
+            branch_prefix: "codex/".to_string(),
+            allowed_remotes: vec!["origin".to_string()],
+            allow_commit: false,
+            // Remote Git mutations are never granted by a placement. Enabling
+            // them needs an owned worktree and an explicit repository policy,
+            // which is an operator decision on *this* machine.
+            allow_push: false,
+            allow_create_pull_request: false,
+            allow_review_comment: false,
+            parent_run_id: None,
+            snapshot_is_frozen: true,
+        };
+        let queued = enqueue(None, &self.paths, &config, &mut store, &mut shared, options)?;
+        Ok(remote::api::PlacedJob {
+            node_run_id: queued.run_id,
+            job_id: queued.job_id,
+            state: format!("{:?}", queued.state).to_ascii_lowercase(),
+        })
+    }
+
+    fn placed_state(&self, job_id: &str) -> Result<Option<remote::api::PlacedJobState>, String> {
+        let store = DaemonStore::open(&self.paths)?;
+        let Some(job) = store.get_job(job_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(remote::api::PlacedJobState {
+            state: format!("{:?}", job.state).to_ascii_lowercase(),
+            terminal: matches!(
+                job.state,
+                JobState::Succeeded | JobState::Failed | JobState::Cancelled
+            ),
+            updated_at_ms: job.updated_at_ms,
+            last_error: job.last_error.clone(),
+        }))
+    }
+}
+
 pub(crate) fn cancel_client_run(run_id: &str, reason: &str) -> Result<(), String> {
     let paths = DaemonPaths::resolve()?;
     let mut store = DaemonStore::open(&paths)?;
@@ -766,11 +1151,17 @@ impl QueueOptions {
 /// Fail-soft. The job is already queued and durable by the time this runs; a
 /// projection failure must not turn a successful enqueue into an error the
 /// caller sees.
+/// `workspace` is the canonicalized root this job will run in. It is threaded
+/// through because `reconcile` only writes the `workspace` column when it
+/// *admits* a row, and this function is what admits the row for a remote-origin
+/// job — omitting it would make every mobile and ACP run permanently invisible to
+/// the fair-share charge, which is the class of work most worth charging.
 fn project_queue_origin(
     shared: &SharedLedger,
     origin: &QueueOrigin,
     job_id: &str,
     run_id: &str,
+    workspace: Option<&str>,
 ) {
     use little_monkey_lib::process_table::{
         ExitStatus, ProcessExit, ProcessKind, ProcessProjection, ProcessState,
@@ -779,9 +1170,9 @@ fn project_queue_origin(
     let QueueOrigin::Remote { request_id } = origin else {
         return;
     };
-    let now_ms = match now_ms().and_then(|value| {
-        i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string())
-    }) {
+    let now_ms = match now_ms()
+        .and_then(|value| i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string()))
+    {
         Ok(value) => value,
         Err(error) => {
             eprintln!("monkey daemon: could not project remote origin: {error}");
@@ -834,7 +1225,8 @@ fn project_queue_origin(
             ProcessState::Admitted,
         )
         .with_parent(ProcessKind::RemoteRun, request_id)
-        .with_run(Some(run_id.to_string())),
+        .with_run(Some(run_id.to_string()))
+        .with_workspace(workspace.map(str::to_string)),
         now_ms,
     ) {
         eprintln!("monkey daemon: could not project remote job {job_id}: {error}");
@@ -857,6 +1249,20 @@ fn enqueue(
     }
     if options.max_runtime_ms == 0 || options.max_runtime_ms > 7 * 24 * 60 * 60 * 1_000 {
         return Err("daemon max runtime must be between 1 second and 7 days".to_string());
+    }
+    // Backpressure is honoured here, before anything is created, and that is the
+    // point of doing it in this function rather than at the five call sites:
+    // every producer — CLI, desktop, ACP, mobile, remote, retry — routes through
+    // `enqueue`, so one check covers all of them and none of them can forget it.
+    // Checking early also matters because the work below creates an owned git
+    // worktree and writes a snapshot; refusing after that would leave both behind
+    // for a job that never existed.
+    //
+    // `insert_preparing`'s own transactional cap stays where it is. That one is
+    // authoritative under concurrent enqueues; this one is the informative refusal
+    // that names the reason and a retry delay.
+    if let Some(refusal) = backpressure_for(store, config)?.refusal() {
+        return Err(refusal);
     }
     let job_id = options
         .deterministic_job_id
@@ -887,9 +1293,8 @@ fn enqueue(
     let effective_system = if snapshot_is_frozen {
         rendered.system.clone()
     } else {
-        let cli = cli.ok_or(
-            "A non-frozen recipe submission requires CLI context for rules merging",
-        )?;
+        let cli =
+            cli.ok_or("A non-frozen recipe submission requires CLI context for rules merging")?;
         let state = crate::build_state(&Some(original_workspace.clone()))?;
         crate::effective_system(cli, &state, rendered.system.as_deref())
     };
@@ -976,7 +1381,13 @@ fn enqueue(
             }
         };
     store.mark_queued(&job_id, &run_id, now_ms()?)?;
-    project_queue_origin(shared, &options.origin, &job_id, &run_id);
+    project_queue_origin(
+        shared,
+        &options.origin,
+        &job_id,
+        &run_id,
+        snapshot.workspace.as_deref(),
+    );
     if let Some(owned) = &worktree {
         shared.record_worktree_lease(
             &owned.lease_id,
@@ -1123,6 +1534,7 @@ fn event_type(event: &RunEvent) -> &'static str {
         RunEvent::ToolProposed { .. } => "tool_proposed",
         RunEvent::PermissionRequested { .. } => "permission_requested",
         RunEvent::PermissionDecided { .. } => "permission_decided",
+        RunEvent::RoutingDecided { .. } => "routing_decided",
         RunEvent::ToolStarted { .. } => "tool_started",
         RunEvent::ToolFinished { .. } => "tool_finished",
         RunEvent::ArtifactAdded { .. } => "artifact_added",
@@ -1139,6 +1551,8 @@ fn event_type(event: &RunEvent) -> &'static str {
         RunEvent::Failed { .. } => "failed",
         RunEvent::Cancelled { .. } => "cancelled",
         RunEvent::NeedsReconciliation { .. } => "needs_reconciliation",
+        RunEvent::MigrationDeparted { .. } => "migration_departed",
+        RunEvent::MigrationArrived { .. } => "migration_arrived",
     }
 }
 
@@ -1676,9 +2090,9 @@ fn read_payload(path: &Path) -> Result<Vec<u8>, String> {
 ///
 /// Logged and swallowed: a stale row is not a reason to refuse to serve.
 fn reap_dead_workflow_hosts(shared: &SharedLedger) {
-    let now = match now_ms().and_then(|value| {
-        i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string())
-    }) {
+    let now = match now_ms()
+        .and_then(|value| i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string()))
+    {
         Ok(value) => value,
         Err(error) => {
             eprintln!("monkey daemon: workflow host reap skipped: {error}");
@@ -1712,6 +2126,23 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
     let mut shared = SharedLedger::open(&paths.ledger_db)?;
     reconcile_reserved_deliveries(&mut store, &mut shared)?;
     let owner_id = format!("daemon-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+    // The identity this daemon serves (K23). Its quota bounds what this profile
+    // may run at once, and its weight bounds the share of the machine it may
+    // claim when another profile's daemon is also running — the two identities
+    // have separate queues, so hardware is the only thing they contend for and
+    // the only place a cross-profile share can be enforced.
+    let profile_limits = match little_monkey_lib::app_paths::base_data_dir()
+        .ok_or_else(|| "Could not resolve the app data directory".to_string())
+        .and_then(|base| {
+            little_monkey_lib::profiles::ProfileLimits::for_active(&base)
+                .map_err(|error| error.to_string())
+        }) {
+        Ok(limits) => limits,
+        Err(error) => {
+            eprintln!("monkey daemon: running without profile limits: {error}");
+            little_monkey_lib::profiles::ProfileLimits::unbounded()
+        }
+    };
     let mut engine = DaemonEngine::new(
         store,
         shared,
@@ -1721,7 +2152,8 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
         OsNotificationAdapter,
         SystemClock,
         owner_id,
-    );
+    )
+    .with_profile_limits(profile_limits);
     engine.recover()?;
     reap_dead_workflow_hosts(&engine.shared);
     // One machine-wide desktop-control runtime, shared with the remote API so
@@ -1732,6 +2164,7 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
         paths.clone(),
         desktop_control.clone(),
         std::sync::Arc::new(DaemonMobileChatQueue::new(paths.clone())),
+        std::sync::Arc::new(DaemonPlacementQueue::new(paths.clone())),
     )
     .await?;
     spawn_knowledge_refresh_scheduler()?;
@@ -1740,8 +2173,23 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
         webhook::spawn_local_listener(paths.clone(), port).await?;
     }
     let mut workflow_trigger_sync = WorkflowBatchSynchronizer::default();
+    // Roadmap K17 S4: the heartbeat. Every machine's daemon is both a node and a
+    // placer, so this runs here rather than in a separate controller process —
+    // there isn't one. On a machine that has placed nothing it is a table read
+    // and no network at all, which is why it can afford to sit in the main loop.
+    let mut next_placement_sync_ms = 0u64;
     loop {
         let now = now_ms()?;
+        if now >= next_placement_sync_ms {
+            next_placement_sync_ms =
+                now.saturating_add(little_monkey_lib::node_placement::HEARTBEAT_INTERVAL_MS);
+            // A node that is down must never take the resident service with it:
+            // every failure here is already recorded against the placement it
+            // belongs to, and the loop keeps its own queue running regardless.
+            if let Err(error) = remote::placement_sync(&paths).await {
+                eprintln!("monkey daemon: placement sync paused: {error}");
+            }
+        }
         if let Err(error) =
             workflow_trigger_sync.sync_if_changed(&paths.root, &mut engine.shared, now)
         {
@@ -2132,6 +2580,7 @@ mod tests {
             },
             "job-remoteorigin",
             run_id,
+            Some("/tmp/remote-origin-workspace"),
         );
 
         let table = shared.process_table();
@@ -2377,5 +2826,164 @@ mod tests {
         ));
         assert!(store.pending_delivery_payloads(1).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(app_data);
+    }
+    // --- Roadmap K17: converting a foreign spec into work here -------------
+
+    /// The refusals the *conversion* owns, as opposed to the ones the wire or
+    /// the placement rule own. Each names the fact this machine has not got.
+    #[test]
+    fn a_placement_this_node_cannot_execute_is_refused_with_the_reason() {
+        use little_monkey_lib::run_protocol::{ModelTargetSnapshot, PermissionMode};
+
+        // A managed placement is resolved against THIS node's hub inventory,
+        // never against the spec's `model_path` — that path is a location on
+        // the submitter's disk. An empty app-data root has the model installed
+        // nowhere, so the refusal names the model rather than the path.
+        let empty_app_data =
+            std::env::temp_dir().join(format!("little-monkey-no-hub-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&empty_app_data).unwrap();
+        let managed = ModelTargetSnapshot::ManagedLlama {
+            target_id: "t".into(),
+            label: "l".into(),
+            model_id: "qwen3-8b".into(),
+            // Deliberately a path that exists nowhere: if this were ever
+            // consulted the refusal below would not fire.
+            model_path: "/models/qwen3-8b.gguf".into(),
+            capabilities: crate::task::cli_capabilities(),
+            estimated_memory_bytes: None,
+        };
+        let refusal = placed_recipe_target(&managed, &empty_app_data).unwrap_err();
+        assert!(
+            refusal.contains("qwen3-8b") && refusal.contains("no managed model"),
+            "the refusal must name the model this node has not got: {refusal}"
+        );
+        let _ = std::fs::remove_dir_all(&empty_app_data);
+
+        // Provider and Ollama both convert, and the provider *credential* is
+        // never part of it: only the identity travels.
+        let provider = ModelTargetSnapshot::Provider {
+            target_id: "t".into(),
+            label: "l".into(),
+            provider_id: "anthropic".into(),
+            endpoint: "https://api.anthropic.com".into(),
+            model: "claude".into(),
+            credential_ref_id: "credential:anthropic".into(),
+            capabilities: crate::task::cli_capabilities(),
+        };
+        let converted = placed_recipe_target(&provider, &empty_app_data).unwrap();
+        assert_eq!(converted.provider.as_deref(), Some("anthropic"));
+        assert_eq!(converted.model.as_deref(), Some("claude"));
+        converted
+            .validate()
+            .expect("the converted target must satisfy the recipe XOR rule");
+
+        // The one mode a foreign spec may never buy on this machine.
+        let refusal = placed_permission_mode(&PermissionMode::Bypass).unwrap_err();
+        assert!(
+            refusal.contains("bypass") && refusal.contains("shell"),
+            "bypass must be refused with the reason: {refusal}"
+        );
+        for mode in [
+            PermissionMode::Manual,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Smart,
+            PermissionMode::Plan,
+            PermissionMode::Auto,
+        ] {
+            let token = placed_permission_mode(&mode).unwrap();
+            // Round-tripped through the executor's own parser rather than
+            // through a copied list of mode strings, so a renamed mode fails
+            // here instead of at spawn on the node.
+            crate::permission::PermissionMode::parse(&token)
+                .unwrap_or_else(|error| panic!("{mode:?} produced an unusable mode: {error}"));
+        }
+    }
+
+    /// Two placements of the same spec resolve to the same job id, so a
+    /// resubmission after a lost response cannot start a second run.
+    #[test]
+    fn a_placements_job_id_is_derived_from_the_submitted_run_id() {
+        assert_eq!(placed_job_id("run:one"), placed_job_id("run:one"));
+        assert_ne!(placed_job_id("run:one"), placed_job_id("run:two"));
+        assert!(placed_job_id("run:one").starts_with("job-"));
+    }
+    /// **The node half of S3, end to end within this process.**
+    ///
+    /// A frozen spec becomes the exact recipe the node writes to disk, that file
+    /// is parsed back the way the executing child parses it, and the four frozen
+    /// fields are still the submitter's. The allowlist and the budgets are the
+    /// ones that would go missing silently — a recipe has nowhere else to put
+    /// them — so both are asserted on the far side of the file, not on the
+    /// struct in memory.
+    #[test]
+    fn a_placed_spec_becomes_a_recipe_that_still_carries_the_submitters_policy() {
+        let root =
+            std::env::temp_dir().join(format!("little-monkey-placed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut spec = engine::tests::spec("run-placed", 1_000);
+        spec.instructions = Some("the submitter's frozen system prompt".to_string());
+        spec.budgets.wall_time_ms = 90_000;
+        spec.budgets.max_output_tokens = 4_321;
+        spec.permission_policy.egress_allowlist =
+            Some(little_monkey_lib::run_protocol::EgressAllowlist {
+                hosts: vec!["api.example.com".to_string()],
+                ports: vec![443],
+                protocols: vec!["https".to_string()],
+            });
+        if let Some(workspace) = spec.workspace.as_mut() {
+            workspace.roots[0].canonical_path = root.to_string_lossy().to_string();
+        }
+
+        let recipe = placed_recipe(&spec).expect("a placeable spec must convert");
+        let path = root.join("placed.json");
+        write_snapshot(&path, &recipe).unwrap();
+        let parsed = little_monkey_lib::recipes::parse_recipe(
+            &std::fs::read_to_string(&path).unwrap(),
+            "json",
+        )
+        .expect("the child parses the node's own snapshot");
+
+        // The execution half became ordinary recipe fields...
+        assert_eq!(parsed.permission_mode, "auto");
+        assert_eq!(parsed.prompt, spec.task);
+        assert_eq!(parsed.system.as_deref(), spec.instructions.as_deref());
+        assert_eq!(parsed.timeout_seconds, Some(90));
+        assert_eq!(
+            parsed.workspace.as_deref(),
+            Some(root.canonicalize().unwrap().to_string_lossy().as_ref())
+        );
+        // ...and the policy half rode along untouched.
+        let placed = parsed.placed_run.expect("the frozen spec travelled");
+        assert_eq!(placed.submitted_run_id, "run-placed");
+        assert_eq!(
+            placed
+                .permission_policy
+                .egress_allowlist
+                .expect("the allowlist must reach the executing process")
+                .hosts,
+            vec!["api.example.com".to_string()]
+        );
+        assert_eq!(placed.budgets.max_output_tokens, 4_321);
+        assert_eq!(placed.budgets.wall_time_ms, 90_000);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A placed workspace root this machine has not got is refused rather than
+    /// rehomed onto the daemon's working directory, which would run the
+    /// submitter's task against the wrong files.
+    #[test]
+    fn a_placement_whose_workspace_root_is_absent_here_is_refused() {
+        let mut spec = engine::tests::spec("run-absent", 1_000);
+        if let Some(workspace) = spec.workspace.as_mut() {
+            workspace.roots[0].canonical_path =
+                "/definitely/not/here/little-monkey-k17".to_string();
+        }
+        let error = placed_recipe(&spec).unwrap_err();
+        assert!(
+            error.contains("cannot resolve the placed workspace root"),
+            "the refusal must name the missing root: {error}"
+        );
     }
 }

@@ -60,8 +60,16 @@ pub struct BrowserLimits {
     pub max_disk_bytes: u64,
 }
 
+/// The wall budget a browser session gets when the caller names none.
+///
+/// `pub` because `ProcessKind::default_limits` declares this same number as the
+/// kind's `max_wall_ms`. Referenced rather than copied for `background_shell`'s
+/// reason: a declaration that drifts from the code enforcing it is worse than an
+/// untidy dependency.
+pub const DEFAULT_MAX_SESSION_MS: u64 = 10 * 60_000;
+
 fn default_max_session_ms() -> u64 {
-    10 * 60_000
+    DEFAULT_MAX_SESSION_MS
 }
 
 fn default_max_disk_bytes() -> u64 {
@@ -234,6 +242,24 @@ pub struct BrowserActionResult {
 pub struct BrowserCommandState {
     profile_root: PathBuf,
     sessions: Mutex<HashMap<String, Arc<OwnedBrowser>>>,
+    /// Where browser actions land in the unified subsystem event stream
+    /// (roadmap K12).
+    ///
+    /// Held here rather than threaded through each command because the twelve
+    /// `browser_*` commands have no other shared parameter — they take this
+    /// state and nothing else in common — and adding an `AppHandle` to twelve
+    /// signatures to reach a ledger this struct already knows the directory of
+    /// would be plumbing for its own sake.
+    audit: crate::subsystem_audit::SubsystemAudit,
+    /// Where a session's row and its Chromium's pid are recorded (roadmap K4).
+    ///
+    /// Path-based rather than an `AppHandle`, for the same reason `audit` above
+    /// is: this module's twelve commands share no handle, and a session is
+    /// launched from inside `spawn_blocking`, which no `AppHandle` reaches
+    /// anyway. `None` in tests that construct a state with no data directory —
+    /// the projection is bookkeeping and must never be able to fail a browser
+    /// action.
+    projector: Option<Arc<crate::process_table::LedgerProcessProjector>>,
 }
 
 impl BrowserCommandState {
@@ -243,7 +269,59 @@ impl BrowserCommandState {
         Ok(Self {
             profile_root,
             sessions: Mutex::new(HashMap::new()),
+            audit: crate::subsystem_audit::SubsystemAudit::in_data_dir(app_data_dir),
+            projector: Some(Arc::new(crate::process_table::LedgerProcessProjector::new(
+                app_data_dir.join(crate::run_commands::DATABASE_FILE),
+            ))),
         })
+    }
+
+    /// Run one browser action against an existing session and record it.
+    ///
+    /// Every acting command routes through here so the recording cannot be
+    /// forgotten when a thirteenth is added — the failure mode of instrumenting
+    /// twelve call sites by hand. Resolving the session is *inside* the audited
+    /// region on purpose: "this action named a session that does not exist" is
+    /// an outcome worth having, not a reason to record nothing.
+    async fn audited<T, F>(&self, action: &str, session_id: &str, work: F) -> Result<T, String>
+    where
+        F: FnOnce(Arc<OwnedBrowser>) -> Result<T, String> + Send + 'static,
+        T: Send + 'static,
+    {
+        let outcome = match self.get(session_id) {
+            Ok(session) => tokio::task::spawn_blocking(move || work(session))
+                .await
+                .map_err(|error| error.to_string())?,
+            Err(error) => Err(error),
+        };
+        self.record(action, Some(session_id), outcome.is_ok());
+        outcome
+    }
+
+    /// The recording half, for the two commands that do not fit
+    /// [`audited`](Self::audited): `browser_start` has no session yet, and
+    /// `browser_stop` removes one rather than borrowing it.
+    fn record(&self, action: &str, session_id: Option<&str>, succeeded: bool) {
+        self.audit.record(crate::subsystem_audit::SubsystemAction {
+            subsystem: crate::run_ledger::Subsystem::Browser,
+            action: action.to_string(),
+            // A browser command carries no turn; the ambient `run_scope` is
+            // the only thing that can say which run it belongs to.
+            turn_id: None,
+            // Nothing here goes through `request_permission` — see the
+            // roadmap entry, which now records that as a finding rather than
+            // leaving the blank unexplained.
+            permission_request_id: None,
+            outcome: if succeeded {
+                crate::run_ledger::SubsystemOutcome::Succeeded
+            } else {
+                crate::run_ledger::SubsystemOutcome::Failed
+            },
+            // The session id only. Never a URL, selector or typed text: this
+            // is covered by the hash chain and therefore permanent, and
+            // typed text is exactly where a password would be.
+            detail: session_id.map(|id| serde_json::json!({ "sessionId": id })),
+        });
     }
 
     fn insert(&self, browser: Arc<OwnedBrowser>) -> Result<(), String> {
@@ -616,6 +694,7 @@ impl BrowserWorkflowAdapter {
                         grant: args.grant,
                         limits: args.limits,
                     },
+                    self.state.projector.clone(),
                 )?;
                 let view = browser.view();
                 self.state.insert(browser)?;
@@ -703,8 +782,24 @@ struct OwnedBrowser {
     profile_root: PathBuf,
     profile: PathBuf,
     child: Mutex<Option<Child>>,
+    /// The Chromium process group's leader pid, which is also the child's own.
+    ///
+    /// Kept beside the child rather than read from it, because `stop` takes the
+    /// child out of the `Mutex` and consumes it — after that there is no handle
+    /// left to ask, and the group kill has to happen *after* the direct child is
+    /// reaped, when the renderer and GPU children are exactly what is left.
+    ///
+    /// `None` on a platform with no process groups (Windows), where the value
+    /// would name only the browser process and killing "the group" is not a
+    /// thing that exists.
+    pgid: Option<u32>,
     cdp: Mutex<CdpConnection>,
     artifacts: ArtifactStore,
+    /// Cloned from [`BrowserCommandState`] rather than reached through it, so
+    /// [`Self::stop`] can record the exit from `Drop` — where no state handle
+    /// exists — and so the launch path, which runs inside `spawn_blocking`, does
+    /// not need one either.
+    projector: Option<Arc<crate::process_table::LedgerProcessProjector>>,
     limits: BrowserLimits,
     cancelled: AtomicBool,
     /// Why `cancelled` was set. Not an `AtomicU8`-flavoured enum because the
@@ -726,6 +821,7 @@ impl OwnedBrowser {
         profile_root: PathBuf,
         artifacts: ArtifactStore,
         request: BrowserStartRequest,
+        projector: Option<Arc<crate::process_table::LedgerProcessProjector>>,
     ) -> Result<Arc<Self>, String> {
         validate_identifier("runId", &request.run_id)?;
         validate_limits(&request.limits)?;
@@ -772,9 +868,26 @@ impl OwnedBrowser {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Its own process group, so this session's pid names its whole tree.
+        //
+        // This was the last app-side spawn site without it, and the one where it
+        // mattered most: Chromium is not one process. It forks renderer, GPU,
+        // network and utility children, and `Child::kill` reaps exactly the
+        // browser process — leaving that fan-out running, holding the profile
+        // directory open and, on a crash, surviving the app entirely. With a
+        // group, `native_pid` below is a handle on all of them.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         let mut child = command
             .spawn()
             .map_err(|error| format!("Failed to launch owned Chromium: {error}"))?;
+        // Captured here because `stop` takes the child out of its `Mutex` and
+        // consumes it; after that there is nothing left to ask for a pid. With
+        // `process_group(0)` above, this is also the group id.
+        let child_pgid = child.id();
 
         let launch_result = (|| {
             let port = wait_for_devtools_port(&profile, &mut child, Duration::from_secs(10))?;
@@ -831,8 +944,13 @@ impl OwnedBrowser {
             profile_root,
             profile,
             child: Mutex::new(Some(child)),
+            #[cfg(unix)]
+            pgid: Some(child_pgid),
+            #[cfg(not(unix))]
+            pgid: None,
             cdp: Mutex::new(cdp),
             artifacts,
+            projector,
             limits: request.limits,
             cancelled: AtomicBool::new(false),
             cancel_reason: Mutex::new(None),
@@ -845,9 +963,48 @@ impl OwnedBrowser {
             network: Mutex::new(Vec::new()),
             viewport: Mutex::new(BrowserViewport::default()),
         });
+        // Recorded before the first navigation, so a session that dies during
+        // its opening `navigate` is still a row with a pid rather than an
+        // untracked Chromium. `running` and not `admitted`: the browser is up,
+        // the CDP handshake above has already completed against it.
+        browser.project(crate::process_table::ProcessState::Running, None);
         browser.navigate(&request.url)?;
         browser.capture_evidence()?;
         Ok(browser)
+    }
+
+    /// Writes this session's row, including the pid that names its process group.
+    ///
+    /// Fail-soft by construction — the result is logged and dropped. A browser
+    /// action must not fail because a bookkeeping row could not be written, which
+    /// is the rule every other adopter of this table follows.
+    fn project(&self, state: crate::process_table::ProcessState, exit: Option<BrowserProcessExit>) {
+        let Some(projector) = self.projector.as_ref() else {
+            return;
+        };
+        use crate::process_table::{ProcessExit, ProcessKind, ProcessProjection, ProcessProjector};
+
+        let mut projection =
+            ProcessProjection::new(ProcessKind::BrowserSession, self.session_id.clone(), state)
+                // The pid is the point of the row: it is the only durable handle on this
+                // Chromium's process group, and the only thing that lets a *later* app
+                // session kill a tree this one launched.
+                .with_native_pid(self.pgid.map(i64::from));
+        projection.limits.max_wall_ms = Some(self.limits.max_session_ms);
+        projection.exit = exit.map(|exit| match exit {
+            BrowserProcessExit::Stopped => ProcessExit {
+                status: crate::process_table::ExitStatus::Cancelled,
+                code: None,
+                signal: None,
+                reason: self.cancel_reason().map(|reason| format!("{reason:?}")),
+            },
+        });
+        if let Err(error) = projector.project(&projection) {
+            eprintln!(
+                "browser worker: could not record session {} in the process table: {error}",
+                self.session_id
+            );
+        }
     }
 
     fn view(&self) -> BrowserSessionView {
@@ -1351,8 +1508,10 @@ impl OwnedBrowser {
     fn stop(&self) -> Result<(), String> {
         self.cancelled.store(true, Ordering::SeqCst);
         self.record_cancel_reason(BrowserCancelReason::Stopped);
+        let mut reaped_child = false;
         if let Ok(mut child) = self.child.lock() {
             if let Some(mut child) = child.take() {
+                reaped_child = true;
                 let _ = child.kill();
                 let deadline = Instant::now() + Duration::from_secs(2);
                 loop {
@@ -1371,7 +1530,29 @@ impl OwnedBrowser {
                 }
             }
         }
-        safe_remove_profile(&self.profile_root, &self.profile, &self.session_id)
+        // The kill above reaps exactly one pid. Chromium's renderer, GPU and
+        // utility children are in the same group and outlive it — this is what
+        // takes them, and it runs *after* the direct child so nothing is left
+        // holding the profile directory the removal below is about to delete.
+        //
+        // Only when this call is the one that reaped the child. `stop` is
+        // idempotent (`Drop` calls it after a reclaim already did), and a second
+        // pass must not signal a group id the kernel may have handed to somebody
+        // else in the meantime.
+        if reaped_child {
+            if let Some(pgid) = self.pgid {
+                kill_browser_process_group(pgid);
+            }
+        }
+        let removal = safe_remove_profile(&self.profile_root, &self.profile, &self.session_id);
+        // Recorded after teardown rather than before, so the row's exit is not
+        // written for a Chromium that is still running. Fail-soft, like every
+        // other adopter: bookkeeping must not fail a teardown.
+        self.project(
+            crate::process_table::ProcessState::Exited,
+            Some(BrowserProcessExit::Stopped),
+        );
+        removal
     }
 }
 
@@ -2335,6 +2516,89 @@ fn ensure_new_owned_profile(root: &Path, profile: &Path, session_id: &str) -> Re
         .map_err(|error| error.to_string())
 }
 
+/// How a browser session's process row was closed out.
+///
+/// One variant today, and a type rather than a bool because `stop` is the single
+/// teardown path: a reclaim, a shutdown and a `Drop` all reach it, and every one
+/// of them is a cancel. If a browser session ever ends some other way, this is
+/// where that shows up as a new variant rather than as a second projection site.
+#[derive(Debug, Clone, Copy)]
+enum BrowserProcessExit {
+    Stopped,
+}
+
+/// Terminates the process group led by `pgid`, swallowing the outcome.
+///
+/// Swallowed because every caller is already tearing the session down: a group
+/// that is already gone reports `ESRCH`, which is the state the caller wanted.
+/// The one thing worth saying out loud is a failure that is *not* that, since it
+/// means Chromium children are still running.
+fn kill_browser_process_group(pgid: u32) {
+    if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
+        eprintln!("browser worker: could not terminate Chromium group {pgid}: {error}");
+    }
+}
+
+/// Kills and closes out browser sessions a previous app process left running.
+///
+/// This is the crash path, and the reason [`ProcessKind::BrowserSession`] and its
+/// `native_pid` exist at all. Chromium is spawned by this app but is not its
+/// child in any way that survives a crash: if the app dies without running
+/// [`OwnedBrowser::stop`], the browser and its renderer/GPU children keep
+/// running, keep the profile directory open, and are owned by nobody. The
+/// existing startup sweep could delete the profile — it could not kill the
+/// processes holding it, because nothing recorded what they were.
+///
+/// Now something does. For every live `browser_session` row this reads the
+/// recorded group id and terminates it, then hands the rows to the ordinary
+/// startup reap, which closes them as [`ExitStatus::Lost`].
+///
+/// # Pid reuse
+///
+/// The recorded pid may have been handed to an unrelated process since. Two
+/// things bound the damage, and neither is a full defence:
+///
+/// - The signal goes to a process *group*, so a recycled pid that does not lead
+///   a group fails with `ESRCH` rather than killing anything.
+/// - The row is only consulted once, at startup, and is closed out immediately
+///   after — so a given pid is signalled at most once, ever.
+///
+/// Narrowing this further needs the process's start time, which has no portable
+/// source across the platforms this ships on — the same limit
+/// `os_signal::process_is_alive` records for the same reason.
+pub fn reclaim_orphaned_browser_sessions(
+    table: &crate::process_table::ProcessTable,
+) -> Result<usize, String> {
+    use crate::process_table::{ProcessFilter, ProcessKind};
+
+    let live = table
+        .list(&ProcessFilter {
+            kinds: vec![ProcessKind::BrowserSession],
+            live_only: true,
+            ..ProcessFilter::default()
+        })
+        .map_err(|error| error.to_string())?;
+
+    let mut killed = 0;
+    for record in live {
+        // A row with no pid says nothing about what is running, so there is
+        // nothing to signal — the same rule `reap_dead_hosts` applies to its own
+        // liveness question, and for the same reason.
+        let Some(pid) = record.native_pid else {
+            continue;
+        };
+        let Ok(pid) = u32::try_from(pid) else {
+            continue;
+        };
+        if !crate::os_signal::process_is_alive(pid) {
+            continue;
+        }
+        kill_browser_process_group(pid);
+        killed += 1;
+    }
+    Ok(killed)
+}
+
 fn safe_remove_profile(root: &Path, profile: &Path, session_id: &str) -> Result<(), String> {
     if !profile.exists() {
         return Ok(());
@@ -2593,12 +2857,17 @@ pub async fn browser_start(
 ) -> Result<BrowserSessionView, String> {
     let profile_root = state.profile_root.clone();
     let artifacts = crate::artifact_commands::store_for(&app, app_state.inner())?;
-    let browser =
-        tokio::task::spawn_blocking(move || OwnedBrowser::launch(profile_root, artifacts, request))
-            .await
-            .map_err(|error| error.to_string())??;
+    let projector = state.projector.clone();
+    let browser = tokio::task::spawn_blocking(move || {
+        OwnedBrowser::launch(profile_root, artifacts, request, projector)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     let view = browser.view();
-    state.insert(browser)?;
+    let session_id = view.session_id.clone();
+    let inserted = state.insert(browser);
+    state.record("start", Some(&session_id), inserted.is_ok());
+    inserted?;
     Ok(view)
 }
 
@@ -2621,10 +2890,11 @@ pub async fn browser_navigate(
     session_id: String,
     url: String,
 ) -> Result<BrowserActionResult, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.navigate(&url))
+    state
+        .audited("navigate", &session_id, move |session| {
+            session.navigate(&url)
+        })
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2632,10 +2902,9 @@ pub async fn browser_reload(
     state: tauri::State<'_, BrowserCommandState>,
     session_id: String,
 ) -> Result<BrowserActionResult, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.reload())
+    state
+        .audited("reload", &session_id, |session| session.reload())
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2644,10 +2913,11 @@ pub async fn browser_set_viewport(
     session_id: String,
     viewport: BrowserViewport,
 ) -> Result<BrowserActionResult, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.set_viewport(viewport))
+    state
+        .audited("set_viewport", &session_id, move |session| {
+            session.set_viewport(viewport)
+        })
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2655,10 +2925,9 @@ pub async fn browser_inspect(
     state: tauri::State<'_, BrowserCommandState>,
     session_id: String,
 ) -> Result<BrowserInspection, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.inspect())
+    state
+        .audited("inspect", &session_id, |session| session.inspect())
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2667,10 +2936,11 @@ pub async fn browser_annotate(
     session_id: String,
     selector: String,
 ) -> Result<BrowserAnnotation, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.annotate(&selector))
+    state
+        .audited("annotate", &session_id, move |session| {
+            session.annotate(&selector)
+        })
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2679,10 +2949,11 @@ pub async fn browser_click(
     session_id: String,
     selector: String,
 ) -> Result<BrowserActionResult, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.click(&selector))
+    state
+        .audited("click", &session_id, move |session| {
+            session.click(&selector)
+        })
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2692,10 +2963,11 @@ pub async fn browser_type_text(
     selector: String,
     text: String,
 ) -> Result<BrowserActionResult, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.type_text(&selector, &text))
+    state
+        .audited("type_text", &session_id, move |session| {
+            session.type_text(&selector, &text)
+        })
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2705,10 +2977,9 @@ pub async fn browser_scroll(
     x: i64,
     y: i64,
 ) -> Result<BrowserActionResult, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.scroll(x, y))
+    state
+        .audited("scroll", &session_id, move |session| session.scroll(x, y))
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2716,10 +2987,11 @@ pub async fn browser_capture_evidence(
     state: tauri::State<'_, BrowserCommandState>,
     session_id: String,
 ) -> Result<BrowserEvidence, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.capture_evidence())
+    state
+        .audited("capture_evidence", &session_id, |session| {
+            session.capture_evidence()
+        })
         .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2727,12 +2999,15 @@ pub async fn browser_stop(
     state: tauri::State<'_, BrowserCommandState>,
     session_id: String,
 ) -> Result<(), String> {
-    let session = state
-        .remove(&session_id)?
-        .ok_or_else(|| "Unknown browser session".to_string())?;
-    tokio::task::spawn_blocking(move || session.stop())
-        .await
-        .map_err(|error| error.to_string())?
+    let outcome = match state.remove(&session_id) {
+        Ok(Some(session)) => tokio::task::spawn_blocking(move || session.stop())
+            .await
+            .map_err(|error| error.to_string())?,
+        Ok(None) => Err("Unknown browser session".to_string()),
+        Err(error) => Err(error),
+    };
+    state.record("stop", Some(&session_id), outcome.is_ok());
+    outcome
 }
 
 #[cfg(test)]
@@ -2775,6 +3050,127 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("the stand-in child spawns")
+    }
+
+    /// The crash path, with a real process group standing in for Chromium's.
+    ///
+    /// This is the capability the roadmap said was missing: a browser session's
+    /// pid is recorded, so a *later* app process can name and kill a tree the
+    /// previous one left running. The stand-in is a `sh` that forks a child and
+    /// then sleeps — a one-process stand-in would pass even if the group were
+    /// never signalled, since `Child::kill` already reaches that one.
+    #[cfg(unix)]
+    #[test]
+    fn an_orphaned_session_row_kills_the_whole_recorded_process_group() {
+        use crate::process_table::{ProcessKind, ProcessProjection, ProcessState, ProcessTable};
+        use std::os::unix::process::CommandExt;
+
+        let database = std::env::temp_dir().join(format!(
+            "lm-browser-orphan-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let ledger = crate::run_ledger::RunLedger::open(&database).expect("ledger opens");
+        let table = ProcessTable::new(ledger.connection());
+
+        // A leader that forks a grandchild into its own group and reports both
+        // pids. `Child::kill` would reap only the leader.
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 60 & echo $!; sleep 60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        command.process_group(0);
+        let mut leader = command.spawn().expect("the stand-in group spawns");
+        let pgid = leader.id();
+
+        let grandchild = {
+            // One line, not the whole stream: the leader holds stdout open for
+            // its full sleep, so reading to EOF would wait out the timer this
+            // test is about killing early.
+            use std::io::BufRead;
+            let mut line = String::new();
+            std::io::BufReader::new(leader.stdout.as_mut().expect("piped stdout"))
+                .read_line(&mut line)
+                .ok();
+            line.trim().parse::<u32>().ok()
+        };
+        assert!(
+            grandchild.is_some(),
+            "the stand-in must report a grandchild, or this proves nothing"
+        );
+
+        let now = 1_000_000_i64;
+        table
+            .reconcile(
+                &ProcessProjection::new(
+                    ProcessKind::BrowserSession,
+                    "orphan-session".to_string(),
+                    ProcessState::Running,
+                )
+                .with_native_pid(Some(i64::from(pgid))),
+                now,
+            )
+            .expect("the orphan row is recorded");
+
+        let killed = reclaim_orphaned_browser_sessions(&table).expect("the reclaim runs");
+        assert_eq!(killed, 1, "the live orphan must be counted");
+
+        let _ = leader.wait();
+        assert!(
+            !crate::os_signal::process_is_alive(pgid),
+            "the leader must be gone"
+        );
+        if let Some(grandchild) = grandchild {
+            assert!(
+                !crate::os_signal::process_is_alive(grandchild),
+                "the grandchild is the whole point: a per-pid kill leaves it running"
+            );
+        }
+
+        // A second pass finds nothing to kill, because the row is closed out by
+        // the reap that follows this in `reap_desktop_processes_at_startup` — and
+        // even before that, a dead pid is skipped rather than signalled again.
+        assert_eq!(
+            reclaim_orphaned_browser_sessions(&table).expect("the reclaim reruns"),
+            0,
+            "a dead pid must not be signalled a second time"
+        );
+
+        let _ = std::fs::remove_file(&database);
+    }
+
+    /// A row with no pid says nothing about what is running. Reading that silence
+    /// as "kill something" is the failure mode worth a test of its own.
+    #[test]
+    fn a_session_row_without_a_pid_is_never_signalled() {
+        use crate::process_table::{ProcessKind, ProcessProjection, ProcessState, ProcessTable};
+
+        let database = std::env::temp_dir().join(format!(
+            "lm-browser-nopid-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let ledger = crate::run_ledger::RunLedger::open(&database).expect("ledger opens");
+        let table = ProcessTable::new(ledger.connection());
+        table
+            .reconcile(
+                &ProcessProjection::new(
+                    ProcessKind::BrowserSession,
+                    "pidless-session".to_string(),
+                    ProcessState::Running,
+                ),
+                1_000_000,
+            )
+            .expect("the row is recorded");
+
+        assert_eq!(
+            reclaim_orphaned_browser_sessions(&table).expect("the reclaim runs"),
+            0
+        );
+        let _ = std::fs::remove_file(&database);
     }
 
     /// Builds a session around a real but trivial child, so the quota branches in
@@ -2822,6 +3218,10 @@ mod tests {
 
         (
             Arc::new(OwnedBrowser {
+                // No real Chromium behind this stand-in, so no group to name and
+                // no ledger to write to: both are `None` rather than faked.
+                pgid: None,
+                projector: None,
                 session_id,
                 run_id: "quota-run".to_string(),
                 profile_root: profiles,
@@ -3066,15 +3466,57 @@ mod tests {
     /// clock branch on every platform. The fixture has no long-lived Windows child,
     /// so a real probe would read every session there as crashed and this could
     /// never reach the clock at all.
+    /// Every acting command routes through `audited`, so the recording cannot be
+    /// forgotten when a thirteenth is added. This pins the funnel rather than the
+    /// twelve call sites: an action against a session that does not exist is
+    /// still an event, and `failed` is the honest outcome for it.
+    #[tokio::test]
+    async fn a_browser_action_is_recorded_even_when_the_session_is_unknown() {
+        let root = std::env::temp_dir().join(format!("lm-browser-audit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = BrowserCommandState::production(&root).unwrap();
+        assert!(
+            state.audit.is_recording(),
+            "a production state must audit — a disabled one here would make every \
+             assertion below vacuous"
+        );
+
+        let outcome: Result<(), String> = state
+            .audited("navigate", "no-such-session", |_| Ok(()))
+            .await;
+        assert!(outcome.is_err(), "the session does not exist");
+
+        let ledger = little_monkey_ledger_at(&root);
+        let events = ledger.recent_subsystem_events(None, 10).unwrap();
+        assert_eq!(events.len(), 1, "the failed action is still an event");
+        assert_eq!(events[0].subsystem, crate::run_ledger::Subsystem::Browser);
+        assert_eq!(events[0].action, "navigate");
+        assert_eq!(
+            events[0].outcome,
+            crate::run_ledger::SubsystemOutcome::Failed
+        );
+        assert!(
+            events[0].permission_request_id.is_none(),
+            "browser actions are not permission-gated today, and the stream says so"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn little_monkey_ledger_at(root: &Path) -> crate::run_ledger::RunLedger {
+        crate::run_ledger::RunLedger::open(root.join("profile-v1.sqlite3")).unwrap()
+    }
+
     #[test]
     fn the_sweep_reclaims_an_idle_expired_session_and_leaves_a_live_one() {
         let root = std::env::temp_dir().join(format!("lm-browser-sweep-{}", uuid::Uuid::new_v4()));
         let state = BrowserCommandState::production(&root).unwrap();
 
-        // Zero means "already past its budget on the first tick", which is the
-        // only way to age a session without sleeping. It is a test input, not a
-        // proposed default — see the counterpart below, which is what stops a
-        // sweep that reclaims everything from passing this.
+        // Zero is the smallest budget that ages a session without waiting out a
+        // real one. It is a test input, not a proposed default — `validate_limits`
+        // floors `max_session_ms` at 1000, so production never sees it — and the
+        // counterpart below is what stops a sweep that reclaims everything from
+        // passing this.
         let (expired, _) = quota_session_with(BrowserLimits {
             max_session_ms: 0,
             ..BrowserLimits::default()
@@ -3082,6 +3524,18 @@ mod tests {
         let (live, _) = quota_session_with(BrowserLimits::default());
         state.insert(expired.clone()).unwrap();
         state.insert(live.clone()).unwrap();
+
+        // `sweep_verdict` compares `elapsed_ms > max_session_ms` strictly, and
+        // `sweep_verdict_now` truncates `Instant::elapsed()` to whole milliseconds.
+        // So even a zero budget needs one millisecond on the clock: without this
+        // the fixture setup and the sweep can land in the same millisecond on a
+        // fast machine, `elapsed_ms` is 0, `0 > 0` is false, and the session this
+        // test is about reads as live. That is what made this flake — it passed
+        // only when the socket and profile setup above happened to straddle a
+        // millisecond boundary. Sleeping is the fix rather than relaxing the
+        // comparison, because `>` is correct for every budget production can
+        // actually receive.
+        std::thread::sleep(Duration::from_millis(2));
 
         let outcomes = state.sweep_sessions(&|_| false).unwrap();
 
@@ -4090,6 +4544,7 @@ mod tests {
                     ..BrowserLimits::default()
                 },
             },
+            None,
         )
         .unwrap();
         let viewport = BrowserViewport {

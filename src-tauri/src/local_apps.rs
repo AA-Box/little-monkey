@@ -30,8 +30,9 @@
 
 use std::path::{Path, PathBuf};
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
+use crate::profiles::ProfileScopedPaths;
 use crate::recipes::Recipe;
 use crate::AppState;
 
@@ -76,10 +77,7 @@ pub enum LocalAppTemplate {
 impl LocalAppTemplate {
     fn heading_and_blurb(self) -> (&'static str, &'static str) {
         match self {
-            LocalAppTemplate::Form => (
-                "Form",
-                "Fill in the parameters below and run the recipe.",
-            ),
+            LocalAppTemplate::Form => ("Form", "Fill in the parameters below and run the recipe."),
             LocalAppTemplate::Dashboard => (
                 "Dashboard",
                 "A quick-glance runner for this recipe's parameters.",
@@ -92,10 +90,9 @@ impl LocalAppTemplate {
                 "Report generator",
                 "Generate a report by running the recipe with these parameters.",
             ),
-            LocalAppTemplate::ChatWidget => (
-                "Chat",
-                "A minimal one-shot prompt runner for this recipe.",
-            ),
+            LocalAppTemplate::ChatWidget => {
+                ("Chat", "A minimal one-shot prompt runner for this recipe.")
+            }
         }
     }
 }
@@ -138,21 +135,20 @@ fn now_ms() -> u64 {
 /// id here would let `app_data/local_apps/<id>` itself escape the intended
 /// directory before path canonicalization even runs.
 pub fn is_valid_app_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 pub fn config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     if !base.exists() {
-        std::fs::create_dir_all(&base)
-            .map_err(|e| format!("Failed to create app data directory {}: {e}", base.display()))?;
+        std::fs::create_dir_all(&base).map_err(|e| {
+            format!(
+                "Failed to create app data directory {}: {e}",
+                base.display()
+            )
+        })?;
     }
     Ok(base.join(CONFIG_FILE))
 }
@@ -209,7 +205,12 @@ fn render_page_html(def: &LocalAppDefinition, recipe: &Recipe, token: &str, port
             .get(*name)
             .cloned()
             .unwrap_or_else(|| (*name).clone());
-        let default_value = recipe.params.get(*name).cloned().flatten().unwrap_or_default();
+        let default_value = recipe
+            .params
+            .get(*name)
+            .cloned()
+            .flatten()
+            .unwrap_or_default();
         fields.push_str(&format!(
             "<label class=\"field\"><span>{}</span><input type=\"text\" name=\"{}\" value=\"{}\" /></label>\n",
             html_escape(&label),
@@ -296,7 +297,10 @@ fn render_page_html(def: &LocalAppDefinition, recipe: &Recipe, token: &str, port
         blurb_escaped = html_escape(blurb),
         fields = fields,
         param_names_json = param_names_json,
-        run_url = js_string(&format!("http://127.0.0.1:{port}/v1/local-apps/{}/run", def.id)),
+        run_url = js_string(&format!(
+            "http://127.0.0.1:{port}/v1/local-apps/{}/run",
+            def.id
+        )),
         token = token,
     )
 }
@@ -308,7 +312,11 @@ fn render_page_html(def: &LocalAppDefinition, recipe: &Recipe, token: &str, port
 /// joined onto a path: an attacker-controlled id containing `..` must be
 /// rejected before path construction, not just after, since the id itself
 /// (not only `rel_path`) forms part of the directory being canonicalized.
-pub fn read_static_file(app_data_dir: &Path, app_id: &str, rel_path: &str) -> Result<Vec<u8>, String> {
+pub fn read_static_file(
+    app_data_dir: &Path,
+    app_id: &str,
+    rel_path: &str,
+) -> Result<Vec<u8>, String> {
     if !is_valid_app_id(app_id) {
         return Err("invalid Local App id".to_string());
     }
@@ -342,8 +350,7 @@ pub fn publish_impl(
     param_bindings: std::collections::HashMap<String, String>,
 ) -> Result<LocalAppDefinition, String> {
     let app_data_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     let workspace_root = crate::workspace::primary_root_canon(state).ok();
     let (recipe, _path) = crate::recipes::resolve_recipe_with_path(
@@ -465,8 +472,7 @@ pub fn unpublish_impl(app: &AppHandle, state: &AppState, id: &str) -> Result<(),
 
     if is_valid_app_id(id) {
         let app_data_dir = app
-            .path()
-            .app_data_dir()
+            .profile_data_dir()
             .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
         let _ = std::fs::remove_dir_all(app_dir(&app_data_dir, id));
     }
@@ -556,7 +562,8 @@ mod tests {
 
     #[test]
     fn read_static_file_rejects_path_traversal_outside_the_app_directory() {
-        let tmp = std::env::temp_dir().join(format!("lmk-local-apps-test-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("lmk-local-apps-test-{}", uuid::Uuid::new_v4()));
         let app_id = "11111111-1111-4111-8111-111111111111";
         let app_dir_path = tmp.join(APPS_DIR).join(app_id);
         std::fs::create_dir_all(&app_dir_path).unwrap();
@@ -568,7 +575,10 @@ mod tests {
         assert_eq!(ok.unwrap(), b"<html>ok</html>".to_vec());
 
         let traversal = read_static_file(&tmp, app_id, "../secret.txt");
-        assert!(traversal.is_err(), "traversal must be rejected, not read the sibling file");
+        assert!(
+            traversal.is_err(),
+            "traversal must be rejected, not read the sibling file"
+        );
 
         let bad_id = read_static_file(&tmp, "../../etc", "passwd");
         assert!(bad_id.is_err());
@@ -600,7 +610,8 @@ mod tests {
     }
 
     #[test]
-    fn render_page_html_html_escapes_param_names_and_default_values_instead_of_json_encoding_them() {
+    fn render_page_html_html_escapes_param_names_and_default_values_instead_of_json_encoding_them()
+    {
         let mut recipe = sample_recipe();
         recipe.params.clear();
         recipe.params.insert(
@@ -635,7 +646,8 @@ mod tests {
 
     #[test]
     fn config_round_trips_through_save_and_load() {
-        let tmp = std::env::temp_dir().join(format!("lmk-local-apps-config-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("lmk-local-apps-config-{}", uuid::Uuid::new_v4()));
         let mut config = LocalAppsConfig::default();
         config.apps.push(LocalAppDefinition {
             id: "app-1".to_string(),
@@ -657,7 +669,8 @@ mod tests {
 
     #[test]
     fn load_config_defaults_when_file_is_missing() {
-        let tmp = std::env::temp_dir().join(format!("lmk-local-apps-missing-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("lmk-local-apps-missing-{}", uuid::Uuid::new_v4()));
         let config = load_config_impl(&tmp).unwrap();
         assert!(config.apps.is_empty());
     }

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { Activity, FileText, Gauge, Play, RefreshCw, Save, Square, Wrench } from "lucide-react";
 import { Button, StatusPill } from "../../ui";
 import type {
@@ -41,7 +42,10 @@ function statusState(detail: RuntimeDetail | undefined): string {
 
 function statusTone(state: string): "neutral" | "success" | "warning" | "danger" {
   if (state === "ready" || state === "running") return "success";
-  if (state === "starting" || state === "degraded") return "warning";
+  // `not_installed` is actionable, not broken: the user installs a package and
+  // it clears. A neutral pill read as "nothing to see here" next to a card
+  // whose only content was an empty model list.
+  if (state === "starting" || state === "degraded" || state === "not_installed") return "warning";
   if (state === "error" || state === "unreachable" || state === "unavailable") return "danger";
   return "neutral";
 }
@@ -236,6 +240,28 @@ function ContextCachePanel({ view }: { view: ContextCacheView | undefined }) {
         )}
         {view.totalSlots != null && <span>Server slots: {view.totalSlots}</span>}
       </div>
+      {/* Both arms render, because "this runtime cannot share a prefix" is as
+          useful to know as that it can — and the union makes it impossible to
+          show either verdict without the sentence that justifies it. */}
+      <p className="mt-2 text-xs leading-5 text-muted">
+        <span className="font-medium text-foreground">
+          {view.prefixSharing.state === "supported"
+            ? "Prompt prefixes are shared between processes: "
+            : "Prompt prefixes are not shared between processes: "}
+        </span>
+        {view.prefixSharing.state === "supported"
+          ? view.prefixSharing.mechanism
+          : view.prefixSharing.reason}
+      </p>
+      {/* Only when a budget cannot be enforced. There is nothing to say when it
+          can — the enforcement is silent and correct — but "you can set a limit
+          here and it will do nothing" is exactly what a user must not discover
+          by setting one. */}
+      {view.contextBudget.state === "unenforceable" && (
+        <p className="mt-1 text-xs leading-5 text-warning">
+          A per-process context budget cannot be enforced on this runtime: {view.contextBudget.reason}
+        </p>
+      )}
       {view.notes.length > 0 && (
         <ul className="mt-3 list-disc space-y-1 pl-5 text-xs leading-5 text-muted">
           {view.notes.map((note) => (
@@ -476,6 +502,7 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   const runtimeDetails = useRuntimeHubStore((state) => state.runtimeDetails);
   const offloadPlan = useRuntimeHubStore((state) => state.offloadPlans[runtimeId]);
   const previewOffloadPlan = useRuntimeHubStore((state) => state.previewOffloadPlan);
+  const installMlxPackage = useRuntimeHubStore((state) => state.installMlxPackage);
   const offloadBusy = busy[`offload-plan:${runtimeId}`];
   const offloadError = errors[`offload-plan:${runtimeId}`];
   const compatibilityReport = useRuntimeHubStore((state) => state.compatibilityReport);
@@ -573,6 +600,33 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
         </BusyButton>
       </div>
       <ErrorNotice message={errors[`runtime:${runtimeId}`]} />
+
+      {/* MLX is the one runtime the app does not ship: its service package is
+          installed separately and Ed25519-verified against the pinned release
+          key. Until one is installed there is nothing to load a model into, so
+          the card offers the install rather than an empty model picker. */}
+      {state === "not_installed" && (
+        <div className="mt-4 rounded-md border border-border bg-surface-2 p-3">
+          <p className="text-sm text-foreground">No MLX service package is installed.</p>
+          <p className="mt-1 text-xs text-muted">
+            Build one with <code className="font-mono">pnpm mlx:package</code>, then choose the
+            resulting folder. It is only installed if the pinned release key signed it.
+          </p>
+          <BusyButton
+            type="button"
+            className="mt-3"
+            busy={busy["mlx-install"]}
+            onClick={() =>
+              void open({ directory: true, multiple: false }).then((path) => {
+                if (typeof path === "string") void installMlxPackage(path).catch(() => {});
+              })
+            }
+          >
+            Choose package folder…
+          </BusyButton>
+          <ErrorNotice message={errors["mlx-install"]} />
+        </div>
+      )}
 
       <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <div className="rounded-md bg-surface-2 p-3">

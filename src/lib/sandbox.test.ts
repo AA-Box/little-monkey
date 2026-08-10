@@ -32,6 +32,7 @@ describe("the enforcement probe", () => {
 describe("the pre-run warning strings", () => {
   /** Every state the panel warns about — `os_enforced` renders no banner. */
   const WARNED: readonly Exclude<SandboxEnforcement, "os_enforced">[] = [
+    "process_contained",
     "process_only",
     "unavailable",
   ];
@@ -51,5 +52,9 @@ describe("the pre-run warning strings", () => {
     expect(sandboxLocale["SandboxPanel.enforcement.unavailable"]).toMatch(
       /fail to start|rather than run unconfined/i,
     );
+    // The contained state is the one most likely to be misread as safe, so its
+    // string has to say both halves: what the kernel holds, and what it does not.
+    expect(sandboxLocale["SandboxPanel.enforcement.process_contained"]).toMatch(/job object/i);
+    expect(sandboxLocale["SandboxPanel.enforcement.process_contained"]).toMatch(/absolute path/i);
   });
 });

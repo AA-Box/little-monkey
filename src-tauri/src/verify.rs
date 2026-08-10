@@ -35,9 +35,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tauri::Manager;
 use tokio::sync::Notify;
 
+use crate::profiles::ProfileScopedPaths;
 use crate::{workspace, AppState};
 
 const VERIFY_CONFIGS_FILE: &str = "verify_configs.json";
@@ -107,8 +107,7 @@ pub struct VerifyResult {
 
 fn verify_configs_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {}", e))?;
     Ok(dir.join(VERIFY_CONFIGS_FILE))

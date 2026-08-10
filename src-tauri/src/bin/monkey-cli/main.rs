@@ -12,9 +12,12 @@ mod agent;
 mod chat;
 mod checkpoints_cli;
 mod cmds;
+mod conformance_cli;
+mod contract_cli;
 mod daemon;
 mod durable_run;
 mod embed_cli;
+mod launcher;
 mod managed_model_cli;
 mod mcp_cli;
 mod modelfile;
@@ -22,6 +25,7 @@ mod ollama_api;
 mod permission;
 mod plugins_cli;
 mod processes_cli;
+mod profiles_cli;
 mod providers_cli;
 mod repl;
 mod security_cli;
@@ -36,6 +40,7 @@ mod web_cli;
 mod workflow_cli;
 
 use std::collections::BTreeSet;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
@@ -48,6 +53,7 @@ use permission::{PermissionMode, TerminalPermissions};
 
 #[derive(Parser, Debug)]
 #[command(name = "monkey", bin_name = "monkey", version, about)]
+#[command(after_help = "Prompts need no quoting — `monkey MODEL summarize this repo` works as-is on sh, PowerShell and cmd. Use double quotes (the one form all three share) when exact spacing or shell metacharacters matter.\n\nRun `monkey` with no arguments for the interactive launcher.")]
 struct Cli {
     /// Ollama-style model management subcommand. Note: a bare first argument
     /// matching a subcommand name (e.g. `monkey list`) parses as that
@@ -60,15 +66,23 @@ struct Cli {
     #[arg(value_name = "MODEL")]
     model_or_prompt: Option<String>,
 
-    /// One-shot prompt for the short model-first form. Omit it to start an
-    /// interactive REPL with the selected model.
+    /// One-shot prompt for the short model-first form. Every remaining
+    /// positional word joins into it, so `monkey MODEL summarize this repo`
+    /// works unquoted on any shell. Omit it to start an interactive REPL
+    /// with the selected model.
     #[arg(value_name = "PROMPT")]
-    prompt: Option<String>,
+    prompt: Vec<String>,
 
     /// Workspace root the agent's tools are sandboxed to. Defaults to the
     /// current directory.
     #[arg(long, value_name = "PATH", global = true)]
     workspace: Option<PathBuf>,
+
+    /// Run this command as another local profile (K23), without changing
+    /// which profile the desktop app opens. Equivalent to setting
+    /// `LITTLE_MONKEY_PROFILE`; see `monkey profiles list` for the ids.
+    #[arg(long, value_name = "ID", global = true)]
+    profile: Option<String>,
 
     /// Provider id (for example ollama, managed-llama, openai, anthropic,
     /// gemini, openrouter, or a custom provider id). Use only to override or
@@ -346,8 +360,9 @@ enum Cmd {
     Run {
         /// Ollama tag, or pinned Hugging Face GGUF reference
         model: String,
-        /// One-shot prompt. Omit to start an interactive REPL instead.
-        prompt: Option<String>,
+        /// One-shot prompt; multiple words join into one prompt. Omit to start
+        /// an interactive REPL instead.
+        prompt: Vec<String>,
         /// System prompt overriding the model's default
         #[arg(long)]
         system: Option<String>,
@@ -372,9 +387,9 @@ enum Cmd {
         port: Option<u16>,
     },
     /// Knowledge Stacks parity (RAG design doc, slice 4): list stacks
-    /// created in the desktop app's Settings > Knowledge tab, or reindex
-    /// one by name. Read-only management stays in the GUI — no
-    /// create/delete/add-source here.
+    /// created in the desktop app's Settings > Knowledge tab, reindex one by
+    /// name, or import one's older index into Knowledge 2.0. Read-only
+    /// management stays in the GUI — no create/delete/add-source here.
     #[command(subcommand)]
     Stacks(StacksCmd),
     /// Saved recipe (YAML/JSON) headless runner — CI-suitable, machine
@@ -398,12 +413,23 @@ enum Cmd {
     /// Inspect local security posture and apply narrowly-scoped safe fixes.
     #[command(subcommand)]
     Security(security_cli::SecurityCmd),
+    /// Print, emit, or version-check the published syscall ABI (roadmap
+    /// K19) — the schema set third parties build against.
+    #[command(subcommand)]
+    Contract(contract_cli::ContractCmd),
     /// Inspect agent processes across every execution surface.
     ///
     /// Named `processes` because `monkey ps` is the Ollama-compatible
     /// "list running models" command.
     #[command(subcommand, alias = "proc")]
     Processes(processes_cli::ProcessesCmd),
+    /// Run the published conformance suite (roadmap K21) against a live node
+    /// and report whether it may claim compatibility with this revision.
+    Conformance(conformance_cli::ConformanceArgs),
+    /// Manage local profiles: separate sessions, run history, artifacts,
+    /// credentials and machine share on one machine (K23).
+    #[command(subcommand, alias = "profile")]
+    Profiles(profiles_cli::ProfilesCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -499,6 +525,19 @@ struct FlatInvocation {
     prompt: Option<String>,
 }
 
+/// Joins the trailing positional words back into a single prompt string;
+/// `None` when none were given (the REPL form). Runs of whitespace are
+/// already gone by the time argv reaches us — sh, PowerShell and cmd
+/// (`CommandLineToArgvW`) all split on it — so a prompt whose exact spacing
+/// matters needs double quotes, the one quoting form all three share.
+fn joined_prompt(words: &[String]) -> Option<String> {
+    if words.is_empty() {
+        None
+    } else {
+        Some(words.join(" "))
+    }
+}
+
 fn flat_invocation(cli: &Cli) -> Result<FlatInvocation, String> {
     let explicit_targets = usize::from(cli.provider.is_some())
         + usize::from(cli.ollama.is_some())
@@ -507,7 +546,7 @@ fn flat_invocation(cli: &Cli) -> Result<FlatInvocation, String> {
         return Err("Choose only one of --provider, --ollama, or --local-url".to_string());
     }
     let reject_extra = || {
-        if cli.prompt.is_some() {
+        if !cli.prompt.is_empty() {
             Err("Too many positional arguments for the legacy target form".to_string())
         } else {
             Ok(())
@@ -531,7 +570,7 @@ fn flat_invocation(cli: &Cli) -> Result<FlatInvocation, String> {
         }
         return Ok(FlatInvocation {
             model: cli.model_or_prompt.clone(),
-            prompt: cli.prompt.clone(),
+            prompt: joined_prompt(&cli.prompt),
         });
     }
     if cli.local_url.is_some() {
@@ -545,10 +584,10 @@ fn flat_invocation(cli: &Cli) -> Result<FlatInvocation, String> {
         // One positional keeps the historical `--local-url URL "prompt"`
         // form (the server may expose one implicit model); two positionals
         // use the new MODEL PROMPT form.
-        return if cli.prompt.is_some() {
+        return if !cli.prompt.is_empty() {
             Ok(FlatInvocation {
                 model: cli.model_or_prompt.clone(),
-                prompt: cli.prompt.clone(),
+                prompt: joined_prompt(&cli.prompt),
             })
         } else {
             Ok(FlatInvocation {
@@ -566,7 +605,7 @@ fn flat_invocation(cli: &Cli) -> Result<FlatInvocation, String> {
     }
     Ok(FlatInvocation {
         model: cli.model_or_prompt.clone(),
-        prompt: cli.prompt.clone(),
+        prompt: joined_prompt(&cli.prompt),
     })
 }
 
@@ -930,17 +969,78 @@ fn compose_system_prompt(state: &AppState, user_system: Option<&str>) -> Option<
     }
 }
 
+/// The workspace-orientation lines every turn starts with, mirroring the
+/// desktop app's `buildSystemPrompt` (`src/lib/systemPrompt.ts`) — without
+/// them the model has no idea what its sandbox root actually is and guesses
+/// (`cd /workspace`, `cd /repo`), burning a turn on a "No such file or
+/// directory" before it finds its footing. Not gated on `--no-rules`: that
+/// flag means "skip MONKEY.md rules and remembered facts", not "hide which
+/// folder you're in".
+/// A workspace root as it should be *said* to a model, which on Windows is not
+/// how it is stored.
+///
+/// `workspace::all_roots` canonicalizes, deliberately — every path comparison in
+/// the crate depends on one exact form. But `std::fs::canonicalize` on Windows
+/// returns a *verbatim* path (`\\?\C:\...`), and that form is correct to compare
+/// and wrong to hand to a model: this string is presented as "the working
+/// directory for run_shell", so the model will paste it into a shell command, and
+/// plenty of Windows tooling — `cmd.exe` builtins among them — mishandles a `\\?\`
+/// prefix. `\\?\UNC\server\share` denormalizes back to `\\server\share` for the
+/// same reason.
+///
+/// Display only. The canonical `PathBuf` every other caller of `all_roots` holds
+/// (`rules.rs` finding MONKEY.md, `tools.rs` resolving tool paths) is untouched,
+/// because those want the exact form and would break without it.
+fn root_for_prompt(path: &Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    text
+}
+
+fn workspace_section(state: &AppState) -> String {
+    let Ok(roots) = workspace::all_roots(state) else {
+        return "No workspace folder is open. File and shell tools will fail until one is — say so instead of retrying.".to_string();
+    };
+    let mut lines = Vec::new();
+    for (path, label, is_primary) in &roots {
+        if *is_primary {
+            lines.push(format!(
+                "The primary workspace folder is \"{}\". It is the working directory for run_shell and the root every tool path resolves against — never cd elsewhere to look for the project.",
+                root_for_prompt(path)
+            ));
+        } else {
+            lines.push(format!(
+                "Additional attached folder \"{label}\" ({}); address its paths by prefixing them with the label.",
+                root_for_prompt(path)
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
 /// `--no-rules` short-circuits straight to `user_system` unchanged; otherwise
 /// defers to [`compose_system_prompt`]. Shared by `chat_setup` (the global
 /// `--system`) and the `run` subcommand's own `--system`, so a `--system`
 /// given after `run` still gets the rules/facts section prepended instead of
-/// silently overwriting it.
+/// silently overwriting it. Either way [`workspace_section`] goes first.
 fn effective_system(cli: &Cli, state: &AppState, user_system: Option<&str>) -> Option<String> {
-    if cli.no_rules {
+    let body = if cli.no_rules {
         user_system.map(str::to_string)
     } else {
         compose_system_prompt(state, user_system)
-    }
+    };
+    Some(match body {
+        Some(body) => format!("{}\n\n{body}", workspace_section(state)),
+        None => workspace_section(state),
+    })
 }
 
 /// Builds the chat-side pieces shared by the flat invocation and `run`:
@@ -991,7 +1091,7 @@ fn fail(message: &str) -> ! {
 fn is_bare_invocation(cli: &Cli) -> bool {
     cli.cmd.is_none()
         && cli.model_or_prompt.is_none()
-        && cli.prompt.is_none()
+        && cli.prompt.is_empty()
         && cli.provider.is_none()
         && cli.model.is_none()
         && cli.ollama.is_none()
@@ -1014,13 +1114,15 @@ async fn resolve_mcp_entries(cli: &Cli, state: &AppState) -> Vec<McpServerEntry>
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
-    if is_bare_invocation(&cli) {
-        use clap::CommandFactory;
-        // Ignore write failures (e.g. stdout piped into a closed `head`).
-        let _ = Cli::command().print_help();
-        return;
+    // Applied before anything resolves a path, and as the environment variable
+    // the library already reads, so the flag and `LITTLE_MONKEY_PROFILE` cannot
+    // disagree — a second resolution rule is a second answer to "whose data is
+    // this". Single-threaded here: `Cli::parse()` is the only thing that has
+    // run.
+    if let Some(profile) = cli.profile.as_deref() {
+        std::env::set_var(little_monkey_lib::profiles::PROFILE_ENV_VAR, profile);
     }
 
     // The one client the whole CLI shares — threaded through as
@@ -1035,8 +1137,35 @@ async fn main() {
         Err(error) => fail(&format!("could not build the HTTP client: {error}")),
     };
 
+    // A bare `monkey` on a TTY opens the launcher (menu → model picker) and
+    // continues below with whatever model was chosen, so a launched session
+    // is byte-for-byte a `monkey MODEL` session. Off a TTY — piped, CI — it
+    // keeps printing help, since there's nobody to press a key.
+    if is_bare_invocation(&cli) {
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            use clap::CommandFactory;
+            // Ignore write failures (e.g. stdout piped into a closed `head`).
+            let _ = Cli::command().print_help();
+            return;
+        }
+        match launcher::run(&client).await {
+            Ok(Some(launch)) => {
+                launch.apply(&mut cli);
+                let backend = if launch.managed {
+                    ModelCommandBackend::Managed
+                } else {
+                    ModelCommandBackend::Ollama
+                };
+                run_model(&cli, &client, &launch.model, None, None, backend).await;
+                return;
+            }
+            Ok(None) => return,
+            Err(error) => fail(&error),
+        }
+    }
+
     if let Some(cmd) = &cli.cmd {
-        if let Some(prompt) = cli.model_or_prompt.as_ref().or(cli.prompt.as_ref()) {
+        if let Some(prompt) = cli.model_or_prompt.as_ref().or(cli.prompt.first()) {
             fail(&format!(
                 "unexpected argument '{prompt}' before a subcommand"
             ));
@@ -1083,6 +1212,109 @@ async fn main() {
     )
     .await
     {
+        fail(&error);
+    }
+}
+
+/// Runs one model to completion — a one-shot `prompt`, or the REPL when it's
+/// `None` — over either backend. Extracted from the `run` subcommand's arm so
+/// the launcher (`launcher.rs`) can start an app-owned GGUF the exact same
+/// way `monkey run REF` does, managed llama-server lifecycle included,
+/// instead of a second copy of the install/start/reap dance.
+///
+/// Exits the process on any failure, like the rest of the flat paths here.
+async fn run_model(
+    cli: &Cli,
+    client: &reqwest::Client,
+    model: &str,
+    prompt: Option<String>,
+    system: Option<&str>,
+    backend: ModelCommandBackend,
+) {
+    // Validate chat-side flags before a potentially long verified install
+    // (or legacy Ollama auto-pull).
+    let (state, mode, mut options, persona) = match chat_setup(cli) {
+        Ok(v) => v,
+        Err(e) => fail(&e),
+    };
+    // `run`'s own --system wins over one given before the subcommand
+    // (still composed with the rules/facts section unless
+    // --no-rules — see `effective_system`). The persona (if any) is
+    // NOT re-applied here: it stays structured in `persona` and
+    // `chat_loop` folds it back in on top of whichever system text
+    // ends up in `options.system`, so a `--persona` given alongside
+    // `run`'s own `--system` is layered rather than dropped.
+    if let Some(system) = system {
+        options.system = effective_system(cli, &state, Some(system));
+    }
+
+    let (target, managed_session) = match backend {
+        ModelCommandBackend::Ollama => {
+            if let Err(error) = cmds::ensure_model(client, model).await {
+                fail(&error);
+            }
+            (native_ollama_target(model.to_string()), None)
+        }
+        ModelCommandBackend::Managed => {
+            let context_tokens = match managed_model_cli::context_tokens(options.num_ctx) {
+                Ok(context_tokens) => context_tokens,
+                Err(error) => fail(&error),
+            };
+            // Managed llama-server consumes this at process startup;
+            // do not forward it as an OpenAI-compatible request option.
+            options.num_ctx = None;
+            let installed = match managed_model_cli::install_for_run(model).await {
+                Ok(installed) => installed,
+                Err(error) => fail(&error),
+            };
+            let session = match managed_model_cli::start_server(client, &installed.local_path, context_tokens)
+                .await
+            {
+                Ok(session) => session,
+                Err(error) => fail(&error),
+            };
+            let target = chat::Target::Local {
+                base_url: session.base_url(),
+                model: Some(session.model_alias().to_string()),
+                native_ollama: false,
+            };
+            (target, Some(session))
+        }
+    };
+
+    let mcp_entries = resolve_mcp_entries(cli, &state).await;
+    let managed_one_shot = managed_session.is_some() && prompt.is_some();
+    let mut chat_future = Box::pin(chat_loop(
+        client,
+        target,
+        &state,
+        mode,
+        options,
+        persona,
+        prompt.as_deref(),
+        &mcp_entries,
+        &cli.stack,
+    ));
+    let result = if managed_one_shot {
+        tokio::select! {
+            result = &mut chat_future => result,
+            interrupt = tokio::signal::ctrl_c() => {
+                match interrupt {
+                    Ok(()) => {
+                        eprintln!("\nInterrupted; stopping managed llama-server.");
+                        Ok(())
+                    }
+                    Err(error) => Err(format!("Failed to listen for Ctrl-C: {error}")),
+                }
+            }
+        }
+    } else {
+        chat_future.await
+    };
+    // Explicitly stop and reap the managed child before a returned chat
+    // error reaches `fail()` (which exits the parent process).
+    drop(managed_session);
+    if let Err(error) = result {
         fail(&error);
     }
 }
@@ -1136,97 +1368,19 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             prompt,
             system,
         } => {
-            // Validate chat-side flags before a potentially long verified
-            // install (or legacy Ollama auto-pull).
-            let (state, mode, mut options, persona) = match chat_setup(cli) {
-                Ok(v) => v,
-                Err(e) => fail(&e),
-            };
-            // `run`'s own --system wins over one given before the subcommand
-            // (still composed with the rules/facts section unless
-            // --no-rules — see `effective_system`). The persona (if any) is
-            // NOT re-applied here: it stays structured in `persona` and
-            // `chat_loop` folds it back in on top of whichever system text
-            // ends up in `options.system`, so a `--persona` given alongside
-            // `run`'s own `--system` is layered rather than dropped.
-            if let Some(system) = system {
-                options.system = effective_system(cli, &state, Some(system.as_str()));
-            }
             let backend = match model_command_backend(cli) {
                 Ok(backend) => backend,
                 Err(error) => fail(&error),
             };
-
-            let (target, managed_session) = match backend {
-                ModelCommandBackend::Ollama => {
-                    if let Err(error) = cmds::ensure_model(client, model).await {
-                        fail(&error);
-                    }
-                    (native_ollama_target(model.clone()), None)
-                }
-                ModelCommandBackend::Managed => {
-                    let context_tokens = match managed_model_cli::context_tokens(options.num_ctx) {
-                        Ok(context_tokens) => context_tokens,
-                        Err(error) => fail(&error),
-                    };
-                    // Managed llama-server consumes this at process startup;
-                    // do not forward it as an OpenAI-compatible request option.
-                    options.num_ctx = None;
-                    let installed = match managed_model_cli::install_for_run(model).await {
-                        Ok(installed) => installed,
-                        Err(error) => fail(&error),
-                    };
-                    let session =
-                        match managed_model_cli::start_server(client, &installed, context_tokens)
-                            .await
-                        {
-                            Ok(session) => session,
-                            Err(error) => fail(&error),
-                        };
-                    let target = chat::Target::Local {
-                        base_url: session.base_url(),
-                        model: Some(session.model_alias().to_string()),
-                        native_ollama: false,
-                    };
-                    (target, Some(session))
-                }
-            };
-
-            let mcp_entries = resolve_mcp_entries(cli, &state).await;
-            let managed_one_shot = managed_session.is_some() && prompt.is_some();
-            let mut chat_future = Box::pin(chat_loop(
+            run_model(
+                cli,
                 client,
-                target,
-                &state,
-                mode,
-                options,
-                persona,
-                prompt.as_deref(),
-                &mcp_entries,
-                &cli.stack,
-            ));
-            let result = if managed_one_shot {
-                tokio::select! {
-                    result = &mut chat_future => result,
-                    interrupt = tokio::signal::ctrl_c() => {
-                        match interrupt {
-                            Ok(()) => {
-                                eprintln!("\nInterrupted; stopping managed llama-server.");
-                                Ok(())
-                            }
-                            Err(error) => Err(format!("Failed to listen for Ctrl-C: {error}")),
-                        }
-                    }
-                }
-            } else {
-                chat_future.await
-            };
-            // Explicitly stop and reap the managed child before a returned
-            // chat error reaches `fail()` (which exits the parent process).
-            drop(managed_session);
-            if let Err(error) = result {
-                fail(&error);
-            }
+                model,
+                joined_prompt(prompt),
+                system.as_deref(),
+                backend,
+            )
+            .await;
             return;
         }
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
@@ -1324,6 +1478,18 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                 .ok_or_else(|| "Could not resolve the app data directory".to_string());
             match data_dir {
                 Ok(data_dir) => processes_cli::run(action, &data_dir),
+                Err(error) => Err(error),
+            }
+        }
+        Cmd::Contract(action) => contract_cli::run(action).await,
+        Cmd::Conformance(args) => conformance_cli::run(args).await,
+        Cmd::Profiles(action) => {
+            // The registry lives *above* the profile roots, so this is the one
+            // command that must not resolve through the active profile.
+            let base = little_monkey_lib::app_paths::base_data_dir()
+                .ok_or_else(|| "Could not resolve the app data directory".to_string());
+            match base {
+                Ok(base) => profiles_cli::run(action, &base),
                 Err(error) => Err(error),
             }
         }
@@ -1498,6 +1664,74 @@ mod tests {
                 model: Some("llama3.2".to_string()),
                 prompt: Some("Summarize this project".to_string()),
             }
+        );
+    }
+
+    #[test]
+    fn an_unquoted_multi_word_prompt_joins_instead_of_erroring() {
+        let cli = Cli::try_parse_from(["monkey", "llama3.2", "graphify", "update", "."])
+            .expect("unquoted multi-word prompt");
+        assert_eq!(
+            flat_invocation(&cli).unwrap(),
+            FlatInvocation {
+                model: Some("llama3.2".to_string()),
+                prompt: Some("graphify update .".to_string()),
+            }
+        );
+        // Flags after the prompt words still parse as flags, not prompt.
+        let with_flag = Cli::try_parse_from([
+            "monkey",
+            "llama3.2",
+            "summarize",
+            "this",
+            "--permission-mode",
+            "auto",
+        ])
+        .expect("prompt words then a flag");
+        assert_eq!(
+            flat_invocation(&with_flag).unwrap().prompt.as_deref(),
+            Some("summarize this")
+        );
+        assert_eq!(with_flag.permission_mode, "auto");
+    }
+
+    #[test]
+    fn the_system_prompt_names_the_workspace_root() {
+        let ws = TempDir::new();
+        let state = state_with_primary_root(&ws.path);
+        let cli = Cli::try_parse_from(["monkey", "llama3.2", "hi"]).unwrap();
+
+        // Present even with --no-rules: that flag hides MONKEY.md/facts, not
+        // which folder the agent is standing in.
+        let no_rules = Cli::try_parse_from(["monkey", "--no-rules", "llama3.2", "hi"]).unwrap();
+        // Against the canonicalized root, the way the sibling tests below already
+        // do it: `all_roots` canonicalizes, so comparing with the raw `TempDir`
+        // path only ever passed by luck. On Windows it stopped passing outright,
+        // because canonicalization there also adds a `\\?\` prefix.
+        let expected = root_for_prompt(&ws.path.canonicalize().unwrap());
+        for cli in [&cli, &no_rules] {
+            let prompt = effective_system(cli, &state, None).expect("workspace section");
+            assert!(prompt.contains(&expected), "{prompt}");
+        }
+    }
+
+    /// A verbatim prefix must never reach the prompt, because the model is told
+    /// this path is where `run_shell` runs and will paste it into a command.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_workspace_root_is_named_without_its_verbatim_prefix() {
+        assert_eq!(
+            root_for_prompt(Path::new(r"\\?\C:\Users\dev\project")),
+            r"C:\Users\dev\project"
+        );
+        assert_eq!(
+            root_for_prompt(Path::new(r"\\?\UNC\server\share\project")),
+            r"\\server\share\project"
+        );
+        // An already-plain path is left exactly as it is.
+        assert_eq!(
+            root_for_prompt(Path::new(r"C:\Users\dev\project")),
+            r"C:\Users\dev\project"
         );
     }
 
@@ -1734,7 +1968,8 @@ mod tests {
         let cli = Cli {
             cmd: None,
             model_or_prompt: None,
-            prompt: None,
+            prompt: Vec::new(),
+            profile: None,
             workspace: None,
             provider: None,
             model: None,
@@ -1765,11 +2000,16 @@ mod tests {
             },
         };
 
+        // --no-rules drops the MONKEY.md/facts section but keeps the
+        // workspace orientation lines (see `workspace_section`), so the
+        // assertion is "nothing but workspace + the user's own text".
+        let with_system = effective_system(&cli, &state, Some("Only this.")).unwrap();
+        assert!(with_system.ends_with("\n\nOnly this."), "{with_system}");
+        assert!(!with_system.contains("Should be ignored."), "{with_system}");
         assert_eq!(
-            effective_system(&cli, &state, Some("Only this.")),
-            Some("Only this.".to_string())
+            effective_system(&cli, &state, None),
+            Some(workspace_section(&state))
         );
-        assert_eq!(effective_system(&cli, &state, None), None);
     }
 
     /// Writes a `prompts.json` blob (the same shape `promptStore.ts` writes)
@@ -1957,7 +2197,8 @@ mod tests {
         let cli = Cli {
             cmd: None,
             model_or_prompt: None,
-            prompt: None,
+            prompt: Vec::new(),
+            profile: None,
             workspace: None,
             provider: None,
             model: None,

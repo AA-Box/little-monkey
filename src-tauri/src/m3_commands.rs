@@ -9,10 +9,14 @@ use crate::agent_launcher::{
     self, AgentConfigDriftReport, AgentTool, DriftCheckInput, GenerateAgentConfigRequest,
     GeneratedAgentConfig,
 };
+use crate::benchmark::{
+    self, BenchmarkFreshness, BenchmarkReport, BenchmarkRequest, MachineIdentity, PeakMemory,
+};
 use crate::chat_template_lab::{run_chat_template_lab, ChatTemplateLabReport, TemplateFamily};
 use crate::compatibility_hub::{
-    LanServerPolicy, PairedToken, PairingChallengeView, PairingRequest, ScopedTokenView,
-    SecurityAuditEvent,
+    CanonicalContent, CanonicalInferenceRequest, CanonicalMessage, CanonicalRole,
+    CompatibilityProtocol, LanServerPolicy, PairedToken, PairingChallengeView, PairingRequest,
+    ScopedTokenView, SecurityAuditEvent, COMPATIBILITY_SCHEMA_VERSION,
 };
 use crate::context_cache::{
     self, ContextCacheView, ContextFailureClassification, ContextFailureInput, ContextRuntimeKind,
@@ -20,31 +24,37 @@ use crate::context_cache::{
 };
 use crate::m3_production::M3CatalogSourceConfig;
 use crate::m3_runtime_hub::{
-    M3ActivateComponentVersionRequest, M3ActivateModelVersionRequest, M3ApiDispatchRequest,
-    M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch, M3CleanupReport,
-    M3CompatibilityMatrixReport, M3ComponentCatalogEntry, M3ComponentHub, M3ComponentUpdateCheck,
-    M3DeleteModelRequest, M3DownloadRequest, M3HardwareCompatibilityReport, M3HubError,
-    M3InstallComponentRequest, M3InstalledComponentView, M3InstalledModelView, M3LoadModelRequest,
-    M3OperationContext, M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub,
-    M3RuntimeKind, M3RuntimeMetricsView, M3RuntimeStatusView, M3SetRuntimeConfigRequest,
-    M3SettingCapabilitiesView, M3StorageStatus, M3UnloadModelRequest, M3VerifyProjectorRequest,
+    M3ActivateComponentVersionRequest, M3ActivateModelVersionRequest, M3ApiCaller,
+    M3ApiDispatchRequest, M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch,
+    M3CleanupReport, M3CompatibilityMatrixReport, M3ComponentCatalogEntry, M3ComponentHub,
+    M3ComponentUpdateCheck, M3DeleteModelRequest, M3DownloadRequest, M3HardwareCompatibilityReport,
+    M3HubError, M3InstallComponentRequest, M3InstalledComponentView, M3InstalledModelView,
+    M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest, M3RuntimeCapabilityView,
+    M3RuntimeHub, M3RuntimeKind, M3RuntimeMetricsView, M3RuntimeStatusView,
+    M3SetRuntimeConfigRequest, M3SettingCapabilitiesView, M3StorageStatus, M3UnloadModelRequest,
+    M3VerifyProjectorRequest,
 };
+// Only `m3_mlx_install_component` inspects a component kind, and that
+// command exists only in the macOS build.
+#[cfg(target_os = "macos")]
+use crate::m3_runtime_hub::M3ComponentKind;
+use crate::profiles::ProfileScopedPaths;
 use crate::quantization::{
     BackendDescriptor, ConversionReport, ConversionRequest, DeclaredLicense, GgufQuantType,
     QuantizationWorkbench,
 };
 use crate::runtime_adapter::{
     HardwareProfile, HardwareSnapshot, LocalOffloadPlanner, LocalRuntimeScheduler, OffloadPlan,
-    OffloadPlanInput, ReqwestHttpTransport, RuntimeInventory, RuntimeLifecycleState, RuntimeLogTail,
-    SchedulingInput, SchedulingPlan,
+    OffloadPlanInput, ReqwestHttpTransport, RuntimeInventory, RuntimeLifecycleState,
+    RuntimeLogTail, SchedulingInput, SchedulingPlan,
 };
 use crate::runtime_telemetry::{
     RecordLoadTraceRequest, RecordRequestTraceRequest, RuntimeTelemetryState, RuntimeTraceRecord,
-    SupportBundle,
+    SupportBundle, TraceFieldNote,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
@@ -57,12 +67,64 @@ const SUPPORT_BUNDLE_MAX_LOG_BYTES_PER_RUNTIME: usize = 64 * 1024;
 /// How many recent traces a support bundle embeds.
 const SUPPORT_BUNDLE_MAX_TRACES: usize = 200;
 
-fn telemetry_now_ms() -> u64 {
+fn trusted_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+/// WebView-safe envelope for the non-streaming Runtime Hub diagnostic.
+///
+/// This is intentionally distinct from [`M3ApiDispatchRequest`], the trusted
+/// hub/HTTP envelope. IPC callers may provide request data, but they cannot
+/// assert an authenticated principal, authorization receipt, or clock value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3DiagnosticDispatchRequest {
+    pub protocol: crate::compatibility_hub::CompatibilityProtocol,
+    pub runtime_id: String,
+    pub request_id: String,
+    pub body: Vec<u8>,
+}
+
+impl M3DiagnosticDispatchRequest {
+    fn into_hub_request(self, now_ms: u64) -> M3ApiDispatchRequest {
+        M3ApiDispatchRequest {
+            protocol: self.protocol,
+            runtime_id: self.runtime_id,
+            request_id: self.request_id,
+            body: self.body,
+            caller: M3ApiCaller::Internal,
+            now_ms,
+        }
+    }
+}
+
+/// WebView-safe cancellation envelope paired with
+/// [`M3DiagnosticDispatchRequest`]. The command supplies the trusted internal
+/// caller and current time after deserialization.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3DiagnosticCancelRequest {
+    pub protocol: crate::compatibility_hub::CompatibilityProtocol,
+    pub runtime_id: String,
+    pub request_id: String,
+    pub model_id: String,
+}
+
+impl M3DiagnosticCancelRequest {
+    fn into_hub_request(self, now_ms: u64) -> M3CancelInferenceRequest {
+        M3CancelInferenceRequest {
+            protocol: self.protocol,
+            runtime_id: self.runtime_id,
+            request_id: self.request_id,
+            model_id: self.model_id,
+            caller: M3ApiCaller::Internal,
+            now_ms,
+        }
+    }
 }
 
 pub trait M3OwnedProcessShutdown: Send + Sync {
@@ -211,6 +273,327 @@ pub fn m3_hardware_profile(
     state.hub.hardware_profile().map_err(command_error)
 }
 
+/// A benchmark report plus the machine it was measured on.
+///
+/// The snapshot is attached here rather than inside `BenchmarkReport` because
+/// `benchmark.rs` has no way to probe hardware and must not acquire one — it can
+/// measure a generation and nothing else. Keeping them separate is also what
+/// lets a stored report be invalidated when the hardware changes.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct M3BenchmarkResponse {
+    pub report: BenchmarkReport,
+    pub hardware: HardwareSnapshot,
+}
+
+/// ROADMAP #2. Times `repeats` real streamed generations of `model` on
+/// `runtime_id` and reports what this machine measured.
+///
+/// The whole surface exists to satisfy one sentence — "no number is displayed
+/// that was not measured on the machine displaying it" — so it refuses rather
+/// than reports in the two cases where it could not honour that: a request too
+/// small to measure (rejected by [`BenchmarkRequest::validated`]) and a model
+/// that does not run here at all (below).
+#[tauri::command]
+pub async fn m3_benchmark_run(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    request: BenchmarkRequest,
+) -> Result<M3BenchmarkResponse, String> {
+    let request = request.validated()?;
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = benchmark_with_context(&state, &request, &context).await;
+    let response = finish(&state, &operation_id, result).await?;
+
+    // Persisted after the operation is finished, not inside it: a benchmark that
+    // measured fine but could not be written down is still a valid measurement,
+    // and failing the command would throw away the wall-clock the user spent.
+    // The write error is surfaced through the log rather than swallowed.
+    let path = benchmark_history_path(&app)?;
+    let stored = StoredBenchmark {
+        report: response.report.clone(),
+        machine: machine_identity(&response.hardware),
+        measured_at_ms: trusted_now_ms(),
+    };
+    if let Err(error) = load_benchmarks(&path)
+        .and_then(|existing| save_benchmarks(&path, &remember_benchmark(existing, stored)))
+    {
+        eprintln!("benchmark measured but not saved: {error}");
+    }
+    Ok(response)
+}
+
+/// Every benchmark this machine has kept, most recent first, each labelled with
+/// whether its numbers still describe the machine asking.
+///
+/// The freshness verdict is computed here rather than stored, because the
+/// question is "is this still true *now*" — a report that was fresh yesterday
+/// and stale today has not changed, the machine has.
+#[tauri::command]
+pub fn m3_benchmark_history(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, M3CommandState>,
+) -> Result<Vec<BenchmarkHistoryEntry>, String> {
+    let current = machine_identity(&state.hub.hardware_snapshot().map_err(command_error)?);
+    Ok(load_benchmarks(&benchmark_history_path(&app)?)?
+        .into_iter()
+        .map(|stored| BenchmarkHistoryEntry {
+            freshness: stored.machine.freshness_against(&current),
+            stored,
+        })
+        .collect())
+}
+
+fn benchmark_history_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .profile_data_dir()
+        .map_err(|error| format!("Failed to resolve app data dir: {error}"))?
+        .join(BENCHMARK_FILE))
+}
+
+/// The I/O half of the benchmark, kept out of `benchmark.rs` for the same reason
+/// `admission.rs` is pure and `engine.rs` is not: everything with a decision in
+/// it should be testable without a hub.
+async fn benchmark_with_context(
+    state: &M3CommandState,
+    request: &BenchmarkRequest,
+    context: &M3OperationContext,
+) -> Result<M3BenchmarkResponse, M3HubError> {
+    let hardware = state.hub.hardware_snapshot()?;
+    refuse_a_model_this_machine_does_not_run(state, request, context).await?;
+
+    let pid = state
+        .hub
+        .benchmark_runtime_pid(&request.runtime_id, context)
+        .await?;
+    let mut memory_notes = Vec::new();
+    let before = read_peak_mark(pid, &mut memory_notes);
+
+    let canonical = canonical_benchmark_request(request);
+    let mut samples = Vec::with_capacity(request.repeats as usize);
+    for repeat in 0..request.repeats {
+        let mut canonical = canonical.clone();
+        // A distinct id per repeat: the hub tracks an in-flight inference by
+        // request id, and reusing one would make the second repeat a duplicate.
+        canonical.request_id = format!("{}-{repeat}", canonical.request_id);
+        samples.push(
+            state
+                .hub
+                .benchmark_stream_once(&request.runtime_id, &canonical, context)
+                .await?,
+        );
+    }
+
+    let after = read_peak_mark(pid, &mut memory_notes);
+    let mut peak_memory = PeakMemory::measure(pid, before, after);
+    peak_memory.unavailable.extend(memory_notes);
+
+    let mut report = benchmark::summarize(
+        request,
+        // Genuinely unavailable rather than skipped: no runtime here reports a
+        // quantization scheme for a loaded model, and a GGUF's own
+        // `general.quantization_version` is a format version ("2"), not the
+        // scheme ("Q4_K_M") a reader would take it for. Naming the model's file
+        // is not the same as knowing how it was quantized.
+        None,
+        benchmark::WARMUP_REPEATS,
+        samples,
+        peak_memory,
+    );
+    report.unavailable.push(TraceFieldNote {
+        field: "quantization".to_string(),
+        reason: "neither this runtime's inventory nor the model's GGUF header reports a \
+                 quantization scheme, so the benchmarked triple is identified by model and \
+                 runtime only"
+            .to_string(),
+    });
+
+    Ok(M3BenchmarkResponse { report, hardware })
+}
+
+/// Refuses a model whose numbers would have been produced somewhere else.
+///
+/// The runtime inventory marks a hosted model `is_cloud`, and timing one
+/// measures a network round trip to a GPU this user does not own — the exact
+/// thing ROADMAP #2's "on the machine displaying it" clause rules out. A model
+/// the inventory does not list at all is also refused, since the alternative is
+/// a per-repeat "model not found" reported as a failed measurement.
+async fn refuse_a_model_this_machine_does_not_run(
+    state: &M3CommandState,
+    request: &BenchmarkRequest,
+    context: &M3OperationContext,
+) -> Result<(), M3HubError> {
+    let inventory = state
+        .hub
+        .runtime_inventory(&request.runtime_id, context)
+        .await?;
+    let Some(model) = inventory
+        .models
+        .iter()
+        .find(|model| model.model_id == request.model)
+    else {
+        return Err(M3HubError::NotFound(format!(
+            "runtime {} does not list model {}",
+            request.runtime_id, request.model
+        )));
+    };
+    if model.metadata.get("is_cloud").map(String::as_str) == Some("true") {
+        return Err(M3HubError::Unsupported(format!(
+            "{} runs in the cloud, so timing it would measure a network round trip and somebody \
+             else's hardware rather than this machine",
+            request.model
+        )));
+    }
+    Ok(())
+}
+
+/// Filename for the persisted benchmark history under the app data directory —
+/// the same file-per-feature pattern as `web_settings.json`/`providers.json`.
+///
+/// Not a table in the run ledger: a benchmark measures *this machine*, not a
+/// run, and hanging it off the ledger's run-shaped schema would be the same
+/// category error `permission_decisions` had to work around.
+const BENCHMARK_FILE: &str = "benchmarks.json";
+
+/// How many reports to keep. One per model per runtime is the useful unit, and a
+/// user with more than this many benchmarked models is better served by the most
+/// recent ones than by an unbounded file.
+const MAX_STORED_BENCHMARKS: usize = 32;
+
+/// A report, the machine it was measured on, and when.
+///
+/// The machine identity is stored *with* the report rather than derived later,
+/// because "was this measured here" is unanswerable once the snapshot is gone —
+/// and answering it wrong is exactly the failure the benchmark surface exists to
+/// prevent.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoredBenchmark {
+    pub report: BenchmarkReport,
+    pub machine: MachineIdentity,
+    pub measured_at_ms: u64,
+}
+
+/// A stored report paired with whether its numbers may be shown.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkHistoryEntry {
+    #[serde(flatten)]
+    pub stored: StoredBenchmark,
+    pub freshness: BenchmarkFreshness,
+}
+
+/// The stable parts of a snapshot a stored benchmark is valid for.
+///
+/// Lives here rather than in `benchmark.rs` so that module keeps no dependency
+/// on hardware probing — it may compare an identity it is handed, never build
+/// one from the host.
+fn machine_identity(hardware: &HardwareSnapshot) -> MachineIdentity {
+    let mut accelerators: Vec<String> = hardware
+        .platform
+        .accelerators
+        .iter()
+        .flat_map(|accelerator| accelerator.device_names.iter().cloned())
+        .collect();
+    accelerators.sort();
+    MachineIdentity {
+        os: hardware.platform.os.clone(),
+        arch: hardware.platform.arch.clone(),
+        total_ram_bytes: hardware.total_ram_bytes,
+        logical_cpu_count: hardware.logical_cpu_count,
+        accelerators,
+    }
+}
+
+/// Reads the stored history, treating a missing file as empty.
+///
+/// A *corrupt* file is an error rather than an empty history: silently starting
+/// over would discard measurements the user paid real wall-clock time for, and
+/// they would never learn it happened.
+fn load_benchmarks(path: &Path) -> Result<Vec<StoredBenchmark>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("Corrupt {BENCHMARK_FILE}: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("Failed to read {BENCHMARK_FILE}: {e}")),
+    }
+}
+
+/// Atomic sibling temp file + rename, the same idiom as `web.rs`'s
+/// `save_settings_impl` and `mcp.rs`'s `save_config_impl`.
+fn save_benchmarks(path: &Path, stored: &[StoredBenchmark]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create the app data dir: {e}"))?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    let serialized = serde_json::to_vec_pretty(stored)
+        .map_err(|e| format!("Failed to encode benchmarks: {e}"))?;
+    std::fs::write(&temporary, serialized)
+        .map_err(|e| format!("Failed to write {BENCHMARK_FILE}: {e}"))?;
+    std::fs::rename(&temporary, path).map_err(|e| format!("Failed to save {BENCHMARK_FILE}: {e}"))
+}
+
+/// Insert `fresh`, replacing any earlier report for the same runtime and model.
+///
+/// Most recent first, capped at [`MAX_STORED_BENCHMARKS`]. Replacing rather than
+/// appending is deliberate: two reports for one model on one runtime differ only
+/// by when they ran, and keeping both invites a reader to compare numbers that
+/// were never meant to be a time series.
+fn remember_benchmark(
+    existing: Vec<StoredBenchmark>,
+    fresh: StoredBenchmark,
+) -> Vec<StoredBenchmark> {
+    let mut kept: Vec<StoredBenchmark> = existing
+        .into_iter()
+        .filter(|entry| {
+            entry.report.runtime_id != fresh.report.runtime_id
+                || entry.report.model != fresh.report.model
+        })
+        .collect();
+    kept.insert(0, fresh);
+    kept.truncate(MAX_STORED_BENCHMARKS);
+    kept
+}
+
+/// Reads the runtime process's high-water mark, collecting the platform's own
+/// reason when it has none to give.
+fn read_peak_mark(pid: Option<i64>, notes: &mut Vec<TraceFieldNote>) -> Option<u64> {
+    let pid = pid?;
+    let (bytes, note) = PeakMemory::sample_mark(pid);
+    if let Some(note) = note {
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+    bytes
+}
+
+/// Builds the canonical request directly, with no protocol translation: a
+/// benchmark is not an API caller, and `temperature: 0` keeps repeats comparable
+/// rather than measuring a different sampling path each time.
+fn canonical_benchmark_request(request: &BenchmarkRequest) -> CanonicalInferenceRequest {
+    CanonicalInferenceRequest {
+        schema_version: COMPATIBILITY_SCHEMA_VERSION,
+        protocol: CompatibilityProtocol::OpenAiChatCompletions,
+        request_id: format!("benchmark-{}", trusted_now_ms()),
+        model: request.model.clone(),
+        messages: vec![CanonicalMessage {
+            role: CanonicalRole::User,
+            content: vec![CanonicalContent::Text {
+                text: request.prompt_text().to_string(),
+            }],
+        }],
+        tools: Vec::new(),
+        max_output_tokens: request.max_output_tokens,
+        temperature: Some(0.0),
+        stream: true,
+        response_schema: None,
+        metadata: serde_json::Value::Null,
+    }
+}
+
 /// Hardware Compatibility Matrix / "Driver Doctor" report. The frontend
 /// fetches this before starting a model download, model load, or runtime
 /// install so the user sees a concrete compatibility report first.
@@ -303,8 +686,12 @@ pub fn m3_resolve_setting_capabilities(
 /// any model's declared `template` string, including `null`/unrecognized
 /// ones (which fall back to the `Generic` family).
 #[tauri::command]
-pub fn m3_chat_template_lab_report(template: Option<String>) -> Result<ChatTemplateLabReport, String> {
-    Ok(run_chat_template_lab(TemplateFamily::detect(template.as_deref())))
+pub fn m3_chat_template_lab_report(
+    template: Option<String>,
+) -> Result<ChatTemplateLabReport, String> {
+    Ok(run_chat_template_lab(TemplateFamily::detect(
+        template.as_deref(),
+    )))
 }
 
 /// Simulates fit and computes a per-load offload plan (context size, batch
@@ -565,7 +952,10 @@ async fn context_cache_state_impl(
         if let Ok(M3RuntimeStatusView::Adapter { status, .. }) =
             state.hub.runtime_status(runtime_id, context).await
         {
-            let reachable = matches!(status.state, RuntimeLifecycleState::Ready | RuntimeLifecycleState::Starting);
+            let reachable = matches!(
+                status.state,
+                RuntimeLifecycleState::Ready | RuntimeLifecycleState::Starting
+            );
             if reachable {
                 if let Ok(transport) = ReqwestHttpTransport::new() {
                     let cancellation = CancellationToken::new();
@@ -583,15 +973,26 @@ async fn context_cache_state_impl(
     }
 
     let reported_context_tokens = live.as_ref().and_then(|live| live.reported_context_tokens);
-    let context_tokens_in_use = live
-        .as_ref()
-        .and_then(|live| live.slots.iter().filter_map(|slot| slot.tokens_in_use).max());
+    let context_tokens_in_use = live.as_ref().and_then(|live| {
+        live.slots
+            .iter()
+            .filter_map(|slot| slot.tokens_in_use)
+            .max()
+    });
     let context_shift_detected = live.as_ref().and_then(|live| {
         if live.slots.is_empty() {
             None
-        } else if live.slots.iter().any(|slot| slot.context_shifted == Some(true)) {
+        } else if live
+            .slots
+            .iter()
+            .any(|slot| slot.context_shifted == Some(true))
+        {
             Some(true)
-        } else if live.slots.iter().all(|slot| slot.context_shifted == Some(false)) {
+        } else if live
+            .slots
+            .iter()
+            .all(|slot| slot.context_shifted == Some(false))
+        {
             Some(false)
         } else {
             None
@@ -607,12 +1008,46 @@ async fn context_cache_state_impl(
         configured,
         reported_context_tokens,
         context_tokens_in_use,
-        context_headroom_tokens: context_cache::context_headroom(effective_context_tokens, context_tokens_in_use),
+        context_headroom_tokens: context_cache::context_headroom(
+            effective_context_tokens,
+            context_tokens_in_use,
+        ),
         context_shift_detected,
         total_slots,
+        prefix_sharing: context_cache::prefix_sharing(kind),
+        context_budget: context_cache::context_budget_enforcement(kind),
         notes,
         sampled_at_ms: context_cache_sampled_at_ms(),
     })
+}
+
+/// The stated eviction/compaction policy for every process class (roadmap K11).
+///
+/// All four at once rather than one per query: the policy is only meaningful as
+/// a comparison — "interactive compacts, maintenance stops" is the fact, and one
+/// class in isolation reads like a global setting.
+#[tauri::command]
+pub fn m3_context_policies() -> Vec<ContextPolicyEntry> {
+    use crate::run_protocol::ProcessClass;
+    [
+        ProcessClass::Interactive,
+        ProcessClass::Batch,
+        ProcessClass::Background,
+        ProcessClass::Maintenance,
+    ]
+    .into_iter()
+    .map(|class| ContextPolicyEntry {
+        class: class.token(),
+        policy: crate::context_cache::context_policy(class),
+    })
+    .collect()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPolicyEntry {
+    pub class: &'static str,
+    pub policy: crate::context_cache::ContextPolicy,
 }
 
 #[tauri::command]
@@ -676,9 +1111,10 @@ pub async fn m3_api_dispatch(
     state: tauri::State<'_, M3CommandState>,
     operation_id: String,
     timeout_ms: Option<u64>,
-    request: M3ApiDispatchRequest,
+    request: M3DiagnosticDispatchRequest,
 ) -> Result<M3ApiDispatchResponse, String> {
     let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let request = request.into_hub_request(trusted_now_ms());
     let result = state.hub.dispatch_api(&request, &context).await;
     finish(&state, &operation_id, result).await
 }
@@ -688,9 +1124,10 @@ pub async fn m3_api_cancel_inference(
     state: tauri::State<'_, M3CommandState>,
     operation_id: String,
     timeout_ms: Option<u64>,
-    request: M3CancelInferenceRequest,
+    request: M3DiagnosticCancelRequest,
 ) -> Result<bool, String> {
     let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let request = request.into_hub_request(trusted_now_ms());
     let result = state.hub.cancel_inference(&request, &context).await;
     finish(&state, &operation_id, result).await
 }
@@ -707,25 +1144,57 @@ pub fn m3_compatibility_matrix(
     state.hub.compatibility_matrix().map_err(command_error)
 }
 
+/// Run the published K21 conformance suite against a live node and return
+/// its report.
+///
+/// Takes no hub state on purpose. The suite's whole claim is that it grades a
+/// node from the outside, over a socket, exactly as a third party would —
+/// handing it a `State<M3CommandState>` would let a future edit shortcut a
+/// check by reading the hub the node is built on. `base_url` therefore points
+/// wherever the operator says, including at a node this app did not start.
+///
+/// The token is the operator's own API-server token. Nothing is persisted:
+/// the desktop stores only token digests, so a plaintext round trip through
+/// here would be the only place one lived.
+#[tauri::command]
+pub async fn run_conformance_suite(
+    base_url: String,
+    token: Option<String>,
+    sections: Vec<String>,
+) -> Result<crate::conformance::ConformanceReport, String> {
+    let mut selected = Vec::new();
+    for name in &sections {
+        selected.push(
+            crate::conformance::SectionId::parse(name)
+                .ok_or_else(|| format!("Unknown conformance section '{name}'."))?,
+        );
+    }
+    let options = crate::conformance::SuiteOptions {
+        base_url,
+        token: token.filter(|token| !token.trim().is_empty()),
+        sections: selected,
+        model: None,
+    };
+    let client = crate::conformance::client()?;
+    Ok(crate::conformance::run_suite(&client, &options).await)
+}
+
 #[tauri::command]
 pub fn m3_lan_validate_policy(policy: LanServerPolicy) -> Result<(), String> {
     M3RuntimeHub::validate_lan_policy(&policy).map_err(command_error)
 }
 
 #[tauri::command]
-pub fn m3_lan_configure(
-    state: tauri::State<'_, M3CommandState>,
+pub async fn m3_lan_configure(
+    app: tauri::AppHandle,
     policy: LanServerPolicy,
 ) -> Result<LanServerPolicy, String> {
-    state.hub.configure_lan(policy).map_err(command_error)
+    crate::server::configure_m3_policy_and_reconcile(&app, policy).await
 }
 
 #[tauri::command]
-pub fn m3_lan_disable(
-    state: tauri::State<'_, M3CommandState>,
-    confirmation: String,
-) -> Result<bool, String> {
-    state.hub.disable_lan(&confirmation).map_err(command_error)
+pub async fn m3_lan_disable(app: tauri::AppHandle, confirmation: String) -> Result<bool, String> {
+    crate::server::disable_m3_policy_and_reconcile(&app, &confirmation).await
 }
 
 #[tauri::command]
@@ -900,7 +1369,9 @@ pub async fn quantization_convert_installed_model(
         .versions
         .into_iter()
         .find(|version| version.version_key == target_version_key)
-        .ok_or_else(|| format!("no installed version '{target_version_key}' for asset '{asset_id}'"))?;
+        .ok_or_else(|| {
+            format!("no installed version '{target_version_key}' for asset '{asset_id}'")
+        })?;
 
     let workbench = state.workbench.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -932,6 +1403,73 @@ pub fn m3_component_installed(
     state: tauri::State<'_, M3CommandState>,
 ) -> Result<Vec<M3InstalledComponentView>, String> {
     state.component_hub.list_installed().map_err(command_error)
+}
+
+/// Installs a built, signed MLX service package and activates it.
+///
+/// `package_directory` is whatever the user picked — the output of
+/// `pnpm mlx:package`. Trust comes from the pinned Ed25519 release key over
+/// the manifest and every file digest, not from the path, so this deliberately
+/// does not restrict where the directory may live.
+///
+/// The runtime list is not refreshed here: the MLX driver reads
+/// `verify_active()` when it is next asked for status, so the caller's own
+/// refresh is what surfaces the newly installed package.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub fn m3_mlx_install(
+    app: tauri::AppHandle,
+    package_directory: String,
+) -> Result<crate::m3_production::MlxInstalledPackageView, String> {
+    let app_data_dir = app
+        .profile_data_dir()
+        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
+    crate::m3_production::install_mlx_package(
+        &app_data_dir,
+        std::path::Path::new(&package_directory),
+    )
+    .map_err(command_error)
+}
+
+/// Activates an MLX package that the component hub has already downloaded.
+///
+/// The two halves are deliberately separate commands rather than one: the
+/// component hub owns fetching, resuming, digest-checking, and version
+/// history, and the MLX installer owns signature verification and the active
+/// symlink. This joins them for the one component kind that needs unpacking,
+/// and re-running it on an already-installed version is a no-op that
+/// re-verifies rather than an error.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub fn m3_mlx_install_component(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, M3CommandState>,
+    component_id: String,
+) -> Result<crate::m3_production::MlxInstalledPackageView, String> {
+    let installed = state
+        .component_hub
+        .list_installed()
+        .map_err(command_error)?
+        .into_iter()
+        .find(|component| component.component_id == component_id)
+        .ok_or_else(|| format!("No component named '{component_id}' is installed"))?;
+    if installed.kind != M3ComponentKind::MlxRuntime {
+        return Err(format!(
+            "'{component_id}' is a {:?} component, not an MLX runtime",
+            installed.kind
+        ));
+    }
+    let artifact = installed
+        .versions
+        .iter()
+        .find(|version| version.version_key == installed.active_version_key)
+        .ok_or("The installed MLX component has no active version")?
+        .artifact_path
+        .clone();
+    let app_data_dir = app
+        .profile_data_dir()
+        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
+    crate::m3_production::install_mlx_from_artifact(&app_data_dir, &artifact).map_err(command_error)
 }
 
 #[tauri::command]
@@ -982,7 +1520,10 @@ pub async fn m3_component_install(
     request: M3InstallComponentRequest,
 ) -> Result<M3InstalledComponentView, String> {
     let context = state.begin_operation(&operation_id, timeout_ms)?;
-    let result = state.component_hub.install_component(&request, &context).await;
+    let result = state
+        .component_hub
+        .install_component(&request, &context)
+        .await;
     finish(&state, &operation_id, result).await
 }
 
@@ -1074,7 +1615,11 @@ async fn assemble_support_bundle(
         let runtime_id = runtime.descriptor.runtime_id.clone();
         if let Ok(tail) = state
             .hub
-            .runtime_logs(&runtime_id, SUPPORT_BUNDLE_MAX_LOG_BYTES_PER_RUNTIME, context)
+            .runtime_logs(
+                &runtime_id,
+                SUPPORT_BUNDLE_MAX_LOG_BYTES_PER_RUNTIME,
+                context,
+            )
             .await
         {
             raw_logs.push((runtime_id, tail.text, tail.truncated));
@@ -1091,7 +1636,7 @@ async fn assemble_support_bundle(
         compatibility,
         traces,
         raw_logs,
-        telemetry_now_ms(),
+        trusted_now_ms(),
     ))
 }
 
@@ -1202,4 +1747,195 @@ pub fn agent_launcher_check_drift(
             .unwrap_or(false),
     };
     agent_launcher::detect_drift(&input).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn dispatch_json() -> Value {
+        json!({
+            "protocol": "open_ai_chat_completions",
+            "runtimeId": "ollama",
+            "requestId": "diagnostic-1",
+            "body": [123, 125]
+        })
+    }
+
+    fn cancel_json() -> Value {
+        json!({
+            "protocol": "open_ai_chat_completions",
+            "runtimeId": "ollama",
+            "requestId": "diagnostic-1",
+            "modelId": "qwen"
+        })
+    }
+
+    #[test]
+    fn diagnostic_dispatch_ipc_shape_supplies_trusted_hub_fields() {
+        let request: M3DiagnosticDispatchRequest =
+            serde_json::from_value(dispatch_json()).expect("valid diagnostic IPC request");
+        assert_eq!(serde_json::to_value(&request).unwrap(), dispatch_json());
+
+        let hub_request = request.into_hub_request(42);
+        assert_eq!(hub_request.caller, M3ApiCaller::Internal);
+        assert_eq!(hub_request.now_ms, 42);
+    }
+
+    #[test]
+    fn diagnostic_cancel_ipc_shape_supplies_trusted_hub_fields() {
+        let request: M3DiagnosticCancelRequest =
+            serde_json::from_value(cancel_json()).expect("valid diagnostic IPC cancel request");
+        assert_eq!(serde_json::to_value(&request).unwrap(), cancel_json());
+
+        let hub_request = request.into_hub_request(43);
+        assert_eq!(hub_request.caller, M3ApiCaller::Internal);
+        assert_eq!(hub_request.now_ms, 43);
+    }
+
+    #[test]
+    fn diagnostic_ipc_shapes_reject_client_asserted_trust_fields() {
+        for forbidden in [
+            ("caller", json!({ "type": "internal" })),
+            ("nowMs", json!(0)),
+            ("authorizationReceipt", json!({ "id": "forged" })),
+        ] {
+            let mut dispatch = dispatch_json();
+            dispatch[forbidden.0] = forbidden.1.clone();
+            assert!(serde_json::from_value::<M3DiagnosticDispatchRequest>(dispatch).is_err());
+
+            let mut cancel = cancel_json();
+            cancel[forbidden.0] = forbidden.1;
+            assert!(serde_json::from_value::<M3DiagnosticCancelRequest>(cancel).is_err());
+        }
+    }
+
+    fn stored(runtime_id: &str, model: &str, measured_at_ms: u64) -> StoredBenchmark {
+        StoredBenchmark {
+            report: BenchmarkReport {
+                schema_version: 1,
+                runtime_id: runtime_id.to_string(),
+                model: model.to_string(),
+                quantization: None,
+                max_output_tokens: 128,
+                repeats_requested: 5,
+                warmup_discarded: 1,
+                samples: Vec::new(),
+                time_to_first_token_ms: None,
+                decode_tokens_per_second: None,
+                peak_memory: PeakMemory::measure(None, None, None),
+                unavailable: Vec::new(),
+            },
+            machine: MachineIdentity {
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                total_ram_bytes: 16 << 30,
+                logical_cpu_count: 8,
+                accelerators: Vec::new(),
+            },
+            measured_at_ms,
+        }
+    }
+
+    /// Two reports for one model on one runtime differ only by when they ran, so
+    /// keeping both would invite a reader to compare numbers that were never
+    /// meant to be a time series.
+    #[test]
+    fn re_benchmarking_a_pair_replaces_its_entry_rather_than_appending() {
+        let history = remember_benchmark(Vec::new(), stored("llama-local", "qwen3-4b", 1));
+        let history = remember_benchmark(history, stored("llama-local", "gemma3-4b", 2));
+        let history = remember_benchmark(history, stored("llama-local", "qwen3-4b", 3));
+
+        assert_eq!(
+            history.len(),
+            2,
+            "the qwen entry was replaced, not appended"
+        );
+        assert_eq!(history[0].report.model, "qwen3-4b");
+        assert_eq!(history[0].measured_at_ms, 3, "most recent first");
+        assert_eq!(history[1].report.model, "gemma3-4b");
+
+        // Same model on a different runtime is a different measurement.
+        let history = remember_benchmark(history, stored("ollama", "qwen3-4b", 4));
+        assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn the_history_is_capped_and_drops_the_oldest() {
+        let mut history = Vec::new();
+        for index in 0..(MAX_STORED_BENCHMARKS + 5) {
+            history = remember_benchmark(
+                history,
+                stored("llama-local", &format!("model-{index}"), index as u64 + 1),
+            );
+        }
+        assert_eq!(history.len(), MAX_STORED_BENCHMARKS);
+        assert_eq!(
+            history[0].report.model,
+            format!("model-{}", MAX_STORED_BENCHMARKS + 4),
+            "the newest survives"
+        );
+        assert!(
+            !history.iter().any(|entry| entry.report.model == "model-0"),
+            "the oldest was dropped"
+        );
+    }
+
+    /// A stored report may only be shown when the machine still matches. The
+    /// volatile fields — `captured_at_ms`, `available_ram_bytes` — are excluded
+    /// from the identity precisely so a fresh report does not read as stale a
+    /// second after it was written.
+    #[test]
+    fn freshness_ignores_volatile_fields_and_names_real_changes() {
+        let here = stored("llama-local", "qwen3-4b", 1).machine;
+        assert_eq!(
+            here.freshness_against(&here.clone()),
+            BenchmarkFreshness::ThisMachine
+        );
+
+        let mut more_ram = here.clone();
+        more_ram.total_ram_bytes = 32 << 30;
+        let BenchmarkFreshness::DifferentMachine { changed } = here.freshness_against(&more_ram)
+        else {
+            panic!("refitted RAM must invalidate a stored report");
+        };
+        assert_eq!(changed.len(), 1);
+        assert!(changed[0].contains("installed RAM"), "got {changed:?}");
+
+        let mut gpu_added = here.clone();
+        gpu_added.accelerators = vec!["NVIDIA RTX 4090".to_string()];
+        let BenchmarkFreshness::DifferentMachine { changed } = here.freshness_against(&gpu_added)
+        else {
+            panic!("a new accelerator must invalidate a stored report");
+        };
+        assert!(changed[0].contains("accelerators"), "got {changed:?}");
+    }
+
+    /// A corrupt file must not read as "never benchmarked": silently starting
+    /// over would discard measurements the user paid wall-clock time for, and
+    /// they would never learn it happened.
+    #[test]
+    fn a_corrupt_history_is_an_error_but_a_missing_one_is_empty() {
+        let directory = std::env::temp_dir().join(format!(
+            "little-monkey-benchmarks-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(BENCHMARK_FILE);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(load_benchmarks(&path).unwrap().is_empty());
+
+        let history = vec![stored("llama-local", "qwen3-4b", 1)];
+        save_benchmarks(&path, &history).unwrap();
+        assert_eq!(load_benchmarks(&path).unwrap(), history, "round trip");
+
+        std::fs::write(&path, b"{ not json").unwrap();
+        let error = load_benchmarks(&path).unwrap_err();
+        assert!(error.contains("Corrupt"), "got {error}");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 }

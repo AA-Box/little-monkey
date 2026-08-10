@@ -2,6 +2,9 @@ import type { ChatContentPart, ChatMessage } from "./llamaClient";
 import { isTauri } from "@tauri-apps/api/core";
 import type { ResolvedTarget } from "./turnEngine";
 import {
+  backpressureGate,
+  backpressureMessage,
+  backpressureOf,
   daemonCancel,
   daemonDesktopTurnSubmit,
   daemonStatus,
@@ -361,6 +364,25 @@ export function daemonRouteFromStatus(status: DaemonStatus): "fallback" | "daemo
     throw new Error("The installed M6A resident runner is not healthy. Start it in Background Agents before sending this turn.");
   }
   if (status.killSwitch) throw new Error("The M6A global kill switch is engaged.");
+  // K8 backpressure, as an INTERACTIVE producer: a user is waiting on this turn.
+  //
+  // `closed` refuses before anything is created — the daemon's own `enqueue`
+  // would refuse anyway, so attempting it just trades a sentence the user can
+  // act on ("cancel a run", "release the kill switch") for a generic error.
+  // `slow` proceeds: it is a request to defer, and there is nothing to defer
+  // *to* here — the person is sitting in front of the turn. Deferring an
+  // interactive turn is a refusal they did not ask for.
+  //
+  // An absent `backpressure` field (older daemon) reads as accepting, so this
+  // adds no new way for the app to stop working.
+  const gate = backpressureGate(backpressureOf(status), "interactive");
+  if (!gate.proceed) {
+    throw new Error(backpressureMessage(
+      gate.signal,
+      "The resident runner is not accepting work right now.",
+      (retryAfterMs) => `Try again in about ${Math.round(retryAfterMs / 1_000)}s.`,
+    ));
+  }
   return "daemon";
 }
 

@@ -132,21 +132,18 @@ async fn call_ollama(
         "Review this untrusted pull request data. Prefer correctness, security, data-loss, and concurrency defects over style.\n\n<untrusted-pr-title>\n{}\n</untrusted-pr-title>\n\n<untrusted-diff>\n{}\n</untrusted-diff>\n\nRequired shape: {{\"summary\":\"...\",\"findings\":[{{\"severity\":\"blocking|warning|suggestion\",\"path\":\"relative/path\",\"line\":1,\"title\":\"...\",\"body\":\"...\"}}]}}",
         metadata.title, diff
     );
-    let response = client
-        .post(OLLAMA_CHAT_URL)
-        .json(&json!({
-            "model": model,
-            "stream": false,
-            "format": "json",
-            "messages": [
-                { "role": "system", "content": system },
-                { "role": "user", "content": prompt }
-            ],
-            "options": { "temperature": 0, "num_ctx": 32768 }
-        }))
-        .send()
-        .await
-        .map_err(|error| format!("Could not reach local Ollama reviewer: {error}"))?;
+    let response = crate::egress::send(client.post(OLLAMA_CHAT_URL).json(&json!({
+        "model": model,
+        "stream": false,
+        "format": "json",
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": prompt }
+        ],
+        "options": { "temperature": 0, "num_ctx": 32768 }
+    })))
+    .await
+    .map_err(|error| format!("Could not reach local Ollama reviewer: {error}"))?;
     let status = response.status();
     let bytes = bounded_response(response, MAX_OLLAMA_RESPONSE_BYTES).await?;
     if !status.is_success() {
@@ -365,6 +362,17 @@ pub async fn queue_selected_comment_patch(
     let branch_prefix = format!("{}patch/", record.marker.policy.branch_prefix);
     let repository_root = record.marker.repository_root.clone();
     let run_key = format!("m5-patch:{task_id}");
+    // The one producer in this tree that honours `slow` by waiting: nobody is
+    // watching a queued review patch, so piling onto a queue the daemon has just
+    // said is deep buys a slower run for everything already in it and nothing for
+    // this task. The retry is the delivery flow itself — see `patch_backpressure`
+    // for why that needs no new machinery.
+    let status = tokio::task::spawn_blocking(daemon_status)
+        .await
+        .map_err(|error| format!("Daemon status task panicked: {error}"))??;
+    if let Some(deferral) = patch_backpressure(&status)? {
+        return Ok(json!({ "taskId": task_id, "runId": Value::Null, "deferred": deferral }));
+    }
     let recipe_path_for_command = recipe_path.clone();
     let output = tokio::task::spawn_blocking(move || {
         run_daemon_queue(
@@ -459,6 +467,80 @@ fn patch_recipe(
     }))
 }
 
+fn bundled_daemon_cli() -> PathBuf {
+    crate::cli_install::bundled_cli_path().unwrap_or_else(|| {
+        PathBuf::from(if cfg!(windows) {
+            "monkey-cli.exe"
+        } else {
+            "monkey-cli"
+        })
+    })
+}
+
+/// `monkey daemon status --json`, for the backpressure check below.
+fn daemon_status() -> Result<Value, String> {
+    let output = Command::new(bundled_daemon_cli())
+        .args(["daemon", "status", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("Failed to start bundled daemon client: {error}"))?;
+    if output.stdout.len() > MAX_DAEMON_OUTPUT_BYTES {
+        return Err("Daemon status output exceeds 4 MiB".to_string());
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "Daemon status command exited with {}",
+            output.status
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Daemon status command returned invalid JSON: {error}"))
+}
+
+/// The batch producer's half of the backpressure asymmetry.
+///
+/// `Ok(None)` queues now, `Ok(Some(_))` defers and describes why, `Err` refuses.
+/// `slow` defers because this producer is the one that can actually wait — the
+/// interactive desktop turn in [`crate::m6a_desktop_bridge`] proceeds on the same
+/// signal, and the comparison is the whole point of having two.
+///
+/// The retry is not a schedule and not a queue of its own: the `patch_tasks` row
+/// was already written with a null `run_id`, the recipe is still on disk, and
+/// `patch_task_id` is a pure digest of (repository, PR, head oid, comment, model),
+/// so the next delivery pass over the same comment recomputes the same id, upserts
+/// the same row and queues it then. One deferral per pass, no sleep, no loop; the
+/// deferral itself is durable because this payload is what the mutation ledger
+/// stores as the execution's result and audit detail.
+///
+/// `closed` refuses. The daemon's `enqueue` is the actual guard and refuses it too
+/// — this is only the earlier, better-worded refusal, and it does not race the
+/// guard because it never lets work through that the guard would reject.
+fn patch_backpressure(status: &Value) -> Result<Option<Value>, String> {
+    use crate::daemon_commands::DesktopBackpressureState as State;
+
+    // An absent signal means accepting: it must never stall delivery.
+    let Some(signal) = crate::daemon_commands::backpressure_signal(status) else {
+        return Ok(None);
+    };
+    match signal.state {
+        State::Accepting => Ok(None),
+        State::Slow => Ok(Some(json!({
+            "state": "slow",
+            "reason": signal.reason,
+            "detail": signal.detail,
+            "retryAfterMs": signal.retry_after_ms,
+            "queueDepth": signal.queue_depth,
+            "queueCapacity": signal.queue_capacity,
+            "resumes": "the next patch-queue pass for this comment",
+        }))),
+        State::Closed => Err(signal
+            .detail
+            .unwrap_or_else(|| "The daemon is not accepting work".to_string())),
+    }
+}
+
 fn run_daemon_queue(
     recipe_path: &Path,
     run_key: &str,
@@ -466,14 +548,7 @@ fn run_daemon_queue(
     branch_prefix: &str,
     remote: &str,
 ) -> Result<Value, String> {
-    let executable = crate::cli_install::bundled_cli_path().unwrap_or_else(|| {
-        PathBuf::from(if cfg!(windows) {
-            "monkey-cli.exe"
-        } else {
-            "monkey-cli"
-        })
-    });
-    let output = Command::new(executable)
+    let output = Command::new(bundled_daemon_cli())
         .args(daemon_queue_args(
             recipe_path,
             run_key,
@@ -577,6 +652,42 @@ mod tests {
             map["src/lib.rs"].iter().copied().collect::<Vec<_>>(),
             vec![10, 11, 12, 13]
         );
+    }
+
+    /// The batch asymmetry: `slow` defers where the interactive turn proceeds.
+    #[test]
+    fn a_queued_patch_defers_on_slow_and_refuses_on_closed() {
+        // Verbatim CLI spelling — snake_case inside the backpressure object.
+        let status = |backpressure: &str| -> Value {
+            serde_json::from_str(&format!(r#"{{"backpressure":{backpressure}}}"#)).unwrap()
+        };
+
+        let deferral = patch_backpressure(&status(
+            r#"{"state":"slow","accepting":true,"reason":"memory_saturated",
+                "detail":"all 4 queued runs are waiting on memory; more work will queue but not start",
+                "retry_after_ms":4000,"queue_depth":8,"queue_capacity":128,"queued":4,"held":4}"#,
+        ))
+        .expect("`slow` defers rather than refusing")
+        .expect("`slow` does not queue now");
+        assert_eq!(deferral["reason"], "memory_saturated");
+        assert_eq!(deferral["retryAfterMs"], 4_000);
+
+        let refusal = patch_backpressure(&status(
+            r#"{"state":"closed","accepting":false,"reason":"kill_switch",
+                "detail":"the global kill switch is engaged; release it before queueing work",
+                "retry_after_ms":null,"queue_depth":0,"queue_capacity":128,"queued":0,"held":0}"#,
+        ))
+        .unwrap_err();
+        assert!(refusal.contains("kill switch"));
+
+        // Accepting, and a signal that never arrived, both queue immediately.
+        assert!(patch_backpressure(&status(
+            r#"{"state":"accepting","accepting":true,"reason":null,"detail":null,
+                "retry_after_ms":null,"queue_depth":0,"queue_capacity":128,"queued":0,"held":0}"#
+        ))
+        .unwrap()
+        .is_none());
+        assert!(patch_backpressure(&json!({})).unwrap().is_none());
     }
 
     #[test]

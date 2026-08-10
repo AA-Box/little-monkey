@@ -1,6 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type SandboxIsolation = "os_sandboxed" | "process_only";
+/**
+ * What a run got.
+ *
+ * `process_contained` is Windows: a job object bounded the process tree, its
+ * committed memory and its window-station reach, and killed the tree at the end
+ * of the run. It is deliberately not `os_sandboxed`, because the filesystem was
+ * never confined — the real workspace stays reachable by absolute path.
+ */
+export type SandboxIsolation = "os_sandboxed" | "process_contained" | "process_only";
 
 /**
  * What this machine can enforce, answerable before a run.
@@ -13,8 +21,16 @@ export type SandboxIsolation = "os_sandboxed" | "process_only";
  * `unavailable` is its own state: on macOS the sandbox binary is spawned
  * unconditionally, so if it is missing the run fails rather than silently
  * downgrading — a different problem from having no sandbox at all.
+ *
+ * `process_contained` sits between `os_enforced` and `process_only`, and closer to
+ * `process_only` for any decision about running untrusted code: the kernel holds
+ * the process tree, not the filesystem.
  */
-export type SandboxEnforcement = "os_enforced" | "process_only" | "unavailable";
+export type SandboxEnforcement =
+  | "os_enforced"
+  | "process_contained"
+  | "process_only"
+  | "unavailable";
 
 export const sandboxEnforcement = () => invoke<SandboxEnforcement>("sandbox_enforcement_probe");
 

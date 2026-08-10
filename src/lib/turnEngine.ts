@@ -13,9 +13,11 @@
  */
 import { invoke } from '@tauri-apps/api/core';
 import { streamChat } from './llamaClient';
+import type { RoutingDecision } from './modelRouting';
 import type { ChatMessage, StreamEvent, ToolCall, ToolDef } from './llamaClient';
 import { streamProviderChat } from './providerClient';
 import { formatMcpCallToolResult, resolveMcpToolName, type McpCallToolResult, type McpToolRegistry } from './mcpTools';
+import { classifyExternalTool } from './checkpointReconciliation';
 import { recordRequest } from './rateLimitTracker';
 import { useUsageStore } from '../store/usageStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
@@ -33,10 +35,14 @@ import {
   providerModelTargetKey,
 } from './modelTargets';
 import { riskCacheKey, type RiskClassification } from './riskJudge';
+import { evaluatePreToolUseHooks, fireObservedHooks, hooksForEvent } from './userHooks';
 import { gatePrivacyWireMessages, type PrivacyWireCache } from './privacyWire';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
+import { useSessionStore } from '../store/sessionStore';
+import { usePermissionStore } from '../store/permissionStore';
 import { runSubagentTask } from './subagent';
+import { resolveWorkflowSpec, runWorkflow } from './workflow';
 import { protocolToolCallId } from './durableRun';
 import { formatSkillToolResult, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
@@ -73,6 +79,28 @@ function costTargetKey(target: ResolvedTarget): string {
   );
 }
 
+/**
+ * Where to charge this request (K25).
+ *
+ * `workspacePath` is the folder open right now — the same identity the K6
+ * process ledger stamps on the processes this turn will spawn, which is what
+ * lets a workspace's token bill and its device time be added up together.
+ * `projectPath` is the folder the *conversation* belongs to, snapshotted when
+ * the session was created: a chat resumed after the user switched folders is
+ * still that project's cost, and charging it to today's folder would be wrong.
+ */
+function attributionOf(sessionId: string): {
+  workspacePath: string | null;
+  projectPath: string | null;
+} {
+  return {
+    workspacePath: primaryRoot(useWorkspaceStore.getState().roots)?.path ?? null,
+    projectPath:
+      useSessionStore.getState().sessions.find((session) => session.id === sessionId)
+        ?.workspacePath ?? null,
+  };
+}
+
 function isMeteredTarget(target: ResolvedTarget): boolean {
   if (target.kind === 'provider') return true;
   if (target.kind !== 'ollama') return false;
@@ -86,7 +114,7 @@ function isMeteredTarget(target: ResolvedTarget): boolean {
 }
 
 /** Stringifies a tool invocation's result (or error) for use as tool-message content. */
-function stringifyToolResult(result: unknown): string {
+export function stringifyToolResult(result: unknown): string {
   if (typeof result === 'string') return result;
   try {
     return JSON.stringify(result);
@@ -202,6 +230,11 @@ export function isToolCallAllowed(toolCall: ToolCall, toolsForTurn: ToolDef[]): 
  * `tool_run_shell` doc comment for the load-bearing invariant this must never
  * violate: nothing computed here ever feeds into whether `run_shell` (or
  * anything else) gets auto-approved. */
+/** How many streamed characters accumulate before the status line's live
+ * token estimate is updated — roughly 50 tokens, which is under one tick of
+ * the 0.1k the label rounds to, so batching costs nothing visible. */
+const STATUS_CHAR_FLUSH = 200;
+
 const RISK_ELIGIBLE_TOOLS = new Set(['write_file', 'edit_file', 'run_shell']);
 
 /** Same three tools, under the name that reads right at each of this
@@ -214,6 +247,25 @@ const MUTATING_TOOLS = RISK_ELIGIBLE_TOOLS;
  * Rust can scope a permission prompt (and, for run_shell/web_fetch, Stop-button
  * cancellation) to the right in-flight turn. */
 const PERMISSION_GATED_TOOLS = new Set([...MUTATING_TOOLS, 'remember', 'web_fetch', 'web_search']);
+
+/**
+ * Whether Plan Mode refuses `name` outright: every permission-gated tool
+ * (the exact set Rust's `mode_short_circuit` would refuse anyway — this
+ * predicate is the fail-closed frontend mirror, used both to EXCLUDE these
+ * names from the offered list (`toolsForMode`, agentLoop.ts) and as
+ * `executeToolCall`'s dispatch backstop), plus:
+ * - `shell_kill`: not permission-gated in Rust (a prompt per kill would make
+ *   the Stop affordance useless), so the frontend layers here are its only
+ *   Plan-Mode guard — it mutates process state, which planning never needs.
+ * - every `mcp__` name: MCP tools carry no reliable read-only marking, so
+ *   Plan Mode excludes them wholesale rather than guessing which ones only
+ *   read (they are all permission-gated in Rust too, so this tightens the
+ *   offer to match what dispatch would do anyway).
+ * Exported for `toolsForMode` and the logic tests.
+ */
+export function isBlockedInPlanMode(name: string): boolean {
+  return PERMISSION_GATED_TOOLS.has(name) || name === 'shell_kill' || name.startsWith('mcp__');
+}
 
 function isPermissionGatedTool(name: string): boolean {
   return PERMISSION_GATED_TOOLS.has(name) || name.startsWith('mcp__');
@@ -230,7 +282,23 @@ interface ReservedArgContext {
   agentLabel?: string;
   attachedStackNames?: string[];
   riskClassification: RiskClassification | null;
+  /** Managed agent-worktree path a worktree-isolated subagent's fs/shell
+   * calls resolve against — see `WORKTREE_OVERRIDE_TOOLS`. */
+  workspaceRootOverride?: string;
 }
+
+/** The tools whose path/cwd resolution honours a worktree override — the
+ * child profiles' fs tools plus run_shell. Everything else (web, memory,
+ * MCP) has no workspace path to redirect. */
+const WORKTREE_OVERRIDE_TOOLS: ReadonlySet<string> = new Set([
+  'read_file',
+  'list_dir',
+  'glob',
+  'grep',
+  'write_file',
+  'edit_file',
+  'run_shell',
+]);
 
 /**
  * The injected-args registry (ROADMAP.md §3 item 3): one table describing
@@ -259,11 +327,18 @@ const RESERVED_ARGS: ReadonlyArray<{ key: string; resolve: (ctx: ReservedArgCont
   // added at all, not even as an explicit `null`.
   { key: 'agent_label', resolve: (ctx) => (MUTATING_TOOLS.has(ctx.name) ? ctx.agentLabel : undefined) },
   // Pins a pre-mutation backup to the right turn's own checkpoint — the
-  // split pane may hold its own concurrent one. `run_shell` doesn't snapshot
-  // anything but still gets the id so `record_shell` can flag `shell_ran`.
+  // split pane may hold its own concurrent one. The mutating tools need it to
+  // snapshot; the external-effect tools need it for a different reason and get
+  // it too, since `checkpoints.rs`'s `record_external_effect` is what makes a
+  // network/MCP/memory effect survive context compaction. Without the id those
+  // effects exist only in the transcript, and `contextTrimmer.ts` can drop that
+  // — after which a rollback reported nothing to reconcile.
   {
     key: 'checkpoint_id',
-    resolve: (ctx) => (MUTATING_TOOLS.has(ctx.name) && ctx.checkpointId !== null ? ctx.checkpointId : undefined),
+    resolve: (ctx) =>
+      (MUTATING_TOOLS.has(ctx.name) || classifyExternalTool(ctx.name) !== null) && ctx.checkpointId !== null
+        ? ctx.checkpointId
+        : undefined,
   },
   // Scopes permission prompts and shell/fetch cancellation to THIS turn —
   // Stop in one pane must never touch the other pane's command or prompt.
@@ -277,6 +352,12 @@ const RESERVED_ARGS: ReadonlyArray<{ key: string; resolve: (ctx: ReservedArgCont
   // model that omits `stack` still gets the correct default-sweep allow-list
   // (see `stacks.rs`'s `resolve_search_stack_ids` doc comment).
   { key: 'allowed_stack_names', resolve: (ctx) => (ctx.name === 'search_docs' ? ctx.attachedStackNames ?? [] : undefined) },
+  // Points a worktree-isolated subagent's fs/shell calls at ITS worktree —
+  // frontend-owned like everything here (a model-supplied value is scrubbed),
+  // and Rust additionally refuses any value that isn't a registered agent
+  // worktree (`agent_worktrees::resolve_with_override`), so even a forged
+  // value could only ever name a directory this app created for this purpose.
+  { key: 'workspace_root_override', resolve: (ctx) => (WORKTREE_OVERRIDE_TOOLS.has(ctx.name) ? ctx.workspaceRootOverride : undefined) },
 ];
 
 function scrubReservedArgs(args: Record<string, unknown>): void {
@@ -336,11 +417,29 @@ export interface SubagentContext {
   sessionId: string;
   /** Immutable durable parent run id used for permission/cancellation audit. */
   runId?: string;
+  /** Shared id for THIS round's parallel `task` calls — set by
+   * `agentLoop.ts` only when the round carries two or more of them (a fresh
+   * UUID per round, since provider-fallback tool-call ids repeat), and
+   * threaded through to `runSubagentTask` as its `groupId` so the
+   * Background-tasks drawer can render the round as one grouped card.
+   * `undefined` for a lone `task` call. */
+  taskGroupId?: string;
   /** THIS turn's already-resolved active target (see `ResolvedTarget`) —
    * passed down rather than re-resolved, so a mid-turn manual model switch
    * can never split the parent and child across different targets. */
   target: ResolvedTarget;
   effort?: string;
+  /** Called once with the child's K9 dispatch decision, so it reaches the
+   * ledger on the parent's run.
+   *
+   * A callback for the reason `onMutatedPath` is one: `subagent.ts` cannot
+   * import `agentLoop.ts` (this module imports `subagent.ts`, so the edge
+   * closes a cycle), and the recorder lives there. A subagent has no durable
+   * run of its own — it borrows the parent's `runId` for permission and
+   * cancellation audit already — so the parent's run is where its decision
+   * belongs. `undefined` when the caller has no recorder, which is the same
+   * shape every other optional hook here takes. */
+  onRoutingDecision?: (decision: RoutingDecision) => void;
   /** The parent turn's own risk-annotation context (built once by
    * `agentLoop.ts`'s `runAgentTurnBody`, same object every `executeToolCall`
    * this turn already receives via the `risk` parameter) — threaded through
@@ -410,8 +509,81 @@ export interface SkillToolContext {
  * to cancel everything cancellable (`tools_cancel_running` kills any running
  * shell child and denies any pending permission prompt) and a cancelled
  * result is returned immediately rather than waiting the command out.
+ *
+ * User hooks wrap the whole dispatch (see `userHooks.ts`): a PreToolUse
+ * hook that explicitly denies blocks the call BEFORE any dispatch and its
+ * reason becomes the tool error; PostToolUse hooks observe the result and
+ * can change nothing. A hook that crashes or times out is a console WARN
+ * and the call proceeds — the deny path fails closed only on an explicit
+ * deny, never on hook infrastructure failure. Every caller (parent turns,
+ * subagents, workflow agents, crew) passes through here, so the hook
+ * boundary is a single place by construction.
  */
 export async function executeToolCall(
+  toolCall: ToolCall,
+  checkpointId: string | null,
+  turnId: string,
+  mcpRegistry: McpToolRegistry,
+  signal?: AbortSignal,
+  risk?: RiskAnnotationContext,
+  attachedStackNames?: string[],
+  subagent?: SubagentContext,
+  agentLabel?: string,
+  skill?: SkillToolContext,
+  chatSessionId?: string,
+  // Managed agent-worktree root for this call's fs/shell resolution — see
+  // `executeToolCallInner`'s param of the same name.
+  workspaceRootOverride?: string
+): Promise<string> {
+  const name = toolCall.function.name;
+  const sessionId = chatSessionId ?? subagent?.sessionId;
+  // Hook payloads carry the model's own args — parsed leniently here (the
+  // strict parse with its error result stays in the inner dispatch).
+  const argsForHooks = (): Record<string, unknown> => {
+    try {
+      const parsed: unknown = JSON.parse(toolCall.function.arguments || '{}');
+      return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  };
+
+  if (hooksForEvent('PreToolUse', name).length > 0) {
+    try {
+      const denial = await evaluatePreToolUseHooks(name, argsForHooks(), sessionId);
+      if (denial !== null) {
+        return stringifyToolError(new Error(`Blocked by a PreToolUse hook: ${denial.reason}`));
+      }
+    } catch (err) {
+      // The evaluator itself already proceeds past individual hook failures;
+      // this catch is defense in depth so a hook-layer bug can never leave a
+      // tool_calls entry without a result.
+      console.warn('PreToolUse hook evaluation failed — proceeding:', err);
+    }
+  }
+
+  const result = await executeToolCallInner(
+    toolCall,
+    checkpointId,
+    turnId,
+    mcpRegistry,
+    signal,
+    risk,
+    attachedStackNames,
+    subagent,
+    agentLabel,
+    skill,
+    chatSessionId,
+    workspaceRootOverride,
+  );
+
+  if (hooksForEvent('PostToolUse', name).length > 0) {
+    fireObservedHooks('PostToolUse', { tool_name: name, args: argsForHooks(), session_id: sessionId, result });
+  }
+  return result;
+}
+
+async function executeToolCallInner(
   toolCall: ToolCall,
   checkpointId: string | null,
   turnId: string,
@@ -444,10 +616,34 @@ export async function executeToolCall(
   // Omitted by every runner that doesn't offer `spawn_task` (subagents, side
   // tasks, crew); a `spawn_task` call arriving without it is reported as a
   // tool error rather than guessing which conversation to attach a chip to.
-  chatSessionId?: string
+  chatSessionId?: string,
+  // Managed agent-worktree path this call's fs/shell tools resolve against —
+  // supplied ONLY by `runSubagentTask` for a worktree-isolated child, per
+  // call rather than via any global state, so concurrent isolated agents can
+  // never race each other's roots. See the `workspace_root_override`
+  // RESERVED_ARGS entry for the trust story.
+  workspaceRootOverride?: string
 ): Promise<string> {
   useUsageHistoryStore.getState().recordToolCall();
   const { name, arguments: rawArguments } = toolCall.function;
+
+  // Plan Mode backstop — the frontend half of the double layer whose other
+  // half is Rust's `mode_short_circuit` (permissions.rs): the offered tool
+  // list already excludes these names in Plan Mode (`toolsForMode`,
+  // agentLoop.ts), but a model that emits one anyway (or a child loop whose
+  // caller composed its own list) must still be refused HERE, before any
+  // dispatch. This is also the ONLY enforcement point for the names Rust
+  // doesn't permission-gate (`shell_kill`), and it covers every subagent's
+  // calls too, since `runSubagentTask` routes through this function.
+  // Checked before the frontend-only branches below purely because none of
+  // those names are blocked — the message mirrors Rust's own wording.
+  if (isBlockedInPlanMode(name) && usePermissionStore.getState().mode === 'plan') {
+    return stringifyToolError(
+      new Error(
+        `Blocked: Little Monkey is in Plan Mode. Describe your plan instead of using ${name} - call the present_plan tool with your proposed plan, then ask the user to approve it and switch out of Plan Mode before making changes.`
+      )
+    );
+  }
 
   let args: Record<string, unknown> = {};
   if (rawArguments && rawArguments.trim().length > 0) {
@@ -492,6 +688,7 @@ export async function executeToolCall(
     agentLabel,
     attachedStackNames,
     riskClassification,
+    workspaceRootOverride,
   });
 
   // `present_plan` is a frontend-only tool (see `tools.ts`'s `PRESENT_PLAN_TOOL`
@@ -523,6 +720,16 @@ export async function executeToolCall(
       tldr: typeof args.tldr === 'string' ? args.tldr : '',
       prompt,
     });
+    // Recorded *after* the store assigned the id, for `tool_remember`'s reason:
+    // an id guessed beforehand could name a chip that was never created. One
+    // call rather than two, so the enumerated effect and the id it needs to
+    // withdraw can never be recorded by halves.
+    if (checkpointId) {
+      await invoke('checkpoint_record_task_suggestion', {
+        id: checkpointId,
+        suggestionId: suggestion.id,
+      }).catch(() => undefined);
+    }
     return stringifyToolResult({
       task_id: suggestion.id,
       status: 'suggested',
@@ -554,11 +761,16 @@ export async function executeToolCall(
       }
       const description = typeof args.description === 'string' ? args.description : 'Subagent task';
       const taskPrompt = typeof args.prompt === 'string' ? args.prompt : '';
-      // Only 'explore' is offered by `TASK_TOOL`'s schema this slice (see
-      // `tools.ts`'s doc comment) — defensively re-validated here anyway,
-      // rather than trusting the model's own JSON, exactly like every other
-      // frontend-injected/validated field in this function.
-      const profile: 'explore' | 'code' = args.profile === 'code' ? 'code' : 'explore';
+      // Passed through as a string: besides the built-in 'explore'/'code',
+      // a loaded custom agent's name is valid too — `runSubagentTask`'s
+      // `resolveSubagentProfile` is the single validation point, and an
+      // unknown name comes back as a tool error naming the known profiles
+      // (never a silent fallback that would run a mutating task under the
+      // wrong tool set).
+      const profile = typeof args.profile === 'string' && args.profile.trim().length > 0 ? args.profile.trim() : 'explore';
+      // Validated properly inside `runSubagentTask` (code-class profiles
+      // only) — anything but the literal 'worktree' is simply absent.
+      const isolation: 'worktree' | undefined = args.isolation === 'worktree' ? 'worktree' : undefined;
       // The child's own turn id — NOT `turnId` (the parent's) — so its
       // tool calls get their own entry in the Rust per-turn `tool_cancel`/
       // permission maps (AppState, lib.rs), scoping Stop-button cancellation
@@ -582,12 +794,47 @@ export async function executeToolCall(
         // `subagentStore`/`ChatSession.subagentRuns` key `MessageList.tsx`
         // can actually correlate against the persisted transcript.
         toolCallId: toolCall.id,
+        groupId: subagent.taskGroupId,
         description,
         prompt: taskPrompt,
         profile,
+        isolation,
+        target: subagent.target,
+        effort: subagent.effort,
+        onRoutingDecision: subagent.onRoutingDecision,
+        risk: subagent.risk,
+        onMutatedPath: subagent.onMutatedPath,
+        onMutationFailure: subagent.onMutationFailure,
+      });
+    } catch (err) {
+      return stringifyToolError(err);
+    }
+  }
+
+  // `workflow` is the named, phased counterpart of `task` — same frontend-only
+  // interception, same SubagentContext requirement (which is also what keeps a
+  // child loop from ever running one: `runSubagentTask`'s own dispatch never
+  // configures the context, and `toolsForProfile` never offers the name).
+  // Same whole-branch try/catch as `task`, for the same transcript-validity
+  // invariant.
+  if (name === 'workflow') {
+    try {
+      if (!subagent) {
+        return stringifyToolError(new Error('The workflow tool has no subagent execution context configured for this turn.'));
+      }
+      const spec = resolveWorkflowSpec(args);
+      return await runWorkflow({
+        sessionId: subagent.sessionId,
+        runId: subagent.runId,
+        parentCheckpointId: checkpointId,
+        parentSignal: signal,
+        toolCallId: toolCall.id,
+        spec,
+        resume: typeof args.resume === 'string' && args.resume.trim().length > 0 ? args.resume.trim() : undefined,
         target: subagent.target,
         effort: subagent.effort,
         risk: subagent.risk,
+        onRoutingDecision: subagent.onRoutingDecision,
         onMutatedPath: subagent.onMutatedPath,
         onMutationFailure: subagent.onMutationFailure,
       });
@@ -919,6 +1166,16 @@ export async function attemptStream(
   let streamError: string | null = null;
   let contentStarted = false;
   let usage: AttemptResult['usage'];
+  // Time-to-first-token for K9's latency criterion (`modelRouting.ts`), the
+  // only latency signal this app will route on. Started immediately before
+  // the loop rather than at function entry: both stream generators are lazy,
+  // so nothing is sent until the first `next()` below, and starting the clock
+  // earlier would charge this target for the privacy gate and budget check.
+  let firstFragmentAtMs: number | null = null;
+  const startedAtMs = Date.now();
+  // Streamed characters not yet reported to the status line — see the delta
+  // branch below.
+  let pendingChars = 0;
 
   const events: AsyncGenerator<StreamEvent> =
     target.kind === 'provider'
@@ -947,10 +1204,24 @@ export async function attemptStream(
   try {
     for await (const event of events) {
       if (event.type === 'delta') {
+        firstFragmentAtMs ??= Date.now();
         contentStarted = true;
         content += event.content;
         onDelta?.(content);
+        // Feeds the status line's live token estimate while the answer is
+        // being written — `usage` doesn't arrive until the stream's final
+        // chunk, so this is the only signal there is until then. Batched:
+        // a store write per delta would re-render the transcript on every
+        // token for a number that only reads to the nearest 0.1k anyway.
+        if (recordTurnStatusTokens) {
+          pendingChars += event.content.length;
+          if (pendingChars >= STATUS_CHAR_FLUSH) {
+            useTurnStatusStore.getState().noteStreamedChars(sessionId, pendingChars);
+            pendingChars = 0;
+          }
+        }
       } else if (event.type === 'tool_call') {
+        firstFragmentAtMs ??= Date.now();
         contentStarted = true;
         toolCalls.push(event.toolCall);
       } else if (event.type === 'usage') {
@@ -967,10 +1238,20 @@ export async function attemptStream(
           targetLabel: describeUsageTarget(target),
           sessionId,
           runId: runId ?? null,
+          // K25 attribution, captured here because this is the only place a
+          // priced call is recorded. Both may be null — a headless/one-shot
+          // caller has no session and the app may have no folder open — and
+          // null attributes to the "unattributed" bucket rather than to
+          // whichever workspace happens to be open when the panel is read.
+          ...attributionOf(sessionId),
           usage,
           costUsd: isMeteredTarget(target)
             ? calculateUsageCostUsd(costState.rates[targetKey], usage)
             : 0,
+          // Null when `usage` arrived before any content did — an honest
+          // "not measured" rather than a 0 that would read as instant.
+          timeToFirstTokenMs:
+            firstFragmentAtMs === null ? null : firstFragmentAtMs - startedAtMs,
         });
         if (recordUsage) {
           useUsageStore.getState().setUsage(sessionId, usage);
@@ -979,6 +1260,10 @@ export async function attemptStream(
           // registered for `sessionId`. The risk judge opts out via
           // `recordTurnStatusTokens` (see the param's doc comment).
           if (recordTurnStatusTokens) {
+            // Exact number supersedes the estimate: the store drops its
+            // streamed-character count, and this attempt's unflushed
+            // remainder goes with it.
+            pendingChars = 0;
             useTurnStatusStore.getState().addTokens(sessionId, usage.totalTokens);
           }
         }
@@ -987,6 +1272,12 @@ export async function attemptStream(
     }
   } catch (err) {
     streamError = errorMessage(err);
+  }
+
+  // An endpoint that never reports `usage` (or a stream that died mid-answer)
+  // would otherwise leave the last partial batch off the status line.
+  if (recordTurnStatusTokens && pendingChars > 0) {
+    useTurnStatusStore.getState().noteStreamedChars(sessionId, pendingChars);
   }
 
   return { content, toolCalls, streamError, contentStarted, usage };

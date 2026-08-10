@@ -690,6 +690,13 @@ pub fn normalize_semantic_stream(events: &[RunEventEnvelope]) -> Vec<NormalizedS
                 match event {
                     RunEvent::Queued { .. } => normalized.push(semantic("queued", serde_json::json!({}))),
                     RunEvent::Started { .. } => normalized.push(semantic("started", serde_json::json!({}))),
+                    // The policy and the sentence, not the chosen key: this
+                    // normalization feeds a human-readable replay, and a target
+                    // key is an identifier the reader would have to resolve.
+                    RunEvent::RoutingDecided { policy_name, reason, .. } => normalized.push(semantic(
+                        "routing_decided",
+                        serde_json::json!({ "policy": policy_name, "reason": reason }),
+                    )),
                     RunEvent::ToolProposed { tool_name, arguments, mutation, .. } => normalized.push(semantic(
                         "tool_proposed",
                         serde_json::json!({ "tool": tool_name, "arguments": arguments.value, "mutation": mutation }),
@@ -748,6 +755,17 @@ pub fn normalize_semantic_stream(events: &[RunEventEnvelope]) -> Vec<NormalizedS
                     RunEvent::NeedsReconciliation { .. } => {
                         terminal = Some(semantic("terminal", serde_json::json!({ "status": "needs_reconciliation" })));
                     }
+                    // The node ids, because a replay of a migrated run read on
+                    // either machine is otherwise silent about the fact that
+                    // half of it happened somewhere else.
+                    RunEvent::MigrationDeparted { target_node_id, .. } => normalized.push(semantic(
+                        "migration_departed",
+                        serde_json::json!({ "target_node_id": target_node_id }),
+                    )),
+                    RunEvent::MigrationArrived { origin_node_id, origin_last_sequence, .. } => normalized.push(semantic(
+                        "migration_arrived",
+                        serde_json::json!({ "origin_node_id": origin_node_id, "origin_last_sequence": origin_last_sequence }),
+                    )),
                     RunEvent::ModelDelta { .. } | RunEvent::UsageRecorded { .. } => unreachable!(),
                 }
             }
@@ -867,6 +885,7 @@ mod tests {
                 tool_rules: Vec::new(),
                 allow_network: true,
                 allow_external_mutations: false,
+                egress_allowlist: None,
             },
             budgets: RunBudgets {
                 wall_time_ms: 60_000,

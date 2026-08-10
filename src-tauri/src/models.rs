@@ -8,11 +8,12 @@
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncWriteExt;
 
 use crate::model_sources::{self, ManagedModelProvenance};
 use crate::permissions;
+use crate::profiles::ProfileScopedPaths;
 use crate::AppState;
 
 /// Whether a `ModelInfo` is a chat (tool-calling instruct) model or an
@@ -58,8 +59,10 @@ pub struct ModelInfo {
 }
 
 /// The curated registry: a small, hand-picked set of instruct models known
-/// to work well with llama.cpp's OpenAI-compatible tool calling.
-fn curated_models() -> Vec<ModelInfo> {
+/// to work well with llama.cpp's OpenAI-compatible tool calling. `pub` so
+/// monkey-cli's launcher can offer the same "Recommended" list the desktop
+/// app's model tab shows, rather than keeping a second copy of it.
+pub fn curated_models() -> Vec<ModelInfo> {
     vec![
         ModelInfo {
             id: "qwen2.5-7b".to_string(),
@@ -162,8 +165,7 @@ fn curated_models() -> Vec<ModelInfo> {
 /// Resolves (and creates, if missing) `<app_data_dir>/models`.
 pub(crate) fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     let dir = base.join("models");
     if !dir.exists() {
@@ -337,8 +339,7 @@ struct ExternalModelEntry {
 /// app data directory if needed.
 fn external_registry_path(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     if !base.exists() {
         std::fs::create_dir_all(&base).map_err(|e| {
@@ -601,7 +602,10 @@ impl Drop for DownloadCancelCleanup<'_> {
 /// Best-effort cancellation, like `stacks_cancel_index`: if no download is
 /// currently running for `file`, this is simply a no-op (nothing to cancel).
 #[tauri::command]
-pub fn models_cancel_download(state: tauri::State<'_, AppState>, file: String) -> Result<(), String> {
+pub fn models_cancel_download(
+    state: tauri::State<'_, AppState>,
+    file: String,
+) -> Result<(), String> {
     let cancels = state
         .model_downloads
         .lock()
@@ -678,9 +682,7 @@ pub(crate) async fn download_to_file(
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
-    let response = client
-        .get(&url)
-        .send()
+    let response = crate::egress::send(client.get(&url))
         .await
         .map_err(|e| format!("Failed to reach Hugging Face at {url}: {e}"))?;
 

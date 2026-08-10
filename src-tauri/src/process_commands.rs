@@ -117,9 +117,7 @@ pub fn process_descendants(
     state: tauri::State<'_, AppState>,
     process_id: String,
 ) -> Result<Vec<ProcessRecord>, String> {
-    with_process_table(&app, state.inner(), |table| {
-        table.descendants(&process_id)
-    })
+    with_process_table(&app, state.inner(), |table| table.descendants(&process_id))
 }
 
 /// Live count per kind.
@@ -172,6 +170,55 @@ pub struct ProcessAdmitArgs {
     pub max_output_bytes: Option<u64>,
     #[serde(default)]
     pub max_child_processes: Option<u32>,
+    #[serde(default)]
+    pub max_context_tokens: Option<u64>,
+    /// Drop this kind's class wall budget for this process, rather than replacing
+    /// it with a number.
+    ///
+    /// A flag and not a `maxWallMs: 0`, deliberately. The ledger's own `CHECK`
+    /// forbids a non-positive `max_wall_ms`, so zero cannot be stored — and
+    /// reading a zero as "unbounded" would be exactly the zero-versus-absent
+    /// overloading this codebase avoids elsewhere. `None`/`false` means "use the
+    /// class default", which is what every existing caller already sends.
+    #[serde(default)]
+    pub unbounded_wall: Option<bool>,
+}
+
+/// The limit set an admission ends up with: the kind's class defaults, with each
+/// stated argument overriding its own field.
+///
+/// **Merged, not substituted, and that was the bug.** `process_admit` built this
+/// from the arguments alone, so every row admitted over IPC was declared
+/// unbounded regardless of what its kind said it was subject to. That is why
+/// `ProcessKind::default_limits` could be given a wall budget and still fire for
+/// nobody: the four kinds it applies to are admitted exactly here, and this
+/// overwrote it with `None` on the way past. `AdmitProcess::new` has always
+/// seeded from the class for native callers; this is the same rule for the IPC
+/// path.
+///
+/// Split out of the command so it can be asserted without an `AppHandle`, the
+/// same reason `verify.rs` tests `run_command_impl` rather than its wrapper.
+fn merged_limits(
+    kind: ProcessKind,
+    args: &ProcessAdmitArgs,
+) -> crate::process_table::ProcessLimits {
+    let class = kind.default_limits();
+    crate::process_table::ProcessLimits {
+        // The one field with an explicit opt-out, because it is the one with a
+        // class default a user can turn off. `unbounded_wall` beats a stated
+        // `max_wall_ms` too: a caller that says both has contradicted itself, and
+        // "no budget" is the safer of the two readings — it declares less rather
+        // than enforcing something nobody asked for.
+        max_wall_ms: if args.unbounded_wall.unwrap_or(false) {
+            None
+        } else {
+            args.max_wall_ms.or(class.max_wall_ms)
+        },
+        max_memory_bytes: args.max_memory_bytes.or(class.max_memory_bytes),
+        max_output_bytes: args.max_output_bytes.or(class.max_output_bytes),
+        max_child_processes: args.max_child_processes.or(class.max_child_processes),
+        max_context_tokens: args.max_context_tokens.or(class.max_context_tokens),
+    }
 }
 
 /// Admit a process. Called by the frontend surfaces — a chat turn, a subagent,
@@ -190,6 +237,9 @@ pub fn process_admit(
     // less than refusing to record the process at all, and the alternative would
     // make a subagent's admission depend on its parent's record having landed
     // first.
+    // Computed before `args` starts being moved from, one line below.
+    let limits = merged_limits(kind, &args);
+
     let parent_process_id = match (args.parent_process_id, args.parent_external_id) {
         (Some(explicit), _) => Some(explicit),
         (None, Some(external)) => {
@@ -212,12 +262,7 @@ pub fn process_admit(
         run_id: args.run_id,
         workspace: args.workspace,
         profile: args.profile,
-        limits: crate::process_table::ProcessLimits {
-            max_wall_ms: args.max_wall_ms,
-            max_memory_bytes: args.max_memory_bytes,
-            max_output_bytes: args.max_output_bytes,
-            max_child_processes: args.max_child_processes,
-        },
+        limits,
     };
 
     let record = with_process_table(&app, state.inner(), |table| table.admit(&request, now))?;
@@ -529,8 +574,9 @@ pub fn process_deliver_os_signal(
         return Ok(None);
     };
 
-    let delivered = crate::background_shell::deliver_os_signal(&app, state.inner(), &record, signal)
-        .unwrap_or(record);
+    let delivered =
+        crate::background_shell::deliver_os_signal(&app, state.inner(), &record, signal)
+            .unwrap_or(record);
     notify(&app, &delivered);
     Ok(Some(delivered))
 }
@@ -617,6 +663,86 @@ pub fn process_pending_signals(
     with_process_table(&app, state.inner(), |table| table.pending_signals(&parsed))
 }
 
+/// Filter arguments for [`process_usage_ledger`].
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessUsageArgs {
+    #[serde(default)]
+    pub process_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub closed_only: Option<bool>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// The resource ledger for a selection of processes: the rows and their totals.
+///
+/// Both in one response because they are only meaningful together — a total whose
+/// `unavailableRows` is nonzero is answering a narrower question than it looks
+/// like, and the rows are how a caller sees which processes were left out and
+/// why.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessUsageLedger {
+    pub rows: Vec<crate::process_table::ProcessUsageRow>,
+    pub totals: crate::process_table::ProcessUsageAggregate,
+    /// Where each row's allowed egress went, keyed by `processId`. Only the
+    /// processes that reached somewhere appear — see
+    /// `ProcessTable::egress_destinations_for`.
+    ///
+    /// Beside the rows rather than inside them because it is the one field here
+    /// that is a list per row: folding it in would make every other caller of
+    /// `usage_rows` — the daemon engine, the background shell — pay for a query
+    /// only this surface reads.
+    pub destinations:
+        std::collections::BTreeMap<String, crate::process_table::ProcessEgressDestinations>,
+    /// Each row's measured prompt-cache reuse, keyed by `processId` (roadmap
+    /// K11). Only the processes whose runtime reported a figure appear — see
+    /// `ProcessTable::context_reuse_for` on why absence is the answer for the
+    /// rest rather than a zero.
+    ///
+    /// Beside the rows for `destinations`' reason: two of the three runtimes
+    /// never populate it, so every other caller of `usage_rows` would be paying
+    /// for a query only this surface reads.
+    pub context_reuse: std::collections::BTreeMap<String, crate::run_scope::ContextReuse>,
+}
+
+/// What each process actually consumed, per process and in aggregate.
+///
+/// The read side of K6(b). Every field is either a measurement or `null` with a
+/// reason in `usage.unavailable` — nothing here is inferred, and in particular
+/// nothing unmeasured is reported as zero, so a surface showing these numbers can
+/// say "not measured, because …" instead of implying a process cost nothing.
+#[tauri::command]
+pub fn process_usage_ledger(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    args: Option<ProcessUsageArgs>,
+) -> Result<ProcessUsageLedger, String> {
+    let args = args.unwrap_or_default();
+    let filter = crate::process_table::ProcessUsageFilter {
+        process_id: args.process_id,
+        run_id: args.run_id,
+        workspace: args.workspace,
+        closed_only: args.closed_only.unwrap_or(false),
+        limit: args.limit,
+    };
+    with_process_table(&app, state.inner(), |table| {
+        let rows = table.usage_rows(&filter)?;
+        let ids: Vec<String> = rows.iter().map(|row| row.process_id.clone()).collect();
+        Ok(ProcessUsageLedger {
+            destinations: table.egress_destinations_for(&ids)?,
+            context_reuse: table.context_reuse_for(&ids)?,
+            totals: table.usage_totals(&filter)?,
+            rows,
+        })
+    })
+}
+
 /// Applies a projection through the shared reconcile, for native adopters that
 /// already hold an `AppHandle` and `AppState`.
 ///
@@ -651,6 +777,25 @@ pub(crate) fn reap_desktop_processes_at_startup<R: tauri::Runtime>(
             return;
         }
     };
+    // Killed *before* the reap, because the reap is what erases the evidence: it
+    // closes every one of these rows, and the recorded pid is the only handle
+    // anything has on a Chromium tree the previous app process left running.
+    // Ordinary desktop kinds need no equivalent — their worker was a WebView loop
+    // that died with the app, so there is nothing left to signal.
+    match with_process_table(app, state, |table| {
+        Ok(crate::browser_worker::reclaim_orphaned_browser_sessions(
+            table,
+        ))
+    }) {
+        Ok(Ok(killed)) if killed > 0 => {
+            eprintln!("browser worker: killed {killed} orphaned Chromium process group(s)")
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) | Err(error) => {
+            eprintln!("browser worker: orphan reclaim failed: {error}")
+        }
+    }
+
     let scope = ProcessFilter {
         kinds: ProcessKind::DESKTOP_OWNED.to_vec(),
         ..ProcessFilter::default()
@@ -692,5 +837,106 @@ pub(crate) fn reap_desktop_processes_at_startup<R: tauri::Runtime>(
         }
         Ok(_) => {}
         Err(error) => eprintln!("process table: host-liveness reap failed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process_table::WEBVIEW_WALL_BUDGET_MS;
+
+    fn args(kind: &str) -> ProcessAdmitArgs {
+        ProcessAdmitArgs {
+            kind: kind.to_string(),
+            external_id: "ext-1".to_string(),
+            parent_process_id: None,
+            parent_external_id: None,
+            parent_kind: None,
+            run_id: None,
+            workspace: None,
+            profile: None,
+            max_wall_ms: None,
+            max_memory_bytes: None,
+            max_output_bytes: None,
+            max_child_processes: None,
+            max_context_tokens: None,
+            unbounded_wall: None,
+        }
+    }
+
+    /// The defect this slice fixed: a caller that states nothing used to get an
+    /// all-`None` limit set, which is how a class default could exist and still
+    /// fire for nobody.
+    #[test]
+    fn an_admission_that_states_nothing_still_carries_its_class_limits() {
+        for kind in [
+            ProcessKind::ChatTurn,
+            ProcessKind::Subagent,
+            ProcessKind::CrewMember,
+            ProcessKind::SideTask,
+        ] {
+            let merged = merged_limits(kind, &args(kind.as_str()));
+            assert_eq!(
+                merged,
+                kind.default_limits(),
+                "{} lost its class limits at the IPC boundary",
+                kind.as_str()
+            );
+            assert_eq!(merged.max_wall_ms, Some(WEBVIEW_WALL_BUDGET_MS));
+        }
+
+        // Not only the kinds this slice added a budget for: a background shell's
+        // output ceiling reached the row the same way, and did not before.
+        assert_eq!(
+            merged_limits(
+                ProcessKind::BackgroundShell,
+                &args(ProcessKind::BackgroundShell.as_str())
+            ),
+            ProcessKind::BackgroundShell.default_limits()
+        );
+    }
+
+    #[test]
+    fn a_stated_value_wins_over_the_class_default_field_by_field() {
+        let mut stated = args("chat_turn");
+        stated.max_wall_ms = Some(30_000);
+        let merged = merged_limits(ProcessKind::ChatTurn, &stated);
+        assert_eq!(merged.max_wall_ms, Some(30_000));
+
+        // …and only that field. A stated context budget must not wipe the class
+        // wall budget beside it, which is exactly what substitution used to do.
+        let mut tokens_only = args("chat_turn");
+        tokens_only.max_context_tokens = Some(8_192);
+        let merged = merged_limits(ProcessKind::ChatTurn, &tokens_only);
+        assert_eq!(merged.max_context_tokens, Some(8_192));
+        assert_eq!(merged.max_wall_ms, Some(WEBVIEW_WALL_BUDGET_MS));
+    }
+
+    /// The opt-out has to produce an *absent* budget rather than a zero, because
+    /// the ledger's `CHECK` refuses a non-positive `max_wall_ms` and a declared
+    /// limit nothing enforces is worse than an honest absence.
+    #[test]
+    fn the_opt_out_drops_the_budget_rather_than_zeroing_it() {
+        let mut off = args("chat_turn");
+        off.unbounded_wall = Some(true);
+        assert_eq!(merged_limits(ProcessKind::ChatTurn, &off).max_wall_ms, None);
+
+        // A caller that says both has contradicted itself; "no budget" is the
+        // reading that declares less.
+        let mut both = args("chat_turn");
+        both.unbounded_wall = Some(true);
+        both.max_wall_ms = Some(30_000);
+        assert_eq!(
+            merged_limits(ProcessKind::ChatTurn, &both).max_wall_ms,
+            None
+        );
+
+        // And `false` is not an opt-out.
+        let mut on = args("chat_turn");
+        on.unbounded_wall = Some(false);
+        assert_eq!(
+            merged_limits(ProcessKind::ChatTurn, &on).max_wall_ms,
+            Some(WEBVIEW_WALL_BUDGET_MS)
+        );
     }
 }

@@ -59,4 +59,7 @@ runs:
         LM_FAIL_ON_BLOCKING: ${{ inputs.fail-on-blocking }}
         LM_MAX_DIFF_BYTES: ${{ inputs.max-diff-bytes }}
         GH_TOKEN: ${{ github.token }}
-      run: node "${{ github.action_path }}/review.mjs"
+      # $GITHUB_ACTION_PATH rather than ${{ github.action_path }}: the
+      # expression form is interpolated into the script before bash sees it,
+      # so the path becomes shell source. The env var is passed as data.
+      run: node "$GITHUB_ACTION_PATH/review.mjs"

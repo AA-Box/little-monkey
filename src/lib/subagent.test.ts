@@ -12,6 +12,32 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeM
 // covers the `executeToolCall` `task`-branch delegation contract itself.
 const attemptStreamMock = vi.fn();
 const executeToolCallMock = vi.fn();
+// The routing engine itself is `modelRouting.test.ts`'s subject. What is under
+// test here is which of the two inputs `subagent.ts` chooses between — a target
+// the user pinned to this profile, or the policy's answer — and the task class
+// it asks under.
+const unrouted = (...args: unknown[]) => ({
+  target: args[0],
+  decision: {
+    taskClass: "subagent_explore",
+    policyId: null as string | null,
+    policyName: null as string | null,
+    chosenKey: null as string | null,
+    changedFromActive: false,
+    sequence: [] as string[],
+    rejected: [] as unknown[],
+    reason: "No policy covers this task class.",
+  },
+  sequence: [args[0]],
+});
+// Defaulted at construction, not only in the K9 describe below: every other
+// suite in this file runs through `resolveSubagentTarget` too, and an
+// implementation-less mock would return `undefined` for all of them.
+const routeFromActiveMock = vi.fn(unrouted);
+vi.mock("./targetRouting", () => ({
+  routeFromActive: (...args: unknown[]) => routeFromActiveMock(...args),
+}));
+
 vi.mock("./turnEngine", () => ({
   attemptStream: (...args: unknown[]) => attemptStreamMock(...args),
   executeToolCall: (...args: unknown[]) => executeToolCallMock(...args),
@@ -21,19 +47,26 @@ vi.mock("./turnEngine", () => ({
   // always says "allowed".
   isToolCallAllowed: (toolCall: { function: { name: string } }, toolsForTurn: { function: { name: string } }[]) =>
     toolsForTurn.some((tool) => tool.function.name === toolCall.function.name),
+  // Same real-implementation-not-spy reasoning as `isToolCallAllowed` just
+  // above: the Plan-Mode suite needs the actual predicate semantics.
+  isBlockedInPlanMode: (name: string) =>
+    ["write_file", "edit_file", "run_shell", "shell_kill", "remember", "web_fetch", "web_search"].includes(name) ||
+    name.startsWith("mcp__"),
   CANCELLED_TOOL_RESULT: JSON.stringify({ error: "Cancelled by the user" }),
   stringifyToolError: (err: unknown) => JSON.stringify({ error: errorMessage(err) }),
   describeUsageTarget: (target: ResolvedTarget) =>
     target.kind === "local" ? "Local model" : target.kind === "ollama" ? `Ollama · ${target.model}` : `${target.providerId} · ${target.model}`,
 }));
 
-import { MAX_SUBAGENT_ITERATIONS, runSubagentTask, type RunSubagentTaskParams } from "./subagent";
+import { MAX_SUBAGENT_ITERATIONS, resolveSubagentProfile, runSubagentTask, steerSubagentRun, type RunSubagentTaskParams } from "./subagent";
 import { clearPauseRegistryForTests, setPauseRequested } from "./pauseRegistry";
 import type { ResolvedTarget, RiskAnnotationContext } from "./turnEngine";
-import type { ToolCall } from "./llamaClient";
+import type { ChatMessage, ToolCall } from "./llamaClient";
 import { selectSubagentRun, useSubagentStore } from "../store/subagentStore";
 import { useSessionStore, type ChatSession } from "../store/sessionStore";
 import { useSettingsStore } from "../store/settingsStore";
+import { useCustomAgentStore } from "../store/customAgentStore";
+import { usePermissionStore } from "../store/permissionStore";
 
 const fakeTarget: ResolvedTarget = { kind: "local", baseUrl: "http://localhost:8090" };
 
@@ -494,6 +527,93 @@ describe("runSubagentTask / per-subagent usage accounting (slice 4)", () => {
 // Slice 4: optional per-profile model override — `resolveSubagentTarget`
 // (private to subagent.ts) is exercised indirectly here through what target
 // actually reaches `attemptStream`.
+
+/**
+ * Roadmap K9: subagents were the one dispatch surface no policy could reach.
+ *
+ * Not for want of a feature — `subagent.ts` cannot import `agentLoop.ts`
+ * (`turnEngine.ts` imports this module, so the edge closes a cycle) and target
+ * resolution lived there. It now lives in `targetRouting.ts`, which has no such
+ * edge.
+ */
+describe("runSubagentTask / K9 dispatch policy", () => {
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    routeFromActiveMock.mockReset();
+    routeFromActiveMock.mockImplementation(unrouted);
+    useSettingsStore.setState({ subagentProfileModels: {} });
+  });
+
+  /** Two classes rather than one: `explore` reads and reports, `code` mutates a
+   * workspace, and a user who wants a cheap model for the first and a careful
+   * one for the second cannot say so with a single "subagent" class. */
+  it.each([
+    ["explore", "subagent_explore"],
+    ["code", "subagent_code"],
+  ] as const)("routes a %s subagent under its own task class", async (profile, taskClass) => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile }));
+
+    expect(routeFromActiveMock.mock.calls[0][1]).toMatchObject({
+      taskClass,
+      // Facts about this surface, not per-run guesses: a subagent's history is
+      // built from a text description, and `toolsForProfile` always offers it
+      // tools.
+      requiresVision: false,
+      requiresTools: true,
+    });
+  });
+
+  it("runs the target a policy chose", async () => {
+    const routed: ResolvedTarget = { kind: "provider", providerId: "openrouter", model: "policy-model" };
+    routeFromActiveMock.mockReturnValue({
+      target: routed,
+      decision: { taskClass: "subagent_explore", policyId: "p-1", policyName: "Cheap explorers", chosenKey: "k", changedFromActive: true, sequence: [], rejected: [], reason: "Cheap explorers chose it." } as const,
+      sequence: [routed],
+    });
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "explore" }));
+
+    expect(attemptStreamMock.mock.calls[0][0]).toEqual(routed);
+  });
+
+  /** A pinned model is a choice the user already made. A policy that silently
+   * overrode it would make the setting a suggestion. */
+  it("never consults a policy when the profile's model is pinned", async () => {
+    useSettingsStore.getState().setSubagentProfileModel("explore", { providerId: "openrouter", model: "pinned" });
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "explore" }));
+
+    expect(routeFromActiveMock).not.toHaveBeenCalled();
+    expect(attemptStreamMock.mock.calls[0][0]).toEqual({ kind: "provider", providerId: "openrouter", model: "pinned" });
+  });
+
+  /** The decision reaches the parent's run, because a subagent has none of its
+   * own — which is what makes "why did this run here" answerable after a
+   * restart rather than only from the transcript. */
+  it("reports its decision to the caller, pinned or routed", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    const onRoutingDecision = vi.fn();
+
+    await runSubagentTask(baseParams({ profile: "explore", onRoutingDecision }));
+    expect(onRoutingDecision.mock.calls[0][0]).toMatchObject({ taskClass: "subagent_explore" });
+
+    onRoutingDecision.mockReset();
+    useSettingsStore.getState().setSubagentProfileModel("code", { providerId: "openrouter", model: "pinned" });
+    await runSubagentTask(baseParams({ profile: "code", taskId: "child-turn-2", onRoutingDecision }));
+
+    // A pinned target still produces a decision, and its reason says a policy
+    // was never consulted — an absent event could not be told from a missing
+    // one.
+    expect(onRoutingDecision.mock.calls[0][0]).toMatchObject({ taskClass: "subagent_code", policyId: null });
+    expect(onRoutingDecision.mock.calls[0][0].reason).toContain("Pinned");
+  });
+});
+
 describe("runSubagentTask / per-profile model override (slice 4)", () => {
   beforeEach(() => {
     attemptStreamMock.mockReset();
@@ -794,5 +914,357 @@ describe("runSubagentTask / onMutatedPath reporting", () => {
 
     expect(executeToolCallMock).not.toHaveBeenCalled();
     expect(onMutatedPath).not.toHaveBeenCalled();
+  });
+});
+
+// Mid-run steering: `steerSubagentRun` queues user messages for a LIVE run
+// (keyed by `cancelId`, same rule as `cancelSubagentRun`); `runSubagentTask`
+// drains the queue at the top of its next loop iteration, appending each as a
+// plain `user` message to both its local wire transcript and the live store.
+describe("runSubagentTask / mid-run steering", () => {
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+  });
+
+  it("drains queued steer messages, in order, into the next iteration's wire history and liveMessages", async () => {
+    let resolveFirst!: (value: unknown) => void;
+    attemptStreamMock
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("grep result");
+
+    const promise = runSubagentTask(baseParams({ taskId: "steer-run-1", toolCallId: "call-steer-1" }));
+    await vi.waitFor(() => expect(attemptStreamMock).toHaveBeenCalledTimes(1));
+
+    expect(steerSubagentRun("steer-run-1", "first steer")).toBe(true);
+    expect(steerSubagentRun("steer-run-1", "second steer")).toBe(true);
+
+    resolveFirst({ content: "", toolCalls: [toolCall("grep", "call-g")], streamError: null, contentStarted: true });
+    expect(await promise).toBe("done");
+
+    // Not in the FIRST call's history (the steers arrived mid-iteration) …
+    const firstWire = attemptStreamMock.mock.calls[0][1] as ChatMessage[];
+    expect(firstWire.some((m) => m.content === "first steer")).toBe(false);
+
+    // … but in the second call's, in queue order, AFTER the tool result.
+    const secondWire = attemptStreamMock.mock.calls[1][1] as ChatMessage[];
+    const userTexts = secondWire.filter((m) => m.role === "user").map((m) => m.content);
+    expect(userTexts).toEqual(["find every caller of X", "first steer", "second steer"]);
+    const toolIndex = secondWire.findIndex((m) => m.role === "tool");
+    expect(secondWire.findIndex((m) => m.content === "first steer")).toBeGreaterThan(toolIndex);
+
+    const run = selectSubagentRun("call-steer-1")(useSubagentStore.getState());
+    expect(run?.liveMessages.filter((m) => m.role === "user").map((m) => m.content)).toEqual(["first steer", "second steer"]);
+  });
+
+  it("is a no-op (returns false, appends nothing) once the run has finished", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    await runSubagentTask(baseParams({ taskId: "steer-run-2", toolCallId: "call-steer-2" }));
+
+    expect(steerSubagentRun("steer-run-2", "too late")).toBe(false);
+    const run = selectSubagentRun("call-steer-2")(useSubagentStore.getState());
+    expect(run?.liveMessages.some((m) => m.content === "too late")).toBe(false);
+  });
+
+  it("returns false for a cancelId no run ever registered (e.g. a restored run's empty cancelId)", () => {
+    expect(steerSubagentRun("", "hello")).toBe(false);
+    expect(steerSubagentRun("never-registered", "hello")).toBe(false);
+  });
+
+  it("drops a steer queued during the run's final iteration — a later run reusing the id never inherits it", async () => {
+    let resolveFirst!: (value: unknown) => void;
+    attemptStreamMock.mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }));
+
+    const promise = runSubagentTask(baseParams({ taskId: "steer-run-3", toolCallId: "call-steer-3" }));
+    await vi.waitFor(() => expect(attemptStreamMock).toHaveBeenCalledTimes(1));
+
+    expect(steerSubagentRun("steer-run-3", "never seen")).toBe(true);
+    // Final answer — the loop returns without another iteration, so the
+    // queued steer must be cleared with the controller, not left behind.
+    resolveFirst({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    await promise;
+
+    attemptStreamMock.mockReset();
+    attemptStreamMock.mockResolvedValue({ content: "second run done", toolCalls: [], streamError: null, contentStarted: true });
+    await runSubagentTask(baseParams({ taskId: "steer-run-3", toolCallId: "call-steer-3b" }));
+
+    const wire = attemptStreamMock.mock.calls[0][1] as ChatMessage[];
+    expect(wire.some((m) => m.content === "never seen")).toBe(false);
+  });
+});
+
+describe("runSubagentTask / custom agent profiles", () => {
+  const docsDef = {
+    name: "docs-writer",
+    description: "Writes docs",
+    tools: ["read_file", "grep"],
+    effort: "low" as const,
+    addendum: "Always write in the imperative mood.",
+    sourcePath: ".monkey/agents/docs-writer.md",
+  };
+  const fixerDef = {
+    name: "fixer",
+    description: "Fixes bugs",
+    tools: ["read_file", "write_file"],
+    addendum: "",
+    sourcePath: ".monkey/agents/fixer.md",
+  };
+
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    routeFromActiveMock.mockClear();
+    // An earlier suite leaves a `code`-profile model pin behind, which would
+    // short-circuit routing entirely (pinned targets never consult K9).
+    useSettingsStore.setState({ subagentProfileModels: {} });
+    useCustomAgentStore.setState({ defs: { "docs-writer": docsDef, fixer: fixerDef }, errors: [], loadedAt: Date.now() });
+  });
+
+  afterEach(() => {
+    useCustomAgentStore.setState({ defs: {}, errors: [], loadedAt: null });
+  });
+
+  it("resolveSubagentProfile: builtin, custom, and unknown (with the known list sorted)", () => {
+    expect(resolveSubagentProfile("explore", {})).toEqual({ kind: "builtin", profile: "explore" });
+    expect(resolveSubagentProfile("code", {})).toEqual({ kind: "builtin", profile: "code" });
+    const custom = resolveSubagentProfile("docs-writer", { "docs-writer": docsDef });
+    expect(custom).toEqual({ kind: "custom", def: docsDef, base: "explore" });
+    const unknown = resolveSubagentProfile("nope", { zeta: docsDef, alpha: fixerDef });
+    expect(unknown).toEqual({ kind: "unknown", known: ["explore", "code", "alpha", "zeta"] });
+  });
+
+  it("an unknown profile finishes as an error naming the known profiles, without ever streaming", async () => {
+    const result = await runSubagentTask(baseParams({ profile: "not-an-agent", toolCallId: "call-unknown" }));
+
+    expect(JSON.parse(result).error).toContain('Unknown agent profile "not-an-agent"');
+    expect(JSON.parse(result).error).toContain("docs-writer");
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+    expect(useSubagentStore.getState().runs["call-unknown"]?.status).toBe("error");
+  });
+
+  it("offers the child exactly the def's tools, appends the addendum, and applies the def's effort", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "docs-writer", effort: "high" }));
+
+    const [, wireHistory, tools, , effort] = attemptStreamMock.mock.calls[0] as [unknown, ChatMessage[], { function: { name: string } }[], unknown, string];
+    expect(tools.map((t) => t.function.name).sort()).toEqual(["grep", "read_file"]);
+    expect(wireHistory[0].content).toContain("Always write in the imperative mood.");
+    expect(wireHistory[0].content).toContain("docs-writer");
+    // The def's own effort wins over the inherited turn effort — declaring
+    // effort in the definition file is the point of the field.
+    expect(effort).toBe("low");
+  });
+
+  it("routes a mutating custom agent as code-class work and a read-only one as explore-class", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "fixer" }));
+    expect((routeFromActiveMock.mock.calls[0][1] as { taskClass: string }).taskClass).toBe("subagent_code");
+
+    routeFromActiveMock.mockClear();
+    await runSubagentTask(baseParams({ profile: "docs-writer" }));
+    expect((routeFromActiveMock.mock.calls[0][1] as { taskClass: string }).taskClass).toBe("subagent_explore");
+  });
+
+  it("rejects a child call to a tool outside the def's list without executing it", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({ content: "", toolCalls: [toolCall("write_file")], streamError: null, contentStarted: true })
+      .mockResolvedValueOnce({ content: "ok", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "docs-writer" }));
+
+    expect(executeToolCallMock).not.toHaveBeenCalled();
+    const wire = attemptStreamMock.mock.calls[1][1] as ChatMessage[];
+    const rejection = wire.find((m) => m.role === "tool");
+    expect(rejection && JSON.parse(rejection.content as string).error).toContain('"write_file"');
+  });
+});
+
+describe("runSubagentTask / Plan Mode", () => {
+  const webAgentDef = {
+    name: "researcher",
+    description: "Researches with web tools",
+    tools: ["read_file", "grep", "web_search"],
+    addendum: "",
+    sourcePath: ".monkey/agents/researcher.md",
+  };
+  const fixerAgentDef = {
+    name: "fixer",
+    description: "Fixes bugs",
+    tools: ["read_file", "write_file"],
+    addendum: "",
+    sourcePath: ".monkey/agents/fixer.md",
+  };
+
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    useSettingsStore.setState({ subagentProfileModels: {} });
+    usePermissionStore.setState({ mode: "plan" });
+    useCustomAgentStore.setState({ defs: { researcher: webAgentDef, fixer: fixerAgentDef }, errors: [], loadedAt: Date.now() });
+  });
+
+  afterEach(() => {
+    usePermissionStore.setState({ mode: "manual" });
+    useCustomAgentStore.setState({ defs: {}, errors: [], loadedAt: null });
+  });
+
+  it("refuses a code-profile dispatch outright, without streaming", async () => {
+    const result = await runSubagentTask(baseParams({ profile: "code", toolCallId: "call-plan-code" }));
+    expect(JSON.parse(result).error).toContain("Plan Mode");
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+    expect(useSubagentStore.getState().runs["call-plan-code"]?.status).toBe("error");
+  });
+
+  it("refuses a mutating custom agent by its own name", async () => {
+    const result = await runSubagentTask(baseParams({ profile: "fixer" }));
+    expect(JSON.parse(result).error).toContain('"fixer"');
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+  });
+
+  it("still dispatches an explore child, with Plan-Mode-blocked names dropped from its offer", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "researcher" }));
+
+    const tools = attemptStreamMock.mock.calls[0][2] as { function: { name: string } }[];
+    // web_search is in the def, but Plan Mode refuses it — so it is not even
+    // offered to the child, same double layer as the parent's toolsForMode.
+    expect(tools.map((t) => t.function.name).sort()).toEqual(["grep", "read_file"]);
+  });
+
+  it("dispatches code normally again once the mode is no longer plan", async () => {
+    usePermissionStore.setState({ mode: "acceptEdits" });
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    const result = await runSubagentTask(baseParams({ profile: "code" }));
+    expect(result).toBe("done");
+  });
+});
+
+describe("runSubagentTask / worktree isolation", () => {
+  const WT_PATH = "/data/agent-worktrees/wt-abc";
+
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    invokeMock.mockReset();
+    usePermissionStore.setState({ mode: "manual" });
+    useSettingsStore.setState({ subagentProfileModels: {} });
+    useSessionStore.setState((state) => ({
+      sessions: [...state.sessions.filter((s) => s.id !== "sess-wt"), makeStoreTestSession("sess-wt")],
+    }));
+  });
+
+  function mockWorktreeInvokes(status: { dirty: boolean; diffstat: string }) {
+    invokeMock.mockImplementation((command: unknown) => {
+      if (command === "worktree_create") return Promise.resolve({ path: WT_PATH, branch: "agent/abc" });
+      if (command === "worktree_status") return Promise.resolve(status);
+      if (command === "worktree_remove") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+  }
+
+  it("refuses isolation for a read-only profile as a preflight error, creating nothing", async () => {
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "explore", isolation: "worktree", toolCallId: "call-wt-explore" }),
+    );
+
+    expect(JSON.parse(result).error).toContain("code-class");
+    expect(invokeMock).not.toHaveBeenCalledWith("worktree_create");
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+    expect(useSubagentStore.getState().runs["call-wt-explore"]?.status).toBe("error");
+  });
+
+  it("surfaces a worktree-creation failure as a preflight error", async () => {
+    invokeMock.mockRejectedValue(new Error("not a git repository"));
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-fail" }),
+    );
+    expect(JSON.parse(result).error).toContain("not a git repository");
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+  });
+
+  it("threads the worktree into the child's prompt, every tool call, and a null checkpoint", async () => {
+    mockWorktreeInvokes({ dirty: false, diffstat: "" });
+    attemptStreamMock
+      .mockResolvedValueOnce({ content: "", toolCalls: [toolCall("write_file")], streamError: null, contentStarted: true })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("ok");
+
+    await runSubagentTask(
+      baseParams({
+        sessionId: "sess-wt",
+        profile: "code",
+        isolation: "worktree",
+        toolCallId: "call-wt-thread",
+        parentCheckpointId: "parent-checkpoint-1",
+      }),
+    );
+
+    const wire = attemptStreamMock.mock.calls[0][1] as ChatMessage[];
+    expect(wire[0].content).toContain(WT_PATH);
+    const executeArgs = executeToolCallMock.mock.calls[0];
+    // (toolCall, checkpointId, turnId, registry, signal, risk, stacks, subagent, agentLabel, skill, chatSessionId, workspaceRootOverride)
+    expect(executeArgs[1]).toBeNull();
+    expect(executeArgs[11]).toBe(WT_PATH);
+  });
+
+  it("removes an untouched worktree at finish and records nothing on the meta", async () => {
+    mockWorktreeInvokes({ dirty: false, diffstat: "" });
+    attemptStreamMock.mockResolvedValue({ content: "all done", toolCalls: [], streamError: null, contentStarted: true });
+
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-clean" }),
+    );
+
+    expect(result).toBe("all done");
+    expect(invokeMock).toHaveBeenCalledWith("worktree_remove", { path: WT_PATH, force: false });
+    const meta = useSessionStore.getState().sessions.find((s) => s.id === "sess-wt")?.subagentRunMeta?.["call-wt-clean"];
+    expect(meta?.worktree).toBeUndefined();
+  });
+
+  it("keeps a dirty worktree, records {path, diffstat} on the meta, and appends the note to the report", async () => {
+    mockWorktreeInvokes({ dirty: true, diffstat: " a.txt | 2 +-" });
+    attemptStreamMock.mockResolvedValue({ content: "changed things", toolCalls: [], streamError: null, contentStarted: true });
+
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-dirty" }),
+    );
+
+    expect(result).toContain("changed things");
+    expect(result).toContain(WT_PATH);
+    expect(result).toContain("a.txt | 2 +-");
+    expect(invokeMock).not.toHaveBeenCalledWith("worktree_remove", expect.anything());
+    const meta = useSessionStore.getState().sessions.find((s) => s.id === "sess-wt")?.subagentRunMeta?.["call-wt-dirty"];
+    expect(meta?.worktree).toEqual({ path: WT_PATH, diffstat: " a.txt | 2 +-", status: "kept" });
+  });
+
+  it("a dirty worktree also survives an errored run, without touching the error payload", async () => {
+    mockWorktreeInvokes({ dirty: true, diffstat: " a.txt | 2 +-" });
+    attemptStreamMock.mockResolvedValue({ content: "", toolCalls: [], streamError: "boom", contentStarted: false });
+
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-err" }),
+    );
+
+    expect(JSON.parse(result).error).toBe("boom");
+    expect(invokeMock).not.toHaveBeenCalledWith("worktree_remove", expect.anything());
+    const meta = useSessionStore.getState().sessions.find((s) => s.id === "sess-wt")?.subagentRunMeta?.["call-wt-err"];
+    expect(meta?.worktree?.status).toBe("kept");
+  });
+
+  it("setSubagentWorktreeStatus advances kept → applied/discarded on the persisted meta", async () => {
+    mockWorktreeInvokes({ dirty: true, diffstat: "stat" });
+    attemptStreamMock.mockResolvedValue({ content: "r", toolCalls: [], streamError: null, contentStarted: true });
+    await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-status" }),
+    );
+
+    useSessionStore.getState().setSubagentWorktreeStatus("sess-wt", "call-wt-status", "applied");
+    const meta = useSessionStore.getState().sessions.find((s) => s.id === "sess-wt")?.subagentRunMeta?.["call-wt-status"];
+    expect(meta?.worktree?.status).toBe("applied");
   });
 });

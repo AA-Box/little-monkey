@@ -257,6 +257,95 @@ impl ClientIdentity {
     }
 }
 
+/// The four named classes, best-served first.
+///
+/// Not a synonym for the `priority` integer. Priority is a number any producer
+/// can pick; a class is derived from the frozen `RunKind` in the run spec, which
+/// is decided at submission by the code path that submitted it and cannot be
+/// re-asserted later. That is what makes "interactive" mean something: a desktop
+/// turn frozen through `daemon_desktop_turn` is `RunKind::Interactive` because
+/// `task.rs` writes that when `recipe.desktop_turn` is present, and a
+/// `monkey daemon run <recipe>` batch migration is `RunKind::Workflow` because
+/// it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProcessClass {
+    /// Something is blocked on the answer: a person at a desktop turn, an ACP
+    /// peer holding a stdio connection, a browser session, a remote controller.
+    Interactive,
+    /// Submitted work that wants throughput. Nobody is waiting on any individual
+    /// turn, but the whole batch finishing sooner is worth something.
+    Batch,
+    /// Opportunistic. Runs when there is room, and is the first thing asked to
+    /// step aside.
+    Background,
+    /// Housekeeping on a schedule. May always be deferred, because the next
+    /// occurrence will come around anyway.
+    Maintenance,
+}
+
+impl ProcessClass {
+    /// Sort rank, lowest first. `Interactive` is 0.
+    pub const fn rank(self) -> u32 {
+        match self {
+            Self::Interactive => 0,
+            Self::Batch => 1,
+            Self::Background => 2,
+            Self::Maintenance => 3,
+        }
+    }
+
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Batch => "batch",
+            Self::Background => "background",
+            Self::Maintenance => "maintenance",
+        }
+    }
+
+    /// This class promoted `steps` levels toward `Interactive`, saturating there.
+    pub const fn promoted(self, steps: u32) -> Self {
+        match self.rank().saturating_sub(steps) {
+            0 => Self::Interactive,
+            1 => Self::Batch,
+            2 => Self::Background,
+            _ => Self::Maintenance,
+        }
+    }
+}
+
+/// The declared class of a run, from its frozen kind and its declared priority.
+///
+/// The kind decides the class. Priority does **not** promote — that direction is
+/// deliberately closed, because a producer that could promote itself by passing
+/// `--priority 9` would make `interactive` mean "whoever asked loudest" within a
+/// day. Priority orders work *inside* a class, which is what a number is good
+/// for.
+///
+/// A negative priority is the one thing a caller may say about its own class,
+/// and it can only demote: the enqueuer explicitly asked to be behind everything
+/// else, so it lands in `Background` (never `Maintenance` — that is reserved for
+/// work the daemon itself scheduled, which is a different claim).
+pub fn classify(kind: &RunKind, priority: i32) -> ProcessClass {
+    let declared = match kind {
+        RunKind::Interactive | RunKind::Acp | RunKind::Browser | RunKind::RemoteDesktopControl => {
+            ProcessClass::Interactive
+        }
+        RunKind::Workflow
+        | RunKind::ComparisonBranch
+        | RunKind::ComparisonSynthesis
+        | RunKind::CrewMember
+        | RunKind::CrewCoordinator
+        | RunKind::Sandboxed => ProcessClass::Batch,
+        RunKind::Background => ProcessClass::Background,
+        RunKind::Scheduled => ProcessClass::Maintenance,
+    };
+    if priority < 0 && declared.rank() < ProcessClass::Background.rank() {
+        return ProcessClass::Background;
+    }
+    declared
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunKind {
@@ -765,6 +854,159 @@ pub struct ToolPermissionRule {
     pub decision: ToolPolicyDecision,
 }
 
+/// Maximum entries in any one dimension of an [`EgressAllowlist`].
+///
+/// Small on purpose. A declaration is meant to be readable by whoever approves the
+/// run; a list of hundreds of hosts is not a policy, it is a shrug.
+pub const MAX_EGRESS_ALLOWLIST_ENTRIES: usize = 64;
+
+/// Longest host entry. The DNS limit, so a legal name always fits and a 40 KB
+/// "host" cannot be frozen into a spec.
+pub const MAX_EGRESS_HOST_BYTES: usize = 253;
+
+/// Where a run may send a request: allowed hosts, ports and protocols.
+///
+/// # Absent, empty, and present — the whole safety property is in this distinction
+///
+/// The field that holds this on [`PermissionPolicySnapshot`] is an `Option`, and the
+/// three states are deliberately three:
+///
+/// - **Absent** (`None`, which is what every already-frozen run row on disk says,
+///   because they were written before this field existed): the run declares nothing
+///   about hosts, ports or protocols, and `allow_network` alone governs — exactly
+///   today's behaviour. Retroactively reading those rows as "deny everything" would
+///   refuse every existing and in-flight run, so absence cannot mean deny.
+/// - **Present and empty** (`Some` with an empty `hosts`/`ports`/`protocols`): a
+///   declaration that permits nothing. Deny-all, apart from the loopback exemption
+///   below. This is the *point* of the shape: a submitter that wants a run with no
+///   egress has a way to say so, and it is not spelled the same way as saying
+///   nothing.
+/// - **Present and populated**: deny-by-default *within* the declaration. A host,
+///   port or protocol that is not named is refused, and the three dimensions are
+///   conjunctive — a request must satisfy all three.
+///
+/// # Making a declaration mandatory is a later release's job
+///
+/// The same staged shape D1 used for token families: the mechanism lands first and
+/// is honoured wherever it is declared, and only once submitters have been converted
+/// can absence become an error. Doing it in one step would mean either rewriting
+/// frozen specs — they are frozen for a reason, and no migration here will touch
+/// them — or refusing every run submitted by a build that predates the field.
+///
+/// # What it does not cover
+///
+/// Loopback. A local-inference run legitimately talks to `127.0.0.1`, and reading a
+/// network policy as "no sockets at all" is not a stricter policy but a broken one —
+/// the same exemption, for the same reason, as
+/// [`crate::egress::is_loopback_target`]'s.
+///
+/// Each dimension must be spelled out when the allowlist is present: the three
+/// fields carry no serde default, so `{"hosts": ["api.example.com"]}` is a
+/// deserialization error rather than a silent deny-all on ports. Absence is a
+/// statement at the allowlist level and nowhere else.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressAllowlist {
+    /// Hostnames, or `*.example.com` for "any subdomain of `example.com`".
+    ///
+    /// A wildcard matches at a label boundary only and never the apex, so
+    /// `*.example.com` covers `api.example.com` and does **not** cover
+    /// `example.com` (name it as well if it is wanted) or `evil-example.com`. The
+    /// matcher is [`crate::egress::allowlist_host_matches`].
+    pub hosts: Vec<String>,
+    /// Ports, as the request's effective port — the URL's own, or the scheme's
+    /// default when it omits one. So a run reaching `https://host/` needs `443`
+    /// listed.
+    pub ports: Vec<u16>,
+    /// URL schemes, lowercase (`https`, `http`).
+    pub protocols: Vec<String>,
+}
+
+impl EgressAllowlist {
+    pub fn validate(&self) -> ProtocolValidationResult {
+        for (field, len) in [
+            ("hosts", self.hosts.len()),
+            ("ports", self.ports.len()),
+            ("protocols", self.protocols.len()),
+        ] {
+            if len > MAX_EGRESS_ALLOWLIST_ENTRIES {
+                return Err(ProtocolValidationError::new(
+                    format!("permission_policy.egress_allowlist.{field}"),
+                    format!("contains more than {MAX_EGRESS_ALLOWLIST_ENTRIES} entries"),
+                ));
+            }
+        }
+
+        for host in &self.hosts {
+            validate_egress_host(host)?;
+        }
+        for port in &self.ports {
+            if *port == 0 {
+                return Err(ProtocolValidationError::new(
+                    "permission_policy.egress_allowlist.ports",
+                    "must not contain port 0, which is not a destination",
+                ));
+            }
+        }
+        for protocol in &self.protocols {
+            validate_egress_protocol(protocol)?;
+        }
+        Ok(())
+    }
+}
+
+/// One host entry: a name, or `*.` plus a name.
+///
+/// Lowercase is required rather than folded, so the matcher can compare a
+/// lowercased URL host against these bytes directly and no call site has to
+/// remember to fold. Rejecting mixed case at submission is the earliest and
+/// loudest place to say so.
+fn validate_egress_host(value: &str) -> ProtocolValidationResult {
+    const FIELD: &str = "permission_policy.egress_allowlist.hosts";
+    let name = value.strip_prefix("*.").unwrap_or(value);
+    if name.is_empty() || value.len() > MAX_EGRESS_HOST_BYTES {
+        return Err(ProtocolValidationError::new(
+            FIELD,
+            format!("each entry must name 1..={MAX_EGRESS_HOST_BYTES} bytes of host"),
+        ));
+    }
+    // `:`, `[` and `]` so an IPv6 literal can be named the way `Url::host_str`
+    // spells one, brackets included.
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-._:[]".contains(&byte))
+    {
+        return Err(ProtocolValidationError::new(
+            FIELD,
+            "each entry must be a lowercase host, optionally prefixed with `*.`",
+        ));
+    }
+    if name.starts_with('.') || name.ends_with('.') {
+        return Err(ProtocolValidationError::new(
+            FIELD,
+            "each entry must not start or end with a dot",
+        ));
+    }
+    Ok(())
+}
+
+/// One protocol entry: an RFC 3986 scheme, lowercase, no `://`.
+fn validate_egress_protocol(value: &str) -> ProtocolValidationResult {
+    const FIELD: &str = "permission_policy.egress_allowlist.protocols";
+    let mut bytes = value.bytes();
+    let valid = bytes.next().is_some_and(|first| first.is_ascii_lowercase())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.')
+        });
+    if !valid {
+        return Err(ProtocolValidationError::new(
+            FIELD,
+            "each entry must be a lowercase URL scheme such as `https`",
+        ));
+    }
+    Ok(())
+}
+
 /// Run-scoped permission snapshot. It records decisions and secret-free tool
 /// policy only; transient approval channel handles and credentials never
 /// enter the contract.
@@ -778,6 +1020,17 @@ pub struct PermissionPolicySnapshot {
     pub tool_rules: Vec<ToolPermissionRule>,
     pub allow_network: bool,
     pub allow_external_mutations: bool,
+    /// The run's frozen host/port/protocol allowlist — see [`EgressAllowlist`] for
+    /// what absent, empty and present each mean.
+    ///
+    /// `default` so every run row written before this field existed still
+    /// deserializes, and `skip_serializing_if` so a spec that declares nothing
+    /// serializes to the **same bytes** it did before. That second half is not
+    /// cosmetic: `run_ledger` compares the serialized spec byte-for-byte to decide
+    /// whether a resubmission is the same run, so emitting `"egress_allowlist":null`
+    /// would turn every idempotent resubmit of an existing run into a conflict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_allowlist: Option<EgressAllowlist>,
 }
 
 impl PermissionPolicySnapshot {
@@ -810,6 +1063,10 @@ impl PermissionPolicySnapshot {
                     "contains duplicate rules for one tool",
                 ));
             }
+        }
+
+        if let Some(allowlist) = &self.egress_allowlist {
+            allowlist.validate()?;
         }
         Ok(())
     }
@@ -984,7 +1241,7 @@ pub enum OutputChannel {
     Status,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionDecision {
     AllowOnce,
@@ -1297,6 +1554,28 @@ pub enum RunEvent {
         decision: PermissionDecision,
         decided_by: ClientIdentity,
     },
+    /// Which dispatch policy chose this run's target, and why (roadmap K9).
+    ///
+    /// The run's frozen `ModelTargetSnapshot` already records *what* ran. This
+    /// records *why* it was that one, on the same append-only, hash-chained
+    /// stream — so "which policy chose this run's target" survives a restart
+    /// instead of living only in the transcript and in session state.
+    ///
+    /// Every field is nullable where the honest answer is "no policy": a fresh
+    /// profile has none, and `reason` still says so rather than leaving the
+    /// event to be read as an absence.
+    RoutingDecided {
+        task_class: String,
+        policy_id: Option<String>,
+        policy_name: Option<String>,
+        /// The `ModelTargetSnapshot` key that won, or `None` when the caller
+        /// keeps its active target.
+        chosen_key: Option<String>,
+        /// False when a policy applied and the active target already satisfied
+        /// it — the steady state of a working conversation.
+        changed_from_active: bool,
+        reason: String,
+    },
     ToolStarted {
         tool_call_id: String,
     },
@@ -1377,6 +1656,35 @@ pub enum RunEvent {
         mutation_id: String,
         reason: String,
     },
+    /// This run's frozen process image left for another owned node (roadmap
+    /// K18), recorded on the origin's half of the chain.
+    ///
+    /// Deliberately **not terminal**. A departure is an attempt, not an
+    /// outcome: the target can still refuse the image, and a run whose move was
+    /// refused has to be able to carry on here. What makes the move auditable
+    /// is not this event's status but its *hash* — it is the origin's chain tip
+    /// that [`RunEvent::MigrationArrived`] names on the far side, so the two
+    /// halves are one chain even though no database spans both machines.
+    MigrationDeparted {
+        target_node_id: String,
+        /// SHA-256 of the transferred file payload, repeated by the arrival so
+        /// a reader can tell that both nodes are talking about the same bytes.
+        payload_sha256: String,
+        checkpoint_id: String,
+    },
+    /// A frozen process image from another owned node arrived here and was
+    /// admitted (roadmap K18), recorded as the first event of the target's half.
+    ///
+    /// `origin_last_event_hash` is what joins the halves. It is inside the
+    /// envelope, which `event_chain_hash` covers, so the link cannot be edited
+    /// on the target without breaking the target's own chain — no schema column
+    /// and no second store needed to span two machines.
+    MigrationArrived {
+        origin_node_id: String,
+        origin_last_sequence: u64,
+        origin_last_event_hash: String,
+        payload_sha256: String,
+    },
 }
 
 impl RunEvent {
@@ -1453,6 +1761,15 @@ impl RunEvent {
                 validate_protocol_id("event.request_id", request_id)?;
                 validate_sha256("event.operation_sha256", operation_sha256)?;
                 decided_by.validate()?;
+            }
+            Self::RoutingDecided {
+                task_class, reason, ..
+            } => {
+                // Only the two fields a reader cannot do without. The policy
+                // id and name are legitimately absent when nothing matched, and
+                // the chosen key is absent when the active target stands.
+                validate_text("event.task_class", task_class, MAX_LABEL_BYTES, false)?;
+                validate_text("event.reason", reason, MAX_EVENT_TEXT_BYTES, false)?;
             }
             Self::ToolStarted { tool_call_id } => {
                 validate_protocol_id("event.tool_call_id", tool_call_id)?;
@@ -1588,6 +1905,31 @@ impl RunEvent {
             } => {
                 validate_protocol_id("event.mutation_id", mutation_id)?;
                 validate_text("event.reason", reason, MAX_EVENT_TEXT_BYTES, false)?;
+            }
+            Self::MigrationDeparted {
+                target_node_id,
+                payload_sha256,
+                checkpoint_id,
+            } => {
+                validate_protocol_id("event.target_node_id", target_node_id)?;
+                validate_sha256("event.payload_sha256", payload_sha256)?;
+                validate_protocol_id("event.checkpoint_id", checkpoint_id)?;
+            }
+            Self::MigrationArrived {
+                origin_node_id,
+                origin_last_sequence,
+                origin_last_event_hash,
+                payload_sha256,
+            } => {
+                validate_protocol_id("event.origin_node_id", origin_node_id)?;
+                if *origin_last_sequence == 0 {
+                    return Err(ProtocolValidationError::new(
+                        "event.origin_last_sequence",
+                        "must name a real event on the origin's chain",
+                    ));
+                }
+                validate_sha256("event.origin_last_event_hash", origin_last_event_hash)?;
+                validate_sha256("event.payload_sha256", payload_sha256)?;
             }
         }
         Ok(())
@@ -1770,6 +2112,7 @@ mod tests {
                 }],
                 allow_network: false,
                 allow_external_mutations: false,
+                egress_allowlist: None,
             },
             budgets: RunBudgets {
                 wall_time_ms: 60_000,
@@ -2010,6 +2353,48 @@ mod tests {
             reason: Some("waiting for user".to_string()),
         }
         .is_terminal());
+    }
+
+    /// Roadmap K9: the run already records *what* target ran (its frozen
+    /// `ModelTargetSnapshot`); this is the *why*.
+    ///
+    /// Every field but the two a reader cannot do without is nullable, because
+    /// "no policy matched" is the answer for a fresh profile and is worth being
+    /// able to produce. What must never be empty is the class that was asked
+    /// under and the sentence explaining the outcome — an event carrying
+    /// neither would record that a decision happened and nothing about it.
+    #[test]
+    fn a_routing_decision_may_name_no_policy_but_never_no_reason() {
+        let unrouted = RunEvent::RoutingDecided {
+            task_class: "subagent_explore".to_string(),
+            policy_id: None,
+            policy_name: None,
+            chosen_key: None,
+            changed_from_active: false,
+            reason: "No enabled policy covers this task class.".to_string(),
+        };
+        assert!(unrouted.validate().is_ok());
+        assert!(!unrouted.is_terminal(), "a dispatch decision ends nothing");
+
+        let blank_reason = RunEvent::RoutingDecided {
+            task_class: "chat".to_string(),
+            policy_id: Some("p-1".to_string()),
+            policy_name: Some("Cheap explorers".to_string()),
+            chosen_key: Some("provider:openrouter/cheap".to_string()),
+            changed_from_active: true,
+            reason: "   ".to_string(),
+        };
+        assert!(blank_reason.validate().is_err());
+
+        let blank_class = RunEvent::RoutingDecided {
+            task_class: String::new(),
+            policy_id: None,
+            policy_name: None,
+            chosen_key: None,
+            changed_from_active: false,
+            reason: "No policy.".to_string(),
+        };
+        assert!(blank_class.validate().is_err());
     }
 
     #[test]
@@ -2268,5 +2653,183 @@ mod tests {
             text: "x".repeat(MAX_EVENT_TEXT_BYTES + 1),
         };
         assert_eq!(event.validate().unwrap_err().field, "event.text");
+    }
+
+    mod egress_allowlist {
+        use super::*;
+
+        /// Exactly what a run row frozen before the field existed contains.
+        ///
+        /// Written out as a **string literal** and not built with `json!`, because the
+        /// claim is about bytes that already exist on disk: a `json!` fixture is built
+        /// from this build's own idea of the shape, so it would keep passing after a
+        /// change that broke every stored row. `deny_unknown_fields` is on this struct,
+        /// so this is also the test that would catch the field being added without a
+        /// `default`.
+        const FROZEN_WITHOUT_THE_FIELD: &str = r#"{
+            "mode": "manual",
+            "unattended": false,
+            "approval_timeout_ms": 60000,
+            "default_tool_decision": "prompt",
+            "tool_rules": [{"tool": "read_file", "decision": "allow"}],
+            "allow_network": false,
+            "allow_external_mutations": false
+        }"#;
+
+        #[test]
+        fn a_policy_frozen_before_the_field_existed_still_deserializes() {
+            let policy: PermissionPolicySnapshot = serde_json::from_str(FROZEN_WITHOUT_THE_FIELD)
+                .expect("every run row already on disk lacks this field and must keep loading");
+            assert_eq!(
+                policy.egress_allowlist, None,
+                "absent must mean absent, not an empty (deny-all) declaration"
+            );
+            policy.validate().expect("an absent allowlist is valid");
+        }
+
+        /// The other half of the compatibility property: a policy that declares
+        /// nothing must serialize to the same bytes it always did. `run_ledger`
+        /// compares the serialized spec byte-for-byte to decide whether a
+        /// resubmission is the same run, so an emitted `"egress_allowlist":null`
+        /// would turn every idempotent resubmit into a conflict.
+        #[test]
+        fn declaring_nothing_adds_no_bytes_to_a_frozen_spec() {
+            let policy: PermissionPolicySnapshot =
+                serde_json::from_str(FROZEN_WITHOUT_THE_FIELD).expect("loads");
+            let reserialized = serde_json::to_string(&policy).expect("serializes");
+            assert!(
+                !reserialized.contains("egress_allowlist"),
+                "an absent allowlist must not appear in the output at all: {reserialized}"
+            );
+        }
+
+        #[test]
+        fn a_declared_allowlist_round_trips() {
+            let mut policy: PermissionPolicySnapshot =
+                serde_json::from_str(FROZEN_WITHOUT_THE_FIELD).expect("loads");
+            policy.egress_allowlist = Some(EgressAllowlist {
+                hosts: vec![
+                    "api.example.com".to_string(),
+                    "*.cdn.example.com".to_string(),
+                ],
+                ports: vec![443],
+                protocols: vec!["https".to_string()],
+            });
+            policy.validate().expect("valid declaration");
+
+            let encoded = serde_json::to_string(&policy).expect("serializes");
+            let decoded: PermissionPolicySnapshot =
+                serde_json::from_str(&encoded).expect("deserializes");
+            assert_eq!(decoded, policy);
+        }
+
+        /// An empty declaration is legal and means deny-all. Pinned because the
+        /// temptation is to validate it as a mistake, which would remove the only way
+        /// a submitter can say "this run sends nothing".
+        #[test]
+        fn an_empty_declaration_is_valid_and_is_not_the_same_as_no_declaration() {
+            let empty = EgressAllowlist::default();
+            empty
+                .validate()
+                .expect("an empty allowlist is a legal policy");
+            assert_ne!(Some(empty), None::<EgressAllowlist>);
+        }
+
+        /// A dimension omitted from a present declaration is an error, not a silent
+        /// deny-all: absence is a statement at the allowlist level and nowhere else.
+        #[test]
+        fn a_declaration_must_name_all_three_dimensions() {
+            let partial = r#"{"hosts": ["api.example.com"]}"#;
+            assert!(serde_json::from_str::<EgressAllowlist>(partial).is_err());
+        }
+
+        #[test]
+        fn each_entry_shape_is_validated_at_submission() {
+            let cases: &[(EgressAllowlist, &str)] = &[
+                (
+                    EgressAllowlist {
+                        hosts: vec!["API.example.com".to_string()],
+                        ports: vec![443],
+                        protocols: vec!["https".to_string()],
+                    },
+                    "permission_policy.egress_allowlist.hosts",
+                ),
+                (
+                    EgressAllowlist {
+                        hosts: vec!["https://api.example.com/v1".to_string()],
+                        ports: vec![443],
+                        protocols: vec!["https".to_string()],
+                    },
+                    "permission_policy.egress_allowlist.hosts",
+                ),
+                (
+                    EgressAllowlist {
+                        hosts: vec!["*.".to_string()],
+                        ports: vec![443],
+                        protocols: vec!["https".to_string()],
+                    },
+                    "permission_policy.egress_allowlist.hosts",
+                ),
+                (
+                    EgressAllowlist {
+                        hosts: vec!["api.example.com".to_string()],
+                        ports: vec![0],
+                        protocols: vec!["https".to_string()],
+                    },
+                    "permission_policy.egress_allowlist.ports",
+                ),
+                (
+                    EgressAllowlist {
+                        hosts: vec!["api.example.com".to_string()],
+                        ports: vec![443],
+                        protocols: vec!["HTTPS".to_string()],
+                    },
+                    "permission_policy.egress_allowlist.protocols",
+                ),
+                (
+                    EgressAllowlist {
+                        hosts: vec!["api.example.com".to_string()],
+                        ports: vec![443],
+                        protocols: vec!["https://".to_string()],
+                    },
+                    "permission_policy.egress_allowlist.protocols",
+                ),
+                (
+                    EgressAllowlist {
+                        hosts: (0..=MAX_EGRESS_ALLOWLIST_ENTRIES)
+                            .map(|index| format!("host{index}.example.com"))
+                            .collect(),
+                        ports: vec![443],
+                        protocols: vec!["https".to_string()],
+                    },
+                    "permission_policy.egress_allowlist.hosts",
+                ),
+            ];
+
+            for (allowlist, field) in cases {
+                assert_eq!(
+                    allowlist.validate().expect_err("must be refused").field,
+                    *field,
+                    "for {allowlist:?}"
+                );
+            }
+        }
+
+        /// The allowlist is validated *through* the policy, so a bad declaration
+        /// cannot be frozen by a submitter that only calls the outer `validate`.
+        #[test]
+        fn a_bad_declaration_fails_the_policy_it_is_declared_on() {
+            let mut policy: PermissionPolicySnapshot =
+                serde_json::from_str(FROZEN_WITHOUT_THE_FIELD).expect("loads");
+            policy.egress_allowlist = Some(EgressAllowlist {
+                hosts: vec!["Api.Example.Com".to_string()],
+                ports: vec![443],
+                protocols: vec!["https".to_string()],
+            });
+            assert_eq!(
+                policy.validate().expect_err("must be refused").field,
+                "permission_policy.egress_allowlist.hosts"
+            );
+        }
     }
 }

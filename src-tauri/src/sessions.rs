@@ -15,7 +15,8 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use tauri::{Emitter, Manager};
+use crate::profiles::ProfileScopedPaths;
+use tauri::Emitter;
 
 const SESSIONS_FILE: &str = "chat_sessions.json";
 
@@ -29,8 +30,7 @@ pub const SESSIONS_CHANGED_EVENT: &str = "sessions://changed";
 
 pub(crate) fn sessions_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {}", e))?;
     Ok(dir.join(SESSIONS_FILE))

@@ -8,6 +8,7 @@
  * can read these bytes directly without going through a sandboxed
  * workspace-relative Rust command like `tool_read_file`.
  */
+import { open } from '@tauri-apps/plugin-dialog';
 import { readFile } from '@tauri-apps/plugin-fs';
 
 /** Extension -> MIME type for the raster formats this app treats as "an image" for vision purposes. */
@@ -28,6 +29,21 @@ function extensionOf(path: string): string {
 /** Whether `path` has a raster image extension this app knows how to attach as a vision content part. */
 export function isImagePath(path: string): boolean {
   return extensionOf(path) in IMAGE_MIME_BY_EXTENSION;
+}
+
+/** Opens the native picker and returns the chosen image as bare base64 (no
+ * `data:` prefix), or null when the dialog is dismissed.
+ *
+ * The native dialog rather than a hidden `<input type="file">`: the input keeps
+ * the previous selection in `value`, so re-picking the same file after clearing
+ * it fires no change event and the image silently refuses to load. */
+export async function pickImageBase64(): Promise<string | null> {
+  const path = await open({
+    multiple: false,
+    filters: [{ name: 'Image', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+  });
+  if (typeof path !== 'string') return null;
+  return (await readImageAsDataUrl(path)).split(',')[1] ?? null;
 }
 
 /** Reads `path`'s bytes and returns a `data:<mime>;base64,...` URL, suitable

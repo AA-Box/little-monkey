@@ -38,6 +38,7 @@ export function ModelManager() {
   const active = useModelStore((s) => s.active);
   const downloadProgress = useModelStore((s) => s.downloadProgress);
   const llamaStatus = useModelStore((s) => s.llamaStatus);
+  const llamaError = useModelStore((s) => s.llamaError);
   const embeddingsEnabled = useModelStore((s) => s.embeddingsEnabled);
   const setEmbeddingsEnabled = useModelStore((s) => s.setEmbeddingsEnabled);
   const refresh = useModelStore((s) => s.refresh);
@@ -111,6 +112,7 @@ export function ModelManager() {
             model={model}
             isActive={active?.id === model.id}
             llamaStatus={llamaStatus}
+            startError={llamaError}
             downloadProgress={downloadProgress[model.file]}
             onInstall={() => void download(model)}
             onCancelDownload={() => void cancelDownload(model)}
@@ -132,6 +134,7 @@ export function ModelManager() {
               model={model}
               isActive={active?.id === model.id}
               llamaStatus={llamaStatus}
+            startError={llamaError}
               downloadProgress={downloadProgress[model.file]}
               onInstall={() => void download(model)}
               onCancelDownload={() => void cancelDownload(model)}

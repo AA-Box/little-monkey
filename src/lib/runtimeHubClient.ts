@@ -1,7 +1,24 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type M3RuntimeKind = "ollama" | "llama_cpp" | "mlx";
-export type AcceleratorKind = "cpu" | "metal" | "cuda" | "rocm" | "vulkan" | "direct_ml";
+export type AcceleratorKind =
+  | "cpu"
+  | "metal"
+  | "cuda"
+  | "rocm"
+  | "vulkan"
+  | "direct_ml"
+  | "apple_neural_engine";
+
+/** Mirrors `ExecutionSupport` — whether anything in this app actually runs work
+ * on a backend, or it is reported for diagnosis only (roadmap K16).
+ *
+ * Distinct from the row's `status` and `confirmed`: `status` is about the
+ * machine, `confirmed` is about the detection, and this is about the build. A
+ * backend can be present, confirmed, and still have nothing here to run on it. */
+export type ExecutionSupport =
+  | { state: "executes"; via: string }
+  | { state: "detectionOnly"; reason: string };
 export type HardwareTier = "constrained" | "balanced" | "performance";
 export type ApiBackend = "managed_local" | "ollama" | "mlx" | "cloud_provider";
 export type ApiScope =
@@ -66,6 +83,7 @@ export interface M3AcceleratorCompatibility {
   driverVersion: string | null;
   computeCapability: string | null;
   confirmed: boolean;
+  execution: ExecutionSupport;
 }
 
 export interface M3JetsonInfo {
@@ -278,7 +296,11 @@ export type M3ComponentKind =
   | "metal_support"
   | "cuda_support"
   | "rocm_support"
-  | "vulkan_support";
+  | "vulkan_support"
+  /** A Studio sidecar tool — a face swapper, a detector, a segmenter. Not an
+   *  inference runtime, but installed through this same verified path so a
+   *  tool is never less checked than a runtime is. */
+  | "studio_tool";
 
 export type M3ComponentChannel = "stable" | "beta" | "pinned";
 
@@ -495,6 +517,115 @@ export type TraceEvent =
   | { kind: "load"; timing: LoadTiming; offload: OffloadPlacementSummary | null; memory: MemoryFootprint | null }
   | { kind: "request"; timing: RequestTiming; sampler: SamplerStats; tokens: TokenTiming };
 
+/**
+ * Mirrors the Rust `benchmark::TraceFieldNote` usage: a field this run could not
+ * populate, and why. The panel renders the reason instead of the number, so a
+ * gap can never be mistaken for a zero.
+ */
+export interface BenchmarkFieldNote {
+  field: string;
+  reason: string;
+}
+
+/** Mirrors `benchmark::Spread`. `stddev` is null for a single repeat — one
+ * observation has no spread, and `0` would read as "perfectly repeatable". */
+export interface BenchmarkSpread {
+  n: number;
+  min: number;
+  median: number;
+  max: number;
+  stddev: number | null;
+}
+
+/** Mirrors `benchmark::SampleTimings`. */
+export interface BenchmarkSampleTimings {
+  totalMs: number;
+  timeToFirstTokenMs: number | null;
+  decodeMs: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  error: string | null;
+  unavailable: BenchmarkFieldNote[];
+}
+
+/** Mirrors `benchmark::SampleReport`. */
+export interface BenchmarkSample {
+  repeat: number;
+  warmup: boolean;
+  timings: BenchmarkSampleTimings;
+  decodeTokensPerSecond: number | null;
+}
+
+/**
+ * Mirrors `benchmark::PeakMemory`. The two fields are deliberately distinct:
+ * `processLifetimePeakBytes` is the runtime process's high-water mark, which
+ * bounds this run's peak, and `runPeakBytes` is set only when this run is what
+ * raised it. Rendering the bound as the run's peak would attribute an earlier
+ * request's memory to this benchmark.
+ */
+export interface BenchmarkPeakMemory {
+  processLifetimePeakBytes: number | null;
+  beforeBytes: number | null;
+  runPeakBytes: number | null;
+  unavailable: BenchmarkFieldNote[];
+}
+
+/** Mirrors `benchmark::BenchmarkReport`. */
+export interface BenchmarkReport {
+  schemaVersion: number;
+  runtimeId: string;
+  model: string;
+  quantization: string | null;
+  maxOutputTokens: number;
+  repeatsRequested: number;
+  warmupDiscarded: number;
+  samples: BenchmarkSample[];
+  timeToFirstTokenMs: BenchmarkSpread | null;
+  decodeTokensPerSecond: BenchmarkSpread | null;
+  peakMemory: BenchmarkPeakMemory;
+  unavailable: BenchmarkFieldNote[];
+}
+
+/** Mirrors the Rust `M3BenchmarkResponse`. */
+export interface BenchmarkRunResponse {
+  report: BenchmarkReport;
+  hardware: HardwareSnapshot;
+}
+
+/** Mirrors `benchmark::MachineIdentity` — the stable parts a stored report is valid for. */
+export interface BenchmarkMachineIdentity {
+  os: string;
+  arch: string;
+  totalRamBytes: number;
+  logicalCpuCount: number;
+  accelerators: string[];
+}
+
+/**
+ * Mirrors `benchmark::BenchmarkFreshness`. A discriminated union rather than a
+ * boolean plus a list, so no caller can read the differences off a stale report
+ * and still render its numbers as this machine's.
+ */
+export type BenchmarkFreshness =
+  | { state: "thisMachine" }
+  | { state: "differentMachine"; changed: string[] };
+
+/** Mirrors the Rust `BenchmarkHistoryEntry` (the stored report is flattened in). */
+export interface BenchmarkHistoryEntry {
+  report: BenchmarkReport;
+  machine: BenchmarkMachineIdentity;
+  measuredAtMs: number;
+  freshness: BenchmarkFreshness;
+}
+
+export interface BenchmarkRunRequest {
+  runtimeId: string;
+  model: string;
+  prompt: string | null;
+  maxOutputTokens: number;
+  repeats: number;
+}
+
 export interface RuntimeTraceRecord {
   schemaVersion: number;
   traceId: string;
@@ -640,6 +771,41 @@ export interface M3CompatibilityMatrixReport {
   rows: M3CompatibilityMatrixRow[];
 }
 
+/** Roadmap K21. Mirrors `src-tauri/src/conformance.rs`. */
+export type ConformanceSectionId = "contract" | "isolation" | "limits" | "ledger";
+export type ConformanceRequirement = "required" | "optional";
+export type ConformanceCheckStatus = "passed" | "failed" | "skipped";
+export type ConformanceSectionStatus = "passed" | "failed" | "incomplete" | "skipped";
+
+export interface ConformanceCheckResult {
+  id: string;
+  title: string;
+  status: ConformanceCheckStatus;
+  detail: string;
+}
+
+export interface ConformanceSectionReport {
+  id: ConformanceSectionId;
+  requirement: ConformanceRequirement;
+  covers: string;
+  status: ConformanceSectionStatus;
+  skipReason?: string | null;
+  checks: ConformanceCheckResult[];
+}
+
+export type ConformanceVerdict =
+  | { state: "compatible"; suiteRevision: string }
+  | { state: "notCompatible"; reasons: string[] };
+
+export interface ConformanceReport {
+  suiteRevision: string;
+  nodeSuiteRevision: string | null;
+  target: string;
+  sections: ConformanceSectionReport[];
+  skippedOptionalSections: string[];
+  verdict: ConformanceVerdict;
+}
+
 export interface RuntimeDescriptor {
   schema_version: number;
   runtime_id: string;
@@ -680,6 +846,12 @@ export type MlxRuntimeStatus =
       handle: Record<string, unknown>;
       metrics: MlxProcessMetrics;
     };
+
+/** Identity of a newly installed MLX package. Paths stay app-private. */
+export interface MlxInstalledPackage {
+  packageVersion: string;
+  manifestSha256: string;
+}
 
 export interface MlxProcessMetrics {
   processAlive: boolean;
@@ -734,6 +906,30 @@ export interface ConfiguredContext {
 
 export type ContextRuntimeKind = "ollama" | "llama_cpp" | "mlx";
 
+/**
+ * Whether two of this app's processes on one resident model can reuse each
+ * other's cached prompt prefix.
+ *
+ * A tagged union, not a boolean: "supported" is unrenderable without the
+ * mechanism that makes it true, and "unsupported" without the reason it is not.
+ */
+export type PrefixSharing =
+  | { state: "supported"; mechanism: string }
+  | { state: "unsupported"; reason: string };
+
+/**
+ * Whether a per-process context budget can be *enforced* against this runtime,
+ * which is a different question from whether one is set.
+ *
+ * Enforcement needs an exact prompt-token count before the request, so only a
+ * runtime that will tokenize on demand can have one. Tagged for
+ * {@link PrefixSharing}'s reason: a budget that cannot be enforced must never be
+ * shown as if it were.
+ */
+export type ContextBudgetEnforcement =
+  | { state: "enforceable" }
+  | { state: "unenforceable"; reason: string };
+
 export interface ContextCacheView {
   runtimeId: string;
   runtimeKind: ContextRuntimeKind;
@@ -743,6 +939,8 @@ export interface ContextCacheView {
   contextHeadroomTokens: number | null;
   contextShiftDetected: boolean | null;
   totalSlots: number | null;
+  prefixSharing: PrefixSharing;
+  contextBudget: ContextBudgetEnforcement;
   notes: string[];
   sampledAtMs: number;
 }
@@ -804,17 +1002,11 @@ export interface M3UnloadModelRequest {
   forceExactOwner: boolean;
 }
 
-export type M3ApiCaller =
-  | { type: "internal" }
-  | { type: "external"; bearer_token: string; remote_address: string };
-
-export interface M3ApiDispatchRequest {
+export interface M3DiagnosticDispatchRequest {
   protocol: CompatibilityProtocol;
   runtimeId: string;
   requestId: string;
   body: number[];
-  caller: M3ApiCaller;
-  nowMs: number;
 }
 
 export interface M3ApiDispatchResponse {
@@ -822,13 +1014,11 @@ export interface M3ApiDispatchResponse {
   body: unknown;
 }
 
-export interface M3CancelInferenceRequest {
+export interface M3DiagnosticCancelRequest {
   protocol: CompatibilityProtocol;
   runtimeId: string;
   requestId: string;
   modelId: string;
-  caller: M3ApiCaller;
-  nowMs: number;
 }
 
 export type TlsPolicy =
@@ -1100,6 +1290,13 @@ export const runtimeHubClient = {
   hardwareProfile: () => invoke<HardwareProfile>("m3_hardware_profile"),
   hardwareCompatibilityReport: () =>
     invoke<M3HardwareCompatibilityReport>("m3_hardware_compatibility_report"),
+  benchmarkRun: (operationId: string, request: BenchmarkRunRequest, timeoutMs?: number) =>
+    invoke<BenchmarkRunResponse>("m3_benchmark_run", {
+      operationId,
+      timeoutMs: timeoutMs ?? null,
+      request,
+    }),
+  benchmarkHistory: () => invoke<BenchmarkHistoryEntry[]>("m3_benchmark_history"),
   storageStatus: () => invoke<M3StorageStatus>("m3_storage_status"),
   installedModels: () => invoke<M3InstalledModel[]>("m3_installed_models"),
   catalogSources: () => invoke<M3CatalogSourceConfig[]>("m3_catalog_sources"),
@@ -1158,11 +1355,13 @@ export const runtimeHubClient = {
     invoke<Record<string, SettingValue>>("m3_runtime_set_config", { request }),
   runtimeConfig: (runtimeId: string) =>
     invoke<Record<string, SettingValue> | null>("m3_runtime_config", { runtimeId }),
-  apiDispatch: (args: OperationArgs & { request: M3ApiDispatchRequest }) =>
+  apiDispatch: (args: OperationArgs & { request: M3DiagnosticDispatchRequest }) =>
     invoke<M3ApiDispatchResponse>("m3_api_dispatch", args),
-  apiCancelInference: (args: OperationArgs & { request: M3CancelInferenceRequest }) =>
+  apiCancelInference: (args: OperationArgs & { request: M3DiagnosticCancelRequest }) =>
     invoke<boolean>("m3_api_cancel_inference", args),
   compatibilityMatrix: () => invoke<M3CompatibilityMatrixReport>("m3_compatibility_matrix"),
+  runConformanceSuite: (baseUrl: string, token: string | null, sections: ConformanceSectionId[]) =>
+    invoke<ConformanceReport>("run_conformance_suite", { baseUrl, token, sections }),
   lanValidatePolicy: (policy: LanServerPolicy) => invoke<void>("m3_lan_validate_policy", { policy }),
   lanConfigure: (policy: LanServerPolicy) => invoke<LanServerPolicy>("m3_lan_configure", { policy }),
   lanDisable: (confirmation: string) => invoke<boolean>("m3_lan_disable", { confirmation }),
@@ -1204,6 +1403,15 @@ export const runtimeHubClient = {
   componentActivateVersion: (
     args: OperationArgs & { request: { componentId: string; versionKey: string } },
   ) => invoke<M3InstalledComponent>("m3_component_activate_version", args),
+  /** Installs and activates a signed MLX service package built by
+   *  `pnpm mlx:package`. The pinned release key over the manifest is what
+   *  makes the directory trustworthy, so any path the user picks is fine. */
+  mlxInstall: (packageDirectory: string) =>
+    invoke<MlxInstalledPackage>("m3_mlx_install", { packageDirectory }),
+  /** Unpacks and activates an `mlx_runtime` component the hub has downloaded.
+   *  The hub proved the digest; this proves the publisher signed it. */
+  mlxInstallComponent: (componentId: string) =>
+    invoke<MlxInstalledPackage>("m3_mlx_install_component", { componentId }),
   runtimePrWatcherState: () => invoke<RuntimePrWatcherState>("runtime_pr_watcher_state"),
   runtimePrWatcherCheckNow: () =>
     invoke<RuntimePrWatcherCheckResult>("runtime_pr_watcher_check_now"),

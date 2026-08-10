@@ -13,6 +13,8 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import { useSettingsStore } from "../store/settingsStore";
+
 /** Mirrors `process_commands.rs`'s `PROCESSES_CHANGED_EVENT`. */
 export const PROCESSES_CHANGED_EVENT = "processes://changed";
 
@@ -92,6 +94,35 @@ export interface ProcessRecord {
   exitedAtMs: number | null;
 }
 
+/**
+ * The kinds a wall budget applies to, as an allow-list rather than an exclusion
+ * list.
+ *
+ * By construction, and that construction is load-bearing for one kind in
+ * particular: `workflow_node` must never appear here. `deliverProcessSignal`
+ * answers `"no-primitive"` for a node and `signal_support` refuses suspend/resume
+ * on the documented grounds that a node has no independent pause mechanism — so a
+ * stop latched on a node row would be committed durably and never delivered,
+ * leaving it reading `stopping` forever with nothing able to clear it. An
+ * exclusion list would put that failure one forgotten line away; an allow-list
+ * needs a positive decision per kind.
+ *
+ * The other absences are all "somebody else already bounds this": `daemon_job`
+ * (its own watchdog), `workflow_run` (the executor's 24h budget), `remote_run`
+ * (records a request, not work), `background_shell` (spawned with no timeout on
+ * purpose, so that it can outlive the turn that started it), `browser_session`
+ * (its own reclaiming watchdog, on the `max_session_ms` its row declares).
+ *
+ * Lives here rather than in `processWallBudget.ts`, which re-exports it: this
+ * module now consults it at admission, and the reverse import would be a cycle.
+ */
+export const WALL_BUDGET_KINDS: readonly ProcessKind[] = [
+  "chat_turn",
+  "subagent",
+  "crew_member",
+  "side_task",
+];
+
 export interface AdmitProcessArgs {
   kind: ProcessKind;
   /** The surface's own id — a turn id, a subagent cancel id, a workflow run id. */
@@ -107,6 +138,17 @@ export interface AdmitProcessArgs {
   maxMemoryBytes?: number | null;
   maxOutputBytes?: number | null;
   maxChildProcesses?: number | null;
+  /**
+   * Admit this process with no wall budget at all, rather than with the class
+   * default its kind declares.
+   *
+   * A flag and not a `maxWallMs: 0`: the ledger's `CHECK` forbids a
+   * non-positive `max_wall_ms`, so zero cannot be stored, and reading one as
+   * "unbounded" would be the zero-versus-absent overloading this codebase
+   * avoids. Set by {@link admitProcess} from the user's setting; callers do not
+   * pass it.
+   */
+  unboundedWall?: boolean;
 }
 
 function warn(operation: string, error: unknown): void {
@@ -125,11 +167,58 @@ function warn(operation: string, error: unknown): void {
 export async function admitProcess(args: AdmitProcessArgs): Promise<string | null> {
   if (!isTauri()) return null;
   try {
-    const record = await invoke<ProcessRecord>("process_admit", { args });
+    const record = await invoke<ProcessRecord>("process_admit", {
+      args: withWallBudgetSetting(args),
+    });
     return record.processId;
   } catch (error) {
     warn(`admit ${args.kind} ${args.externalId}`, error);
     return null;
+  }
+}
+
+/**
+ * Applies the user's wall-budget setting to an admission, if the kind has one.
+ *
+ * Here rather than at the four call sites, and that placement is the point: a
+ * fifth WebView surface would otherwise be admitted unbudgeted and nothing would
+ * say so. `admitProcess` is the one function all four already go through.
+ *
+ * A caller that states its own `maxWallMs` keeps it — the setting is a default,
+ * not an override of an explicit decision — and a kind with no class budget
+ * (`workflow_run`, `daemon_job`, …) is untouched, since its bound comes from
+ * somewhere truer than a global slider.
+ */
+function withWallBudgetSetting(args: AdmitProcessArgs): AdmitProcessArgs {
+  if (!WALL_BUDGET_KINDS.includes(args.kind)) return args;
+  if (args.maxWallMs !== undefined && args.maxWallMs !== null) return args;
+  const { processWallBudgetEnabled, processWallBudgetHours } =
+    useSettingsStore.getState();
+  if (!processWallBudgetEnabled) return { ...args, unboundedWall: true };
+  return { ...args, maxWallMs: processWallBudgetHours * 60 * 60 * 1000 };
+}
+
+/**
+ * Point an already-admitted process at its ledger run.
+ *
+ * Separate from {@link AdmitProcessArgs.runId} because `agent_processes.run_id`
+ * is a foreign key into `runs`: a surface whose process row is minted *before*
+ * its run row exists cannot carry the link at admission time. The link is what
+ * lets the per-process resource ledger attribute a run's measured usage — CPU
+ * time, peak RSS, disk I/O, egress bytes — to this row instead of an
+ * unattributed bucket.
+ *
+ * Call it at most **once** per process. The ledger charges a run only when
+ * exactly one row claims it, and re-pointing a row at a second run does not
+ * merely move the charge: it leaves the first run claimed by nobody, which the
+ * ledger treats exactly like several rows claiming it — unattributed.
+ */
+export async function linkProcessRun(processId: string, runId: string): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    await invoke("process_link_run", { processId, runId });
+  } catch (error) {
+    warn(`link ${processId} to run ${runId}`, error);
   }
 }
 
