@@ -211,8 +211,20 @@ jobs:
             echo "GPG_PRIVATE_KEY unset — skipping installer signatures"
             exit 0
           fi
-          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          KEY_ID="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/ {print $5; exit}')"
+          # `gpg --import` exits 2 when it logs any error at all, including a
+          # malformed armor header line, even when the key itself imported —
+          # which is what this secret does: "invalid armor header", then
+          # "secret keys imported: 1" in the same output. Under `set -e` that
+          # killed the step after a successful import (release run for 1.3.0,
+          # Linux arm64). The import's exit code cannot answer the question
+          # this step needs answered, so ask the keyring instead: an empty
+          # KEY_ID is the real failure and stays fatal.
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import || true
+          KEY_ID="$({ gpg --list-secret-keys --with-colons || true; } | awk -F: '/^sec:/ {print $5; exit}')"
+          if [ -z "$KEY_ID" ]; then
+            echo "GPG_PRIVATE_KEY is set but no secret key was imported — refusing to ship unsigned installers"
+            exit 1
+          fi
           BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle"
           VERSION="$(jq -r .version src-tauri/tauri.conf.json)"
 
