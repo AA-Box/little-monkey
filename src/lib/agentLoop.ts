@@ -54,6 +54,9 @@ import {
 } from './mentions';
 import { currentSystemPrompt, ULTRACODE_SYSTEM_SECTION, type AttachedStackPromptInfo } from './systemPrompt';
 import { composeSkillCatalog, composeSkillSystemPrompt, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
+import { composeSavedWorkflowCatalog } from './workflow';
+import { selectSavedWorkflowList, useSavedWorkflowStore } from '../store/savedWorkflowStore';
+import { collectUserPromptSubmitContext } from './userHooks';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { isBtwNotice } from './slashCommands';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
@@ -2727,6 +2730,12 @@ async function runAgentTurnBody(
     await honourPause(turnId, processId, signal);
   }
 
+  // UserPromptSubmit hooks fire once per turn, before the first round trip;
+  // their stdout joins the system prompt's sections below for EVERY iteration
+  // of this turn (a hook that fails or times out contributes nothing — see
+  // `userHooks.ts`'s failure posture).
+  const userPromptHookContext = await collectUserPromptSubmitContext(sessionId);
+
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
     if (signal) await parkHere();
     // Stop button fired while a tool call was executing (between model
@@ -2783,6 +2792,12 @@ async function runAgentTurnBody(
         ),
         ...(ultracode ? [ULTRACODE_SYSTEM_SECTION] : []),
         ...(settings.skillAutoInvokeEnabled ? [composeSkillCatalog(availableSkills, invokedSkillCommands)] : []),
+        // Saved workflows are only actionable when WORKFLOW_TOOL is offered,
+        // so the catalog rides the same `subagentsEnabled` gate.
+        ...(settings.subagentsEnabled
+          ? [composeSavedWorkflowCatalog(selectSavedWorkflowList(useSavedWorkflowStore.getState()))]
+          : []),
+        ...(userPromptHookContext ? [userPromptHookContext] : []),
       ]
         .filter(Boolean)
         .join('\n\n'),

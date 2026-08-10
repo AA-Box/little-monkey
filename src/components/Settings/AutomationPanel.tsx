@@ -28,6 +28,7 @@ import {
 } from "../../lib/modelRouting";
 import { buildModelTargetInventory } from "../../lib/modelTargets";
 import { useRoutingPolicyStore } from "../../store/routingPolicyStore";
+import { USER_HOOK_EVENTS, useUserHooksStore, type UserHookEvent } from "../../store/userHooksStore";
 
 /** No shared toggle-switch component exists in `ui/` yet — this one is small and specific enough to keep local rather than promote prematurely. */
 function Toggle({
@@ -1281,9 +1282,109 @@ export function AutomationPanel() {
       </section>
 
       <DispatchPolicySection />
+      <UserHooksSection />
       <WebSettingsSection />
       <CliInstallSection />
     </div>
+  );
+}
+
+/** Minimal editor for user lifecycle hooks (see `lib/userHooks.ts`): list +
+ * add/remove. Command string, event, optional tool matcher — no inline
+ * editing in this slice; delete and re-add. */
+function UserHooksSection() {
+  const { t } = useT();
+  const hooks = useUserHooksStore((state) => state.hooks);
+  const loaded = useUserHooksStore((state) => state.loaded);
+  const [event, setEvent] = useState<UserHookEvent>("PreToolUse");
+  const [command, setCommand] = useState("");
+  const [matcher, setMatcher] = useState("");
+
+  useEffect(() => {
+    if (!loaded) void useUserHooksStore.getState().initialize();
+  }, [loaded]);
+
+  const matcherApplies = event === "PreToolUse" || event === "PostToolUse";
+  const add = () => {
+    const trimmed = command.trim();
+    if (!trimmed) return;
+    useUserHooksStore.getState().add({
+      event,
+      command: trimmed,
+      matcher: matcherApplies && matcher.trim().length > 0 ? matcher.trim() : undefined,
+    });
+    setCommand("");
+    setMatcher("");
+  };
+
+  return (
+    <section>
+      <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.hooksHeading")}</h3>
+      <div className="rounded-lg border border-border bg-background px-3 py-3">
+        <p className="text-xs text-muted">{t("AutomationPanel.hooksDescription")}</p>
+
+        {hooks.length > 0 && (
+          <div className="mt-3 flex flex-col gap-1.5 border-t border-border pt-3">
+            {hooks.map((hook) => (
+              <div key={hook.id} className="flex items-center justify-between gap-2 text-xs">
+                <span className="flex min-w-0 items-center gap-2">
+                  <StatusPill tone="neutral">{hook.event}</StatusPill>
+                  {hook.matcher && <span className="shrink-0 font-mono text-faint">{hook.matcher}</span>}
+                  <span className="truncate font-mono text-muted">{hook.command}</span>
+                </span>
+                <button
+                  type="button"
+                  aria-label={t("AutomationPanel.hookDeleteAriaLabel", { command: hook.command })}
+                  onClick={() => useUserHooksStore.getState().remove(hook.id)}
+                  className="shrink-0 cursor-pointer text-faint hover:text-danger"
+                >
+                  <Trash2 size={13} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3">
+          <div className="flex items-center gap-2">
+            <select
+              value={event}
+              onChange={(e) => setEvent(e.target.value as UserHookEvent)}
+              aria-label={t("AutomationPanel.hookEventLabel")}
+              className="h-8 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+            >
+              {USER_HOOK_EVENTS.map((value) => (
+                <option key={value} value={value}>
+                  {value}
+                </option>
+              ))}
+            </select>
+            {matcherApplies && (
+              <input
+                type="text"
+                value={matcher}
+                onChange={(e) => setMatcher(e.target.value)}
+                placeholder={t("AutomationPanel.hookMatcherPlaceholder")}
+                className="h-8 w-40 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+              />
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={command}
+              onChange={(e) => setCommand(e.target.value)}
+              placeholder={t("AutomationPanel.hookCommandPlaceholder")}
+              className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+            />
+            <Button size="sm" onClick={add} disabled={command.trim().length === 0}>
+              <Plus size={13} />
+              {t("AutomationPanel.hookAddButton")}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 
