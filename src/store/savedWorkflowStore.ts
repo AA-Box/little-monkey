@@ -48,7 +48,10 @@ function sanitizeEntry(value: unknown): SavedWorkflow | null {
     for (const agent of phase.agents) {
       if (!agent || typeof agent.description !== "string") return null;
       if (typeof agent.prompt !== "string" || agent.prompt.length === 0) return null;
-      if (agent.profile !== "explore" && agent.profile !== "code") return null;
+      // Any non-empty profile string is structurally valid — custom agent
+      // names are legal here, and dispatch re-validates against the defs
+      // actually loaded at run time.
+      if (typeof agent.profile !== "string" || agent.profile.length === 0) return null;
     }
   }
   return {

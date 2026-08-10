@@ -19,6 +19,7 @@ import {
   attemptStream,
   describeUsageTarget,
   executeToolCall,
+  isBlockedInPlanMode,
   isToolCallAllowed,
   CANCELLED_TOOL_RESULT,
   stringifyToolError,
@@ -36,8 +37,12 @@ import { useSettingsStore } from '../store/settingsStore';
 import { routeFromActive, type RoutedTarget } from './targetRouting';
 import type { RoutingDecision } from './modelRouting';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
-import { protectToolResult } from './untrustedContent';
+import { protectToolResult, unwrapUntrustedContent } from './untrustedContent';
 import { mutationToolFailureReason } from './workspaceMutation';
+import { customAgentBaseProfile, toolsForCustomAgent, type CustomAgentDef } from './customAgents';
+import { useCustomAgentStore } from '../store/customAgentStore';
+import { usePermissionStore } from '../store/permissionStore';
+import { agentWorktreeClient } from './agentWorktree';
 
 /** Hard cap on model/tool round trips for a single subagent run — smaller
  * than the parent's own `MAX_ITERATIONS` (25, agentLoop.ts) since a
@@ -199,6 +204,27 @@ function emptyMcpRegistry(): McpToolRegistry {
  * The routing decision is returned rather than only its target, so the caller
  * can record *why* this subagent ran where it did.
  */
+/** How a `profile` string resolves before the child loop starts — exported
+ * (with `resolveSubagentProfile`) for the DOM-free logic tests. A custom
+ * def's `base` is the built-in profile its ROUTING rides (`code` iff the def
+ * grants a mutating tool): per-profile model pins and dispatch policies only
+ * know the two built-in task classes, and a custom agent is one of those two
+ * kinds of work as far as model choice is concerned. */
+export type ResolvedSubagentProfile =
+  | { kind: 'builtin'; profile: 'explore' | 'code' }
+  | { kind: 'custom'; def: CustomAgentDef; base: 'explore' | 'code' }
+  | { kind: 'unknown'; known: string[] };
+
+export function resolveSubagentProfile(
+  profile: string,
+  defs: Record<string, CustomAgentDef>,
+): ResolvedSubagentProfile {
+  if (profile === 'explore' || profile === 'code') return { kind: 'builtin', profile };
+  const def = defs[profile];
+  if (def) return { kind: 'custom', def, base: customAgentBaseProfile(def) };
+  return { kind: 'unknown', known: ['explore', 'code', ...Object.keys(defs).sort()] };
+}
+
 function resolveSubagentTarget(
   target: ResolvedTarget,
   profile: 'explore' | 'code',
@@ -306,7 +332,29 @@ export interface RunSubagentTaskParams {
    * one user message. The child has no access to the parent conversation
    * beyond this string. */
   prompt: string;
-  profile: 'explore' | 'code';
+  /** `'explore'`, `'code'`, or a loaded custom agent's name (see
+   * `customAgents.ts`). An unknown name resolves to a tool-error result
+   * naming the known profiles — never a silent fallback to a built-in. */
+  profile: string;
+  /** `'worktree'` runs this (code-class) agent against a fresh managed git
+   * worktree of the primary root — see `runSubagentTask`'s isolation
+   * wrapper. Only meaningful with a mutating profile; anything else is a
+   * tool error, never a silent fallthrough to the shared checkout. */
+  isolation?: 'worktree';
+  /** INTERNAL (set only by the isolation wrapper): fail the run with this
+   * error immediately after registering it, so preflight failures (bad
+   * isolation/profile combo, worktree creation failure) still surface as a
+   * truthful errored run in the UI instead of a store-less orphan result. */
+  preflightError?: string;
+  /** INTERNAL (set only by the isolation wrapper): the managed worktree path
+   * threaded into every child tool call as `executeToolCall`'s per-call
+   * root override — never global state, so concurrent isolated agents can't
+   * race. */
+  workspaceRootOverride?: string;
+  /** INTERNAL (set only by the isolation wrapper): what the child's system
+   * prompt names as its workspace, in place of the real roots — an isolated
+   * child must be told it works in the worktree. */
+  promptWorkspaceRoots?: PromptWorkspaceRoot[];
   /** THIS turn's already-resolved active target — passed down rather than
    * re-resolved, so a mid-turn manual model switch in the parent can never
    * split the parent and child across different targets mid-turn. */
@@ -358,7 +406,90 @@ export interface RunSubagentTaskParams {
  * wraps its own call to this in another try/catch as defense in depth, but
  * the invariant is owned here first).
  */
+/** True when a loop result is an `{"error":...}` payload rather than a
+ * report — same reading `workflow.ts`'s `resultIsError` applies, duplicated
+ * as a tiny local (that module imports this one). */
+function isErrorResult(result: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(unwrapUntrustedContent(result));
+    return typeof parsed === 'object' && parsed !== null && 'error' in parsed;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Public entry point — plain runs go straight to the loop; a
+ * `isolation: 'worktree'` run wraps it in the worktree lifecycle:
+ * validate (code-class profiles only) → create the managed worktree →
+ * run the loop with every tool call rooted there → then either remove the
+ * untouched worktree, or keep it and record `{path, diffstat}` on the run's
+ * persisted meta for the SubagentRow footer's Apply/Discard. A kept
+ * worktree survives EVERY non-clean outcome — cancellation and errors
+ * included — because deleting uncommitted agent work on a Stop click is the
+ * one unforgivable behavior here. The epilogue itself never throws: a
+ * worktree bookkeeping failure must not corrupt the tool result.
+ */
 export async function runSubagentTask(params: RunSubagentTaskParams): Promise<string> {
+  if (params.isolation !== 'worktree') return runSubagentTaskLoop(params);
+
+  const resolved = resolveSubagentProfile(params.profile, useCustomAgentStore.getState().defs);
+  const base = resolved.kind === 'builtin' ? resolved.profile : resolved.kind === 'custom' ? resolved.base : null;
+  if (base !== 'code') {
+    return runSubagentTaskLoop({
+      ...params,
+      preflightError:
+        base === null
+          ? `Unknown agent profile "${params.profile}" for a worktree-isolated task. Known profiles: ${resolved.kind === 'unknown' ? resolved.known.join(', ') : ''}.`
+          : `Worktree isolation requires a mutating (code-class) profile — "${params.profile}" is read-only. Drop "isolation" or use a code-class profile.`,
+    });
+  }
+
+  let created: { path: string; branch: string };
+  try {
+    created = await agentWorktreeClient.create();
+  } catch (err) {
+    return runSubagentTaskLoop({
+      ...params,
+      preflightError: `Failed to create an isolated worktree: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
+
+  const result = await runSubagentTaskLoop({
+    ...params,
+    // The isolated child's changes never join the parent turn's checkpoint:
+    // they live in the worktree, and Apply/Discard IS their revert story —
+    // a checkpoint manifest full of paths inside a possibly-deleted temp
+    // worktree would promise a revert it can't keep.
+    parentCheckpointId: null,
+    workspaceRootOverride: created.path,
+    promptWorkspaceRoots: [{ path: created.path, label: 'worktree', is_primary: true }],
+  });
+
+  try {
+    const st = await agentWorktreeClient.status(created.path);
+    if (!st.dirty) {
+      // Nothing was produced — an empty worktree holds no agent work, so
+      // removing it is safe on every outcome, cancellation included.
+      await agentWorktreeClient.remove(created.path, false);
+      return result;
+    }
+    useSessionStore
+      .getState()
+      .setSubagentWorktree(params.sessionId, params.toolCallId ?? params.taskId, {
+        path: created.path,
+        diffstat: st.diffstat,
+        status: 'kept',
+      });
+    return isErrorResult(result)
+      ? result
+      : `${result}\n\n[Changes were left in an isolated worktree at ${created.path} — NOT applied to the workspace. The user can apply or discard them from this agent's row.]\nDiffstat:\n${st.diffstat}`;
+  } catch {
+    return result;
+  }
+}
+
+async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<string> {
   useUsageHistoryStore.getState().recordSubagentTaskStarted();
   const { sessionId, runId, parentCheckpointId, parentSignal, taskId, toolCallId, groupId, workflowRunId, description, prompt, profile, target, effort, risk, onMutatedPath, onMutationFailure } =
     params;
@@ -462,17 +593,73 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
   };
 
   try {
-    const roots: PromptWorkspaceRoot[] = useWorkspaceStore.getState().roots;
+    // A preflight failure from the isolation wrapper — the run was
+    // registered above so the UI shows a truthful errored row, and fails
+    // here before any model streaming.
+    if (params.preflightError) {
+      return finish('error', stringifyToolError(new Error(params.preflightError)));
+    }
+    // Resolved from the store ONCE, before the loop — a def file edited (or
+    // deleted) mid-run must not change an already-running agent's tools.
+    const resolvedProfile = resolveSubagentProfile(profile, useCustomAgentStore.getState().defs);
+    if (resolvedProfile.kind === 'unknown') {
+      return finish(
+        'error',
+        stringifyToolError(
+          new Error(`Unknown agent profile "${profile}". Known profiles: ${resolvedProfile.known.join(', ')}.`)
+        )
+      );
+    }
+    const baseProfile = resolvedProfile.kind === 'custom' ? resolvedProfile.base : resolvedProfile.profile;
+    // Plan Mode refusal, at DISPATCH rather than per child tool call: a
+    // `code`-class agent exists to make changes, and every change it tried
+    // would be refused anyway (`executeToolCall`'s Plan-Mode backstop + the
+    // Rust mode gate) — refusing the whole dispatch with one actionable
+    // error beats burning a child loop on doomed calls. Snapshotted once,
+    // like every other per-run resolution here: the user approving the plan
+    // mid-run must not retroactively rewire an already-running child.
+    const planMode = usePermissionStore.getState().mode === 'plan';
+    if (planMode && baseProfile === 'code') {
+      return finish(
+        'error',
+        stringifyToolError(
+          new Error(
+            `Blocked: Little Monkey is in Plan Mode, and the "${profile}" agent profile can make changes. Use profile "explore" (or a read-only custom agent) to investigate, or ask the user to approve the plan first.`
+          )
+        )
+      );
+    }
+    const roots: PromptWorkspaceRoot[] = params.promptWorkspaceRoots ?? useWorkspaceStore.getState().roots;
     const osLabel = detectOsLabel(typeof navigator !== 'undefined' ? navigator.platform : '');
-    const systemPrompt = buildSubagentSystemPrompt(roots, osLabel, profile, description);
-    const tools: ToolDef[] = toolsForProfile(profile);
+    const systemPrompt = buildSubagentSystemPrompt(
+      roots,
+      osLabel,
+      baseProfile,
+      description,
+      resolvedProfile.kind === 'custom' ? resolvedProfile.def : undefined,
+    );
+    // A custom def's list is re-intersected with the ceiling inside
+    // `toolsForCustomAgent` (defense in depth on top of load-time
+    // validation); `isToolCallAllowed` below then enforces exactly this list
+    // per call, so a granted-but-hallucinated name never dispatches either.
+    const profileTools: ToolDef[] =
+      resolvedProfile.kind === 'custom' ? toolsForCustomAgent(resolvedProfile.def) : toolsForProfile(resolvedProfile.profile);
+    // In Plan Mode an `explore`-class agent still dispatches, but any name
+    // Plan Mode refuses (a read-only custom agent may hold web tools, which
+    // are permission-gated) is dropped from the child's OFFER too — same
+    // fail-closed double layer the parent's own `toolsForMode` applies.
+    const tools: ToolDef[] = planMode ? profileTools.filter((tool) => !isBlockedInPlanMode(tool.function.name)) : profileTools;
+    // The def's own effort wins over the inherited turn effort — that's what
+    // declaring `effort` in the definition file is FOR; a caller has no way
+    // to signal "explicitly override the def" separately from "inherited".
+    const childEffort = resolvedProfile.kind === 'custom' ? (resolvedProfile.def.effort ?? effort) : effort;
     const mcpRegistry = emptyMcpRegistry();
     // Resolved once, up front — not re-checked every iteration — for the
     // same "never split-brain mid-run" reason `target` itself is passed down
     // rather than re-resolved (see `RunSubagentTaskParams.target`'s doc
     // comment): a settings change mid-run shouldn't retarget an
     // already-running subagent partway through its own loop.
-    const routed = resolveSubagentTarget(target, profile);
+    const routed = resolveSubagentTarget(target, baseProfile);
     const resolvedTarget = routed.target;
     // Onto the parent's run: a subagent has none of its own, and the decision
     // is about work the parent asked for.
@@ -501,7 +688,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
       // child attempt's usage must never clobber the PARENT session's
       // context-usage ring. `onDelta` is omitted: nothing renders the
       // child's in-progress streaming content anywhere in this slice.
-      const attempt = await attemptStream(resolvedTarget, wireHistory, tools, signal, effort, sessionId, undefined, false);
+      const attempt = await attemptStream(resolvedTarget, wireHistory, tools, signal, childEffort, sessionId, undefined, false);
 
       if (attempt.usage) {
         useSubagentStore.getState().accumulateUsage(storeKey, attempt.usage);
@@ -587,6 +774,9 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
                 undefined,
                 undefined,
                 description,
+                undefined,
+                undefined,
+                params.workspaceRootOverride,
               );
         const toolMessage: ChatMessage = {
           role: 'tool',

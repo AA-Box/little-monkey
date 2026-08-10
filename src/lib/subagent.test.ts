@@ -47,19 +47,26 @@ vi.mock("./turnEngine", () => ({
   // always says "allowed".
   isToolCallAllowed: (toolCall: { function: { name: string } }, toolsForTurn: { function: { name: string } }[]) =>
     toolsForTurn.some((tool) => tool.function.name === toolCall.function.name),
+  // Same real-implementation-not-spy reasoning as `isToolCallAllowed` just
+  // above: the Plan-Mode suite needs the actual predicate semantics.
+  isBlockedInPlanMode: (name: string) =>
+    ["write_file", "edit_file", "run_shell", "shell_kill", "remember", "web_fetch", "web_search"].includes(name) ||
+    name.startsWith("mcp__"),
   CANCELLED_TOOL_RESULT: JSON.stringify({ error: "Cancelled by the user" }),
   stringifyToolError: (err: unknown) => JSON.stringify({ error: errorMessage(err) }),
   describeUsageTarget: (target: ResolvedTarget) =>
     target.kind === "local" ? "Local model" : target.kind === "ollama" ? `Ollama · ${target.model}` : `${target.providerId} · ${target.model}`,
 }));
 
-import { MAX_SUBAGENT_ITERATIONS, runSubagentTask, steerSubagentRun, type RunSubagentTaskParams } from "./subagent";
+import { MAX_SUBAGENT_ITERATIONS, resolveSubagentProfile, runSubagentTask, steerSubagentRun, type RunSubagentTaskParams } from "./subagent";
 import { clearPauseRegistryForTests, setPauseRequested } from "./pauseRegistry";
 import type { ResolvedTarget, RiskAnnotationContext } from "./turnEngine";
 import type { ChatMessage, ToolCall } from "./llamaClient";
 import { selectSubagentRun, useSubagentStore } from "../store/subagentStore";
 import { useSessionStore, type ChatSession } from "../store/sessionStore";
 import { useSettingsStore } from "../store/settingsStore";
+import { useCustomAgentStore } from "../store/customAgentStore";
+import { usePermissionStore } from "../store/permissionStore";
 
 const fakeTarget: ResolvedTarget = { kind: "local", baseUrl: "http://localhost:8090" };
 
@@ -984,5 +991,280 @@ describe("runSubagentTask / mid-run steering", () => {
 
     const wire = attemptStreamMock.mock.calls[0][1] as ChatMessage[];
     expect(wire.some((m) => m.content === "never seen")).toBe(false);
+  });
+});
+
+describe("runSubagentTask / custom agent profiles", () => {
+  const docsDef = {
+    name: "docs-writer",
+    description: "Writes docs",
+    tools: ["read_file", "grep"],
+    effort: "low" as const,
+    addendum: "Always write in the imperative mood.",
+    sourcePath: ".monkey/agents/docs-writer.md",
+  };
+  const fixerDef = {
+    name: "fixer",
+    description: "Fixes bugs",
+    tools: ["read_file", "write_file"],
+    addendum: "",
+    sourcePath: ".monkey/agents/fixer.md",
+  };
+
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    routeFromActiveMock.mockClear();
+    // An earlier suite leaves a `code`-profile model pin behind, which would
+    // short-circuit routing entirely (pinned targets never consult K9).
+    useSettingsStore.setState({ subagentProfileModels: {} });
+    useCustomAgentStore.setState({ defs: { "docs-writer": docsDef, fixer: fixerDef }, errors: [], loadedAt: Date.now() });
+  });
+
+  afterEach(() => {
+    useCustomAgentStore.setState({ defs: {}, errors: [], loadedAt: null });
+  });
+
+  it("resolveSubagentProfile: builtin, custom, and unknown (with the known list sorted)", () => {
+    expect(resolveSubagentProfile("explore", {})).toEqual({ kind: "builtin", profile: "explore" });
+    expect(resolveSubagentProfile("code", {})).toEqual({ kind: "builtin", profile: "code" });
+    const custom = resolveSubagentProfile("docs-writer", { "docs-writer": docsDef });
+    expect(custom).toEqual({ kind: "custom", def: docsDef, base: "explore" });
+    const unknown = resolveSubagentProfile("nope", { zeta: docsDef, alpha: fixerDef });
+    expect(unknown).toEqual({ kind: "unknown", known: ["explore", "code", "alpha", "zeta"] });
+  });
+
+  it("an unknown profile finishes as an error naming the known profiles, without ever streaming", async () => {
+    const result = await runSubagentTask(baseParams({ profile: "not-an-agent", toolCallId: "call-unknown" }));
+
+    expect(JSON.parse(result).error).toContain('Unknown agent profile "not-an-agent"');
+    expect(JSON.parse(result).error).toContain("docs-writer");
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+    expect(useSubagentStore.getState().runs["call-unknown"]?.status).toBe("error");
+  });
+
+  it("offers the child exactly the def's tools, appends the addendum, and applies the def's effort", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "docs-writer", effort: "high" }));
+
+    const [, wireHistory, tools, , effort] = attemptStreamMock.mock.calls[0] as [unknown, ChatMessage[], { function: { name: string } }[], unknown, string];
+    expect(tools.map((t) => t.function.name).sort()).toEqual(["grep", "read_file"]);
+    expect(wireHistory[0].content).toContain("Always write in the imperative mood.");
+    expect(wireHistory[0].content).toContain("docs-writer");
+    // The def's own effort wins over the inherited turn effort — declaring
+    // effort in the definition file is the point of the field.
+    expect(effort).toBe("low");
+  });
+
+  it("routes a mutating custom agent as code-class work and a read-only one as explore-class", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "fixer" }));
+    expect((routeFromActiveMock.mock.calls[0][1] as { taskClass: string }).taskClass).toBe("subagent_code");
+
+    routeFromActiveMock.mockClear();
+    await runSubagentTask(baseParams({ profile: "docs-writer" }));
+    expect((routeFromActiveMock.mock.calls[0][1] as { taskClass: string }).taskClass).toBe("subagent_explore");
+  });
+
+  it("rejects a child call to a tool outside the def's list without executing it", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({ content: "", toolCalls: [toolCall("write_file")], streamError: null, contentStarted: true })
+      .mockResolvedValueOnce({ content: "ok", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "docs-writer" }));
+
+    expect(executeToolCallMock).not.toHaveBeenCalled();
+    const wire = attemptStreamMock.mock.calls[1][1] as ChatMessage[];
+    const rejection = wire.find((m) => m.role === "tool");
+    expect(rejection && JSON.parse(rejection.content as string).error).toContain('"write_file"');
+  });
+});
+
+describe("runSubagentTask / Plan Mode", () => {
+  const webAgentDef = {
+    name: "researcher",
+    description: "Researches with web tools",
+    tools: ["read_file", "grep", "web_search"],
+    addendum: "",
+    sourcePath: ".monkey/agents/researcher.md",
+  };
+  const fixerAgentDef = {
+    name: "fixer",
+    description: "Fixes bugs",
+    tools: ["read_file", "write_file"],
+    addendum: "",
+    sourcePath: ".monkey/agents/fixer.md",
+  };
+
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    useSettingsStore.setState({ subagentProfileModels: {} });
+    usePermissionStore.setState({ mode: "plan" });
+    useCustomAgentStore.setState({ defs: { researcher: webAgentDef, fixer: fixerAgentDef }, errors: [], loadedAt: Date.now() });
+  });
+
+  afterEach(() => {
+    usePermissionStore.setState({ mode: "manual" });
+    useCustomAgentStore.setState({ defs: {}, errors: [], loadedAt: null });
+  });
+
+  it("refuses a code-profile dispatch outright, without streaming", async () => {
+    const result = await runSubagentTask(baseParams({ profile: "code", toolCallId: "call-plan-code" }));
+    expect(JSON.parse(result).error).toContain("Plan Mode");
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+    expect(useSubagentStore.getState().runs["call-plan-code"]?.status).toBe("error");
+  });
+
+  it("refuses a mutating custom agent by its own name", async () => {
+    const result = await runSubagentTask(baseParams({ profile: "fixer" }));
+    expect(JSON.parse(result).error).toContain('"fixer"');
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+  });
+
+  it("still dispatches an explore child, with Plan-Mode-blocked names dropped from its offer", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "researcher" }));
+
+    const tools = attemptStreamMock.mock.calls[0][2] as { function: { name: string } }[];
+    // web_search is in the def, but Plan Mode refuses it — so it is not even
+    // offered to the child, same double layer as the parent's toolsForMode.
+    expect(tools.map((t) => t.function.name).sort()).toEqual(["grep", "read_file"]);
+  });
+
+  it("dispatches code normally again once the mode is no longer plan", async () => {
+    usePermissionStore.setState({ mode: "acceptEdits" });
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    const result = await runSubagentTask(baseParams({ profile: "code" }));
+    expect(result).toBe("done");
+  });
+});
+
+describe("runSubagentTask / worktree isolation", () => {
+  const WT_PATH = "/data/agent-worktrees/wt-abc";
+
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    invokeMock.mockReset();
+    usePermissionStore.setState({ mode: "manual" });
+    useSettingsStore.setState({ subagentProfileModels: {} });
+    useSessionStore.setState((state) => ({
+      sessions: [...state.sessions.filter((s) => s.id !== "sess-wt"), makeStoreTestSession("sess-wt")],
+    }));
+  });
+
+  function mockWorktreeInvokes(status: { dirty: boolean; diffstat: string }) {
+    invokeMock.mockImplementation((command: unknown) => {
+      if (command === "worktree_create") return Promise.resolve({ path: WT_PATH, branch: "agent/abc" });
+      if (command === "worktree_status") return Promise.resolve(status);
+      if (command === "worktree_remove") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+  }
+
+  it("refuses isolation for a read-only profile as a preflight error, creating nothing", async () => {
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "explore", isolation: "worktree", toolCallId: "call-wt-explore" }),
+    );
+
+    expect(JSON.parse(result).error).toContain("code-class");
+    expect(invokeMock).not.toHaveBeenCalledWith("worktree_create");
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+    expect(useSubagentStore.getState().runs["call-wt-explore"]?.status).toBe("error");
+  });
+
+  it("surfaces a worktree-creation failure as a preflight error", async () => {
+    invokeMock.mockRejectedValue(new Error("not a git repository"));
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-fail" }),
+    );
+    expect(JSON.parse(result).error).toContain("not a git repository");
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+  });
+
+  it("threads the worktree into the child's prompt, every tool call, and a null checkpoint", async () => {
+    mockWorktreeInvokes({ dirty: false, diffstat: "" });
+    attemptStreamMock
+      .mockResolvedValueOnce({ content: "", toolCalls: [toolCall("write_file")], streamError: null, contentStarted: true })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("ok");
+
+    await runSubagentTask(
+      baseParams({
+        sessionId: "sess-wt",
+        profile: "code",
+        isolation: "worktree",
+        toolCallId: "call-wt-thread",
+        parentCheckpointId: "parent-checkpoint-1",
+      }),
+    );
+
+    const wire = attemptStreamMock.mock.calls[0][1] as ChatMessage[];
+    expect(wire[0].content).toContain(WT_PATH);
+    const executeArgs = executeToolCallMock.mock.calls[0];
+    // (toolCall, checkpointId, turnId, registry, signal, risk, stacks, subagent, agentLabel, skill, chatSessionId, workspaceRootOverride)
+    expect(executeArgs[1]).toBeNull();
+    expect(executeArgs[11]).toBe(WT_PATH);
+  });
+
+  it("removes an untouched worktree at finish and records nothing on the meta", async () => {
+    mockWorktreeInvokes({ dirty: false, diffstat: "" });
+    attemptStreamMock.mockResolvedValue({ content: "all done", toolCalls: [], streamError: null, contentStarted: true });
+
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-clean" }),
+    );
+
+    expect(result).toBe("all done");
+    expect(invokeMock).toHaveBeenCalledWith("worktree_remove", { path: WT_PATH, force: false });
+    const meta = useSessionStore.getState().sessions.find((s) => s.id === "sess-wt")?.subagentRunMeta?.["call-wt-clean"];
+    expect(meta?.worktree).toBeUndefined();
+  });
+
+  it("keeps a dirty worktree, records {path, diffstat} on the meta, and appends the note to the report", async () => {
+    mockWorktreeInvokes({ dirty: true, diffstat: " a.txt | 2 +-" });
+    attemptStreamMock.mockResolvedValue({ content: "changed things", toolCalls: [], streamError: null, contentStarted: true });
+
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-dirty" }),
+    );
+
+    expect(result).toContain("changed things");
+    expect(result).toContain(WT_PATH);
+    expect(result).toContain("a.txt | 2 +-");
+    expect(invokeMock).not.toHaveBeenCalledWith("worktree_remove", expect.anything());
+    const meta = useSessionStore.getState().sessions.find((s) => s.id === "sess-wt")?.subagentRunMeta?.["call-wt-dirty"];
+    expect(meta?.worktree).toEqual({ path: WT_PATH, diffstat: " a.txt | 2 +-", status: "kept" });
+  });
+
+  it("a dirty worktree also survives an errored run, without touching the error payload", async () => {
+    mockWorktreeInvokes({ dirty: true, diffstat: " a.txt | 2 +-" });
+    attemptStreamMock.mockResolvedValue({ content: "", toolCalls: [], streamError: "boom", contentStarted: false });
+
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-err" }),
+    );
+
+    expect(JSON.parse(result).error).toBe("boom");
+    expect(invokeMock).not.toHaveBeenCalledWith("worktree_remove", expect.anything());
+    const meta = useSessionStore.getState().sessions.find((s) => s.id === "sess-wt")?.subagentRunMeta?.["call-wt-err"];
+    expect(meta?.worktree?.status).toBe("kept");
+  });
+
+  it("setSubagentWorktreeStatus advances kept → applied/discarded on the persisted meta", async () => {
+    mockWorktreeInvokes({ dirty: true, diffstat: "stat" });
+    attemptStreamMock.mockResolvedValue({ content: "r", toolCalls: [], streamError: null, contentStarted: true });
+    await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-status" }),
+    );
+
+    useSessionStore.getState().setSubagentWorktreeStatus("sess-wt", "call-wt-status", "applied");
+    const meta = useSessionStore.getState().sessions.find((s) => s.id === "sess-wt")?.subagentRunMeta?.["call-wt-status"];
+    expect(meta?.worktree?.status).toBe("applied");
   });
 });

@@ -274,6 +274,11 @@ pub fn task_tool_def() -> serde_json::Value {
                         "type": "string",
                         "enum": ["explore", "code"],
                         "description": "Tool access profile. 'explore' is read-only (read_file, list_dir, glob, grep). 'code' adds write_file, edit_file, and run_shell; mutations use the parent turn checkpoint and normal permission gate."
+                    },
+                    "isolation": {
+                        "type": "string",
+                        "enum": ["worktree"],
+                        "description": "Optional, code profile only: run the subagent in a fresh git worktree of the workspace so parallel agents never collide on files. Its changes stay in the worktree for the user to apply or discard. Not supported by the CLI surface."
                     }
                 },
                 "required": ["description", "prompt", "profile"],

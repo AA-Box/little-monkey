@@ -43,7 +43,7 @@ export interface SubagentRun {
    * that workflow's card and excludes it from the plain agent list. */
   workflowRunId?: string;
   description: string;
-  profile: "explore" | "code";
+  profile: string; // built-in profile or custom agent name
   status: SubagentStatus;
   /** When `start` registered this run — drives the elapsed-time column in
    * the Background-tasks drawer and the grouped-agents card. Wall-clock
@@ -85,7 +85,7 @@ interface SubagentStoreState {
   runs: Record<string, SubagentRun>;
   /** Registers a new run as `'running'` with an empty activity log — called
    * once by `runSubagentTask` right before it starts the child's loop. */
-  start: (params: { sessionId: string; taskId: string; cancelId: string; groupId?: string; workflowRunId?: string; description: string; profile: "explore" | "code" }) => void;
+  start: (params: { sessionId: string; taskId: string; cancelId: string; groupId?: string; workflowRunId?: string; description: string; profile: string }) => void;
   /** Updates `lastActivity` and bumps `toolCallCount` by one — called once
    * per child tool call `runSubagentTask` is about to execute. No-ops if
    * `taskId` was never `start`-ed (defensive; should not happen). */

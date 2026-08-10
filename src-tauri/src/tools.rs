@@ -67,12 +67,13 @@ const GLOB_MAX_MATCHES: usize = 300;
 const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Read a UTF-8 text file from the workspace.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_read_file(
     state: tauri::State<'_, AppState>,
     path: String,
+    workspace_root_override: Option<String>,
 ) -> Result<String, String> {
-    let (resolved, _) = workspace::resolve_path_and_root(state.inner(), &path)?;
+    let (resolved, _) = crate::agent_worktrees::resolve_with_override(state.inner(), &path, workspace_root_override.as_deref())?;
 
     if !resolved.is_file() {
         return Err(format!("'{}' is not a file", path));
@@ -82,12 +83,13 @@ pub async fn tool_read_file(
 }
 
 /// List the immediate contents of a directory in the workspace.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_list_dir(
     state: tauri::State<'_, AppState>,
     path: String,
+    workspace_root_override: Option<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let (resolved, _) = workspace::resolve_path_and_root(state.inner(), &path)?;
+    let (resolved, _) = crate::agent_worktrees::resolve_with_override(state.inner(), &path, workspace_root_override.as_deref())?;
 
     if !resolved.is_dir() {
         return Err(format!("'{}' is not a directory", path));
@@ -123,16 +125,17 @@ pub async fn tool_list_dir(
 /// Regex-search text files under `path` (defaults to the workspace root),
 /// skipping VCS/build/dependency directories, capped at
 /// [`GREP_MAX_MATCHES`] results.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_grep(
     state: tauri::State<'_, AppState>,
     pattern: String,
     path: Option<String>,
+    workspace_root_override: Option<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let regex = Regex::new(&pattern).map_err(|e| format!("Invalid regex '{}': {}", pattern, e))?;
 
     let (search_root, display_root) =
-        workspace::resolve_path_and_root(state.inner(), path.as_deref().unwrap_or("."))?;
+        crate::agent_worktrees::resolve_with_override(state.inner(), path.as_deref().unwrap_or("."), workspace_root_override.as_deref())?;
     let label_prefix = workspace::secondary_label_for(state.inner(), &display_root)?
         .map(|label| format!("{}/", label))
         .unwrap_or_default();
@@ -198,14 +201,15 @@ pub async fn tool_grep(
 /// `path` (defaults to the workspace root), skipping VCS/build/dependency
 /// directories, capped at [`GLOB_MAX_MATCHES`] results sorted by most
 /// recently modified first.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_glob(
     state: tauri::State<'_, AppState>,
     pattern: String,
     path: Option<String>,
+    workspace_root_override: Option<String>,
 ) -> Result<Vec<String>, String> {
     let (search_root, display_root) =
-        workspace::resolve_path_and_root(state.inner(), path.as_deref().unwrap_or("."))?;
+        crate::agent_worktrees::resolve_with_override(state.inner(), path.as_deref().unwrap_or("."), workspace_root_override.as_deref())?;
     let label_prefix = workspace::secondary_label_for(state.inner(), &display_root)?
         .map(|label| format!("{}/", label))
         .unwrap_or_default();
@@ -329,12 +333,17 @@ pub async fn tool_write_file(
     risk_level: Option<String>,
     risk_reason: Option<String>,
     agent_label: Option<String>,
+    workspace_root_override: Option<String>,
 ) -> Result<String, String> {
     // Resolved BEFORE the permission prompt (unlike this function's
     // pre-Phase-2 ordering) so `path_risk_floor` can be checked against the
     // actual sandboxed/canonicalized target — an invalid path now fails
-    // before a prompt is even shown, which is also strictly safer.
-    let (resolved, root) = workspace::resolve_path_and_root(state.inner(), &path)?;
+    // before a prompt is even shown, which is also strictly safer. The
+    // worktree override (validated against the managed registry inside
+    // `resolve_with_override`) is applied at this same point for the same
+    // reason: the floor and the prompt must describe the real target.
+    let (resolved, root) =
+        crate::agent_worktrees::resolve_with_override(state.inner(), &path, workspace_root_override.as_deref())?;
     let risk = permissions::compute_risk(Some((&resolved, &root)), risk_level, risk_reason);
 
     let detail = format!("Write {} bytes to {}", content.len(), path);
@@ -617,12 +626,16 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
     risk_level: Option<String>,
     risk_reason: Option<String>,
     agent_label: Option<String>,
+    workspace_root_override: Option<String>,
 ) -> Result<String, String> {
     if old_string.is_empty() {
         return Err("old_string must not be empty".to_string());
     }
 
-    let (resolved, root) = workspace::resolve_path_and_root(state.inner(), &path)?;
+    // Same before-the-prompt override point as `tool_write_file` — see its
+    // comment.
+    let (resolved, root) =
+        crate::agent_worktrees::resolve_with_override(state.inner(), &path, workspace_root_override.as_deref())?;
 
     if !resolved.is_file() {
         return Err(format!("'{}' is not a file", path));
@@ -848,6 +861,7 @@ pub async fn tool_run_shell(
     risk_reason: Option<String>,
     agent_label: Option<String>,
     full_output: Option<bool>,
+    workspace_root_override: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let risk = permissions::compute_risk(None, risk_level, risk_reason);
     permissions::request_permission(
@@ -864,9 +878,19 @@ pub async fn tool_run_shell(
 
     checkpoints::record_shell(state.inner(), checkpoint_id.as_deref())?;
 
+    // Under a worktree override the DEFAULT cwd is the worktree itself, and
+    // an explicit `cwd` is sandboxed inside it — a worktree-isolated agent's
+    // commands must never silently run in the shared checkout.
     let cwd_path = match cwd {
-        Some(ref c) => workspace::resolve_path_and_root(state.inner(), c)?.0,
-        None => workspace::primary_root_canon(state.inner())?,
+        Some(ref c) => {
+            crate::agent_worktrees::resolve_with_override(state.inner(), c, workspace_root_override.as_deref())?.0
+        }
+        None => match workspace_root_override.as_deref() {
+            Some(root) => {
+                crate::agent_worktrees::resolve_with_override(state.inner(), ".", Some(root))?.0
+            }
+            None => workspace::primary_root_canon(state.inner())?,
+        },
     };
 
     // `sh` does not exist on Windows (and the app bundles for all targets) —
@@ -2171,6 +2195,7 @@ mod tests {
                         "OLD".to_string(),
                         new_value.to_string(),
                         Some("test-checkpoint".to_string()),
+                        None,
                         None,
                         None,
                         None,

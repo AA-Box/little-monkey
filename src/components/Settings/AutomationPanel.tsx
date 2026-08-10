@@ -29,6 +29,7 @@ import {
 import { buildModelTargetInventory } from "../../lib/modelTargets";
 import { useRoutingPolicyStore } from "../../store/routingPolicyStore";
 import { USER_HOOK_EVENTS, useUserHooksStore, type UserHookEvent } from "../../store/userHooksStore";
+import { useCustomAgentStore } from "../../store/customAgentStore";
 
 /** No shared toggle-switch component exists in `ui/` yet — this one is small and specific enough to keep local rather than promote prematurely. */
 function Toggle({
@@ -260,6 +261,65 @@ function SubagentModelOverrideRow({
         <StatusPill tone="neutral">{t("AutomationPanel.subagentModelOverrideDefaultBadge")}</StatusPill>
       )}
     </div>
+  );
+}
+
+/**
+ * Loaded `.monkey/agents/*.md` custom agent definitions plus their per-file
+ * load errors — the visibility half of the "fail the def with a visible
+ * warning, not silently" contract (`customAgents.ts`). Refreshes on mount so
+ * opening Settings always reflects the files on disk, and offers a manual
+ * refresh for mid-session edits.
+ */
+function CustomAgentsSection() {
+  const { t } = useT();
+  const defs = useCustomAgentStore((state) => state.defs);
+  const errors = useCustomAgentStore((state) => state.errors);
+  const loadedAt = useCustomAgentStore((state) => state.loadedAt);
+  useEffect(() => {
+    void useCustomAgentStore.getState().refresh();
+  }, []);
+  const list = useMemo(() => Object.values(defs).sort((a, b) => a.name.localeCompare(b.name)), [defs]);
+
+  return (
+    <>
+      <div className="mb-1 mt-3 flex items-center justify-between gap-2">
+        <p className="text-xs text-muted">{t("AutomationPanel.customAgentsIntro")}</p>
+        <button
+          type="button"
+          onClick={() => void useCustomAgentStore.getState().refresh()}
+          className="shrink-0 cursor-pointer text-xs text-faint hover:text-foreground"
+        >
+          {t("AutomationPanel.customAgentsRefreshButton")}
+        </button>
+      </div>
+      <div className="rounded-lg border border-border bg-background px-3">
+        {list.length === 0 && errors.length === 0 ? (
+          <p className="py-2.5 text-xs text-faint">
+            {loadedAt === null ? t("AutomationPanel.customAgentsLoading") : t("AutomationPanel.customAgentsEmpty")}
+          </p>
+        ) : (
+          <>
+            {list.map((def) => (
+              <div key={def.name} className="flex flex-col gap-0.5 border-t border-border py-2.5 first:border-t-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium text-foreground">{def.name}</span>
+                  {def.effort && <StatusPill tone="neutral">{def.effort}</StatusPill>}
+                  <span className="ml-auto font-mono text-[10px] text-faint">{def.sourcePath}</span>
+                </div>
+                <span className="text-xs text-muted">{def.description}</span>
+                <span className="font-mono text-[10px] text-faint">{def.tools.join(", ")}</span>
+              </div>
+            ))}
+            {errors.map((error) => (
+              <p key={error.path} className="my-2 rounded border border-danger bg-danger-soft px-2 py-1 text-xs text-danger">
+                {error.path}: {error.message}
+              </p>
+            ))}
+          </>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -1096,6 +1156,7 @@ export function AutomationPanel() {
             onClear={() => clearSubagentProfileModel("code")}
           />
         </div>
+        <CustomAgentsSection />
       </section>
 
       <section>
