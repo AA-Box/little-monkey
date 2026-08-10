@@ -570,8 +570,17 @@ struct ActiveProcess {
 /// `// ponytail:` comment declined to make blind.
 /// The answer to "may this suspended job have its memory back".
 enum Reacquired {
-    Fits(Option<(String, MemoryRequirement)>),
+    Fits(Option<AdmittedClaim>),
     Held(String),
+}
+
+/// What an admitted job records: the resident model it holds, its pooled memory,
+/// and that memory broken out per accelerator device.
+#[derive(Debug, Clone)]
+struct AdmittedClaim {
+    model_key: String,
+    memory: MemoryRequirement,
+    devices: Vec<admission::DeviceClaim>,
 }
 
 #[derive(Clone)]
@@ -841,6 +850,28 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             .collect())
     }
 
+    /// What is held on each accelerator device right now, summed across resident
+    /// models (K15).
+    ///
+    /// Deliberately *not* derivable from [`Self::committed`]: that map's
+    /// `vram_bytes` is a per-model total across whatever cards the model landed
+    /// on, and summing totals is precisely the aggregate this item exists to stop
+    /// reserving against. It is read from the per-device rows instead, which are
+    /// grouped by resident model for the same reason `committed_reservations` is
+    /// — two turns against one loaded model pay for it once.
+    fn committed_devices(&self) -> Result<admission::DeviceCommitments, String> {
+        let mut totals = admission::DeviceCommitments::new();
+        for (kind, index, bytes) in self.store.committed_device_reservations()? {
+            let device = match index {
+                Some(index) => admission::DeviceId::device(kind, index),
+                None => admission::DeviceId::aggregate(kind),
+            };
+            let slot = totals.entry(device).or_insert(0);
+            *slot = slot.saturating_add(bytes);
+        }
+        Ok(totals)
+    }
+
     /// What a queued job will make resident: the target frozen at submission,
     /// plus whatever the model hub knows about that target's model id.
     ///
@@ -1098,6 +1129,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         // Keyed by resident model, so admitting a second job against a model
         // already loaded adds nothing to the total.
         let mut resident = self.committed()?;
+        let mut resident_devices = self.committed_devices()?;
         let mut running = self.running_jobs()?;
 
         for index in 0..candidates.len() {
@@ -1125,7 +1157,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             // with no hardware snapshot records no claim rather than a zero-byte
             // one: it did not decide this job fitted, so it must not leave a row
             // saying the model is free.
-            let mut claim: Option<(String, MemoryRequirement)> = None;
+            let mut claim: Option<AdmittedClaim> = None;
             if let Some(snapshot) = snapshot.as_ref() {
                 let already = reservation
                     .model_key()
@@ -1135,19 +1167,31 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                     // Already resident: this job is another turn against a model
                     // whose memory is paid for. It still records the same claim,
                     // which is what keeps the model reserved until the *last*
-                    // holder exits.
-                    Some(paid) => Fit::Fits { claim: paid },
+                    // holder exits. Its per-device rows are already on the other
+                    // holder, so no device bytes are booked a second time.
+                    Some(paid) => Fit::Fits {
+                        claim: paid,
+                        devices: Vec::new(),
+                    },
                     None => admission::fit(
                         &reservation,
                         &sum_reservations(&resident),
+                        &resident_devices,
                         snapshot,
                         self.profile_limits
                             .memory_ceiling_bytes(snapshot.total_ram_bytes),
                     ),
                 };
                 match outcome {
-                    Fit::Fits { claim: fitted } => {
-                        claim = reservation.model_key().map(|key| (key.to_string(), fitted));
+                    Fit::Fits {
+                        claim: fitted,
+                        devices,
+                    } => {
+                        claim = reservation.model_key().map(|key| AdmittedClaim {
+                            model_key: key.to_string(),
+                            memory: fitted,
+                            devices,
+                        });
                     }
                     Fit::Unmeasured => {
                         if let Reservation::Unmeasured { model_id } = &reservation {
@@ -1173,7 +1217,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                         // shortfall, so this cannot park work for nothing.
                         let victims: Vec<String> = scheduler::preemption_victims(
                             candidate.effective_class(now),
-                            resource,
+                            &resource,
                             shortfall_bytes,
                             &running,
                         )
@@ -1191,7 +1235,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                                 &victim_id,
                                 &candidate,
                                 now,
-                                resource,
+                                &resource,
                                 shortfall_bytes,
                                 snapshot,
                             )? {
@@ -1229,8 +1273,9 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                             // how much longer this job can still be outranked
                             // before aging puts it at the head of the ranking.
                             let bound = scheduler::starvation_bound_ms();
-                            let promoted_in_ms = bound
-                                .saturating_sub(now.saturating_sub(candidate.created_at_ms).min(bound));
+                            let promoted_in_ms = bound.saturating_sub(
+                                now.saturating_sub(candidate.created_at_ms).min(bound),
+                            );
                             self.log_decision(
                                 &candidate,
                                 now,
@@ -1248,7 +1293,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                         resource,
                         shortfall_bytes,
                     } => {
-                        self.reject_oversized(&job, now, resource, shortfall_bytes)?;
+                        self.reject_oversized(&job, now, &resource, shortfall_bytes)?;
                         self.log_decision(
                             &candidate,
                             now,
@@ -1273,8 +1318,14 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             // without admitting when another owner holds the lease.
             if self.active.contains_key(&job_id) {
                 slots -= 1;
-                if let Some((key, claimed)) = claim {
-                    resident.entry(key).or_insert(claimed);
+                if let Some(claimed) = claim {
+                    // Both maps, and both keyed by resident model: a second turn
+                    // against the same model must not be charged for it twice on
+                    // this tick either.
+                    if !resident.contains_key(&claimed.model_key) {
+                        admission::commit_devices(&mut resident_devices, &claimed.devices);
+                        resident.insert(claimed.model_key, claimed.memory);
+                    }
                 }
                 // The measurement cited for an admission is the ranking key that
                 // put this job first, not the memory reading — the memory reading
@@ -1318,6 +1369,9 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
     /// stays resident for the other holder.
     fn running_jobs(&mut self) -> Result<Vec<Running>, String> {
         let reservations = self.store.job_reservations()?;
+        // Per job, like `reservations` beside it: preemption asks *who* is
+        // holding a card, which a per-device total cannot answer.
+        let device_reservations = self.store.job_device_reservations()?;
         let mut holders: HashMap<&str, usize> = HashMap::new();
         for (_, model_key, _, _) in &reservations {
             *holders.entry(model_key.as_str()).or_insert(0) += 1;
@@ -1349,6 +1403,10 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                 class: facts.class,
                 ram_bytes: *ram_bytes,
                 vram_bytes: *vram_bytes,
+                device_bytes: device_reservations
+                    .get(&job.job_id)
+                    .cloned()
+                    .unwrap_or_default(),
                 preempted,
                 started_at_ms,
             });
@@ -1376,7 +1434,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         victim_job_id: &str,
         claimant: &Candidate,
         now: u64,
-        resource: admission::Resource,
+        resource: &admission::Resource,
         shortfall_bytes: u64,
         snapshot: &little_monkey_lib::runtime_adapter::HardwareSnapshot,
     ) -> Result<bool, String> {
@@ -1623,7 +1681,11 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
     fn record_usage(&self, job: &DaemonJob, now: u64) {
         use little_monkey_lib::process_table::ProcessKind;
 
-        let Some(pid) = self.active.get(&job.job_id).map(|active| active.process.id()) else {
+        let Some(pid) = self
+            .active
+            .get(&job.job_id)
+            .map(|active| active.process.id())
+        else {
             return;
         };
         let Ok(now_ms) = i64::try_from(now) else {
@@ -1939,6 +2001,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         let mut footprints = HashMap::new();
         let reservation = self.facts_for(job, &mut footprints).reservation;
         let resident = self.committed()?;
+        let resident_devices = self.committed_devices()?;
         let already = reservation
             .model_key()
             .and_then(|key| resident.get(key))
@@ -1946,22 +2009,29 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         let outcome = match already {
             // Another holder kept the model resident, so there is nothing to buy
             // back — recording the same claim is what keeps it reserved until the
-            // last of them exits.
-            Some(paid) => Fit::Fits { claim: paid },
+            // last of them exits. The per-device rows are already there for the
+            // same reason, so this re-records only the pooled figure.
+            Some(paid) => Fit::Fits {
+                claim: paid,
+                devices: Vec::new(),
+            },
             None => admission::fit(
                 &reservation,
                 &sum_reservations(&resident),
+                &resident_devices,
                 &snapshot,
                 self.profile_limits
                     .memory_ceiling_bytes(snapshot.total_ram_bytes),
             ),
         };
         Ok(match outcome {
-            Fit::Fits { claim } => Reacquired::Fits(
-                reservation
-                    .model_key()
-                    .map(|key| (key.to_string(), claim)),
-            ),
+            Fit::Fits { claim, devices } => {
+                Reacquired::Fits(reservation.model_key().map(|key| AdmittedClaim {
+                    model_key: key.to_string(),
+                    memory: claim,
+                    devices,
+                }))
+            }
             Fit::Unmeasured => Reacquired::Fits(None),
             Fit::Hold {
                 resource,
@@ -1996,7 +2066,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         &mut self,
         job: &DaemonJob,
         now: u64,
-        resource: admission::Resource,
+        resource: &admission::Resource,
         shortfall_bytes: u64,
     ) -> Result<(), String> {
         let reason = format!(
@@ -2015,7 +2085,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         &mut self,
         job: DaemonJob,
         now: u64,
-        claim: Option<&(String, MemoryRequirement)>,
+        claim: Option<&AdmittedClaim>,
     ) -> Result<(), String> {
         let run_id = job
             .run_id
@@ -2041,12 +2111,13 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                     Some(process_id),
                     None,
                 )?;
-                if let Some((model_key, claim)) = claim {
+                if let Some(claim) = claim {
                     self.store.record_reservation(
                         &job.job_id,
-                        model_key,
-                        claim.ram_bytes,
-                        claim.vram_bytes,
+                        &claim.model_key,
+                        claim.memory.ram_bytes,
+                        claim.memory.vram_bytes,
+                        &claim.devices,
                     )?;
                 }
                 self.active
@@ -2201,11 +2272,12 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                 engine_id: "monkey-daemon-resume".to_string(),
             })?;
             match claim {
-                Some((model_key, claim)) => self.store.record_reservation(
+                Some(claim) => self.store.record_reservation(
                     job_id,
-                    &model_key,
-                    claim.ram_bytes,
-                    claim.vram_bytes,
+                    &claim.model_key,
+                    claim.memory.ram_bytes,
+                    claim.memory.vram_bytes,
+                    &claim.devices,
                 )?,
                 // Nothing to re-claim, but a stale hold reason from an earlier
                 // failed resume would still be sitting on the row.
@@ -4026,7 +4098,9 @@ pub(super) mod tests {
         assert_eq!(signal.state, scheduler::BackpressureState::Closed);
         assert!(!signal.accepting);
         assert_eq!(signal.reason, Some(scheduler::BACKPRESSURE_QUEUE_FULL));
-        assert!(signal.refusal().is_some_and(|text| text.contains("retry after")));
+        assert!(signal
+            .refusal()
+            .is_some_and(|text| text.contains("retry after")));
 
         // One tick holds job-b for memory, which is a different sentence: the
         // queue has room, the machine does not.

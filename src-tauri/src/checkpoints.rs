@@ -47,9 +47,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-
-use crate::AppState;
 use crate::profiles::ProfileScopedPaths;
+use crate::AppState;
 
 /// How many finished checkpoints to keep on disk before pruning the oldest,
 /// when the caller doesn't pass an explicit `max_keep`.
@@ -271,7 +270,9 @@ pub struct ResumeState {
 /// enumerating is [`ExternalEffectKind::compensator`]: the set is not a list of
 /// worries, it is a list of things with a stated undo or a stated reason there
 /// is none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExternalEffectKind {
     /// `tool_run_shell` or a background shell ran an arbitrary command.
@@ -1511,14 +1512,27 @@ const MAX_DIFF_BYTES: usize = 2_000_000;
 /// backtracks it into a sequence of context/added/removed lines. Pure and
 /// deterministic — no filesystem access — so it's directly unit-testable.
 pub fn diff_lines(before: &str, after: &str) -> DiffResult {
-    let before_lines: Vec<&str> = if before.is_empty() { Vec::new() } else { before.split('\n').collect() };
-    let after_lines: Vec<&str> = if after.is_empty() { Vec::new() } else { after.split('\n').collect() };
+    let before_lines: Vec<&str> = if before.is_empty() {
+        Vec::new()
+    } else {
+        before.split('\n').collect()
+    };
+    let after_lines: Vec<&str> = if after.is_empty() {
+        Vec::new()
+    } else {
+        after.split('\n').collect()
+    };
 
     let n = before_lines.len();
     let m = after_lines.len();
 
     if n.saturating_mul(m) > MAX_DIFF_CELLS {
-        return DiffResult { lines: Vec::new(), truncated: true, added: 0, removed: 0 };
+        return DiffResult {
+            lines: Vec::new(),
+            truncated: true,
+            added: 0,
+            removed: 0,
+        };
     }
 
     // lcs[i][j] = length of the longest common subsequence of
@@ -1540,31 +1554,51 @@ pub fn diff_lines(before: &str, after: &str) -> DiffResult {
     let (mut i, mut j) = (0usize, 0usize);
     while i < n && j < m {
         if before_lines[i] == after_lines[j] {
-            lines.push(DiffLine { kind: DiffLineKind::Context, text: before_lines[i].to_string() });
+            lines.push(DiffLine {
+                kind: DiffLineKind::Context,
+                text: before_lines[i].to_string(),
+            });
             i += 1;
             j += 1;
         } else if lcs[i + 1][j] >= lcs[i][j + 1] {
-            lines.push(DiffLine { kind: DiffLineKind::Removed, text: before_lines[i].to_string() });
+            lines.push(DiffLine {
+                kind: DiffLineKind::Removed,
+                text: before_lines[i].to_string(),
+            });
             removed += 1;
             i += 1;
         } else {
-            lines.push(DiffLine { kind: DiffLineKind::Added, text: after_lines[j].to_string() });
+            lines.push(DiffLine {
+                kind: DiffLineKind::Added,
+                text: after_lines[j].to_string(),
+            });
             added += 1;
             j += 1;
         }
     }
     while i < n {
-        lines.push(DiffLine { kind: DiffLineKind::Removed, text: before_lines[i].to_string() });
+        lines.push(DiffLine {
+            kind: DiffLineKind::Removed,
+            text: before_lines[i].to_string(),
+        });
         removed += 1;
         i += 1;
     }
     while j < m {
-        lines.push(DiffLine { kind: DiffLineKind::Added, text: after_lines[j].to_string() });
+        lines.push(DiffLine {
+            kind: DiffLineKind::Added,
+            text: after_lines[j].to_string(),
+        });
         added += 1;
         j += 1;
     }
 
-    DiffResult { lines, truncated: false, added, removed }
+    DiffResult {
+        lines,
+        truncated: false,
+        added,
+        removed,
+    }
 }
 
 /// Where a [`FilePreviewEntry`]'s "after" content came from — callers use
@@ -1620,7 +1654,10 @@ pub struct FilePreviewEntry {
 
 /// Reads checkpoint entry `entry`'s pre-turn ("before") content, if any.
 fn read_before(dir: &Path, entry: &CheckpointEntry) -> Option<Vec<u8>> {
-    entry.backup.as_ref().and_then(|name| std::fs::read(dir.join(name)).ok())
+    entry
+        .backup
+        .as_ref()
+        .and_then(|name| std::fs::read(dir.join(name)).ok())
 }
 
 /// Manifest schema version from which `end_impl` always attempts an "after"
@@ -1681,7 +1718,12 @@ fn read_after(
 /// `manifest_version` decides how much [`read_after`]'s fallback chain can
 /// trust a missing snapshot — see that function's and
 /// [`AFTER_CAPTURE_MANIFEST_VERSION`]'s doc comments.
-fn build_file_preview(dir: &Path, entry: &CheckpointEntry, reverted: bool, manifest_version: u8) -> FilePreviewEntry {
+fn build_file_preview(
+    dir: &Path,
+    entry: &CheckpointEntry,
+    reverted: bool,
+    manifest_version: u8,
+) -> FilePreviewEntry {
     let before = read_before(dir, entry);
     let after_capture_attempted = manifest_version >= AFTER_CAPTURE_MANIFEST_VERSION;
     let (after, after_source) = read_after(dir, entry, reverted, after_capture_attempted);
@@ -1692,13 +1734,17 @@ fn build_file_preview(dir: &Path, entry: &CheckpointEntry, reverted: bool, manif
 
     let before_text = before.as_deref().and_then(|b| std::str::from_utf8(b).ok());
     let after_text = after.as_deref().and_then(|b| std::str::from_utf8(b).ok());
-    let binary = (before.is_some() && before_text.is_none()) || (after.is_some() && after_text.is_none());
+    let binary =
+        (before.is_some() && before_text.is_none()) || (after.is_some() && after_text.is_none());
 
     // Only `Captured`/`Redo` are exact snapshots taken AT the relevant
     // moment; `Live`/`Unavailable` are best-effort or empty, so a `None`
     // paired with either of those is genuinely unknown, never a confirmed
     // deletion.
-    let after_confident = matches!(after_source, SnapshotSource::Captured | SnapshotSource::Redo);
+    let after_confident = matches!(
+        after_source,
+        SnapshotSource::Captured | SnapshotSource::Redo
+    );
 
     let status = match (existed_before, &after) {
         (true, Some(after_bytes_vec)) => {
@@ -1731,9 +1777,17 @@ fn build_file_preview(dir: &Path, entry: &CheckpointEntry, reverted: bool, manif
     let diff = if binary || status == FileChangeStatus::Unknown {
         None
     } else if before_bytes.max(after_bytes) > MAX_DIFF_BYTES {
-        Some(DiffResult { lines: Vec::new(), truncated: true, added: 0, removed: 0 })
+        Some(DiffResult {
+            lines: Vec::new(),
+            truncated: true,
+            added: 0,
+            removed: 0,
+        })
     } else {
-        Some(diff_lines(before_text.unwrap_or(""), after_text.unwrap_or("")))
+        Some(diff_lines(
+            before_text.unwrap_or(""),
+            after_text.unwrap_or(""),
+        ))
     };
 
     FilePreviewEntry {
@@ -1823,7 +1877,11 @@ pub struct CheckpointCompareResult {
 /// each with its own per-checkpoint preview plus a direct A-vs-B diff of
 /// their resulting content. Entirely read-only — reads each checkpoint's
 /// manifest and backups independently; never restores either one.
-pub fn compare_impl(base_dir: &Path, id_a: &str, id_b: &str) -> Result<CheckpointCompareResult, String> {
+pub fn compare_impl(
+    base_dir: &Path,
+    id_a: &str,
+    id_b: &str,
+) -> Result<CheckpointCompareResult, String> {
     let preview_a = preview_impl(base_dir, id_a)?;
     let preview_b = preview_impl(base_dir, id_b)?;
 
@@ -1845,34 +1903,64 @@ pub fn compare_impl(base_dir: &Path, id_a: &str, id_b: &str) -> Result<Checkpoin
             let a = preview_a.files.iter().find(|f| f.path == path).cloned();
             let b = preview_b.files.iter().find(|f| f.path == path).cloned();
 
-            let a_text = manifest_a.entries.iter().find(|e| e.path == path).and_then(|e| {
-                let attempted = manifest_a.version >= AFTER_CAPTURE_MANIFEST_VERSION;
-                let (bytes, _src) = read_after(&dir_a, e, manifest_a.reverted, attempted);
-                bytes.and_then(|b| String::from_utf8(b).ok())
-            });
-            let b_text = manifest_b.entries.iter().find(|e| e.path == path).and_then(|e| {
-                let attempted = manifest_b.version >= AFTER_CAPTURE_MANIFEST_VERSION;
-                let (bytes, _src) = read_after(&dir_b, e, manifest_b.reverted, attempted);
-                bytes.and_then(|b| String::from_utf8(b).ok())
-            });
+            let a_text = manifest_a
+                .entries
+                .iter()
+                .find(|e| e.path == path)
+                .and_then(|e| {
+                    let attempted = manifest_a.version >= AFTER_CAPTURE_MANIFEST_VERSION;
+                    let (bytes, _src) = read_after(&dir_a, e, manifest_a.reverted, attempted);
+                    bytes.and_then(|b| String::from_utf8(b).ok())
+                });
+            let b_text = manifest_b
+                .entries
+                .iter()
+                .find(|e| e.path == path)
+                .and_then(|e| {
+                    let attempted = manifest_b.version >= AFTER_CAPTURE_MANIFEST_VERSION;
+                    let (bytes, _src) = read_after(&dir_b, e, manifest_b.reverted, attempted);
+                    bytes.and_then(|b| String::from_utf8(b).ok())
+                });
 
             let between = match (&a_text, &b_text) {
-                (Some(ta), Some(tb)) if ta.len().max(tb.len()) <= MAX_DIFF_BYTES => Some(diff_lines(ta, tb)),
-                (Some(_), Some(_)) => Some(DiffResult { lines: Vec::new(), truncated: true, added: 0, removed: 0 }),
+                (Some(ta), Some(tb)) if ta.len().max(tb.len()) <= MAX_DIFF_BYTES => {
+                    Some(diff_lines(ta, tb))
+                }
+                (Some(_), Some(_)) => Some(DiffResult {
+                    lines: Vec::new(),
+                    truncated: true,
+                    added: 0,
+                    removed: 0,
+                }),
                 _ => None,
             };
 
-            CompareFileEntry { path, in_a: a.is_some(), in_b: b.is_some(), a, b, between }
+            CompareFileEntry {
+                path,
+                in_a: a.is_some(),
+                in_b: b.is_some(),
+                a,
+                b,
+                between,
+            }
         })
         .collect();
 
-    Ok(CheckpointCompareResult { a: preview_a, b: preview_b, files })
+    Ok(CheckpointCompareResult {
+        a: preview_a,
+        b: preview_b,
+        files,
+    })
 }
 
 /// Compares checkpoints `id_a` and `id_b` without restoring either one. Like
 /// `checkpoint_preview`, read-only UI plumbing, not permission-gated.
 #[tauri::command]
-pub fn checkpoint_compare(app: tauri::AppHandle, id_a: String, id_b: String) -> Result<CheckpointCompareResult, String> {
+pub fn checkpoint_compare(
+    app: tauri::AppHandle,
+    id_a: String,
+    id_b: String,
+) -> Result<CheckpointCompareResult, String> {
     compare_impl(&checkpoints_base_dir(&app)?, &id_a, &id_b)
 }
 
@@ -2056,7 +2144,11 @@ pub fn simulate_restore_impl(base_dir: &Path, id: &str) -> Result<RestoreSimulat
                 SnapshotSource::Live | SnapshotSource::Unavailable => false,
             };
 
-            RestorePlanEntry { path: entry.path.clone(), action, drifted }
+            RestorePlanEntry {
+                path: entry.path.clone(),
+                action,
+                drifted,
+            }
         })
         .collect();
 
@@ -2072,7 +2164,10 @@ pub fn simulate_restore_impl(base_dir: &Path, id: &str) -> Result<RestoreSimulat
 /// rollback-simulation step the UI runs before `checkpoint_revert`. Like
 /// `checkpoint_preview`, read-only and not permission-gated.
 #[tauri::command]
-pub fn checkpoint_simulate_restore(app: tauri::AppHandle, id: String) -> Result<RestoreSimulation, String> {
+pub fn checkpoint_simulate_restore(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<RestoreSimulation, String> {
     simulate_restore_impl(&checkpoints_base_dir(&app)?, &id)
 }
 
@@ -3920,7 +4015,10 @@ mod tests {
         assert_eq!(result.removed, 0);
         assert_eq!(
             result.lines.last(),
-            Some(&DiffLine { kind: DiffLineKind::Added, text: "c".to_string() })
+            Some(&DiffLine {
+                kind: DiffLineKind::Added,
+                text: "c".to_string()
+            })
         );
     }
 
@@ -3929,12 +4027,10 @@ mod tests {
         let result = diff_lines("a\nb\nc", "a\nc");
         assert_eq!(result.added, 0);
         assert_eq!(result.removed, 1);
-        assert!(
-            result
-                .lines
-                .iter()
-                .any(|l| l.kind == DiffLineKind::Removed && l.text == "b")
-        );
+        assert!(result
+            .lines
+            .iter()
+            .any(|l| l.kind == DiffLineKind::Removed && l.text == "b"));
     }
 
     #[test]
@@ -3969,10 +4065,19 @@ mod tests {
     #[test]
     fn diff_lines_truncates_when_the_input_is_too_large_to_diff_cheaply() {
         // Comfortably over MAX_DIFF_CELLS (4,000,000): 2100 * 2100 > 4.4M.
-        let before = (0..2100).map(|i| format!("before-{i}")).collect::<Vec<_>>().join("\n");
-        let after = (0..2100).map(|i| format!("after-{i}")).collect::<Vec<_>>().join("\n");
+        let before = (0..2100)
+            .map(|i| format!("before-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let after = (0..2100)
+            .map(|i| format!("after-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let result = diff_lines(&before, &after);
-        assert!(result.truncated, "oversized diff must report truncated: true");
+        assert!(
+            result.truncated,
+            "oversized diff must report truncated: true"
+        );
         assert!(result.lines.is_empty());
     }
 
@@ -4004,19 +4109,31 @@ mod tests {
         let preview = preview_impl(&base.path, &id).unwrap();
         assert_eq!(preview.files.len(), 3);
 
-        let modified_entry = preview.files.iter().find(|f| f.path.ends_with("modified.txt")).unwrap();
+        let modified_entry = preview
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("modified.txt"))
+            .unwrap();
         assert_eq!(modified_entry.status, FileChangeStatus::Modified);
         assert_eq!(modified_entry.after_source, SnapshotSource::Captured);
         let diff = modified_entry.diff.as_ref().unwrap();
         assert_eq!(diff.added, 1);
         assert_eq!(diff.removed, 1);
 
-        let created_entry = preview.files.iter().find(|f| f.path.ends_with("created.txt")).unwrap();
+        let created_entry = preview
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("created.txt"))
+            .unwrap();
         assert_eq!(created_entry.status, FileChangeStatus::Added);
         assert_eq!(created_entry.after_source, SnapshotSource::Captured);
         assert_eq!(created_entry.diff.as_ref().unwrap().added, 1);
 
-        let deleted_entry = preview.files.iter().find(|f| f.path.ends_with("deleted.txt")).unwrap();
+        let deleted_entry = preview
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("deleted.txt"))
+            .unwrap();
         assert_eq!(
             deleted_entry.status,
             FileChangeStatus::Deleted,
@@ -4081,7 +4198,10 @@ mod tests {
         let id = "00000000-0000-4000-8000-00000000nofil";
         let dir = base.path.join(id);
         std::fs::create_dir_all(&dir).unwrap();
-        let raw = format!(r#"[{{"path":{:?},"backup":null}}]"#, missing.to_string_lossy());
+        let raw = format!(
+            r#"[{{"path":{:?},"backup":null}}]"#,
+            missing.to_string_lossy()
+        );
         std::fs::write(dir.join(MANIFEST_FILE), raw).unwrap();
 
         let preview = preview_impl(&base.path, id).unwrap();
@@ -4117,17 +4237,36 @@ mod tests {
         end_impl(&state, &id_b).unwrap();
 
         let compare = compare_impl(&base.path, &id_a, &id_b).unwrap();
-        assert_eq!(compare.files.len(), 3, "must be the union, not intersection, of touched files");
+        assert_eq!(
+            compare.files.len(),
+            3,
+            "must be the union, not intersection, of touched files"
+        );
 
-        let only_a_entry = compare.files.iter().find(|f| f.path.ends_with("only_a.txt")).unwrap();
+        let only_a_entry = compare
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("only_a.txt"))
+            .unwrap();
         assert!(only_a_entry.in_a && !only_a_entry.in_b);
 
-        let only_b_entry = compare.files.iter().find(|f| f.path.ends_with("only_b.txt")).unwrap();
+        let only_b_entry = compare
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("only_b.txt"))
+            .unwrap();
         assert!(!only_b_entry.in_a && only_b_entry.in_b);
 
-        let shared_entry = compare.files.iter().find(|f| f.path.ends_with("shared.txt")).unwrap();
+        let shared_entry = compare
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("shared.txt"))
+            .unwrap();
         assert!(shared_entry.in_a && shared_entry.in_b);
-        let between = shared_entry.between.as_ref().expect("both sides have text content");
+        let between = shared_entry
+            .between
+            .as_ref()
+            .expect("both sides have text content");
         // A's resulting content was "v2", B's was "v3" — one line differs.
         assert_eq!(between.added, 1);
         assert_eq!(between.removed, 1);
@@ -4158,11 +4297,22 @@ mod tests {
         assert!(!sim.already_reverted);
         assert!(!sim.needs_reconciliation, "no shell command ran");
 
-        let existing_plan = sim.files.iter().find(|f| f.path.ends_with("existing.txt")).unwrap();
+        let existing_plan = sim
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("existing.txt"))
+            .unwrap();
         assert_eq!(existing_plan.action, RestoreAction::Restore);
-        assert!(!existing_plan.drifted, "nothing touched the file since the turn ended");
+        assert!(
+            !existing_plan.drifted,
+            "nothing touched the file since the turn ended"
+        );
 
-        let created_plan = sim.files.iter().find(|f| f.path.ends_with("created.txt")).unwrap();
+        let created_plan = sim
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("created.txt"))
+            .unwrap();
         assert_eq!(created_plan.action, RestoreAction::Delete);
         assert!(!created_plan.drifted);
     }
@@ -4186,7 +4336,11 @@ mod tests {
         std::fs::write(&file, "original").unwrap();
 
         let sim = simulate_restore_impl(&base.path, &id).unwrap();
-        let plan = sim.files.iter().find(|f| f.path.ends_with("f.txt")).unwrap();
+        let plan = sim
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("f.txt"))
+            .unwrap();
         assert_eq!(plan.action, RestoreAction::NoOp);
     }
 
@@ -4209,7 +4363,11 @@ mod tests {
         std::fs::write(&file, "someone-elses-later-edit").unwrap();
 
         let sim = simulate_restore_impl(&base.path, &id).unwrap();
-        let plan = sim.files.iter().find(|f| f.path.ends_with("f.txt")).unwrap();
+        let plan = sim
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("f.txt"))
+            .unwrap();
         assert_eq!(plan.action, RestoreAction::Restore);
         assert!(
             plan.drifted,
@@ -4470,23 +4628,65 @@ mod tests {
     /// failing to compile.
     #[test]
     fn enum_wire_format_matches_the_hand_maintained_frontend_types() {
-        assert_eq!(serde_json::to_string(&DiffLineKind::Context).unwrap(), "\"context\"");
-        assert_eq!(serde_json::to_string(&DiffLineKind::Added).unwrap(), "\"added\"");
-        assert_eq!(serde_json::to_string(&DiffLineKind::Removed).unwrap(), "\"removed\"");
+        assert_eq!(
+            serde_json::to_string(&DiffLineKind::Context).unwrap(),
+            "\"context\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DiffLineKind::Added).unwrap(),
+            "\"added\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DiffLineKind::Removed).unwrap(),
+            "\"removed\""
+        );
 
-        assert_eq!(serde_json::to_string(&SnapshotSource::Captured).unwrap(), "\"captured\"");
-        assert_eq!(serde_json::to_string(&SnapshotSource::Redo).unwrap(), "\"redo\"");
-        assert_eq!(serde_json::to_string(&SnapshotSource::Live).unwrap(), "\"live\"");
-        assert_eq!(serde_json::to_string(&SnapshotSource::Unavailable).unwrap(), "\"unavailable\"");
+        assert_eq!(
+            serde_json::to_string(&SnapshotSource::Captured).unwrap(),
+            "\"captured\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapshotSource::Redo).unwrap(),
+            "\"redo\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapshotSource::Live).unwrap(),
+            "\"live\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapshotSource::Unavailable).unwrap(),
+            "\"unavailable\""
+        );
 
-        assert_eq!(serde_json::to_string(&FileChangeStatus::Added).unwrap(), "\"added\"");
-        assert_eq!(serde_json::to_string(&FileChangeStatus::Modified).unwrap(), "\"modified\"");
-        assert_eq!(serde_json::to_string(&FileChangeStatus::Deleted).unwrap(), "\"deleted\"");
-        assert_eq!(serde_json::to_string(&FileChangeStatus::Unchanged).unwrap(), "\"unchanged\"");
-        assert_eq!(serde_json::to_string(&FileChangeStatus::Unknown).unwrap(), "\"unknown\"");
+        assert_eq!(
+            serde_json::to_string(&FileChangeStatus::Added).unwrap(),
+            "\"added\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FileChangeStatus::Modified).unwrap(),
+            "\"modified\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FileChangeStatus::Deleted).unwrap(),
+            "\"deleted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FileChangeStatus::Unchanged).unwrap(),
+            "\"unchanged\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FileChangeStatus::Unknown).unwrap(),
+            "\"unknown\""
+        );
 
-        assert_eq!(serde_json::to_string(&RestoreAction::Restore).unwrap(), "\"restore\"");
-        assert_eq!(serde_json::to_string(&RestoreAction::Delete).unwrap(), "\"delete\"");
+        assert_eq!(
+            serde_json::to_string(&RestoreAction::Restore).unwrap(),
+            "\"restore\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RestoreAction::Delete).unwrap(),
+            "\"delete\""
+        );
         assert_eq!(
             serde_json::to_string(&RestoreAction::NoOp).unwrap(),
             "\"noOp\"",

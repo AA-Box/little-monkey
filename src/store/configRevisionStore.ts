@@ -13,6 +13,14 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 export const PROMPT_ENTRY_KIND = "prompt";
 export const PROMPT_LIBRARY_KIND = "prompt-library";
 export const WORKFLOW_KIND = "workflow";
+/** One `MONKEY.md` rules/memory file — `rules::RULES_REVISION_KIND`. */
+export const RULES_KIND = "rules";
+/** The whole `mcp_servers.json` document — `mcp::MCP_CONFIG_REVISION_KIND`. */
+export const MCP_CONFIG_KIND = "mcp-config";
+/** One configured MCP server — `mcp::MCP_SERVER_REVISION_KIND`. */
+export const MCP_SERVER_KIND = "mcp-server";
+/** The one entity id the MCP config document is filed under. */
+export const MCP_CONFIG_ENTITY = "servers";
 
 /** The branch every entity starts on (`config_revisions::DEFAULT_BRANCH`). */
 export const DEFAULT_BRANCH = "main";
@@ -147,4 +155,47 @@ export async function branchFromRevision(
  * form can reject a bad name before a round trip. */
 export function isValidBranchName(name: string): boolean {
   return /^[a-z0-9._-]{1,48}$/.test(name);
+}
+
+/**
+ * The revision entity id for one rules file.
+ *
+ * Asked of the backend rather than derived here, and that is deliberate: the id
+ * is built from the file's *resolved* path (two attached roots can both be
+ * labelled `src`), and re-deriving that rule in TypeScript is how a conflict
+ * check ends up silently checking a different file's log.
+ */
+export async function rulesRevisionEntity(
+  scope: "global" | "project",
+  rootPath: string | null,
+): Promise<string | null> {
+  if (unavailable()) return null;
+  return await invoke<string>("rules_revision_entity", { scope, rootPath });
+}
+
+/** The revision a rules editor should save against, or `null` if none yet. */
+export async function rulesCurrentRevision(
+  scope: "global" | "project",
+  rootPath: string | null,
+): Promise<string | null> {
+  if (unavailable()) return null;
+  return await invoke<string | null>("rules_current_revision", { scope, rootPath });
+}
+
+/** The revision an MCP config mutation should save against. */
+export async function mcpCurrentRevision(): Promise<string | null> {
+  if (unavailable()) return null;
+  return await invoke<string | null>("mcp_current_revision");
+}
+
+/**
+ * Puts a whole `mcp_servers.json` snapshot back, through the ordinary save path
+ * so the restore is itself recorded.
+ *
+ * The snapshot is validated backend-side before anything is written, so a
+ * hand-edited revision is refused rather than installed and discovered at the
+ * next connect.
+ */
+export async function restoreMcpConfig(snapshot: string): Promise<string> {
+  return await invoke<string>("mcp_restore_config", { snapshot });
 }

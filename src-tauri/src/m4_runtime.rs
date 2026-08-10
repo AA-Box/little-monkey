@@ -878,7 +878,9 @@ impl WorkflowHumanApprovalBroker for InMemoryWorkflowApprovalBroker {
         let now = system_now_unix_ms();
         let mut records = lock(&self.records, "workflow approval broker")?;
         Self::purge_expired(&mut records, now);
-        Ok(records.get(challenge_id).map(|record| record.challenge.clone()))
+        Ok(records
+            .get(challenge_id)
+            .map(|record| record.challenge.clone()))
     }
 
     fn decide(&self, challenge_id: &str, approved: bool) -> Result<(), String> {
@@ -2563,7 +2565,7 @@ mod tests {
                 timeout_secs: Some(30),
             }],
         };
-        crate::mcp::save_config_impl(&directory.0.join("mcp_servers.json"), &config).unwrap();
+        crate::mcp::save_config_impl(&directory.0.join("mcp_servers.json"), &config, None).unwrap();
         let catalog = production_workflow_capabilities(&directory.0).unwrap();
         assert_eq!(
             catalog.mcp_tools.get("fixture:lookup"),
