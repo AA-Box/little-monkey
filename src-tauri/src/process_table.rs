@@ -80,6 +80,45 @@ pub enum ProcessKind {
     BrowserSession,
 }
 
+/// The wall-clock budget the four WebView kinds carry by default.
+///
+/// # Why this number, and why one number for all four
+///
+/// Six hours. A `chat_turn`, a `subagent`, a `crew_member` and a `side_task` are
+/// the same shape of process — a WebView agent loop issuing an unbounded number
+/// of bounded tool calls — so giving them four different numbers would be
+/// inventing policy where there is only one question: how long may a loop keep
+/// *starting new work* before something concludes it is not going to stop?
+///
+/// Six hours answers that and nothing else. The longest legitimate run this app
+/// produces is a long agentic session, which is minutes to an hour of wall time
+/// even with hundreds of tool calls; a runaway loop has no bound at all. Anything
+/// between those is unaffected, which is the property a default has to have.
+///
+/// # The precondition this had to clear
+///
+/// `processWallBudget.ts` shipped inert on a stated reason, not on timidity:
+/// [`ProcessState`] has no state for "parked waiting on a human". A turn blocked
+/// on an unanswered permission dialog reads as `Running` and its `started_at_ms`
+/// keeps ageing, so a *tight* default would kill a turn for the user's own
+/// slowness — "the app cancelled my work while I was reading the prompt", which
+/// is worse than an unbounded turn.
+///
+/// That argument is an argument against a tight default, and it is why this one is
+/// not tight. Six hours of an unanswered dialog is not a user reading a prompt; it
+/// is a session nobody came back to, and ending it is the correct outcome rather
+/// than the regrettable one. Suspended time counting against the budget (see
+/// `processWallBudget.ts`) is bounded by the same reasoning.
+///
+/// # It is a floor, not a ceiling
+///
+/// The latch is observed at a safe point, so the real bound is this plus the
+/// longest tool timeout in flight — 120 s for a shell, 300 s for a verify. This
+/// bounds how long a runaway keeps starting new work. It is not a hard kill and
+/// must not be documented as one: a hard kill needs an OS process to signal,
+/// which is exactly what these kinds do not have.
+pub const WEBVIEW_WALL_BUDGET_MS: u64 = 6 * 60 * 60 * 1_000;
+
 impl ProcessKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -384,19 +423,30 @@ impl ProcessKind {
             // projection anyway, so claiming one would only mislead a reader
             // between admission and the first tick.
             ProcessKind::DaemonJob => ProcessLimits::default(),
-            // Nothing bounds these per process. A chat turn, a subagent and a
-            // crew member each run an unbounded number of bounded tool calls; a
-            // workflow run and node carry the executor's own per-node budgets,
-            // which are not these fields; and a remote run records that a
-            // controller *asked* for work rather than the work itself, so the
-            // daemon job it spawns is what carries limits.
+            // The four WebView kinds. Each runs an unbounded number of *bounded*
+            // tool calls, so the tools were capped and the process issuing them
+            // was not — `processWallBudget.ts` built the enforcement and then
+            // shipped it inert, because nothing chose a number.
+            //
+            // This chooses one. [`WEBVIEW_WALL_BUDGET_MS`] explains the value; what
+            // matters here is that it is a *class* default, seeded into every row
+            // at admission, and that an explicit budget from the caller still wins
+            // — which is how the wall-budget setting overrides it, and how a
+            // caller turns it off entirely.
             ProcessKind::ChatTurn
             | ProcessKind::Subagent
             | ProcessKind::CrewMember
-            | ProcessKind::WorkflowRun
-            | ProcessKind::WorkflowNode
-            | ProcessKind::RemoteRun
-            | ProcessKind::SideTask => ProcessLimits::default(),
+            | ProcessKind::SideTask => ProcessLimits {
+                max_wall_ms: Some(WEBVIEW_WALL_BUDGET_MS),
+                ..ProcessLimits::default()
+            },
+            // Still nothing per process. A workflow run and node carry the
+            // executor's own per-node budgets, which are not these fields; and a
+            // remote run records that a controller *asked* for work rather than
+            // the work itself, so the daemon job it spawns is what carries limits.
+            ProcessKind::WorkflowRun | ProcessKind::WorkflowNode | ProcessKind::RemoteRun => {
+                ProcessLimits::default()
+            }
             // The second kind with a real, enforced wall bound, and the only
             // desktop one. `browser_worker`'s watchdog already reclaims a
             // session past `BrowserLimits::max_session_ms` on a 30-second sweep;
@@ -1917,14 +1967,10 @@ impl<'a> ProcessTable<'a> {
         }
         for (destination, requests) in &drain.seen {
             transaction.execute(
-                "INSERT INTO egress_destinations
-                     (process_id, scheme, host, port, requests, first_seen_ms, last_seen_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-                 ON CONFLICT(process_id, scheme, host, port) DO UPDATE SET
-                     requests = requests + excluded.requests,
-                     last_seen_ms = MAX(last_seen_ms, excluded.last_seen_ms)",
+                UPSERT_DESTINATION_SQL,
                 params![
                     process_id,
+                    None::<&str>,
                     destination.scheme,
                     destination.host,
                     i64::from(destination.port),
@@ -2728,6 +2774,134 @@ pub struct ProcessEgressDestinations {
 
 /// One destination a process's allowed egress reached.
 ///
+/// The one insert both destination writers use.
+///
+/// `ON CONFLICT` names the same `COALESCE` expressions as
+/// `egress_destinations_key_idx`, which is what a nullable attribution column
+/// costs: SQLite permits NULLs in a non-`INTEGER` primary key, so the key that
+/// used to deduplicate these rows would silently stop doing so. Targeting the
+/// index by its expressions restores exactly the old behaviour for a process row
+/// and gives the unattributed rows the same.
+const UPSERT_DESTINATION_SQL: &str = "INSERT INTO egress_destinations
+     (process_id, unattributed_reason, scheme, host, port, requests, first_seen_ms, last_seen_ms)
+ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+ ON CONFLICT(COALESCE(process_id, ''), COALESCE(unattributed_reason, ''), scheme, host, port)
+ DO UPDATE SET
+     requests = requests + excluded.requests,
+     last_seen_ms = MAX(last_seen_ms, excluded.last_seen_ms)";
+
+impl ProcessTable<'_> {
+    /// Record where egress that belongs to *no run* went (roadmap K5).
+    ///
+    /// The counterpart to [`Self::add_egress_destinations`], and deliberately the
+    /// same table: "which hosts did this app reach" is one question, and splitting
+    /// its answer across two surfaces by whether a run happened to be in scope
+    /// would make every reader join twice to ask it.
+    ///
+    /// `reason` is [`crate::run_scope::Unattributed::code`]'s own string — the
+    /// vocabulary that already persists in `UNATTRIBUTED_EGRESS`'s labels and in
+    /// the permission ledger's `attribution` — plus `egress.no-scope` and
+    /// `egress.run-without-process`, the two cases that enum does not cover.
+    /// Nothing new is invented here, so a reader correlating volume with
+    /// destinations is matching on one vocabulary rather than two.
+    ///
+    /// Additive and all-or-nothing, exactly like the attributed writer, and for
+    /// the same reason: the drain that produced this is consumed, so a
+    /// half-written flush could not be retried without double-counting.
+    pub fn add_unattributed_egress_destinations(
+        &self,
+        reason: &str,
+        drain: &crate::run_scope::DestinationDrain,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        if drain.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        if drain.overflowed > 0 {
+            transaction.execute(
+                "INSERT INTO unattributed_egress_overflow (reason, dropped, updated_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(reason) DO UPDATE SET
+                     dropped = dropped + excluded.dropped,
+                     updated_at_ms = excluded.updated_at_ms",
+                params![reason, drain.overflowed as i64, now_ms],
+            )?;
+        }
+        for (destination, requests) in &drain.seen {
+            transaction.execute(
+                UPSERT_DESTINATION_SQL,
+                params![
+                    None::<&str>,
+                    reason,
+                    destination.scheme,
+                    destination.host,
+                    i64::from(destination.port),
+                    *requests as i64,
+                    now_ms,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Every destination reached outside a run, by the reason it had no run.
+    ///
+    /// Ordered like [`Self::egress_destinations_for`]'s — noisiest first, then
+    /// host, port and scheme — so the two surfaces read the same way.
+    pub fn unattributed_egress_destinations(
+        &self,
+    ) -> ProcessTableResult<BTreeMap<String, ProcessEgressDestinations>> {
+        let mut found: BTreeMap<String, ProcessEgressDestinations> = BTreeMap::new();
+        let mut statement = self.connection.prepare(
+            "SELECT unattributed_reason, scheme, host, port, requests, first_seen_ms, last_seen_ms
+               FROM egress_destinations
+              WHERE unattributed_reason IS NOT NULL
+              ORDER BY requests DESC, host ASC, port ASC, scheme ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    EgressDestinationRow {
+                        scheme: row.get(1)?,
+                        host: row.get(2)?,
+                        port: u16::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                        requests: row.get::<_, i64>(4)? as u64,
+                        first_seen_ms: row.get(5)?,
+                        last_seen_ms: row.get(6)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (reason, destination) in rows {
+            found
+                .entry(reason)
+                .or_default()
+                .destinations
+                .push(destination);
+        }
+
+        // A second query for the same reason the attributed reader uses one: the
+        // dropped count lives elsewhere, and a reason can have overflowed without
+        // any surviving named destination — which is precisely the case a reader
+        // must not mistake for "reached nowhere".
+        let mut dropped = self.connection.prepare(
+            "SELECT reason, dropped FROM unattributed_egress_overflow WHERE dropped > 0",
+        )?;
+        let counts = dropped
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (reason, count) in counts {
+            found.entry(reason).or_default().dropped = count;
+        }
+        Ok(found)
+    }
+}
+
 /// A summary rather than an event — see `MIGRATION_V14_SQL` on why this is not
 /// part of a hash chain and does not claim to be tamper-evident.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -3871,7 +4045,14 @@ mod tests {
             .collect();
         assert_eq!(
             bounded,
-            vec![ProcessKind::BackgroundShell, ProcessKind::BrowserSession],
+            vec![
+                ProcessKind::ChatTurn,
+                ProcessKind::Subagent,
+                ProcessKind::CrewMember,
+                ProcessKind::BackgroundShell,
+                ProcessKind::SideTask,
+                ProcessKind::BrowserSession
+            ],
             "a kind gained or lost a class-level bound; if that is intended, the \
              field docs on ProcessLimits and the K4 roadmap entry have to move with it"
         );
@@ -3898,10 +4079,44 @@ mod tests {
         assert_eq!(shell.max_wall_ms, None);
         assert_eq!(shell.max_memory_bytes, None);
 
+        // The four WebView kinds all carry the same wall budget, and only that:
+        // one number for four kinds because they are the same shape of process,
+        // and four different numbers would be inventing policy.
+        for kind in [
+            ProcessKind::ChatTurn,
+            ProcessKind::Subagent,
+            ProcessKind::CrewMember,
+            ProcessKind::SideTask,
+        ] {
+            let limits = kind.default_limits();
+            assert_eq!(
+                limits.max_wall_ms,
+                Some(WEBVIEW_WALL_BUDGET_MS),
+                "{} must carry the WebView wall budget",
+                kind.as_str()
+            );
+            assert_eq!(
+                limits,
+                ProcessLimits {
+                    max_wall_ms: Some(WEBVIEW_WALL_BUDGET_MS),
+                    ..ProcessLimits::default()
+                },
+                "{} must declare the wall budget and nothing else — the other \
+                 resources still have no enforcer for this kind",
+                kind.as_str()
+            );
+        }
+        // Six hours, asserted rather than left to a reader to infer, because the
+        // *value* is the decision this slice made.
+        assert_eq!(WEBVIEW_WALL_BUDGET_MS, 6 * 60 * 60 * 1_000);
+
         // The daemon is bounded, but by its own per-job recipe rather than by its
         // class — a class default would be overwritten on the next projection and
         // would only mislead a reader in between.
         assert!(ProcessKind::DaemonJob.default_limits().is_unbounded());
+        // A workflow node and a remote run stay genuinely unbounded here.
+        assert!(ProcessKind::WorkflowNode.default_limits().is_unbounded());
+        assert!(ProcessKind::RemoteRun.default_limits().is_unbounded());
     }
 
     /// The seeding has to reach the stored row, not just the builder, and it has
@@ -3928,10 +4143,12 @@ mod tests {
             "the class limits must survive the round-trip through SQL"
         );
 
-        // A turn declares nothing, and that has to stay visible as nothing rather
-        // than inheriting another kind's ceiling.
+        // A turn declares its own class's wall budget and nothing else — it must
+        // not inherit another kind's ceiling on the way past.
         let turn = admit(&table, ProcessKind::ChatTurn, "turn-classlimits");
-        assert!(turn.limits.is_unbounded());
+        assert_eq!(turn.limits, ProcessKind::ChatTurn.default_limits());
+        assert_eq!(turn.limits.max_wall_ms, Some(WEBVIEW_WALL_BUDGET_MS));
+        assert_eq!(turn.limits.max_output_bytes, None);
 
         let explicit = ProcessLimits {
             max_wall_ms: Some(30_000),
@@ -3997,7 +4214,8 @@ mod tests {
         assert!(record.started_at_ms.is_none());
         assert!(record.exited_at_ms.is_none());
         assert_eq!(record.created_at_ms, T0);
-        assert!(record.limits.is_unbounded());
+        // Seeded from the class, which for a chat turn is the WebView wall budget.
+        assert_eq!(record.limits, ProcessKind::ChatTurn.default_limits());
         assert!(record.is_live());
     }
 
@@ -5109,6 +5327,140 @@ mod tests {
             )
             .unwrap();
         assert_eq!(updated.native_pid, Some(4321));
+    }
+
+    /// The unattributed half of the destination ledger, which is the whole of
+    /// this slice: a reason accumulates like a process does, its overflow is
+    /// counted rather than dropped, and neither attribution can collide with the
+    /// other.
+    #[test]
+    fn unattributed_destinations_accumulate_by_reason_and_never_collide_with_a_process() {
+        use crate::run_scope::{Destination, DestinationDrain, Unattributed};
+
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::BackgroundShell, "shell-dest");
+
+        let destination = |host: &str| Destination {
+            scheme: "https".to_string(),
+            host: host.to_string(),
+            port: 443,
+        };
+        let user_action = Unattributed::UserAction.code();
+
+        table
+            .add_unattributed_egress_destinations(
+                user_action,
+                &DestinationDrain {
+                    seen: vec![(destination("updates.test"), 2)],
+                    overflowed: 0,
+                },
+                T0,
+            )
+            .expect("the first flush lands");
+        // A second flush is additive, and keeps the first sighting.
+        table
+            .add_unattributed_egress_destinations(
+                user_action,
+                &DestinationDrain {
+                    seen: vec![(destination("updates.test"), 3)],
+                    overflowed: 4,
+                },
+                T0 + 500,
+            )
+            .expect("the second flush lands");
+
+        let stored = table
+            .unattributed_egress_destinations()
+            .expect("the reasons read back");
+        let recorded = stored.get(user_action).expect("the reason is present");
+        assert_eq!(recorded.destinations.len(), 1, "one row, not two");
+        assert_eq!(recorded.destinations[0].requests, 5, "flushes are additive");
+        assert_eq!(recorded.destinations[0].first_seen_ms, T0);
+        assert_eq!(recorded.destinations[0].last_seen_ms, T0 + 500);
+        assert_eq!(
+            recorded.dropped, 4,
+            "a truncated list that does not say it is truncated reads as a complete one"
+        );
+
+        // A different reason is a different list, not a merge.
+        table
+            .add_unattributed_egress_destinations(
+                Unattributed::Startup.code(),
+                &DestinationDrain {
+                    seen: vec![(destination("updates.test"), 1)],
+                    overflowed: 0,
+                },
+                T0 + 600,
+            )
+            .expect("a second reason lands");
+        let stored = table
+            .unattributed_egress_destinations()
+            .expect("the reasons read back");
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[user_action].destinations[0].requests, 5);
+        assert_eq!(
+            stored[Unattributed::Startup.code()].destinations[0].requests,
+            1
+        );
+
+        // And the same host under a *process* is a third row, untouched by either.
+        table
+            .add_egress_destinations(
+                &record.process_id,
+                &DestinationDrain {
+                    seen: vec![(destination("updates.test"), 9)],
+                    overflowed: 0,
+                },
+                T0 + 700,
+            )
+            .expect("the process flush lands");
+        let attributed = table
+            .egress_destinations_for(&[record.process_id.clone()])
+            .expect("the process reads back");
+        assert_eq!(attributed[&record.process_id].destinations[0].requests, 9);
+        // The unattributed rows are exactly as they were: the `COALESCE` key must
+        // separate a process from a reason, or one of these two counts would have
+        // absorbed the other.
+        let stored = table
+            .unattributed_egress_destinations()
+            .expect("the reasons read back");
+        assert_eq!(stored[user_action].destinations[0].requests, 5);
+        assert_eq!(
+            stored[Unattributed::Startup.code()].destinations[0].requests,
+            1
+        );
+        // …and the attributed reader still shows only process rows.
+        assert_eq!(attributed[&record.process_id].destinations.len(), 1);
+    }
+
+    /// A reason that overflowed but named nothing must still be visible. It is the
+    /// case a reader would most easily mistake for "reached nowhere".
+    #[test]
+    fn a_reason_that_only_overflowed_is_still_reported() {
+        use crate::run_scope::{DestinationDrain, Unattributed};
+
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        table
+            .add_unattributed_egress_destinations(
+                Unattributed::Scheduled.code(),
+                &DestinationDrain {
+                    seen: Vec::new(),
+                    overflowed: 6,
+                },
+                T0,
+            )
+            .expect("an overflow-only flush lands");
+
+        let stored = table
+            .unattributed_egress_destinations()
+            .expect("the reasons read back");
+        let recorded = stored
+            .get(Unattributed::Scheduled.code())
+            .expect("a reason with only an overflow is still a reason that reached somewhere");
+        assert!(recorded.destinations.is_empty());
+        assert_eq!(recorded.dropped, 6);
     }
 
     /// Names the code that creates records for each kind.

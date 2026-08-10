@@ -697,7 +697,10 @@ async fn gather_runtime_snapshot(
     runtime.ollama_reachable = ollama_status.reachable;
 
     {
-        let guard = state.llama.lock().map_err(|_| "Llama state lock poisoned".to_string())?;
+        let guard = state
+            .llama
+            .lock()
+            .map_err(|_| "Llama state lock poisoned".to_string())?;
         runtime.llama.status = guard.status.clone();
         runtime.llama.model_path = guard.model_path.clone();
     }
@@ -820,8 +823,17 @@ pub async fn diagnostics_apply_fix(
     }
 
     if let Some(server_id) = finding_id.strip_prefix("mcp.") {
-        crate::mcp::mcp_set_enabled(app.clone(), state.clone(), server_id.to_string(), false)
-            .await?;
+        crate::mcp::mcp_set_enabled(
+            app.clone(),
+            state.clone(),
+            server_id.to_string(),
+            false,
+            // No base: a diagnostic quarantine is not a user edit racing another
+            // window, and refusing to disable a misbehaving server because the
+            // config changed elsewhere would be the wrong failure.
+            None,
+        )
+        .await?;
         return Ok(fixed_finding(
             &finding_id,
             "mcp",
@@ -991,7 +1003,10 @@ mod tests {
         audit.runtime.llama.status = "ready".to_string();
         audit.runtime.llama.health_reachable = Some(true);
         let report = run_diagnostics(&audit).unwrap();
-        assert_eq!(find(&report, "llama.reachability").status, DiagnosticStatus::Pass);
+        assert_eq!(
+            find(&report, "llama.reachability").status,
+            DiagnosticStatus::Pass
+        );
     }
 
     #[test]
@@ -1092,10 +1107,19 @@ mod tests {
         )
         .unwrap();
         let mut audit = request(&temp.0);
-        audit.runtime.mcp_connected_ids.insert("healthy".to_string());
+        audit
+            .runtime
+            .mcp_connected_ids
+            .insert("healthy".to_string());
         let report = run_diagnostics(&audit).unwrap();
-        assert_eq!(find(&report, "mcp.connected").status, DiagnosticStatus::Pass);
-        assert!(!report.findings.iter().any(|f| f.id.starts_with("mcp.") && f.id != "mcp.connected"));
+        assert_eq!(
+            find(&report, "mcp.connected").status,
+            DiagnosticStatus::Pass
+        );
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.id.starts_with("mcp.") && f.id != "mcp.connected"));
     }
 
     #[test]
@@ -1178,7 +1202,10 @@ mod tests {
         )
         .unwrap();
         let report = run_diagnostics(&request(&temp.0)).unwrap();
-        assert_eq!(find(&report, "knowledge_index.healthy").status, DiagnosticStatus::Pass);
+        assert_eq!(
+            find(&report, "knowledge_index.healthy").status,
+            DiagnosticStatus::Pass
+        );
     }
 
     #[test]
@@ -1227,7 +1254,13 @@ mod tests {
     /// exercised instead by each owning module's own tests.
     #[test]
     fn every_fixable_finding_id_routes_to_a_known_existing_command_prefix() {
-        let known_prefixes = ["llama.", "embed_llama.", "api_server.", "mcp.", "knowledge_index."];
+        let known_prefixes = [
+            "llama.",
+            "embed_llama.",
+            "api_server.",
+            "mcp.",
+            "knowledge_index.",
+        ];
         for prefix in known_prefixes {
             assert!(
                 "llama.reachability".starts_with(prefix)
@@ -1256,6 +1289,9 @@ mod tests {
         assert!(probe_keychain().is_ok());
         let leftover = keyring::Entry::new(&KEYCHAIN_SERVICE, KEYCHAIN_PROBE_ACCOUNT)
             .and_then(|entry| entry.get_password());
-        assert!(leftover.is_err(), "probe entry must be deleted after the round trip");
+        assert!(
+            leftover.is_err(),
+            "probe entry must be deleted after the round trip"
+        );
     }
 }

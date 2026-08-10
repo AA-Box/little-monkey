@@ -183,7 +183,11 @@ fn auth_material<'a>(required: bool, token: Option<&'a str>) -> AuthMaterial<'a>
     }
 }
 
-fn auth_value(auth: &AuthMaterial<'_>, tool: AgentTool, warnings: &mut Vec<AgentConfigWarning>) -> String {
+fn auth_value(
+    auth: &AuthMaterial<'_>,
+    tool: AgentTool,
+    warnings: &mut Vec<AgentConfigWarning>,
+) -> String {
     match auth {
         AuthMaterial::NotRequired => AUTH_NOT_REQUIRED_MARKER.to_string(),
         AuthMaterial::RealToken(token) => (*token).to_string(),
@@ -223,7 +227,10 @@ fn aider_telemetry_note() -> AgentConfigWarning {
 
 fn generate_continue(request: &GenerateAgentConfigRequest) -> GeneratedAgentConfig {
     let mut warnings = Vec::new();
-    let auth = auth_material(request.endpoint.auth_required, request.auth_token.as_deref());
+    let auth = auth_material(
+        request.endpoint.auth_required,
+        request.auth_token.as_deref(),
+    );
     let api_key = auth_value(&auth, AgentTool::ContinueDev, &mut warnings);
 
     let mut lines = vec![
@@ -260,7 +267,10 @@ fn generate_continue(request: &GenerateAgentConfigRequest) -> GeneratedAgentConf
 
 fn generate_aider(request: &GenerateAgentConfigRequest) -> GeneratedAgentConfig {
     let mut warnings = Vec::new();
-    let auth = auth_material(request.endpoint.auth_required, request.auth_token.as_deref());
+    let auth = auth_material(
+        request.endpoint.auth_required,
+        request.auth_token.as_deref(),
+    );
     let api_key = auth_value(&auth, AgentTool::Aider, &mut warnings);
 
     let lines = vec![
@@ -284,13 +294,17 @@ fn generate_aider(request: &GenerateAgentConfigRequest) -> GeneratedAgentConfig 
 
 fn generate_openai_env(request: &GenerateAgentConfigRequest) -> GeneratedAgentConfig {
     let mut warnings = Vec::new();
-    let auth = auth_material(request.endpoint.auth_required, request.auth_token.as_deref());
+    let auth = auth_material(
+        request.endpoint.auth_required,
+        request.auth_token.as_deref(),
+    );
     let api_key = auth_value(&auth, AgentTool::OpenAiEnv, &mut warnings);
 
     let mut lines = vec![
         "# Generic OpenAI SDK-compatible environment variables.".to_string(),
         "# Recognized by the official OpenAI Python/Node SDKs and many tools built on".to_string(),
-        "# them. Some older tools instead read OPENAI_API_BASE — check your tool's docs.".to_string(),
+        "# them. Some older tools instead read OPENAI_API_BASE — check your tool's docs."
+            .to_string(),
     ];
     if let Some(tokens) = request.effective_context_tokens {
         lines.push(format!(
@@ -301,7 +315,10 @@ fn generate_openai_env(request: &GenerateAgentConfigRequest) -> GeneratedAgentCo
     }
     lines.push(format!("OPENAI_BASE_URL={}", request.endpoint.base_url));
     lines.push(format!("OPENAI_API_KEY={api_key}"));
-    lines.push(format!("# Model id to select in your tool: {}", request.model_id));
+    lines.push(format!(
+        "# Model id to select in your tool: {}",
+        request.model_id
+    ));
 
     GeneratedAgentConfig {
         tool: AgentTool::OpenAiEnv,
@@ -512,9 +529,13 @@ struct ContinueYamlCompletionOptions {
     context_length: Option<u64>,
 }
 
-fn detect_drift_continue(input: &DriftCheckInput) -> Result<AgentConfigDriftReport, AgentLauncherError> {
+fn detect_drift_continue(
+    input: &DriftCheckInput,
+) -> Result<AgentConfigDriftReport, AgentLauncherError> {
     let doc: ContinueYamlDoc = serde_saphyr::from_str(&input.pasted_config).map_err(|error| {
-        AgentLauncherError::Invalid(format!("Could not parse as a Continue.dev config.yaml: {error}"))
+        AgentLauncherError::Invalid(format!(
+            "Could not parse as a Continue.dev config.yaml: {error}"
+        ))
     })?;
     let selected = doc
         .models
@@ -536,9 +557,21 @@ fn detect_drift_continue(input: &DriftCheckInput) -> Result<AgentConfigDriftRepo
             message: "No models[] entry was found in this config.yaml.".to_string(),
         });
     }
-    check_model_drift(parsed_model.as_deref(), &input.installed_model_ids, &mut findings);
-    check_endpoint_drift(parsed_base.as_deref(), input.current_endpoint.as_ref(), &mut findings);
-    check_auth_drift(parsed_api_key.as_deref(), input.auth_currently_required, &mut findings);
+    check_model_drift(
+        parsed_model.as_deref(),
+        &input.installed_model_ids,
+        &mut findings,
+    );
+    check_endpoint_drift(
+        parsed_base.as_deref(),
+        input.current_endpoint.as_ref(),
+        &mut findings,
+    );
+    check_auth_drift(
+        parsed_api_key.as_deref(),
+        input.auth_currently_required,
+        &mut findings,
+    );
     check_context_drift(
         parsed_model.as_deref(),
         parsed_context,
@@ -567,22 +600,33 @@ struct AiderYamlDoc {
     analytics_disable: Option<bool>,
 }
 
-fn detect_drift_aider(input: &DriftCheckInput) -> Result<AgentConfigDriftReport, AgentLauncherError> {
-    let doc: AiderYamlDoc = serde_saphyr::from_str(&input.pasted_config)
-        .map_err(|error| AgentLauncherError::Invalid(format!("Could not parse as an .aider.conf.yml: {error}")))?;
+fn detect_drift_aider(
+    input: &DriftCheckInput,
+) -> Result<AgentConfigDriftReport, AgentLauncherError> {
+    let doc: AiderYamlDoc = serde_saphyr::from_str(&input.pasted_config).map_err(|error| {
+        AgentLauncherError::Invalid(format!("Could not parse as an .aider.conf.yml: {error}"))
+    })?;
     let parsed_model = doc
         .model
         .as_deref()
         .map(|model| model.strip_prefix("openai/").unwrap_or(model).to_string());
 
     let mut findings = Vec::new();
-    check_model_drift(parsed_model.as_deref(), &input.installed_model_ids, &mut findings);
+    check_model_drift(
+        parsed_model.as_deref(),
+        &input.installed_model_ids,
+        &mut findings,
+    );
     check_endpoint_drift(
         doc.openai_api_base.as_deref(),
         input.current_endpoint.as_ref(),
         &mut findings,
     );
-    check_auth_drift(doc.openai_api_key.as_deref(), input.auth_currently_required, &mut findings);
+    check_auth_drift(
+        doc.openai_api_key.as_deref(),
+        input.auth_currently_required,
+        &mut findings,
+    );
     if doc.analytics_disable != Some(true) {
         findings.push(AgentConfigWarning {
             kind: AgentWarningKind::Telemetry,
@@ -628,7 +672,9 @@ fn parse_env_like(content: &str) -> BTreeMap<String, String> {
     values
 }
 
-fn detect_drift_openai_env(input: &DriftCheckInput) -> Result<AgentConfigDriftReport, AgentLauncherError> {
+fn detect_drift_openai_env(
+    input: &DriftCheckInput,
+) -> Result<AgentConfigDriftReport, AgentLauncherError> {
     let values = parse_env_like(&input.pasted_config);
     if values.is_empty() {
         return Err(AgentLauncherError::Invalid(
@@ -642,8 +688,16 @@ fn detect_drift_openai_env(input: &DriftCheckInput) -> Result<AgentConfigDriftRe
     let parsed_key = values.get("OPENAI_API_KEY").cloned();
 
     let mut findings = Vec::new();
-    check_endpoint_drift(parsed_base.as_deref(), input.current_endpoint.as_ref(), &mut findings);
-    check_auth_drift(parsed_key.as_deref(), input.auth_currently_required, &mut findings);
+    check_endpoint_drift(
+        parsed_base.as_deref(),
+        input.current_endpoint.as_ref(),
+        &mut findings,
+    );
+    check_auth_drift(
+        parsed_key.as_deref(),
+        input.auth_currently_required,
+        &mut findings,
+    );
 
     Ok(AgentConfigDriftReport {
         tool: AgentTool::OpenAiEnv,
@@ -661,7 +715,9 @@ fn detect_drift_openai_env(input: &DriftCheckInput) -> Result<AgentConfigDriftRe
 /// length, or a telemetry-sensitive default that was left enabled.
 pub fn detect_drift(input: &DriftCheckInput) -> Result<AgentConfigDriftReport, AgentLauncherError> {
     if input.pasted_config.trim().is_empty() {
-        return Err(AgentLauncherError::Invalid("Paste a config to check for drift".to_string()));
+        return Err(AgentLauncherError::Invalid(
+            "Paste a config to check for drift".to_string(),
+        ));
     }
     if input.pasted_config.len() > MAX_PASTED_CONFIG_BYTES {
         return Err(AgentLauncherError::Invalid(format!(
@@ -745,8 +801,14 @@ mod tests {
             "      contextLength: 8192\n",
         );
         assert_eq!(generated.content, expected);
-        assert!(generated.warnings.iter().any(|warning| warning.kind == AgentWarningKind::Telemetry));
-        assert!(!generated.warnings.iter().any(|warning| warning.kind == AgentWarningKind::Auth));
+        assert!(generated
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == AgentWarningKind::Telemetry));
+        assert!(!generated
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == AgentWarningKind::Auth));
     }
 
     #[test]
@@ -759,10 +821,18 @@ mod tests {
             auth_token: None,
         };
         let generated = generate_config(&request);
-        assert!(generated.content.contains("apiKey: REPLACE_WITH_PAIRED_TOKEN"));
+        assert!(generated
+            .content
+            .contains("apiKey: REPLACE_WITH_PAIRED_TOKEN"));
         assert!(!generated.content.contains("defaultCompletionOptions"));
-        assert!(generated.warnings.iter().any(|warning| warning.kind == AgentWarningKind::Auth));
-        assert!(generated.warnings.iter().any(|warning| warning.kind == AgentWarningKind::ContextLength));
+        assert!(generated
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == AgentWarningKind::Auth));
+        assert!(generated
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == AgentWarningKind::ContextLength));
     }
 
     #[test]
@@ -775,8 +845,13 @@ mod tests {
             auth_token: None,
         };
         let generated = generate_config(&request);
-        assert!(generated.content.contains("apiKey: not-required-loopback-only"));
-        assert!(!generated.warnings.iter().any(|warning| warning.kind == AgentWarningKind::Auth));
+        assert!(generated
+            .content
+            .contains("apiKey: not-required-loopback-only"));
+        assert!(!generated
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == AgentWarningKind::Auth));
     }
 
     #[test]
@@ -795,7 +870,10 @@ openai-api-key: paired-secret-token\n\
 model: openai/qwen2.5-coder-7b\n\
 analytics-disable: true\n";
         assert_eq!(generated.content, expected);
-        assert!(generated.warnings.iter().any(|warning| warning.kind == AgentWarningKind::Telemetry));
+        assert!(generated
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == AgentWarningKind::Telemetry));
     }
 
     #[test]
@@ -809,10 +887,19 @@ analytics-disable: true\n";
         };
         let generated = generate_config(&request);
         assert_eq!(generated.filename, ".env");
-        assert!(generated.content.contains("OPENAI_BASE_URL=http://127.0.0.1:1234/v1"));
-        assert!(generated.content.contains("OPENAI_API_KEY=paired-secret-token"));
-        assert!(generated.content.contains("# Model id to select in your tool: qwen2.5-coder-7b"));
-        assert!(!generated.warnings.iter().any(|warning| warning.kind == AgentWarningKind::Telemetry));
+        assert!(generated
+            .content
+            .contains("OPENAI_BASE_URL=http://127.0.0.1:1234/v1"));
+        assert!(generated
+            .content
+            .contains("OPENAI_API_KEY=paired-secret-token"));
+        assert!(generated
+            .content
+            .contains("# Model id to select in your tool: qwen2.5-coder-7b"));
+        assert!(!generated
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == AgentWarningKind::Telemetry));
     }
 
     #[test]
@@ -835,7 +922,11 @@ analytics-disable: true\n";
                 key: "context_size".to_string(),
                 label: "Context size".to_string(),
                 description: "llama-server context window.".to_string(),
-                schema: SettingValueSchema::Integer { min: 128, max: 1_048_576, step: 1 },
+                schema: SettingValueSchema::Integer {
+                    min: 128,
+                    max: 1_048_576,
+                    step: 1,
+                },
                 default_value: SettingValue::Integer { value: 4_096 },
                 restart_required: true,
                 supported: true,
@@ -843,7 +934,10 @@ analytics-disable: true\n";
             }],
         };
         let mut stored = BTreeMap::new();
-        stored.insert("context_size".to_string(), SettingValue::Integer { value: 32_768 });
+        stored.insert(
+            "context_size".to_string(),
+            SettingValue::Integer { value: 32_768 },
+        );
 
         assert_eq!(
             effective_context_tokens(Some(&capability), Some(&stored), M3RuntimeKind::LlamaCpp),
@@ -853,7 +947,10 @@ analytics-disable: true\n";
             effective_context_tokens(Some(&capability), None, M3RuntimeKind::LlamaCpp),
             Some(4_096)
         );
-        assert_eq!(effective_context_tokens(None, None, M3RuntimeKind::Mlx), None);
+        assert_eq!(
+            effective_context_tokens(None, None, M3RuntimeKind::Mlx),
+            None
+        );
     }
 
     #[test]
@@ -880,7 +977,10 @@ analytics-disable: true\n";
             }
         }
         let installed = vec![model("embedder", false), model("chat-model", true)];
-        assert_eq!(pick_default_model(&installed).map(|m| m.model_id.as_str()), Some("chat-model"));
+        assert_eq!(
+            pick_default_model(&installed).map(|m| m.model_id.as_str()),
+            Some("chat-model")
+        );
         assert_eq!(pick_default_model(&[]), None);
     }
 
@@ -904,16 +1004,25 @@ analytics-disable: true\n";
         let pasted = "name: Little Monkey Local\nversion: 1.0.0\nschema: v1\nmodels:\n  - name: qwen2.5-coder-7b\n    provider: openai\n    model: qwen2.5-coder-7b\n    apiBase: http://127.0.0.1:1234/v1\n    apiKey: real-token\n    defaultCompletionOptions:\n      contextLength: 4096\n";
         let report = detect_drift(&drift_input(AgentTool::ContinueDev, pasted)).expect("parses");
         assert_eq!(report.parsed_model_id.as_deref(), Some("qwen2.5-coder-7b"));
-        assert_eq!(report.parsed_base_url.as_deref(), Some("http://127.0.0.1:1234/v1"));
+        assert_eq!(
+            report.parsed_base_url.as_deref(),
+            Some("http://127.0.0.1:1234/v1")
+        );
         assert_eq!(report.parsed_context_tokens, Some(4096));
-        assert!(report.findings.is_empty(), "unexpected findings: {:?}", report.findings);
+        assert!(
+            report.findings.is_empty(),
+            "unexpected findings: {:?}",
+            report.findings
+        );
     }
 
     #[test]
     fn detect_drift_continue_flags_missing_model_stale_endpoint_and_context() {
         let pasted = "models:\n  - name: retired-model\n    provider: openai\n    model: retired-model\n    apiBase: http://127.0.0.1:9999/v1\n    apiKey: REPLACE_WITH_PAIRED_TOKEN\n    defaultCompletionOptions:\n      contextLength: 999999\n";
         let mut input = drift_input(AgentTool::ContinueDev, pasted);
-        input.effective_context_by_model.insert("retired-model".to_string(), 4096);
+        input
+            .effective_context_by_model
+            .insert("retired-model".to_string(), 4096);
         let report = detect_drift(&input).expect("parses");
         let kinds: Vec<_> = report.findings.iter().map(|finding| finding.kind).collect();
         assert!(kinds.contains(&AgentWarningKind::ModelMissing));
@@ -926,7 +1035,10 @@ analytics-disable: true\n";
     fn detect_drift_continue_flags_auth_drift_when_now_required() {
         let pasted = "models:\n  - name: qwen2.5-coder-7b\n    provider: openai\n    model: qwen2.5-coder-7b\n    apiBase: http://127.0.0.1:1234/v1\n    apiKey: not-required-loopback-only\n";
         let report = detect_drift(&drift_input(AgentTool::ContinueDev, pasted)).expect("parses");
-        assert!(report.findings.iter().any(|finding| finding.kind == AgentWarningKind::AuthDrift));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.kind == AgentWarningKind::AuthDrift));
     }
 
     #[test]
@@ -947,41 +1059,61 @@ analytics-disable: true\n";
         let pasted = "openai-api-base: http://127.0.0.1:1234/v1\nopenai-api-key: real-token\nmodel: openai/qwen2.5-coder-7b\n";
         let report = detect_drift(&drift_input(AgentTool::Aider, pasted)).expect("parses");
         assert_eq!(report.parsed_model_id.as_deref(), Some("qwen2.5-coder-7b"));
-        assert!(report.findings.iter().any(|finding| finding.kind == AgentWarningKind::Telemetry));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.kind == AgentWarningKind::Telemetry));
     }
 
     #[test]
     fn detect_drift_aider_strips_openai_prefix_and_finds_no_drift() {
         let pasted = "openai-api-base: http://127.0.0.1:1234/v1\nopenai-api-key: real-token\nmodel: openai/qwen2.5-coder-7b\nanalytics-disable: true\n";
         let report = detect_drift(&drift_input(AgentTool::Aider, pasted)).expect("parses");
-        assert!(!report.findings.iter().any(|finding| finding.kind == AgentWarningKind::ModelMissing));
-        assert!(!report.findings.iter().any(|finding| finding.kind == AgentWarningKind::EndpointDrift));
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.kind == AgentWarningKind::ModelMissing));
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.kind == AgentWarningKind::EndpointDrift));
     }
 
     #[test]
     fn detect_drift_openai_env_flags_stale_endpoint() {
         let pasted = "OPENAI_BASE_URL=http://127.0.0.1:9999/v1\nOPENAI_API_KEY=real-token\n";
         let report = detect_drift(&drift_input(AgentTool::OpenAiEnv, pasted)).expect("parses");
-        assert!(report.findings.iter().any(|finding| finding.kind == AgentWarningKind::EndpointDrift));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.kind == AgentWarningKind::EndpointDrift));
     }
 
     #[test]
     fn detect_drift_openai_env_accepts_legacy_api_base_name() {
         let pasted = "OPENAI_API_BASE=http://127.0.0.1:1234/v1\nOPENAI_API_KEY=real-token\n";
         let report = detect_drift(&drift_input(AgentTool::OpenAiEnv, pasted)).expect("parses");
-        assert_eq!(report.parsed_base_url.as_deref(), Some("http://127.0.0.1:1234/v1"));
-        assert!(!report.findings.iter().any(|finding| finding.kind == AgentWarningKind::EndpointDrift));
+        assert_eq!(
+            report.parsed_base_url.as_deref(),
+            Some("http://127.0.0.1:1234/v1")
+        );
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.kind == AgentWarningKind::EndpointDrift));
     }
 
     #[test]
     fn detect_drift_openai_env_rejects_content_with_no_assignments() {
-        let error = detect_drift(&drift_input(AgentTool::OpenAiEnv, "# just a comment\n")).unwrap_err();
+        let error =
+            detect_drift(&drift_input(AgentTool::OpenAiEnv, "# just a comment\n")).unwrap_err();
         assert!(error.to_string().contains("KEY=VALUE"));
     }
 
     #[test]
     fn detect_drift_continue_rejects_invalid_yaml() {
-        let error = detect_drift(&drift_input(AgentTool::ContinueDev, "not: [valid: yaml")).unwrap_err();
+        let error =
+            detect_drift(&drift_input(AgentTool::ContinueDev, "not: [valid: yaml")).unwrap_err();
         assert!(error.to_string().contains("Could not parse"));
     }
 

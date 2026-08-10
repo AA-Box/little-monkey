@@ -59,36 +59,9 @@
  */
 import { invoke } from "@tauri-apps/api/core";
 
-import {
-  listProcesses,
-  type ProcessKind,
-  type ProcessRecord,
-} from "./processTable";
+import { listProcesses, WALL_BUDGET_KINDS, type ProcessRecord } from "./processTable";
 
-/**
- * The kinds a wall budget applies to, as an allow-list rather than an exclusion
- * list.
- *
- * By construction, and that construction is load-bearing for one kind in
- * particular: `workflow_node` must never appear here. `deliverProcessSignal`
- * answers `"no-primitive"` for a node and `signal_support` refuses suspend/resume
- * on the documented grounds that a node has no independent pause mechanism — so a
- * stop latched on a node row would be committed durably and never delivered,
- * leaving it reading `stopping` forever with nothing able to clear it. An
- * exclusion list would put that failure one forgotten line away; an allow-list
- * needs a positive decision per kind.
- *
- * The other absences are all "somebody else already bounds this": `daemon_job`
- * (its own watchdog), `workflow_run` (the executor's 24h budget), `remote_run`
- * (records a request, not work), `background_shell` (spawned with no timeout on
- * purpose, so that it can outlive the turn that started it).
- */
-export const WALL_BUDGET_KINDS: readonly ProcessKind[] = [
-  "chat_turn",
-  "subagent",
-  "crew_member",
-  "side_task",
-];
+export { WALL_BUDGET_KINDS } from "./processTable";
 
 /**
  * Why a row was or was not killed for its budget.
