@@ -1,5 +1,5 @@
 {
-  "contract_version": "1.1.0",
+  "contract_version": "1.2.0",
   "support_window_days": 180,
   "http_routes": [
     {
@@ -755,6 +755,13 @@
         "properties": {
           "description": {
             "description": "A short (3-6 word) label for this subtask, shown to the user.",
+            "type": "string"
+          },
+          "isolation": {
+            "description": "Optional, code profile only: run the subagent in a fresh git worktree of the workspace so parallel agents never collide on files. Its changes stay in the worktree for the user to apply or discard. Not supported by the CLI surface.",
+            "enum": [
+              "worktree"
+            ],
             "type": "string"
           },
           "profile": {

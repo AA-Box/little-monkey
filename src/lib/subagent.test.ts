@@ -1143,3 +1143,128 @@ describe("runSubagentTask / Plan Mode", () => {
     expect(result).toBe("done");
   });
 });
+
+describe("runSubagentTask / worktree isolation", () => {
+  const WT_PATH = "/data/agent-worktrees/wt-abc";
+
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    invokeMock.mockReset();
+    usePermissionStore.setState({ mode: "manual" });
+    useSettingsStore.setState({ subagentProfileModels: {} });
+    useSessionStore.setState((state) => ({
+      sessions: [...state.sessions.filter((s) => s.id !== "sess-wt"), makeStoreTestSession("sess-wt")],
+    }));
+  });
+
+  function mockWorktreeInvokes(status: { dirty: boolean; diffstat: string }) {
+    invokeMock.mockImplementation((command: unknown) => {
+      if (command === "worktree_create") return Promise.resolve({ path: WT_PATH, branch: "agent/abc" });
+      if (command === "worktree_status") return Promise.resolve(status);
+      if (command === "worktree_remove") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+  }
+
+  it("refuses isolation for a read-only profile as a preflight error, creating nothing", async () => {
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "explore", isolation: "worktree", toolCallId: "call-wt-explore" }),
+    );
+
+    expect(JSON.parse(result).error).toContain("code-class");
+    expect(invokeMock).not.toHaveBeenCalledWith("worktree_create");
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+    expect(useSubagentStore.getState().runs["call-wt-explore"]?.status).toBe("error");
+  });
+
+  it("surfaces a worktree-creation failure as a preflight error", async () => {
+    invokeMock.mockRejectedValue(new Error("not a git repository"));
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-fail" }),
+    );
+    expect(JSON.parse(result).error).toContain("not a git repository");
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+  });
+
+  it("threads the worktree into the child's prompt, every tool call, and a null checkpoint", async () => {
+    mockWorktreeInvokes({ dirty: false, diffstat: "" });
+    attemptStreamMock
+      .mockResolvedValueOnce({ content: "", toolCalls: [toolCall("write_file")], streamError: null, contentStarted: true })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("ok");
+
+    await runSubagentTask(
+      baseParams({
+        sessionId: "sess-wt",
+        profile: "code",
+        isolation: "worktree",
+        toolCallId: "call-wt-thread",
+        parentCheckpointId: "parent-checkpoint-1",
+      }),
+    );
+
+    const wire = attemptStreamMock.mock.calls[0][1] as ChatMessage[];
+    expect(wire[0].content).toContain(WT_PATH);
+    const executeArgs = executeToolCallMock.mock.calls[0];
+    // (toolCall, checkpointId, turnId, registry, signal, risk, stacks, subagent, agentLabel, skill, chatSessionId, workspaceRootOverride)
+    expect(executeArgs[1]).toBeNull();
+    expect(executeArgs[11]).toBe(WT_PATH);
+  });
+
+  it("removes an untouched worktree at finish and records nothing on the meta", async () => {
+    mockWorktreeInvokes({ dirty: false, diffstat: "" });
+    attemptStreamMock.mockResolvedValue({ content: "all done", toolCalls: [], streamError: null, contentStarted: true });
+
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-clean" }),
+    );
+
+    expect(result).toBe("all done");
+    expect(invokeMock).toHaveBeenCalledWith("worktree_remove", { path: WT_PATH, force: false });
+    const meta = useSessionStore.getState().sessions.find((s) => s.id === "sess-wt")?.subagentRunMeta?.["call-wt-clean"];
+    expect(meta?.worktree).toBeUndefined();
+  });
+
+  it("keeps a dirty worktree, records {path, diffstat} on the meta, and appends the note to the report", async () => {
+    mockWorktreeInvokes({ dirty: true, diffstat: " a.txt | 2 +-" });
+    attemptStreamMock.mockResolvedValue({ content: "changed things", toolCalls: [], streamError: null, contentStarted: true });
+
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-dirty" }),
+    );
+
+    expect(result).toContain("changed things");
+    expect(result).toContain(WT_PATH);
+    expect(result).toContain("a.txt | 2 +-");
+    expect(invokeMock).not.toHaveBeenCalledWith("worktree_remove", expect.anything());
+    const meta = useSessionStore.getState().sessions.find((s) => s.id === "sess-wt")?.subagentRunMeta?.["call-wt-dirty"];
+    expect(meta?.worktree).toEqual({ path: WT_PATH, diffstat: " a.txt | 2 +-", status: "kept" });
+  });
+
+  it("a dirty worktree also survives an errored run, without touching the error payload", async () => {
+    mockWorktreeInvokes({ dirty: true, diffstat: " a.txt | 2 +-" });
+    attemptStreamMock.mockResolvedValue({ content: "", toolCalls: [], streamError: "boom", contentStarted: false });
+
+    const result = await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-err" }),
+    );
+
+    expect(JSON.parse(result).error).toBe("boom");
+    expect(invokeMock).not.toHaveBeenCalledWith("worktree_remove", expect.anything());
+    const meta = useSessionStore.getState().sessions.find((s) => s.id === "sess-wt")?.subagentRunMeta?.["call-wt-err"];
+    expect(meta?.worktree?.status).toBe("kept");
+  });
+
+  it("setSubagentWorktreeStatus advances kept → applied/discarded on the persisted meta", async () => {
+    mockWorktreeInvokes({ dirty: true, diffstat: "stat" });
+    attemptStreamMock.mockResolvedValue({ content: "r", toolCalls: [], streamError: null, contentStarted: true });
+    await runSubagentTask(
+      baseParams({ sessionId: "sess-wt", profile: "code", isolation: "worktree", toolCallId: "call-wt-status" }),
+    );
+
+    useSessionStore.getState().setSubagentWorktreeStatus("sess-wt", "call-wt-status", "applied");
+    const meta = useSessionStore.getState().sessions.find((s) => s.id === "sess-wt")?.subagentRunMeta?.["call-wt-status"];
+    expect(meta?.worktree?.status).toBe("applied");
+  });
+});

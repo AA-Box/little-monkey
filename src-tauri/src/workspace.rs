@@ -329,6 +329,15 @@ pub fn resolve_path_and_root(state: &AppState, path: &str) -> Result<(PathBuf, P
     Ok((resolved, root_canon))
 }
 
+/// Resolve `path` inside one explicit canonical root, with the exact same
+/// escape-proof sandboxing as [`resolve_path_and_root`] — the per-call
+/// workspace-root-override entry point (`agent_worktrees::resolve_with_override`
+/// is the one caller; the override target is validated against the managed
+/// worktree registry BEFORE this ever runs).
+pub fn resolve_in_root(root_canon: &Path, path: &str) -> Result<PathBuf, String> {
+    resolve_against_root(root_canon, path)
+}
+
 /// Core logic behind [`set_primary_workspace_root`], factored out so it's
 /// directly testable without a `tauri::AppHandle`. Returns whether the
 /// primary actually changed (callers use this to decide whether to reset

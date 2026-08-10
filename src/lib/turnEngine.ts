@@ -282,7 +282,23 @@ interface ReservedArgContext {
   agentLabel?: string;
   attachedStackNames?: string[];
   riskClassification: RiskClassification | null;
+  /** Managed agent-worktree path a worktree-isolated subagent's fs/shell
+   * calls resolve against — see `WORKTREE_OVERRIDE_TOOLS`. */
+  workspaceRootOverride?: string;
 }
+
+/** The tools whose path/cwd resolution honours a worktree override — the
+ * child profiles' fs tools plus run_shell. Everything else (web, memory,
+ * MCP) has no workspace path to redirect. */
+const WORKTREE_OVERRIDE_TOOLS: ReadonlySet<string> = new Set([
+  'read_file',
+  'list_dir',
+  'glob',
+  'grep',
+  'write_file',
+  'edit_file',
+  'run_shell',
+]);
 
 /**
  * The injected-args registry (ROADMAP.md §3 item 3): one table describing
@@ -336,6 +352,12 @@ const RESERVED_ARGS: ReadonlyArray<{ key: string; resolve: (ctx: ReservedArgCont
   // model that omits `stack` still gets the correct default-sweep allow-list
   // (see `stacks.rs`'s `resolve_search_stack_ids` doc comment).
   { key: 'allowed_stack_names', resolve: (ctx) => (ctx.name === 'search_docs' ? ctx.attachedStackNames ?? [] : undefined) },
+  // Points a worktree-isolated subagent's fs/shell calls at ITS worktree —
+  // frontend-owned like everything here (a model-supplied value is scrubbed),
+  // and Rust additionally refuses any value that isn't a registered agent
+  // worktree (`agent_worktrees::resolve_with_override`), so even a forged
+  // value could only ever name a directory this app created for this purpose.
+  { key: 'workspace_root_override', resolve: (ctx) => (WORKTREE_OVERRIDE_TOOLS.has(ctx.name) ? ctx.workspaceRootOverride : undefined) },
 ];
 
 function scrubReservedArgs(args: Record<string, unknown>): void {
@@ -508,7 +530,10 @@ export async function executeToolCall(
   subagent?: SubagentContext,
   agentLabel?: string,
   skill?: SkillToolContext,
-  chatSessionId?: string
+  chatSessionId?: string,
+  // Managed agent-worktree root for this call's fs/shell resolution — see
+  // `executeToolCallInner`'s param of the same name.
+  workspaceRootOverride?: string
 ): Promise<string> {
   const name = toolCall.function.name;
   const sessionId = chatSessionId ?? subagent?.sessionId;
@@ -549,6 +574,7 @@ export async function executeToolCall(
     agentLabel,
     skill,
     chatSessionId,
+    workspaceRootOverride,
   );
 
   if (hooksForEvent('PostToolUse', name).length > 0) {
@@ -590,7 +616,13 @@ async function executeToolCallInner(
   // Omitted by every runner that doesn't offer `spawn_task` (subagents, side
   // tasks, crew); a `spawn_task` call arriving without it is reported as a
   // tool error rather than guessing which conversation to attach a chip to.
-  chatSessionId?: string
+  chatSessionId?: string,
+  // Managed agent-worktree path this call's fs/shell tools resolve against —
+  // supplied ONLY by `runSubagentTask` for a worktree-isolated child, per
+  // call rather than via any global state, so concurrent isolated agents can
+  // never race each other's roots. See the `workspace_root_override`
+  // RESERVED_ARGS entry for the trust story.
+  workspaceRootOverride?: string
 ): Promise<string> {
   useUsageHistoryStore.getState().recordToolCall();
   const { name, arguments: rawArguments } = toolCall.function;
@@ -656,6 +688,7 @@ async function executeToolCallInner(
     agentLabel,
     attachedStackNames,
     riskClassification,
+    workspaceRootOverride,
   });
 
   // `present_plan` is a frontend-only tool (see `tools.ts`'s `PRESENT_PLAN_TOOL`
@@ -735,6 +768,9 @@ async function executeToolCallInner(
       // (never a silent fallback that would run a mutating task under the
       // wrong tool set).
       const profile = typeof args.profile === 'string' && args.profile.trim().length > 0 ? args.profile.trim() : 'explore';
+      // Validated properly inside `runSubagentTask` (code-class profiles
+      // only) — anything but the literal 'worktree' is simply absent.
+      const isolation: 'worktree' | undefined = args.isolation === 'worktree' ? 'worktree' : undefined;
       // The child's own turn id — NOT `turnId` (the parent's) — so its
       // tool calls get their own entry in the Rust per-turn `tool_cancel`/
       // permission maps (AppState, lib.rs), scoping Stop-button cancellation
@@ -762,6 +798,7 @@ async function executeToolCallInner(
         description,
         prompt: taskPrompt,
         profile,
+        isolation,
         target: subagent.target,
         effort: subagent.effort,
         onRoutingDecision: subagent.onRoutingDecision,

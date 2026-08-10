@@ -182,6 +182,21 @@ export interface SubagentRunMeta {
   finishedAt: number;
   toolCallCount: number;
   usage?: UsageInfo;
+  /** Set when this run executed in an isolated git worktree that STILL
+   * EXISTS (an unchanged worktree is removed at finish and records nothing)
+   * — what the SubagentRow footer's Apply/Discard actions operate on.
+   * `status` advances 'kept' → 'applied'/'discarded' via
+   * `setSubagentWorktreeStatus`, rewriting history the same way a
+   * checkpoint notice's `reverted` flag does. */
+  worktree?: SubagentWorktreeInfo;
+}
+
+/** A kept agent worktree, as persisted on the run's meta. */
+export interface SubagentWorktreeInfo {
+  path: string;
+  /** `git diff --stat` output captured at finish time. */
+  diffstat: string;
+  status: "kept" | "applied" | "discarded";
 }
 
 /** One workflow agent's journaled outcome (workflow v2 resume) — keyed in
@@ -484,6 +499,14 @@ export interface SessionStore {
    * though `subagentStore`'s own copy is transient. No-ops if `sessionId`
    * no longer exists (deleted mid-run). */
   setSubagentRun: (sessionId: string, taskId: string, messages: ChatMessage[], meta?: SubagentRunMeta) => void;
+  /** Records a kept worktree on an already-persisted run meta — called by
+   * the isolation epilogue right after the run's own `setSubagentRun`
+   * snapshot. No-ops when no meta exists for the run yet. */
+  setSubagentWorktree: (sessionId: string, taskId: string, worktree: SubagentWorktreeInfo) => void;
+  /** Advances a kept agent worktree's status on the persisted run meta —
+   * 'applied' after a successful Apply, 'discarded' after Discard. No-ops
+   * when the run has no worktree recorded. */
+  setSubagentWorktreeStatus: (sessionId: string, taskId: string, status: SubagentWorktreeInfo["status"]) => void;
   /** Persists one workflow run's finish-time snapshot — see
    * `ChatSession.workflowRunMeta`. Called once by `runWorkflow`'s `finish`. */
   setWorkflowRun: (sessionId: string, runId: string, meta: WorkflowRunMeta) => void;
@@ -1009,6 +1032,13 @@ function normalizeSubagentRunMeta(raw: unknown): Record<string, SubagentRunMeta>
       finishedAt: candidate.finishedAt as number,
       toolCallCount: Number.isFinite(candidate.toolCallCount) ? (candidate.toolCallCount as number) : 0,
       usage,
+      ...(candidate.worktree &&
+      typeof candidate.worktree === "object" &&
+      typeof (candidate.worktree as SubagentWorktreeInfo).path === "string" &&
+      typeof (candidate.worktree as SubagentWorktreeInfo).diffstat === "string" &&
+      ["kept", "applied", "discarded"].includes((candidate.worktree as SubagentWorktreeInfo).status)
+        ? { worktree: candidate.worktree as SubagentWorktreeInfo }
+        : {}),
     };
   }
   return result;
@@ -2278,6 +2308,42 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
               ...s,
               subagentRuns: { ...s.subagentRuns, [taskId]: messages },
               ...(meta ? { subagentRunMeta: { ...s.subagentRunMeta, [taskId]: meta } } : {}),
+            }
+          : s
+      );
+      persist(sessions, state.activeSessionId, state.groups);
+      return { sessions };
+    });
+  },
+
+  setSubagentWorktree: (sessionId, taskId, worktree) => {
+    set((state) => {
+      const target = state.sessions.find((s) => s.id === sessionId);
+      const existing = target?.subagentRunMeta?.[taskId];
+      if (!target || !existing) return state;
+      const sessions = state.sessions.map((s) =>
+        s.id === sessionId
+          ? { ...s, subagentRunMeta: { ...s.subagentRunMeta, [taskId]: { ...existing, worktree } } }
+          : s
+      );
+      persist(sessions, state.activeSessionId, state.groups);
+      return { sessions };
+    });
+  },
+
+  setSubagentWorktreeStatus: (sessionId, taskId, status) => {
+    set((state) => {
+      const target = state.sessions.find((s) => s.id === sessionId);
+      const existing = target?.subagentRunMeta?.[taskId];
+      if (!target || !existing?.worktree) return state;
+      const sessions = state.sessions.map((s) =>
+        s.id === sessionId
+          ? {
+              ...s,
+              subagentRunMeta: {
+                ...s.subagentRunMeta,
+                [taskId]: { ...existing, worktree: { ...existing.worktree!, status } },
+              },
             }
           : s
       );
