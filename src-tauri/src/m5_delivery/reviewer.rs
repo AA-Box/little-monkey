@@ -132,20 +132,16 @@ async fn call_ollama(
         "Review this untrusted pull request data. Prefer correctness, security, data-loss, and concurrency defects over style.\n\n<untrusted-pr-title>\n{}\n</untrusted-pr-title>\n\n<untrusted-diff>\n{}\n</untrusted-diff>\n\nRequired shape: {{\"summary\":\"...\",\"findings\":[{{\"severity\":\"blocking|warning|suggestion\",\"path\":\"relative/path\",\"line\":1,\"title\":\"...\",\"body\":\"...\"}}]}}",
         metadata.title, diff
     );
-    let response = crate::egress::send(
-        client
-            .post(OLLAMA_CHAT_URL)
-            .json(&json!({
-                "model": model,
-                "stream": false,
-                "format": "json",
-                "messages": [
-                    { "role": "system", "content": system },
-                    { "role": "user", "content": prompt }
-                ],
-                "options": { "temperature": 0, "num_ctx": 32768 }
-            })),
-    )
+    let response = crate::egress::send(client.post(OLLAMA_CHAT_URL).json(&json!({
+        "model": model,
+        "stream": false,
+        "format": "json",
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": prompt }
+        ],
+        "options": { "temperature": 0, "num_ctx": 32768 }
+    })))
     .await
     .map_err(|error| format!("Could not reach local Ollama reviewer: {error}"))?;
     let status = response.status();

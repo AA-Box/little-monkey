@@ -17,7 +17,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{Emitter};
+use tauri::Emitter;
 use url::Url;
 use uuid::Uuid;
 
@@ -2201,7 +2201,9 @@ async fn probe_remote_snapshot(
     remote_path: &str,
 ) -> Result<RemoteSnapshotProbe, String> {
     let response = crate::egress::send(
-        client.get(remote_url(config, remote_path)?).basic_auth(&config.username, Some(password)),
+        client
+            .get(remote_url(config, remote_path)?)
+            .basic_auth(&config.username, Some(password)),
     )
     .await
     .map_err(command_error)?;

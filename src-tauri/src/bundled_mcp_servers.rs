@@ -26,8 +26,7 @@
 //! server's own file-header comment for why no extra gating is layered on
 //! top here.
 
-const OSASCRIPT_CONTROL_SOURCE: &str =
-    include_str!("../mcp-servers/osascript-control/index.mjs");
+const OSASCRIPT_CONTROL_SOURCE: &str = include_str!("../mcp-servers/osascript-control/index.mjs");
 
 /// Looks up a known bundled server id's embedded source. `None` for anything
 /// unrecognized — callers turn that into a clear error rather than ever
@@ -63,8 +62,8 @@ pub fn stage_bundled_server_impl(data_dir: &std::path::Path, id: &str) -> Result
 /// transport's sole `node` argument.
 #[tauri::command]
 pub fn mcp_stage_bundled_server(id: String) -> Result<String, String> {
-    let data_dir = crate::app_paths::data_dir()
-        .ok_or_else(|| "Failed to resolve app data dir".to_string())?;
+    let data_dir =
+        crate::app_paths::data_dir().ok_or_else(|| "Failed to resolve app data dir".to_string())?;
     stage_bundled_server_impl(&data_dir, &id)
 }
 
@@ -110,7 +109,10 @@ mod tests {
         let data_dir = temp_data_dir();
         let error = stage_bundled_server_impl(&data_dir, "does-not-exist").unwrap_err();
         assert!(error.contains("Unknown bundled MCP server"));
-        assert!(!data_dir.exists(), "an unknown id must never create the data dir");
+        assert!(
+            !data_dir.exists(),
+            "an unknown id must never create the data dir"
+        );
     }
 
     #[test]

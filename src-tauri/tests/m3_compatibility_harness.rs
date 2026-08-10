@@ -598,8 +598,12 @@ async fn streaming_is_registered_before_http_200_and_cancel_is_owner_bound() {
         })
     };
 
+    // Generous, because this asserts a *shape* and not a latency: the mock holds
+    // the stream open until `control.release` fires far below, so a response that
+    // waited for the body would never arrive at all. Two seconds was tight enough
+    // that a loaded Windows runner tripped it on a cold first connection.
     let first = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(30),
         client
             .post(format!("{base}/v1/chat/completions"))
             .bearer_auth(&owner_token)

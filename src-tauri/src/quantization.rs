@@ -227,19 +227,21 @@ fn read_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
 }
 
 fn read_gguf_string<R: Read>(reader: &mut R) -> QuantizationResult<String> {
-    let len = read_u64(reader)
-        .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF string length: {error}")))?;
+    let len = read_u64(reader).map_err(|error| {
+        QuantizationError::Invalid(format!("truncated GGUF string length: {error}"))
+    })?;
     if len > MAX_GGUF_STRING_BYTES {
         return Err(QuantizationError::Invalid(format!(
             "GGUF string of {len} bytes exceeds the {MAX_GGUF_STRING_BYTES} byte safety bound"
         )));
     }
     let mut bytes = vec![0_u8; len as usize];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF string body: {error}")))?;
-    String::from_utf8(bytes)
-        .map_err(|error| QuantizationError::Invalid(format!("GGUF string is not valid UTF-8: {error}")))
+    reader.read_exact(&mut bytes).map_err(|error| {
+        QuantizationError::Invalid(format!("truncated GGUF string body: {error}"))
+    })?;
+    String::from_utf8(bytes).map_err(|error| {
+        QuantizationError::Invalid(format!("GGUF string is not valid UTF-8: {error}"))
+    })
 }
 
 /// GGUF metadata value type tags, from the `gguf` binary format.
@@ -280,44 +282,50 @@ fn read_gguf_value<R: Read>(
     match value_type {
         GGUF_TYPE_UINT8 | GGUF_TYPE_INT8 | GGUF_TYPE_BOOL => {
             let mut byte = [0_u8; 1];
-            reader
-                .read_exact(&mut byte)
-                .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF scalar: {error}")))?;
+            reader.read_exact(&mut byte).map_err(|error| {
+                QuantizationError::Invalid(format!("truncated GGUF scalar: {error}"))
+            })?;
             Ok(Some(GgufScalar::UInt(byte[0] as u64)))
         }
         GGUF_TYPE_UINT16 | GGUF_TYPE_INT16 => {
             let mut bytes = [0_u8; 2];
-            reader
-                .read_exact(&mut bytes)
-                .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF scalar: {error}")))?;
+            reader.read_exact(&mut bytes).map_err(|error| {
+                QuantizationError::Invalid(format!("truncated GGUF scalar: {error}"))
+            })?;
             Ok(Some(GgufScalar::UInt(u16::from_le_bytes(bytes) as u64)))
         }
         GGUF_TYPE_UINT32 | GGUF_TYPE_INT32 => {
-            let value = read_u32(reader)
-                .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF scalar: {error}")))?;
+            let value = read_u32(reader).map_err(|error| {
+                QuantizationError::Invalid(format!("truncated GGUF scalar: {error}"))
+            })?;
             Ok(Some(GgufScalar::UInt(value as u64)))
         }
         GGUF_TYPE_FLOAT32 => {
-            read_u32(reader)
-                .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF scalar: {error}")))?;
+            read_u32(reader).map_err(|error| {
+                QuantizationError::Invalid(format!("truncated GGUF scalar: {error}"))
+            })?;
             Ok(None)
         }
         GGUF_TYPE_UINT64 | GGUF_TYPE_INT64 => {
-            let value = read_u64(reader)
-                .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF scalar: {error}")))?;
+            let value = read_u64(reader).map_err(|error| {
+                QuantizationError::Invalid(format!("truncated GGUF scalar: {error}"))
+            })?;
             Ok(Some(GgufScalar::UInt(value)))
         }
         GGUF_TYPE_FLOAT64 => {
-            read_u64(reader)
-                .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF scalar: {error}")))?;
+            read_u64(reader).map_err(|error| {
+                QuantizationError::Invalid(format!("truncated GGUF scalar: {error}"))
+            })?;
             Ok(None)
         }
         GGUF_TYPE_STRING => Ok(Some(GgufScalar::Text(read_gguf_string(reader)?))),
         GGUF_TYPE_ARRAY => {
-            let element_type = read_u32(reader)
-                .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF array header: {error}")))?;
-            let count = read_u64(reader)
-                .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF array header: {error}")))?;
+            let element_type = read_u32(reader).map_err(|error| {
+                QuantizationError::Invalid(format!("truncated GGUF array header: {error}"))
+            })?;
+            let count = read_u64(reader).map_err(|error| {
+                QuantizationError::Invalid(format!("truncated GGUF array header: {error}"))
+            })?;
             if count > MAX_GGUF_ARRAY_ELEMENTS {
                 return Err(QuantizationError::Invalid(format!(
                     "GGUF array of {count} elements exceeds the {MAX_GGUF_ARRAY_ELEMENTS} element safety bound"
@@ -363,15 +371,17 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
             "unsupported GGUF version {version} (supported: {MIN_SUPPORTED_GGUF_VERSION}..={MAX_SUPPORTED_GGUF_VERSION})"
         )));
     }
-    let tensor_count = read_u64(&mut reader)
-        .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF tensor count: {error}")))?;
+    let tensor_count = read_u64(&mut reader).map_err(|error| {
+        QuantizationError::Invalid(format!("truncated GGUF tensor count: {error}"))
+    })?;
     if tensor_count > MAX_GGUF_TENSOR_COUNT {
         return Err(QuantizationError::Invalid(format!(
             "GGUF tensor count {tensor_count} exceeds the {MAX_GGUF_TENSOR_COUNT} safety bound"
         )));
     }
-    let metadata_kv_count = read_u64(&mut reader)
-        .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF metadata count: {error}")))?;
+    let metadata_kv_count = read_u64(&mut reader).map_err(|error| {
+        QuantizationError::Invalid(format!("truncated GGUF metadata count: {error}"))
+    })?;
     if metadata_kv_count > MAX_GGUF_METADATA_KV_COUNT {
         return Err(QuantizationError::Invalid(format!(
             "GGUF metadata count {metadata_kv_count} exceeds the {MAX_GGUF_METADATA_KV_COUNT} safety bound"
@@ -386,8 +396,9 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
     let mut chat_template = None;
     for _ in 0..metadata_kv_count {
         let key = read_gguf_string(&mut reader)?;
-        let value_type = read_u32(&mut reader)
-            .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF value type: {error}")))?;
+        let value_type = read_u32(&mut reader).map_err(|error| {
+            QuantizationError::Invalid(format!("truncated GGUF value type: {error}"))
+        })?;
         let value = read_gguf_value(&mut reader, value_type, 0)?;
         match (key.as_str(), value) {
             ("general.architecture", Some(GgufScalar::Text(text))) => architecture = Some(text),
@@ -419,21 +430,25 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
     // real "does it parse as valid GGUF" smoke test the eval result reuses.
     for _ in 0..tensor_count {
         let _name = read_gguf_string(&mut reader)?;
-        let dimension_count = read_u32(&mut reader)
-            .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF tensor dims: {error}")))?;
+        let dimension_count = read_u32(&mut reader).map_err(|error| {
+            QuantizationError::Invalid(format!("truncated GGUF tensor dims: {error}"))
+        })?;
         if dimension_count > 64 {
             return Err(QuantizationError::Invalid(
                 "GGUF tensor has an implausible dimension count".to_string(),
             ));
         }
         for _ in 0..dimension_count {
-            read_u64(&mut reader)
-                .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF tensor dims: {error}")))?;
+            read_u64(&mut reader).map_err(|error| {
+                QuantizationError::Invalid(format!("truncated GGUF tensor dims: {error}"))
+            })?;
         }
-        let _ggml_type = read_u32(&mut reader)
-            .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF tensor type: {error}")))?;
-        let _offset = read_u64(&mut reader)
-            .map_err(|error| QuantizationError::Invalid(format!("truncated GGUF tensor offset: {error}")))?;
+        let _ggml_type = read_u32(&mut reader).map_err(|error| {
+            QuantizationError::Invalid(format!("truncated GGUF tensor type: {error}"))
+        })?;
+        let _offset = read_u64(&mut reader).map_err(|error| {
+            QuantizationError::Invalid(format!("truncated GGUF tensor offset: {error}"))
+        })?;
     }
 
     Ok(GgufHeaderInfo {
@@ -473,23 +488,27 @@ pub struct SafetensorsHeaderInfo {
 /// bytes of JSON (a map of tensor name -> `{dtype, shape, data_offsets}`,
 /// plus an optional `__metadata__` string map) — the format every
 /// `.safetensors` file starts with, regardless of what it stores.
-pub fn sniff_safetensors_header<R: Read>(mut source: R) -> QuantizationResult<SafetensorsHeaderInfo> {
-    let header_size = read_u64(&mut source)
-        .map_err(|error| QuantizationError::Invalid(format!("truncated safetensors header length: {error}")))?;
+pub fn sniff_safetensors_header<R: Read>(
+    mut source: R,
+) -> QuantizationResult<SafetensorsHeaderInfo> {
+    let header_size = read_u64(&mut source).map_err(|error| {
+        QuantizationError::Invalid(format!("truncated safetensors header length: {error}"))
+    })?;
     if header_size == 0 || header_size > MAX_SAFETENSORS_HEADER_BYTES {
         return Err(QuantizationError::Invalid(format!(
             "safetensors header length {header_size} is not between 1 and {MAX_SAFETENSORS_HEADER_BYTES} bytes"
         )));
     }
     let mut header_bytes = vec![0_u8; header_size as usize];
-    source
-        .read_exact(&mut header_bytes)
-        .map_err(|error| QuantizationError::Invalid(format!("truncated safetensors header body: {error}")))?;
-    let parsed: Value = serde_json::from_slice(&header_bytes)
-        .map_err(|error| QuantizationError::Invalid(format!("safetensors header is not valid JSON: {error}")))?;
-    let object = parsed
-        .as_object()
-        .ok_or_else(|| QuantizationError::Invalid("safetensors header JSON is not an object".to_string()))?;
+    source.read_exact(&mut header_bytes).map_err(|error| {
+        QuantizationError::Invalid(format!("truncated safetensors header body: {error}"))
+    })?;
+    let parsed: Value = serde_json::from_slice(&header_bytes).map_err(|error| {
+        QuantizationError::Invalid(format!("safetensors header is not valid JSON: {error}"))
+    })?;
+    let object = parsed.as_object().ok_or_else(|| {
+        QuantizationError::Invalid("safetensors header JSON is not an object".to_string())
+    })?;
 
     let mut metadata = BTreeMap::new();
     let mut declared_license = None;
@@ -603,25 +622,34 @@ fn first_safetensors_file(directory: &Path) -> QuantizationResult<PathBuf> {
     {
         return Ok(candidates.remove(preferred));
     }
-    candidates
-        .into_iter()
-        .next()
-        .ok_or_else(|| QuantizationError::NotFound(format!("no .safetensors file found in {}", directory.display())))
+    candidates.into_iter().next().ok_or_else(|| {
+        QuantizationError::NotFound(format!(
+            "no .safetensors file found in {}",
+            directory.display()
+        ))
+    })
 }
 
 /// Detects the source format of `path` (a single file or a Hugging
 /// Face-style checkout directory) and sniffs its header. Returns the exact
 /// file that was sniffed/will be digested (equal to `path` for a plain
 /// file).
-pub fn detect_and_sniff_source(path: &Path) -> QuantizationResult<(PathBuf, SourceFormat, SourceHeader)> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| io_at("inspect source", path, error))?;
+pub fn detect_and_sniff_source(
+    path: &Path,
+) -> QuantizationResult<(PathBuf, SourceFormat, SourceHeader)> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| io_at("inspect source", path, error))?;
     if metadata.is_dir() {
         let file = first_safetensors_file(path)?;
         let mut header = sniff_safetensors_file(&file)?;
         if header.declared_license.is_none() {
             header.declared_license = config_json_declared_license(path);
         }
-        return Ok((file, SourceFormat::Safetensors, SourceHeader::Safetensors(header)));
+        return Ok((
+            file,
+            SourceFormat::Safetensors,
+            SourceHeader::Safetensors(header),
+        ));
     }
     if !metadata.is_file() {
         return Err(QuantizationError::Invalid(
@@ -642,7 +670,11 @@ pub fn detect_and_sniff_source(path: &Path) -> QuantizationResult<(PathBuf, Sour
         .map_err(|error| io_at("read source header", path, error))?;
     if magic == GGUF_MAGIC {
         let header = sniff_gguf_file(path)?;
-        return Ok((path.to_path_buf(), SourceFormat::Gguf, SourceHeader::Gguf(header)));
+        return Ok((
+            path.to_path_buf(),
+            SourceFormat::Gguf,
+            SourceHeader::Gguf(header),
+        ));
     }
     if let Ok(header) = sniff_safetensors_file(path) {
         return Ok((
@@ -652,7 +684,8 @@ pub fn detect_and_sniff_source(path: &Path) -> QuantizationResult<(PathBuf, Sour
         ));
     }
     Err(QuantizationError::Unsupported(
-        "source does not look like a GGUF file (bad magic) or a safetensors file (bad header)".to_string(),
+        "source does not look like a GGUF file (bad magic) or a safetensors file (bad header)"
+            .to_string(),
     ))
 }
 
@@ -712,7 +745,14 @@ const RESTRICTED_MARKERS: &[&str] = &[
 ];
 const COPYLEFT_MARKERS: &[&str] = &["agpl", "gpl", "lgpl", "mpl", "cc-by-sa", "eupl"];
 const PERMISSIVE_MARKERS: &[&str] = &[
-    "mit", "apache", "bsd", "isc", "unlicense", "cc0", "cc-by-4", "cc-by ",
+    "mit",
+    "apache",
+    "bsd",
+    "isc",
+    "unlicense",
+    "cc0",
+    "cc-by-4",
+    "cc-by ",
 ];
 
 pub fn assess_license(
@@ -734,7 +774,10 @@ pub fn assess_license(
                 "No license declaration was found for this model; verify licensing manually before distributing or serving the converted output.".to_string(),
             ),
         )
-    } else if RESTRICTED_MARKERS.iter().any(|marker| haystack.contains(marker)) {
+    } else if RESTRICTED_MARKERS
+        .iter()
+        .any(|marker| haystack.contains(marker))
+    {
         (
             LicenseRisk::Restricted,
             Some(format!(
@@ -742,7 +785,10 @@ pub fn assess_license(
                 declared_name.or(declared_spdx_id).unwrap_or("unknown")
             )),
         )
-    } else if COPYLEFT_MARKERS.iter().any(|marker| haystack.contains(marker)) {
+    } else if COPYLEFT_MARKERS
+        .iter()
+        .any(|marker| haystack.contains(marker))
+    {
         (
             LicenseRisk::Copyleft,
             Some(format!(
@@ -750,7 +796,10 @@ pub fn assess_license(
                 declared_name.or(declared_spdx_id).unwrap_or("unknown")
             )),
         )
-    } else if PERMISSIVE_MARKERS.iter().any(|marker| haystack.contains(marker)) {
+    } else if PERMISSIVE_MARKERS
+        .iter()
+        .any(|marker| haystack.contains(marker))
+    {
         (LicenseRisk::Permissive, None)
     } else {
         (
@@ -894,8 +943,9 @@ impl Serialize for GgufQuantType {
 impl<'de> Deserialize<'de> for GgufQuantType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
-        GgufQuantType::parse(&value)
-            .ok_or_else(|| serde::de::Error::custom(format!("unknown GGUF quantization type '{value}'")))
+        GgufQuantType::parse(&value).ok_or_else(|| {
+            serde::de::Error::custom(format!("unknown GGUF quantization type '{value}'"))
+        })
     }
 }
 
@@ -963,7 +1013,9 @@ fn discover_in_path_dirs(name: &str, path_var: Option<&OsStr>) -> Option<PathBuf
 /// `find_llama_server_binary` convention for the sibling `llama-quantize`
 /// tool shipped by the same `llama.cpp` formula.
 pub fn find_llama_quantize_binary() -> Option<PathBuf> {
-    if let Some(found) = discover_in_path_dirs("llama-quantize", std::env::var_os("PATH").as_deref()) {
+    if let Some(found) =
+        discover_in_path_dirs("llama-quantize", std::env::var_os("PATH").as_deref())
+    {
         return Some(found);
     }
     for base in ["/opt/homebrew/bin", "/usr/local/bin"] {
@@ -994,7 +1046,9 @@ pub struct LlamaCppQuantizeBackend {
 
 impl LlamaCppQuantizeBackend {
     pub fn from_binary(binary: impl Into<PathBuf>) -> Self {
-        Self { binary: binary.into() }
+        Self {
+            binary: binary.into(),
+        }
     }
 
     pub fn discover() -> Option<Self> {
@@ -1027,9 +1081,15 @@ impl QuantizationBackend for LlamaCppQuantizeBackend {
             command.arg("--allow-requantize");
         }
         command.arg(source).arg(output).arg(quant.cli_name());
-        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let result = command.output().map_err(|error| {
-            QuantizationError::Backend(format!("failed to spawn {}: {error}", self.binary.display()))
+            QuantizationError::Backend(format!(
+                "failed to spawn {}: {error}",
+                self.binary.display()
+            ))
         })?;
         let stderr = String::from_utf8_lossy(&result.stderr).to_string();
         if !result.status.success() {
@@ -1081,7 +1141,8 @@ impl QuantizationBackend for PassthroughGgufRequantize {
                 GgufQuantType::Copy.cli_name()
             )));
         }
-        fs::copy(source, output).map_err(|error| io_at("copy passthrough output", output, error))?;
+        fs::copy(source, output)
+            .map_err(|error| io_at("copy passthrough output", output, error))?;
         Ok(BackendOutput {
             tool_name: "passthrough-copy".to_string(),
             tool_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -1213,7 +1274,11 @@ impl QuantizationWorkbench {
             .collect()
     }
 
-    fn select_backend(&self, format: SourceFormat, quant: GgufQuantType) -> QuantizationResult<&Arc<dyn QuantizationBackend>> {
+    fn select_backend(
+        &self,
+        format: SourceFormat,
+        quant: GgufQuantType,
+    ) -> QuantizationResult<&Arc<dyn QuantizationBackend>> {
         if format != SourceFormat::Gguf {
             return Err(QuantizationError::Unsupported(
                 "converting safetensors/Hugging Face sources to GGUF requires an external conversion toolchain (e.g. llama.cpp's convert_hf_to_gguf.py with Python + transformers/torch) that is not bundled with this app; convert to GGUF externally first, then use this workbench to quantize the resulting file.".to_string(),
@@ -1237,8 +1302,8 @@ impl QuantizationWorkbench {
 
     pub fn convert(&self, request: ConversionRequest) -> QuantizationResult<ConversionReport> {
         let (sniff_path, format, header) = detect_and_sniff_source(&request.source_path)?;
-        let source_metadata =
-            fs::metadata(&sniff_path).map_err(|error| io_at("inspect source", &sniff_path, error))?;
+        let source_metadata = fs::metadata(&sniff_path)
+            .map_err(|error| io_at("inspect source", &sniff_path, error))?;
         let source_size = source_metadata.len();
         let source_digest = sha256_file(&sniff_path, source_size)
             .map_err(|error| QuantizationError::Digest(error.to_string()))?;
@@ -1258,8 +1323,8 @@ impl QuantizationWorkbench {
             request.allow_requantize,
         )?;
 
-        let output_metadata =
-            fs::metadata(&output_path).map_err(|error| io_at("inspect conversion output", &output_path, error))?;
+        let output_metadata = fs::metadata(&output_path)
+            .map_err(|error| io_at("inspect conversion output", &output_path, error))?;
         let output_size = output_metadata.len();
         let output_digest = sha256_file(&output_path, output_size)
             .map_err(|error| QuantizationError::Digest(error.to_string()))?;
@@ -1323,7 +1388,8 @@ impl QuantizationWorkbench {
 
         let report_path = conversion_dir.join(QUANTIZATION_REPORT_FILE);
         let report_json = serde_json::to_vec_pretty(&report)?;
-        fs::write(&report_path, report_json).map_err(|error| io_at("write conversion report", &report_path, error))?;
+        fs::write(&report_path, report_json)
+            .map_err(|error| io_at("write conversion report", &report_path, error))?;
 
         Ok(report)
     }
@@ -1419,10 +1485,7 @@ mod tests {
         let mut header = serde_json::Map::new();
         let mut tensor = serde_json::Map::new();
         tensor.insert("dtype".to_string(), Value::String("F32".to_string()));
-        tensor.insert(
-            "shape".to_string(),
-            Value::Array(vec![Value::from(4)]),
-        );
+        tensor.insert("shape".to_string(), Value::Array(vec![Value::from(4)]));
         tensor.insert(
             "data_offsets".to_string(),
             Value::Array(vec![Value::from(0), Value::from(16)]),
@@ -1509,7 +1572,8 @@ mod tests {
     #[test]
     fn sniffs_safetensors_header_and_metadata_license() {
         let bytes = build_minimal_safetensors(Some("mit"));
-        let header = sniff_safetensors_header(Cursor::new(bytes)).expect("valid safetensors fixture must parse");
+        let header = sniff_safetensors_header(Cursor::new(bytes))
+            .expect("valid safetensors fixture must parse");
         assert_eq!(header.tensor_count, 1);
         assert_eq!(header.declared_license.as_deref(), Some("mit"));
     }
@@ -1539,8 +1603,13 @@ mod tests {
     #[test]
     fn detects_safetensors_directory_source() {
         let dir = tempfile_dir();
-        fs::write(dir.join("model.safetensors"), build_minimal_safetensors(Some("cc-by-nc-4.0"))).unwrap();
-        let (resolved, format, header) = detect_and_sniff_source(&dir).expect("must detect safetensors directory");
+        fs::write(
+            dir.join("model.safetensors"),
+            build_minimal_safetensors(Some("cc-by-nc-4.0")),
+        )
+        .unwrap();
+        let (resolved, format, header) =
+            detect_and_sniff_source(&dir).expect("must detect safetensors directory");
         assert_eq!(resolved, dir.join("model.safetensors"));
         assert_eq!(format, SourceFormat::Safetensors);
         assert_eq!(header.declared_license(), Some("cc-by-nc-4.0"));
@@ -1549,14 +1618,26 @@ mod tests {
 
     #[test]
     fn license_classifier_flags_restricted_and_copyleft_and_permissive() {
-        let restricted = assess_license(Some("Llama 3 Community License"), None, LicenseSource::GgufMetadata);
+        let restricted = assess_license(
+            Some("Llama 3 Community License"),
+            None,
+            LicenseSource::GgufMetadata,
+        );
         assert_eq!(restricted.risk, LicenseRisk::Restricted);
         assert!(restricted.warning.is_some());
 
-        let copyleft = assess_license(Some("GPL-3.0"), Some("GPL-3.0"), LicenseSource::GgufMetadata);
+        let copyleft = assess_license(
+            Some("GPL-3.0"),
+            Some("GPL-3.0"),
+            LicenseSource::GgufMetadata,
+        );
         assert_eq!(copyleft.risk, LicenseRisk::Copyleft);
 
-        let permissive = assess_license(Some("Apache License 2.0"), Some("Apache-2.0"), LicenseSource::GgufMetadata);
+        let permissive = assess_license(
+            Some("Apache License 2.0"),
+            Some("Apache-2.0"),
+            LicenseSource::GgufMetadata,
+        );
         assert_eq!(permissive.risk, LicenseRisk::Permissive);
         assert!(permissive.warning.is_none());
 
@@ -1588,7 +1669,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, QuantizationError::Unsupported(_)));
 
-        let result = backend.convert(&source, &output, GgufQuantType::Copy, false).unwrap();
+        let result = backend
+            .convert(&source, &output, GgufQuantType::Copy, false)
+            .unwrap();
         assert!(!result.real);
         assert_eq!(fs::read(&source).unwrap(), fs::read(&output).unwrap());
         fs::remove_dir_all(&dir).ok();
@@ -1600,7 +1683,11 @@ mod tests {
         let source_dir = dir.join("source");
         fs::create_dir_all(&source_dir).unwrap();
         let source_path = source_dir.join("model.gguf");
-        fs::write(&source_path, build_minimal_gguf("llama", Some("apache-2.0"))).unwrap();
+        fs::write(
+            &source_path,
+            build_minimal_gguf("llama", Some("apache-2.0")),
+        )
+        .unwrap();
 
         let workbench = QuantizationWorkbench::new(
             dir.join("workbench"),
@@ -1626,8 +1713,8 @@ mod tests {
             .root()
             .join(&report.conversion_id)
             .join(QUANTIZATION_REPORT_FILE);
-        let persisted: ConversionReport =
-            serde_json::from_slice(&fs::read(&report_path).unwrap()).expect("report.json must parse");
+        let persisted: ConversionReport = serde_json::from_slice(&fs::read(&report_path).unwrap())
+            .expect("report.json must parse");
         assert_eq!(persisted.conversion_id, report.conversion_id);
         fs::remove_dir_all(&dir).ok();
     }
@@ -1637,7 +1724,11 @@ mod tests {
         let dir = tempfile_dir();
         let source_dir = dir.join("source");
         fs::create_dir_all(&source_dir).unwrap();
-        fs::write(source_dir.join("model.safetensors"), build_minimal_safetensors(None)).unwrap();
+        fs::write(
+            source_dir.join("model.safetensors"),
+            build_minimal_safetensors(None),
+        )
+        .unwrap();
 
         let workbench = QuantizationWorkbench::new(
             dir.join("workbench"),
@@ -1675,7 +1766,8 @@ mod tests {
                 _quant: GgufQuantType,
                 _allow_requantize: bool,
             ) -> QuantizationResult<BackendOutput> {
-                fs::write(output, b"not a gguf file").map_err(|error| io_at("write corrupt output", output, error))?;
+                fs::write(output, b"not a gguf file")
+                    .map_err(|error| io_at("write corrupt output", output, error))?;
                 Ok(BackendOutput {
                     tool_name: "corrupting-test-backend".to_string(),
                     tool_version: None,
@@ -1690,7 +1782,8 @@ mod tests {
         let source_path = source_dir.join("model.gguf");
         fs::write(&source_path, build_minimal_gguf("llama", None)).unwrap();
 
-        let workbench = QuantizationWorkbench::new(dir.join("workbench"), vec![Arc::new(CorruptingBackend)]);
+        let workbench =
+            QuantizationWorkbench::new(dir.join("workbench"), vec![Arc::new(CorruptingBackend)]);
         let report = workbench
             .convert(ConversionRequest {
                 source_path,
@@ -1790,7 +1883,10 @@ exit 0
         let path_var = std::ffi::OsString::from(dir.to_string_lossy().to_string());
         let found = discover_in_path_dirs("my-tool", Some(path_var.as_os_str()));
         assert_eq!(found.as_deref(), Some(tool_path.as_path()));
-        assert_eq!(discover_in_path_dirs("does-not-exist-tool", Some(path_var.as_os_str())), None);
+        assert_eq!(
+            discover_in_path_dirs("does-not-exist-tool", Some(path_var.as_os_str())),
+            None
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1800,7 +1896,11 @@ exit 0
         // installed, discovery must either return a real, executable path or
         // `None` — never panic or return a bogus path.
         if let Some(path) = find_llama_quantize_binary() {
-            assert!(is_executable_file(&path), "{} must be executable", path.display());
+            assert!(
+                is_executable_file(&path),
+                "{} must be executable",
+                path.display()
+            );
         }
     }
 

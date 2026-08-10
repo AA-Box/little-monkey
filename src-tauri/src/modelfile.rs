@@ -263,7 +263,10 @@ pub fn parse_modelfile(text: &str) -> Result<ParsedModelfile, ModelfileIssue> {
             "PARAMETER" => {
                 let (key, raw_value) = split_first_token(&value);
                 if key.is_empty() || raw_value.trim().is_empty() {
-                    return Err(issue(Some(line_no), "PARAMETER requires a name and a value"));
+                    return Err(issue(
+                        Some(line_no),
+                        "PARAMETER requires a name and a value",
+                    ));
                 }
                 result.parameters.push(ModelfileParameter {
                     key: key.to_string(),
@@ -302,7 +305,10 @@ pub fn parse_modelfile(text: &str) -> Result<ParsedModelfile, ModelfileIssue> {
                 });
             }
             other => {
-                return Err(issue(Some(line_no), format!("unknown instruction '{other}'")));
+                return Err(issue(
+                    Some(line_no),
+                    format!("unknown instruction '{other}'"),
+                ));
             }
         }
 
@@ -370,9 +376,12 @@ impl ParsedModelfile {
             }
         }
         for adapter in cloned.adapters.iter_mut() {
-            let canonical = Path::new(adapter)
-                .canonicalize()
-                .map_err(|e| issue(None, format!("failed to resolve ADAPTER path {adapter}: {e}")))?;
+            let canonical = Path::new(adapter).canonicalize().map_err(|e| {
+                issue(
+                    None,
+                    format!("failed to resolve ADAPTER path {adapter}: {e}"),
+                )
+            })?;
             *adapter = canonical.display().to_string();
         }
         Ok(cloned)
@@ -618,8 +627,8 @@ fn inspect_model_file(
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
 
-    let mut file =
-        std::fs::File::open(path).map_err(|e| issue(None, format!("failed to open {original}: {e}")))?;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| issue(None, format!("failed to open {original}: {e}")))?;
     let mut magic = [0u8; 4];
     let read = file.read(&mut magic).unwrap_or(0);
 
@@ -635,7 +644,9 @@ fn inspect_model_file(
         Some("safetensors") => validate_safetensors_header(path, original, size_bytes),
         _ => Err(issue(
             None,
-            format!("unrecognized model file format for {original} (expected .gguf or .safetensors)"),
+            format!(
+                "unrecognized model file format for {original} (expected .gguf or .safetensors)"
+            ),
         )),
     }
 }
@@ -684,13 +695,15 @@ fn validate_safetensors_header(
     original: &str,
     size_bytes: u64,
 ) -> Result<SourceInspection, ModelfileIssue> {
-    let mut file =
-        std::fs::File::open(path).map_err(|e| issue(None, format!("failed to open {original}: {e}")))?;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| issue(None, format!("failed to open {original}: {e}")))?;
     let mut len_buf = [0u8; 8];
     if file.read(&mut len_buf).unwrap_or(0) != 8 {
         return Err(issue(
             None,
-            format!("not a valid safetensors file: file too small to contain a header ({original})"),
+            format!(
+                "not a valid safetensors file: file too small to contain a header ({original})"
+            ),
         ));
     }
     let header_len = u64::from_le_bytes(len_buf);
@@ -705,10 +718,18 @@ fn validate_safetensors_header(
     }
 
     let mut header_buf = vec![0u8; header_len as usize];
-    file.read_exact(&mut header_buf)
-        .map_err(|e| issue(None, format!("failed to read safetensors header from {original}: {e}")))?;
-    serde_json::from_slice::<serde_json::Value>(&header_buf)
-        .map_err(|_| issue(None, format!("safetensors header is not valid JSON ({original})")))?;
+    file.read_exact(&mut header_buf).map_err(|e| {
+        issue(
+            None,
+            format!("failed to read safetensors header from {original}: {e}"),
+        )
+    })?;
+    serde_json::from_slice::<serde_json::Value>(&header_buf).map_err(|_| {
+        issue(
+            None,
+            format!("safetensors header is not valid JSON ({original})"),
+        )
+    })?;
 
     Ok(SourceInspection {
         original_path: original.to_string(),
@@ -867,7 +888,9 @@ fn read_reference_text_file(raw_path: &str) -> Result<String, ModelfileIssue> {
     if metadata.len() > MAX_REFERENCE_TEXT_BYTES {
         return Err(issue(
             None,
-            format!("{trimmed} is too large to load as text (max {MAX_REFERENCE_TEXT_BYTES} bytes)"),
+            format!(
+                "{trimmed} is too large to load as text (max {MAX_REFERENCE_TEXT_BYTES} bytes)"
+            ),
         ));
     }
     let bytes =
@@ -910,10 +933,8 @@ mod tests {
 
     impl TempPath {
         fn dir(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "modelfile-test-{label}-{}",
-                uuid::Uuid::new_v4()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("modelfile-test-{label}-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&path).expect("create temp dir");
             TempPath(path)
         }
@@ -972,13 +993,22 @@ MESSAGE user Hello!
         let parsed = parse_modelfile(text).expect("valid modelfile parses");
         assert_eq!(parsed.from.as_deref(), Some("llama3.2:latest"));
         assert_eq!(parsed.requires.as_deref(), Some("0.5.0"));
-        assert_eq!(parsed.template.as_deref(), Some("{{ .System }}\n{{ .Prompt }}"));
+        assert_eq!(
+            parsed.template.as_deref(),
+            Some("{{ .System }}\n{{ .Prompt }}")
+        );
         assert_eq!(parsed.system.as_deref(), Some("You are a terse assistant."));
         assert_eq!(
             parsed.parameters,
             vec![
-                ModelfileParameter { key: "temperature".into(), value: "0.7".into() },
-                ModelfileParameter { key: "stop".into(), value: "AI assistant:".into() },
+                ModelfileParameter {
+                    key: "temperature".into(),
+                    value: "0.7".into()
+                },
+                ModelfileParameter {
+                    key: "stop".into(),
+                    value: "AI assistant:".into()
+                },
             ]
         );
         assert_eq!(parsed.licenses, vec!["Apache-2.0".to_string()]);
@@ -997,9 +1027,11 @@ MESSAGE user Hello!
 
     #[test]
     fn single_line_triple_quote_block_is_supported() {
-        let parsed = parse_modelfile(r#"FROM x
+        let parsed = parse_modelfile(
+            r#"FROM x
 SYSTEM """You are helpful."""
-"#)
+"#,
+        )
         .expect("single-line triple-quoted block parses");
         assert_eq!(parsed.system.as_deref(), Some("You are helpful."));
     }
@@ -1029,7 +1061,9 @@ SYSTEM """You are helpful."""
     #[test]
     fn rejects_malformed_parameter_missing_value() {
         let err = parse_modelfile("FROM x\nPARAMETER temperature\n").unwrap_err();
-        assert!(err.message.contains("PARAMETER requires a name and a value"));
+        assert!(err
+            .message
+            .contains("PARAMETER requires a name and a value"));
     }
 
     #[test]
@@ -1050,7 +1084,9 @@ SYSTEM """You are helpful."""
     fn rejects_malformed_numeric_parameter_value() {
         let parsed = parse_modelfile("FROM x\nPARAMETER num_ctx not-a-number\n").expect("parses");
         let err = validate_modelfile(&parsed).unwrap_err();
-        assert!(err.message.contains("malformed parameter value for 'num_ctx'"));
+        assert!(err
+            .message
+            .contains("malformed parameter value for 'num_ctx'"));
     }
 
     #[test]
@@ -1079,11 +1115,8 @@ SYSTEM """You are helpful."""
     fn accepts_existing_adapter_file() {
         let dir = TempPath::dir("adapter");
         let adapter_path = write_file(&dir.0, "adapter.safetensors", b"whatever");
-        let parsed = parse_modelfile(&format!(
-            "FROM x\nADAPTER {}\n",
-            adapter_path.display()
-        ))
-        .expect("parses");
+        let parsed = parse_modelfile(&format!("FROM x\nADAPTER {}\n", adapter_path.display()))
+            .expect("parses");
         let warnings = validate_modelfile(&parsed).expect("existing adapter file passes");
         assert!(warnings.is_empty());
     }
@@ -1093,14 +1126,20 @@ SYSTEM """You are helpful."""
     #[test]
     fn accepts_reasonable_short_names() {
         for name in ["my-model", "namespace/model:tag", "model.v2", "model_v2"] {
-            assert!(validate_short_name(name).is_ok(), "expected {name} to be valid");
+            assert!(
+                validate_short_name(name).is_ok(),
+                "expected {name} to be valid"
+            );
         }
     }
 
     #[test]
     fn rejects_path_traversal_short_names() {
         for name in ["../etc/passwd", "a/../b", "..", "/etc/passwd", "a//b", "a/"] {
-            assert!(validate_short_name(name).is_err(), "expected {name} to be rejected");
+            assert!(
+                validate_short_name(name).is_err(),
+                "expected {name} to be rejected"
+            );
         }
     }
 
@@ -1128,7 +1167,8 @@ SYSTEM """You are helpful."""
     fn detects_valid_gguf_file() {
         let dir = TempPath::dir("gguf-ok");
         let path = write_file(&dir.0, "model.gguf", &valid_gguf_bytes());
-        let inspection = inspect_source(&path.display().to_string()).expect("valid GGUF sniffs clean");
+        let inspection =
+            inspect_source(&path.display().to_string()).expect("valid GGUF sniffs clean");
         assert_eq!(inspection.format, DetectedFormat::Gguf);
         assert!(inspection.warnings.is_empty());
     }
@@ -1138,7 +1178,9 @@ SYSTEM """You are helpful."""
         let dir = TempPath::dir("gguf-bad-magic");
         let path = write_file(&dir.0, "model.gguf", b"NOTGGUF-and-some-more-bytes-padding");
         let err = inspect_source(&path.display().to_string()).unwrap_err();
-        assert!(err.message.contains("not a valid GGUF file: bad magic bytes"));
+        assert!(err
+            .message
+            .contains("not a valid GGUF file: bad magic bytes"));
     }
 
     #[test]
@@ -1153,7 +1195,8 @@ SYSTEM """You are helpful."""
     fn detects_valid_safetensors_file() {
         let dir = TempPath::dir("safetensors-ok");
         let path = write_file(&dir.0, "model.safetensors", &valid_safetensors_bytes());
-        let inspection = inspect_source(&path.display().to_string()).expect("valid safetensors sniffs clean");
+        let inspection =
+            inspect_source(&path.display().to_string()).expect("valid safetensors sniffs clean");
         assert_eq!(inspection.format, DetectedFormat::SafetensorsFile);
     }
 
@@ -1197,17 +1240,26 @@ SYSTEM """You are helpful."""
 
     #[test]
     fn bare_model_tag_is_an_existing_model_reference() {
-        let inspection = inspect_source("llama3.2:latest").expect("tag-shaped FROM sniffs as a reference");
+        let inspection =
+            inspect_source("llama3.2:latest").expect("tag-shaped FROM sniffs as a reference");
         assert_eq!(inspection.format, DetectedFormat::ExistingModelReference);
     }
 
     #[test]
     fn detects_safetensors_directory_and_warns_on_missing_config() {
         let dir = TempPath::dir("safetensors-dir");
-        write_file(&dir.0, "model-00001-of-00001.safetensors", &valid_safetensors_bytes());
-        let inspection = inspect_source(&dir.0.display().to_string()).expect("directory sniffs clean");
+        write_file(
+            &dir.0,
+            "model-00001-of-00001.safetensors",
+            &valid_safetensors_bytes(),
+        );
+        let inspection =
+            inspect_source(&dir.0.display().to_string()).expect("directory sniffs clean");
         assert_eq!(inspection.format, DetectedFormat::SafetensorsDirectory);
-        assert!(inspection.warnings.iter().any(|w| w.contains("config.json")));
+        assert!(inspection
+            .warnings
+            .iter()
+            .any(|w| w.contains("config.json")));
     }
 
     #[test]
@@ -1274,10 +1326,16 @@ SYSTEM """You are helpful."""
             requires: Some("0.5.0".to_string()),
             template: Some("{{ .Prompt }}".to_string()),
             system: Some("Be terse.".to_string()),
-            parameters: vec![ModelfileParameter { key: "temperature".into(), value: "0.7".into() }],
+            parameters: vec![ModelfileParameter {
+                key: "temperature".into(),
+                value: "0.7".into(),
+            }],
             adapters: vec!["/tmp/adapter.gguf".to_string()],
             licenses: vec!["MIT".to_string()],
-            messages: vec![ModelfileMessage { role: "user".into(), content: "hi".into() }],
+            messages: vec![ModelfileMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
         };
         let rendered = parsed.render();
         let reparsed = parse_modelfile(&rendered).expect("rendered modelfile reparses cleanly");
@@ -1325,7 +1383,9 @@ SYSTEM """You are helpful."""
             from: Some("llama3.2:latest".to_string()),
             ..Default::default()
         };
-        let resolved = parsed.with_canonicalized_paths().expect("no path to resolve");
+        let resolved = parsed
+            .with_canonicalized_paths()
+            .expect("no path to resolve");
         assert_eq!(resolved.from.as_deref(), Some("llama3.2:latest"));
     }
 

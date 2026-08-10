@@ -287,13 +287,38 @@ fn write_log(
     }
     // Temp file + rename, same reasoning as `prompts::save_impl`: a crash
     // mid-rewrite must not leave a truncated history behind.
-    let tmp = path.with_extension("jsonl.tmp");
+    //
+    // The temp name is **per writer**, not a fixed `.jsonl.tmp`. Two writers
+    // rewriting one entity concurrently — two windows, or the desktop and the
+    // CLI — otherwise pick the same temp path: the first rename moves it away
+    // and the second fails with `ENOENT`, reported as "failed to finalize
+    // revisions". Both writes are legitimate and the loser's should simply be
+    // second, not an error. A pid and a counter are enough: the rename is
+    // atomic, so the last one to finish wins, which is the same outcome two
+    // sequential saves would have had.
+    let tmp = path.with_extension(format!(
+        "jsonl.{}.{}.tmp",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::write(&tmp, body)
         .map_err(|e| RevisionError::Io(format!("failed to write revisions: {e}")))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| RevisionError::Io(format!("failed to finalize revisions: {e}")))?;
+    if let Err(error) = std::fs::rename(&tmp, &path) {
+        // The temp file is this writer's own, so cleaning it up on failure
+        // cannot disturb anybody else's in-flight write.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(RevisionError::Io(format!(
+            "failed to finalize revisions: {error}"
+        )));
+    }
     Ok(())
 }
+
+/// Distinguishes one writer's temp file from another's within this process.
+///
+/// Paired with the pid so two *processes* — the desktop app and `monkey` — do
+/// not collide either. See [`write_log`] for the failure this prevents.
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn append_line(
     root: &Path,
@@ -1089,5 +1114,87 @@ mod tests {
             head_label: None,
         };
         assert!(error.to_string().starts_with("conflict:"));
+    }
+
+    /// Two writers rewriting one entity at once must both succeed.
+    ///
+    /// The rewrite path (`write_log`, reached once a log passes
+    /// `MAX_REVISIONS_PER_ENTITY`) used a fixed `<entity>.jsonl.tmp`. Two
+    /// concurrent writers therefore picked the *same* temp path: the first
+    /// rename moved it away and the second failed with `ENOENT`, surfacing as
+    /// "failed to finalize revisions: No such file or directory". Both writes
+    /// are legitimate; the loser's should simply be second.
+    ///
+    /// Reachable in production by two windows, or the desktop and the CLI,
+    /// saving the same config at once — and it is what turned the MCP tests red
+    /// as soon as they shared one revision root.
+    #[test]
+    fn concurrent_rewrites_of_one_entity_do_not_collide_on_a_temp_file() {
+        let root = temp_root();
+
+        // Push the log past the prune threshold so every further record takes
+        // the rewrite path rather than the append one.
+        for index in 0..=MAX_REVISIONS_PER_ENTITY {
+            record(
+                &root,
+                "kind",
+                "entity",
+                RecordRequest {
+                    branch: None,
+                    base_revision_id: None,
+                    label: format!("seed {index}"),
+                    content: format!("content {index}"),
+                },
+            )
+            .expect("seeding the log");
+        }
+
+        let failures = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for writer in 0..8 {
+                let root = &root;
+                let failures = &failures;
+                scope.spawn(move || {
+                    for round in 0..5 {
+                        if let Err(error) = record(
+                            root,
+                            "kind",
+                            "entity",
+                            RecordRequest {
+                                branch: None,
+                                base_revision_id: None,
+                                label: format!("writer {writer} round {round}"),
+                                content: format!("concurrent {writer}-{round}"),
+                            },
+                        ) {
+                            failures.lock().expect("lock").push(error.to_string());
+                        }
+                    }
+                });
+            }
+        });
+
+        let failures = failures.into_inner().expect("lock");
+        assert!(
+            failures.is_empty(),
+            "concurrent writers must not lose a rewrite to a shared temp file: {failures:?}",
+        );
+
+        // The log is still readable and still bounded, so the rewrites landed
+        // rather than merely not erroring.
+        let history = history(&root, "kind", "entity", None).expect("history reads");
+        assert!(!history.is_empty());
+        assert!(history.len() <= MAX_REVISIONS_PER_ENTITY);
+
+        // And no temp file was orphaned by a failed rename.
+        let leftovers: Vec<_> = std::fs::read_dir(root.join(slug("kind")))
+            .expect("kind dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "orphaned temp files: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

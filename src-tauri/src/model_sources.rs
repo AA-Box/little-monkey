@@ -1285,7 +1285,10 @@ async fn fetch_registry_token(
         }
     }
     let response = crate::egress::send(
-        client.get(url).header(ACCEPT, "application/json").header(ACCEPT_ENCODING, "identity"),
+        client
+            .get(url)
+            .header(ACCEPT, "application/json")
+            .header(ACCEPT_ENCODING, "identity"),
     )
     .await
     .map_err(|error| format!("Failed to obtain Ollama registry token: {error}"))?;

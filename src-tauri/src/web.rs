@@ -39,8 +39,8 @@ use tokio::sync::Notify;
 use url::Url;
 
 use crate::egress::{EgressDenial, EgressRule};
-use crate::{checkpoints, permissions, AppState};
 use crate::profiles::ProfileScopedPaths;
+use crate::{checkpoints, permissions, AppState};
 
 /// Total request timeout (connect through full body read) for `tool_web_fetch`.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);

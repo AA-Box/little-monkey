@@ -431,8 +431,7 @@ pub fn extract_package_archive(
         .entries()
         .map_err(|source| io_at("read MLX package archive", archive, source))?;
     for entry in entries {
-        let mut entry =
-            entry.map_err(|source| io_at("read MLX package entry", archive, source))?;
+        let mut entry = entry.map_err(|source| io_at("read MLX package entry", archive, source))?;
         // Directories are implied by the files inside them; anything that is
         // neither a directory nor a regular file has no place in a package.
         if entry.header().entry_type().is_dir() {
@@ -2230,10 +2229,16 @@ mod tests {
         };
 
         // The ordinary case still works, or the checks below prove nothing.
-        let good = build("good.tar.gz", vec![("service/mlx_server.py", b"print(1)" as &[u8])]);
+        let good = build(
+            "good.tar.gz",
+            vec![("service/mlx_server.py", b"print(1)" as &[u8])],
+        );
         let out = base.join("good-out");
         extract_package_archive(&good, &out, &limits).expect("a normal archive unpacks");
-        assert_eq!(fs::read(out.join("service/mlx_server.py")).unwrap(), b"print(1)");
+        assert_eq!(
+            fs::read(out.join("service/mlx_server.py")).unwrap(),
+            b"print(1)"
+        );
 
         // Escapes, refused before any write reaches the parent.
         let canary = base.join("pwned.txt");
@@ -2254,8 +2259,10 @@ mod tests {
         // tree, so the entry type is refused rather than followed.
         let link = base.join("link.tar.gz");
         {
-            let encoder =
-                flate2::write::GzEncoder::new(File::create(&link).unwrap(), flate2::Compression::fast());
+            let encoder = flate2::write::GzEncoder::new(
+                File::create(&link).unwrap(),
+                flate2::Compression::fast(),
+            );
             let mut archive = tar::Builder::new(encoder);
             let mut header = tar::Header::new_gnu();
             header.set_size(0);

@@ -308,8 +308,10 @@ mod tests {
     #[test]
     fn load_enabled_from_filters_out_disabled_servers() {
         let path = temp_config_path("filter.json");
-        mcp::add_server_impl(&path, stdio_entry("on", true)).unwrap();
-        mcp::add_server_impl(&path, stdio_entry("off", false)).unwrap();
+        // No base revision: this fixture writes the config from nothing, which is
+        // the unconditional-append case `add_server_impl` documents.
+        mcp::add_server_impl(&path, stdio_entry("on", true), None).unwrap();
+        mcp::add_server_impl(&path, stdio_entry("off", false), None).unwrap();
 
         let enabled = load_enabled_from(&path);
         assert_eq!(enabled.len(), 1);

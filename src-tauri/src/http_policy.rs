@@ -569,7 +569,10 @@ mod tests {
     fn constant_time_eq_matches_equal_digests_and_rejects_unequal_ones() {
         let digest = |input: &str| format!("{:x}", sha2::Sha256::digest(input.as_bytes()));
         let base = digest("lmk-abc");
-        assert!(constant_time_eq(base.as_bytes(), digest("lmk-abc").as_bytes()));
+        assert!(constant_time_eq(
+            base.as_bytes(),
+            digest("lmk-abc").as_bytes()
+        ));
         assert!(!constant_time_eq(
             base.as_bytes(),
             digest("lmk-different").as_bytes()

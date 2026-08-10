@@ -1,3 +1,4 @@
+import { en } from "./en";
 import { crewLocale } from "./crew";
 import { runLocale } from "./runs";
 import { searchLocale } from "./search";
@@ -39,7 +40,8 @@ import { privacyFirewallLocale } from "./privacyFirewall";
 import { redTeamLabLocale } from "./redTeamLab";
 import { sandboxLocale } from "./sandbox";
 
-export const pt: Record<string, string> = {
+/** What this locale says in its own words — everything else falls back to English. */
+const translated: Record<string, string> = {
   ...dbAdminGuardrailsLocale,
   ...developerLocale,
   ...ecosystemLocale,
@@ -2642,3 +2644,34 @@ export const pt: Record<string, string> = {
   "Studio.unsupported.title": "O Studio não está disponível nesta máquina",
   "Studio.unsupported.body": "O motor de geração é distribuído pré-compilado para Macs com Apple silicon e para Windows e Linux x86-64. Chat e Code não são afetados."
 };
+
+/**
+ * Every key, so this locale's key set is identical to the base's *by
+ * construction* (roadmap K22).
+ *
+ * Before this, each locale carried only the keys somebody had translated, so
+ * the sets diverged by over a thousand entries and nothing could be enforced: a
+ * key renamed in `en` left ten locales pointing at one that no longer existed,
+ * and no check failed. `useT()` already fell back to English for a missing key,
+ * so **no user-visible text changes** — what changes is that the divergence is
+ * now impossible rather than merely unmeasured, and `localeSync.test.ts` holds
+ * it that way.
+ *
+ * `en` is imported by `index.ts` unconditionally as the runtime fallback, so
+ * spreading it here costs nothing at the bundle: those bytes were already
+ * loaded for every locale.
+ *
+ * The real translation gap stays countable: `TRANSLATED_KEYS` below is what this
+ * locale actually says in its own words, and everything else is showing English.
+ */
+export const pt: Record<string, string> = { ...en, ...translated };
+
+/**
+ * The keys this locale genuinely translates.
+ *
+ * Exported so the count of what is *not* translated is exact rather than
+ * inferred from "the string happens to equal English" — many real translations
+ * legitimately do ("OK", "Studio", a product name).
+ */
+export const ptTranslatedKeys: readonly string[] = Object.keys(translated);
+

@@ -109,29 +109,51 @@ describe("mcpStore CRUD actions", () => {
       tool_allowlist: null,
       timeout_secs: null,
     };
-    invokeMock.mockResolvedValueOnce(entry).mockResolvedValueOnce([makeInfo()]);
+    // Every mutation now reads its base revision first, so the write can be
+    // refused if another window saved since (roadmap K24).
+    invokeMock
+      .mockResolvedValueOnce("rev-1")
+      .mockResolvedValueOnce(entry)
+      .mockResolvedValueOnce([makeInfo()]);
 
     await useMcpStore.getState().addServer(entry);
 
-    expect(invokeMock).toHaveBeenNthCalledWith(1, "mcp_add_server", { entry });
-    expect(invokeMock).toHaveBeenNthCalledWith(2, "mcp_list_servers");
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "mcp_current_revision");
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "mcp_add_server", {
+      entry,
+      base_revision_id: "rev-1",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "mcp_list_servers");
     expect(useMcpStore.getState().servers).toHaveLength(1);
   });
 
   it("removeServer invokes mcp_remove_server with server_id then refreshes", async () => {
-    invokeMock.mockResolvedValueOnce(undefined).mockResolvedValueOnce([]);
+    invokeMock
+      .mockResolvedValueOnce("rev-1")
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce([]);
 
     await useMcpStore.getState().removeServer("srv");
 
-    expect(invokeMock).toHaveBeenNthCalledWith(1, "mcp_remove_server", { server_id: "srv" });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "mcp_remove_server", {
+      server_id: "srv",
+      base_revision_id: "rev-1",
+    });
   });
 
   it("setEnabled invokes mcp_set_enabled with server_id and enabled then refreshes", async () => {
-    invokeMock.mockResolvedValueOnce(makeInfo()).mockResolvedValueOnce([]);
+    invokeMock
+      .mockResolvedValueOnce("rev-1")
+      .mockResolvedValueOnce(makeInfo())
+      .mockResolvedValueOnce([]);
 
     await useMcpStore.getState().setEnabled("srv", false);
 
-    expect(invokeMock).toHaveBeenNthCalledWith(1, "mcp_set_enabled", { server_id: "srv", enabled: false });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "mcp_set_enabled", {
+      server_id: "srv",
+      enabled: false,
+      base_revision_id: "rev-1",
+    });
   });
 
   it("connect invokes mcp_connect with server_id then refreshes", async () => {

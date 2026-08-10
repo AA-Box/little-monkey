@@ -24,9 +24,9 @@ use uuid::Uuid;
 use crate::artifact_store::ArtifactStore;
 use crate::generation::{self, GenerationModelSpec, GenerationRequest, JobProgress};
 use crate::managed_runtime::{self, STABLE_DIFFUSION};
+use crate::profiles::ProfileScopedPaths;
 use crate::studio_tools;
 use crate::AppState;
-use crate::profiles::ProfileScopedPaths;
 
 const GALLERY_FILE: &str = "studio-gallery.json";
 /// The user's own model list. There is no built-in catalogue — this file is
@@ -226,9 +226,11 @@ fn engine_binary(app: &AppHandle) -> Result<PathBuf, String> {
         .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     let resource_dir = app.path().resource_dir().ok();
-    if let Ok(Some(path)) =
-        managed_runtime::materialize_bundled_runtime_for(&STABLE_DIFFUSION, resource_dir.as_deref(), &app_data)
-    {
+    if let Ok(Some(path)) = managed_runtime::materialize_bundled_runtime_for(
+        &STABLE_DIFFUSION,
+        resource_dir.as_deref(),
+        &app_data,
+    ) {
         return Ok(path);
     }
     managed_runtime::find_managed_sd_server(Some(&app_data)).ok_or_else(|| {
@@ -264,7 +266,9 @@ fn engine_starts(binary: &Path) -> bool {
     static STARTS: OnceLock<Mutex<HashMap<ProbeKey, bool>>> = OnceLock::new();
     let key: ProbeKey = (
         binary.to_path_buf(),
-        std::fs::metadata(binary).and_then(|meta| meta.modified()).ok(),
+        std::fs::metadata(binary)
+            .and_then(|meta| meta.modified())
+            .ok(),
     );
     if let Ok(cache) = STARTS.get_or_init(Default::default).lock() {
         if let Some(&cached) = cache.get(&key) {
@@ -454,7 +458,11 @@ pub async fn generation_download_model(
             }
             // Download beside the destination and rename, so an interrupted
             // transfer never leaves a half file that looks installed.
-            let temporary = root.join(format!(".{}.{}.part", component.file_name(), Uuid::new_v4()));
+            let temporary = root.join(format!(
+                ".{}.{}.part",
+                component.file_name(),
+                Uuid::new_v4()
+            ));
             let outcome =
                 crate::models::download_to_file(&app, repo, file, &temporary, &cancel).await;
             if let Err(error) = outcome {
@@ -660,7 +668,6 @@ async fn run_speech_with(
     spec: &GenerationModelSpec,
     request: &GenerationRequest,
 ) -> Result<generation::GeneratedMedia, String> {
-
     let output_path = studio_dir(app)?.join(format!("speech-{}.wav", Uuid::new_v4()));
     let args = generation::speech_args(spec, &model_root(app)?, request, &output_path)?;
     let run = tokio::process::Command::new(binary)
@@ -984,10 +991,7 @@ pub fn generation_delete_entry(app: AppHandle, entry_id: String) -> Result<(), S
 /// The engine holds tens of gigabytes of weights, so callers preview from the
 /// artifact store rather than regenerating.
 #[tauri::command]
-pub fn generation_media_data_url(
-    app: AppHandle,
-    artifact_id: String,
-) -> Result<String, String> {
+pub fn generation_media_data_url(app: AppHandle, artifact_id: String) -> Result<String, String> {
     let gallery: Vec<GenerationEntry> = read_state(&app, GALLERY_FILE)?;
     let entry = gallery
         .into_iter()
@@ -1248,8 +1252,9 @@ pub fn studio_tool_import_catalog(
     let held = crate::m3_production::component_registry_entries(m3.component_hub.root())
         .map_err(|error| error.to_string())?;
     let merged = merge_tool_catalog(held, imported)?;
-    let stored = crate::m3_production::replace_component_registry_entries(&m3.component_hub, merged)
-        .map_err(|error| error.to_string())?;
+    let stored =
+        crate::m3_production::replace_component_registry_entries(&m3.component_hub, merged)
+            .map_err(|error| error.to_string())?;
     Ok(stored
         .into_iter()
         .filter(|entry| entry.kind == M3ComponentKind::StudioTool)
@@ -1338,7 +1343,11 @@ mod tests {
     /// those would turn importing a tool list into repointing the engine.
     #[test]
     fn importing_a_catalog_takes_only_studio_tools() {
-        let held = vec![entry("llama-cpp-server", "1.0.0", M3ComponentKind::LlamaCppServer)];
+        let held = vec![entry(
+            "llama-cpp-server",
+            "1.0.0",
+            M3ComponentKind::LlamaCppServer,
+        )];
         let imported = vec![
             entry("face-swap", "1.0.0", M3ComponentKind::StudioTool),
             // The smuggled one: same id as the installed runtime, so a blind
@@ -1355,9 +1364,7 @@ mod tests {
             1,
             "the runtime entry must be the one already held"
         );
-        assert!(merged
-            .iter()
-            .any(|held| held.component_id == "face-swap"));
+        assert!(merged.iter().any(|held| held.component_id == "face-swap"));
     }
 
     #[test]
@@ -1385,7 +1392,10 @@ mod tests {
         .unwrap();
         assert_eq!(merged.len(), 3);
         assert_eq!(
-            merged.iter().filter(|e| e.component_id == "face-swap").count(),
+            merged
+                .iter()
+                .filter(|e| e.component_id == "face-swap")
+                .count(),
             2
         );
     }

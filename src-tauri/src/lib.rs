@@ -1016,6 +1016,25 @@ pub fn run() {
                 process_commands::reap_desktop_processes_at_startup(&reap_app, reap_state.inner());
             }
 
+            // Move destinations for egress that belongs to no run onto the
+            // ledger. Attributed destinations ride their run's own drain, which
+            // an app making only unattributed requests never reaches — so
+            // without this the "where did the app itself go" half stays in
+            // memory and dies with the process.
+            {
+                static UNATTRIBUTED_DRAIN_STOP: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                let drain_app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    run_commands::run_unattributed_egress_drain(
+                        drain_app,
+                        run_commands::UNATTRIBUTED_DRAIN_INTERVAL,
+                        &UNATTRIBUTED_DRAIN_STOP,
+                    )
+                    .await;
+                });
+            }
+
             // Reclaim browser sessions nothing is driving any more. Before this,
             // a session was bounded only inside `begin_action`, which an agent
             // reaches only while it is actively driving the page — so an
@@ -1196,6 +1215,8 @@ pub fn run() {
             web::web_remove_brave_key,
             rules::rules_read,
             rules::rules_write,
+            rules::rules_current_revision,
+            rules::rules_revision_entity,
             memory::memory_list,
             memory::memory_add,
             memory::memory_delete,
@@ -1275,6 +1296,8 @@ pub fn run() {
             git::git_file_diff,
             mcp::mcp_list_servers,
             mcp::mcp_add_server,
+            mcp::mcp_current_revision,
+            mcp::mcp_restore_config,
             mcp::mcp_update_server,
             mcp::mcp_remove_server,
             mcp::mcp_set_enabled,

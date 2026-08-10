@@ -14,7 +14,7 @@
 //! *what the answer is*. A scheduler whose logic only exists inside a tokio tick
 //! is a scheduler nobody can test.
 
-use super::admission::Resource;
+use super::admission::{DeviceClaim, Resource};
 use little_monkey_lib::run_protocol::RunKind;
 // `ProcessClass` and `classify` live in the lib beside `RunKind`, which is what
 // decides a class — the desktop and the ledger need the same answer this
@@ -197,10 +197,7 @@ pub fn deciding_key(
         );
     }
     if chosen.aging_steps(now_ms) != other.aging_steps(now_ms) {
-        return (
-            KEY_AGING_STEPS,
-            Some(u64::from(chosen.aging_steps(now_ms))),
-        );
+        return (KEY_AGING_STEPS, Some(u64::from(chosen.aging_steps(now_ms))));
     }
     if chosen.charge_bucket() != other.charge_bucket() {
         // The reported value is the raw measured charge, not the bucket: the
@@ -227,16 +224,34 @@ pub struct Running {
     pub class: ProcessClass,
     pub ram_bytes: u64,
     pub vram_bytes: u64,
+    /// What this job holds on each accelerator device (K15).
+    ///
+    /// Beside `vram_bytes` rather than replacing it: that figure is the pooled
+    /// total and is still what a RAM-versus-accelerator comparison reads. This is
+    /// what a *device* shortfall is answered from, and the distinction is the
+    /// whole point — suspending a job that holds 8 GB on card 0 frees nothing at
+    /// all when card 1 is the one that is full.
+    pub device_bytes: Vec<DeviceClaim>,
     /// Already suspended by the scheduler, so it has nothing left to give.
     pub preempted: bool,
     pub started_at_ms: u64,
 }
 
 impl Running {
-    fn claim(&self, resource: Resource) -> u64 {
+    fn claim(&self, resource: &Resource) -> u64 {
         match resource {
             Resource::Ram => self.ram_bytes,
-            Resource::Vram => self.vram_bytes,
+            // Only the bytes on the device that actually fell short. Falling back
+            // to `vram_bytes` here would re-introduce the aggregate through the
+            // preemption path: a victim would look like it could free memory on a
+            // card it never touched, the set would pass the covers-the-shortfall
+            // guard, and real work would be parked for nothing.
+            Resource::Accelerator(device) => self
+                .device_bytes
+                .iter()
+                .find(|claim| claim.device == *device)
+                .map(|claim| claim.bytes)
+                .unwrap_or(0),
         }
     }
 }
@@ -267,12 +282,12 @@ impl Running {
 /// Returns empty when no set covers the shortfall, when nothing is eligible, or
 /// when `shortfall_bytes` is zero — the last because a claimant that needs
 /// nothing must not suspend anyone.
-pub fn preemption_victims(
+pub fn preemption_victims<'a>(
     claimant: ProcessClass,
-    resource: Resource,
+    resource: &Resource,
     shortfall_bytes: u64,
-    running: &[Running],
-) -> Vec<&Running> {
+    running: &'a [Running],
+) -> Vec<&'a Running> {
     if shortfall_bytes == 0 {
         return Vec::new();
     }
@@ -313,7 +328,7 @@ fn eligible(claimant: ProcessClass, running: &[Running]) -> impl Iterator<Item =
 /// long-running job keeps its progress, which is the difference between
 /// preemption and just undoing work. `job_id` last, so the order is total and a
 /// tick's decision is reproducible.
-fn preference(left: &Running, right: &Running, resource: Resource) -> std::cmp::Ordering {
+fn preference(left: &Running, right: &Running, resource: &Resource) -> std::cmp::Ordering {
     right
         .class
         .rank()
@@ -599,7 +614,8 @@ mod tests {
         }
         rank(&mut queue, at_bound);
         assert_eq!(
-            queue[0].job_id, "starving",
+            queue[0].job_id,
+            "starving",
             "a maintenance job must reach the head after {} ms",
             starvation_bound_ms()
         );
@@ -727,7 +743,11 @@ mod tests {
                 // One interval on, `base` has aged from batch to interactive and
                 // this arrival is interactive already: same effective class,
                 // fewer aging steps.
-                candidate("arrival", ProcessClass::Interactive, 1_000 + AGING_INTERVAL_MS),
+                candidate(
+                    "arrival",
+                    ProcessClass::Interactive,
+                    1_000 + AGING_INTERVAL_MS,
+                ),
                 1_000 + AGING_INTERVAL_MS,
                 KEY_AGING_STEPS,
             ),
@@ -752,7 +772,11 @@ mod tests {
                 1_001,
                 KEY_QUEUE_AGE,
             ),
-            (candidate("zzz", ProcessClass::Batch, 1_000), 1_000, KEY_JOB_ID),
+            (
+                candidate("zzz", ProcessClass::Batch, 1_000),
+                1_000,
+                KEY_JOB_ID,
+            ),
         ];
         for (other, now, expected) in cases {
             let mut pair = vec![base.clone(), other.clone()];
@@ -769,6 +793,7 @@ mod tests {
 
     fn running(job_id: &str, class: ProcessClass, ram_bytes: u64) -> Running {
         Running {
+            device_bytes: Vec::new(),
             job_id: job_id.to_string(),
             class,
             ram_bytes,
@@ -784,7 +809,8 @@ mod tests {
             running("peer", ProcessClass::Interactive, 8_000),
             running("lower", ProcessClass::Background, 8_000),
         ];
-        let victims = preemption_victims(ProcessClass::Interactive, Resource::Ram, 4_000, &running);
+        let victims =
+            preemption_victims(ProcessClass::Interactive, &Resource::Ram, 4_000, &running);
         assert_eq!(
             victims
                 .iter()
@@ -794,7 +820,8 @@ mod tests {
         );
 
         assert!(
-            preemption_victims(ProcessClass::Background, Resource::Ram, 4_000, &running).is_empty(),
+            preemption_victims(ProcessClass::Background, &Resource::Ram, 4_000, &running)
+                .is_empty(),
             "a background claimant may not preempt an interactive peer"
         );
     }
@@ -804,7 +831,9 @@ mod tests {
     #[test]
     fn an_equal_class_is_never_a_victim() {
         let running = vec![running("peer", ProcessClass::Batch, 16_000)];
-        assert!(preemption_victims(ProcessClass::Batch, Resource::Ram, 1_000, &running).is_empty());
+        assert!(
+            preemption_victims(ProcessClass::Batch, &Resource::Ram, 1_000, &running).is_empty()
+        );
     }
 
     #[test]
@@ -820,7 +849,7 @@ mod tests {
                 ..running("oldest", ProcessClass::Maintenance, 9_000)
             },
         ];
-        let victims = preemption_victims(ProcessClass::Batch, Resource::Ram, 8_000, &running);
+        let victims = preemption_victims(ProcessClass::Batch, &Resource::Ram, 8_000, &running);
         assert_eq!(
             victims
                 .iter()
@@ -831,7 +860,7 @@ mod tests {
         );
 
         assert!(
-            preemption_victims(ProcessClass::Batch, Resource::Ram, 20_000, &running).is_empty(),
+            preemption_victims(ProcessClass::Batch, &Resource::Ram, 20_000, &running).is_empty(),
             "19_000 across everything eligible still does not cover 20_000"
         );
     }
@@ -854,7 +883,7 @@ mod tests {
 
         // 9_000 alone is short; 9_000 + 9_000 is not.
         let victims: Vec<&str> =
-            preemption_victims(ProcessClass::Batch, Resource::Ram, 15_000, &running)
+            preemption_victims(ProcessClass::Batch, &Resource::Ram, 15_000, &running)
                 .iter()
                 .map(|victim| victim.job_id.as_str())
                 .collect();
@@ -865,7 +894,7 @@ mod tests {
         );
 
         assert_eq!(
-            preemption_victims(ProcessClass::Batch, Resource::Ram, 8_000, &running)
+            preemption_victims(ProcessClass::Batch, &Resource::Ram, 8_000, &running)
                 .iter()
                 .map(|victim| victim.job_id.as_str())
                 .collect::<Vec<_>>(),
@@ -883,18 +912,19 @@ mod tests {
             running("b", ProcessClass::Background, 4_000),
         ];
         assert!(
-            preemption_victims(ProcessClass::Interactive, Resource::Ram, 20_000, &running)
+            preemption_victims(ProcessClass::Interactive, &Resource::Ram, 20_000, &running)
                 .is_empty(),
             "suspending work that still would not admit the claimant is pure loss"
         );
         // And the same rule for a claimant that needs nothing at all.
         assert!(
-            preemption_victims(ProcessClass::Interactive, Resource::Ram, 0, &running).is_empty(),
+            preemption_victims(ProcessClass::Interactive, &Resource::Ram, 0, &running).is_empty(),
             "a claimant with no shortfall must not suspend anyone"
         );
         // Equal class is never eligible, cascading or not.
         assert!(
-            preemption_victims(ProcessClass::Background, Resource::Ram, 4_000, &running).is_empty(),
+            preemption_victims(ProcessClass::Background, &Resource::Ram, 4_000, &running)
+                .is_empty(),
             "equal classes preempting each other is the livelock this rules out"
         );
     }
@@ -906,7 +936,7 @@ mod tests {
             ..running("parked", ProcessClass::Background, 9_000)
         }];
         assert!(
-            preemption_victims(ProcessClass::Interactive, Resource::Ram, 1_000, &running)
+            preemption_victims(ProcessClass::Interactive, &Resource::Ram, 1_000, &running)
                 .is_empty()
         );
     }
@@ -922,7 +952,9 @@ mod tests {
         assert_eq!(full.state, BackpressureState::Closed);
         assert_eq!(full.reason, Some(BACKPRESSURE_QUEUE_FULL));
         assert_eq!(full.retry_after_ms, Some(250 * 128));
-        assert!(full.refusal().is_some_and(|text| text.contains("retry after")));
+        assert!(full
+            .refusal()
+            .is_some_and(|text| text.contains("retry after")));
 
         // The kill switch wins: it is the one an operator set deliberately.
         assert_eq!(
@@ -972,6 +1004,91 @@ mod tests {
             ProcessClass::Maintenance.promoted(1_000),
             ProcessClass::Interactive
         );
-        assert_eq!(ProcessClass::Maintenance.promoted(0), ProcessClass::Maintenance);
+        assert_eq!(
+            ProcessClass::Maintenance.promoted(0),
+            ProcessClass::Maintenance
+        );
+    }
+
+    /// Preemption has to free memory on the card that is actually full.
+    ///
+    /// The failure this guards is subtle and expensive: with a pooled figure, a
+    /// job holding 8 GiB on card 0 looks like it can relieve a shortfall on card
+    /// 1. The victim set passes the covers-the-shortfall guard, real work is
+    /// suspended, and the claimant is *still* held — the exact "park work for
+    /// nothing" outcome the set-based rule was built to rule out.
+    #[test]
+    fn a_device_shortfall_only_counts_victims_holding_that_device() {
+        use super::super::admission::{DeviceClaim, DeviceId};
+        use little_monkey_lib::runtime_adapter::AcceleratorKind;
+
+        let card0 = DeviceId::device(AcceleratorKind::Cuda, 0);
+        let card1 = DeviceId::device(AcceleratorKind::Cuda, 1);
+
+        let holder = |job_id: &str, device: &DeviceId, bytes: u64| Running {
+            job_id: job_id.to_string(),
+            class: ProcessClass::Background,
+            ram_bytes: 0,
+            vram_bytes: bytes,
+            device_bytes: vec![DeviceClaim {
+                device: device.clone(),
+                bytes,
+            }],
+            preempted: false,
+            started_at_ms: 1,
+        };
+
+        let running = vec![
+            holder("on-card-0", &card0, 8_000),
+            holder("on-card-1", &card1, 8_000),
+        ];
+
+        let victims = preemption_victims(
+            ProcessClass::Interactive,
+            &Resource::Accelerator(card1.clone()),
+            4_000,
+            &running,
+        );
+        assert_eq!(
+            victims
+                .iter()
+                .map(|v| v.job_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["on-card-1"],
+            "only the job holding the full card can relieve it"
+        );
+
+        // Nobody holds card 0 enough to cover this, and the job on card 1 must
+        // not be counted toward it — so nobody is suspended at all.
+        let none = preemption_victims(
+            ProcessClass::Interactive,
+            &Resource::Accelerator(card0.clone()),
+            20_000,
+            &running,
+        );
+        assert!(
+            none.is_empty(),
+            "a set that cannot cover the shortfall must park nobody, got {:?}",
+            none.iter().map(|v| &v.job_id).collect::<Vec<_>>()
+        );
+
+        // And the RAM leg is unaffected by any of this.
+        let ram_holder = Running {
+            job_id: "ram".to_string(),
+            class: ProcessClass::Background,
+            ram_bytes: 9_000,
+            vram_bytes: 0,
+            device_bytes: Vec::new(),
+            preempted: false,
+            started_at_ms: 1,
+        };
+        let ram_running = vec![ram_holder];
+        let victims = preemption_victims(
+            ProcessClass::Interactive,
+            &Resource::Ram,
+            4_000,
+            &ram_running,
+        );
+        assert_eq!(victims.len(), 1);
     }
 }

@@ -13,8 +13,8 @@ use tokio::io::AsyncWriteExt;
 
 use crate::model_sources::{self, ManagedModelProvenance};
 use crate::permissions;
-use crate::AppState;
 use crate::profiles::ProfileScopedPaths;
+use crate::AppState;
 
 /// Whether a `ModelInfo` is a chat (tool-calling instruct) model or an
 /// embedding model — added for the RAG/Knowledge Stacks feature so
@@ -602,7 +602,10 @@ impl Drop for DownloadCancelCleanup<'_> {
 /// Best-effort cancellation, like `stacks_cancel_index`: if no download is
 /// currently running for `file`, this is simply a no-op (nothing to cancel).
 #[tauri::command]
-pub fn models_cancel_download(state: tauri::State<'_, AppState>, file: String) -> Result<(), String> {
+pub fn models_cancel_download(
+    state: tauri::State<'_, AppState>,
+    file: String,
+) -> Result<(), String> {
     let cancels = state
         .model_downloads
         .lock()

@@ -500,10 +500,29 @@ migration over users' existing embedded vectors**:
   One claim in this section stands unchanged and was not what forced the staging: **v1's
   query cache was never worth porting** — the test-search box fires on Enter, not per
   keystroke, and `LoadedStack` was an unbounded `HashMap` holding every parsed chunk and
-  vector. The real v2 regression is still open and still worth fixing on its own terms:
-  `HybridIndex::open` re-digests and re-validates every chunk on **every query**, so a warm
-  v1 query did zero deserialization passes where v2 does three. That is a fix to the open
-  path, not a cache, and it is now the only performance debt v1's removal leaves behind.
+  vector.
+
+  **The v2 regression this named is closed.** `HybridIndex::open` re-digested and
+  re-validated every chunk on *every query*, so a warm v1 query did zero deserialization
+  passes where v2 did three. The two O(all chunks) passes — re-deriving the content
+  digest, and the FTS mirror set-difference — now run once per *file version*.
+
+  The cache is keyed on the file's identity: device, inode, size and mtime, together
+  with the digest stored inside it. A path alone would be wrong (a prune replaces
+  `index.sqlite3` under a stable path) and the digest alone would be wrong for the
+  opposite reason — it is read *out of* the file, so it is the claim being checked
+  rather than evidence about it. A generation is immutable, so a match on all four
+  means the bytes are the ones that were validated.
+
+  **What it deliberately does not claim.** Corruption detection stays where it belongs,
+  at write and at import, and the first open of any file version still pays the full
+  check. A rewrite preserving device, inode, size and mtime to the nanosecond would be
+  skipped — an accepted limit, because an actor able to do that can also rewrite the
+  `index_digest` this check compares against, so the check was never the defence against
+  them. What it does defend is the ordinary case: a truncated write, a bit-rotted page, a
+  partially copied file, each of which changes size or mtime and re-validates. A test
+  corrupts a chunk *after* a successful open has already cached a verdict and asserts the
+  refusal, which is the case a path-keyed cache would have served happily.
 
 **Blocks:** nothing now. K11's precondition was that two systems stopped producing
 context by different rules; one index is one rule.
@@ -1359,7 +1378,8 @@ jobs that measures memory across the whole process group, a per-kind declared li
 set, a bounded *read* of the shell output that reaches a model — the cap holds the
 app's own heap, not just the returned string — a browser-session
 watchdog plus a recorded process group that survives the app that spawned it, and a
-wall-clock budget mechanism for the four WebView kinds. A limit kill
+wall-clock budget for the four WebView kinds that is now set as well as enforced.
+A limit kill
 records as `limit_exceeded` rather than as an indistinguishable cancel, on every
 host.
 
@@ -1794,9 +1814,34 @@ for that rather than against it — it took owning `CreateProcessW` to get there
 
 ### Still genuinely missing, after the corrections above narrowed the list
 
-- The four WebView kinds' wall budget is **enforced but unset** (see below): the
-  mechanism fires for nobody until a number is configured, and choosing that number
-  is blocked on a precondition, not on effort.
+- ~~The four WebView kinds' wall budget is **enforced but unset**~~ — **closed,
+  and a second defect fell out of closing it.** `ProcessKind::default_limits` now
+  gives `chat_turn`, `subagent`, `crew_member` and `side_task` a six-hour
+  `WEBVIEW_WALL_BUDGET_MS`. One number for four kinds, because they are the same
+  shape of process — a WebView loop issuing an unbounded number of bounded tool
+  calls — and four different numbers would be inventing policy where there is one
+  question: how long may a loop keep *starting new work* before something concludes
+  it is not going to stop.
+
+  The blocking precondition was real and is answered rather than waived: a turn
+  parked on an unanswered permission dialog reads as `Running` and keeps ageing, so
+  a *tight* default would cancel work for the user's own slowness. That is an
+  argument against a tight default, which is why this one is not tight — six hours
+  of an unanswered dialog is a session nobody came back to, not a user reading a
+  prompt. `processWallBudgetEnabled`/`processWallBudgetHours` (1–72 h) make it the
+  user's call, and *off* means the row is admitted with **no** `maxWallMs` rather
+  than one nothing enforces: a flag, not a `maxWallMs: 0`, because the ledger's
+  `CHECK` refuses a non-positive value and a zero read as "unbounded" is the
+  zero-versus-absent overloading this codebase avoids.
+
+  **The second defect:** `process_admit` built its limit set from the arguments
+  alone rather than merging onto the class default, so *every* row admitted over
+  IPC was declared unbounded no matter what its kind said. A class default could
+  therefore have been set at any point and would still have fired for nobody. That
+  also silently cost `background_shell` the output ceiling its class declares. The
+  merge is now one tested function (`merged_limits`), and the setting is applied at
+  `admitProcess` — the single chokepoint all four surfaces already go through — so
+  a fifth WebView surface cannot be admitted unbudgeted by omission.
 - ~~The foreground shell's **intermediate heap buffer**~~ — **closed.** The cap is
   now applied to the *read* rather than to the returned string. `wait_with_output`
   materialized both streams in full before any cap applied, so
@@ -2966,13 +3011,47 @@ from `egress::send`.
   empty list: "reached nowhere" and "this build recorded nothing" are the same
   absence here, and an empty list on screen would claim the first.
 
-**Still missing: unattributed egress names no destinations.** Only the attributed
-case is recorded, which is the same split byte counting already makes — an
-unattributed byte has a reason to be charged to but no row to hang a destination
-list off, and `UNATTRIBUTED_EGRESS` is a fixed array of counters precisely so it
-never allocates per request. Upgrade path is a bounded global map behind the same
-cap, if "which hosts does the app itself reach outside a run" turns out to be a
-question anyone asks.
+**Shipped — unattributed egress now names its destinations.** This was the last
+split in the record: an unattributed byte had a *reason* to be charged to and no
+row to hang a destination list off, so "which hosts does the app itself reach
+outside a run" had no answer at all. It is answered by the upgrade path this entry
+named — a bounded global map behind the same cap — and it lands in the *same*
+table the attributed case writes to, because "which hosts did this app reach" is
+one question and splitting its answer by whether a run happened to be in scope
+would make every reader join twice to ask it.
+
+- **The vocabulary is the existing one, not a second one.** Rows are keyed by
+  `Unattributed::code()` — the same strings `UNATTRIBUTED_EGRESS`'s tallies
+  already carry — plus `egress.no-scope` and `egress.run-without-process`, the two
+  cases that enum does not cover. A test pins the two label lists as equal and in
+  the same order, so correlating "how much left under this reason" with "where it
+  went" is a match rather than a guess.
+- **The lock this entry worried about is real and is paid on the right path.**
+  Volume is counted per body *frame* — an SSE stream calls it thousands of times —
+  so `UNATTRIBUTED_EGRESS` stays a lock-free array of atomics. A destination is
+  noted once per *request*, beside a DNS lookup and a TLS handshake, and the map
+  is bounded at the same `MAX_DESTINATIONS` a process gets, so the critical
+  section is a probe over at most 128 entries. The split is deliberate: volume
+  stays lock-free, destinations pay a lock they can afford.
+- **Migration V19 relaxes rather than adds**, and is `Additive` on that basis:
+  `egress_destinations.process_id` becomes nullable beside a new
+  `unattributed_reason`, under a `CHECK` that exactly one is present — "neither"
+  is a destination charged to nothing, which is the failure this item is about,
+  and "both" is a row two readers would each count once. The primary key becomes a
+  unique index over `COALESCE`d attribution columns, because SQLite permits NULLs
+  in a non-`INTEGER` primary key and the old key would have silently stopped
+  deduplicating. A V18 binary reads exactly the attributed rows it always did.
+- **The overflow count gets its own small table** rather than a sentinel row,
+  which V14's own note rejects: the attributed count lives on `agent_processes`
+  because it is a property of that process, and an unattributed overflow has no
+  process. A reason that overflowed while naming nothing is still reported —
+  the case a reader would most easily mistake for "reached nowhere".
+- **It needs a drain of its own**, on a 30-second tick, because unattributed
+  traffic has no lifetime to ride: piggy-backing on a run's drain would mean an app
+  that only ever made unattributed requests — a `monkey` invocation, an update
+  check — wrote no destinations at all, which is the gap itself. Fail-soft with
+  return-on-failure like every other drain here, and a returned drain past the cap
+  becomes overflow rather than breaching it.
 
 **Blocks:** K17 — placing a run on a remote node is only safe if the run's
 egress travels with it.
@@ -4487,14 +4566,14 @@ added when a tool that produces the effect exists.
 
 # Phase 4 — Devices and nodes
 
-## K15. Multi-GPU as schedulable devices
+## K15. Multi-GPU as schedulable devices *(built)*
 
 **Today:** a single `gpu_layers` count. Hybrid and multi-GPU hardware is
 detected by the Hardware Compatibility Matrix and never used as more than one
 device.
 
-**Shipped — per-device memory, the split it makes possible, and the refusal when
-a runtime cannot take it. Not yet the per-device admission reservation.**
+**Shipped — per-device memory, the split it makes possible, the refusal when a
+runtime cannot take it, and the per-device admission reservation.**
 
 The entry read as a missing feature. It was also a live bug, and finding it is
 what set the shape of the fix: `parse_nvidia_smi` **summed** each card's memory
@@ -4524,12 +4603,44 @@ carried memory but had summed the devices away.
   several and dies at load time with an out-of-memory error that names nothing
   about the cause.
 
-**Remaining: "each device is a schedulable resource K7 reserves against
-independently."** `daemon/admission.rs`'s `Resource` is `Ram | Vram` and the
-reservation row has two byte columns, so a second job is still admitted against
-an aggregate the first job may have exhausted on one card. That is a daemon
-schema change on top of this one, and it is the half that needs multi-GPU
-hardware to be worth trusting.
+**Shipped — "each device is a schedulable resource K7 reserves against
+independently."** `Resource` was `Ram | Vram`, so a second job was admitted
+against an aggregate the first may have exhausted on one card: two 24 GB cards
+read as one 48 GB pool, two 20 GB models were both admitted, and the second died
+at load time with an out-of-memory error naming nothing about the cause. That is
+the same shape as the detection bug above, one layer down.
+
+- **`Resource::Accelerator(DeviceId)`.** A shortfall names the card, and the
+  `DeviceId` carries the runtime's own ordinal — what `--main-gpu` and a position
+  in `--tensor-split` mean, not an index into any local vector. `index: None` is
+  kept as a case for a machine that advertised accelerator memory without
+  enumerating a device, on the same grounds `DeviceSplit::budget_bytes` gives:
+  inventing device 0 would make a reservation no runtime flag could honour.
+- **Claims are per device and are never summed.** `Fit::Fits` carries a
+  `Vec<DeviceClaim>` alongside the pooled `MemoryRequirement`, distributed by the
+  plan's own `DeviceSplit` — `SingleDevice` puts it on one card, `Across` splits
+  it by the same weights `--tensor-split` will receive, each rounded **up** so the
+  busiest card is never under-booked.
+- **`Never` measures against the largest single device**, so a model no one card
+  can hold is refused rather than started, even when the cards sum to more than
+  it needs.
+- **Reservations are rows, not columns.** `daemon_job_device_reservations` (V4),
+  because a column holds one device and a split model holds several. Grouped
+  `MAX` within a resident model then `SUM` across models, which is what a card
+  actually has to hold — two turns against one loaded model still pay once.
+- **Every release path covers them.** `release_reservation` deletes the device
+  rows in the same transaction as it clears the columns, and both `finish_active`
+  (the clean exit) and `reconcile_interrupted` (the crash funnel) reach it;
+  `sweep_stale_reservations` takes them too.
+- **Preemption follows the device.** `Running::claim` answers a device shortfall
+  from that device's bytes and not from the pooled figure. Otherwise a job holding
+  8 GB on card 0 would look able to relieve card 1, the victim set would pass the
+  covers-the-shortfall guard, and real work would be parked while the claimant
+  stayed held — the exact outcome the set-based rule exists to rule out.
+
+What still needs multi-GPU hardware is *confidence*, not code: the arithmetic is
+asserted against enumerated two-card fixtures, and nothing here has been watched
+against two real cards.
 
 **Acceptance:** ROADMAP #7 — an explicit per-device split chosen from the real
 hardware snapshot, the offload planner accounting for each device's own
@@ -5208,12 +5319,52 @@ digest-verified manifests that never trust a corrupt local copy for reuse. CI
 runs dependency review plus Rust/npm advisory audits and publishes a CycloneDX
 SBOM, attached to each release as an asset.
 
+**Shipped since — the three CI-shaped gaps.**
+
+- **An accessibility audit in CI** (`src/lib/a11yAudit.ts`), over the built
+  shell and over rendered screens, in the existing frontend job. It is a
+  **named rule set, not a WCAG audit, and says so**: eleven rules, each
+  decidable from the DOM alone and each a defect this codebase can actually
+  introduce — an icon-only button one `aria-label` away from being unusable is
+  the one it exists for. Contrast, focus order, live-region timing and reading
+  order are *not* covered and are stated as not covered. axe-core is the better
+  tool; it needs a browser in CI, which is a larger change than the check
+  itself, and the upgrade path is to swap `auditDom`'s body for `axe.run` with
+  the call sites and the job unchanged.
+- **A clean-machine install/upgrade smoke test** in release CI, between the
+  build matrix and publish, so a release that cannot be installed is never
+  published. It unpacks the real `.deb`/`.dmg`/NSIS payload into a scratch
+  prefix, asserts the binaries a user would get are there, runs the installed
+  CLI and compares its version to the release, then installs over the previous
+  release and asserts a file under the data directory survived. **Every leg
+  reports PASS, FAIL, or SKIPPED with its reason** — a hosted runner cannot
+  exercise an MSI without elevation, and the first release ever has nothing to
+  upgrade from, so "not covered here" is often the honest answer and is written
+  to the job summary rather than left as silence. Only a real failure is fatal.
+  What extraction does *not* cover — post-install scripts, registry and desktop
+  entries — is named in the runner rather than implied to be tested.
+- **The locale key sets are equal, and now enforced.** The gap was not ~650: it
+  had grown to **1,468 keys per locale across ten locales** while `keyLint`'s
+  warning printed on every run, because a warning is not a gate. Each locale now
+  spreads `en` as its base, so the sets are identical *by construction* rather
+  than by a batch pass that would drift again by the next feature. No
+  user-visible text changes — `useT()` already fell back to English for a
+  missing key — and there is no bundle cost, because `index.ts` imports `en`
+  unconditionally as that fallback. `localeSync.test.ts` then holds three
+  properties as a **failing** check: identical key sets, identical
+  `{{placeholder}}` sets per key (a dropped brace renders as literal text and is
+  invisible to everyone who does not read that language), and no empty values.
+  Completing the sets did not hide the real gap: each locale exports the keys it
+  genuinely translates, so coverage is an exact number rather than one inferred
+  from "the string differs from English" — which plenty of real translations do
+  not.
+
 **Still open:** signing beyond macOS (Windows needs a code-signing certificate
 this project does not have; Linux has no OS-level binary signature to verify,
 which is why the integrity check reports the runtime digests as the whole of
-the evidence there), clean-machine install/upgrade tests, an accessibility
-audit in CI, a release penetration test, and the ~650 keys each of ten locales
-is missing.
+the evidence there), a release penetration test, and the translation of those
+1,468 keys per locale — the key sets are complete and enforced, the *words* are
+still English, and the coverage number says so.
 
 **Acceptance:** ROADMAP #8 in full, plus a startup self-integrity check that
 verifies the app's own binary signature and the digests of every managed
@@ -5346,9 +5497,37 @@ workflows the same refusal comes from the definition store's own version rule.
 Both the desktop and the CLI/daemon write the same history, because the store
 sits below the Tauri layer.
 
-**Remaining:** rules/memory files and MCP server definitions still save
-last-write-wins; the history is per-entity, so there is no cross-entity view of
-what a given change touched.
+**Shipped — rules/memory files and MCP server definitions now go through the
+same log.** Both were the last last-write-wins stores: two windows (or the
+desktop and the CLI) editing one `MONKEY.md` or one MCP server silently kept
+whichever saved second, with nothing recording that the other edit existed.
+
+- **Rules.** `write_rules_impl` records before it writes, in `prompts_save`'s
+  order and for its reason: recording is the only step that can *reject* the
+  write, and rejecting after the file is replaced would defeat the point of
+  detecting the conflict. The entity is keyed on the file's **resolved path**,
+  not its label — two attached roots can both be called `src`, and a
+  label-keyed history would merge them into one log where a restore puts one
+  repo's instructions into the other. `rules_current_revision` gives an editor
+  its base; a stale one is refused with `conflict:` and the file on disk is
+  untouched.
+- **MCP.** The record happens inside `save_config_impl`, which *every* mutation
+  — add, update, remove, enable — already goes through, so a fifth mutation
+  cannot skip versioning by forgetting a line. Two kinds are written: the whole
+  document (what a restore puts back, since restoring one server into a file
+  that has since gained and lost others would produce a state that never
+  existed) and one per server (what answers "what changed about *this* server").
+  An unchanged server dedupes on its digest, so a save touching one server
+  appends one entry revision rather than one per server.
+- **Restore is the owning store's job**, per `RevisionHistoryPanel`'s rule.
+  `mcp_restore_config` parses and validates the snapshot before writing anything
+  — a hand-edited revision is refused rather than installed and discovered at
+  the next connect — and then goes through the ordinary save, so the restore is
+  itself a revision. The rules editor loads a snapshot into the textarea rather
+  than writing it, so the user's own Save records it.
+
+**Remaining:** the history is per-entity, so there is still no cross-entity view
+of what a given change touched.
 
 *Maps to: ROADMAP #3.*
 

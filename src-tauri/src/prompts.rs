@@ -16,9 +16,9 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
-use tauri::{Emitter};
 use crate::profiles::ProfileScopedPaths;
+use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 
 use crate::config_revisions::{self, RecordRequest};
 

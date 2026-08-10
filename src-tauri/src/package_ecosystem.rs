@@ -3965,14 +3965,20 @@ mod tests {
     #[test]
     fn vulnerability_notices_are_validated_and_surfaced_on_the_manifest() {
         let mut bundle = first_party_package_fixtures().remove(0).bundle;
-        bundle.manifest.vulnerability_notices.push(VulnerabilityNotice {
-            notice_id: "notice-1".to_string(),
-            severity: VulnerabilitySeverity::High,
-            summary: "Sample dependency has a known issue".to_string(),
-            affected_versions: BTreeSet::from([SemanticVersion::new(1, 0, 0)]),
-            advisory_url: Some("https://example.com/advisories/1".to_string()),
-        });
-        bundle.manifest.validate(&PackageLimits::default()).expect("valid notice");
+        bundle
+            .manifest
+            .vulnerability_notices
+            .push(VulnerabilityNotice {
+                notice_id: "notice-1".to_string(),
+                severity: VulnerabilitySeverity::High,
+                summary: "Sample dependency has a known issue".to_string(),
+                affected_versions: BTreeSet::from([SemanticVersion::new(1, 0, 0)]),
+                advisory_url: Some("https://example.com/advisories/1".to_string()),
+            });
+        bundle
+            .manifest
+            .validate(&PackageLimits::default())
+            .expect("valid notice");
         let verified = verify_local(&bundle);
         assert_eq!(verified.manifest().vulnerability_notices.len(), 1);
 
@@ -3987,7 +3993,9 @@ mod tests {
         insecure_advisory.manifest.vulnerability_notices[0].advisory_url =
             Some("http://example.com/advisories/1".to_string());
         assert!(matches!(
-            insecure_advisory.manifest.validate(&PackageLimits::default()),
+            insecure_advisory
+                .manifest
+                .validate(&PackageLimits::default()),
             Err(PackageError::InvalidManifest(_))
         ));
     }
@@ -3996,7 +4004,10 @@ mod tests {
     fn additional_registry_sources_require_the_existing_verification_chain() {
         let directory = TestDirectory::new("registry-sources");
         let store = PackageStore::new(&directory.0).expect("store");
-        assert!(store.list_registry_sources().expect("empty list").is_empty());
+        assert!(store
+            .list_registry_sources()
+            .expect("empty list")
+            .is_empty());
 
         let source = AdditionalRegistrySource {
             source_id: "team-catalog".to_string(),
@@ -4065,8 +4076,9 @@ mod tests {
         assert!(after_failed[0].verified.is_none());
         assert!(after_failed[0].last_verification_error.is_some());
 
-        let verified = verify_registry_snapshot(&snapshot, &trust_store(), None, &DigestVerifier, 1_000)
-            .expect("verify team-catalog snapshot through the existing Ed25519 chain");
+        let verified =
+            verify_registry_snapshot(&snapshot, &trust_store(), None, &DigestVerifier, 1_000)
+                .expect("verify team-catalog snapshot through the existing Ed25519 chain");
         let updated = store
             .record_registry_verification(&source.source_id, Some(verified), None)
             .expect("record success");
@@ -4080,7 +4092,10 @@ mod tests {
         assert!(store
             .remove_registry_source(&source.source_id)
             .expect("remove"));
-        assert!(store.list_registry_sources().expect("empty again").is_empty());
+        assert!(store
+            .list_registry_sources()
+            .expect("empty again")
+            .is_empty());
         assert!(!store
             .remove_registry_source(&source.source_id)
             .expect("remove missing is a no-op"));

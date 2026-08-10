@@ -18,9 +18,8 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::MutexGuard;
 
-
-use crate::{permissions, AppState};
 use crate::profiles::ProfileScopedPaths;
+use crate::{permissions, AppState};
 
 /// One attached folder. `id` is the canonicalized path string — stable and
 /// unique for as long as the folder stays attached.

@@ -37,7 +37,9 @@ use crate::compatibility_hub::{
     CanonicalStreamEvent, CanonicalToolDefinition, CompatibilityProtocol,
     COMPATIBILITY_SCHEMA_VERSION,
 };
-use crate::m3_production::{ingest_sse_line, openai_request_body, parse_openai_response, OpenAiStreamState};
+use crate::m3_production::{
+    ingest_sse_line, openai_request_body, parse_openai_response, OpenAiStreamState,
+};
 use crate::m3_runtime_hub::{M3CanonicalStreamSink, M3ModelCapabilities};
 // The MLX leg of the tool-call fixture only exists where the MLX driver does.
 #[cfg(target_os = "macos")]
@@ -117,11 +119,19 @@ pub struct ChatTemplateLabResult {
 
 impl ChatTemplateLabResult {
     fn pass(area: CapabilityArea, detail: impl Into<String>) -> Self {
-        Self { area, passed: true, detail: detail.into() }
+        Self {
+            area,
+            passed: true,
+            detail: detail.into(),
+        }
     }
 
     fn fail(area: CapabilityArea, detail: impl Into<String>) -> Self {
-        Self { area, passed: false, detail: detail.into() }
+        Self {
+            area,
+            passed: false,
+            detail: detail.into(),
+        }
     }
 }
 
@@ -138,7 +148,9 @@ impl ChatTemplateLabReport {
     /// an area with no matching result (defensive; every area currently
     /// always has exactly one result).
     pub fn passed(&self, area: CapabilityArea) -> bool {
-        self.results.iter().any(|result| result.area == area && result.passed)
+        self.results
+            .iter()
+            .any(|result| result.area == area && result.passed)
     }
 }
 
@@ -242,7 +254,9 @@ fn fixture_tool_calling(_family: TemplateFamily) -> ChatTemplateLabResult {
         vec![
             CanonicalMessage {
                 role: CanonicalRole::User,
-                content: vec![CanonicalContent::Text { text: "Read src/lib.rs".to_string() }],
+                content: vec![CanonicalContent::Text {
+                    text: "Read src/lib.rs".to_string(),
+                }],
             },
             CanonicalMessage {
                 role: CanonicalRole::Assistant,
@@ -271,7 +285,12 @@ fn fixture_tool_calling(_family: TemplateFamily) -> ChatTemplateLabResult {
     );
     let wire = match openai_request_body(&request, false) {
         Ok(body) => body,
-        Err(error) => return ChatTemplateLabResult::fail(area, format!("request composition failed: {error}")),
+        Err(error) => {
+            return ChatTemplateLabResult::fail(
+                area,
+                format!("request composition failed: {error}"),
+            )
+        }
     };
     let messages = wire["messages"].as_array().cloned().unwrap_or_default();
     if messages.len() != 3 {
@@ -293,7 +312,8 @@ fn fixture_tool_calling(_family: TemplateFamily) -> ChatTemplateLabResult {
     if composed_arguments.as_ref() != Some(&tool_input) {
         return ChatTemplateLabResult::fail(
             area,
-            "composed tool_calls[0].function.arguments did not round-trip the tool input JSON".to_string(),
+            "composed tool_calls[0].function.arguments did not round-trip the tool input JSON"
+                .to_string(),
         );
     }
     let tool_result_message = &messages[2];
@@ -303,7 +323,8 @@ fn fixture_tool_calling(_family: TemplateFamily) -> ChatTemplateLabResult {
     {
         return ChatTemplateLabResult::fail(
             area,
-            "composed tool-role message did not carry the expected tool_call_id/content".to_string(),
+            "composed tool-role message did not carry the expected tool_call_id/content"
+                .to_string(),
         );
     }
 
@@ -318,7 +339,9 @@ fn fixture_tool_calling(_family: TemplateFamily) -> ChatTemplateLabResult {
     let stream_request = fixture_request(
         vec![CanonicalMessage {
             role: CanonicalRole::User,
-            content: vec![CanonicalContent::Text { text: "go".to_string() }],
+            content: vec![CanonicalContent::Text {
+                text: "go".to_string(),
+            }],
         }],
         vec![CanonicalToolDefinition {
             name: "read_file".to_string(),
@@ -351,32 +374,47 @@ fn fixture_tool_calling(_family: TemplateFamily) -> ChatTemplateLabResult {
         "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
     });
     for chunk in [&delta_chunk, &finish_chunk] {
-        if let Err(error) = ingest_sse_line(&sse_line(chunk), &stream_request, &mut sink, &mut state) {
-            return ChatTemplateLabResult::fail(area, format!("streamed tool-call ingestion failed: {error}"));
+        if let Err(error) =
+            ingest_sse_line(&sse_line(chunk), &stream_request, &mut sink, &mut state)
+        {
+            return ChatTemplateLabResult::fail(
+                area,
+                format!("streamed tool-call ingestion failed: {error}"),
+            );
         }
     }
     if let Err(error) = state.finish(&stream_request, &mut sink) {
-        return ChatTemplateLabResult::fail(area, format!("streamed tool-call did not finish cleanly: {error}"));
+        return ChatTemplateLabResult::fail(
+            area,
+            format!("streamed tool-call did not finish cleanly: {error}"),
+        );
     }
     let reconstructed_name = sink.0.iter().find_map(|event| match event {
-        CanonicalStreamEvent::ToolCallStart { call_id, name, .. } if call_id == "call_9" => Some(name.clone()),
+        CanonicalStreamEvent::ToolCallStart { call_id, name, .. } if call_id == "call_9" => {
+            Some(name.clone())
+        }
         _ => None,
     });
     let reconstructed_arguments: String = sink
         .0
         .iter()
         .filter_map(|event| match event {
-            CanonicalStreamEvent::ToolCallArgumentsDelta { call_id, json_delta, .. } if call_id == "call_9" => {
-                Some(json_delta.as_str())
-            }
+            CanonicalStreamEvent::ToolCallArgumentsDelta {
+                call_id,
+                json_delta,
+                ..
+            } if call_id == "call_9" => Some(json_delta.as_str()),
             _ => None,
         })
         .collect();
     let reconstructed_input: Option<Value> = serde_json::from_str(&reconstructed_arguments).ok();
-    if reconstructed_name.as_deref() != Some("read_file") || reconstructed_input.as_ref() != Some(&tool_input) {
+    if reconstructed_name.as_deref() != Some("read_file")
+        || reconstructed_input.as_ref() != Some(&tool_input)
+    {
         return ChatTemplateLabResult::fail(
             area,
-            "streamed tool-call reconstruction did not match the original name/arguments".to_string(),
+            "streamed tool-call reconstruction did not match the original name/arguments"
+                .to_string(),
         );
     }
 
@@ -398,7 +436,12 @@ fn fixture_tool_calling(_family: TemplateFamily) -> ChatTemplateLabResult {
     });
     let parsed = match parse_openai_response(&complete_body, &stream_request) {
         Ok(response) => response,
-        Err(error) => return ChatTemplateLabResult::fail(area, format!("non-streaming tool-call parse failed: {error}")),
+        Err(error) => {
+            return ChatTemplateLabResult::fail(
+                area,
+                format!("non-streaming tool-call parse failed: {error}"),
+            )
+        }
     };
     let non_stream_ok = parsed.content.iter().any(|content| {
         matches!(
@@ -409,7 +452,8 @@ fn fixture_tool_calling(_family: TemplateFamily) -> ChatTemplateLabResult {
     if !non_stream_ok {
         return ChatTemplateLabResult::fail(
             area,
-            "non-streaming response parse did not reconstruct the expected ToolUse content".to_string(),
+            "non-streaming response parse did not reconstruct the expected ToolUse content"
+                .to_string(),
         );
     }
 
@@ -427,7 +471,12 @@ fn fixture_tool_calling(_family: TemplateFamily) -> ChatTemplateLabResult {
             }],
         }) {
             Ok(message) => message,
-            Err(error) => return ChatTemplateLabResult::fail(area, format!("MLX assistant flattening failed: {error}")),
+            Err(error) => {
+                return ChatTemplateLabResult::fail(
+                    area,
+                    format!("MLX assistant flattening failed: {error}"),
+                )
+            }
         };
         let mlx_tool_result = match canonical_message_to_mlx(&CanonicalMessage {
             role: CanonicalRole::Tool,
@@ -438,19 +487,28 @@ fn fixture_tool_calling(_family: TemplateFamily) -> ChatTemplateLabResult {
             }],
         }) {
             Ok(message) => message,
-            Err(error) => return ChatTemplateLabResult::fail(area, format!("MLX tool-result flattening failed: {error}")),
+            Err(error) => {
+                return ChatTemplateLabResult::fail(
+                    area,
+                    format!("MLX tool-result flattening failed: {error}"),
+                )
+            }
         };
         let mlx_assistant_json: Option<Value> = serde_json::from_str(&mlx_assistant.text).ok();
         let mlx_ok = mlx_assistant_json
             .as_ref()
             .and_then(|value| value.get("input"))
             == Some(&tool_input)
-            && mlx_assistant_json.as_ref().and_then(|value| value.get("name")) == Some(&json!("read_file"))
+            && mlx_assistant_json
+                .as_ref()
+                .and_then(|value| value.get("name"))
+                == Some(&json!("read_file"))
             && mlx_tool_result.text.contains("fn main() {}");
         if !mlx_ok {
             return ChatTemplateLabResult::fail(
                 area,
-                "MLX driver's flattened tool_use/tool_result text did not round-trip the same call".to_string(),
+                "MLX driver's flattened tool_use/tool_result text did not round-trip the same call"
+                    .to_string(),
             );
         }
     }
@@ -478,11 +536,15 @@ fn fixture_system_prompt(family: TemplateFamily) -> ChatTemplateLabResult {
         vec![
             CanonicalMessage {
                 role: CanonicalRole::System,
-                content: vec![CanonicalContent::Text { text: system_text.to_string() }],
+                content: vec![CanonicalContent::Text {
+                    text: system_text.to_string(),
+                }],
             },
             CanonicalMessage {
                 role: CanonicalRole::User,
-                content: vec![CanonicalContent::Text { text: "Hi".to_string() }],
+                content: vec![CanonicalContent::Text {
+                    text: "Hi".to_string(),
+                }],
             },
         ],
         Vec::new(),
@@ -490,7 +552,12 @@ fn fixture_system_prompt(family: TemplateFamily) -> ChatTemplateLabResult {
     );
     let wire = match openai_request_body(&request, false) {
         Ok(body) => body,
-        Err(error) => return ChatTemplateLabResult::fail(area, format!("request composition failed: {error}")),
+        Err(error) => {
+            return ChatTemplateLabResult::fail(
+                area,
+                format!("request composition failed: {error}"),
+            )
+        }
     };
     let messages = wire["messages"].as_array().cloned().unwrap_or_default();
     let sends_distinct_system_turn = messages
@@ -546,7 +613,9 @@ fn fixture_stop_token(_family: TemplateFamily) -> ChatTemplateLabResult {
         let request = fixture_request(
             vec![CanonicalMessage {
                 role: CanonicalRole::User,
-                content: vec![CanonicalContent::Text { text: "hi".to_string() }],
+                content: vec![CanonicalContent::Text {
+                    text: "hi".to_string(),
+                }],
             }],
             Vec::new(),
             None,
@@ -571,7 +640,10 @@ fn fixture_stop_token(_family: TemplateFamily) -> ChatTemplateLabResult {
         if response.finish_reason != expected {
             return ChatTemplateLabResult::fail(
                 area,
-                format!("expected non-streaming finish_reason {expected:?}, got {:?}", response.finish_reason),
+                format!(
+                    "expected non-streaming finish_reason {expected:?}, got {:?}",
+                    response.finish_reason
+                ),
             );
         }
 
@@ -596,7 +668,9 @@ fn fixture_stop_token(_family: TemplateFamily) -> ChatTemplateLabResult {
             );
         }
         let completed = sink.0.iter().find_map(|event| match event {
-            CanonicalStreamEvent::ResponseCompleted { finish_reason, .. } => Some(finish_reason.clone()),
+            CanonicalStreamEvent::ResponseCompleted { finish_reason, .. } => {
+                Some(finish_reason.clone())
+            }
             _ => None,
         });
         if completed.as_deref() != Some(expected) {
@@ -622,20 +696,29 @@ fn fixture_structured_output(_family: TemplateFamily) -> ChatTemplateLabResult {
     let request = fixture_request(
         vec![CanonicalMessage {
             role: CanonicalRole::User,
-            content: vec![CanonicalContent::Text { text: "What is 2+2?".to_string() }],
+            content: vec![CanonicalContent::Text {
+                text: "What is 2+2?".to_string(),
+            }],
         }],
         Vec::new(),
         Some(schema.clone()),
     );
     let wire = match openai_request_body(&request, false) {
         Ok(body) => body,
-        Err(error) => return ChatTemplateLabResult::fail(area, format!("request composition failed: {error}")),
+        Err(error) => {
+            return ChatTemplateLabResult::fail(
+                area,
+                format!("request composition failed: {error}"),
+            )
+        }
     };
-    if wire["response_format"]["type"] != "json_schema" || wire["response_format"]["json_schema"]["schema"] != schema
+    if wire["response_format"]["type"] != "json_schema"
+        || wire["response_format"]["json_schema"]["schema"] != schema
     {
         return ChatTemplateLabResult::fail(
             area,
-            "composed response_format.json_schema.schema did not match the requested schema".to_string(),
+            "composed response_format.json_schema.schema did not match the requested schema"
+                .to_string(),
         );
     }
 
@@ -649,7 +732,12 @@ fn fixture_structured_output(_family: TemplateFamily) -> ChatTemplateLabResult {
     });
     let parsed = match parse_openai_response(&complete_body, &request) {
         Ok(response) => response,
-        Err(error) => return ChatTemplateLabResult::fail(area, format!("structured response parse failed: {error}")),
+        Err(error) => {
+            return ChatTemplateLabResult::fail(
+                area,
+                format!("structured response parse failed: {error}"),
+            )
+        }
     };
     let round_tripped = parsed.content.iter().find_map(|content| match content {
         CanonicalContent::Text { text } => serde_json::from_str::<Value>(text).ok(),
@@ -710,7 +798,9 @@ fn fixture_thinking(_family: TemplateFamily) -> ChatTemplateLabResult {
     let request = fixture_request(
         vec![CanonicalMessage {
             role: CanonicalRole::User,
-            content: vec![CanonicalContent::Text { text: "What's 19 * 23?".to_string() }],
+            content: vec![CanonicalContent::Text {
+                text: "What's 19 * 23?".to_string(),
+            }],
         }],
         Vec::new(),
         None,
@@ -736,11 +826,17 @@ fn fixture_thinking(_family: TemplateFamily) -> ChatTemplateLabResult {
     });
     for line in [&chunk, &finish_chunk] {
         if let Err(error) = ingest_sse_line(&sse_line(line), &request, &mut sink, &mut state) {
-            return ChatTemplateLabResult::fail(area, format!("reasoning-turn stream ingestion failed: {error}"));
+            return ChatTemplateLabResult::fail(
+                area,
+                format!("reasoning-turn stream ingestion failed: {error}"),
+            );
         }
     }
     if let Err(error) = state.finish(&request, &mut sink) {
-        return ChatTemplateLabResult::fail(area, format!("reasoning-turn stream did not finish cleanly: {error}"));
+        return ChatTemplateLabResult::fail(
+            area,
+            format!("reasoning-turn stream did not finish cleanly: {error}"),
+        );
     }
     let reasoning_recovered = sink.0.iter().any(|event| match event {
         CanonicalStreamEvent::TextDelta { text, .. } => text.contains(reasoning_text),
@@ -777,13 +873,34 @@ mod tests {
 
     #[test]
     fn detects_known_template_families() {
-        assert_eq!(TemplateFamily::detect(Some("chatml")), TemplateFamily::Chatml);
-        assert_eq!(TemplateFamily::detect(Some("Qwen2.5-ChatML")), TemplateFamily::Chatml);
-        assert_eq!(TemplateFamily::detect(Some("llama-3")), TemplateFamily::Llama3);
-        assert_eq!(TemplateFamily::detect(Some("Llama3-Instruct")), TemplateFamily::Llama3);
-        assert_eq!(TemplateFamily::detect(Some("mistral-instruct")), TemplateFamily::Mistral);
-        assert_eq!(TemplateFamily::detect(Some("gemma-2")), TemplateFamily::Gemma);
-        assert_eq!(TemplateFamily::detect(Some("something-unknown")), TemplateFamily::Generic);
+        assert_eq!(
+            TemplateFamily::detect(Some("chatml")),
+            TemplateFamily::Chatml
+        );
+        assert_eq!(
+            TemplateFamily::detect(Some("Qwen2.5-ChatML")),
+            TemplateFamily::Chatml
+        );
+        assert_eq!(
+            TemplateFamily::detect(Some("llama-3")),
+            TemplateFamily::Llama3
+        );
+        assert_eq!(
+            TemplateFamily::detect(Some("Llama3-Instruct")),
+            TemplateFamily::Llama3
+        );
+        assert_eq!(
+            TemplateFamily::detect(Some("mistral-instruct")),
+            TemplateFamily::Mistral
+        );
+        assert_eq!(
+            TemplateFamily::detect(Some("gemma-2")),
+            TemplateFamily::Gemma
+        );
+        assert_eq!(
+            TemplateFamily::detect(Some("something-unknown")),
+            TemplateFamily::Generic
+        );
         assert_eq!(TemplateFamily::detect(None), TemplateFamily::Generic);
     }
 
@@ -803,12 +920,24 @@ mod tests {
 
     #[test]
     fn system_prompt_fixture_fails_only_for_gemma() {
-        for family in [TemplateFamily::Chatml, TemplateFamily::Llama3, TemplateFamily::Mistral, TemplateFamily::Generic] {
+        for family in [
+            TemplateFamily::Chatml,
+            TemplateFamily::Llama3,
+            TemplateFamily::Mistral,
+            TemplateFamily::Generic,
+        ] {
             let result = fixture_system_prompt(family);
-            assert!(result.passed, "{family:?} should accept a system-role turn: {}", result.detail);
+            assert!(
+                result.passed,
+                "{family:?} should accept a system-role turn: {}",
+                result.detail
+            );
         }
         let gemma = fixture_system_prompt(TemplateFamily::Gemma);
-        assert!(!gemma.passed, "gemma should flag the unhandled system-role quirk");
+        assert!(
+            !gemma.passed,
+            "gemma should flag the unhandled system-role quirk"
+        );
         assert!(gemma.detail.contains("system"));
     }
 
@@ -838,7 +967,11 @@ mod tests {
         // content support was added to CanonicalContent — update this test
         // (and the gating story) deliberately rather than let it silently
         // start advertising `vision` as ready.
-        for family in [TemplateFamily::Chatml, TemplateFamily::Gemma, TemplateFamily::Generic] {
+        for family in [
+            TemplateFamily::Chatml,
+            TemplateFamily::Gemma,
+            TemplateFamily::Generic,
+        ] {
             assert!(!fixture_vision(family).passed);
         }
     }
@@ -883,16 +1016,28 @@ mod tests {
         let declared = all_true_capabilities();
         let generic_report = run_chat_template_lab(TemplateFamily::Generic);
         let gated = gate_capabilities(&declared, &generic_report);
-        assert!(gated.chat, "generic family's system prompt/stop-token fixtures both pass");
+        assert!(
+            gated.chat,
+            "generic family's system prompt/stop-token fixtures both pass"
+        );
         assert!(gated.tool_calling);
         assert!(gated.structured_output);
-        assert!(gated.embeddings, "embeddings has no fixture and passes through unchanged");
+        assert!(
+            gated.embeddings,
+            "embeddings has no fixture and passes through unchanged"
+        );
         assert!(!gated.vision, "vision fixture always fails today");
 
         let gemma_report = run_chat_template_lab(TemplateFamily::Gemma);
         let gemma_gated = gate_capabilities(&declared, &gemma_report);
-        assert!(!gemma_gated.chat, "gemma's system-prompt fixture fails, so chat must not be advertised ready");
-        assert!(gemma_gated.tool_calling, "tool-calling fixture is unaffected by the system-role quirk");
+        assert!(
+            !gemma_gated.chat,
+            "gemma's system-prompt fixture fails, so chat must not be advertised ready"
+        );
+        assert!(
+            gemma_gated.tool_calling,
+            "tool-calling fixture is unaffected by the system-role quirk"
+        );
 
         let mut nothing_declared = all_true_capabilities();
         nothing_declared.tool_calling = false;

@@ -282,11 +282,9 @@ fn project_process(app: &tauri::AppHandle, view: &BackgroundShellView, native_pi
     projection.exit = exit;
 
     let state_handle = app.state::<crate::AppState>();
-    if let Err(error) = crate::process_commands::project_process_record(
-        app,
-        state_handle.inner(),
-        &projection,
-    ) {
+    if let Err(error) =
+        crate::process_commands::project_process_record(app, state_handle.inner(), &projection)
+    {
         eprintln!("background shell: could not project {}: {error}", view.id);
     }
 }
@@ -403,7 +401,9 @@ fn spawn_reader<R: Read + Send + 'static>(
                 Ok(count) => {
                     let chunk = String::from_utf8_lossy(&buffer[..count]).to_string();
                     let (id, truncated) = {
-                        let Ok(mut view) = process.view.lock() else { break };
+                        let Ok(mut view) = process.view.lock() else {
+                            break;
+                        };
                         let mut flag = view.output_truncated;
                         let dropped = append_bounded(&mut view.output, &chunk, &mut flag);
                         view.output_truncated = flag;
@@ -478,7 +478,9 @@ fn spawn_exit_watcher(app: tauri::AppHandle, process: Arc<BackgroundProcess>) {
                 usage.observe_pid(pid);
             }
             let waited = {
-                let Ok(mut child) = process.child.lock() else { break };
+                let Ok(mut child) = process.child.lock() else {
+                    break;
+                };
                 child.try_wait()
             };
             match waited {
@@ -916,7 +918,10 @@ mod tests {
             .unwrap();
 
         let record = crate::process_commands::with_process_table(&handle, &state, |table| {
-            table.admit(&AdmitProcess::new(ProcessKind::BackgroundShell, shell_id.clone()), 1_000)
+            table.admit(
+                &AdmitProcess::new(ProcessKind::BackgroundShell, shell_id.clone()),
+                1_000,
+            )
         })
         .unwrap();
         let record = crate::process_commands::with_process_table(&handle, &state, |table| {
@@ -944,6 +949,13 @@ mod tests {
             process_state(pid)
         );
 
-        let _ = state.background_shell.get(&shell_id).unwrap().child.lock().unwrap().kill();
+        let _ = state
+            .background_shell
+            .get(&shell_id)
+            .unwrap()
+            .child
+            .lock()
+            .unwrap()
+            .kill();
     }
 }

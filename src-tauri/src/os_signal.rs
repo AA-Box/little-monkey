@@ -186,7 +186,11 @@ fn signal_group(pid: u32, signal: i32) -> Result<(), String> {
 
 #[cfg(windows)]
 fn signal_process_group(pid: u32, stop: bool) -> Result<(), String> {
-    let verb = if stop { "Suspend-Process" } else { "Resume-Process" };
+    let verb = if stop {
+        "Suspend-Process"
+    } else {
+        "Resume-Process"
+    };
     let script = format!("{verb} -Id {pid} -ErrorAction Stop");
     command_ok(
         "powershell",
@@ -276,7 +280,10 @@ mod tests {
         // distinction `liveness_distinguishes_a_running_child_from_a_reaped_one`
         // pins, and it is why the grace above is a flat wait rather than a poll.
         let status = child.wait().await.expect("leader is reaped");
-        assert!(!status.success(), "a terminated shell must not report success");
+        assert!(
+            !status.success(),
+            "a terminated shell must not report success"
+        );
         assert!(!process_is_alive(pgid));
     }
 

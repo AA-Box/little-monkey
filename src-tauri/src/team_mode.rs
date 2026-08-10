@@ -33,10 +33,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-
+use crate::profiles::ProfileScopedPaths;
 use crate::run_protocol::RunEvent;
 use crate::AppState;
-use crate::profiles::ProfileScopedPaths;
 
 const TEAM_MEMBERS_FILE: &str = "team_members.json";
 
@@ -702,7 +701,11 @@ mod tests {
         assert!(err.contains("last remaining Owner"));
 
         let file = load_impl(&path).unwrap();
-        assert_eq!(file.members.len(), 1, "the owner must not have been removed");
+        assert_eq!(
+            file.members.len(),
+            1,
+            "the owner must not have been removed"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -753,7 +756,10 @@ mod tests {
         let path = temp_path();
         let owner = add_impl(&path, "Ada", Role::Owner).unwrap();
         add_impl(&path, "Grace", Role::Owner).unwrap();
-        assert_eq!(load_impl(&path).unwrap().current_member_id, Some(owner.id.clone()));
+        assert_eq!(
+            load_impl(&path).unwrap().current_member_id,
+            Some(owner.id.clone())
+        );
 
         remove_impl(&path, &owner.id).unwrap();
 
