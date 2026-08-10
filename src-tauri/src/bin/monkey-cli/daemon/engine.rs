@@ -5,15 +5,86 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use little_monkey_lib::m3_runtime_hub::M3ModelFootprint;
 use little_monkey_lib::run_protocol::{
-    ClientIdentity, ClientKind, PermissionDecision, RepositoryPolicy, RunEvent, RunStatus,
+    ClientIdentity, ClientKind, ModelTargetSnapshot, PermissionDecision, RepositoryPolicy,
+    RunEvent, RunStatus,
 };
+use little_monkey_lib::runtime_adapter::MemoryRequirement;
 
 use crate::durable_run::{bounded_text, CliRunEventSink, DurableRunRecorder};
 
+use super::admission::{self, Fit, Reservation};
 use super::ledger::{LeaseToken, SharedLedger};
-use super::store::{map_run_status, DaemonConfig, DaemonJob, DaemonPaths, DaemonStore, JobState};
+use super::scheduler::{self, Candidate, ProcessClass, Running};
+use super::store::{
+    map_run_status, DaemonConfig, DaemonJob, DaemonPaths, DaemonStore, JobState, SchedulerDecision,
+    DECISION_ADMITTED, DECISION_HELD, DECISION_PREEMPTED, DECISION_REJECTED, DECISION_RESUMED,
+};
 use super::worktree::OwnedWorktree;
+use little_monkey_lib::profiles::ProfileLimits;
+
+/// How the engine learns what this machine has.
+///
+/// A plain `fn` pointer rather than a fourth generic parameter or a boxed trait:
+/// there is exactly one production answer and one test answer, and every
+/// existing `DaemonEngine::new` call site keeps its arity.
+pub type HardwareProbe = fn() -> Option<little_monkey_lib::runtime_adapter::HardwareSnapshot>;
+
+/// The real probe. Shells out to `nvidia-smi` on CUDA hosts, which is why the
+/// admission loop calls it at most once per tick and only when something is
+/// actually queued.
+fn probe_hardware() -> Option<little_monkey_lib::runtime_adapter::HardwareSnapshot> {
+    use little_monkey_lib::m3_runtime_hub::M3HardwareProbe;
+    little_monkey_lib::m3_production::SystemM3HardwareProbe
+        .snapshot()
+        .ok()
+}
+
+/// Collapse the per-model reservations into the one pair the fit computation
+/// compares against.
+fn sum_reservations(resident: &HashMap<String, MemoryRequirement>) -> MemoryRequirement {
+    resident
+        .values()
+        .fold(admission::ZERO_MEMORY, |sum, claim| MemoryRequirement {
+            ram_bytes: sum.ram_bytes.saturating_add(claim.ram_bytes),
+            vram_bytes: sum.vram_bytes.saturating_add(claim.vram_bytes),
+        })
+}
+
+/// How many losers a decision row names. Bounded so one row cannot grow with the
+/// queue; the ranking is deterministic, so the next few are the ones that were
+/// genuinely close.
+const DECISION_PASSED_OVER_MAX: usize = 4;
+
+/// Measurement tokens for the decision log. Each names a real field of a real
+/// reading, so `measured_at_ms` can be that reading's own timestamp rather than
+/// the time the row was written.
+const MEASUREMENT_AVAILABLE_RAM: &str = "available_ram_bytes";
+const MEASUREMENT_TOTAL_RAM: &str = "total_ram_bytes";
+const MEASUREMENT_SUSPENDED_MS: &str = "suspended_ms";
+
+/// The run's primary workspace root, which is the fair-share key.
+///
+/// The *root path* rather than `workspace_id`, because `agent_processes.workspace`
+/// is documented as the owning workspace root and every other producer writes a
+/// path there. Two producers keying the same directory differently would silently
+/// split it into two share groups, each of which would then look half as busy as
+/// it is.
+///
+/// ponytail: workspaces only. The roadmap asks for fair-share across workspaces
+/// *and profiles*, and `agent_processes` has a `profile` column, but `RunSpec`
+/// carries no profile at all — there is nothing to read. When a profile lands on
+/// the spec the share key becomes the pair and the arbitration is unchanged:
+/// `Candidate::workspace` becomes a composite key and `rank` never mentions it.
+fn workspace_root(spec: &little_monkey_lib::run_protocol::RunSpec) -> Option<String> {
+    let workspace = spec.workspace.as_ref()?;
+    workspace
+        .roots
+        .iter()
+        .find(|root| root.root_id == workspace.primary_root_id)
+        .map(|root| root.canonical_path.clone())
+}
 
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
@@ -217,8 +288,12 @@ impl ManagedProcess for RealManagedProcess {
 
     fn signal(&mut self, signal: ProcessSignal) -> Result<(), String> {
         match signal {
-            ProcessSignal::Pause => little_monkey_lib::os_signal::suspend_process_group(self.child.id()),
-            ProcessSignal::Resume => little_monkey_lib::os_signal::resume_process_group(self.child.id()),
+            ProcessSignal::Pause => {
+                little_monkey_lib::os_signal::suspend_process_group(self.child.id())
+            }
+            ProcessSignal::Resume => {
+                little_monkey_lib::os_signal::resume_process_group(self.child.id())
+            }
             ProcessSignal::Terminate => terminate_process_group(self.child.id()),
             ProcessSignal::Kill => kill_process_group(self.child.id()),
         }
@@ -252,7 +327,9 @@ fn terminate_process_group(process_id: u32) -> Result<(), String> {
 /// force retries onto a job explicitly submitted with `max_attempts: 1`.
 fn retry_permitted(job: &DaemonJob) -> bool {
     use little_monkey_lib::process_table::ProcessKind;
-    ProcessKind::DaemonJob.restart_policy().permits_retry(job.attempt)
+    ProcessKind::DaemonJob
+        .restart_policy()
+        .permits_retry(job.attempt)
         && job.attempt.saturating_add(1) < job.max_attempts
 }
 
@@ -481,6 +558,39 @@ struct ActiveProcess {
     lease: LeaseToken,
 }
 
+/// Everything the scheduler needs about a job that is *not* in `daemon_jobs`,
+/// read once and kept.
+///
+/// All three fields come from the run's frozen `RunSpec`, which is immutable by
+/// construction — that is the whole premise of a durable run — so caching them
+/// is not an optimization with a staleness risk, it is the correct way to read an
+/// immutable record. It is also what makes the candidate window the *whole*
+/// queue affordable: without it, widening the window meant one ledger read per
+/// queued job per poll interval, which is exactly the trade the previous
+/// `// ponytail:` comment declined to make blind.
+/// The answer to "may this suspended job have its memory back".
+enum Reacquired {
+    Fits(Option<AdmittedClaim>),
+    Held(String),
+}
+
+/// What an admitted job records: the resident model it holds, its pooled memory,
+/// and that memory broken out per accelerator device.
+#[derive(Debug, Clone)]
+struct AdmittedClaim {
+    model_key: String,
+    memory: MemoryRequirement,
+    devices: Vec<admission::DeviceClaim>,
+}
+
+#[derive(Clone)]
+struct JobFacts {
+    class: ProcessClass,
+    /// The run's primary workspace root, the fair-share key.
+    workspace: Option<String>,
+    reservation: Reservation,
+}
+
 /// `JobState` → the unified [`ProcessState`].
 ///
 /// Deliberately lossy in one direction: `WaitingApproval` and `Cancelling` are
@@ -624,6 +734,23 @@ pub struct DaemonEngine<P, N, C> {
     /// `apply_signal_intent` every tick, so a restart re-derives it rather than
     /// carrying a second copy that could drift from the one that matters.
     immediate_termination: std::collections::HashSet<String>,
+    hardware: HardwareProbe,
+    /// Per-job scheduling facts, memoized. See [`JobFacts`].
+    facts: HashMap<String, JobFacts>,
+    /// Ceilings the active profile (K23) holds this daemon to: its quota (K4)
+    /// and its share of the machine (K8). Defaulted to unbounded so every
+    /// existing call site keeps its arity — see `with_profile_limits`.
+    profile_limits: ProfileLimits,
+    /// Jobs the *scheduler* suspended, and when, so a scheduler-driven
+    /// suspension is distinguishable from an operator pressing Pause.
+    ///
+    /// In-memory for the same reason `immediate_termination` is: `recover` moves
+    /// every active job — paused included — out of an active state, so no
+    /// preemption can outlive the daemon that made it. The durable half of the
+    /// suspension is the `agent_processes` suspend latch, which is what actually
+    /// stops the child; this map only records *who asked*, and if that answer
+    /// were lost the worst case is that the job resumes on its own.
+    preempted: HashMap<String, u64>,
 }
 
 impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> {
@@ -650,11 +777,208 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             active: HashMap::new(),
             last_retention_ms: 0,
             immediate_termination: std::collections::HashSet::new(),
+            hardware: probe_hardware,
+            facts: HashMap::new(),
+            profile_limits: ProfileLimits::unbounded(),
+            preempted: HashMap::new(),
         }
+    }
+
+    /// Holds this daemon to the active profile's quota and machine share.
+    ///
+    /// A setter rather than a ninth constructor argument for the same reason
+    /// `set_hardware_probe` is one: there is a single production answer, read
+    /// once at startup from the registry, and no test should have to restate
+    /// "unbounded" to keep compiling.
+    #[must_use]
+    pub fn with_profile_limits(mut self, limits: ProfileLimits) -> Self {
+        self.profile_limits = limits;
+        self
+    }
+
+    /// This job's wall-clock ceiling: the lower of what it asked for and what
+    /// the profile allows.
+    fn effective_runtime_ms(&self, job: &DaemonJob) -> u64 {
+        self.profile_limits
+            .quota
+            .clamp_runtime_ms(Some(job.max_runtime_ms))
+            .unwrap_or(job.max_runtime_ms)
+    }
+
+    /// Swap the hardware probe. Exists so admission can be tested against a
+    /// machine of a chosen size rather than whichever one CI happens to run on.
+    /// Production never swaps it — there is one real machine to measure.
+    #[cfg(test)]
+    pub fn set_hardware_probe(&mut self, probe: HardwareProbe) {
+        self.hardware = probe;
     }
 
     pub fn active_count(&self) -> usize {
         self.active.len()
+    }
+
+    /// Where the model hub keeps its installed inventory.
+    ///
+    /// Derived from `DaemonPaths` rather than from `crate::app_data_dir()` so a
+    /// test daemon rooted in a temp directory looks at that directory's hub and
+    /// not at the developer's real one.
+    fn app_data_dir(&self) -> Option<&Path> {
+        self.paths.root.parent()
+    }
+
+    /// What every admitted job holds right now, deduplicated by resident model.
+    ///
+    /// Read from `daemon_jobs` rather than summed over `self.active`, which is
+    /// what makes a reservation outlive the process that took it: the map
+    /// vanishes with the daemon, the rows do not. It also means the accounting
+    /// is correct during the window between a restart and `recover`, when jobs
+    /// are still marked active but nothing is in `self.active` yet.
+    fn committed(&self) -> Result<HashMap<String, MemoryRequirement>, String> {
+        Ok(self
+            .store
+            .committed_reservations()?
+            .into_iter()
+            .map(|(key, ram_bytes, vram_bytes)| {
+                (
+                    key,
+                    MemoryRequirement {
+                        ram_bytes,
+                        vram_bytes,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// What is held on each accelerator device right now, summed across resident
+    /// models (K15).
+    ///
+    /// Deliberately *not* derivable from [`Self::committed`]: that map's
+    /// `vram_bytes` is a per-model total across whatever cards the model landed
+    /// on, and summing totals is precisely the aggregate this item exists to stop
+    /// reserving against. It is read from the per-device rows instead, which are
+    /// grouped by resident model for the same reason `committed_reservations` is
+    /// — two turns against one loaded model pay for it once.
+    fn committed_devices(&self) -> Result<admission::DeviceCommitments, String> {
+        let mut totals = admission::DeviceCommitments::new();
+        for (kind, index, bytes) in self.store.committed_device_reservations()? {
+            let device = match index {
+                Some(index) => admission::DeviceId::device(kind, index),
+                None => admission::DeviceId::aggregate(kind),
+            };
+            let slot = totals.entry(device).or_insert(0);
+            *slot = slot.saturating_add(bytes);
+        }
+        Ok(totals)
+    }
+
+    /// What a queued job will make resident: the target frozen at submission,
+    /// plus whatever the model hub knows about that target's model id.
+    ///
+    /// An unreadable run reserves nothing rather than blocking: the admission
+    /// bound exists to stop thrashing, and failing a job because its ledger row
+    /// could not be read would be a stricter policy than the one asked for.
+    ///
+    /// `footprints` memoizes the hub lookup for this tick. A queue of turns
+    /// against one model is the common case and it would otherwise re-read the
+    /// same state file once per queued job.
+    fn read_facts(
+        &self,
+        job: &DaemonJob,
+        footprints: &mut HashMap<String, M3ModelFootprint>,
+    ) -> JobFacts {
+        let Some(run) = job
+            .run_id
+            .as_deref()
+            .and_then(|run_id| self.shared.load_run(run_id).ok().flatten())
+        else {
+            // Unreadable: reserves nothing, and takes the *lowest* class rather
+            // than a middling one. A job whose spec could not be read has not
+            // proved it is interactive, and guessing upward would let an
+            // unreadable run outrank a desktop turn.
+            return JobFacts {
+                class: ProcessClass::Maintenance,
+                workspace: None,
+                reservation: Reservation::Remote,
+            };
+        };
+        let target = &run.spec.target;
+        let model_id = match target {
+            ModelTargetSnapshot::Provider { .. } => None,
+            ModelTargetSnapshot::Ollama { model, .. } => Some(model.clone()),
+            ModelTargetSnapshot::ManagedLlama { model_id, .. } => Some(model_id.clone()),
+        };
+        let footprint = match model_id {
+            Some(model_id) => footprints
+                .entry(model_id.clone())
+                .or_insert_with(|| match self.app_data_dir() {
+                    Some(app_data) => little_monkey_lib::m3_runtime_hub::installed_model_footprint(
+                        app_data, &model_id,
+                    ),
+                    None => M3ModelFootprint::Unknown,
+                })
+                .clone(),
+            None => M3ModelFootprint::Unknown,
+        };
+        JobFacts {
+            class: scheduler::classify(&run.spec.kind, job.priority),
+            workspace: workspace_root(&run.spec),
+            reservation: admission::reservation(target, &footprint),
+        }
+    }
+
+    /// [`Self::read_facts`], memoized for the life of the daemon.
+    fn facts_for(
+        &mut self,
+        job: &DaemonJob,
+        footprints: &mut HashMap<String, M3ModelFootprint>,
+    ) -> JobFacts {
+        if let Some(cached) = self.facts.get(&job.job_id) {
+            return cached.clone();
+        }
+        // Bounded rather than pruned per exit. The cache is derived from
+        // immutable data, so a stale entry for a job that has gone terminal is
+        // harmless — it is only wasted bytes — and dropping the lot when it grows
+        // past four queues' worth costs one ledger read per live job, once.
+        if self.facts.len() > usize::try_from(self.config.max_queue).unwrap_or(128) * 4 {
+            self.facts.clear();
+        }
+        let facts = self.read_facts(job, footprints);
+        self.facts.insert(job.job_id.clone(), facts.clone());
+        facts
+    }
+
+    /// The fair-share charge for one workspace: measured `cpu_time_ms` summed
+    /// over its most recent processes.
+    ///
+    /// Read from the unified process table, which is where K6's per-process
+    /// measurement lands, so this is a real measured number rather than a proxy
+    /// for one. A workspace nothing has ever measured charges zero, which is
+    /// correct — it has not had the device.
+    ///
+    /// A run with no workspace snapshot at all charges nothing and shares nothing:
+    /// model-only chat has no workspace to be fair between.
+    /// ponytail: one bounded query per distinct workspace per tick, memoized only
+    /// within the tick. The charge moves as jobs run, so a longer-lived cache
+    /// would be wrong rather than merely stale; the cost is linear in the number
+    /// of *distinct workspaces* with queued work, which is a small number in every
+    /// shape this runs in today. If it stops being small, the fix is a rolling
+    /// per-workspace total maintained on exit rather than recomputed on read.
+    fn workspace_charge(&self, workspace: Option<&str>) -> u64 {
+        use little_monkey_lib::process_table::ProcessUsageFilter;
+        let Some(workspace) = workspace else {
+            return 0;
+        };
+        self.shared
+            .process_table()
+            .usage_totals(&ProcessUsageFilter {
+                workspace: Some(workspace.to_string()),
+                limit: Some(scheduler::FAIR_SHARE_WINDOW_ROWS),
+                ..ProcessUsageFilter::default()
+            })
+            .ok()
+            .and_then(|totals| totals.cpu_time_ms.value)
+            .unwrap_or(0)
     }
 
     pub fn recover(&mut self) -> Result<(), String> {
@@ -668,6 +992,12 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             }
             self.reconcile_interrupted(&job, now, "daemon restarted while the run was active")?;
         }
+        // Reservations belong to processes that no longer exist. The loop above
+        // already moved every active job out of an active state, so this is the
+        // belt to that braces: any row still carrying a claim after it is one
+        // nothing released, and holding it would shrink the budget of a daemon
+        // that has nothing running at all.
+        self.store.sweep_stale_reservations()?;
         self.store.set_meta("last_recovery_ms", &now.to_string())?;
         Ok(())
     }
@@ -696,24 +1026,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         }
 
         if !self.store.kill_switch()? {
-            let available = usize::try_from(self.config.concurrency)
-                .unwrap_or(usize::MAX)
-                .saturating_sub(self.active.len());
-            if available > 0 {
-                for job in self
-                    .store
-                    .ready_jobs(u32::try_from(available).unwrap_or(u32::MAX))?
-                {
-                    // A retry waits out its backoff. Skipping rather than
-                    // sleeping keeps the tick non-blocking, so one backing-off
-                    // job never delays every other queued one — it is simply
-                    // passed over until a later tick.
-                    if !backoff_elapsed(&job, now) {
-                        continue;
-                    }
-                    self.start_job(job, now)?;
-                }
-            }
+            self.schedule(now)?;
         } else {
             self.cancel_queued(now, "global kill switch is engaged")?;
         }
@@ -729,6 +1042,681 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             self.last_retention_ms = now;
         }
         Ok(())
+    }
+
+    /// One scheduling pass (K8).
+    ///
+    /// The order of operations matters and is not arbitrary. Candidates are
+    /// gathered and ranked *before* anything is admitted, because preemption and
+    /// preemption-release both need to know what is waiting; releases happen
+    /// before admissions, so a job whose suspension is no longer justified gets
+    /// its slot back in the same tick it becomes eligible rather than the next
+    /// one; and admissions walk the ranking in order, holding rather than
+    /// stopping at whatever does not fit.
+    fn schedule(&mut self, now: u64) -> Result<(), String> {
+        // The candidate window is the whole queue, not the free-slot count.
+        //
+        // This is the starvation bug the `// ponytail:` comment that used to live
+        // here named: with a window as wide as the free slots, a 2 GiB job queued
+        // behind `concurrency` larger *held* jobs was never even looked at until
+        // one of them left, because the held jobs consumed the window itself. The
+        // reason the window was narrow was cost — one ledger read per candidate
+        // per poll interval — and `JobFacts` removes that reason: a run's spec is
+        // immutable, so it is read once per job for the life of the daemon and the
+        // window can be as wide as the queue is allowed to be.
+        let queued = self.store.ready_jobs(self.config.max_queue)?;
+        let mut footprints = HashMap::new();
+        let mut charges: HashMap<String, u64> = HashMap::new();
+        let mut jobs: HashMap<String, DaemonJob> = HashMap::new();
+        let mut facts_by_job: HashMap<String, JobFacts> = HashMap::new();
+        let mut candidates = Vec::new();
+        for job in queued {
+            // A retry waits out its backoff. Skipping rather than sleeping keeps
+            // the tick non-blocking, so one backing-off job never delays every
+            // other queued one — it is simply passed over until a later tick.
+            if !backoff_elapsed(&job, now) {
+                continue;
+            }
+            let facts = self.facts_for(&job, &mut footprints);
+            let charged_ms = match facts.workspace.as_deref() {
+                Some(workspace) => match charges.get(workspace) {
+                    Some(charge) => *charge,
+                    None => {
+                        let charge = self.workspace_charge(Some(workspace));
+                        charges.insert(workspace.to_string(), charge);
+                        charge
+                    }
+                },
+                None => 0,
+            };
+            candidates.push(Candidate {
+                job_id: job.job_id.clone(),
+                class: facts.class,
+                workspace: facts.workspace.clone(),
+                priority: job.priority,
+                created_at_ms: job.created_at_ms,
+                charged_ms,
+            });
+            facts_by_job.insert(job.job_id.clone(), facts);
+            jobs.insert(job.job_id.clone(), job);
+        }
+        scheduler::rank(&mut candidates, now);
+
+        self.release_preemptions(&candidates, now)?;
+
+        // The profile's own ceiling applies on top of the configured
+        // concurrency, and only ever downward: a quota is a bound, not a grant.
+        let concurrency = self
+            .profile_limits
+            .quota
+            .clamp_concurrency(self.config.concurrency);
+        let mut slots = usize::try_from(concurrency)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(self.active.len());
+        if slots == 0 || candidates.is_empty() {
+            return Ok(());
+        }
+
+        // Probed once per pass and only when something is actually queued: the
+        // real probe forks `nvidia-smi` on CUDA hosts, and an idle daemon must not
+        // pay for that every poll interval.
+        //
+        // `None` means the probe failed, and that falls through to the pre-K7
+        // behaviour deliberately. A machine we could not measure is not a reason
+        // to refuse work — it is a reason to stop claiming the queue is
+        // resource-aware for this tick.
+        let snapshot = (self.hardware)();
+        // Keyed by resident model, so admitting a second job against a model
+        // already loaded adds nothing to the total.
+        let mut resident = self.committed()?;
+        let mut resident_devices = self.committed_devices()?;
+        let mut running = self.running_jobs()?;
+
+        for index in 0..candidates.len() {
+            if slots == 0 {
+                break;
+            }
+            let candidate = candidates[index].clone();
+            let Some(job) = jobs.get(&candidate.job_id).cloned() else {
+                continue;
+            };
+            let reservation = facts_by_job
+                .get(&candidate.job_id)
+                .map(|facts| facts.reservation.clone())
+                .unwrap_or(Reservation::Remote);
+            // What this job was chosen over: the candidates ranked immediately
+            // behind it. Bounded, because a decision row must not grow with the
+            // queue.
+            let passed_over: Vec<String> = candidates[index + 1..]
+                .iter()
+                .take(DECISION_PASSED_OVER_MAX)
+                .map(|other| other.job_id.clone())
+                .collect();
+            let runner_up = candidates.get(index + 1);
+            // Set only by an admission that actually measured something. A tick
+            // with no hardware snapshot records no claim rather than a zero-byte
+            // one: it did not decide this job fitted, so it must not leave a row
+            // saying the model is free.
+            let mut claim: Option<AdmittedClaim> = None;
+            if let Some(snapshot) = snapshot.as_ref() {
+                let already = reservation
+                    .model_key()
+                    .and_then(|key| resident.get(key))
+                    .cloned();
+                let outcome = match already {
+                    // Already resident: this job is another turn against a model
+                    // whose memory is paid for. It still records the same claim,
+                    // which is what keeps the model reserved until the *last*
+                    // holder exits. Its per-device rows are already on the other
+                    // holder, so no device bytes are booked a second time.
+                    Some(paid) => Fit::Fits {
+                        claim: paid,
+                        devices: Vec::new(),
+                    },
+                    None => admission::fit(
+                        &reservation,
+                        &sum_reservations(&resident),
+                        &resident_devices,
+                        snapshot,
+                        self.profile_limits
+                            .memory_ceiling_bytes(snapshot.total_ram_bytes),
+                    ),
+                };
+                match outcome {
+                    Fit::Fits {
+                        claim: fitted,
+                        devices,
+                    } => {
+                        claim = reservation.model_key().map(|key| AdmittedClaim {
+                            model_key: key.to_string(),
+                            memory: fitted,
+                            devices,
+                        });
+                    }
+                    Fit::Unmeasured => {
+                        if let Reservation::Unmeasured { model_id } = &reservation {
+                            eprintln!(
+                                "monkey daemon: admitting job '{}' unmeasured — no installed footprint for model '{model_id}', so this admission was not bounded by memory",
+                                job.job_id
+                            );
+                        }
+                    }
+                    Fit::Hold {
+                        resource,
+                        shortfall_bytes,
+                    } => {
+                        // Somebody lower may be able to step aside. Suspension
+                        // takes effect on the next tick — `tick_active` is what
+                        // delivers the signal and releases the claim — so this
+                        // candidate is still held now, and its hold reason says
+                        // what it is waiting for rather than just "memory".
+                        // A set rather than one job: two `background` jobs that
+                        // together free enough used to free nothing, so a
+                        // claimant sat behind a pair it could have displaced.
+                        // The set is empty unless it actually covers the
+                        // shortfall, so this cannot park work for nothing.
+                        let victims: Vec<String> = scheduler::preemption_victims(
+                            candidate.effective_class(now),
+                            &resource,
+                            shortfall_bytes,
+                            &running,
+                        )
+                        .into_iter()
+                        .map(|victim| victim.job_id.clone())
+                        .collect();
+                        let mut reason = format!(
+                            "needs {} more {} than is free",
+                            admission::describe_bytes(shortfall_bytes),
+                            resource.label()
+                        );
+                        let mut suspended: Vec<String> = Vec::new();
+                        for victim_id in victims {
+                            if self.preempt(
+                                &victim_id,
+                                &candidate,
+                                now,
+                                &resource,
+                                shortfall_bytes,
+                                snapshot,
+                            )? {
+                                if let Some(entry) =
+                                    running.iter_mut().find(|entry| entry.job_id == victim_id)
+                                {
+                                    // Nothing left to give, so it cannot be
+                                    // chosen again in this same pass.
+                                    entry.preempted = true;
+                                }
+                                suspended.push(victim_id);
+                            }
+                        }
+                        if !suspended.is_empty() {
+                            // Named individually rather than counted: "suspended
+                            // 2 jobs" is not something an operator can act on.
+                            let names = suspended
+                                .iter()
+                                .map(|id| format!("'{id}'"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            reason = format!("{reason}; suspended {names} to make room");
+                        }
+                        // Stays `queued`. This is the case that used to be an
+                        // admission, and then a thrash.
+                        //
+                        // The decision is logged only when the hold reason
+                        // actually changed, for the same reason `hold` only writes
+                        // then: admission re-evaluates every held job four times a
+                        // second, and a row per evaluation would churn the whole
+                        // 512-row log every two minutes and bury the decisions
+                        // worth reading.
+                        if self.hold(&job, &reason)? {
+                            // The other half of the starvation bound, recorded:
+                            // how much longer this job can still be outranked
+                            // before aging puts it at the head of the ranking.
+                            let bound = scheduler::starvation_bound_ms();
+                            let promoted_in_ms = bound.saturating_sub(
+                                now.saturating_sub(candidate.created_at_ms).min(bound),
+                            );
+                            self.log_decision(
+                                &candidate,
+                                now,
+                                DECISION_HELD,
+                                passed_over,
+                                format!("{reason}; ranked first in at most {promoted_in_ms} ms"),
+                                MEASUREMENT_AVAILABLE_RAM,
+                                Some(snapshot.available_ram_bytes),
+                                Some(snapshot.captured_at_ms),
+                            );
+                        }
+                        continue;
+                    }
+                    Fit::Never {
+                        resource,
+                        shortfall_bytes,
+                    } => {
+                        self.reject_oversized(&job, now, &resource, shortfall_bytes)?;
+                        self.log_decision(
+                            &candidate,
+                            now,
+                            DECISION_REJECTED,
+                            passed_over,
+                            format!(
+                                "needs {} more {} than this machine has",
+                                admission::describe_bytes(shortfall_bytes),
+                                resource.label()
+                            ),
+                            MEASUREMENT_TOTAL_RAM,
+                            Some(snapshot.total_ram_bytes),
+                            Some(snapshot.captured_at_ms),
+                        );
+                        continue;
+                    }
+                }
+            }
+            let job_id = job.job_id.clone();
+            self.start_job(job, now, claim.as_ref())?;
+            // Only count what actually became active: `start_job` returns `Ok`
+            // without admitting when another owner holds the lease.
+            if self.active.contains_key(&job_id) {
+                slots -= 1;
+                if let Some(claimed) = claim {
+                    // Both maps, and both keyed by resident model: a second turn
+                    // against the same model must not be charged for it twice on
+                    // this tick either.
+                    if !resident.contains_key(&claimed.model_key) {
+                        admission::commit_devices(&mut resident_devices, &claimed.devices);
+                        resident.insert(claimed.model_key, claimed.memory);
+                    }
+                }
+                // The measurement cited for an admission is the ranking key that
+                // put this job first, not the memory reading — the memory reading
+                // is why it was *allowed* to start, and goes in the detail, but
+                // the ranking key is why it went before the others.
+                let (measurement, measured_value) =
+                    scheduler::deciding_key(&candidate, runner_up, now);
+                let detail = match snapshot.as_ref() {
+                    Some(snapshot) => format!(
+                        "priority {}, workspace charged {} ms, available RAM {}",
+                        candidate.priority,
+                        candidate.charged_ms,
+                        admission::describe_bytes(snapshot.available_ram_bytes)
+                    ),
+                    None => format!(
+                        "priority {}, workspace charged {} ms; hardware unmeasured, so this admission was bounded by concurrency alone",
+                        candidate.priority, candidate.charged_ms
+                    ),
+                };
+                self.log_decision(
+                    &candidate,
+                    now,
+                    DECISION_ADMITTED,
+                    passed_over,
+                    detail,
+                    measurement,
+                    measured_value,
+                    Some(now),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Every running job that could be asked to step aside.
+    ///
+    /// Only a job that holds a *measured* reservation is here, and only if it is
+    /// the sole holder of its resident model. Both exclusions are the same point:
+    /// preemption is worth doing when it returns accountable bytes, and suspending
+    /// one of two jobs sharing a loaded model returns none of them — the model
+    /// stays resident for the other holder.
+    fn running_jobs(&mut self) -> Result<Vec<Running>, String> {
+        let reservations = self.store.job_reservations()?;
+        // Per job, like `reservations` beside it: preemption asks *who* is
+        // holding a card, which a per-device total cannot answer.
+        let device_reservations = self.store.job_device_reservations()?;
+        let mut holders: HashMap<&str, usize> = HashMap::new();
+        for (_, model_key, _, _) in &reservations {
+            *holders.entry(model_key.as_str()).or_insert(0) += 1;
+        }
+        let active = self.store.active_jobs()?;
+        let mut footprints = HashMap::new();
+        let mut out = Vec::new();
+        for job in active {
+            // Only a `running` job has anything to suspend. One already paused,
+            // cancelling, or waiting on an approval is either stopped or on its
+            // way out.
+            if job.state != JobState::Running {
+                continue;
+            }
+            let Some((_, model_key, ram_bytes, vram_bytes)) = reservations
+                .iter()
+                .find(|(job_id, _, _, _)| *job_id == job.job_id)
+            else {
+                continue;
+            };
+            if holders.get(model_key.as_str()).copied().unwrap_or(0) > 1 {
+                continue;
+            }
+            let preempted = self.preempted.contains_key(&job.job_id);
+            let started_at_ms = job.started_at_ms.unwrap_or(job.created_at_ms);
+            let facts = self.facts_for(&job, &mut footprints);
+            out.push(Running {
+                job_id: job.job_id.clone(),
+                class: facts.class,
+                ram_bytes: *ram_bytes,
+                vram_bytes: *vram_bytes,
+                device_bytes: device_reservations
+                    .get(&job.job_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                preempted,
+                started_at_ms,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Ask a running job to step aside, by setting the durable suspend latch K2
+    /// already built.
+    ///
+    /// The latch rather than `pause_requested` directly, and this is the
+    /// load-bearing detail: `apply_signal_intent` copies intent one way, table →
+    /// daemon, and it is *level-triggered*. Setting `pause_requested` without the
+    /// latch would be undone on the very next tick, when that function saw the
+    /// latch clear and the daemon bit set and dutifully cleared the bit. Going
+    /// through the latch also means a preemption is visible in
+    /// `monkey processes list` like any other suspension, and survives a restart
+    /// exactly as far as the suspended job itself does.
+    ///
+    /// Returns whether the latch was actually set — a job whose process row has
+    /// gone is not an error, it is a job that has already left.
+    #[allow(clippy::too_many_arguments)]
+    fn preempt(
+        &mut self,
+        victim_job_id: &str,
+        claimant: &Candidate,
+        now: u64,
+        resource: &admission::Resource,
+        shortfall_bytes: u64,
+        snapshot: &little_monkey_lib::runtime_adapter::HardwareSnapshot,
+    ) -> Result<bool, String> {
+        use little_monkey_lib::process_table::{ProcessKind, ProcessSignal as TableSignal};
+
+        let Some(victim) = self.store.get_job(victim_job_id)? else {
+            return Ok(false);
+        };
+        let now_ms = i64::try_from(now).map_err(|_| "clock is beyond bounds".to_string())?;
+        let reason = format!(
+            "preempted so '{}' ({}) can start",
+            claimant.job_id,
+            claimant.effective_class(now).token()
+        );
+        let external_id = process_external_id(&victim.job_id, attempt_ordinal(&victim));
+        let latched = {
+            let table = self.shared.process_table();
+            match table
+                .find_by_external_id(ProcessKind::DaemonJob, &external_id)
+                .map_err(|error| error.to_string())?
+            {
+                // Fail-soft, and specifically because of `AlreadyExited`: the
+                // victim was `running` when `running_jobs` read it, but its
+                // process row can go terminal between that read and this write,
+                // and a job that has already left is not an error — it is a
+                // preemption that is no longer needed.
+                Some(record) => match table.signal(
+                    &record.process_id,
+                    TableSignal::Suspend,
+                    Some(&reason),
+                    now_ms,
+                ) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        eprintln!(
+                            "monkey daemon: could not suspend '{}': {error}",
+                            victim.job_id
+                        );
+                        false
+                    }
+                },
+                None => false,
+            }
+        };
+        if !latched {
+            return Ok(false);
+        }
+        self.preempted.insert(victim.job_id.clone(), now);
+        eprintln!("monkey daemon: {} — {reason}", victim.job_id);
+        let victim_class = self
+            .facts
+            .get(&victim.job_id)
+            .map(|facts| facts.class)
+            .unwrap_or(ProcessClass::Batch);
+        self.store
+            .record_decision(&SchedulerDecision {
+                decided_at_ms: now,
+                job_id: victim.job_id.clone(),
+                outcome: DECISION_PREEMPTED.to_string(),
+                process_class: victim_class.token().to_string(),
+                effective_class: victim_class.token().to_string(),
+                workspace: self
+                    .facts
+                    .get(&victim.job_id)
+                    .and_then(|facts| facts.workspace.clone()),
+                passed_over: vec![claimant.job_id.clone()],
+                detail: format!(
+                    "{reason}; it was short {} of {}",
+                    admission::describe_bytes(shortfall_bytes),
+                    resource.label()
+                ),
+                measurement: MEASUREMENT_AVAILABLE_RAM.to_string(),
+                measured_value: Some(snapshot.available_ram_bytes),
+                measured_at_ms: Some(snapshot.captured_at_ms),
+            })
+            .unwrap_or_else(|error| {
+                eprintln!("monkey daemon: could not record preemption: {error}")
+            });
+        Ok(true)
+    }
+
+    /// Clear the suspend latch on preempted jobs whose preemption is no longer
+    /// justified.
+    ///
+    /// "No longer justified" is: nothing queued outranks the suspended job any
+    /// more. `PREEMPTION_MIN_SUSPENDED_MS` is the floor that stops one interactive
+    /// job arriving and leaving every poll interval from suspending and resuming
+    /// the same background job four times a second.
+    ///
+    /// Clearing the latch is all this does. Whether the job can actually have its
+    /// memory back is decided in `tick_active`, which is the only place that can
+    /// ask, and a job that no longer fits stays suspended there rather than being
+    /// resumed into a machine that has no room for it.
+    fn release_preemptions(&mut self, candidates: &[Candidate], now: u64) -> Result<(), String> {
+        use little_monkey_lib::process_table::{ProcessKind, ProcessSignal as TableSignal};
+
+        if self.preempted.is_empty() {
+            return Ok(());
+        }
+        let mut releasable: Vec<(String, ProcessClass)> = Vec::new();
+        for (job_id, suspended_at) in &self.preempted {
+            if now.saturating_sub(*suspended_at) < scheduler::PREEMPTION_MIN_SUSPENDED_MS {
+                continue;
+            }
+            let class = self
+                .facts
+                .get(job_id)
+                .map(|facts| facts.class)
+                .unwrap_or(ProcessClass::Batch);
+            let still_outranked = candidates
+                .iter()
+                .any(|candidate| candidate.effective_class(now).rank() < class.rank());
+            if !still_outranked {
+                releasable.push((job_id.clone(), class));
+            }
+        }
+        let now_ms = i64::try_from(now).map_err(|_| "clock is beyond bounds".to_string())?;
+        for (job_id, class) in releasable {
+            // Dropped from the map either way. A job that has gone terminal since
+            // it was suspended has nothing to release, and leaving it here would
+            // retry the same dead lookup on every tick forever.
+            self.preempted.remove(&job_id);
+            let Some(job) = self.store.get_job(&job_id)? else {
+                continue;
+            };
+            if job.state.is_terminal() {
+                continue;
+            }
+            let external_id = process_external_id(&job.job_id, attempt_ordinal(&job));
+            let cleared = {
+                let table = self.shared.process_table();
+                match table
+                    .find_by_external_id(ProcessKind::DaemonJob, &external_id)
+                    .map_err(|error| error.to_string())?
+                {
+                    // Fail-soft for the same reason `preempt` is: the row can
+                    // reach a terminal state between the two reads, and
+                    // `AlreadyExited` then means the release is moot rather than
+                    // that the tick failed.
+                    Some(record) => match table.signal(
+                        &record.process_id,
+                        TableSignal::Resume,
+                        Some("preemption released; nothing queued outranks it"),
+                        now_ms,
+                    ) {
+                        Ok(_) => true,
+                        Err(error) => {
+                            eprintln!("monkey daemon: could not resume '{job_id}': {error}");
+                            false
+                        }
+                    },
+                    None => false,
+                }
+            };
+            if !cleared {
+                continue;
+            }
+            let workspace = self
+                .facts
+                .get(&job_id)
+                .and_then(|facts| facts.workspace.clone());
+            self.store
+                .record_decision(&SchedulerDecision {
+                    decided_at_ms: now,
+                    job_id,
+                    outcome: DECISION_RESUMED.to_string(),
+                    process_class: class.token().to_string(),
+                    effective_class: class.token().to_string(),
+                    workspace,
+                    passed_over: Vec::new(),
+                    detail: "nothing queued outranks it any more".to_string(),
+                    measurement: MEASUREMENT_SUSPENDED_MS.to_string(),
+                    measured_value: Some(scheduler::PREEMPTION_MIN_SUSPENDED_MS),
+                    measured_at_ms: Some(now),
+                })
+                .unwrap_or_else(|error| {
+                    eprintln!("monkey daemon: could not record resume: {error}")
+                });
+        }
+        Ok(())
+    }
+
+    /// Append one decision, fail-soft.
+    ///
+    /// Swallowed for the same reason the process-table projection is: the log is
+    /// an inspection surface, and the one thing worse than a missing row is a job
+    /// that refused to run to protect one.
+    #[allow(clippy::too_many_arguments)]
+    fn log_decision(
+        &mut self,
+        candidate: &Candidate,
+        now: u64,
+        outcome: &str,
+        passed_over: Vec<String>,
+        detail: String,
+        measurement: &str,
+        measured_value: Option<u64>,
+        measured_at_ms: Option<u64>,
+    ) {
+        if let Err(error) = self.store.record_decision(&SchedulerDecision {
+            decided_at_ms: now,
+            job_id: candidate.job_id.clone(),
+            outcome: outcome.to_string(),
+            process_class: candidate.class.token().to_string(),
+            effective_class: candidate.effective_class(now).token().to_string(),
+            workspace: candidate.workspace.clone(),
+            passed_over,
+            detail,
+            measurement: measurement.to_string(),
+            measured_value,
+            measured_at_ms,
+        }) {
+            eprintln!("monkey daemon: could not record scheduling decision: {error}");
+        }
+    }
+
+    /// Fold this job's per-process measurement into the resource ledger (K6).
+    ///
+    /// **What is measured, and what is not.** This samples the *supervised child's
+    /// own pid* — the `monkey task` process that runs the agent loop — so
+    /// `cpu_time_ms`, `peak_rss_bytes`, `bytes_read` and `bytes_written` describe
+    /// that process and not its descendants. The memory *budget* deliberately
+    /// measures something wider: `process_memory_bytes` sums the whole process
+    /// group, because a job whose tool spawned `cargo build` must not escape its
+    /// ceiling through a grandchild. Those two scopes are genuinely different and
+    /// the difference is kept rather than papered over — a budget that only
+    /// watched one pid would be trivially escapable, and a ledger row whose
+    /// `peak_rss_bytes` silently included every tool subprocess would answer a
+    /// question nobody asked of a row that represents the agent.
+    ///
+    /// So: the group total drives the budget, the per-pid sample feeds the ledger,
+    /// and `peak_rss_bytes` on an `agent_processes` row means "the high-water
+    /// footprint of the agent process itself".
+    ///
+    /// ponytail: no group-wide CPU or disk roll-up. `process_usage::sample` reads
+    /// one pid, and summing a process group's CPU needs a per-platform walk of the
+    /// group — the same walk `sum_group_rss_kib` and
+    /// `sum_process_tree_working_set` already do for memory, extended to two more
+    /// counters. The upgrade path is to widen those two functions and feed their
+    /// output through the same `accumulate_usage` call as here; nothing else
+    /// changes.
+    ///
+    /// Fail-soft, like every other write to the process table.
+    fn record_usage(&self, job: &DaemonJob, now: u64) {
+        use little_monkey_lib::process_table::ProcessKind;
+
+        let Some(pid) = self
+            .active
+            .get(&job.job_id)
+            .map(|active| active.process.id())
+        else {
+            return;
+        };
+        let Ok(now_ms) = i64::try_from(now) else {
+            return;
+        };
+        let sample = little_monkey_lib::process_usage::sample(i64::from(pid));
+        let table = self.shared.process_table();
+        let record = table.find_by_external_id(
+            ProcessKind::DaemonJob,
+            &process_external_id(&job.job_id, attempt_ordinal(job)),
+        );
+        match record {
+            Ok(Some(record)) => {
+                // `accumulate_usage` folds by maximum in SQL, so an accumulator
+                // in the engine would be a second copy of a rule the ledger
+                // already enforces — and a failed read comes back as `NULL`,
+                // which the same statement leaves alone rather than treating as a
+                // zero. Nothing here has to remember the previous reading.
+                if let Err(error) = table.accumulate_usage(&record.process_id, &sample, now_ms) {
+                    eprintln!(
+                        "monkey daemon: could not record usage for '{}': {error}",
+                        job.job_id
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "monkey daemon: could not find the process row for '{}': {error}",
+                job.job_id
+            ),
+        }
     }
 
     /// Project every daemon job onto the unified process table.
@@ -839,7 +1827,8 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             ProcessState,
         };
 
-        let now_ms = i64::try_from(now).map_err(|_| "clock is beyond protocol bounds".to_string())?;
+        let now_ms =
+            i64::try_from(now).map_err(|_| "clock is beyond protocol bounds".to_string())?;
         let jobs = self.store.nonterminal_jobs()?;
 
         // Keyed by the attempt-scoped external id, not the job id: a job that has
@@ -915,9 +1904,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                     status: ExitStatus::Lost,
                     code: None,
                     signal: None,
-                    reason: Some(
-                        "process row predates attempt-scoped daemon job ids".to_string(),
-                    ),
+                    reason: Some("process row predates attempt-scoped daemon job ids".to_string()),
                 },
                 None => ProcessExit {
                     status: ExitStatus::Lost,
@@ -944,12 +1931,26 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                 process_state_for(job.state),
             )
             .with_run(job.run_id.clone())
+            // Set so fair-share can charge this job's device time to the right
+            // workspace: `usage_totals` selects on this column, and a row without
+            // it is invisible to the charge. `reconcile` only writes it on admit,
+            // which is fine — the scheduling pass runs before this projection, so
+            // the fact is already cached by the time a queued job is first
+            // projected.
+            .with_workspace(
+                self.facts
+                    .get(&job.job_id)
+                    .and_then(|facts| facts.workspace.clone()),
+            )
             .with_native_pid(job.process_id.map(i64::from))
             .with_limits(ProcessLimits {
                 max_wall_ms: Some(job.max_runtime_ms),
                 max_memory_bytes: job.max_memory_bytes,
                 max_output_bytes: Some(job.max_log_bytes),
                 max_child_processes: None,
+                // A daemon job's recipe carries no context budget, and inventing
+                // one here would be a default nobody chose.
+                max_context_tokens: None,
             });
             // A non-terminal job never carries an exit, so this cannot be a
             // terminal projection — the terminal case is the sweep above.
@@ -961,7 +1962,131 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         Ok(())
     }
 
-    fn start_job(&mut self, job: DaemonJob, now: u64) -> Result<(), String> {
+    /// Leave a job queued and record why.
+    ///
+    /// The unified process table already reports a held job as
+    /// `ProcessState::Admitted` — `process_state_for` maps `Queued` there — so
+    /// the roadmap's "sits in `admitted`" holds without a new `JobState`. What
+    /// `Admitted` alone cannot say is *why* it is still sitting there, which is
+    /// the question an operator actually has, so the reason goes on the row.
+    ///
+    /// Written only when it changes. Admission re-evaluates every held job every
+    /// tick, and re-writing the same sentence four times a second would turn one
+    /// waiting job into a write loop and a log flood.
+    ///
+    /// Returns whether anything was written, which is also what gates the
+    /// scheduling decision log — a decision worth recording is one that changed
+    /// something.
+    fn hold(&mut self, job: &DaemonJob, reason: &str) -> Result<bool, String> {
+        if job.hold_reason.as_deref() == Some(reason) {
+            return Ok(false);
+        }
+        eprintln!("monkey daemon: holding job '{}' — {reason}", job.job_id);
+        self.store.record_hold(&job.job_id, Some(reason))?;
+        Ok(true)
+    }
+
+    /// Whether a suspended job may have the claim it released back.
+    ///
+    /// `Fits(None)` and `Held` are not the same answer with different labels:
+    /// `None` means there is nothing to re-claim (a provider run, or a machine
+    /// nothing could measure), which is a resume, and `Held` means the bytes are
+    /// gone, which is not.
+    fn reacquire(&mut self, job: &DaemonJob) -> Result<Reacquired, String> {
+        let Some(snapshot) = (self.hardware)() else {
+            // A machine we could not measure is not a reason to refuse to resume
+            // a job that was already running a moment ago.
+            return Ok(Reacquired::Fits(None));
+        };
+        let mut footprints = HashMap::new();
+        let reservation = self.facts_for(job, &mut footprints).reservation;
+        let resident = self.committed()?;
+        let resident_devices = self.committed_devices()?;
+        let already = reservation
+            .model_key()
+            .and_then(|key| resident.get(key))
+            .cloned();
+        let outcome = match already {
+            // Another holder kept the model resident, so there is nothing to buy
+            // back — recording the same claim is what keeps it reserved until the
+            // last of them exits. The per-device rows are already there for the
+            // same reason, so this re-records only the pooled figure.
+            Some(paid) => Fit::Fits {
+                claim: paid,
+                devices: Vec::new(),
+            },
+            None => admission::fit(
+                &reservation,
+                &sum_reservations(&resident),
+                &resident_devices,
+                &snapshot,
+                self.profile_limits
+                    .memory_ceiling_bytes(snapshot.total_ram_bytes),
+            ),
+        };
+        Ok(match outcome {
+            Fit::Fits { claim, devices } => {
+                Reacquired::Fits(reservation.model_key().map(|key| AdmittedClaim {
+                    model_key: key.to_string(),
+                    memory: claim,
+                    devices,
+                }))
+            }
+            Fit::Unmeasured => Reacquired::Fits(None),
+            Fit::Hold {
+                resource,
+                shortfall_bytes,
+            } => Reacquired::Held(format!(
+                "suspended and cannot resume: needs {} more {} than is free",
+                admission::describe_bytes(shortfall_bytes),
+                resource.label()
+            )),
+            // The machine shrank under it — a card was unplugged, or the reserve
+            // moved. Still a hold rather than a failure: the job is intact and
+            // suspended, and failing work the operator can fix by closing
+            // something is a worse answer than leaving it parked.
+            Fit::Never {
+                resource,
+                shortfall_bytes,
+            } => Reacquired::Held(format!(
+                "suspended and cannot resume: needs {} more {} than this machine now has",
+                admission::describe_bytes(shortfall_bytes),
+                resource.label()
+            )),
+        })
+    }
+
+    /// A job that cannot fit on this machine even when it is idle is failed
+    /// without ever being spawned.
+    ///
+    /// Holding it instead would be waiting for memory that cannot appear, and
+    /// starting it is what the memory watchdog used to clean up after — a kill
+    /// several minutes in, indistinguishable from the job's own failure.
+    fn reject_oversized(
+        &mut self,
+        job: &DaemonJob,
+        now: u64,
+        resource: &admission::Resource,
+        shortfall_bytes: u64,
+    ) -> Result<(), String> {
+        let reason = format!(
+            "needs {} more {} than this machine has; refused at admission rather than started and killed",
+            admission::describe_bytes(shortfall_bytes),
+            resource.label()
+        );
+        if let Some(run_id) = job.run_id.as_deref() {
+            self.fail_run(run_id, "daemon_admission_rejected", &reason)?;
+        }
+        self.store
+            .transition(&job.job_id, JobState::Failed, now, None, Some(&reason))
+    }
+
+    fn start_job(
+        &mut self,
+        job: DaemonJob,
+        now: u64,
+        claim: Option<&AdmittedClaim>,
+    ) -> Result<(), String> {
         let run_id = job
             .run_id
             .as_deref()
@@ -986,6 +2111,15 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                     Some(process_id),
                     None,
                 )?;
+                if let Some(claim) = claim {
+                    self.store.record_reservation(
+                        &job.job_id,
+                        &claim.model_key,
+                        claim.memory.ram_bytes,
+                        claim.memory.vram_bytes,
+                        &claim.devices,
+                    )?;
+                }
                 self.active
                     .insert(job.job_id.clone(), ActiveProcess { process, lease });
                 self.notify(run_id, "Background run started", &job.job_id);
@@ -1041,6 +2175,12 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                 .update_worktree_lease(&owned.lease_id, "active", now);
         }
 
+        // Sampled while the process is alive and before every branch that can tear
+        // it down — cancellation, a budget kill, a clean exit. Peak resident size
+        // is unreadable once a pid is gone, so whichever of those fires later in
+        // this same tick must not be the reason the last reading was lost.
+        self.record_usage(&job, now);
+
         if job.cancel_requested || self.store.kill_switch()? {
             // The kill switch is an operator's emergency stop, so it gets the
             // same no-grace-period treatment as an explicit per-job `kill`.
@@ -1081,11 +2221,45 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             self.control(run_id)?.emit(RunEvent::Paused {
                 reason: Some("Paused by daemon controller".to_string()),
             })?;
+            // The suspended half of the reservation round-trip (K8). A suspended
+            // job gives its claim back, which is what lets a higher class start —
+            // and it is what makes resuming a decision rather than a formality.
+            //
+            // Accounting, not eviction, and the distinction is worth being blunt
+            // about: `SIGSTOP` does not return one page to the OS, and for a local
+            // model the weights are resident in a model server that is not even in
+            // this process group. Releasing the claim trades a possible swap for
+            // interactive latency, which is the trade the roadmap asks for.
+            //
+            // ponytail: the model stays loaded. Actually reclaiming those bytes
+            // means asking the runtime hub to unload the model, which is a
+            // cross-component request this engine has no seam for yet; the upgrade
+            // path is one call here, and the accounting above is already correct
+            // for it.
+            self.store.release_reservation(job_id)?;
             self.store
                 .transition(job_id, JobState::Paused, now, Some(process_id), None)?;
             return Ok(());
         }
         if !job.pause_requested && job.state == JobState::Paused {
+            // The reacquire half, and the interesting one: the memory this job
+            // let go of may be gone. It is checked here rather than by the
+            // scheduler because this is the only place a resume actually happens —
+            // an operator clearing a pause by hand arrives here too, and must not
+            // be able to resume a job into a machine with no room for it.
+            //
+            // A job that cannot have its claim back stays `paused` with a hold
+            // reason and no signal delivered. That is the no-thrash property:
+            // nothing is sent to the child, so re-evaluating on the next tick
+            // costs one fit computation and changes nothing until the answer
+            // changes.
+            let claim = match self.reacquire(&job)? {
+                Reacquired::Fits(claim) => claim,
+                Reacquired::Held(reason) => {
+                    self.hold(&job, &reason)?;
+                    return Ok(());
+                }
+            };
             let process_id = {
                 let active = self
                     .active
@@ -1097,6 +2271,19 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             self.control(run_id)?.emit(RunEvent::Started {
                 engine_id: "monkey-daemon-resume".to_string(),
             })?;
+            match claim {
+                Some(claim) => self.store.record_reservation(
+                    job_id,
+                    &claim.model_key,
+                    claim.memory.ram_bytes,
+                    claim.memory.vram_bytes,
+                    &claim.devices,
+                )?,
+                // Nothing to re-claim, but a stale hold reason from an earlier
+                // failed resume would still be sitting on the row.
+                None if job.hold_reason.is_some() => self.store.record_hold(job_id, None)?,
+                None => {}
+            }
             self.store
                 .transition(job_id, JobState::Running, now, Some(process_id), None)?;
         }
@@ -1106,16 +2293,22 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         // whoever reads the exit whether the budget was wrong or the job was.
         if let Some(started) = job.started_at_ms {
             let elapsed = now.saturating_sub(started);
-            if elapsed > job.max_runtime_ms {
+            // The profile's quota can only tighten the job's own budget, and
+            // the message names the number that actually tripped so an operator
+            // can tell a job's budget from an identity's ceiling.
+            let budget = self.effective_runtime_ms(&job);
+            if elapsed > budget {
+                let source = if budget < job.max_runtime_ms {
+                    " (profile quota)"
+                } else {
+                    ""
+                };
                 self.cancel_for_budget(
                     job_id,
                     run_id,
                     now,
                     BudgetLimit::Wall,
-                    &format!(
-                        "ran for {elapsed} ms against a {} ms budget",
-                        job.max_runtime_ms
-                    ),
+                    &format!("ran for {elapsed} ms against a {budget} ms budget{source}"),
                 )?;
                 return Ok(());
             }
@@ -1247,6 +2440,14 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         if let Some(active) = self.active.remove(job_id) {
             let _ = self.shared.release_lease(&active.lease);
         }
+        self.preempted.remove(job_id);
+        // Released here as well as implied by the state change, because this is
+        // the one place every ordinary exit passes through and an explicit
+        // release is what makes the columns readable by anything but
+        // `committed_reservations`. A model with other holders keeps its bytes:
+        // the total is grouped by model key, so it only comes back when the last
+        // of them has let go.
+        self.store.release_reservation(job_id)?;
         self.store.transition(job_id, state, now, None, error)
     }
 
@@ -1256,6 +2457,11 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         now: u64,
         reason: &str,
     ) -> Result<(), String> {
+        // The crash funnel: a child that died, a lease that lapsed, a daemon that
+        // restarted. None of those went through `finish_active`, so this is where
+        // their claim comes back.
+        self.preempted.remove(&job.job_id);
+        self.store.release_reservation(&job.job_id)?;
         let Some(run_id) = job.run_id.as_deref() else {
             self.store.transition(
                 &job.job_id,
@@ -1723,6 +2929,7 @@ pub(super) mod tests {
                 tool_rules: vec![],
                 allow_network: false,
                 allow_external_mutations: false,
+                egress_allowlist: None,
             },
             budgets: RunBudgets {
                 wall_time_ms: 60_000,
@@ -1817,6 +3024,1149 @@ pub(super) mod tests {
         }
     }
 
+    /// A 16 GiB machine with 16 GiB free, so admission is decided by the
+    /// reservations rather than by whatever CI is running on.
+    fn sixteen_gig_machine() -> Option<little_monkey_lib::runtime_adapter::HardwareSnapshot> {
+        Some(little_monkey_lib::runtime_adapter::HardwareSnapshot {
+            captured_at_ms: 1,
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,
+            available_ram_bytes: 16 * 1024 * 1024 * 1024,
+            logical_cpu_count: 8,
+            platform: little_monkey_lib::runtime_adapter::PlatformCapabilities::from_host(
+                "macos",
+                "aarch64",
+                Vec::new(),
+            ),
+        })
+    }
+
+    /// Several queued jobs, each with its own durable run whose frozen target is
+    /// a *local* model of the given size — the case the reservation is read
+    /// from. The shared `spec` fixture targets a provider, which correctly
+    /// reserves nothing and so cannot exercise admission at all.
+    ///
+    /// Each tuple is `(job label, estimated bytes, model name)`. The model name
+    /// is separate from the job label because reservations are keyed by resident
+    /// model: two jobs sharing a name deliberately share one reservation, so a
+    /// fixture that wants N independent claims has to say N different names.
+    fn admission_fixture(
+        label: &str,
+        jobs: &[(&str, u64, &str)],
+    ) -> (DaemonPaths, DaemonStore, SharedLedger) {
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-daemon-admission-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = DaemonPaths::under(&root);
+        paths.ensure().unwrap();
+        let mut store = DaemonStore::open(&paths).unwrap();
+
+        for (job_label, estimated_memory_bytes, model) in jobs {
+            let run_id = format!("run-{job_label}");
+            let mut run_spec = spec(&run_id, 1_000);
+            // Zero keeps the shared fixture's provider target: the protocol
+            // rejects a zero estimate, and a zero-sized local model is not the
+            // thing being modelled — a remote one is.
+            if *estimated_memory_bytes > 0 {
+                run_spec.target = ModelTargetSnapshot::ManagedLlama {
+                    target_id: format!("local-target-{model}"),
+                    label: "local".into(),
+                    model_id: (*model).into(),
+                    model_path: format!("/tmp/{model}.gguf"),
+                    capabilities: crate::task::cli_capabilities(),
+                    estimated_memory_bytes: Some(*estimated_memory_bytes),
+                };
+            }
+            let ledger = RunLedger::open(&paths.ledger_db).unwrap();
+            DurableRunRecorder::submit(ledger, &run_spec, "daemon-fixture".into()).unwrap();
+
+            let job_id = format!("job-{job_label}");
+            let snapshot = paths.snapshots.join(format!("{job_id}.json"));
+            std::fs::write(&snapshot, b"{}").unwrap();
+            store
+                .insert_preparing(
+                    &NewDaemonJob {
+                        job_id: job_id.clone(),
+                        recipe_snapshot: snapshot,
+                        priority: 0,
+                        max_attempts: 1,
+                        created_at_ms: 1_000,
+                        max_runtime_ms: 60_000,
+                        max_memory_bytes: None,
+                        max_log_bytes: DEFAULT_MAX_LOG_BYTES,
+                        repository_policy_json: None,
+                        worktree_json: None,
+                        parent_run_id: None,
+                    },
+                    8,
+                )
+                .unwrap();
+            store.mark_queued(&job_id, &run_id, 1_000).unwrap();
+        }
+
+        let shared = SharedLedger::open(&paths.ledger_db).unwrap();
+        (paths, store, shared)
+    }
+
+    fn admission_engine(
+        paths: DaemonPaths,
+        store: DaemonStore,
+        shared: SharedLedger,
+        adapter: FakeProcesses,
+    ) -> DaemonEngine<FakeProcesses, FakeNotifier, FakeClock> {
+        let mut engine = DaemonEngine::new(
+            store,
+            shared,
+            paths,
+            DaemonConfig::default(),
+            adapter,
+            FakeNotifier::default(),
+            FakeClock(Arc::new(Mutex::new(2_000))),
+            "daemon-test-owner".into(),
+        );
+        engine.set_hardware_probe(sixteen_gig_machine);
+        engine
+    }
+
+    /// The roadmap's own example, end to end through the real tick: four 12 GB
+    /// jobs on a 16 GB machine were all admitted and all thrashed, because
+    /// `concurrency = 4` was the only question asked.
+    #[test]
+    fn four_twelve_gig_jobs_on_a_sixteen_gig_machine_admit_one_at_a_time() {
+        const TWELVE_GIB: u64 = 12 * 1024 * 1024 * 1024;
+        let (paths, store, shared) = admission_fixture(
+            "thrash",
+            &[
+                ("a", TWELVE_GIB, "model-a"),
+                ("b", TWELVE_GIB, "model-b"),
+                ("c", TWELVE_GIB, "model-c"),
+                ("d", TWELVE_GIB, "model-d"),
+            ],
+        );
+        let adapter = fake_adapter();
+        let spawns = adapter.spawns.clone();
+        let mut engine = admission_engine(paths, store, shared, adapter);
+
+        engine.tick().unwrap();
+
+        assert_eq!(
+            engine.active_count(),
+            1,
+            "concurrency alone would have admitted all four"
+        );
+        assert_eq!(*spawns.lock().unwrap(), 1, "only one job may be spawned");
+
+        // The three held jobs are still queued — held, not failed.
+        let queued = engine
+            .store
+            .ready_jobs(8)
+            .unwrap()
+            .into_iter()
+            .map(|job| job.job_id)
+            .collect::<Vec<_>>();
+        assert_eq!(queued.len(), 3, "the rest wait rather than being rejected");
+    }
+
+    /// Without the probe the queue must behave exactly as it did before K7 —
+    /// a machine we could not measure is not a reason to refuse work.
+    #[test]
+    fn an_unavailable_hardware_probe_falls_back_to_concurrency_alone() {
+        const TWELVE_GIB: u64 = 12 * 1024 * 1024 * 1024;
+        let (paths, store, shared) = admission_fixture(
+            "noprobe",
+            &[("a", TWELVE_GIB, "m-a"), ("b", TWELVE_GIB, "m-b")],
+        );
+        let adapter = fake_adapter();
+        let mut engine = admission_engine(paths, store, shared, adapter);
+        engine.set_hardware_probe(|| None);
+
+        engine.tick().unwrap();
+
+        assert_eq!(engine.active_count(), 2, "pre-K7 behaviour is preserved");
+    }
+
+    /// A job too big for the machine is failed at admission with the shortfall,
+    /// rather than started and killed by the memory watchdog minutes later.
+    #[test]
+    fn a_job_larger_than_the_machine_is_rejected_without_being_spawned() {
+        const SIXTY_FOUR_GIB: u64 = 64 * 1024 * 1024 * 1024;
+        let (paths, store, shared) =
+            admission_fixture("oversized", &[("a", SIXTY_FOUR_GIB, "big")]);
+        let adapter = fake_adapter();
+        let spawns = adapter.spawns.clone();
+        let mut engine = admission_engine(paths, store, shared, adapter);
+
+        engine.tick().unwrap();
+
+        assert_eq!(*spawns.lock().unwrap(), 0, "must never be spawned");
+        assert_eq!(engine.active_count(), 0);
+
+        let job = engine.store.get_job("job-a").unwrap().unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        let error = job.last_error.unwrap_or_default();
+        assert!(
+            error.contains("GiB"),
+            "refusal must name the shortfall, got {error:?}"
+        );
+    }
+
+    /// A cloud target holds no local weights, so a local memory bound must not
+    /// serialize provider jobs behind each other.
+    #[test]
+    fn provider_jobs_are_not_held_by_a_local_memory_bound() {
+        let (paths, store, shared) =
+            admission_fixture("remote", &[("a", 0, "remote-a"), ("b", 0, "remote-b")]);
+        let adapter = fake_adapter();
+        let mut engine = admission_engine(paths, store, shared, adapter);
+
+        engine.tick().unwrap();
+
+        assert_eq!(engine.active_count(), 2);
+    }
+
+    /// The common case the per-job reservation got wrong: a queue of turns
+    /// against one local model. The model is resident once, so it is charged
+    /// once, and all four run.
+    #[test]
+    fn jobs_sharing_one_local_model_reserve_it_once() {
+        const TWELVE_GIB: u64 = 12 * 1024 * 1024 * 1024;
+        let (paths, store, shared) = admission_fixture(
+            "dedup",
+            &[
+                ("a", TWELVE_GIB, "shared-model"),
+                ("b", TWELVE_GIB, "shared-model"),
+                ("c", TWELVE_GIB, "shared-model"),
+                ("d", TWELVE_GIB, "shared-model"),
+            ],
+        );
+        let adapter = fake_adapter();
+        let mut engine = admission_engine(paths, store, shared, adapter);
+
+        engine.tick().unwrap();
+
+        assert_eq!(
+            engine.active_count(),
+            4,
+            "one resident model must not be paid for four times"
+        );
+        let committed = engine.store.committed_reservations().unwrap();
+        assert_eq!(
+            committed.len(),
+            1,
+            "one row per resident model, got {committed:?}"
+        );
+        assert_eq!(committed[0].1, TWELVE_GIB);
+    }
+
+    /// The subtle half of keying reservations by model: the bytes come back when
+    /// the *last* holder exits, not the first.
+    #[test]
+    fn a_shared_reservation_survives_until_the_last_holder_exits() {
+        const TWELVE_GIB: u64 = 12 * 1024 * 1024 * 1024;
+        let (paths, store, shared) = admission_fixture(
+            "lastholder",
+            &[("a", TWELVE_GIB, "shared"), ("b", TWELVE_GIB, "shared")],
+        );
+        let adapter = fake_adapter();
+        let mut engine = admission_engine(paths, store, shared, adapter);
+        engine.tick().unwrap();
+        assert_eq!(engine.active_count(), 2);
+
+        engine
+            .finish_active("job-a", JobState::Succeeded, 2_001, None)
+            .unwrap();
+        let after_first = engine.store.committed_reservations().unwrap();
+        assert_eq!(
+            after_first.len(),
+            1,
+            "the model is still loaded for job-b, got {after_first:?}"
+        );
+
+        engine
+            .finish_active("job-b", JobState::Succeeded, 2_002, None)
+            .unwrap();
+        assert!(
+            engine.store.committed_reservations().unwrap().is_empty(),
+            "the last holder releases it"
+        );
+    }
+
+    /// The reservation lives in `daemon_jobs`, not in a `HashMap` that dies with
+    /// the process, and a claim left behind by a daemon that never came back is
+    /// swept rather than shrinking the budget forever.
+    #[test]
+    fn a_reservation_outlives_the_daemon_and_a_stale_one_is_swept() {
+        const EIGHT_GIB: u64 = 8 * 1024 * 1024 * 1024;
+        let (paths, store, shared) = admission_fixture("restart", &[("a", EIGHT_GIB, "durable")]);
+        let adapter = fake_adapter();
+        let mut engine = admission_engine(paths.clone(), store, shared, adapter);
+        engine.tick().unwrap();
+        assert_eq!(engine.active_count(), 1);
+        // The daemon dies here: drop everything it held in memory.
+        drop(engine);
+
+        let reopened = DaemonStore::open(&paths).unwrap();
+        let committed = reopened.committed_reservations().unwrap();
+        assert_eq!(
+            committed.len(),
+            1,
+            "a restarted daemon must still see the claim, got {committed:?}"
+        );
+        assert_eq!(committed[0].1, EIGHT_GIB);
+
+        let shared = SharedLedger::open(&paths.ledger_db).unwrap();
+        let mut engine = admission_engine(paths, reopened, shared, fake_adapter());
+        engine.recover().unwrap();
+        assert!(
+            engine.store.committed_reservations().unwrap().is_empty(),
+            "nothing is running, so nothing may still be reserved"
+        );
+    }
+
+    /// A held job is not silently indistinguishable from one nothing has looked
+    /// at: the reason is on the row, and it is cleared once the job starts.
+    #[test]
+    fn a_held_job_records_why_and_is_retried_on_a_later_tick() {
+        const TWELVE_GIB: u64 = 12 * 1024 * 1024 * 1024;
+        let (paths, store, shared) = admission_fixture(
+            "heldreason",
+            &[("a", TWELVE_GIB, "first"), ("b", TWELVE_GIB, "second")],
+        );
+        let adapter = fake_adapter();
+        let mut engine = admission_engine(paths, store, shared, adapter);
+        engine.tick().unwrap();
+
+        let held = engine.store.get_job("job-b").unwrap().unwrap();
+        assert_eq!(held.state, JobState::Queued, "held, not failed");
+        let reason = held.hold_reason.unwrap_or_default();
+        assert!(
+            reason.contains("system memory") && reason.contains("GiB"),
+            "the hold must name the resource and the shortfall, got {reason:?}"
+        );
+
+        // Freeing the first job's reservation lets the later tick admit it —
+        // a hold is a retry, not a terminal decision.
+        engine
+            .finish_active("job-a", JobState::Succeeded, 2_001, None)
+            .unwrap();
+        engine.tick().unwrap();
+        let admitted = engine.store.get_job("job-b").unwrap().unwrap();
+        assert_eq!(admitted.state, JobState::Running);
+        assert_eq!(
+            admitted.hold_reason, None,
+            "the hold reason is stale once the job starts"
+        );
+    }
+
+    /// A held job is skipped, not stopped at: strictly smaller work queued behind
+    /// it still starts in the same tick.
+    #[test]
+    fn a_hold_does_not_block_smaller_jobs_behind_it() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // 16 GiB total puts the machine in the Balanced tier, whose reserve is
+        // 3 GiB, so 13 GiB is schedulable.
+        let (paths, store, shared) = admission_fixture(
+            "headofline",
+            &[
+                ("a", 10 * GIB, "ten"),
+                ("b", 12 * GIB, "twelve"),
+                ("c", 2 * GIB, "two"),
+            ],
+        );
+        let adapter = fake_adapter();
+        let mut engine = admission_engine(paths, store, shared, adapter);
+
+        engine.tick().unwrap();
+
+        let state = |id: &str| engine.store.get_job(id).unwrap().unwrap().state;
+        assert_eq!(state("job-a"), JobState::Running);
+        assert_eq!(state("job-b"), JobState::Queued, "12 GiB no longer fits");
+        assert_eq!(
+            state("job-c"),
+            JobState::Running,
+            "a 2 GiB job must not wait behind a held 12 GiB one"
+        );
+    }
+
+    /// An unmeasured model is admitted, but it is never counted as having fitted:
+    /// its claim stays absent rather than becoming a zero that satisfies a bound.
+    #[test]
+    fn an_unmeasured_model_is_admitted_without_a_reservation() {
+        // Zero means the fixture keeps its provider target, so an unmeasured
+        // *local* model needs its own run spec.
+        let (paths, store, shared) = admission_fixture("unmeasured", &[("a", 0, "unmeasured")]);
+        let mut store = store;
+        {
+            let ledger = RunLedger::open(&paths.ledger_db).unwrap();
+            let mut run_spec = spec("run-solo", 1_000);
+            run_spec.target = ModelTargetSnapshot::ManagedLlama {
+                target_id: "local-target-solo".into(),
+                label: "local".into(),
+                model_id: "never-installed".into(),
+                model_path: "/tmp/solo.gguf".into(),
+                capabilities: crate::task::cli_capabilities(),
+                estimated_memory_bytes: None,
+            };
+            DurableRunRecorder::submit(ledger, &run_spec, "daemon-fixture".into()).unwrap();
+            let snapshot = paths.snapshots.join("job-solo.json");
+            std::fs::write(&snapshot, b"{}").unwrap();
+            store
+                .insert_preparing(
+                    &NewDaemonJob {
+                        job_id: "job-solo".into(),
+                        recipe_snapshot: snapshot,
+                        priority: 0,
+                        max_attempts: 1,
+                        created_at_ms: 1_000,
+                        max_runtime_ms: 60_000,
+                        max_memory_bytes: None,
+                        max_log_bytes: DEFAULT_MAX_LOG_BYTES,
+                        repository_policy_json: None,
+                        worktree_json: None,
+                        parent_run_id: None,
+                    },
+                    8,
+                )
+                .unwrap();
+            store.mark_queued("job-solo", "run-solo", 1_000).unwrap();
+        }
+        let mut engine = admission_engine(paths, store, shared, fake_adapter());
+
+        engine.tick().unwrap();
+
+        assert_eq!(
+            engine.store.get_job("job-solo").unwrap().unwrap().state,
+            JobState::Running,
+            "an unmeasured model still runs"
+        );
+        assert!(
+            engine
+                .store
+                .committed_reservations()
+                .unwrap()
+                .iter()
+                .all(|(key, _, _)| key != "local-target-solo"),
+            "an unknown footprint must not become a zero-byte reservation"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // K8 — the scheduler.
+    // ---------------------------------------------------------------------
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// One job for [`sched_job`], spelled out because the scheduler tests need to
+    /// vary things `admission_fixture` fixes: the run kind (which is where the
+    /// process class comes from), the workspace (which is the fair-share key), the
+    /// priority and the queue age.
+    struct SchedJob<'a> {
+        label: &'a str,
+        kind: RunKind,
+        bytes: u64,
+        model: &'a str,
+        workspace: &'a str,
+        priority: i32,
+        created_at_ms: u64,
+    }
+
+    impl<'a> SchedJob<'a> {
+        fn new(label: &'a str, kind: RunKind, bytes: u64, model: &'a str) -> Self {
+            Self {
+                label,
+                kind,
+                bytes,
+                model,
+                workspace: "/tmp/lm-sched-workspace",
+                priority: 0,
+                created_at_ms: 1_000,
+            }
+        }
+    }
+
+    fn sched_paths(label: &str) -> DaemonPaths {
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-daemon-sched-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = DaemonPaths::under(&root);
+        paths.ensure().unwrap();
+        paths
+    }
+
+    /// Submits the durable run and queues the daemon job for one [`SchedJob`].
+    fn sched_job(paths: &DaemonPaths, store: &mut DaemonStore, job: &SchedJob<'_>) {
+        let run_id = format!("run-{}", job.label);
+        let mut run_spec = spec(&run_id, 1_000);
+        run_spec.kind = job.kind.clone();
+        if let Some(workspace) = run_spec.workspace.as_mut() {
+            workspace.roots[0].canonical_path = job.workspace.to_string();
+        }
+        if job.bytes > 0 {
+            run_spec.target = ModelTargetSnapshot::ManagedLlama {
+                target_id: format!("local-target-{}", job.model),
+                label: "local".into(),
+                model_id: job.model.into(),
+                model_path: format!("/tmp/{}.gguf", job.model),
+                capabilities: crate::task::cli_capabilities(),
+                estimated_memory_bytes: Some(job.bytes),
+            };
+        }
+        let ledger = RunLedger::open(&paths.ledger_db).unwrap();
+        DurableRunRecorder::submit(ledger, &run_spec, "daemon-fixture".into()).unwrap();
+
+        let job_id = format!("job-{}", job.label);
+        let snapshot = paths.snapshots.join(format!("{job_id}.json"));
+        std::fs::write(&snapshot, b"{}").unwrap();
+        store
+            .insert_preparing(
+                &NewDaemonJob {
+                    job_id: job_id.clone(),
+                    recipe_snapshot: snapshot,
+                    priority: job.priority,
+                    max_attempts: 1,
+                    created_at_ms: job.created_at_ms,
+                    max_runtime_ms: 60_000,
+                    max_memory_bytes: None,
+                    max_log_bytes: DEFAULT_MAX_LOG_BYTES,
+                    repository_policy_json: None,
+                    worktree_json: None,
+                    parent_run_id: None,
+                },
+                64,
+            )
+            .unwrap();
+        store
+            .mark_queued(&job_id, &run_id, job.created_at_ms)
+            .unwrap();
+    }
+
+    fn sched_engine(
+        paths: &DaemonPaths,
+        adapter: FakeProcesses,
+        concurrency: u32,
+        clock: FakeClock,
+    ) -> DaemonEngine<FakeProcesses, FakeNotifier, FakeClock> {
+        let store = DaemonStore::open(paths).unwrap();
+        let shared = SharedLedger::open(&paths.ledger_db).unwrap();
+        let mut engine = DaemonEngine::new(
+            store,
+            shared,
+            paths.clone(),
+            DaemonConfig {
+                concurrency,
+                ..DaemonConfig::default()
+            },
+            adapter,
+            FakeNotifier::default(),
+            clock,
+            "daemon-test-owner".into(),
+        );
+        engine.set_hardware_probe(sixteen_gig_machine);
+        engine
+    }
+
+    fn job_state(
+        engine: &DaemonEngine<FakeProcesses, FakeNotifier, FakeClock>,
+        job_id: &str,
+    ) -> JobState {
+        engine.store.get_job(job_id).unwrap().unwrap().state
+    }
+
+    /// The starvation bug the previous `// ponytail:` comment named, fixed: the
+    /// candidate window used to be exactly as wide as the free slots, so four held
+    /// 12 GiB jobs consumed the window and a 1 GiB job behind them was never even
+    /// looked at — not on this tick and not on any later one, because the held jobs
+    /// were still there.
+    #[test]
+    fn a_small_job_is_considered_past_a_window_full_of_held_ones() {
+        let paths = sched_paths("window");
+        let mut store = DaemonStore::open(&paths).unwrap();
+        // 16 GiB total, Balanced tier reserve 3 GiB, so 13 GiB is schedulable.
+        // job-a and job-e fit together; b, c and d do not fit at all alongside a.
+        for label in ["a", "b", "c", "d"] {
+            sched_job(
+                &paths,
+                &mut store,
+                &SchedJob::new(label, RunKind::Background, 12 * GIB, &format!("m-{label}")),
+            );
+        }
+        sched_job(
+            &paths,
+            &mut store,
+            &SchedJob::new("e", RunKind::Background, GIB, "m-e"),
+        );
+        drop(store);
+        let mut engine = sched_engine(
+            &paths,
+            fake_adapter(),
+            4,
+            FakeClock(Arc::new(Mutex::new(2_000))),
+        );
+
+        engine.tick().unwrap();
+
+        assert_eq!(job_state(&engine, "job-a"), JobState::Running);
+        for held in ["job-b", "job-c", "job-d"] {
+            assert_eq!(job_state(&engine, held), JobState::Queued, "{held}");
+        }
+        assert_eq!(
+            job_state(&engine, "job-e"),
+            JobState::Running,
+            "a 1 GiB job must not be invisible behind four held 12 GiB ones"
+        );
+    }
+
+    /// K23/K4: a profile's quota binds *before* the daemon's own configuration
+    /// does, and only downward. Four remote jobs — nothing to reserve, so
+    /// memory cannot be what holds them — against `concurrency: 4` and a
+    /// two-run quota.
+    #[test]
+    fn a_profiles_quota_admits_fewer_jobs_than_the_configured_concurrency() {
+        let paths = sched_paths("quota");
+        let mut store = DaemonStore::open(&paths).unwrap();
+        for label in ["a", "b", "c", "d"] {
+            sched_job(
+                &paths,
+                &mut store,
+                // `bytes: 0` leaves the frozen provider target in place, which
+                // admission treats as remote: no local claim, no memory hold.
+                &SchedJob::new(label, RunKind::Background, 0, &format!("m-{label}")),
+            );
+        }
+        drop(store);
+        let mut engine = sched_engine(
+            &paths,
+            fake_adapter(),
+            4,
+            FakeClock(Arc::new(Mutex::new(2_000))),
+        )
+        .with_profile_limits(ProfileLimits {
+            quota: little_monkey_lib::profiles::ProfileQuota {
+                max_concurrent_runs: Some(2),
+                max_memory_bytes: None,
+                max_runtime_ms: None,
+            },
+            memory_share: 1.0,
+        });
+
+        engine.tick().unwrap();
+
+        let running = ["job-a", "job-b", "job-c", "job-d"]
+            .iter()
+            .filter(|job| job_state(&engine, job) == JobState::Running)
+            .count();
+        assert_eq!(
+            running, 2,
+            "the profile quota must bound dispatch below `concurrency: 4`"
+        );
+    }
+
+    /// Preemption: a lower class is **suspended**, not killed, its reservation
+    /// comes back, and the interactive job that displaced it then starts.
+    #[test]
+    fn an_interactive_job_suspends_a_background_one_and_takes_its_reservation() {
+        let paths = sched_paths("preempt");
+        let mut store = DaemonStore::open(&paths).unwrap();
+        sched_job(
+            &paths,
+            &mut store,
+            &SchedJob::new("bg", RunKind::Background, 12 * GIB, "bg-model"),
+        );
+        drop(store);
+        let adapter = fake_adapter();
+        let signals = adapter.signals.clone();
+        // Long-lived: the fake adapter's default exit queue is two `None`s, and a
+        // preemption test ticks more than twice.
+        *adapter.exits.lock().unwrap() = VecDeque::new();
+        let clock = FakeClock(Arc::new(Mutex::new(2_000)));
+        let mut engine = sched_engine(&paths, adapter, 4, clock.clone());
+
+        engine.tick().unwrap();
+        assert_eq!(job_state(&engine, "job-bg"), JobState::Running);
+        assert_eq!(engine.store.committed_reservations().unwrap().len(), 1);
+
+        // A desktop turn arrives. 12 + 12 does not fit in 13 GiB, and the only
+        // thing holding memory is a lower class.
+        sched_job(
+            &paths,
+            &mut engine.store,
+            &SchedJob {
+                created_at_ms: 2_001,
+                ..SchedJob::new("ui", RunKind::Interactive, 12 * GIB, "ui-model")
+            },
+        );
+        *clock.0.lock().unwrap() = 2_002;
+        engine.tick().unwrap();
+
+        // The suspend latch is set, which is what survives a restart and what
+        // `monkey processes` shows. The daemon's own bit follows on the next tick.
+        assert!(
+            engine
+                .store
+                .recent_decisions(8)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.job_id == "job-bg"
+                    && entry.outcome == DECISION_PREEMPTED
+                    && entry.measurement == MEASUREMENT_AVAILABLE_RAM
+                    && entry.measured_value == Some(16 * GIB)
+                    && entry.measured_at_ms == Some(1)),
+            "the preemption must be recorded with the measurement that decided it"
+        );
+
+        *clock.0.lock().unwrap() = 2_003;
+        engine.tick().unwrap();
+        assert_eq!(
+            job_state(&engine, "job-bg"),
+            JobState::Paused,
+            "preemption suspends"
+        );
+        let delivered = signals.lock().unwrap().clone();
+        assert!(delivered.contains(&ProcessSignal::Pause));
+        assert!(
+            !delivered.contains(&ProcessSignal::Terminate)
+                && !delivered.contains(&ProcessSignal::Kill),
+            "preemption must never kill, got {delivered:?}"
+        );
+        assert!(
+            engine
+                .store
+                .committed_reservations()
+                .unwrap()
+                .iter()
+                .all(|(key, _, _)| key != "local-target-bg-model"),
+            "a suspended job gives its claim back"
+        );
+
+        // With the memory released the interactive turn starts.
+        *clock.0.lock().unwrap() = 2_004;
+        engine.tick().unwrap();
+        assert_eq!(job_state(&engine, "job-ui"), JobState::Running);
+        assert_eq!(
+            job_state(&engine, "job-bg"),
+            JobState::Paused,
+            "the dwell floor keeps it parked while the turn it made room for runs"
+        );
+
+        // The turn finishes and nothing queued outranks the parked job any more,
+        // so its suspension is released and it reacquires what it gave up. Past
+        // the dwell floor, or it would be resumed and re-suspended four times a
+        // second.
+        engine
+            .finish_active("job-ui", JobState::Succeeded, 2_005, None)
+            .unwrap();
+        for step in 5..12 {
+            *clock.0.lock().unwrap() = 2_000 + step * 1_000;
+            engine.tick().unwrap();
+        }
+        assert_eq!(
+            job_state(&engine, "job-bg"),
+            JobState::Running,
+            "a released preemption resumes"
+        );
+        assert!(
+            engine
+                .store
+                .committed_reservations()
+                .unwrap()
+                .iter()
+                .any(|(key, ram, _)| key == "local-target-bg-model" && *ram == 12 * GIB),
+            "and reacquires the claim it released"
+        );
+        assert!(
+            engine
+                .store
+                .recent_decisions(32)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.job_id == "job-bg" && entry.outcome == DECISION_RESUMED),
+            "the release is inspectable too"
+        );
+    }
+
+    /// The interesting half of the round-trip: a resume can fail. A job whose
+    /// memory was taken while it was suspended stays suspended with a reason, and
+    /// nothing is delivered to the child — so re-evaluating every tick costs one
+    /// fit computation and thrashes nothing.
+    #[test]
+    fn a_suspended_job_that_no_longer_fits_stays_held_instead_of_thrashing() {
+        use little_monkey_lib::process_table::{ProcessKind, ProcessSignal as TableSignal};
+
+        let paths = sched_paths("reacquire");
+        let mut store = DaemonStore::open(&paths).unwrap();
+        sched_job(
+            &paths,
+            &mut store,
+            &SchedJob::new("parked", RunKind::Background, 12 * GIB, "parked-model"),
+        );
+        drop(store);
+        let adapter = fake_adapter();
+        let signals = adapter.signals.clone();
+        *adapter.exits.lock().unwrap() = VecDeque::new();
+        let clock = FakeClock(Arc::new(Mutex::new(2_000)));
+        let mut engine = sched_engine(&paths, adapter, 4, clock.clone());
+        engine.tick().unwrap();
+        assert_eq!(job_state(&engine, "job-parked"), JobState::Running);
+
+        let process_id = {
+            let table = engine.shared.process_table();
+            table
+                .find_by_external_id(
+                    ProcessKind::DaemonJob,
+                    &process_external_id("job-parked", 0),
+                )
+                .unwrap()
+                .unwrap()
+                .process_id
+        };
+        {
+            let table = engine.shared.process_table();
+            table
+                .signal(&process_id, TableSignal::Suspend, None, 2_001)
+                .unwrap();
+        }
+        *clock.0.lock().unwrap() = 2_001;
+        engine.tick().unwrap();
+        assert_eq!(job_state(&engine, "job-parked"), JobState::Paused);
+        assert!(engine.store.committed_reservations().unwrap().is_empty());
+
+        // Somebody else takes the memory while it is parked.
+        sched_job(
+            &paths,
+            &mut engine.store,
+            &SchedJob::new("hog", RunKind::Background, 12 * GIB, "hog-model"),
+        );
+        *clock.0.lock().unwrap() = 2_002;
+        engine.tick().unwrap();
+        assert_eq!(job_state(&engine, "job-hog"), JobState::Running);
+
+        // Now try to resume. There is no room, so it must not resume.
+        {
+            let table = engine.shared.process_table();
+            table
+                .signal(&process_id, TableSignal::Resume, None, 2_003)
+                .unwrap();
+        }
+        let resumes_before = signals
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|signal| **signal == ProcessSignal::Resume)
+            .count();
+        for extra in 3..8 {
+            *clock.0.lock().unwrap() = 2_000 + extra;
+            engine.tick().unwrap();
+        }
+        assert_eq!(
+            job_state(&engine, "job-parked"),
+            JobState::Paused,
+            "a resume with no memory to reacquire must not resume"
+        );
+        let reason = engine
+            .store
+            .get_job("job-parked")
+            .unwrap()
+            .unwrap()
+            .hold_reason
+            .unwrap_or_default();
+        assert!(
+            reason.contains("cannot resume") && reason.contains("system memory"),
+            "the failed reacquire must say what it is waiting for, got {reason:?}"
+        );
+        assert_eq!(
+            signals
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|signal| **signal == ProcessSignal::Resume)
+                .count(),
+            resumes_before,
+            "five ticks of a failed reacquire must deliver nothing to the child"
+        );
+
+        // Free the memory and the same job resumes, reclaiming its reservation.
+        engine
+            .finish_active("job-hog", JobState::Succeeded, 2_009, None)
+            .unwrap();
+        *clock.0.lock().unwrap() = 2_010;
+        engine.tick().unwrap();
+        assert_eq!(job_state(&engine, "job-parked"), JobState::Running);
+        assert!(
+            engine
+                .store
+                .committed_reservations()
+                .unwrap()
+                .iter()
+                .any(|(key, ram, _)| key == "local-target-parked-model" && *ram == 12 * GIB),
+            "the reservation has to come back with the job"
+        );
+    }
+
+    /// Fair-share, measured rather than rotated: the workspace that has already
+    /// had the device loses to one that has not, even though its job is older and
+    /// has the higher declared priority. The number that decides it is K6's
+    /// `cpu_time_ms`, which is why the decision log cites that field.
+    #[test]
+    fn a_workspace_that_used_the_device_is_outranked_by_one_that_has_not() {
+        use little_monkey_lib::process_table::ProcessKind;
+        use little_monkey_lib::process_usage::ProcessUsageSample;
+
+        const BUSY: &str = "/tmp/lm-sched-busy";
+        const QUIET: &str = "/tmp/lm-sched-quiet";
+
+        let paths = sched_paths("fairshare");
+        let mut store = DaemonStore::open(&paths).unwrap();
+        sched_job(
+            &paths,
+            &mut store,
+            &SchedJob {
+                workspace: BUSY,
+                ..SchedJob::new("first", RunKind::Background, 12 * GIB, "shared-model")
+            },
+        );
+        drop(store);
+        let clock = FakeClock(Arc::new(Mutex::new(2_000)));
+        // One slot, so each tick admits at most one job and the ranking is what
+        // decides which.
+        let mut engine = sched_engine(&paths, fake_adapter(), 1, clock.clone());
+        engine.tick().unwrap();
+        assert_eq!(job_state(&engine, "job-first"), JobState::Running);
+
+        // Ten minutes of measured CPU, charged to the busy workspace. Written
+        // through the same call the daemon's own K6 sampler uses.
+        {
+            let table = engine.shared.process_table();
+            let record = table
+                .find_by_external_id(ProcessKind::DaemonJob, &process_external_id("job-first", 0))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                record.workspace.as_deref(),
+                Some(BUSY),
+                "without the workspace on the row there is nothing to charge"
+            );
+            table
+                .accumulate_usage(
+                    &record.process_id,
+                    &ProcessUsageSample {
+                        cpu_time_ms: Some(10 * 60 * 1_000),
+                        ..ProcessUsageSample::default()
+                    },
+                    2_000,
+                )
+                .unwrap();
+        }
+        engine
+            .finish_active("job-first", JobState::Succeeded, 2_001, None)
+            .unwrap();
+
+        // The busy workspace's next job is older and higher priority; the quiet
+        // workspace's is neither.
+        sched_job(
+            &paths,
+            &mut engine.store,
+            &SchedJob {
+                workspace: BUSY,
+                priority: 5,
+                created_at_ms: 1_000,
+                ..SchedJob::new("busy-next", RunKind::Background, 12 * GIB, "busy-model")
+            },
+        );
+        sched_job(
+            &paths,
+            &mut engine.store,
+            &SchedJob {
+                workspace: QUIET,
+                priority: 0,
+                created_at_ms: 1_500,
+                ..SchedJob::new("quiet-next", RunKind::Background, 12 * GIB, "quiet-model")
+            },
+        );
+
+        *clock.0.lock().unwrap() = 2_002;
+        engine.tick().unwrap();
+
+        assert_eq!(
+            job_state(&engine, "job-quiet-next"),
+            JobState::Running,
+            "the workspace that already had ten CPU-minutes must not go first"
+        );
+        assert_eq!(job_state(&engine, "job-busy-next"), JobState::Queued);
+
+        let decision = engine
+            .store
+            .recent_decisions(16)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.job_id == "job-quiet-next" && entry.outcome == DECISION_ADMITTED)
+            .expect("an admission is recorded");
+        assert_eq!(
+            decision.measurement,
+            scheduler::KEY_FAIR_SHARE,
+            "fair-share decided it, so the log must name the measured field"
+        );
+        assert_eq!(decision.measured_value, Some(0), "the quiet charge");
+        assert_eq!(decision.workspace.as_deref(), Some(QUIET));
+        assert_eq!(
+            decision.passed_over,
+            ["job-busy-next"],
+            "the log has to say what it was chosen over"
+        );
+        assert_eq!(decision.process_class, "background");
+    }
+
+    /// A held job's decision cites the reading that produced the shortfall, with
+    /// that reading's own timestamp — not the time the row was written.
+    #[test]
+    fn a_hold_decision_names_the_measurement_and_its_own_timestamp() {
+        let paths = sched_paths("decision");
+        let mut store = DaemonStore::open(&paths).unwrap();
+        for label in ["a", "b"] {
+            sched_job(
+                &paths,
+                &mut store,
+                &SchedJob::new(label, RunKind::Background, 12 * GIB, &format!("m-{label}")),
+            );
+        }
+        drop(store);
+        let mut engine = sched_engine(
+            &paths,
+            fake_adapter(),
+            4,
+            FakeClock(Arc::new(Mutex::new(2_000))),
+        );
+        engine.tick().unwrap();
+
+        let held = engine
+            .store
+            .recent_decisions(16)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.job_id == "job-b" && entry.outcome == DECISION_HELD)
+            .expect("the held job's decision is recorded");
+        assert_eq!(held.measurement, MEASUREMENT_AVAILABLE_RAM);
+        assert_eq!(held.measured_value, Some(16 * GIB));
+        assert_eq!(
+            held.measured_at_ms,
+            Some(1),
+            "the snapshot's own capture time, not the write time (2_000)"
+        );
+        assert!(
+            held.detail.contains("ranked first in at most"),
+            "a hold states its starvation bound, got {:?}",
+            held.detail
+        );
+
+        // Re-evaluated four times a second; recorded once, or the bounded log is
+        // churned away within minutes.
+        let before = engine.store.recent_decisions(512).unwrap().len();
+        for _ in 0..4 {
+            engine.tick().unwrap();
+        }
+        assert_eq!(
+            engine.store.recent_decisions(512).unwrap().len(),
+            before,
+            "an unchanged hold must not append a row per tick"
+        );
+    }
+
+    /// The backpressure signal, through the engine that owns the counts.
+    #[test]
+    fn backpressure_closes_when_the_queue_is_full_and_refuses_in_words() {
+        let paths = sched_paths("backpressure");
+        let mut store = DaemonStore::open(&paths).unwrap();
+        for label in ["a", "b"] {
+            sched_job(
+                &paths,
+                &mut store,
+                &SchedJob::new(label, RunKind::Background, 12 * GIB, &format!("m-{label}")),
+            );
+        }
+        drop(store);
+        let mut engine = sched_engine(
+            &paths,
+            fake_adapter(),
+            4,
+            FakeClock(Arc::new(Mutex::new(2_000))),
+        );
+        engine.config.max_queue = 2;
+
+        let signal = super::super::backpressure_for(&engine.store, &engine.config).unwrap();
+        assert_eq!(signal.state, scheduler::BackpressureState::Closed);
+        assert!(!signal.accepting);
+        assert_eq!(signal.reason, Some(scheduler::BACKPRESSURE_QUEUE_FULL));
+        assert!(signal
+            .refusal()
+            .is_some_and(|text| text.contains("retry after")));
+
+        // One tick holds job-b for memory, which is a different sentence: the
+        // queue has room, the machine does not.
+        engine.tick().unwrap();
+        engine.config.max_queue = 8;
+        let signal = super::super::backpressure_for(&engine.store, &engine.config).unwrap();
+        assert_eq!(signal.state, scheduler::BackpressureState::Slow);
+        assert_eq!(
+            signal.reason,
+            Some(scheduler::BACKPRESSURE_MEMORY_SATURATED)
+        );
+        assert_eq!(signal.held, 1);
+        assert!(signal.refusal().is_none(), "slow still accepts work");
+    }
+
+    /// K6, wired: an active job's own measurement reaches the resource ledger
+    /// while it is alive, and the row it lands on is the one representing the job.
+    #[test]
+    fn an_active_job_writes_its_own_measurement_into_the_resource_ledger() {
+        use little_monkey_lib::process_table::{ProcessKind, ProcessUsageFilter};
+
+        let (paths, store, shared, _recorder, _run_id) = fixture("usage");
+        let adapter = fake_adapter();
+        *adapter.exits.lock().unwrap() = VecDeque::new();
+        let mut engine = DaemonEngine::new(
+            store,
+            shared,
+            paths,
+            DaemonConfig::default(),
+            adapter,
+            FakeNotifier::default(),
+            FakeClock(Arc::new(Mutex::new(2_000))),
+            "daemon-test-owner".into(),
+        );
+        engine.tick().unwrap();
+        engine.tick().unwrap();
+
+        let table = engine.shared.process_table();
+        let record = table
+            .find_by_external_id(ProcessKind::DaemonJob, &first_attempt_id("usage"))
+            .unwrap()
+            .expect("the job has a process row");
+        let rows = table
+            .usage_rows(&ProcessUsageFilter {
+                process_id: Some(record.process_id.clone()),
+                ..ProcessUsageFilter::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the ledger row exists and is reachable");
+        // The fake pid is not a real process, so the sampler's fields come back
+        // unavailable *with a reason* — which is the contract that matters here. A
+        // missing measurement must never read as a measured zero, and this is the
+        // assertion that would fail if `record_usage` ever started writing one.
+        let measured = rows[0].usage.measured();
+        for (field, value) in [
+            ("cpuTimeMs", measured.cpu_time_ms),
+            ("peakRssBytes", measured.peak_rss_bytes),
+            ("bytesEgressed", measured.bytes_egressed),
+        ] {
+            assert!(
+                value.is_some() || rows[0].usage.reason_for(field).is_some(),
+                "{field} must be either measured or explained"
+            );
+        }
+    }
+
     #[test]
     fn process_signal_enum_distinguishes_pause_resume_and_cancel() {
         assert_ne!(ProcessSignal::Pause, ProcessSignal::Resume);
@@ -1875,6 +4225,7 @@ pub(super) mod tests {
             worktree_json: None,
             parent_run_id: None,
             last_error: None,
+            hold_reason: None,
         }
     }
 
@@ -1928,7 +4279,11 @@ pub(super) mod tests {
             (TableSignal::Stop, ProcessSignal::Terminate),
             (TableSignal::Kill, ProcessSignal::Kill),
         ] {
-            let label = if signal == TableSignal::Kill { "kill" } else { "stop" };
+            let label = if signal == TableSignal::Kill {
+                "kill"
+            } else {
+                "stop"
+            };
             let (paths, store, shared, _recorder, run_id) = fixture(label);
             let adapter = fake_adapter();
             let signals = adapter.signals.clone();
@@ -2296,13 +4651,22 @@ pub(super) mod tests {
             );
         }
 
-        assert_eq!(exit_for(JobState::Succeeded, None).status, ExitStatus::Succeeded);
-        assert_eq!(exit_for(JobState::Failed, Some("boom")).status, ExitStatus::Failed);
+        assert_eq!(
+            exit_for(JobState::Succeeded, None).status,
+            ExitStatus::Succeeded
+        );
+        assert_eq!(
+            exit_for(JobState::Failed, Some("boom")).status,
+            ExitStatus::Failed
+        );
         assert_eq!(
             exit_for(JobState::Failed, Some("boom")).reason.as_deref(),
             Some("boom")
         );
-        assert_eq!(exit_for(JobState::Cancelled, None).status, ExitStatus::Cancelled);
+        assert_eq!(
+            exit_for(JobState::Cancelled, None).status,
+            ExitStatus::Cancelled
+        );
         assert_eq!(
             exit_for(JobState::NeedsReconciliation, None).status,
             ExitStatus::NeedsReconciliation
@@ -2325,6 +4689,7 @@ pub(super) mod tests {
             max_memory_bytes,
             max_output_bytes,
             max_child_processes: _,
+            max_context_tokens: _,
         } = ProcessLimits::default();
         assert_eq!(max_wall_ms, None);
         assert_eq!(max_memory_bytes, None);

@@ -300,10 +300,9 @@ describe("runtimeHubStore", () => {
     expect(useRuntimeHubStore.getState().errors["runtime:ollama"]).toBeUndefined();
   });
 
-  it("validates and persists LAN policy before refreshing scoped tokens and audit events", async () => {
+  it("uses the atomic LAN configure transaction before refreshing scoped tokens and audit events", async () => {
     mocks.client.lanValidatePolicy.mockResolvedValue(undefined);
     mocks.client.lanConfigure.mockResolvedValue(policy);
-    mocks.client.httpServerStart.mockResolvedValue({ status: "running", bindAddress: "127.0.0.1", port: 1234 });
     mocks.client.lanPolicy.mockResolvedValue(policy);
     mocks.client.httpServerStatus.mockResolvedValue({ status: "running", bindAddress: "127.0.0.1", port: 1234 });
     mocks.client.lanTokens.mockResolvedValue([{ tokenId: "token-1" }]);
@@ -313,24 +312,42 @@ describe("runtimeHubStore", () => {
 
     expect(mocks.client.lanValidatePolicy).toHaveBeenCalledWith(policy);
     expect(mocks.client.lanConfigure).toHaveBeenCalledWith(policy);
-    expect(mocks.client.httpServerStart).toHaveBeenCalled();
+    expect(mocks.client.httpServerStart).not.toHaveBeenCalled();
     expect(useRuntimeHubStore.getState().lanPolicy).toEqual(policy);
     expect(useRuntimeHubStore.getState().lanTokens).toEqual([{ tokenId: "token-1" }]);
     expect(useRuntimeHubStore.getState().lanAudit).toEqual([{ eventId: "event-1" }]);
   });
 
-  it("keeps a persisted LAN policy and exposes listener diagnostics when startup fails", async () => {
+  it("keeps the previous LAN policy and exposes diagnostics when the atomic configure rolls back", async () => {
     const status = { status: "error", bindAddress: "127.0.0.1", port: 1234, lastError: "Address in use" };
     mocks.client.lanValidatePolicy.mockResolvedValue(undefined);
-    mocks.client.lanConfigure.mockResolvedValue(policy);
-    mocks.client.httpServerStart.mockRejectedValue(new Error("Address in use"));
+    mocks.client.lanConfigure.mockRejectedValue(new Error("Address in use"));
     mocks.client.httpServerStatus.mockResolvedValue(status);
 
     await expect(useRuntimeHubStore.getState().configureLan(policy as never)).rejects.toThrow("Address in use");
 
-    expect(useRuntimeHubStore.getState().lanPolicy).toEqual(policy);
+    expect(useRuntimeHubStore.getState().lanPolicy).toBeNull();
     expect(useRuntimeHubStore.getState().httpServerStatus).toEqual(status);
     expect(useRuntimeHubStore.getState().errors["lan-policy"]).toContain("Address in use");
+  });
+
+  it("uses the atomic LAN disable transaction without a separate listener stop", async () => {
+    useRuntimeHubStore.setState({
+      lanPolicy: policy as never,
+      lanTokens: [{ tokenId: "token-1" }] as never,
+      pairingChallenge: { challengeId: "challenge-1" } as never,
+      pairedToken: { bearerToken: "secret" } as never,
+    });
+    mocks.client.lanDisable.mockResolvedValue(true);
+    mocks.client.httpServerStatus.mockResolvedValue({ status: "stopped" });
+
+    await useRuntimeHubStore.getState().disableLan();
+
+    expect(mocks.client.lanDisable).toHaveBeenCalledWith("DISABLE LAN API");
+    expect(mocks.client.httpServerStop).not.toHaveBeenCalled();
+    expect(useRuntimeHubStore.getState().lanPolicy).toBeNull();
+    expect(useRuntimeHubStore.getState().lanTokens).toEqual([]);
+    expect(useRuntimeHubStore.getState().httpServerStatus).toEqual({ status: "stopped" });
   });
 
   it("dispatches and cancels compatibility requests without losing the protocol result", async () => {
@@ -339,8 +356,6 @@ describe("runtimeHubStore", () => {
       runtimeId: "ollama",
       requestId: "req-1",
       body: [123, 125],
-      caller: { type: "internal" },
-      nowMs: 1,
     };
     mocks.client.apiDispatch.mockResolvedValue({ status: 200, body: { id: "response" } });
     mocks.client.apiCancelInference.mockResolvedValue(true);

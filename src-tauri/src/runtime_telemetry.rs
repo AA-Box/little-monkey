@@ -457,7 +457,10 @@ impl RuntimeTraceStore {
     /// so exposing a second public counter would just be a parallel API.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.records.lock().map(|records| records.len()).unwrap_or(0)
+        self.records
+            .lock()
+            .map(|records| records.len())
+            .unwrap_or(0)
     }
 }
 
@@ -508,8 +511,7 @@ impl RuntimeTelemetryState {
                 Some(MemoryFootprint::from(plan)),
             ),
             None => {
-                let reason =
-                    "no offload plan was supplied for this load".to_string();
+                let reason = "no offload plan was supplied for this load".to_string();
                 unavailable.push(TraceFieldNote {
                     field: "offload".to_string(),
                     reason: reason.clone(),
@@ -737,6 +739,7 @@ mod tests {
             parallel_sequences: 1,
             available_ram_bytes: 8_000_000_000,
             available_vram_bytes: 16_000_000_000,
+            device_split: crate::runtime_adapter::DeviceSplit::SingleDevice { index: 0 },
             rationale: Vec::new(),
             improvement_suggestions: Vec::new(),
         }
@@ -765,8 +768,8 @@ mod tests {
     #[test]
     fn redacts_cli_flag_style_secret() {
         let redactor = Redactor::new();
-        let (redacted, summary) =
-            redactor.redact("launching: llama-server --api-key sk-live-9f8e7d6c5b4a3210 --port 8080");
+        let (redacted, summary) = redactor
+            .redact("launching: llama-server --api-key sk-live-9f8e7d6c5b4a3210 --port 8080");
         assert!(!redacted.contains("sk-live-9f8e7d6c5b4a3210"));
         assert!(redacted.contains("--port 8080"));
         assert!(summary.findings_redacted >= 1);
@@ -881,7 +884,11 @@ mod tests {
         assert_eq!(record.outcome, TraceOutcome::Success);
         assert!(record.unavailable.is_empty());
         match record.event {
-            TraceEvent::Load { timing, offload, memory } => {
+            TraceEvent::Load {
+                timing,
+                offload,
+                memory,
+            } => {
                 assert_eq!(timing.duration_ms, 3_500);
                 let offload = offload.expect("offload placement expected");
                 assert_eq!(offload.gpu_layers, plan.gpu_layers);
@@ -906,7 +913,11 @@ mod tests {
                 error_message: None,
             })
             .expect("record_load should succeed");
-        let fields: Vec<_> = record.unavailable.iter().map(|note| note.field.as_str()).collect();
+        let fields: Vec<_> = record
+            .unavailable
+            .iter()
+            .map(|note| note.field.as_str())
+            .collect();
         assert!(fields.contains(&"offload"));
         assert!(fields.contains(&"memory"));
     }
@@ -960,7 +971,11 @@ mod tests {
             }
             TraceEvent::Load { .. } => panic!("expected a request event"),
         }
-        let fields: Vec<_> = record.unavailable.iter().map(|note| note.field.as_str()).collect();
+        let fields: Vec<_> = record
+            .unavailable
+            .iter()
+            .map(|note| note.field.as_str())
+            .collect();
         assert!(fields.contains(&"tokens.cachedPromptTokens"));
         assert!(!fields.contains(&"tokens.tokensPerSecond"));
     }
@@ -979,7 +994,11 @@ mod tests {
                 error_message: None,
             })
             .expect("record_request should succeed");
-        let fields: Vec<_> = record.unavailable.iter().map(|note| note.field.as_str()).collect();
+        let fields: Vec<_> = record
+            .unavailable
+            .iter()
+            .map(|note| note.field.as_str())
+            .collect();
         assert!(fields.contains(&"tokens.tokensPerSecond"));
     }
 
@@ -1013,7 +1032,11 @@ mod tests {
                 outcome: TraceOutcome::Success,
                 error_message: None,
                 event: TraceEvent::Load {
-                    timing: LoadTiming { started_at_ms: 0, ready_at_ms: 1, duration_ms: 1 },
+                    timing: LoadTiming {
+                        started_at_ms: 0,
+                        ready_at_ms: 1,
+                        duration_ms: 1,
+                    },
                     offload: None,
                     memory: None,
                 },
@@ -1041,7 +1064,11 @@ mod tests {
                 outcome: TraceOutcome::Success,
                 error_message: None,
                 event: TraceEvent::Load {
-                    timing: LoadTiming { started_at_ms: 0, ready_at_ms: 1, duration_ms: 1 },
+                    timing: LoadTiming {
+                        started_at_ms: 0,
+                        ready_at_ms: 1,
+                        duration_ms: 1,
+                    },
                     offload: None,
                     memory: None,
                 },
@@ -1102,9 +1129,15 @@ mod tests {
             model_id: "m".to_string(),
             recorded_at_ms: 0,
             outcome: TraceOutcome::Failed,
-            error_message: Some(format!("request rejected, authorization: Bearer {fake_key}")),
+            error_message: Some(format!(
+                "request rejected, authorization: Bearer {fake_key}"
+            )),
             event: TraceEvent::Load {
-                timing: LoadTiming { started_at_ms: 0, ready_at_ms: 1, duration_ms: 1 },
+                timing: LoadTiming {
+                    started_at_ms: 0,
+                    ready_at_ms: 1,
+                    duration_ms: 1,
+                },
                 offload: None,
                 memory: None,
             },

@@ -33,8 +33,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tauri::Manager;
-
+use crate::profiles::ProfileScopedPaths;
 use crate::run_protocol::RunEvent;
 use crate::AppState;
 
@@ -203,8 +202,7 @@ fn now_ms() -> u64 {
 
 fn team_members_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {}", e))?;
     Ok(dir.join(TEAM_MEMBERS_FILE))
@@ -703,7 +701,11 @@ mod tests {
         assert!(err.contains("last remaining Owner"));
 
         let file = load_impl(&path).unwrap();
-        assert_eq!(file.members.len(), 1, "the owner must not have been removed");
+        assert_eq!(
+            file.members.len(),
+            1,
+            "the owner must not have been removed"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -754,7 +756,10 @@ mod tests {
         let path = temp_path();
         let owner = add_impl(&path, "Ada", Role::Owner).unwrap();
         add_impl(&path, "Grace", Role::Owner).unwrap();
-        assert_eq!(load_impl(&path).unwrap().current_member_id, Some(owner.id.clone()));
+        assert_eq!(
+            load_impl(&path).unwrap().current_member_id,
+            Some(owner.id.clone())
+        );
 
         remove_impl(&path, &owner.id).unwrap();
 

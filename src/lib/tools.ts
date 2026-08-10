@@ -475,10 +475,110 @@ export const TASK_TOOL: ToolDef = {
           type: 'string',
           enum: ['explore', 'code'],
           description:
-            "Tool access profile for the subagent. 'explore' gives read-only tools (read_file, list_dir, glob, grep) — use it for research and investigation. 'code' additionally allows write_file, edit_file, and run_shell — its edits land in this turn's own checkpoint and go through the same permission prompts as your own edits — use it for an independent, disjoint implementation subtask.",
+            "Tool access profile for the subagent. 'explore' gives read-only tools (read_file, list_dir, glob, grep) — use it for research and investigation. 'code' additionally allows write_file, edit_file, and run_shell — its edits land in this turn's own checkpoint and go through the same permission prompts as your own edits — use it for an independent, disjoint implementation subtask. A custom agent name from the system prompt's \"## Custom agents\" section is also accepted and runs that agent's declared tool set and instructions.",
+        },
+        isolation: {
+          type: 'string',
+          enum: ['worktree'],
+          description:
+            "Optional, only valid with a mutating (code-class) profile: 'worktree' runs the subagent in a fresh git worktree of the workspace, so parallel code agents can never collide on files. Its changes stay in the worktree — the user applies or discards them afterwards — so use it for parallel or experimental edits, not for changes this conversation needs on disk immediately.",
         },
       },
       required: ['description', 'prompt', 'profile'],
+      additionalProperties: false,
+    },
+  },
+};
+
+/**
+ * The `workflow` tool: a named, phased orchestration of subagents — the
+ * multi-stage counterpart of `task`. The model supplies a declarative spec
+ * (name + phases, each phase a set of agents); `runWorkflow`
+ * (`lib/workflow.ts`) drives phases sequentially with each phase's agents
+ * in parallel, injecting earlier phases' reports into later phases'
+ * prompts. Deliberately data-only — no model-authored code ever executes.
+ * Kept OUT of `TOOLS` and offered by `toolsForSettings` under the same
+ * `subagentsEnabled` gate as `TASK_TOOL`; never offered to a child loop
+ * (`toolsForProfile`), which caps orchestration depth at 1 structurally.
+ * Frontend-only: `executeToolCall` intercepts the name before the
+ * `invoke('tool_'+name)` dispatch, exactly like `task`.
+ */
+export const WORKFLOW_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'workflow',
+    description:
+      'Run a named, multi-phase orchestration of subagents. Phases run in order; the agents inside one phase run in parallel. Each later phase automatically receives the earlier phases\' reports appended to its prompts. Use this instead of plain task calls when the work has distinct stages (e.g. survey then verify, or explore then implement then review). Each agent is isolated: give every prompt full, self-contained context. Limits: at most 6 phases, 6 agents per phase, 16 agents total. To re-run a previously saved workflow, pass only {"saved": "<name>"} (see the "Saved workflows" section of the system prompt) and omit every other field.',
+    parameters: {
+      type: 'object',
+      properties: {
+        saved: {
+          type: 'string',
+          description: 'Name of a previously saved workflow to re-run. When set, omit "name"/"description"/"phases" — the saved spec is used as-is.',
+        },
+        resume: {
+          type: 'string',
+          description:
+            "An earlier workflow tool call's own id to resume from, when that run ended with failures. Agents that already completed with an unchanged prompt return their journaled reports instantly; only failed or changed agents re-run. Best-effort: an unknown id just runs everything fresh.",
+        },
+        name: {
+          type: 'string',
+          description: 'A short kebab-case name for the whole workflow (e.g. "roadmap-audit"), shown to the user.',
+        },
+        description: {
+          type: 'string',
+          description: 'One line describing what the workflow does, shown to the user.',
+        },
+        phases: {
+          type: 'array',
+          description: 'The stages, executed strictly in order.',
+          items: {
+            type: 'object',
+            properties: {
+              title: { type: 'string', description: 'Short phase title (e.g. "Audit", "Verify"), shown to the user.' },
+              agents: {
+                type: 'array',
+                description: 'The agents of this phase — dispatched together, in parallel.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    description: { type: 'string', description: 'A short (3-6 word) label for this agent, shown to the user.' },
+                    prompt: {
+                      type: 'string',
+                      description: 'Full, self-contained instructions — the agent cannot see this conversation or its sibling agents.',
+                    },
+                    profile: {
+                      type: 'string',
+                      enum: ['explore', 'code'],
+                      description: "Tool access profile — same meaning as the task tool's profile, including custom agent names from the \"## Custom agents\" section.",
+                    },
+                    effort: {
+                      type: 'string',
+                      enum: ['low', 'medium', 'high'],
+                      description: 'Optional reasoning-effort override for this one agent — omit to inherit the turn\'s effort. Use "low" for cheap mechanical work, "high" only for the hardest verify/judge agents.',
+                    },
+                    isolation: {
+                      type: 'string',
+                      enum: ['worktree'],
+                      description: "Optional — same meaning as the task tool's isolation: run this (code-class) agent in its own git worktree so parallel agents never collide on files.",
+                    },
+                  },
+                  required: ['description', 'prompt', 'profile'],
+                  additionalProperties: false,
+                },
+              },
+            },
+            required: ['title', 'agents'],
+            additionalProperties: false,
+          },
+        },
+      },
+      // Nothing hard-required at the schema level: a saved-workflow call is
+      // just {"saved": "<name>"}, while an inline call needs name/description/
+      // phases — `resolveWorkflowSpec`/`parseWorkflowSpec` enforce whichever
+      // shape applies and return an actionable error for anything else, same
+      // frontend-validation posture as every other tool argument.
+      required: [],
       additionalProperties: false,
     },
   },

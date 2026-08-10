@@ -869,13 +869,14 @@ async fn resolve_hugging_face(
     reference: &HuggingFaceReference,
 ) -> Result<InternalResolution, String> {
     let metadata_url = hugging_face_metadata_url(reference)?;
-    let response = client
-        .get(metadata_url.clone())
-        .header(ACCEPT, "application/json")
-        .header(ACCEPT_ENCODING, "identity")
-        .send()
-        .await
-        .map_err(|error| format!("Failed to reach Hugging Face: {error}"))?;
+    let response = crate::egress::send(
+        client
+            .get(metadata_url.clone())
+            .header(ACCEPT, "application/json")
+            .header(ACCEPT_ENCODING, "identity"),
+    )
+    .await
+    .map_err(|error| format!("Failed to reach Hugging Face: {error}"))?;
     let status = response.status();
     if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
         return Err(
@@ -1241,8 +1242,7 @@ async fn send_ollama_registry_get(
     if let Some(token) = bearer_token {
         request = request.bearer_auth(token);
     }
-    let response = request
-        .send()
+    let response = crate::egress::send(request)
         .await
         .map_err(|error| format!("Failed to reach Ollama registry: {error}"))?;
     if response.status() != StatusCode::UNAUTHORIZED {
@@ -1256,14 +1256,15 @@ async fn send_ollama_registry_get(
         .map_err(|_| "Ollama registry Bearer challenge was not valid ASCII")?;
     let challenge = parse_registry_auth_challenge(challenge)?;
     let token = fetch_registry_token(client, &challenge).await?;
-    let response = client
-        .get(url)
-        .header(ACCEPT, accept)
-        .header(ACCEPT_ENCODING, "identity")
-        .bearer_auth(&token)
-        .send()
-        .await
-        .map_err(|error| format!("Failed to reach authenticated Ollama registry: {error}"))?;
+    let response = crate::egress::send(
+        client
+            .get(url)
+            .header(ACCEPT, accept)
+            .header(ACCEPT_ENCODING, "identity")
+            .bearer_auth(&token),
+    )
+    .await
+    .map_err(|error| format!("Failed to reach authenticated Ollama registry: {error}"))?;
     Ok((response, Some(token)))
 }
 
@@ -1283,13 +1284,14 @@ async fn fetch_registry_token(
             query.append_pair("scope", scope);
         }
     }
-    let response = client
-        .get(url)
-        .header(ACCEPT, "application/json")
-        .header(ACCEPT_ENCODING, "identity")
-        .send()
-        .await
-        .map_err(|error| format!("Failed to obtain Ollama registry token: {error}"))?;
+    let response = crate::egress::send(
+        client
+            .get(url)
+            .header(ACCEPT, "application/json")
+            .header(ACCEPT_ENCODING, "identity"),
+    )
+    .await
+    .map_err(|error| format!("Failed to obtain Ollama registry token: {error}"))?;
     // The pre-flight check above pins the realm the *challenge* named. It does not
     // pin where the request ends up: `build_http_client`'s redirect policy judges
     // every hop with `validate_public_https_url` only — no ollama allowlist, no port
@@ -1418,8 +1420,7 @@ async fn send_get(
     if let Some(range) = range {
         request = request.header(RANGE, range);
     }
-    let response = request
-        .send()
+    let response = crate::egress::send(request)
         .await
         .map_err(|error| format!("Model download request failed: {error}"))?;
     // As in `probe_remote_gguf`, this says "final" so that a post-redirect

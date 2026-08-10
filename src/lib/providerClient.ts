@@ -14,7 +14,7 @@
  */
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { SseEventParser } from './llamaClient';
+import { SseEventParser, toWireMessages } from './llamaClient';
 import type { ChatMessage, StreamEvent, ToolDef } from './llamaClient';
 import { errorMessage } from "./errors";
 
@@ -114,7 +114,7 @@ export async function* streamProviderChat(
     requestId,
     providerId,
     model,
-    messages,
+    messages: toWireMessages(messages),
     tools,
     effort: effort ?? null,
     runId: runId ?? null,

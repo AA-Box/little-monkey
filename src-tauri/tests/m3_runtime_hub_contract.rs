@@ -1,6 +1,6 @@
 use little_monkey_lib::compatibility_hub::{
     ApiBackend, ApiScope, CompatibilityProtocol, LanEntropySource, LanServerPolicy,
-    LanStateProtector, PairingRequest, RateLimitPolicy, SecurityAuditKind, TlsPolicy,
+    LanStateProtector, PairedToken, PairingRequest, RateLimitPolicy, SecurityAuditKind, TlsPolicy,
 };
 use little_monkey_lib::m3_runtime_hub::*;
 use little_monkey_lib::model_retirement::STALE_LOCAL_MODEL_THRESHOLD_MS;
@@ -15,8 +15,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 struct TestDirectory(PathBuf);
 
@@ -363,6 +364,7 @@ fn hardware_with_cuda() -> HardwareSnapshot {
                 device_names: vec!["Test GPU".to_string()],
                 total_memory_bytes: Some(24 * 1024 * 1024 * 1024),
                 available_memory_bytes: Some(20 * 1024 * 1024 * 1024),
+                devices: Vec::new(),
             }],
         ),
     }
@@ -619,6 +621,12 @@ struct MockRuntimeState {
     models: Mutex<BTreeMap<String, (PathBuf, u64)>>,
     loaded: Mutex<BTreeSet<String>>,
     cancelled: Mutex<Vec<String>>,
+    hold_stream: AtomicBool,
+    stream_started: Notify,
+    stream_release: Notify,
+    hold_completion: AtomicBool,
+    completion_started: Notify,
+    completion_release: Notify,
 }
 
 struct MockRuntimeDriver {
@@ -909,6 +917,9 @@ impl M3RuntimeDriver for MockRuntimeDriver {
                     status,
                     running_models,
                 }),
+                // `Adapter` is the whole enum unless the macOS-only MLX variant
+                // is compiled in, and a catch-all over one variant is dead code.
+                #[cfg(target_os = "macos")]
                 _ => unreachable!(),
             }
         })
@@ -920,6 +931,10 @@ impl M3RuntimeDriver for MockRuntimeDriver {
         _context: &'a M3OperationContext,
     ) -> M3HubFuture<'a, little_monkey_lib::compatibility_hub::CanonicalInferenceResponse> {
         Box::pin(async move {
+            if self.state.hold_completion.load(Ordering::SeqCst) {
+                self.state.completion_started.notify_one();
+                self.state.completion_release.notified().await;
+            }
             Ok(
                 little_monkey_lib::compatibility_hub::CanonicalInferenceResponse {
                     response_id: format!("response-{}", request.request_id),
@@ -933,6 +948,7 @@ impl M3RuntimeDriver for MockRuntimeDriver {
                     usage: little_monkey_lib::compatibility_hub::CanonicalUsage {
                         input_tokens: 4,
                         output_tokens: 2,
+                        cached_input_tokens: None,
                     },
                     created_at_seconds: 20,
                 },
@@ -947,6 +963,10 @@ impl M3RuntimeDriver for MockRuntimeDriver {
         _context: &'a M3OperationContext,
     ) -> M3HubFuture<'a, ()> {
         Box::pin(async move {
+            if self.state.hold_stream.load(Ordering::SeqCst) {
+                self.state.stream_started.notify_one();
+                self.state.stream_release.notified().await;
+            }
             use little_monkey_lib::compatibility_hub::{CanonicalStreamEvent, CanonicalUsage};
             let response_id = format!("response-{}", request.request_id);
             sink.emit(CanonicalStreamEvent::ResponseStart {
@@ -970,6 +990,7 @@ impl M3RuntimeDriver for MockRuntimeDriver {
                         usage: CanonicalUsage {
                             input_tokens: 4,
                             output_tokens: 1,
+                            cached_input_tokens: None,
                         },
                     })
                 })
@@ -988,6 +1009,12 @@ impl M3RuntimeDriver for MockRuntimeDriver {
                 .lock()
                 .map_err(|_| M3HubError::LockPoisoned)?
                 .push(request_id.to_string());
+            if self.state.hold_stream.load(Ordering::SeqCst) {
+                self.state.stream_release.notify_one();
+            }
+            if self.state.hold_completion.load(Ordering::SeqCst) {
+                self.state.completion_release.notify_one();
+            }
             Ok(true)
         })
     }
@@ -1204,7 +1231,9 @@ async fn set_runtime_config_gates_flash_attention_and_mixed_precision_on_hardwar
             )]),
         })
         .expect_err("flash attention cannot be forced on without a GPU backend");
-    assert!(matches!(flash_on_rejected, M3HubError::Unsupported(reason) if reason.contains("GPU backend")));
+    assert!(
+        matches!(flash_on_rejected, M3HubError::Unsupported(reason) if reason.contains("GPU backend"))
+    );
     let mixed_precision_rejected = cpu_only_hub
         .set_runtime_config(&M3SetRuntimeConfigRequest {
             runtime_id: "managed-llama".to_string(),
@@ -1216,7 +1245,9 @@ async fn set_runtime_config_gates_flash_attention_and_mixed_precision_on_hardwar
             )]),
         })
         .expect_err("quantized KV cache cannot be enabled without a GPU backend");
-    assert!(matches!(mixed_precision_rejected, M3HubError::Unsupported(reason) if reason.contains("GPU backend")));
+    assert!(
+        matches!(mixed_precision_rejected, M3HubError::Unsupported(reason) if reason.contains("GPU backend"))
+    );
 
     // The same requests succeed once the Hardware Compatibility report shows
     // a real GPU backend — proving this is a genuine hardware check, not a
@@ -1508,7 +1539,10 @@ async fn resolve_setting_capabilities_reports_gpu_gates_and_draft_model_candidat
     assert!(draft_model_setting.supported);
     assert!(draft_model_setting.unsupported_reason.is_none());
     assert_eq!(with_draft.draft_model_candidates.len(), 1);
-    assert_eq!(with_draft.draft_model_candidates[0].model_id, draft.model_id);
+    assert_eq!(
+        with_draft.draft_model_candidates[0].model_id,
+        draft.model_id
+    );
     assert_eq!(
         with_draft.draft_model_candidates[0].display_name,
         draft.display_name
@@ -1568,6 +1602,35 @@ impl M3ProtocolFrameSink for VecFrameSink {
         self.0.push(frame);
         Ok(())
     }
+}
+
+fn pair_scoped_token(
+    hub: &M3RuntimeHub,
+    label: &str,
+    scopes: BTreeSet<ApiScope>,
+    allowed_models: BTreeSet<String>,
+    now_ms: u64,
+) -> PairedToken {
+    let challenge = hub
+        .begin_pairing(
+            PairingRequest {
+                client_label: label.to_string(),
+                scopes,
+                backends: BTreeSet::from([ApiBackend::ManagedLocal]),
+                allowed_models,
+                token_expires_at_ms: Some(now_ms + 100_000),
+            },
+            now_ms,
+            "127.0.0.1",
+        )
+        .expect("begin scoped pairing");
+    hub.complete_pairing(
+        &challenge.challenge_id,
+        &challenge.pairing_code,
+        now_ms + 1,
+        "127.0.0.1",
+    )
+    .expect("complete scoped pairing")
 }
 
 #[tokio::test]
@@ -1687,8 +1750,8 @@ async fn scoped_pairing_dispatch_stream_rate_limit_cancel_revoke_and_audit_are_w
         Err(M3HubError::RateLimited { .. })
     ));
 
-    assert!(hub
-        .cancel_inference(
+    assert!(matches!(
+        hub.cancel_inference(
             &M3CancelInferenceRequest {
                 protocol: CompatibilityProtocol::OpenAiChatCompletions,
                 runtime_id: "managed-llama".to_string(),
@@ -1699,12 +1762,10 @@ async fn scoped_pairing_dispatch_stream_rate_limit_cancel_revoke_and_audit_are_w
             },
             &context,
         )
-        .await
-        .expect("internal cancel"));
-    assert_eq!(
-        runtime_state.cancelled.lock().unwrap().as_slice(),
-        ["request-internal-cancel"]
-    );
+        .await,
+        Err(M3HubError::NotFound(_))
+    ));
+    assert!(runtime_state.cancelled.lock().unwrap().is_empty());
 
     hub.revoke_token(&paired.record.token_id, 20_006, "127.0.0.1")
         .expect("revoke");
@@ -1714,6 +1775,10 @@ async fn scoped_pairing_dispatch_stream_rate_limit_cancel_revoke_and_audit_are_w
         "max_tokens":8
     }))
     .unwrap();
+    // Generic `Unauthorized`, not `Forbidden("token is revoked")`: a revoked
+    // token must be indistinguishable from one that was never issued, or the
+    // response is an existence oracle. See `compatibility_hub.rs`'s
+    // `credential_validity_denial`.
     assert!(matches!(
         hub.dispatch_api(
             &M3ApiDispatchRequest {
@@ -1727,7 +1792,7 @@ async fn scoped_pairing_dispatch_stream_rate_limit_cancel_revoke_and_audit_are_w
             &context,
         )
         .await,
-        Err(M3HubError::Forbidden(_))
+        Err(M3HubError::Unauthorized(_))
     ));
     let audit = hub.security_audit_events().expect("audit");
     assert!(audit
@@ -1792,10 +1857,314 @@ async fn scoped_pairing_dispatch_stream_rate_limit_cancel_revoke_and_audit_are_w
         .expect("disable LAN and revoke live tokens"));
     hub.configure_lan(policy).expect("re-enable loopback LAN");
     authorization.now_ms = 20_012;
+    // `disable_lan` revoked it, and a revoked token now answers the same
+    // generic `Unauthorized` an unknown one does — still a refusal, just one
+    // that no longer confirms the token was ever real.
     assert!(matches!(
         hub.authorize_external_operation(&authorization),
-        Err(M3HubError::Forbidden(_))
+        Err(M3HubError::Unauthorized(_))
     ));
+}
+
+#[tokio::test]
+async fn cancellation_is_bound_to_active_request_metadata_and_paired_principal() {
+    let directory = TestDirectory::new("cancel-ownership");
+    let runtime_state = Arc::new(MockRuntimeState::default());
+    runtime_state.hold_stream.store(true, Ordering::SeqCst);
+    let lan_factory = Arc::new(DefaultM3LanAccessFactory::new(
+        Arc::new(DeterministicEntropy(Mutex::new(50))),
+        Arc::new(TestProtector(b"cancel-ownership-key".to_vec())),
+    ));
+    let hub = Arc::new(make_hub(
+        &directory.0,
+        Arc::new(MutableDownload::new(payload(70_000, 1), "unused")),
+        Vec::new(),
+        vec![Arc::new(MockRuntimeDriver::new(runtime_state.clone()))],
+        None,
+        Some(lan_factory),
+    ));
+    let mut policy = LanServerPolicy::default();
+    policy.rate_limit = RateLimitPolicy {
+        window_ms: 60_000,
+        max_requests: 100,
+        max_input_bytes: 16 * 1024 * 1024,
+    };
+    policy.tls = TlsPolicy::Disabled;
+    hub.configure_lan(policy)
+        .expect("configure cancellation LAN");
+
+    let token_a = pair_scoped_token(
+        &hub,
+        "owner-a",
+        BTreeSet::from([ApiScope::ChatCompletions]),
+        BTreeSet::from(["local-model".to_string()]),
+        30_000,
+    );
+    let token_b = pair_scoped_token(
+        &hub,
+        "owner-b-same-capabilities",
+        BTreeSet::from([ApiScope::ChatCompletions]),
+        BTreeSet::from(["local-model".to_string()]),
+        30_010,
+    );
+    let wrong_model_token = pair_scoped_token(
+        &hub,
+        "wrong-model",
+        BTreeSet::from([ApiScope::ChatCompletions]),
+        BTreeSet::from(["other-model".to_string()]),
+        30_020,
+    );
+    let wrong_scope_token = pair_scoped_token(
+        &hub,
+        "wrong-scope",
+        BTreeSet::from([ApiScope::Responses]),
+        BTreeSet::from(["local-model".to_string()]),
+        30_030,
+    );
+    let stream_body = serde_json::to_vec(&json!({
+        "model":"local-model",
+        "messages":[{"role":"user","content":"hold"}],
+        "max_tokens":32,
+        "stream":true
+    }))
+    .unwrap();
+    let request_id = "owned-stream";
+    let owner_token = token_a.token.clone();
+    let stream_owner_token = owner_token.clone();
+    let stream_hub = hub.clone();
+    let stream_task = tokio::spawn(async move {
+        let mut frames = VecFrameSink(Vec::new());
+        let result = stream_hub
+            .dispatch_api_stream(
+                &M3ApiDispatchRequest {
+                    protocol: CompatibilityProtocol::OpenAiChatCompletions,
+                    runtime_id: "managed-llama".to_string(),
+                    request_id: request_id.to_string(),
+                    body: stream_body,
+                    caller: M3ApiCaller::External {
+                        bearer_token: stream_owner_token,
+                        remote_address: "127.0.0.1".to_string(),
+                    },
+                    now_ms: 30_100,
+                },
+                &mut frames,
+                &M3OperationContext::default(),
+            )
+            .await;
+        (result, frames)
+    });
+    runtime_state.stream_started.notified().await;
+
+    let duplicate_body = serde_json::to_vec(&json!({
+        "model":"local-model",
+        "messages":[{"role":"user","content":"duplicate"}],
+        "max_tokens":32,
+        "stream":true
+    }))
+    .unwrap();
+    let mut duplicate_frames = VecFrameSink(Vec::new());
+    assert!(matches!(
+        hub.dispatch_api_stream(
+            &M3ApiDispatchRequest {
+                protocol: CompatibilityProtocol::OpenAiChatCompletions,
+                runtime_id: "managed-llama".to_string(),
+                request_id: request_id.to_string(),
+                body: duplicate_body,
+                caller: M3ApiCaller::External {
+                    bearer_token: token_b.token.clone(),
+                    remote_address: "127.0.0.1".to_string(),
+                },
+                now_ms: 30_101,
+            },
+            &mut duplicate_frames,
+            &M3OperationContext::default(),
+        )
+        .await,
+        Err(M3HubError::Conflict(_))
+    ));
+
+    let cancel = |token: String,
+                  protocol: CompatibilityProtocol,
+                  model_id: &str,
+                  target_request_id: &str,
+                  now_ms: u64| M3CancelInferenceRequest {
+        protocol,
+        runtime_id: "managed-llama".to_string(),
+        request_id: target_request_id.to_string(),
+        model_id: model_id.to_string(),
+        caller: M3ApiCaller::External {
+            bearer_token: token,
+            remote_address: "127.0.0.1".to_string(),
+        },
+        now_ms,
+    };
+    let missing = hub
+        .cancel_inference(
+            &cancel(
+                token_b.token.clone(),
+                CompatibilityProtocol::OpenAiChatCompletions,
+                "local-model",
+                "missing-stream",
+                30_102,
+            ),
+            &M3OperationContext::default(),
+        )
+        .await
+        .expect_err("missing request must stay concealed");
+    let other_owner = hub
+        .cancel_inference(
+            &cancel(
+                token_b.token.clone(),
+                CompatibilityProtocol::OpenAiChatCompletions,
+                "local-model",
+                request_id,
+                30_103,
+            ),
+            &M3OperationContext::default(),
+        )
+        .await
+        .expect_err("same-capability foreign token must not cancel");
+    assert!(matches!(missing, M3HubError::NotFound(_)));
+    assert!(matches!(other_owner, M3HubError::NotFound(_)));
+    assert_eq!(missing.to_string(), other_owner.to_string());
+
+    assert!(matches!(
+        hub.cancel_inference(
+            &cancel(
+                wrong_model_token.token,
+                CompatibilityProtocol::OpenAiChatCompletions,
+                "other-model",
+                request_id,
+                30_104,
+            ),
+            &M3OperationContext::default(),
+        )
+        .await,
+        Err(M3HubError::NotFound(_))
+    ));
+    assert!(matches!(
+        hub.cancel_inference(
+            &cancel(
+                wrong_scope_token.token,
+                CompatibilityProtocol::OpenAiResponses,
+                "local-model",
+                request_id,
+                30_105,
+            ),
+            &M3OperationContext::default(),
+        )
+        .await,
+        Err(M3HubError::NotFound(_))
+    ));
+    assert!(runtime_state.cancelled.lock().unwrap().is_empty());
+
+    assert!(matches!(
+        hub.cancel_inference(
+            &M3CancelInferenceRequest {
+                protocol: CompatibilityProtocol::OpenAiChatCompletions,
+                runtime_id: "other-runtime".to_string(),
+                request_id: request_id.to_string(),
+                model_id: "local-model".to_string(),
+                caller: M3ApiCaller::External {
+                    bearer_token: owner_token.clone(),
+                    remote_address: "127.0.0.1".to_string(),
+                },
+                now_ms: 30_106,
+            },
+            &M3OperationContext::default(),
+        )
+        .await,
+        Err(M3HubError::NotFound(_))
+    ));
+    assert!(runtime_state.cancelled.lock().unwrap().is_empty());
+
+    assert!(hub
+        .cancel_inference(
+            &cancel(
+                owner_token,
+                CompatibilityProtocol::OpenAiChatCompletions,
+                "local-model",
+                request_id,
+                30_107,
+            ),
+            &M3OperationContext::default(),
+        )
+        .await
+        .expect("exact paired owner cancellation"));
+    stream_task
+        .await
+        .expect("owned stream task")
+        .0
+        .expect("cancelled owned stream exits");
+    assert_eq!(
+        runtime_state.cancelled.lock().unwrap().as_slice(),
+        ["owned-stream"]
+    );
+
+    runtime_state.hold_stream.store(false, Ordering::SeqCst);
+    hub.dispatch_api(
+        &M3ApiDispatchRequest {
+            protocol: CompatibilityProtocol::OpenAiChatCompletions,
+            runtime_id: "managed-llama".to_string(),
+            request_id: request_id.to_string(),
+            body: serde_json::to_vec(&json!({
+                "model":"local-model",
+                "messages":[{"role":"user","content":"reused after completion"}],
+                "max_tokens":8
+            }))
+            .unwrap(),
+            caller: M3ApiCaller::Internal,
+            now_ms: 30_108,
+        },
+        &M3OperationContext::default(),
+    )
+    .await
+    .expect("completed requestId may be reused after RAII cleanup");
+    runtime_state.hold_completion.store(true, Ordering::SeqCst);
+    let completion_hub = hub.clone();
+    let completion_task = tokio::spawn(async move {
+        completion_hub
+            .dispatch_api(
+                &M3ApiDispatchRequest {
+                    protocol: CompatibilityProtocol::OpenAiChatCompletions,
+                    runtime_id: "managed-llama".to_string(),
+                    request_id: "owned-completion".to_string(),
+                    body: serde_json::to_vec(&json!({
+                        "model":"local-model",
+                        "messages":[{"role":"user","content":"hold completion"}],
+                        "max_tokens":8
+                    }))
+                    .unwrap(),
+                    caller: M3ApiCaller::Internal,
+                    now_ms: 30_200,
+                },
+                &M3OperationContext::default(),
+            )
+            .await
+    });
+    runtime_state.completion_started.notified().await;
+    assert!(hub
+        .cancel_inference(
+            &M3CancelInferenceRequest {
+                protocol: CompatibilityProtocol::OpenAiChatCompletions,
+                runtime_id: "managed-llama".to_string(),
+                request_id: "owned-completion".to_string(),
+                model_id: "local-model".to_string(),
+                caller: M3ApiCaller::Internal,
+                now_ms: 30_201,
+            },
+            &M3OperationContext::default(),
+        )
+        .await
+        .expect("exact internal completion cancellation"));
+    completion_task
+        .await
+        .expect("completion task")
+        .expect("cancelled completion exits");
+    assert_eq!(
+        runtime_state.cancelled.lock().unwrap().as_slice(),
+        ["owned-stream", "owned-completion"]
+    );
 }
 
 #[test]
@@ -1803,7 +2172,9 @@ fn catalog_model_manifest_stays_backward_compatible_without_new_provenance_field
     let bytes = payload(4_096, 3);
     let model = catalog_model(&bytes, "rev-compat");
     let mut value = serde_json::to_value(&model).expect("serialize catalog model");
-    let object = value.as_object_mut().expect("catalog model is a JSON object");
+    let object = value
+        .as_object_mut()
+        .expect("catalog model is a JSON object");
     // Simulate a manifest written before template/projector/provenance
     // existed: the keys are entirely absent, not merely null.
     assert!(object.remove("template").is_some());
@@ -1872,7 +2243,10 @@ async fn search_stamps_provenance_and_installed_view_surfaces_template_projector
     assert_eq!(active.source_id, "test-catalog");
     assert_eq!(active.template.as_deref(), Some("chatml"));
     assert_eq!(
-        active.projector.as_ref().map(|projector| projector.kind.as_str()),
+        active
+            .projector
+            .as_ref()
+            .map(|projector| projector.kind.as_str()),
         Some("clip")
     );
     assert_eq!(active.catalog_retrieved_at_ms, Some(retrieved_at));
@@ -1910,9 +2284,19 @@ async fn vision_capable_model_surfaces_missing_and_verified_projector_evidence()
         .download_model(&request, &context)
         .await
         .expect("install vision-capable model without a projector reference yet");
-    let active = installed.versions.iter().find(|version| version.active).expect("active version");
-    assert_eq!(active.projector_verification, M3ProjectorVerificationState::MissingReference);
-    assert!(!active.vision_ready, "vision must never be ready with no projector reference at all");
+    let active = installed
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active version");
+    assert_eq!(
+        active.projector_verification,
+        M3ProjectorVerificationState::MissingReference
+    );
+    assert!(
+        !active.vision_ready,
+        "vision must never be ready with no projector reference at all"
+    );
     assert_eq!(active.estimated_projector_memory_bytes, None);
 
     // Now the catalog ships a new revision that declares a real projector
@@ -1940,9 +2324,19 @@ async fn vision_capable_model_surfaces_missing_and_verified_projector_evidence()
         .download_model(&request, &context)
         .await
         .expect("install a new revision that declares a projector reference");
-    let active = installed.versions.iter().find(|version| version.active).expect("active version");
-    assert_eq!(active.projector_verification, M3ProjectorVerificationState::Unverified);
-    assert!(!active.vision_ready, "an unverified projector must never be shown vision-ready");
+    let active = installed
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active version");
+    assert_eq!(
+        active.projector_verification,
+        M3ProjectorVerificationState::Unverified
+    );
+    assert!(
+        !active.vision_ready,
+        "an unverified projector must never be shown vision-ready"
+    );
     assert_eq!(
         active.estimated_projector_memory_bytes,
         Some(projector_bytes.len() as u64)
@@ -1979,10 +2373,20 @@ async fn vision_capable_model_surfaces_missing_and_verified_projector_evidence()
         )
         .await
         .expect("verify real projector bytes");
-    let active = verified.versions.iter().find(|version| version.active).expect("active version");
-    assert_eq!(active.projector_verification, M3ProjectorVerificationState::Verified);
+    let active = verified
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active version");
+    assert_eq!(
+        active.projector_verification,
+        M3ProjectorVerificationState::Verified
+    );
     assert!(active.projector_verified_at_ms.is_some());
-    assert!(active.vision_ready, "a verified projector on a transport-capable runtime must be vision-ready");
+    assert!(
+        active.vision_ready,
+        "a verified projector on a transport-capable runtime must be vision-ready"
+    );
 
     // Verifying a model version with no projector reference at all is a
     // clear NotFound, not a silent no-op or a false success.
@@ -1994,13 +2398,27 @@ async fn vision_capable_model_surfaces_missing_and_verified_projector_evidence()
     };
     let other_directory = TestDirectory::new("no-projector");
     let other_download = Arc::new(MutableDownload::new(payload(4_096, 5), "etag-no-projector"));
-    let other_hub = make_hub(&other_directory.0, other_download, Vec::new(), Vec::new(), None, None);
+    let other_hub = make_hub(
+        &other_directory.0,
+        other_download,
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
     let other_installed = other_hub
         .download_model(&request, &context)
         .await
         .expect("install a non-vision model");
-    let other_active = other_installed.versions.iter().find(|version| version.active).expect("active");
-    assert_eq!(other_active.projector_verification, M3ProjectorVerificationState::NotRequired);
+    let other_active = other_installed
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active");
+    assert_eq!(
+        other_active.projector_verification,
+        M3ProjectorVerificationState::NotRequired
+    );
     let missing_projector = other_hub
         .verify_projector(
             &M3VerifyProjectorRequest {
@@ -2094,7 +2512,10 @@ async fn identical_payload_across_assets_is_reused_without_a_network_transfer_an
 async fn corrupted_local_candidate_is_never_reused_and_falls_back_to_a_real_download() {
     let directory = TestDirectory::new("dedup-corrupt");
     let shared_bytes = payload(80_000, 5);
-    let download = Arc::new(MutableDownload::new(shared_bytes.clone(), "etag-corrupt-guard"));
+    let download = Arc::new(MutableDownload::new(
+        shared_bytes.clone(),
+        "etag-corrupt-guard",
+    ));
     let hub = make_hub(
         &directory.0,
         download.clone(),
@@ -2262,13 +2683,18 @@ async fn model_staleness_check_flags_a_long_unrefreshed_model_once_a_newer_revis
         .find(|version| version.active)
         .expect("active version")
         .installed_at_ms;
-    assert_eq!(installed_at_ms, 10_000, "controllable clock is exact, not auto-incrementing");
+    assert_eq!(
+        installed_at_ms, 10_000,
+        "controllable clock is exact, not auto-incrementing"
+    );
 
     // Nothing to migrate to yet: still on the only revision the catalog
     // knows about, however old.
     clock.set(10_000 + STALE_LOCAL_MODEL_THRESHOLD_MS + 1);
     assert_eq!(
-        hub.model_staleness_check(&asset_id, &context).await.expect("staleness check"),
+        hub.model_staleness_check(&asset_id, &context)
+            .await
+            .expect("staleness check"),
         None,
         "no newer catalog revision exists yet — nothing to flag"
     );
@@ -2287,7 +2713,9 @@ async fn model_staleness_check_flags_a_long_unrefreshed_model_once_a_newer_revis
     // though a newer revision now exists.
     clock.set(installed_at_ms + STALE_LOCAL_MODEL_THRESHOLD_MS - 1);
     assert_eq!(
-        hub.model_staleness_check(&asset_id, &context).await.expect("staleness check"),
+        hub.model_staleness_check(&asset_id, &context)
+            .await
+            .expect("staleness check"),
         None,
         "a newer revision exists, but the install isn't old enough yet"
     );
@@ -2302,14 +2730,24 @@ async fn model_staleness_check_flags_a_long_unrefreshed_model_once_a_newer_revis
     assert_eq!(warning.asset_id, asset_id);
     assert_eq!(warning.installed_revision, "rev-1");
     assert_eq!(warning.latest_revision, "rev-2");
-    assert_eq!(warning.suggested_replacement_display_name, "local-model rev2");
+    assert_eq!(
+        warning.suggested_replacement_display_name,
+        "local-model rev2"
+    );
     assert!(warning.age_ms >= STALE_LOCAL_MODEL_THRESHOLD_MS);
 }
 
 #[tokio::test]
 async fn model_staleness_check_rejects_an_unknown_asset_id() {
     let directory = TestDirectory::new("staleness-unknown-asset");
-    let hub = make_hub(&directory.0, Arc::new(MutableDownload::new(Vec::new(), "etag")), Vec::new(), Vec::new(), None, None);
+    let hub = make_hub(
+        &directory.0,
+        Arc::new(MutableDownload::new(Vec::new(), "etag")),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
     let context = M3OperationContext::new(10_000);
     assert!(matches!(
         hub.model_staleness_check("does-not-exist", &context).await,

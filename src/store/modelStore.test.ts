@@ -110,6 +110,26 @@ describe("modelStore.start", () => {
   });
 });
 
+/** Without a context limit, `contextTrimmer.ts`'s `shouldTrim` returns false
+ *  for any history, so a cloud model never auto-compacts and the context ring
+ *  has no denominator. The provider's `/models` already carried the number. */
+describe("modelStore.useProviderModel", () => {
+  it("adopts the provider-reported context window, and clears it when there isn't one", async () => {
+    const { useUsageStore } = await import("./usageStore");
+    useModelStore.setState({
+      providerModels: {
+        openrouter: [{ id: "vendor/big", context_length: 1_000_000 }, { id: "vendor/silent" }],
+      },
+    });
+
+    useModelStore.getState().useProviderModel("openrouter", "vendor/big");
+    expect(useUsageStore.getState().contextLimit).toBe(1_000_000);
+
+    useModelStore.getState().useProviderModel("openrouter", "vendor/silent");
+    expect(useUsageStore.getState().contextLimit).toBeNull();
+  });
+});
+
 describe("modelStore model reference install", () => {
   const resolved: ResolvedModelReference = {
     source: "ollama",
@@ -215,6 +235,51 @@ describe("modelStore.download", () => {
     await expect(useModelStore.getState().download(model)).rejects.toThrow("Download cancelled");
 
     expect(useModelStore.getState().downloadProgress[model.file]).toBeUndefined();
+  });
+
+  it("starts the model it just pulled, so Pull is one click and not two", async () => {
+    const model = makeModel({ file: "qwen2.5-14b-instruct.gguf", installed: false, path: undefined });
+    const installed = makeModel({
+      file: "qwen2.5-14b-instruct.gguf",
+      path: "/models/qwen2.5-14b-instruct.gguf",
+    });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "models_list_installed") return Promise.resolve([installed]);
+      if (command === "models_list_curated") return Promise.resolve([]);
+      if (command === "llama_status") return Promise.resolve({ status: "stopped", port: 8090, model_path: null });
+      if (command === "llama_start") return Promise.resolve(8192);
+      return Promise.resolve(undefined);
+    });
+
+    await useModelStore.getState().download(model);
+
+    expect(invokeMock).toHaveBeenCalledWith("llama_start", {
+      modelPath: installed.path,
+      gpuLayers: 999,
+      embeddings: false,
+    });
+    expect(useModelStore.getState().active?.path).toBe(installed.path);
+  });
+
+  it("leaves a running model alone — a background pull must not kill a live chat", async () => {
+    const running = makeModel();
+    useModelStore.setState({ active: running, llamaStatus: "ready" });
+    const model = makeModel({ file: "qwen2.5-14b-instruct.gguf", installed: false, path: undefined });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "models_list_installed") {
+        return Promise.resolve([running, makeModel({ file: model.file, path: "/models/new.gguf" })]);
+      }
+      if (command === "models_list_curated") return Promise.resolve([]);
+      if (command === "llama_status") {
+        return Promise.resolve({ status: "ready", port: 8090, model_path: running.path });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    await useModelStore.getState().download(model);
+
+    expect(invokeMock).not.toHaveBeenCalledWith("llama_start", expect.anything());
+    expect(useModelStore.getState().active?.path).toBe(running.path);
   });
 });
 

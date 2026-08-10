@@ -1,3 +1,4 @@
+import { en } from "./en";
 import { crewLocale } from "./crew";
 import { runLocale } from "./runs";
 import { searchLocale } from "./search";
@@ -39,7 +40,8 @@ import { privacyFirewallLocale } from "./privacyFirewall";
 import { redTeamLabLocale } from "./redTeamLab";
 import { sandboxLocale } from "./sandbox";
 
-export const hi: Record<string, string> = {
+/** What this locale says in its own words — everything else falls back to English. */
+const translated: Record<string, string> = {
   ...dbAdminGuardrailsLocale,
   ...developerLocale,
   ...ecosystemLocale,
@@ -1083,6 +1085,11 @@ export const hi: Record<string, string> = {
   "MessageList.recipeStartedFromLocalApp": "रेसिपी से शुरू किया गया: {{name}} · लोकल ऐप \"{{appName}}\" के ज़रिए",
   "SubagentRow.profileExplore": "अन्वेषण",
   "SubagentRow.profileCode": "कोड",
+  "SubagentRow.worktreeChanges": "worktree में बदलाव",
+  "SubagentRow.worktreeApply": "लागू करें",
+  "SubagentRow.worktreeDiscard": "हटाएँ",
+  "SubagentRow.worktreeApplied": "वर्कस्पेस में लागू किया गया",
+  "SubagentRow.worktreeDiscarded": "हटा दिया गया",
   "SubagentRow.statusRunning": "चल रहा है",
   "SubagentRow.statusDone": "पूर्ण",
   "SubagentRow.statusFailed": "विफल",
@@ -1099,6 +1106,8 @@ export const hi: Record<string, string> = {
   "BackgroundTasksPanel.finishedHeading": "समाप्त",
   "BackgroundTasksPanel.clearButton": "साफ़ करें",
   "BackgroundTasksPanel.stopAriaLabel": "\"{{name}}\" रोकें",
+  "BackgroundTasksPanel.steerPlaceholder": "इस एजेंट को संदेश भेजें…",
+  "BackgroundTasksPanel.steerSendAriaLabel": "\"{{name}}\" को संदेश भेजें",
   "BackgroundTasksPanel.shellKindLabel": "शेल",
   "BackgroundTasksPanel.agentKindLabel": "एजेंट",
   "BackgroundTasksPanel.exitCode": "एग्ज़िट {{code}}",
@@ -1119,6 +1128,20 @@ export const hi: Record<string, string> = {
   "BackgroundTasksPanel.agentStatusCompleted": "पूर्ण",
   "BackgroundTasksPanel.agentStatusFailed": "विफल",
   "BackgroundTasksPanel.agentStatusCancelled": "रद्द",
+  "BackgroundTasksPanel.agentGroupTitle": "{{count}} एजेंट",
+  "BackgroundTasksPanel.workflowKindLabel": "वर्कफ़्लो",
+  "BackgroundTasksPanel.savedWorkflowsHeading": "सहेजे गए वर्कफ़्लो",
+  "BackgroundTasksPanel.saveWorkflowButton": "वर्कफ़्लो सहेजें",
+  "BackgroundTasksPanel.savedWorkflowShape": "{{phases}} चरण · {{agents}} एजेंट",
+  "BackgroundTasksPanel.savedWorkflowLastRun": "पिछली बार चला {{when}}",
+  "BackgroundTasksPanel.savedWorkflowNeverRun": "अभी तक नहीं चला",
+  "BackgroundTasksPanel.savedWorkflowDeleteAriaLabel": "सहेजा गया वर्कफ़्लो \"{{name}}\" हटाएँ",
+  "BackgroundTasksPanel.phaseQueued": "कतार में",
+  "BackgroundTasksPanel.stopAllAriaLabel": "सभी चल रहे एजेंट रोकें",
+  "BackgroundTasksPanel.tableAgentHeader": "एजेंट",
+  "BackgroundTasksPanel.tableTokensHeader": "टोकन",
+  "BackgroundTasksPanel.tableToolsHeader": "टूल",
+  "BackgroundTasksPanel.tableTimeHeader": "समय",
   "MessageList.emptyStateTitle": "अभी यहां कुछ नहीं है",
   "MessageList.emptyStateDescription": "शुरू करने के लिए Little Monkey से अपने वर्कस्पेस में कुछ समझाने, लिखने या ठीक करने के लिए कहें।",
   "ModeSelector.modeManualLabel": "मैनुअल",
@@ -1261,6 +1284,13 @@ export const hi: Record<string, string> = {
   "AddCustomProviderForm.addButton": "जोड़ें",
   "AddCustomProviderForm.helpText": "कोई भी OpenAI-संगत बेस URL — ऐप इसमें /chat/completions और /models जोड़ देता है।",
   "AutomationPanel.reliabilityHeading": "विश्वसनीयता",
+  "AutomationPanel.hooksHeading": "हुक",
+  "AutomationPanel.hooksDescription": "शेल कमांड जो एजेंट जीवनचक्र की घटनाओं पर चलते हैं। PreToolUse हुक टूल कॉल को रोक सकता है (गैर-शून्य एग्ज़िट, या stdout पर {\"decision\":\"deny\"}); UserPromptSubmit का आउटपुट टर्न के संदर्भ में जोड़ा जाता है। 10 सेकंड की समय-सीमा, कोई अनुमति संकेत नहीं।",
+  "AutomationPanel.hookEventLabel": "घटना",
+  "AutomationPanel.hookMatcherPlaceholder": "टूल मैचर (regex, वैकल्पिक)",
+  "AutomationPanel.hookCommandPlaceholder": "शेल कमांड",
+  "AutomationPanel.hookAddButton": "हुक जोड़ें",
+  "AutomationPanel.hookDeleteAriaLabel": "हुक \"{{command}}\" हटाएँ",
   "AutomationPanel.autoFailoverLabel": "प्रदाताओं के बीच ऑटो-फेलओवर",
   "AutomationPanel.autoFailoverDescription": "यदि कोई क्लाउड प्रदाता प्रतिक्रिया देने से पहले त्रुटि देता है, तो टर्न विफल करने के बजाय स्वतः किसी अन्य कॉन्फ़िगर किए गए प्रदाता के साथ पुनः प्रयास करें।",
   "AutomationPanel.autoVisionSwitchLabel": "छवियों के लिए स्वतः विज़न मॉडल पर स्विच करें",
@@ -1325,6 +1355,10 @@ export const hi: Record<string, string> = {
   "AutomationPanel.subagentModelOverrideExploreLabel": "एक्सप्लोर प्रोफ़ाइल",
   "AutomationPanel.subagentModelOverrideCodeLabel": "कोड प्रोफ़ाइल",
   "AutomationPanel.subagentModelOverrideDefaultBadge": "मूल जैसा ही",
+  "AutomationPanel.customAgentsIntro": "खुले वर्कस्पेस की .monkey/agents/*.md फ़ाइलों से कस्टम एजेंट — हर एक task और workflow टूल्स द्वारा स्वीकृत एक अतिरिक्त प्रोफ़ाइल बन जाता है।",
+  "AutomationPanel.customAgentsRefreshButton": "रिफ़्रेश करें",
+  "AutomationPanel.customAgentsLoading": ".monkey/agents स्कैन हो रहा है…",
+  "AutomationPanel.customAgentsEmpty": "कोई कस्टम एजेंट नहीं मिला। अपने वर्कस्पेस के .monkey/agents/ में name, description और tools फ्रंटमैटर वाली markdown फ़ाइल जोड़ें।",
   "AutomationPanel.checkpointsHeading": "चेकपॉइंट",
   "AutomationPanel.checkpointRetentionLabel": "हाल के कितने रखें",
   "AutomationPanel.checkpointRetentionDescription": "सबसे पुराने हटाए जाने से पहले डिस्क पर हाल के कितने चेकपॉइंट रखने हैं। यह अगली बार बनने वाले चेकपॉइंट से लागू होगा।",
@@ -1654,15 +1688,8 @@ export const hi: Record<string, string> = {
   "KnowledgePanel.addFileButton": "फ़ाइल जोड़ें",
   "KnowledgePanel.noSourcesHint": "अभी तक कोई स्रोत नहीं — इंडेक्स करने के लिए एक फ़ोल्डर या फ़ाइल जोड़ें।",
   "KnowledgePanel.removeSourceAriaLabel": "स्रोत हटाएं",
-  "KnowledgePanel.reindexButton": "फिर से इंडेक्स करें",
-  "KnowledgePanel.cancelIndexButton": "इंडेक्सिंग रद्द करें",
-  "KnowledgePanel.phaseWalking": "फ़ाइलें स्कैन हो रही हैं…",
-  "KnowledgePanel.phaseChunking": "विभाजन हो रहा है… ({{done}}/{{total}} फ़ाइलें)",
-  "KnowledgePanel.phaseEmbedding": "एम्बेडिंग हो रही है… ({{chunks}} खंड)",
-  "KnowledgePanel.phaseDone": "इंडेक्स हो गया",
   "KnowledgePanel.neverIndexed": "अभी तक इंडेक्स नहीं हुआ",
   "KnowledgePanel.indexedAt": "{{when}} को इंडेक्स किया गया · {{count}} खंड",
-  "KnowledgePanel.staleIndexBadge": "पुनः इंडेक्स आवश्यक",
   "KnowledgePanel.testSearchHeading": "परीक्षण खोज",
   "KnowledgePanel.notIndexedForSearch": "खोजने से पहले इस स्टैक को इंडेक्स करें।",
   "KnowledgePanel.searchPlaceholder": "इस स्टैक में खोजें…",
@@ -2459,7 +2486,6 @@ export const hi: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "बजट सक्षम करें",
   "UsagePanel.dailyBudget": "दैनिक बजट (USD)",
   "UsagePanel.monthlyBudget": "मासिक बजट (USD)",
-  "UsagePanel.warningThreshold": "चेतावनी दें (%)",
   "UsagePanel.enforcement": "सीमा पर पहुँचने पर",
   "UsagePanel.enforcementWarn": "केवल चेतावनी दें",
   "UsagePanel.enforcementPause": "क्लाउड कॉल रोकें",
@@ -2519,7 +2545,7 @@ export const hi: Record<string, string> = {
   "Studio.add.repoFilePlaceholder": "split_files/vae/wan2.2_vae.safetensors",
   "Studio.add.namePlaceholder": "Wan 2.2 TI2V 5B",
   "Studio.add.familyPlaceholder": "Wan",
-  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --offload-to-cpu",
+  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --threads 8 --offload-to-cpu",
   "Studio.speakerPlaceholder": "/Users/you/voices/narrator.wav",
   "Studio.languagePlaceholder": "hi",
   "Studio.add.name": "नाम",
@@ -2641,3 +2667,34 @@ export const hi: Record<string, string> = {
   "Studio.unsupported.title": "इस मशीन पर स्टूडियो उपलब्ध नहीं है",
   "Studio.unsupported.body": "जेनरेशन इंजन Apple silicon वाले Mac और x86-64 Windows तथा Linux के लिए पहले से बना हुआ आता है। चैट और कोड पर कोई असर नहीं।"
 };
+
+/**
+ * Every key, so this locale's key set is identical to the base's *by
+ * construction* (roadmap K22).
+ *
+ * Before this, each locale carried only the keys somebody had translated, so
+ * the sets diverged by over a thousand entries and nothing could be enforced: a
+ * key renamed in `en` left ten locales pointing at one that no longer existed,
+ * and no check failed. `useT()` already fell back to English for a missing key,
+ * so **no user-visible text changes** — what changes is that the divergence is
+ * now impossible rather than merely unmeasured, and `localeSync.test.ts` holds
+ * it that way.
+ *
+ * `en` is imported by `index.ts` unconditionally as the runtime fallback, so
+ * spreading it here costs nothing at the bundle: those bytes were already
+ * loaded for every locale.
+ *
+ * The real translation gap stays countable: `TRANSLATED_KEYS` below is what this
+ * locale actually says in its own words, and everything else is showing English.
+ */
+export const hi: Record<string, string> = { ...en, ...translated };
+
+/**
+ * The keys this locale genuinely translates.
+ *
+ * Exported so the count of what is *not* translated is exact rather than
+ * inferred from "the string happens to equal English" — many real translations
+ * legitimately do ("OK", "Studio", a product name).
+ */
+export const hiTranslatedKeys: readonly string[] = Object.keys(translated);
+

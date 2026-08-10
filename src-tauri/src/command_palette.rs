@@ -94,7 +94,9 @@ impl CommandPaletteState {
 }
 
 fn lock<'a, T>(mutex: &'a Mutex<T>, label: &str) -> Result<MutexGuard<'a, T>, String> {
-    mutex.lock().map_err(|_| format!("{label} lock is poisoned"))
+    mutex
+        .lock()
+        .map_err(|_| format!("{label} lock is poisoned"))
 }
 
 fn ensure_main_window(window: &tauri::Window) -> Result<(), String> {
@@ -120,7 +122,8 @@ fn validate_config(config: &PaletteConfig) -> Result<(), String> {
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path).map_err(|error| format!("Could not create {}: {error}", path.display()))?;
+    fs::create_dir_all(path)
+        .map_err(|error| format!("Could not create {}: {error}", path.display()))?;
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
     if !metadata.file_type().is_dir() {
@@ -160,7 +163,8 @@ fn atomic_write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()
         .map_err(|error| format!("Could not stage {}: {error}", path.display()))?;
     file.write_all(&bytes).map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
-    fs::rename(&temp, path).map_err(|error| format!("Could not publish {}: {error}", path.display()))
+    fs::rename(&temp, path)
+        .map_err(|error| format!("Could not publish {}: {error}", path.display()))
 }
 
 /// Brings the main window to the front (creating no new window — the
@@ -187,7 +191,9 @@ pub fn palette_show(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn palette_config_get(state: tauri::State<'_, CommandPaletteState>) -> Result<PaletteConfig, String> {
+pub fn palette_config_get(
+    state: tauri::State<'_, CommandPaletteState>,
+) -> Result<PaletteConfig, String> {
     state.config()
 }
 
@@ -231,7 +237,8 @@ mod tests {
     struct TempRoot(PathBuf);
     impl TempRoot {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("little-monkey-palette-{}", Uuid::new_v4()));
+            let path =
+                std::env::temp_dir().join(format!("little-monkey-palette-{}", Uuid::new_v4()));
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }

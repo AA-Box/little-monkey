@@ -439,6 +439,88 @@ fn verify_runtime_directory(
     verify_runtime_directory_with_digest(spec, directory, spec.trusted_manifest_digest()?)
 }
 
+/// What the startup self-integrity check (K22) found for one runtime.
+///
+/// [`verify_runtime_directory`] answers a launcher's question ("give me a
+/// binary or an error"), which collapses four genuinely different situations
+/// into one `Err`. `self_integrity` has to tell them apart: only a tree that is
+/// present and provably wrong is tampering, and only tampering refuses.
+#[derive(Debug)]
+pub enum RuntimeIntegrity {
+    /// Every file matched the authenticated manifest.
+    Verified { server: PathBuf },
+    /// A tree is installed and it does not match. This refuses.
+    Mismatch { path: PathBuf, reason: String },
+    /// A tree exists but could not be authenticated for a reason that is not
+    /// evidence of tampering — a developer override, or a source build with no
+    /// trusted digest baked in.
+    Unverified {
+        path: Option<PathBuf>,
+        reason: String,
+    },
+    /// Nothing installed on this host.
+    Absent,
+    /// No build of this runtime is published for this target.
+    Unsupported,
+}
+
+/// Authenticates a runtime *without* resolving a binary to launch.
+///
+/// Deliberately ungated: this is the primitive the integrity gate itself is
+/// built on, and it is also what tells a repair pass that a tree is broken.
+/// Callers that intend to execute the result go through
+/// [`find_managed_server`] and `self_integrity::ensure_loadable` instead.
+pub fn verify_runtime_installation(
+    spec: &ManagedRuntimeSpec,
+    app_data_dir: Option<&Path>,
+) -> RuntimeIntegrity {
+    if !runtime_supported_here(spec) {
+        return RuntimeIntegrity::Unsupported;
+    }
+    if let Some(path) = explicit_runtime_override(spec).filter(|path| path.is_file()) {
+        return RuntimeIntegrity::Unverified {
+            path: Some(path),
+            reason: format!(
+                "{} points this runtime at an unverified developer override",
+                spec.override_env
+            ),
+        };
+    }
+    let installed = app_data_dir
+        .map(|root| managed_runtime_dir_for(spec, root))
+        .filter(|directory| directory.join(MANIFEST_FILE).is_file());
+    let Some(directory) = installed.or_else(|| bundled_runtime_near_current_exe(spec)) else {
+        return RuntimeIntegrity::Absent;
+    };
+    classify_installation(spec, directory, spec.trusted_manifest_digest())
+}
+
+/// The verdict for a tree that is definitely there, given the digest this build
+/// trusts. Split out so the mismatch path can be exercised on a build that has
+/// no digest baked in (see `pnpm stage:runtime`).
+fn classify_installation(
+    spec: &ManagedRuntimeSpec,
+    directory: PathBuf,
+    trusted_manifest_sha256: Result<&str, String>,
+) -> RuntimeIntegrity {
+    let digest = match trusted_manifest_sha256 {
+        Ok(digest) => digest,
+        Err(reason) => {
+            return RuntimeIntegrity::Unverified {
+                path: Some(directory),
+                reason,
+            }
+        }
+    };
+    match verify_runtime_directory_with_digest(spec, &directory, digest) {
+        Ok(server) => RuntimeIntegrity::Verified { server },
+        Err(reason) => RuntimeIntegrity::Mismatch {
+            path: directory,
+            reason,
+        },
+    }
+}
+
 fn runtime_candidates(spec: &ManagedRuntimeSpec, base: &Path) -> [PathBuf; 3] {
     let staged = format!("{}-{}", spec.id, spec.version);
     [
@@ -463,10 +545,7 @@ fn bundled_runtime_near_current_exe(spec: &ManagedRuntimeSpec) -> Option<PathBuf
     None
 }
 
-pub fn bundled_runtime_in_for(
-    spec: &ManagedRuntimeSpec,
-    resource_dir: &Path,
-) -> Option<PathBuf> {
+pub fn bundled_runtime_in_for(spec: &ManagedRuntimeSpec, resource_dir: &Path) -> Option<PathBuf> {
     runtime_candidates(spec, resource_dir)
         .into_iter()
         .find(|candidate| candidate.join(MANIFEST_FILE).is_file())
@@ -720,7 +799,11 @@ mod tests {
         let installed = managed_runtime_dir_for(&STABLE_DIFFUSION, &root);
         fs::create_dir_all(&installed).unwrap();
 
-        fs::write(installed.join(STABLE_DIFFUSION.executable()), b"not really a binary").unwrap();
+        fs::write(
+            installed.join(STABLE_DIFFUSION.executable()),
+            b"not really a binary",
+        )
+        .unwrap();
         assert!(managed_server_present(&STABLE_DIFFUSION, Some(&root)));
         // Same directory, and verification refuses it: there is no manifest
         // and the bytes are not a runtime. That gap is the whole point —
@@ -762,11 +845,40 @@ mod tests {
         (directory, trusted_manifest_sha256)
     }
 
+    /// K22: the startup check has to tell "this tree was tampered with" apart
+    /// from "there is nothing to check", because only the first one refuses.
+    #[test]
+    fn a_tampered_file_is_a_mismatch_and_a_missing_trusted_digest_is_not() {
+        let (directory, trusted) = runtime_fixture(&LLAMA, "integrity");
+
+        assert!(matches!(
+            classify_installation(&LLAMA, directory.clone(), Ok(trusted.as_str())),
+            RuntimeIntegrity::Verified { .. }
+        ));
+
+        // A source build with no digest baked in cannot authenticate the same
+        // tree — and must not call it tampering.
+        assert!(matches!(
+            classify_installation(&LLAMA, directory.clone(), Err("not staged".to_string())),
+            RuntimeIntegrity::Unverified { .. }
+        ));
+
+        fs::write(directory.join(LLAMA.executable()), b"swapped-binary").unwrap();
+        assert!(
+            matches!(
+                classify_installation(&LLAMA, directory.clone(), Ok(trusted.as_str())),
+                RuntimeIntegrity::Mismatch { .. }
+            ),
+            "a replaced binary under an authentic manifest must refuse"
+        );
+
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn concurrent_materialization_serializes_invalid_runtime_repair() {
-        let (source, trusted_manifest_sha256) =
-            runtime_fixture(&LLAMA, "concurrent-repair-source");
+        let (source, trusted_manifest_sha256) = runtime_fixture(&LLAMA, "concurrent-repair-source");
         let app_data = std::env::temp_dir().join(format!(
             "little-monkey-managed-runtime-concurrent-app-{}",
             Uuid::new_v4().simple()
@@ -829,8 +941,7 @@ mod tests {
     #[test]
     fn the_llama_tree_carries_the_speech_binary() {
         let (directory, digest) = runtime_fixture(&LLAMA, "tts-sibling");
-        let server =
-            verify_runtime_directory_with_digest(&LLAMA, &directory, &digest).unwrap();
+        let server = verify_runtime_directory_with_digest(&LLAMA, &directory, &digest).unwrap();
         assert_eq!(
             server.with_file_name(llama_tts_filename()).file_name(),
             Some(std::ffi::OsStr::new(llama_tts_filename()))
@@ -868,7 +979,9 @@ mod tests {
         let root = Path::new("/tmp/little-monkey-test-data");
         assert_eq!(
             managed_runtime_dir_for(&LLAMA, root),
-            root.join("runtimes").join("llama").join(MANAGED_LLAMA_VERSION)
+            root.join("runtimes")
+                .join("llama")
+                .join(MANAGED_LLAMA_VERSION)
         );
         assert_eq!(
             managed_runtime_dir_for(&STABLE_DIFFUSION, root),
@@ -919,7 +1032,9 @@ mod tests {
             return;
         }
         let (directory, digest) = runtime_fixture(&STABLE_DIFFUSION, "cross-runtime");
-        assert!(verify_runtime_directory_with_digest(&STABLE_DIFFUSION, &directory, &digest).is_ok());
+        assert!(
+            verify_runtime_directory_with_digest(&STABLE_DIFFUSION, &directory, &digest).is_ok()
+        );
         assert!(
             verify_runtime_directory_with_digest(&LLAMA, &directory, &digest)
                 .unwrap_err()

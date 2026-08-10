@@ -309,6 +309,14 @@ body {
   transition: width 180ms ease-out;
 }
 
+/* Studio's column holds the run settings — sliders, number steppers, a mask
+ * canvas — not a list of session titles, so it needs more room than chat does.
+ * `max` rather than a flat width so the density setting can still widen it, and
+ * only ever widens: the spacious 22rem stays 22rem. */
+.app-session-sidebar[data-section="studio"] {
+  width: max(var(--app-sidebar-width), 21rem);
+}
+
 :root[data-ui-density="compact"] .app-session-sidebar button {
   min-height: 2rem;
 }

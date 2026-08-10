@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use little_monkey_lib::egress;
 use little_monkey_lib::model_sources::{
     self, InstalledModelReference, ModelDownloadProgress, ModelReferenceSource,
 };
@@ -199,6 +200,9 @@ pub async fn pull(reference: &str, insecure: bool) -> Result<(), String> {
 }
 
 fn managed_llama_server(app_data: &Path) -> Result<PathBuf, String> {
+    // K22: the CLI shares the desktop app's runtime trees, so it runs the same
+    // startup integrity gate before spawning one of them.
+    little_monkey_lib::self_integrity::ensure_loadable()?;
     match little_monkey_lib::managed_runtime::materialize_bundled_runtime(None, app_data)? {
         Some(path) => Ok(path),
         None => little_monkey_lib::managed_runtime::find_managed_llama_server(Some(app_data))
@@ -306,11 +310,8 @@ async fn wait_until_healthy(
             }
         }
 
-        if let Ok(response) = client
-            .get(&health_url)
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await
+        if let Ok(response) =
+            egress::send(client.get(&health_url).timeout(Duration::from_secs(2))).await
         {
             if response.status().is_success()
                 && server_reports_alias(client, port, expected_alias).await
@@ -339,15 +340,12 @@ async fn wait_until_healthy(
 
 async fn server_reports_alias(client: &reqwest::Client, port: u16, expected_alias: &str) -> bool {
     let models_url = format!("http://{}:{port}/v1/models", Ipv4Addr::LOCALHOST);
-    let mut response = match client
-        .get(models_url)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-    {
-        Ok(response) if response.status().is_success() => response,
-        _ => return false,
-    };
+    // Chunked below rather than buffered, and metering does not change that.
+    let mut response =
+        match egress::send(client.get(models_url).timeout(Duration::from_secs(2))).await {
+            Ok(response) if response.status().is_success() => response,
+            _ => return false,
+        };
     if response
         .content_length()
         .is_some_and(|length| length > MAX_MODELS_RESPONSE_BYTES as u64)
@@ -382,19 +380,27 @@ fn models_payload_reports_alias(bytes: &[u8], expected_alias: &str) -> bool {
 }
 
 /// Materializes/finds the verified app-owned runtime, starts it against the
-/// installed GGUF on an available loopback port, and waits for `/health`.
+/// GGUF at `model_path` on an available loopback port, and waits for `/health`.
+///
+/// Takes the path rather than an `InstalledModelReference` because it only ever
+/// used that struct's `local_path`, and the second caller has no reference to
+/// give: a run placed by another owned machine names a model *id*, which the
+/// receiving node resolves against its own runtime-hub inventory
+/// (`m3_runtime_hub::installed_model_artifact`) rather than against the CLI's
+/// separate `<app_data>/models` store. Both callers still go through
+/// `verify_managed_model_for_runtime` below, which is the check that matters.
 pub async fn start_server(
     client: &reqwest::Client,
-    installed: &InstalledModelReference,
+    model_path: &Path,
     context_tokens: u32,
 ) -> Result<ManagedServerSession, String> {
-    model_sources::verify_managed_model_for_runtime(&installed.local_path)?;
+    model_sources::verify_managed_model_for_runtime(model_path)?;
     let data = app_data_dir()?;
     let binary = managed_llama_server(&data)?;
     for attempt in 1..=MAX_START_ATTEMPTS {
         let port = candidate_loopback_port()?;
         let startup_alias = little_monkey_lib::llama::fresh_server_alias();
-        let args = chat_server_args(&installed.local_path, port, context_tokens, &startup_alias);
+        let args = chat_server_args(model_path, port, context_tokens, &startup_alias);
         eprintln!("Starting Little Monkey's managed llama-server on 127.0.0.1:{port}...");
 
         let mut command = Command::new(&binary);
@@ -513,21 +519,38 @@ mod tests {
 
     #[test]
     fn available_port_is_ephemeral_and_loopback_rebindable() {
-        let port = match candidate_loopback_port() {
-            Ok(port) => port,
-            // Some restricted CI/sandbox profiles prohibit even a loopback
-            // bind. Production still reports that failure to the caller.
-            Err(error)
-                if error.contains("Operation not permitted")
-                    || error.contains("Permission denied") =>
-            {
-                return
+        // The probe listener is closed before we rebind, so a busy runner can
+        // claim the port in between. Production tolerates that with its own
+        // fresh-port retry in `start_server`; the test retries too instead of
+        // failing on a lost race.
+        const REBIND_ATTEMPTS: usize = 5;
+        for attempt in 1..=REBIND_ATTEMPTS {
+            let port = match candidate_loopback_port() {
+                Ok(port) => port,
+                // Some restricted CI/sandbox profiles prohibit even a loopback
+                // bind. Production still reports that failure to the caller.
+                Err(error)
+                    if error.contains("Operation not permitted")
+                        || error.contains("Permission denied") =>
+                {
+                    return
+                }
+                Err(error) => panic!("{error}"),
+            };
+            assert_ne!(port, 0);
+            match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => {
+                    assert_eq!(listener.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+                    return;
+                }
+                Err(error) if attempt < REBIND_ATTEMPTS => {
+                    eprintln!("port {port} was claimed before the rebind ({error}); retrying");
+                }
+                Err(error) => panic!(
+                    "no ephemeral loopback port stayed free across {REBIND_ATTEMPTS} attempts: {error}"
+                ),
             }
-            Err(error) => panic!("{error}"),
-        };
-        assert_ne!(port, 0);
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
-        assert_eq!(listener.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+        }
     }
 
     #[test]

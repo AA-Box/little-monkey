@@ -3,6 +3,10 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Activity, Ban, Cloud, KeyRound, Loader2, Play, Power, RefreshCw, RotateCw, ShieldAlert, Square, Trash2 } from "lucide-react";
 import {
+  backpressureGate,
+  backpressureMessage,
+  backpressureOf,
+  type BackpressureState,
   daemonInstall,
   daemonKillSwitch,
   daemonQueue,
@@ -29,10 +33,18 @@ import { useRecipeStore } from "../../store/recipeStore";
 import { useRunStore } from "../../store/runStore";
 import { Button, Tabs } from "../ui";
 import { errorMessage } from "../../lib/errors";
+import { useT } from "../../lib/i18n";
 
 function errorText(error: unknown) { return errorMessage(error); }
 
+function backpressureStateLabel(t: ReturnType<typeof useT>["t"], state: BackpressureState): string {
+  if (state === "closed") return t("BackgroundAgentsPanel.backpressureClosed");
+  if (state === "slow") return t("BackgroundAgentsPanel.backpressureSlow");
+  return t("BackgroundAgentsPanel.backpressureAccepting");
+}
+
 export function BackgroundAgentsPanel() {
+  const { t } = useT();
   const [tab, setTab] = useState<"daemon" | "queue" | "remote">("daemon");
   const [status, setStatus] = useState<DaemonStatus | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -60,6 +72,19 @@ export function BackgroundAgentsPanel() {
   const [pair, setPair] = useState({ expiresMinutes: 15, actions: ["view-runs", "view-events", "read-artifacts"], mobileCapabilities: [] as string[], runIds: "", workspaceIds: "", maxArtifactBytes: 8 * 1024 * 1024 });
   const [audit, setAudit] = useState<unknown>(null);
   const [deviceId, setDeviceId] = useState("");
+
+  // Absent on an older daemon, which `backpressureOf` reads as accepting — a
+  // signal this build cannot see must never become a refusal.
+  const backpressure = useMemo(() => backpressureOf(status), [status]);
+  const queueGate = useMemo(() => backpressureGate(backpressure, "batch"), [backpressure]);
+  const queueBackpressureMessage = useMemo(
+    () => backpressureMessage(
+      backpressure,
+      t("BackgroundAgentsPanel.backpressureFallbackDetail"),
+      (retryAfterMs) => t("BackgroundAgentsPanel.backpressureRetryHint", { seconds: Math.round(retryAfterMs / 1_000) }),
+    ),
+    [backpressure, t],
+  );
 
   const queueWarnings = useMemo(() => validateDaemonQueuePolicy(queue), [queue]);
   const pairRequest = useMemo(() => ({
@@ -110,7 +135,7 @@ export function BackgroundAgentsPanel() {
 
       {tab === "daemon" && <>
         <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
-          {[["Service", status?.serviceRunning ? "Running" : status?.installed ? "Stopped" : "Not installed"], ["Heartbeat", status?.heartbeatFresh ? "Healthy" : "Offline"], ["Active", status?.active ?? 0], ["Waiting approval", status?.waitingApproval ?? 0], ["Queued", status?.queued ?? 0], ["Paused", status?.paused ?? 0], ["PID", status?.pid ?? "—"], ["Kill switch", status?.killSwitch ? "Engaged" : "Released"]].map(([label, value]) => <div key={String(label)} className="rounded-lg border border-border bg-surface p-3"><p className="text-[11px] text-faint">{label}</p><p className="mt-1 text-sm font-medium text-foreground">{value}</p></div>)}
+          {[["Service", status?.serviceRunning ? "Running" : status?.installed ? "Stopped" : "Not installed"], ["Heartbeat", status?.heartbeatFresh ? "Healthy" : "Offline"], ["Active", status?.active ?? 0], ["Waiting approval", status?.waitingApproval ?? 0], ["Queued", status?.queued ?? 0], ["Paused", status?.paused ?? 0], ["PID", status?.pid ?? "—"], ["Kill switch", status?.killSwitch ? "Engaged" : "Released"], [t("BackgroundAgentsPanel.backpressureLabel"), backpressureStateLabel(t, backpressure.state)], [t("BackgroundAgentsPanel.backpressureQueueLabel"), `${backpressure.queueDepth}/${backpressure.queueCapacity || "—"}`]].map(([label, value]) => <div key={String(label)} className="rounded-lg border border-border bg-surface p-3"><p className="text-[11px] text-faint">{label}</p><p className="mt-1 text-sm font-medium text-foreground">{value}</p></div>)}
         </div>
         {!status?.installed ? <div className="rounded-lg border border-border bg-surface p-3">
           <h4 className="text-xs font-semibold text-foreground">Install current-user service</h4>
@@ -128,7 +153,16 @@ export function BackgroundAgentsPanel() {
         {queue.ownedWorktree && <div className="mt-2 grid gap-2 sm:grid-cols-2"><label className="text-xs text-muted">Repository<input value={queue.repository ?? ""} onChange={(event) => setQueue({ ...queue, repository: event.target.value || null })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label><label className="text-xs text-muted">Protected branch prefix<input value={queue.branchPrefix} onChange={(event) => setQueue({ ...queue, branchPrefix: event.target.value })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label></div>}
         <div className="mt-3 flex flex-wrap gap-4 text-xs text-muted">{[["allowPush", "Push owned branch"], ["allowCreatePullRequest", "Create draft PR"], ["allowReviewComment", "Publish review comments"]].map(([key, label]) => <label key={key} className="flex gap-2"><input type="checkbox" checked={Boolean(queue[key as keyof DaemonQueueRequest])} onChange={(event) => setQueue({ ...queue, [key]: event.target.checked })} /> {label}</label>)}</div>
         {queueWarnings.map((warning) => <p key={warning} role="alert" className="mt-2 text-xs text-warning">{warning}</p>)}
-        <Button className="mt-3" variant="primary" disabled={!status?.serviceRunning || !queue.recipe || queueWarnings.length > 0 || busy !== null} onClick={() => { const writes = queue.allowPush || queue.allowCreatePullRequest || queue.allowReviewComment; if (!writes || window.confirm("Queue this background job with the displayed Git/GitHub write scopes?")) void act("queue", () => daemonQueue(queue)); }}><Activity size={14} /> Queue durable run</Button>
+        {/* K8 backpressure, as a BATCH producer. Nobody is watching a queued
+            job, so `slow` — the state that exists precisely for a producer with
+            a choice — defers it behind an explicit override instead of adding
+            to a queue the daemon just asked us to stop feeding. `closed`
+            disables the button outright: the daemon's `enqueue` refuses there,
+            and attempting it would replace this actionable sentence with a
+            generic error. The sentence itself is the daemon's own `detail`,
+            shown verbatim — never parsed, never paraphrased. */}
+        {!queueGate.proceed && <p role="alert" className="mt-2 text-xs text-warning">{queueBackpressureMessage}</p>}
+        <Button className="mt-3" variant="primary" disabled={!status?.serviceRunning || !queue.recipe || queueWarnings.length > 0 || busy !== null || (!queueGate.proceed && !queueGate.deferrable)} onClick={() => { if (queueGate.deferrable && !window.confirm(t("BackgroundAgentsPanel.backpressureQueueAnywayConfirm", { detail: queueBackpressureMessage }))) return; const writes = queue.allowPush || queue.allowCreatePullRequest || queue.allowReviewComment; if (!writes || window.confirm("Queue this background job with the displayed Git/GitHub write scopes?")) void act("queue", () => daemonQueue(queue)); }}><Activity size={14} /> Queue durable run</Button>
       </div>}
 
       {tab === "remote" && <>

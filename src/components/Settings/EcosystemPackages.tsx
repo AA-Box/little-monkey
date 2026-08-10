@@ -4,6 +4,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { readTextFile, stat, writeTextFile } from "@tauri-apps/plugin-fs";
 import { Button, StatusPill } from "../ui";
 import { ecosystemClient, type InstalledPackageState, type PackageCatalogEntry, type PackagePermission, type PortablePackageExport } from "../../lib/ecosystemClient";
+import { ResolutionSection } from "./PackageResolution";
 import { useT } from "../../lib/i18n";
 import { useEcosystemStore } from "../../store/ecosystemStore";
 import { errorMessage } from "../../lib/errors";
@@ -337,6 +338,7 @@ export function EcosystemPackages({ view }: { view: "marketplace" | "installed" 
             ) : (
               <section className="mt-5"><h4 className="mb-2 text-xs font-semibold text-foreground">{t("EcosystemPackages.requestedPermissions")}</h4><PermissionList permissions={installPreview.preview.permissions} empty={t("EcosystemPackages.noPermissions")} /></section>
             )}
+            <ResolutionSection plan={installPreview.preview.plan} />
             {installPreview.preview.mcp_actions_separate.length > 0 && (
               <div className="mt-4 rounded-lg border border-warning/30 bg-warning-soft p-3 text-xs text-warning">
                 {t("EcosystemPackages.mcpSeparate", { count: installPreview.preview.mcp_actions_separate.length })}
@@ -347,7 +349,7 @@ export function EcosystemPackages({ view }: { view: "marketplace" | "installed" 
               <Button variant="ghost" onClick={() => useEcosystemStore.setState({ installPreview: null })}>{t("EcosystemPackages.deny")}</Button>
               <Button
                 variant="primary"
-                disabled={busy["package-install"] || busy["package-update"]}
+                disabled={busy["package-install"] || busy["package-update"] || !installPreview.preview.plan.satisfiable}
                 onClick={() => void (previewIntent === "install"
                   ? installPackage(true)
                   : updatePackage(installPreview.preview.package_id, installPreview.preview.version, true))}

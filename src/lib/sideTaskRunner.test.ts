@@ -551,8 +551,12 @@ describe("openSideTaskAsFullChat", () => {
     expect(newSessionId).not.toBeNull();
     expect(useSessionStore.getState().sessions.length).toBe(beforeCount + 1);
     const session = useSessionStore.getState().sessions.find((s) => s.id === newSessionId)!;
-    expect(session.messages[0]).toEqual({ role: "user", content: "Explain the auth flow in depth" });
-    expect(session.messages[1]).toEqual({ role: "assistant", content: "Here's the report." });
+    expect(session.messages[0]).toEqual({
+      role: "user",
+      content: "Explain the auth flow in depth",
+      at: expect.any(Number),
+    });
+    expect(session.messages[1]).toEqual({ role: "assistant", content: "Here's the report.", at: expect.any(Number) });
     expect(useSessionStore.getState().activeSessionId).toBe(newSessionId);
   });
 

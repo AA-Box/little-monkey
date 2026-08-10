@@ -188,9 +188,33 @@ describe("daemon desktop routing and event replay", () => {
 
   it("falls back only when M6A is absent and fails closed when installed but unhealthy", () => {
     expect(daemonRouteFromStatus({ ...healthy, installed: false })).toBe("fallback");
+    // `healthy` carries no `backpressure` field, which is what an older daemon
+    // sends: a missing signal must route normally rather than block the app.
     expect(daemonRouteFromStatus(healthy)).toBe("daemon");
     expect(() => daemonRouteFromStatus({ ...healthy, heartbeatFresh: false })).toThrow(/not healthy/i);
     expect(() => daemonRouteFromStatus({ ...healthy, killSwitch: true })).toThrow(/kill switch/i);
+  });
+
+  it("refuses an interactive turn on closed backpressure and lets slow through", () => {
+    const signal = (state: "accepting" | "slow" | "closed", detail: string, retry: number | null) => ({
+      state, accepting: state !== "closed", reason: null, detail,
+      retry_after_ms: retry, queue_depth: 1, queue_capacity: 128, queued: 1, held: 0,
+    });
+
+    // Closed: nothing is attempted, and the user reads the daemon's own
+    // sentence plus its advisory retry hint rather than a generic enqueue error.
+    expect(() => daemonRouteFromStatus({
+      ...healthy,
+      backpressure: signal("closed", "128 of 128 queue slots are in use; wait for a run or cancel one", 5_000),
+    })).toThrow(/128 of 128 queue slots are in use.*about 5s/i);
+
+    // Slow: a person is waiting on this turn. There is nothing to defer to, so
+    // deferring would be a refusal they did not ask for.
+    expect(daemonRouteFromStatus({
+      ...healthy,
+      backpressure: signal("slow", "103 of 128 queue slots are in use; slow down", 2_000),
+    })).toBe("daemon");
+    expect(daemonRouteFromStatus({ ...healthy, backpressure: signal("accepting", "", null) })).toBe("daemon");
   });
 
   it("replays ordered deltas once and projects terminal status", () => {

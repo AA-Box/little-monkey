@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import { isMachOFile } from "./lib/machO.mjs";
 import {
   managedRuntime,
+  restampRuntimeManifest,
   stagedRuntimeDirectory,
 } from "./lib/managedRuntimeManifest.mjs";
 
@@ -105,6 +106,12 @@ for (const path of binaries) {
   });
 }
 
+// Signing changed every binary's bytes, so the manifest staging wrote no longer
+// describes this tree. Restamp it here — before build.rs hashes the manifest
+// into the app and before Tauri copies the tree into Contents/Resources — or
+// managed_runtime.rs rejects the shipped runtime and nothing can launch it.
+restampRuntimeManifest(stageRoot);
+
 console.log(
-  `[codesign-managed-runtime] signed and verified ${binaries.length} binaries for ${target}`,
+  `[codesign-managed-runtime] signed and verified ${binaries.length} binaries for ${target}, manifest restamped`,
 );

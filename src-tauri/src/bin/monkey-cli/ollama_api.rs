@@ -5,6 +5,7 @@
 //! HTTP API directly, so monkey-cli only needs a reachable daemon. All endpoints
 //! resolve their base URL through `host()`, honoring `OLLAMA_HOST`.
 use futures_util::StreamExt;
+use little_monkey_lib::egress;
 use little_monkey_lib::providers::Utf8ChunkAccumulator;
 use serde::{Deserialize, Serialize};
 
@@ -270,9 +271,7 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     path: &str,
     what: &str,
 ) -> Result<T, String> {
-    let response = client
-        .get(api(path))
-        .send()
+    let response = egress::send(client.get(api(path)))
         .await
         .map_err(|e| format!("Failed to reach Ollama: {e}"))?;
     let response = check_status(response, what).await?;
@@ -296,12 +295,13 @@ pub async fn ps(client: &reqwest::Client) -> Result<PsResp, String> {
 }
 
 pub async fn show(client: &reqwest::Client, model: &str) -> Result<ShowResp, String> {
-    let response = client
-        .post(api("/api/show"))
-        .json(&serde_json::json!({ "model": model }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach Ollama: {e}"))?;
+    let response = egress::send(
+        client
+            .post(api("/api/show"))
+            .json(&serde_json::json!({ "model": model })),
+    )
+    .await
+    .map_err(|e| format!("Failed to reach Ollama: {e}"))?;
     let response = check_status(response, "show").await?;
     response
         .json()
@@ -310,39 +310,38 @@ pub async fn show(client: &reqwest::Client, model: &str) -> Result<ShowResp, Str
 }
 
 pub async fn delete(client: &reqwest::Client, model: &str) -> Result<(), String> {
-    let response = client
-        .delete(api("/api/delete"))
-        .json(&serde_json::json!({ "model": model }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach Ollama: {e}"))?;
+    let response = egress::send(
+        client
+            .delete(api("/api/delete"))
+            .json(&serde_json::json!({ "model": model })),
+    )
+    .await
+    .map_err(|e| format!("Failed to reach Ollama: {e}"))?;
     check_status(response, "delete").await.map(|_| ())
 }
 
 pub async fn copy(client: &reqwest::Client, source: &str, destination: &str) -> Result<(), String> {
-    let response = client
-        .post(api("/api/copy"))
-        .json(&serde_json::json!({ "source": source, "destination": destination }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach Ollama: {e}"))?;
+    let response = egress::send(
+        client
+            .post(api("/api/copy"))
+            .json(&serde_json::json!({ "source": source, "destination": destination })),
+    )
+    .await
+    .map_err(|e| format!("Failed to reach Ollama: {e}"))?;
     check_status(response, "copy").await.map(|_| ())
 }
 
 /// Unload a model from memory (= `ollama stop`): a chat request with an
 /// empty message list and `keep_alive: 0`. The reply body is ignored.
 pub async fn unload(client: &reqwest::Client, model: &str) -> Result<(), String> {
-    let response = client
-        .post(api("/api/chat"))
-        .json(&serde_json::json!({
-            "model": model,
-            "messages": [],
-            "keep_alive": 0,
-            "stream": false,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach Ollama: {e}"))?;
+    let response = egress::send(client.post(api("/api/chat")).json(&serde_json::json!({
+        "model": model,
+        "messages": [],
+        "keep_alive": 0,
+        "stream": false,
+    })))
+    .await
+    .map_err(|e| format!("Failed to reach Ollama: {e}"))?;
     check_status(response, "stop").await.map(|_| ())
 }
 
@@ -391,10 +390,9 @@ pub async fn chat_stream(
     req: &NativeChatReq,
     mut on_event: impl FnMut(ChatEvent) -> Result<(), String>,
 ) -> Result<(), String> {
-    let response = client
-        .post(api("/api/chat"))
-        .json(req)
-        .send()
+    // Metered, still streamed: `stream_ndjson` below reads the same response
+    // frame by frame.
+    let response = egress::send(client.post(api("/api/chat")).json(req))
         .await
         .map_err(|e| format!("Failed to reach Ollama: {e}"))?;
     let response = check_status(response, "chat").await?;
@@ -421,8 +419,8 @@ async fn stream_progress(
     what: &str,
     mut on_progress: impl FnMut(ProgressLine),
 ) -> Result<(), String> {
-    let response = request
-        .send()
+    // Same for pull/push/create: the NDJSON progress body stays streamed.
+    let response = egress::send(request)
         .await
         .map_err(|e| format!("Failed to reach Ollama: {e}"))?;
     let response = check_status(response, what).await?;

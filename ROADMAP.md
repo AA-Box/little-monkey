@@ -21,23 +21,26 @@ have no entry here.
 
 ---
 
-## 1. Policy-driven model routing
+## 1. Policy-driven model routing *(partially built)*
 
-**Today:** a single hardcoded fallback toggle. Provider failover follows a
-fixed sequence; there is no user-defined policy of any kind.
+**Shipped:** named routing policies authored in **Settings → Automation →
+Dispatch policies**, evaluated top to bottom (the list order *is* the
+precedence), each scoped by task class and constrained by a cost-rate ceiling,
+a measured-latency target, data sensitivity, a tool requirement, and an ordered
+list of preferred models. A matched policy also supplies the turn's failover
+order, replacing the fixed provider sequence. Which policy chose a turn's
+target and why appears as a transcript note and in the panel, alongside every
+rejected model and the reason it lost. Policies only ever select among models
+already configured, and routing runs before the Privacy Firewall, which still
+overrides it.
 
-**Acceptance:** a user can author named routing policies (by task class,
-cost ceiling, latency target, data sensitivity, or tool requirements),
-inspect which policy chose a given turn's target and why, and reorder or
-disable policies without editing code. A policy can never widen a permission
-or bypass the Privacy Firewall.
+**Remaining:** subagent task classes (blocked on lifting target resolution out
+of `agentLoop.ts` — see K9 in [docs/agent-os-roadmap.md](docs/agent-os-roadmap.md)
+for why the import direction forbids it today), routing to managed llama.cpp
+rather than only Ollama for local-only policies, and recording the decision in
+the durable run ledger so "why this target" survives a restart.
 
-## 2. Real benchmarking
-
-**Today:** the Quantization workbench performs genuine conversions and
-records reproducible reports, and the Runtime Hub shows honest hardware
-detection. The "benchmark" surface, however, measures nothing — edge device
-profiles are static prose, not measurements.
+## 2. Real benchmarking *(built)*
 
 **Acceptance:** a benchmark run produces measured tokens/sec, time-to-first
 token, and peak memory for a specific model + runtime + quantization on
@@ -45,25 +48,68 @@ token, and peak memory for a specific model + runtime + quantization on
 snapshot attached. No number is displayed that was not measured on the
 machine displaying it.
 
-## 3. Prompt and workflow version control
+**Shipped — Runtime Hub → Benchmark.** Every duration comes from a monotonic
+`Instant` around a real streamed generation on this machine; token counts come
+from the runtime's own completion usage; peak memory comes from sampling the
+runtime process. Variance is the sample standard deviation across repeats, and it
+is *absent* rather than `0.0` for a single repeat. The first repeat is discarded as
+warm-up so that loading the weights is not reported as prefill.
 
-**Today:** last-write-wins everywhere. Only marketplace packages have a diff
-view.
+The last clause is enforced in the type system rather than by convention: an
+unmeasurable field carries the reason it is unmeasurable and has no numeric
+branch to render, so a gap cannot be printed as a zero. There is deliberately no
+chart — a zero-height bar cannot say "unknown" rather than "zero".
 
-**Acceptance:** prompts, personas, skills, and workflow definitions keep a
-local revision history with diff, restore, and branch/compare; a concurrent
-edit is detected and surfaced rather than silently overwritten.
+**One honest gap:** no runtime here reports a quantization *scheme* for a loaded
+model (a GGUF's `general.quantization_version` is a format version, not `Q4_K_M`),
+so a run identifies its model and runtime and says plainly that it cannot identify
+the quantization. See `docs/agent-os-roadmap.md` K6 for the full account, including
+why the abandoned TypeScript prototype was audited and not salvaged.
 
-## 4. Cost attribution and budget enforcement *(partially built)*
+**Remaining:** `runtimeEdgeProfiles.ts` still returns hardcoded prose profiles
+whose own text defers to this benchmark; replacing that prose with measurements is
+a separate change.
+
+## 3. Prompt and workflow version control *(built)*
+
+**Shipped:** personas, snippets, skills, and workflow definitions keep an
+append-only local revision history (`config-revisions/` in the app data
+directory). **Settings → Prompts** gives every entry a History button and the
+workflow editor gives every saved workflow one: list revisions, select any two
+— including two on different branches — to diff, restore an older snapshot
+back into the editor, and fork a named branch to keep a variant instead of
+overwriting it. A save that would clobber another window's (or the CLI's) is
+refused and surfaced with a choice — take theirs, or knowingly overwrite —
+rather than silently winning.
+
+**Remaining:** rules/memory files and MCP server definitions are not versioned
+yet; the history is per-entity, with no cross-entity "what did this release
+change" view.
+
+## 4. Cost attribution and budget enforcement *(built)*
 
 **Shipped:** per-request cost recording against user-entered rates, daily and
 monthly budgets with a warn/pause enforcement mode, and a live budget check
 before every provider request (**Settings → Usage**).
 
-**Remaining:** per-workspace and per-project attribution, multi-tier warning
-thresholds, and honest handling of providers whose real billing differs from
-the user's entered rate (the app cannot see actual invoices and must not
-imply that it can).
+Every recorded call is attributed to the workspace that was open when it went
+out and to the project folder its conversation belongs to — two different
+things once a chat outlives the folder it was started in — and can be broken
+down by either, or by session or model. Anything recorded without one is
+counted under *Unattributed* rather than charged to a folder it may not belong
+to. The workspace key is the same one the K6 process ledger stamps on
+processes, so a workspace's measured wall/CPU/GPU time is shown beside its
+token bill; an unmeasured field renders as its reason, never as a zero.
+
+Budget warnings are multi-tier (default 50/80/95%), and the highest tier
+crossed is reported rather than the first.
+
+Provider billing is handled honestly rather than pretended away: every figure
+the app computes is labelled an estimate from user-entered rates, calls with no
+configured rate stay visibly unpriced, and a month's actual invoice total can be
+entered per provider to show the drift against the estimate. Recording a bill
+never rewrites the per-call estimates — a monthly total cannot be honestly split
+back across the calls that produced it — and the app never reads an invoice.
 
 ## 5. Mobile companion — remaining gaps *(partially built)*
 
@@ -119,11 +165,20 @@ the requested split.
 **Today:** the in-app updater ships on all three desktop platforms — background
 checks, a staged bundle, a relaunch card, and Windows deferring its installer to
 the click so an update cannot kill a turn mid-flight — and releases publish
-themselves once every matrix target has uploaded. What is missing: rollback, a
-manual check control, a visible failed check, Linux coverage beyond the AppImage,
-and a startup self-integrity check. Signing is macOS-only. Ten locales are each
-missing the same ~650 of 1,726 keys (they fall back to English at runtime). There
-is no dependency scanning, SBOM, accessibility CI, or penetration test.
+themselves once every matrix target has uploaded. Settings → Updates & integrity
+adds the manual half: a check-now control, the last check and its failure if it
+failed, and a per-platform rollback that snapshots the install before an update
+replaces it and restores it with a detached script. A Linux install that is not
+an AppImage is told so instead of silently never updating. A startup
+self-integrity check verifies the app's own signature and every managed runtime
+file against its trusted manifest before anything native is executed, and a
+mismatch refuses to launch rather than warning. CI runs dependency review, a
+Rust and npm advisory audit, and publishes a CycloneDX SBOM, which is also
+attached to every release. What is missing: signing beyond macOS (Windows needs
+a code-signing certificate; Linux has no OS-level signature to produce),
+clean-machine install/upgrade tests, an accessibility audit in CI, and a release
+penetration test. Ten locales are each missing the same ~650 of 1,726 keys (they
+fall back to English at runtime).
 
 **Acceptance:** signed, verifiable in-app updates with rollback on every
 supported platform; signed/notarized installers per platform; clean-machine

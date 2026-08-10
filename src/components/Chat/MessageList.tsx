@@ -1,5 +1,6 @@
 import { memo, useEffect, useId, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { reapplyCheckpoint, revertCheckpoint } from "../../lib/checkpointCompensation";
 import {
   BookmarkX,
   BookOpen,
@@ -16,6 +17,7 @@ import {
   ListChecks,
   LoaderCircle,
   MessageSquareX,
+  Pin,
   Plug,
   RefreshCw,
   Search,
@@ -58,7 +60,7 @@ import {
 import { isCompactionMarker } from "../../lib/contextTrimmer";
 import { isBtwNotice, isCommandNotice, parseCommandNotice, type CommandNotice } from "../../lib/slashCommands";
 import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore } from "../../store/sessionStore";
-import { selectTurnStatus, useTurnStatusStore, type TurnStatus } from "../../store/turnStatusStore";
+import { liveTurnTokens, selectTurnStatus, useTurnStatusStore, type TurnStatus } from "../../store/turnStatusStore";
 import { formatCompactTokens, formatElapsed } from "../../lib/taskFormat";
 import { useCheckpointStore } from "../../store/checkpointStore";
 import { useRulesStore } from "../../store/rulesStore";
@@ -68,6 +70,7 @@ import GeneratedImageCard from "./GeneratedImageCard";
 import PlanCard from "./PlanCard";
 import SubagentRow from "./SubagentRow";
 import SubagentGroupCard, { type SubagentGroupTask } from "./SubagentGroupCard";
+import WorkflowChatCard from "./WorkflowChatCard";
 import { CheckpointPreviewModal } from "./CheckpointPreviewModal";
 import { useT } from "../../lib/i18n";
 import { StepCopyButton, ToolStepRow, TOOL_STEP_LIST_CLASSES } from "./ToolStepRow";
@@ -115,6 +118,10 @@ export interface MessageListProps {
   /** Prepares a generated PNG as an image attachment in the composer so the
    * user can describe an edit before sending another turn. */
   onEditGeneratedImage?: (path: string, prompt: string, artifactId?: string) => void | Promise<void>;
+  /** Opens the Background-tasks drawer — threaded to `SubagentGroupCard` so
+   * clicking a parallel-agents card reveals its per-agent table there (see
+   * that component's `onOpenPanel`). Omitted keeps the inline expansion. */
+  onOpenBackgroundTasks?: () => void;
 }
 
 type TimelineItem =
@@ -122,6 +129,7 @@ type TimelineItem =
   | { kind: "activity"; key: string; calls: ActivityCall[]; prompt: string }
   | { kind: "subagent"; key: string; taskId: string; args: string; result?: string }
   | { kind: "subagentGroup"; key: string; tasks: SubagentGroupTask[] }
+  | { kind: "workflow"; key: string; runId: string; args: string; result?: string }
   | { kind: "notice"; key: string; text: string }
   | { kind: "command"; key: string; notice: CommandNotice }
   | { kind: "checkpoint"; key: string; notice: CheckpointNotice; messageIndex: number }
@@ -190,6 +198,16 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
             calls: entry.calls,
             prompt: latestUserPrompt,
           });
+          continue;
+        }
+
+        if (entry.kind === "workflows") {
+          // One card per `workflow` call — a round issuing several distinct
+          // named workflows should read as several named cards, unlike the
+          // interchangeable agents of a task group.
+          for (const call of entry.calls) {
+            items.push({ kind: "workflow", key: `workflow-${call.id}`, runId: call.id, args: call.args, result: call.result });
+          }
           continue;
         }
 
@@ -634,7 +652,7 @@ const CheckpointRow = memo(function CheckpointRow({
 
   const restoreFiles = async (): Promise<boolean> => {
     try {
-      await invoke("checkpoint_revert", { id: notice.id });
+      await revertCheckpoint(notice.id);
       useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
         content: formatCheckpointNotice({ ...notice, reverted: true }),
       });
@@ -654,7 +672,7 @@ const CheckpointRow = memo(function CheckpointRow({
     setBusy(true);
     setError(null);
     try {
-      await invoke("checkpoint_reapply", { id: notice.id });
+      await reapplyCheckpoint(notice.id);
       useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
         content: formatCheckpointNotice({ ...notice, reverted: false }),
       });
@@ -1024,6 +1042,7 @@ function TurnStatusLine({ status }: { status: TurnStatus }) {
 
   const elapsedMs = Date.now() - status.startedAt;
   const silentMs = Date.now() - status.lastEventAt;
+  const { tokens, estimated } = liveTurnTokens(status);
   const word = status.activity
     ? `${liveActivityLabel(status.activity)}…`
     : t(silentMs >= STILL_THINKING_AFTER_MS ? "MessageList.turnStatusStillThinking" : "MessageList.turnStatusThinking");
@@ -1036,10 +1055,17 @@ function TurnStatusLine({ status }: { status: TurnStatus }) {
         ✳
       </span>
       <span className="font-mono">{formatElapsed(elapsedMs)}</span>
-      {status.totalTokens > 0 && (
+      {tokens > 0 && (
         <>
           <span>·</span>
-          <span className="font-mono">{t("MessageList.turnStatusTokens", { count: formatCompactTokens(status.totalTokens) })}</span>
+          {/* `~` while part of the number is estimated from streamed text —
+              it firms up to the exact count the moment the attempt reports
+              its usage. */}
+          <span className="font-mono">
+            {t("MessageList.turnStatusTokens", {
+              count: `${estimated ? "~" : ""}${formatCompactTokens(tokens)}`,
+            })}
+          </span>
         </>
       )}
       <span>·</span>
@@ -1102,6 +1128,7 @@ export default function MessageList({
   messageIndexOffset = 0,
   onStartSideTask,
   onEditGeneratedImage,
+  onOpenBackgroundTasks,
 }: MessageListProps) {
   const { t } = useT();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -1145,7 +1172,7 @@ export default function MessageList({
           {items.map((item) => {
             if (item.kind === "bubble") {
               const editable = item.message.role === "user" && onEditUserMessage;
-              return (
+              const bubble = (
                 <MessageBubble
                   key={item.key}
                   message={item.message}
@@ -1157,6 +1184,23 @@ export default function MessageList({
                   preferredTranslationLocale={preferredTranslationLocale}
                   onStartSideTask={onStartSideTask}
                 />
+              );
+              // A message pinned as a chapter (see `MessageActions.tsx`)
+              // carries its own divider, so a long transcript reads as
+              // labelled sections instead of one undifferentiated scroll.
+              if (item.message.chapter === undefined) return bubble;
+              return (
+                <div key={item.key} className="flex flex-col gap-6">
+                  <div className="flex items-center gap-2 text-faint">
+                    <span className="h-px flex-1 bg-border" />
+                    <span className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide">
+                      <Pin size={11} />
+                      {item.message.chapter}
+                    </span>
+                    <span className="h-px flex-1 bg-border" />
+                  </div>
+                  {bubble}
+                </div>
               );
             }
             if (item.kind === "activity") {
@@ -1188,8 +1232,20 @@ export default function MessageList({
                 <SubagentRow key={item.key} sessionId={sessionId} taskId={item.taskId} args={item.args} result={item.result} />
               );
             }
+            if (item.kind === "workflow") {
+              return (
+                <WorkflowChatCard
+                  key={item.key}
+                  sessionId={sessionId}
+                  runId={item.runId}
+                  args={item.args}
+                  result={item.result}
+                  onOpenPanel={onOpenBackgroundTasks}
+                />
+              );
+            }
             if (item.kind === "subagentGroup") {
-              return <SubagentGroupCard key={item.key} sessionId={sessionId} tasks={item.tasks} />;
+              return <SubagentGroupCard key={item.key} sessionId={sessionId} tasks={item.tasks} onOpenPanel={onOpenBackgroundTasks} />;
             }
             if (item.kind === "notice") {
               return <NoticeRow key={item.key} text={item.text} />;

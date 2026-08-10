@@ -1,3 +1,4 @@
+import { en } from "./en";
 import { crewLocale } from "./crew";
 import { runLocale } from "./runs";
 import { searchLocale } from "./search";
@@ -39,7 +40,8 @@ import { privacyFirewallLocale } from "./privacyFirewall";
 import { redTeamLabLocale } from "./redTeamLab";
 import { sandboxLocale } from "./sandbox";
 
-export const ko: Record<string, string> = {
+/** What this locale says in its own words — everything else falls back to English. */
+const translated: Record<string, string> = {
   ...dbAdminGuardrailsLocale,
   ...developerLocale,
   ...ecosystemLocale,
@@ -1083,6 +1085,11 @@ export const ko: Record<string, string> = {
   "MessageList.recipeStartedFromLocalApp": "레시피에서 시작됨: {{name}} · 로컬 앱 \"{{appName}}\" 경유",
   "SubagentRow.profileExplore": "탐색",
   "SubagentRow.profileCode": "코드",
+  "SubagentRow.worktreeChanges": "워크트리의 변경 사항",
+  "SubagentRow.worktreeApply": "적용",
+  "SubagentRow.worktreeDiscard": "버리기",
+  "SubagentRow.worktreeApplied": "워크스페이스에 적용됨",
+  "SubagentRow.worktreeDiscarded": "버려짐",
   "SubagentRow.statusRunning": "실행 중",
   "SubagentRow.statusDone": "완료",
   "SubagentRow.statusFailed": "실패",
@@ -1099,6 +1106,8 @@ export const ko: Record<string, string> = {
   "BackgroundTasksPanel.finishedHeading": "완료됨",
   "BackgroundTasksPanel.clearButton": "지우기",
   "BackgroundTasksPanel.stopAriaLabel": "\"{{name}}\" 중지",
+  "BackgroundTasksPanel.steerPlaceholder": "이 에이전트에게 메시지 보내기…",
+  "BackgroundTasksPanel.steerSendAriaLabel": "\"{{name}}\"에게 메시지 보내기",
   "BackgroundTasksPanel.shellKindLabel": "셸",
   "BackgroundTasksPanel.agentKindLabel": "에이전트",
   "BackgroundTasksPanel.exitCode": "종료 코드 {{code}}",
@@ -1119,6 +1128,20 @@ export const ko: Record<string, string> = {
   "BackgroundTasksPanel.agentStatusCompleted": "완료",
   "BackgroundTasksPanel.agentStatusFailed": "실패",
   "BackgroundTasksPanel.agentStatusCancelled": "취소됨",
+  "BackgroundTasksPanel.agentGroupTitle": "에이전트 {{count}}개",
+  "BackgroundTasksPanel.workflowKindLabel": "워크플로",
+  "BackgroundTasksPanel.savedWorkflowsHeading": "저장된 워크플로",
+  "BackgroundTasksPanel.saveWorkflowButton": "워크플로 저장",
+  "BackgroundTasksPanel.savedWorkflowShape": "{{phases}}개 단계 · {{agents}}개 에이전트",
+  "BackgroundTasksPanel.savedWorkflowLastRun": "마지막 실행 {{when}}",
+  "BackgroundTasksPanel.savedWorkflowNeverRun": "아직 실행되지 않음",
+  "BackgroundTasksPanel.savedWorkflowDeleteAriaLabel": "저장된 워크플로 \"{{name}}\" 삭제",
+  "BackgroundTasksPanel.phaseQueued": "대기 중",
+  "BackgroundTasksPanel.stopAllAriaLabel": "실행 중인 에이전트 모두 중지",
+  "BackgroundTasksPanel.tableAgentHeader": "에이전트",
+  "BackgroundTasksPanel.tableTokensHeader": "토큰",
+  "BackgroundTasksPanel.tableToolsHeader": "도구",
+  "BackgroundTasksPanel.tableTimeHeader": "시간",
   "MessageList.emptyStateTitle": "아직 표시할 내용이 없습니다",
   "MessageList.emptyStateDescription": "Little Monkey에게 워크스페이스에서 설명, 작성 또는 수정할 작업을 요청해 시작해 보세요.",
   "ModeSelector.modeManualLabel": "수동",
@@ -1261,6 +1284,13 @@ export const ko: Record<string, string> = {
   "AddCustomProviderForm.addButton": "추가",
   "AddCustomProviderForm.helpText": "OpenAI 호환 기본 URL이면 어떤 것이든 가능합니다 — 앱이 자동으로 /chat/completions와 /models를 추가합니다.",
   "AutomationPanel.reliabilityHeading": "안정성",
+  "AutomationPanel.hooksHeading": "후크",
+  "AutomationPanel.hooksDescription": "에이전트 수명 주기 이벤트에서 실행되는 셸 명령입니다. PreToolUse 후크는 도구 호출을 차단할 수 있습니다(0이 아닌 종료 코드 또는 stdout의 {\"decision\":\"deny\"}). UserPromptSubmit 출력은 턴의 컨텍스트에 추가됩니다. 10초 제한, 권한 프롬프트 없음.",
+  "AutomationPanel.hookEventLabel": "이벤트",
+  "AutomationPanel.hookMatcherPlaceholder": "도구 매처(정규식, 선택 사항)",
+  "AutomationPanel.hookCommandPlaceholder": "셸 명령",
+  "AutomationPanel.hookAddButton": "후크 추가",
+  "AutomationPanel.hookDeleteAriaLabel": "후크 \"{{command}}\" 삭제",
   "AutomationPanel.autoFailoverLabel": "공급자 간 자동 장애 조치",
   "AutomationPanel.autoFailoverDescription": "클라우드 공급자가 응답 전에 오류를 반환하면, 턴을 실패 처리하는 대신 구성된 다른 공급자로 자동 재시도합니다.",
   "AutomationPanel.autoVisionSwitchLabel": "이미지가 있으면 비전 모델로 자동 전환",
@@ -1325,6 +1355,10 @@ export const ko: Record<string, string> = {
   "AutomationPanel.subagentModelOverrideExploreLabel": "탐색(explore) 프로필",
   "AutomationPanel.subagentModelOverrideCodeLabel": "코드(code) 프로필",
   "AutomationPanel.subagentModelOverrideDefaultBadge": "상위와 동일",
+  "AutomationPanel.customAgentsIntro": "열린 워크스페이스의 .monkey/agents/*.md에서 불러온 커스텀 에이전트 — 각각 task 및 workflow 도구가 허용하는 추가 프로파일이 됩니다.",
+  "AutomationPanel.customAgentsRefreshButton": "새로 고침",
+  "AutomationPanel.customAgentsLoading": ".monkey/agents 스캔 중…",
+  "AutomationPanel.customAgentsEmpty": "커스텀 에이전트가 없습니다. 워크스페이스의 .monkey/agents/에 name, description, tools 프런트매터가 있는 markdown 파일을 추가하세요.",
   "AutomationPanel.checkpointsHeading": "체크포인트",
   "AutomationPanel.checkpointRetentionLabel": "최근 보관 개수",
   "AutomationPanel.checkpointRetentionDescription": "가장 오래된 것이 삭제되기 전까지 디스크에 보관할 최근 체크포인트 개수입니다. 다음에 생성되는 체크포인트부터 적용됩니다.",
@@ -1654,15 +1688,8 @@ export const ko: Record<string, string> = {
   "KnowledgePanel.addFileButton": "파일 추가",
   "KnowledgePanel.noSourcesHint": "아직 소스가 없습니다 — 인덱싱할 폴더나 파일을 추가하세요.",
   "KnowledgePanel.removeSourceAriaLabel": "소스 제거",
-  "KnowledgePanel.reindexButton": "다시 인덱싱",
-  "KnowledgePanel.cancelIndexButton": "인덱싱 취소",
-  "KnowledgePanel.phaseWalking": "파일 스캔 중…",
-  "KnowledgePanel.phaseChunking": "청크로 분할 중… ({{done}}/{{total}} 파일)",
-  "KnowledgePanel.phaseEmbedding": "임베딩 중… ({{chunks}}개 청크)",
-  "KnowledgePanel.phaseDone": "인덱싱됨",
   "KnowledgePanel.neverIndexed": "아직 인덱싱되지 않음",
   "KnowledgePanel.indexedAt": "{{when}}에 인덱싱됨 · {{count}}개 청크",
-  "KnowledgePanel.staleIndexBadge": "재인덱싱 필요",
   "KnowledgePanel.testSearchHeading": "테스트 검색",
   "KnowledgePanel.notIndexedForSearch": "검색하기 전에 이 스택을 인덱싱하세요.",
   "KnowledgePanel.searchPlaceholder": "이 스택에서 검색…",
@@ -2458,7 +2485,6 @@ export const ko: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "예산 활성화",
   "UsagePanel.dailyBudget": "일별 예산(USD)",
   "UsagePanel.monthlyBudget": "월별 예산(USD)",
-  "UsagePanel.warningThreshold": "경고 기준(%)",
   "UsagePanel.enforcement": "한도 도달 시",
   "UsagePanel.enforcementWarn": "경고만",
   "UsagePanel.enforcementPause": "클라우드 호출 일시 중지",
@@ -2523,7 +2549,7 @@ export const ko: Record<string, string> = {
   "Studio.add.repoFilePlaceholder": "split_files/vae/wan2.2_vae.safetensors",
   "Studio.add.namePlaceholder": "Wan 2.2 TI2V 5B",
   "Studio.add.familyPlaceholder": "Wan",
-  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --offload-to-cpu",
+  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --threads 8 --offload-to-cpu",
   "Studio.speakerPlaceholder": "/Users/you/voices/narrator.wav",
   "Studio.languagePlaceholder": "ko",
   "Studio.add.name": "이름",
@@ -2645,3 +2671,34 @@ export const ko: Record<string, string> = {
   "Studio.unsupported.title": "이 컴퓨터에서는 스튜디오를 쓸 수 없습니다",
   "Studio.unsupported.body": "생성 엔진은 Apple 실리콘 Mac 과 x86-64 Windows·Linux 용으로 미리 빌드되어 배포됩니다. 채팅과 코드에는 영향이 없습니다."
 };
+
+/**
+ * Every key, so this locale's key set is identical to the base's *by
+ * construction* (roadmap K22).
+ *
+ * Before this, each locale carried only the keys somebody had translated, so
+ * the sets diverged by over a thousand entries and nothing could be enforced: a
+ * key renamed in `en` left ten locales pointing at one that no longer existed,
+ * and no check failed. `useT()` already fell back to English for a missing key,
+ * so **no user-visible text changes** — what changes is that the divergence is
+ * now impossible rather than merely unmeasured, and `localeSync.test.ts` holds
+ * it that way.
+ *
+ * `en` is imported by `index.ts` unconditionally as the runtime fallback, so
+ * spreading it here costs nothing at the bundle: those bytes were already
+ * loaded for every locale.
+ *
+ * The real translation gap stays countable: `TRANSLATED_KEYS` below is what this
+ * locale actually says in its own words, and everything else is showing English.
+ */
+export const ko: Record<string, string> = { ...en, ...translated };
+
+/**
+ * The keys this locale genuinely translates.
+ *
+ * Exported so the count of what is *not* translated is exact rather than
+ * inferred from "the string happens to equal English" — many real translations
+ * legitimately do ("OK", "Studio", a product name).
+ */
+export const koTranslatedKeys: readonly string[] = Object.keys(translated);
+

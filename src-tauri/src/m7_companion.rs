@@ -552,17 +552,6 @@ fn bounded_file(path: &str) -> Result<(PathBuf, Vec<u8>), String> {
     Ok((canonical, bytes))
 }
 
-fn configured_custom_providers() -> Vec<crate::providers::CustomProviderEntry> {
-    crate::app_paths::data_dir()
-        .and_then(|dir| fs::read_to_string(dir.join("providers.json")).ok())
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|value| value.get("custom").cloned())
-        .and_then(|value| {
-            serde_json::from_value::<Vec<crate::providers::CustomProviderEntry>>(value).ok()
-        })
-        .unwrap_or_default()
-}
-
 pub fn show_overlay(app: &tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("companion-overlay") {
         window.show().map_err(|error| error.to_string())?;
@@ -982,7 +971,7 @@ async fn transcribe_path(
             let provider = config
                 .provider_id
                 .ok_or("Configure a BYOK transcription provider")?;
-            let custom_entries = configured_custom_providers();
+            let custom_entries = crate::providers::configured_custom_providers();
             let base_url = crate::providers::resolve_base_url(&provider, &custom_entries)?;
             let key = crate::providers::read_key_with_env(&provider)?;
             let bytes = fs::read(path).map_err(|error| error.to_string())?;
@@ -1023,7 +1012,7 @@ async fn transcribe_path(
             );
             let response = tokio::select! {
                 _ = cancellation.cancelled() => return Err("Transcription cancelled".to_string()),
-                response = request.send() => response.map_err(|error| format!("Transcription provider: {error}"))?,
+                response = crate::egress::send(request) => response.map_err(|error| format!("Transcription provider: {error}"))?,
             };
             let status = response.status();
             let bytes = response.bytes().await.map_err(|error| error.to_string())?;
@@ -1273,7 +1262,7 @@ async fn generate_openai_image(
     request: &ImageGenerationRequest,
     cancellation: &CancellationToken,
 ) -> Result<(Vec<u8>, String), String> {
-    let custom_entries = configured_custom_providers();
+    let custom_entries = crate::providers::configured_custom_providers();
     let provider = endpoint
         .provider_id
         .as_deref()
@@ -1306,31 +1295,33 @@ async fn generate_openai_image(
                 "image",
                 reqwest::multipart::Part::bytes(source).file_name("source.png"),
             );
-        let call = client
-            .post(format!("{}/images/edits", base_url.trim_end_matches('/')))
-            .bearer_auth(&key)
-            .multipart(form)
-            .send();
+        let call = crate::egress::send(
+            client
+                .post(format!("{}/images/edits", base_url.trim_end_matches('/')))
+                .bearer_auth(&key)
+                .multipart(form),
+        );
         tokio::select! {
             _ = cancellation.cancelled() => return Err("Image edit cancelled".to_string()),
             response = call => response.map_err(|error| error.to_string())?,
         }
     } else {
-        let call = client
-            .post(format!(
-                "{}/images/generations",
-                base_url.trim_end_matches('/')
-            ))
-            .bearer_auth(&key)
-            .json(&json!({
-                "model": request.model,
-                "prompt": request.prompt,
-                "size": format!("{}x{}", request.width, request.height),
-                "response_format": "b64_json",
-                "n": 1,
-                "seed": request.seed,
-            }))
-            .send();
+        let call = crate::egress::send(
+            client
+                .post(format!(
+                    "{}/images/generations",
+                    base_url.trim_end_matches('/')
+                ))
+                .bearer_auth(&key)
+                .json(&json!({
+                    "model": request.model,
+                    "prompt": request.prompt,
+                    "size": format!("{}x{}", request.width, request.height),
+                    "response_format": "b64_json",
+                    "n": 1,
+                    "seed": request.seed,
+                })),
+        );
         tokio::select! {
             _ = cancellation.cancelled() => return Err("Image generation cancelled".to_string()),
             response = call => response.map_err(|error| error.to_string())?,
@@ -1410,12 +1401,13 @@ async fn generate_comfy_image(
         .build()
         .map_err(|error| error.to_string())?;
     let base = endpoint.base_url.trim_end_matches('/');
-    let response = client
-        .post(format!("{base}/prompt"))
-        .json(&json!({"prompt": workflow, "client_id": request.job_id}))
-        .send()
-        .await
-        .map_err(|error| format!("Submit ComfyUI workflow: {error}"))?;
+    let response = crate::egress::send(
+        client
+            .post(format!("{base}/prompt"))
+            .json(&json!({"prompt": workflow, "client_id": request.job_id})),
+    )
+    .await
+    .map_err(|error| format!("Submit ComfyUI workflow: {error}"))?;
     if !response.status().is_success() {
         return Err(format!("ComfyUI submit returned {}", response.status()));
     }
@@ -1430,15 +1422,13 @@ async fn generate_comfy_image(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
     let descriptor = loop {
         if cancellation.is_cancelled() {
-            let _ = client.post(format!("{base}/interrupt")).send().await;
+            let _ = crate::egress::send(client.post(format!("{base}/interrupt"))).await;
             return Err("ComfyUI generation cancelled".to_string());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err("ComfyUI generation exceeded 30 minutes".to_string());
         }
-        let response = client
-            .get(format!("{base}/history/{prompt_id}"))
-            .send()
+        let response = crate::egress::send(client.get(format!("{base}/history/{prompt_id}")))
             .await
             .map_err(|error| error.to_string())?;
         if response.status().is_success() {
@@ -1449,16 +1439,13 @@ async fn generate_comfy_image(
         }
         tokio::time::sleep(Duration::from_millis(750)).await;
     };
-    let response = client
-        .get(format!("{base}/view"))
-        .query(&[
-            ("filename", descriptor.0.as_str()),
-            ("subfolder", descriptor.1.as_str()),
-            ("type", descriptor.2.as_str()),
-        ])
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
+    let response = crate::egress::send(client.get(format!("{base}/view")).query(&[
+        ("filename", descriptor.0.as_str()),
+        ("subfolder", descriptor.1.as_str()),
+        ("type", descriptor.2.as_str()),
+    ]))
+    .await
+    .map_err(|error| error.to_string())?;
     if !response.status().is_success() {
         return Err(format!(
             "ComfyUI image fetch returned {}",

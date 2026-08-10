@@ -186,6 +186,16 @@ export interface ProviderConfig {
 /** Mirrors the Rust `ProviderModelInfo` struct exactly. */
 export interface ProviderModelInfo {
   id: string;
+  /** The provider's own image-input answer, absent when its `/models` doesn't
+   * carry one (the Rust side skips the field rather than sending `null`) — see
+   * `lib/visionModels.ts`, which prefers this over its name-pattern guess. */
+  vision?: boolean;
+  /** The model's context window, when the provider publishes one — becomes
+   * `usageStore`'s `contextLimit` in `useProviderModel` below. */
+  context_length?: number;
+  /** Whether the provider says the model accepts tools. OpenRouter answers;
+   * nobody else does yet, so this is usually absent. */
+  tool_calling?: boolean;
 }
 
 /**
@@ -253,6 +263,11 @@ export interface ModelStore {
   active: ModelInfo | null;
   downloadProgress: Record<string, DownloadProgress>;
   llamaStatus: LlamaStatus;
+  /** Why the last `start()` failed, verbatim from the backend. A generic
+   * "llama-server failed to start" tells nobody whether the runtime is
+   * unverified, the port is taken or the GGUF is corrupt — so the real message
+   * is kept and rendered instead of being swallowed. */
+  llamaError: string | null;
   /** Whether the next `start()` should launch llama-server with `--embeddings`
    * (surfaced as a checkbox in the Models panel — see `docs/roadmap/p1-local-api-server.md`
    * phase 3). Persisted to localStorage so the preference survives a restart,
@@ -396,6 +411,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
   active: null,
   downloadProgress: {},
   llamaStatus: "stopped",
+  llamaError: null,
   embeddingsEnabled: readInitialEmbeddingsEnabled(),
 
   setEmbeddingsEnabled: (value) => {
@@ -468,6 +484,22 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       throw error;
     }
     await get().refresh();
+
+    // Pulling a model is a request to use it, so don't make the user click
+    // Start too. Skipped when a model is already loaded: `llama_start` kills
+    // the running process, and nothing about a background pull should yank a
+    // live chat's model out from under it. `start` records its own failure in
+    // `llamaError`, and the pull itself succeeded, so don't reject here.
+    if (get().llamaStatus === "stopped") {
+      const pulled = get().installed.find((entry) => entry.file === model.file);
+      if (pulled?.path) {
+        try {
+          await get().start(pulled);
+        } catch {
+          // Already surfaced on the card via `llamaError`.
+        }
+      }
+    }
   },
 
   cancelDownload: async (model) => {
@@ -490,7 +522,12 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     if (!model.path) {
       throw new Error(`Model "${model.name}" has not been downloaded yet`);
     }
-    set({ active: model, llamaStatus: "starting", activeProvider: "local" });
+    set({
+      active: model,
+      llamaStatus: "starting",
+      llamaError: null,
+      activeProvider: "local",
+    });
     let resolvedCtxSize: number;
     try {
       // `ctxSize` is omitted so the backend auto-sizes the context window
@@ -508,7 +545,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       // paths never emit a `llama://status` event, so without this the
       // optimistic "starting" set above would never be corrected and the
       // UI would be stuck showing "Starting..." indefinitely.
-      set({ llamaStatus: "error" });
+      set({ llamaStatus: "error", llamaError: errorMessage(err) });
       throw err;
     }
     // The context limit for a local model is exactly the ctx_size it was
@@ -518,7 +555,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
 
   stop: async () => {
     await invoke("llama_stop");
-    set({ llamaStatus: "stopped" });
+    set({ llamaStatus: "stopped", llamaError: null });
   },
 
   removeModel: async (model) => {
@@ -754,6 +791,13 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       activeProviderModel: modelId,
       lastModelForProvider: { ...state.lastModelForProvider, [providerId]: modelId },
     }));
+    // Already in hand from the last `/models` refresh, so unlike the Ollama
+    // path this needs no lookup. A provider that publishes no context window
+    // leaves this null, which is what `contextTrimmer.ts` reads as "no budget
+    // to aim for" — the same state every cloud model was stuck in before.
+    const contextLength = get().providerModels[providerId]?.find((model) => model.id === modelId)
+      ?.context_length;
+    useUsageStore.getState().setContextLimit(contextLength ?? null);
   },
 
   effortByTarget: readInitialEffortByTarget(),

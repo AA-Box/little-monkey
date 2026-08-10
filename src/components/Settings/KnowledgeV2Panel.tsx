@@ -112,7 +112,22 @@ function sourceDescription(source: KnowledgeSourceV2): string {
   }
 }
 
-export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
+/**
+ * `stackId` and `onStackChange` are owned by `KnowledgePanel`, which uses the
+ * same value to decide which stack row is expanded. Before that, this panel kept
+ * its own selection and the two could sit on different stacks — a stack's v1
+ * sources and its v2 sources were then on screen together, describing different
+ * stacks, with nothing saying so.
+ */
+export function KnowledgeV2Panel({
+  stacks,
+  stackId,
+  onStackChange,
+}: {
+  stacks: KnowledgeStack[];
+  stackId: string;
+  onStackChange: (stackId: string) => void;
+}) {
   const sources = useKnowledgeV2Store((state) => state.sources);
   const progress = useKnowledgeV2Store((state) => state.progress);
   const reports = useKnowledgeV2Store((state) => state.reports);
@@ -139,7 +154,6 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
   const refreshConnectorAccounts = useConnectorsStore((state) => state.refresh);
   const { t } = useT();
 
-  const [stackId, setStackId] = useState("");
   const [adding, setAdding] = useState(false);
   const [kind, setKind] = useState<ConnectorKind>("local_folder");
   const [label, setLabel] = useState("");
@@ -211,11 +225,6 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
   }, [backgroundConfig]);
 
   useEffect(() => {
-    if (!stackId && stacks.length > 0) setStackId(stacks[0].id);
-    if (stackId && !stacks.some((stack) => stack.id === stackId)) setStackId(stacks[0]?.id ?? "");
-  }, [stackId, stacks]);
-
-  useEffect(() => {
     if ((kind === "url" || kind === "sitemap" || kind === "web_dav") && url) {
       setAllowedOrigin(toOrigin(url));
     }
@@ -229,7 +238,6 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
   const activeProgress = stackId ? progress[stackId] : undefined;
   const indexing = activeProgress != null && activeProgress.phase !== "done";
   const report = stackId ? reports[stackId] : undefined;
-
   const resetForm = () => {
     setAdding(false);
     setLabel("");
@@ -371,7 +379,8 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
         </div>
         <select
           value={stackId}
-          onChange={(event) => setStackId(event.target.value)}
+          onChange={(event) => onStackChange(event.target.value)}
+          aria-label={t("KnowledgeV2Panel.stackSelectorAriaLabel")}
           className="h-8 min-w-44 rounded-md border border-border bg-surface px-2 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
         >
           {stacks.length === 0 && <option value="">Create a stack first</option>}

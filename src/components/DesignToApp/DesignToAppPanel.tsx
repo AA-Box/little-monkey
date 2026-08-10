@@ -274,9 +274,9 @@ export function DesignToAppPanel({ onClose, onOpenRunCapsule }: DesignToAppPanel
     });
   };
 
-  const handleFiles = async (files: FileList | null): Promise<void> => {
-    if (!selected || !files) return;
-    for (const file of Array.from(files)) {
+  const handleFiles = async (files: readonly File[]): Promise<void> => {
+    if (!selected) return;
+    for (const file of files) {
       const isImage = file.type.startsWith('image/') || /\.(png|jpe?g|gif|webp)$/i.test(file.name);
       if (isImage && sourceKind === 'design_tokens') {
         throw new Error(t('DesignToApp.tokensNeedJson'));
@@ -433,7 +433,7 @@ export function DesignToAppPanel({ onClose, onOpenRunCapsule }: DesignToAppPanel
                 <div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="text-sm font-semibold">{t('DesignToApp.sources')}</h3><p className="mt-1 text-xs text-muted">{t('DesignToApp.sourcesHint')}</p></div><StatusPill tone={sourceErrors.length ? 'warning' : selected.sources.length ? 'success' : 'neutral'}>{t('DesignToApp.sourceCount', { count: selected.sources.length })}</StatusPill></div>
                 <div className="mt-3 grid gap-3 md:grid-cols-[12rem_1fr]">
                   <label className="text-xs text-muted">{t('DesignToApp.sourceKind')}<select value={sourceKind} onChange={(event) => setSourceKind(event.target.value as Exclude<DesignSourceKind, 'reference_url'>)} className={FIELD_CLASS}>{SOURCE_KINDS.map((kind) => <option key={kind} value={kind}>{t(`DesignToApp.sourceKind.${kind}`)}</option>)}</select></label>
-                  <div className="flex items-end gap-2"><input ref={fileInputRef} type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp,application/json,.json" className="sr-only" onChange={(event) => void perform(() => handleFiles(event.target.files))} /><Button className="w-full md:w-auto" onClick={() => fileInputRef.current?.click()}><FileUp size={14} />{t('DesignToApp.importFiles')}</Button></div>
+                  <div className="flex items-end gap-2"><input ref={fileInputRef} type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp,application/json,.json" className="sr-only" onChange={(event) => { const files = Array.from(event.target.files ?? []); event.target.value = ""; void perform(() => handleFiles(files)); }} /><Button className="w-full md:w-auto" onClick={() => fileInputRef.current?.click()}><FileUp size={14} />{t('DesignToApp.importFiles')}</Button></div>
                 </div>
                 <div className="mt-3 grid gap-3 md:grid-cols-2">
                   <div className="rounded-lg border border-border bg-background p-3"><h4 className="text-xs font-semibold">{t('DesignToApp.pastePayload')}</h4><input value={payloadName} onChange={(event) => setPayloadName(event.target.value)} className={FIELD_CLASS} placeholder={t('DesignToApp.payloadNamePlaceholder')} /><textarea value={payloadText} onChange={(event) => setPayloadText(event.target.value)} className={`${FIELD_CLASS} min-h-28 resize-y font-mono text-xs`} placeholder={t('DesignToApp.payloadPlaceholder')} /><Button size="sm" className="mt-2" disabled={busy || !payloadText.trim()} onClick={() => void perform(addPastedPayload)}><FileJson2 size={13} />{t('DesignToApp.addPayload')}</Button></div>

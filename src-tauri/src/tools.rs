@@ -67,12 +67,13 @@ const GLOB_MAX_MATCHES: usize = 300;
 const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Read a UTF-8 text file from the workspace.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_read_file(
     state: tauri::State<'_, AppState>,
     path: String,
+    workspace_root_override: Option<String>,
 ) -> Result<String, String> {
-    let (resolved, _) = workspace::resolve_path_and_root(state.inner(), &path)?;
+    let (resolved, _) = crate::agent_worktrees::resolve_with_override(state.inner(), &path, workspace_root_override.as_deref())?;
 
     if !resolved.is_file() {
         return Err(format!("'{}' is not a file", path));
@@ -82,12 +83,13 @@ pub async fn tool_read_file(
 }
 
 /// List the immediate contents of a directory in the workspace.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_list_dir(
     state: tauri::State<'_, AppState>,
     path: String,
+    workspace_root_override: Option<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let (resolved, _) = workspace::resolve_path_and_root(state.inner(), &path)?;
+    let (resolved, _) = crate::agent_worktrees::resolve_with_override(state.inner(), &path, workspace_root_override.as_deref())?;
 
     if !resolved.is_dir() {
         return Err(format!("'{}' is not a directory", path));
@@ -123,16 +125,17 @@ pub async fn tool_list_dir(
 /// Regex-search text files under `path` (defaults to the workspace root),
 /// skipping VCS/build/dependency directories, capped at
 /// [`GREP_MAX_MATCHES`] results.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_grep(
     state: tauri::State<'_, AppState>,
     pattern: String,
     path: Option<String>,
+    workspace_root_override: Option<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let regex = Regex::new(&pattern).map_err(|e| format!("Invalid regex '{}': {}", pattern, e))?;
 
     let (search_root, display_root) =
-        workspace::resolve_path_and_root(state.inner(), path.as_deref().unwrap_or("."))?;
+        crate::agent_worktrees::resolve_with_override(state.inner(), path.as_deref().unwrap_or("."), workspace_root_override.as_deref())?;
     let label_prefix = workspace::secondary_label_for(state.inner(), &display_root)?
         .map(|label| format!("{}/", label))
         .unwrap_or_default();
@@ -198,14 +201,15 @@ pub async fn tool_grep(
 /// `path` (defaults to the workspace root), skipping VCS/build/dependency
 /// directories, capped at [`GLOB_MAX_MATCHES`] results sorted by most
 /// recently modified first.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_glob(
     state: tauri::State<'_, AppState>,
     pattern: String,
     path: Option<String>,
+    workspace_root_override: Option<String>,
 ) -> Result<Vec<String>, String> {
     let (search_root, display_root) =
-        workspace::resolve_path_and_root(state.inner(), path.as_deref().unwrap_or("."))?;
+        crate::agent_worktrees::resolve_with_override(state.inner(), path.as_deref().unwrap_or("."), workspace_root_override.as_deref())?;
     let label_prefix = workspace::secondary_label_for(state.inner(), &display_root)?
         .map(|label| format!("{}/", label))
         .unwrap_or_default();
@@ -329,12 +333,17 @@ pub async fn tool_write_file(
     risk_level: Option<String>,
     risk_reason: Option<String>,
     agent_label: Option<String>,
+    workspace_root_override: Option<String>,
 ) -> Result<String, String> {
     // Resolved BEFORE the permission prompt (unlike this function's
     // pre-Phase-2 ordering) so `path_risk_floor` can be checked against the
     // actual sandboxed/canonicalized target — an invalid path now fails
-    // before a prompt is even shown, which is also strictly safer.
-    let (resolved, root) = workspace::resolve_path_and_root(state.inner(), &path)?;
+    // before a prompt is even shown, which is also strictly safer. The
+    // worktree override (validated against the managed registry inside
+    // `resolve_with_override`) is applied at this same point for the same
+    // reason: the floor and the prompt must describe the real target.
+    let (resolved, root) =
+        crate::agent_worktrees::resolve_with_override(state.inner(), &path, workspace_root_override.as_deref())?;
     let risk = permissions::compute_risk(Some((&resolved, &root)), risk_level, risk_reason);
 
     let detail = format!("Write {} bytes to {}", content.len(), path);
@@ -449,11 +458,7 @@ fn persist_generated_image(
     let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f").to_string();
     let unique = uuid::Uuid::new_v4().simple().to_string();
     let suggested_name = generated_image_filename(filename, &timestamp, &unique[..8])?;
-    let bytes = crate::artifact_commands::decode_bounded(
-        content_base64,
-        IMAGE_MAX_BYTES,
-        "image",
-    )?;
+    let bytes = crate::artifact_commands::decode_bounded(content_base64, IMAGE_MAX_BYTES, "image")?;
     if !bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
         return Err("Generated image content is not a PNG (bad magic number)".to_string());
     }
@@ -621,12 +626,16 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
     risk_level: Option<String>,
     risk_reason: Option<String>,
     agent_label: Option<String>,
+    workspace_root_override: Option<String>,
 ) -> Result<String, String> {
     if old_string.is_empty() {
         return Err("old_string must not be empty".to_string());
     }
 
-    let (resolved, root) = workspace::resolve_path_and_root(state.inner(), &path)?;
+    // Same before-the-prompt override point as `tool_write_file` — see its
+    // comment.
+    let (resolved, root) =
+        crate::agent_worktrees::resolve_with_override(state.inner(), &path, workspace_root_override.as_deref())?;
 
     if !resolved.is_file() {
         return Err(format!("'{}' is not a file", path));
@@ -852,6 +861,7 @@ pub async fn tool_run_shell(
     risk_reason: Option<String>,
     agent_label: Option<String>,
     full_output: Option<bool>,
+    workspace_root_override: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let risk = permissions::compute_risk(None, risk_level, risk_reason);
     permissions::request_permission(
@@ -868,9 +878,19 @@ pub async fn tool_run_shell(
 
     checkpoints::record_shell(state.inner(), checkpoint_id.as_deref())?;
 
+    // Under a worktree override the DEFAULT cwd is the worktree itself, and
+    // an explicit `cwd` is sandboxed inside it — a worktree-isolated agent's
+    // commands must never silently run in the shared checkout.
     let cwd_path = match cwd {
-        Some(ref c) => workspace::resolve_path_and_root(state.inner(), c)?.0,
-        None => workspace::primary_root_canon(state.inner())?,
+        Some(ref c) => {
+            crate::agent_worktrees::resolve_with_override(state.inner(), c, workspace_root_override.as_deref())?.0
+        }
+        None => match workspace_root_override.as_deref() {
+            Some(root) => {
+                crate::agent_worktrees::resolve_with_override(state.inner(), ".", Some(root))?.0
+            }
+            None => workspace::primary_root_canon(state.inner())?,
+        },
     };
 
     // `sh` does not exist on Windows (and the app bundles for all targets) —
@@ -916,12 +936,29 @@ pub async fn tool_run_shell(
         &mut command_builder,
     );
 
-    let child = command_builder
+    // Decided before the spawn, because it is now the *read* that is bounded
+    // rather than the returned string: the drain below needs to know its ceiling
+    // before the first byte arrives.
+    let cap = stream_cap(full_output);
+
+    let mut child = command_builder
         .spawn()
         .map_err(|e| format!("Failed to spawn shell: {}", e))?;
-    // Captured before `wait_with_output` consumes the child. With
+    // Captured before the capture future borrows the child. With
     // `process_group(0)` above, the child's own pid is also its group id.
     let child_pgid = child.id();
+    // Taken out of the child *before* the wait, so the two pipes can be drained
+    // concurrently with it. `Stdio::piped()` above guarantees both are `Some`;
+    // the `ok_or` is a refusal rather than an `expect` because a panic inside a
+    // Tauri command aborts the whole IPC task.
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Shell child had no stdout pipe".to_string())?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Shell child had no stderr pipe".to_string())?;
 
     // Each turn gets its own cancellation channel so Stop in one pane never
     // kills a command the other pane's turn is still running. Callers that
@@ -945,7 +982,7 @@ pub async fn tool_run_shell(
     });
 
     let outcome = tokio::select! {
-        result = child.wait_with_output() => {
+        result = capture_bounded(&mut child, stdout_pipe, stderr_pipe, cap) => {
             result.map_err(|e| format!("Failed to run command: {}", e))
         }
         _ = cancel.notified() => {
@@ -998,6 +1035,15 @@ pub async fn tool_run_shell(
     }
 
     let output = outcome?;
+    // The command was watched to exit. A timeout or a Stop leaves only the
+    // declaration above, which is the right way round: a killed `sh -c` had
+    // already run for as long as it ran, and the preview says "may have" rather
+    // than reporting nothing.
+    checkpoints::commit_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        checkpoints::ExternalEffectKind::Shell,
+    )?;
     // Both streams were unbounded from the child's pipes all the way into the
     // model's context. Of the app's command-running paths this was the only
     // uncapped one, and the only one whose output a model reads directly:
@@ -1014,9 +1060,11 @@ pub async fn tool_run_shell(
     // Deliberately a flag and not a byte count: nothing needs a *different*
     // ceiling, and `Some(0)` meaning "unlimited" would be exactly the
     // zero-versus-absent overloading this codebase avoids elsewhere.
-    let cap = stream_cap(full_output);
-    let (stdout, stdout_truncated) = cap_stream(&output.stdout, cap);
-    let (stderr, stderr_truncated) = cap_stream(&output.stderr, cap);
+    //
+    // The cap was applied *while reading* (see [`capture_bounded`]); by here both
+    // strings are already at or under it, and this is only the decode.
+    let (stdout, stdout_truncated) = output.stdout.into_string();
+    let (stderr, stderr_truncated) = output.stderr.into_string();
     Ok(serde_json::json!({
         "stdout": stdout,
         "stderr": stderr,
@@ -1044,21 +1092,137 @@ fn stream_cap(full_output: Option<bool>) -> Option<usize> {
     }
 }
 
-/// Decodes one captured stream and applies `cap`, if any.
+/// One captured stream, already held to its ceiling.
 ///
-/// `None` means the caller asked for the whole thing. Note what this does *not*
-/// fix: `wait_with_output` has already materialized both streams in full by the
-/// time this runs, so the app's own heap stays unbounded even when the returned
-/// tail is capped. Bounding the read itself means draining both pipes
-/// concurrently with the wait — which is the service `wait_with_output` currently
-/// performs, and getting it wrong deadlocks a chatty-stderr child once the pipe
-/// buffer fills. That is a separate change, not a line to smuggle in here.
-fn cap_stream(raw: &[u8], cap: Option<usize>) -> (String, bool) {
-    let decoded = String::from_utf8_lossy(raw).to_string();
-    match cap {
-        Some(cap) => crate::output_cap::cap_tail(decoded, cap),
-        None => (decoded, false),
+/// Bytes rather than a `String` because the cap is enforced during the read, when
+/// a chunk boundary can land inside a multi-byte character and there is no whole
+/// string to decode yet. [`Self::into_string`] does the one decode, at the end,
+/// over a buffer that is bounded by construction.
+#[derive(Debug, Default)]
+struct CappedStream {
+    /// The kept tail. At most `cap` bytes once a cap is in force.
+    bytes: Vec<u8>,
+    /// Whether anything was dropped from the front to stay inside the cap.
+    truncated: bool,
+}
+
+impl CappedStream {
+    /// Appends `chunk`, dropping whole bytes off the *front* once `cap` is
+    /// exceeded.
+    ///
+    /// Tail, not head, for the reason [`crate::output_cap::cap_tail`] gives: a
+    /// failing command prints its diagnostic last. Front-dropping is what makes
+    /// this bounded in the first place — a head-keeping cap could stop reading,
+    /// but then the child blocks forever on a full pipe instead of running to
+    /// completion, which turns a noisy command into a timeout.
+    fn push(&mut self, chunk: &[u8], cap: Option<usize>) {
+        self.bytes.extend_from_slice(chunk);
+        let Some(cap) = cap else { return };
+        if self.bytes.len() <= cap {
+            return;
+        }
+        let overflow = self.bytes.len() - cap;
+        self.bytes.drain(..overflow);
+        self.truncated = true;
     }
+
+    /// Decodes the kept tail, prefixing the shared truncation marker if the front
+    /// was dropped.
+    ///
+    /// The leading continuation bytes are shed first, so a cut that landed inside
+    /// a character widens the kept region forward to the next boundary instead of
+    /// decoding to a replacement character. That is exactly what `cap_tail` did
+    /// when it worked on a whole `String`, and keeping the behaviour identical is
+    /// why it is done here rather than left to `from_utf8_lossy`.
+    fn into_string(mut self) -> (String, bool) {
+        if self.truncated {
+            let keep = self
+                .bytes
+                .iter()
+                .position(|byte| (byte & 0b1100_0000) != 0b1000_0000)
+                .unwrap_or(self.bytes.len());
+            self.bytes.drain(..keep);
+        }
+        let decoded = String::from_utf8_lossy(&self.bytes).to_string();
+        if self.truncated {
+            (
+                format!("{}{decoded}", crate::output_cap::TRUNCATION_MARKER),
+                true,
+            )
+        } else {
+            (decoded, false)
+        }
+    }
+}
+
+/// What a finished `run_shell` child produced, with both streams already bounded.
+struct ShellCapture {
+    status: std::process::ExitStatus,
+    stdout: CappedStream,
+    stderr: CappedStream,
+}
+
+/// Reads one pipe to EOF, keeping at most `cap` bytes of its tail.
+///
+/// Reading to EOF rather than stopping at the cap is the whole point: an
+/// early-returning reader leaves the child blocked on a full pipe buffer, so a
+/// command that merely printed too much would report a timeout instead of its
+/// exit code.
+async fn drain_capped<R>(mut reader: R, cap: Option<usize>) -> std::io::Result<CappedStream>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut stream = CappedStream::default();
+    // 8 KiB: larger than the 64 KiB pipe buffer would not help (the kernel hands
+    // over what it has), and smaller would just mean more syscalls.
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(stream);
+        }
+        stream.push(&chunk[..read], cap);
+    }
+}
+
+/// Waits for `child` while draining both of its pipes, holding each to `cap`.
+///
+/// This is the fix for the last unbounded buffer on the shell path.
+/// `wait_with_output` materialized *both* streams in full before any cap applied,
+/// so `sh -c 'cat /dev/urandom | base64'` had the whole 120-second timeout to grow
+/// the app's own heap — the returned string was capped, the heap behind it was
+/// not.
+///
+/// The three futures are joined rather than sequenced, and that is the part with a
+/// failure mode: reading stdout to EOF *before* touching stderr deadlocks a child
+/// with a chatty stderr as soon as the 64 KiB stderr pipe buffer fills, and
+/// waiting for exit before reading either deadlocks on the first full pipe.
+/// `try_join!` polls all three, which is the service `wait_with_output` performed
+/// and the reason it could not simply be dropped.
+///
+/// Cancellation safety is inherited rather than argued: the caller races this
+/// whole future in a `tokio::select!`, and dropping it drops the two pipe readers
+/// (closing the read ends) and stops the wait. The child itself is killed by the
+/// caller's process-group terminate, with `kill_on_drop` as the backstop — the
+/// same two mechanisms as before this change.
+async fn capture_bounded(
+    child: &mut tokio::process::Child,
+    stdout_pipe: tokio::process::ChildStdout,
+    stderr_pipe: tokio::process::ChildStderr,
+    cap: Option<usize>,
+) -> std::io::Result<ShellCapture> {
+    let (status, stdout, stderr) = tokio::try_join!(
+        child.wait(),
+        drain_capped(stdout_pipe, cap),
+        drain_capped(stderr_pipe, cap),
+    )?;
+    Ok(ShellCapture {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Save a short durable fact about the current project/user preferences to
@@ -1073,9 +1237,14 @@ fn cap_stream(raw: &[u8], cap: Option<usize>) -> (String, bool) {
 /// to save to and the tool call failed outright, even though the model had
 /// already told the user it remembered.
 ///
-/// `checkpoint_id` is deliberately NOT accepted here (unlike write/edit/
-/// run_shell): a remembered fact isn't a workspace file, so there is nothing
-/// for a per-turn checkpoint to snapshot or revert. `turn_id` is injected by
+/// `checkpoint_id` was deliberately NOT accepted here, on the grounds that a
+/// remembered fact isn't a workspace file so there is nothing for a per-turn
+/// checkpoint to snapshot or revert. The first half of that is still true and
+/// the conclusion no longer follows: the checkpoint does not snapshot this, but
+/// it does now *enumerate* it, because "nothing here can undo this" is the fact
+/// a rollback needs and the reason `ExternalEffectKind` exists. So the id is
+/// accepted and used for exactly one thing — recording that a memory write
+/// happened — and never to snapshot anything. `turn_id` is injected by
 /// the frontend agent loop (never model-supplied) purely to scope the
 /// permission prompt to the calling turn, exactly as it does for the other
 /// mutating tools.
@@ -1090,6 +1259,7 @@ pub async fn tool_remember(
     text: String,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<memory::Fact, String> {
     permissions::request_permission(
         &app,
@@ -1102,6 +1272,15 @@ pub async fn tool_remember(
         None,
     )
     .await?;
+
+    // Recorded, never snapshotted — see this command's doc comment. A memory
+    // write is outside the checkpointed workspace, so a revert cannot undo it
+    // and the enumerated set is where that is said.
+    checkpoints::record_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        checkpoints::ExternalEffectKind::Memory,
+    )?;
 
     let root = workspace::primary_root_canon(state.inner())
         .map(|p| p.to_string_lossy().to_string())
@@ -1117,7 +1296,27 @@ pub async fn tool_remember(
         .memory_lock
         .lock()
         .map_err(|_| "Memory lock poisoned".to_string())?;
-    memory::add_fact_impl(&path, &root, &text, "agent", turn_id.as_deref())
+    let fact = memory::add_fact_impl(&path, &root, &text, "agent", turn_id.as_deref())?;
+    // Recorded *after* the add, with the id the store actually assigned — an id
+    // guessed before the write could name a fact that was never created, and
+    // `add_fact_impl` returns the pre-existing fact when the text is a duplicate.
+    checkpoints::record_remembered_fact(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        checkpoints::RememberedFact {
+            id: fact.id.clone(),
+            text: fact.text.clone(),
+        },
+    )?;
+    // The write returned, so the fact is in the store. This is the one kind
+    // whose commit is also its compensator's precondition: `remembered_facts`
+    // is what revert deletes, and both are filled by the same success path.
+    checkpoints::commit_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        checkpoints::ExternalEffectKind::Memory,
+    )?;
+    Ok(fact)
 }
 
 /// Read one bundled file from an installed native skill's folder — the
@@ -1389,7 +1588,11 @@ mod shell_suspend_tests {
 
         signal_turn_shells(&state, "turn-a", true);
         std::thread::sleep(Duration::from_millis(100));
-        assert!(is_stopped(paused_pgid), "ps said {}", process_state(paused_pgid));
+        assert!(
+            is_stopped(paused_pgid),
+            "ps said {}",
+            process_state(paused_pgid)
+        );
         assert!(
             !is_stopped(running_pgid),
             "the other pane's command must keep running"
@@ -1412,13 +1615,11 @@ mod shell_suspend_tests {
         };
 
         forget_shell_process_group(&state, "turn-3", pgid);
-        assert!(
-            !state
-                .shell_process_groups
-                .lock()
-                .expect("lock")
-                .contains_key("turn-3")
-        );
+        assert!(!state
+            .shell_process_groups
+            .lock()
+            .expect("lock")
+            .contains_key("turn-3"));
         assert_eq!(signal_turn_shells(&state, "turn-3", false), 0);
     }
 
@@ -1435,21 +1636,17 @@ mod shell_suspend_tests {
         };
         forget_shell_process_group(&state, "turn-4", pgid);
 
-        assert!(
-            state
-                .shell_process_groups
-                .lock()
-                .expect("lock")
-                .contains_key("turn-4")
-        );
+        assert!(state
+            .shell_process_groups
+            .lock()
+            .expect("lock")
+            .contains_key("turn-4"));
         signal_turn_shells(&state, "turn-4", false);
-        assert!(
-            !state
-                .shell_process_groups
-                .lock()
-                .expect("lock")
-                .contains_key("turn-4")
-        );
+        assert!(!state
+            .shell_process_groups
+            .lock()
+            .expect("lock")
+            .contains_key("turn-4"));
     }
 }
 
@@ -1478,22 +1675,31 @@ mod tests {
         assert_eq!(super::stream_cap(Some(true)), None);
     }
 
+    /// Fed one byte at a time, which is the case the old whole-buffer cap never
+    /// had to survive: the cap now has to hold across arbitrary chunk boundaries
+    /// rather than being applied once to a finished string.
     #[test]
     fn a_capped_stream_keeps_its_tail_and_reports_that_it_was_cut() {
-        let raw = b"0123456789";
+        let feed = |cap: Option<usize>| {
+            let mut stream = super::CappedStream::default();
+            for byte in b"0123456789" {
+                stream.push(&[*byte], cap);
+            }
+            stream.into_string()
+        };
 
-        let (value, truncated) = super::cap_stream(raw, Some(4));
+        let (value, truncated) = feed(Some(4));
         assert!(truncated, "a cut stream must say so on the wire");
         assert!(
             value.ends_with("6789"),
             "the tail is what a failing command puts its diagnostic in, got {value:?}"
         );
 
-        let (value, truncated) = super::cap_stream(raw, Some(64));
+        let (value, truncated) = feed(Some(64));
         assert_eq!(value, "0123456789");
         assert!(!truncated, "output inside the cap is not truncated");
 
-        let (value, truncated) = super::cap_stream(raw, None);
+        let (value, truncated) = feed(None);
         assert_eq!(value, "0123456789");
         assert!(
             !truncated,
@@ -1501,16 +1707,142 @@ mod tests {
         );
     }
 
+    /// The bound is on the *buffer*, not just on the returned string — that
+    /// distinction is the whole reason this slice exists, so it is asserted
+    /// directly rather than inferred from the output.
+    #[test]
+    fn the_kept_buffer_never_grows_past_the_cap_however_much_arrives() {
+        const CAP: usize = 1_024;
+        let mut stream = super::CappedStream::default();
+        // 4 MiB through a 1 KiB ceiling, in chunks that do not divide it.
+        for _ in 0..4_096 {
+            stream.push(&[b'x'; 1_000], Some(CAP));
+            assert!(
+                stream.bytes.len() <= CAP,
+                "the buffer grew to {} bytes past a {CAP}-byte cap",
+                stream.bytes.len()
+            );
+        }
+        let (value, truncated) = stream.into_string();
+        assert!(truncated);
+        assert!(value.len() <= CAP + super::super::output_cap::TRUNCATION_MARKER.len());
+    }
+
     /// Command output is bytes, not text, and a stream cut mid-codepoint by the
     /// child itself must not lose the rest of the output.
     #[test]
     fn invalid_utf8_in_a_stream_is_replaced_rather_than_dropped() {
-        let (value, truncated) = super::cap_stream(&[b'o', b'k', 0xff, b'!'], Some(64));
+        let mut stream = super::CappedStream::default();
+        stream.push(&[b'o', b'k', 0xff, b'!'], Some(64));
+        let (value, truncated) = stream.into_string();
         assert!(!truncated);
         assert!(
             value.starts_with("ok") && value.ends_with('!'),
             "the surrounding bytes must survive a lossy decode, got {value:?}"
         );
+    }
+
+    /// A front-drop that lands inside a character widens forward to the next
+    /// boundary, exactly as the whole-string `cap_tail` did. Getting this wrong
+    /// shows up as a stray replacement character at the head of every truncated
+    /// stream, which is small enough to ship unnoticed.
+    #[test]
+    fn a_front_drop_inside_a_character_widens_to_the_next_boundary() {
+        // Four bytes each, so a cap of 5 cannot fall on a boundary.
+        let mut stream = super::CappedStream::default();
+        stream.push("🙈🙉🙊".as_bytes(), Some(5));
+        let (value, truncated) = stream.into_string();
+        assert!(truncated);
+        assert_eq!(
+            value,
+            format!("{}🙊", super::super::output_cap::TRUNCATION_MARKER),
+            "a split codepoint must be dropped whole, not decoded to U+FFFD"
+        );
+    }
+
+    /// The deadlock this change had to avoid, run for real.
+    ///
+    /// A child that fills stderr while stdout is still open wedges any reader
+    /// that drains one pipe to EOF before touching the other: the 64 KiB stderr
+    /// pipe buffer fills, the child blocks writing to it, and stdout never sees
+    /// EOF. Both streams here are far past that buffer, and both are past the
+    /// cap, so this also proves the bounded read still lets the child *finish*
+    /// rather than stopping early and hanging it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_floods_both_pipes_still_exits_and_is_held_to_the_cap() {
+        use std::process::Stdio;
+
+        const CAP: usize = 4_096;
+
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            // ~200 KiB down each pipe, interleaved, so neither can be drained
+            // to completion before the other is read.
+            .arg(
+                "i=0; while [ $i -lt 200 ]; do \
+                   printf 'o%.0s' $(seq 1 1024); \
+                   printf 'e%.0s' $(seq 1 1024) >&2; \
+                   i=$((i+1)); \
+                 done; exit 3",
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the flooding child");
+
+        let stdout_pipe = child.stdout.take().expect("stdout pipe");
+        let stderr_pipe = child.stderr.take().expect("stderr pipe");
+
+        let captured = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            super::capture_bounded(&mut child, stdout_pipe, stderr_pipe, Some(CAP)),
+        )
+        .await
+        .expect("draining both pipes concurrently must not deadlock")
+        .expect("the child ran to completion");
+
+        assert_eq!(
+            captured.status.code(),
+            Some(3),
+            "the child's own exit code must survive a truncated capture"
+        );
+        assert!(captured.stdout.bytes.len() <= CAP);
+        assert!(captured.stderr.bytes.len() <= CAP);
+
+        let (stdout, stdout_truncated) = captured.stdout.into_string();
+        let (stderr, stderr_truncated) = captured.stderr.into_string();
+        assert!(stdout_truncated && stderr_truncated);
+        assert!(stdout.ends_with('o'), "the tail is what is kept");
+        assert!(stderr.ends_with('e'), "the tail is what is kept");
+    }
+
+    /// The uncapped path still returns the whole document, because
+    /// `securityAutofix.ts` `JSON.parse`s it and a truncated tail there reads as
+    /// zero vulnerabilities.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_uncapped_path_still_returns_the_whole_stream() {
+        use std::process::Stdio;
+
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("printf 'x%.0s' $(seq 1 100000)")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let stdout_pipe = child.stdout.take().expect("stdout pipe");
+        let stderr_pipe = child.stderr.take().expect("stderr pipe");
+
+        let captured = super::capture_bounded(&mut child, stdout_pipe, stderr_pipe, None)
+            .await
+            .expect("the child ran");
+        let (stdout, truncated) = captured.stdout.into_string();
+        assert_eq!(stdout.len(), 100_000);
+        assert!(!truncated);
     }
 
     use super::*;
@@ -1546,9 +1878,11 @@ mod tests {
         assert!(crate::artifact_commands::decode_bounded("aGVsbG8=", 4, "image").is_err());
         // Encoded length rejected before any decode allocation.
         let oversized = "A".repeat(64);
-        assert!(crate::artifact_commands::decode_bounded(&oversized, 4, "image")
-            .unwrap_err()
-            .contains("Encoded image exceeds"));
+        assert!(
+            crate::artifact_commands::decode_bounded(&oversized, 4, "image")
+                .unwrap_err()
+                .contains("Encoded image exceeds")
+        );
         assert!(crate::artifact_commands::decode_bounded("not base64", 128, "image").is_err());
     }
 
@@ -1686,6 +2020,11 @@ mod tests {
     /// Builds a mock Tauri app whose workspace root is `root`, with the
     /// permission mode preset so `edit_file`/`write_file` auto-approve
     /// instead of hanging on a prompt no one can answer in a test.
+    ///
+    /// Built through `test_support::build` rather than `tauri::test`'s own
+    /// context, so this app's app-data directory — and therefore the run
+    /// ledger every auto-approved permission decision is written to — belongs
+    /// to one test and no other.
     fn mock_app_with_workspace(root: &std::path::Path) -> tauri::App<tauri::test::MockRuntime> {
         let canonical = root.canonicalize().unwrap();
         let checkpoint_dir = canonical.join(".checkpoint");
@@ -1705,6 +2044,8 @@ mod tests {
         state.checkpoints.lock().unwrap().insert(
             "test-checkpoint".to_string(),
             checkpoints::ActiveCheckpoint {
+                remembered_facts: Vec::new(),
+                staged_task_suggestions: Vec::new(),
                 dir: checkpoint_dir,
                 entries: Vec::new(),
                 created_at_ms: 0,
@@ -1712,15 +2053,17 @@ mod tests {
                 anchor_index: 0,
                 label: String::new(),
                 shell_ran: false,
+                external_effects: std::collections::BTreeSet::new(),
+                committed_effects: std::collections::BTreeSet::new(),
                 prev_id: None,
             },
         );
 
-        tauri::test::mock_builder()
-            .invoke_handler(tauri::generate_handler![tool_edit_file])
-            .manage(state)
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .unwrap()
+        crate::test_support::build(
+            tauri::test::mock_builder()
+                .invoke_handler(tauri::generate_handler![tool_edit_file])
+                .manage(state),
+        )
     }
 
     fn edit_file_invoke_request(args: serde_json::Value) -> tauri::webview::InvokeRequest {
@@ -1852,6 +2195,7 @@ mod tests {
                         "OLD".to_string(),
                         new_value.to_string(),
                         Some("test-checkpoint".to_string()),
+                        None,
                         None,
                         None,
                         None,

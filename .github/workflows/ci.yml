@@ -7,6 +7,12 @@ on:
       - develop
   pull_request:
 
+# Least privilege by default: these jobs read the tree and run tests. A job
+# that needs more than that (the supply-chain one below) states it explicitly
+# rather than inheriting a write-capable token it never uses.
+permissions:
+  contents: read
+
 jobs:
   frontend:
     # TS/JS checks are platform-independent — one OS is enough, no reason to
@@ -21,7 +27,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 9
 
@@ -39,8 +45,26 @@ jobs:
       - name: Frontend tests
         run: pnpm test
 
-      - name: i18n key-lint
+      - name: i18n key-lint and locale key-set sync
+        # Two gates, not one. `keyLint` fails on a key used but absent from the
+        # base; `localeSync` fails when a locale's key set, placeholders, or
+        # values drift from it. The second is what the base's own warning could
+        # never be — the gap it warned about grew from ~650 to 1,468 keys per
+        # locale while the warning printed on every run.
         run: pnpm i18n:lint
+
+      - name: Accessibility audit
+        # Runs after the production build above, so the built shell is what is
+        # audited rather than a dev-server page. A named rule set over jsdom
+        # (see `src/lib/a11yAudit.ts`) — not a full WCAG audit, and documented
+        # there as not being one.
+        run: pnpm a11y
+
+      - name: Install/upgrade smoke-test logic
+        # The decision logic only. The install itself runs in `release.yml`,
+        # where there are installers to install; this holds the rule that a leg
+        # which cannot run reports SKIPPED with a reason and never a pass.
+        run: pnpm test:install-smoke
 
   rust-tests:
     # Real per-OS compilation + test coverage for `#[cfg(target_os = ...)]`
@@ -91,7 +115,7 @@ jobs:
           eval "$(printf '\n' | gnome-keyring-daemon --unlock --replace --components=secrets)"
           echo "GNOME_KEYRING_CONTROL=$GNOME_KEYRING_CONTROL" >> "$GITHUB_ENV"
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 9
 
@@ -100,9 +124,9 @@ jobs:
           node-version: 20
           cache: pnpm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
           key: ${{ matrix.os }}
@@ -112,3 +136,84 @@ jobs:
 
       - name: Rust tests
         run: pnpm test:rust
+
+      # The K19 gate, named as its own step so a failure reads as "the
+      # published ABI changed without a version bump" rather than as one line
+      # in a 2,000-test run. Everything is already compiled by the step above,
+      # so this costs a test binary invocation.
+      - name: Contract ABI gate
+        run: pnpm contract:check
+
+  # ROADMAP #8 / K22: supply-chain review of what a release actually ships.
+  # Split from the test matrix on purpose — these check the dependency set, not
+  # the code, so they run once and neither blocks nor is blocked by a platform.
+  supply-chain:
+    runs-on: ubuntu-22.04
+
+    # Least privilege for the job whose whole point is supply-chain hygiene:
+    # read the tree, and let the dependency review post its summary. Nothing
+    # here writes code, releases, or issues.
+    permissions:
+      contents: read
+      # rustsec/audit-check reports advisories as a check run.
+      checks: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fails the PR on a dependency introduced with a known vulnerability or a
+      # disallowed licence. Pull-request only: it diffs the manifests against
+      # the base commit, and there is no base to diff on a push.
+      - name: Dependency review
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+
+      # Every third-party action here — and in every other workflow — is pinned
+      # to a commit, not a tag: a mutable tag is arbitrary code running with
+      # this token, which is exactly the class of risk this job exists to find.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9
+
+      # No `cache: pnpm` here, unlike the jobs above: this job audits the
+      # lockfile and never runs `pnpm install`, so the store directory the
+      # cache post-step wants to save does not exist and it fails the job.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Audit npm dependencies
+        # `--prod` because a vulnerable build-time devDependency is not shipped
+        # to a user; --audit-level high matches the dependency review above.
+        run: pnpm audit --prod --audit-level high
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Audit Rust dependencies
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # The lockfile is the Tauri crate's, not the repository root's, and
+          # the action looks for `./Cargo.lock` relative to this directory.
+          working-directory: src-tauri
+
+      # The SBOM covers both dependency trees (pnpm-lock.yaml and Cargo.lock are
+      # both in the scanned tree), so one artifact describes the whole app.
+      - name: Generate SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: little-monkey-sbom.cyclonedx.json
+          output-file: little-monkey-sbom.cyclonedx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: little-monkey-sbom.cyclonedx.json
+          if-no-files-found: error

@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use little_monkey_lib::egress;
 use reqwest::{Certificate, Method, Response};
 use serde_json::Value;
 
@@ -37,20 +38,20 @@ pub async fn accept_invitation(
         "{}/v1/remote/pairings/accept",
         invitation.runner_url.trim_end_matches('/')
     );
-    let response = client
-        .post(endpoint)
-        .json(&PairAcceptRequest {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            pairing_id: invitation.pairing_id.clone(),
-            pairing_token: invitation.pairing_token.clone(),
-            device_name: device_name.to_string(),
-            // The CLI controller never down-selects: omitting the subset
-            // requests the invitation's complete capability grant.
-            requested_capabilities: None,
-        })
-        .send()
-        .await
-        .map_err(|error| format!("Pairing request failed: {error}"))?;
+    // Metered like every other outbound request. The TLS pin below still works:
+    // the meter rebuilds the response from its own parts, extensions included, so
+    // `reqwest::tls::TlsInfo` survives.
+    let response = egress::send(client.post(endpoint).json(&PairAcceptRequest {
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+        pairing_id: invitation.pairing_id.clone(),
+        pairing_token: invitation.pairing_token.clone(),
+        device_name: device_name.to_string(),
+        // The CLI controller never down-selects: omitting the subset
+        // requests the invitation's complete capability grant.
+        requested_capabilities: None,
+    }))
+    .await
+    .map_err(|error| format!("Pairing request failed: {error}"))?;
     verify_response_pin(&response, &invitation.server_certificate_sha256)?;
     let status = response.status();
     let bytes = response
@@ -173,25 +174,28 @@ pub async fn call(
     );
     let mut last_error = None;
     for attempt in 0..3u32 {
-        let response = client
-            .request(method.clone(), &endpoint)
-            .header("x-little-monkey-device", &auth.device_id)
-            .header(
-                "x-little-monkey-key-generation",
-                auth.secret_generation.to_string(),
-            )
-            .header("x-little-monkey-sequence", auth.sequence.to_string())
-            .header(
-                "x-little-monkey-timestamp-ms",
-                auth.timestamp_ms.to_string(),
-            )
-            .header("x-little-monkey-nonce", &auth.nonce)
-            .header("x-little-monkey-command", &auth.command_id)
-            .header("x-little-monkey-signature", &auth.signature)
-            .header("content-type", "application/json")
-            .body(body.clone())
-            .send()
-            .await;
+        let response = egress::send(
+            client
+                .request(method.clone(), &endpoint)
+                .header("x-little-monkey-device", &auth.device_id)
+                .header(
+                    "x-little-monkey-key-generation",
+                    auth.secret_generation.to_string(),
+                )
+                .header("x-little-monkey-sequence", auth.sequence.to_string())
+                .header(
+                    "x-little-monkey-timestamp-ms",
+                    auth.timestamp_ms.to_string(),
+                )
+                .header("x-little-monkey-nonce", &auth.nonce)
+                .header("x-little-monkey-command", &auth.command_id)
+                .header("x-little-monkey-signature", &auth.signature)
+                .header("content-type", "application/json")
+                // Cloned per attempt because a retry re-sends it, which the meter
+                // charges again — the bytes really do leave the machine twice.
+                .body(body.clone()),
+        )
+        .await;
         match response {
             Ok(response) => {
                 verify_response_pin(&response, &profile.server_certificate_sha256)?;
@@ -283,6 +287,116 @@ pub async fn fetch_artifact(
     std::fs::rename(&temporary, destination)
         .map_err(|error| format!("Could not publish remote artifact: {error}"))?;
     Ok(())
+}
+
+// --- Roadmap K17: the placement plane, from the asking side ----------------
+
+/// Asks one node to describe itself and stores the answer.
+///
+/// The store write is what makes `last_seen_at_ms` meaningful: it happens only
+/// on a successful answer, so a failed probe leaves the previous timestamp
+/// alone and `node_placement::liveness` sees the silence grow rather than
+/// resetting on every attempt.
+pub async fn refresh_node(
+    paths: &DaemonPaths,
+    alias: &str,
+    now_ms: u64,
+) -> Result<little_monkey_lib::node_placement::NodeDescriptor, String> {
+    let value = call(paths, alias, Method::GET, "/v1/remote/node", vec![], now_ms).await?;
+    let descriptor: little_monkey_lib::node_placement::NodeDescriptor =
+        serde_json::from_value(value)
+            .map_err(|error| format!("Node descriptor is invalid: {error}"))?;
+    descriptor.validate()?;
+    RemoteStore::open(&paths.root)?.save_node(alias, &descriptor, now_ms)?;
+    Ok(descriptor)
+}
+
+/// The cheap liveness probe. Refreshes `last_seen_at_ms` without making the node
+/// re-measure its hardware.
+///
+/// The node's queue state *is* refreshed here, because that is the part that
+/// actually moves between probes — and a placer ranking on a two-minute-old
+/// "accepting" flag would keep choosing a node that has since filled up.
+pub async fn probe_node(
+    paths: &DaemonPaths,
+    alias: &str,
+    now_ms: u64,
+) -> Result<little_monkey_lib::node_placement::NodeHealth, String> {
+    let value = call(
+        paths,
+        alias,
+        Method::GET,
+        "/v1/remote/node/health",
+        vec![],
+        now_ms,
+    )
+    .await?;
+    let health: little_monkey_lib::node_placement::NodeHealth = serde_json::from_value(value)
+        .map_err(|error| format!("Node health is invalid: {error}"))?;
+    let mut store = RemoteStore::open(&paths.root)?;
+    if let Some((_, descriptor, _)) = store
+        .nodes()?
+        .into_iter()
+        .find(|(stored_alias, _, _)| stored_alias == alias)
+    {
+        if descriptor.runner_id != health.runner_id {
+            // The alias now points at a different machine. Refusing here rather
+            // than quietly re-pointing is the whole reason the runner id is on
+            // the health response: a residency rule proved against one host must
+            // not silently carry over to another.
+            return Err(format!(
+                "Node '{alias}' answered as runner '{}' but is recorded as '{}'; re-pair it",
+                health.runner_id, descriptor.runner_id
+            ));
+        }
+        store.save_node(
+            alias,
+            &little_monkey_lib::node_placement::NodeDescriptor {
+                accepting: health.accepting,
+                queue_depth: health.queue_depth,
+                queue_capacity: health.queue_capacity,
+                ..descriptor
+            },
+            now_ms,
+        )?;
+    }
+    Ok(health)
+}
+
+/// Ships one frozen `RunSpec` to a node.
+pub async fn place_run(
+    paths: &DaemonPaths,
+    alias: &str,
+    request: &little_monkey_lib::node_placement::PlaceRunRequest,
+    now_ms: u64,
+) -> Result<little_monkey_lib::node_placement::PlaceRunResponse, String> {
+    request.validate()?;
+    let body = serde_json::to_vec(request).map_err(|error| error.to_string())?;
+    let value = call(
+        paths,
+        alias,
+        Method::POST,
+        "/v1/remote/node/runs",
+        body,
+        now_ms,
+    )
+    .await?;
+    serde_json::from_value(value).map_err(|error| format!("Placement response is invalid: {error}"))
+}
+
+/// Reads one placement back from the node that holds it.
+pub async fn placed_status(
+    paths: &DaemonPaths,
+    alias: &str,
+    submitted_run_id: &str,
+    now_ms: u64,
+) -> Result<little_monkey_lib::node_placement::PlacedRunStatus, String> {
+    let path = format!(
+        "/v1/remote/node/runs/{}",
+        percent_segment(submitted_run_id)?
+    );
+    let value = call(paths, alias, Method::GET, &path, vec![], now_ms).await?;
+    serde_json::from_value(value).map_err(|error| format!("Placed run status is invalid: {error}"))
 }
 
 fn pinned_client(certificate_pem: &str, expected_sha256: &str) -> Result<reqwest::Client, String> {

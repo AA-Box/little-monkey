@@ -16,9 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use rusqlite::{
-    params, params_from_iter,
-    types::Value as SqlValue,
-    OptionalExtension, Transaction, TransactionBehavior,
+    params, params_from_iter, types::Value as SqlValue, OptionalExtension, Transaction,
+    TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -680,23 +679,23 @@ fn global_search_impl(
 
     let mut statement = ledger.connection().prepare(&sql)?;
     let rows = statement.query_map(params_from_iter(values.iter()), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, Option<String>>(11)?,
-                row.get::<_, i64>(12)?,
-                row.get::<_, f64>(13)?,
-            ))
-        })?;
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+            row.get::<_, i64>(12)?,
+            row.get::<_, f64>(13)?,
+        ))
+    })?;
 
     let mut hits = Vec::new();
     for row in rows {
@@ -2634,6 +2633,18 @@ fn searchable_run_event(
             ]),
         ),
         RunEvent::Started { engine_id } => ("started", "run", engine_id.clone()),
+        // Searchable by the reason, which is the sentence naming the policy —
+        // "which policy chose this run's target" is the question this event
+        // exists to answer, so it is the text worth finding it by.
+        RunEvent::RoutingDecided {
+            policy_name,
+            reason,
+            ..
+        } => (
+            "routing_decided",
+            "run",
+            join_search_text([policy_name.as_deref(), Some(reason.as_str())]),
+        ),
         RunEvent::ModelDelta { channel, text, .. } => (
             "model_delta",
             match channel {
@@ -2766,6 +2777,27 @@ fn searchable_run_event(
             "needs_reconciliation",
             "mutation",
             format!("{mutation_id} {reason}"),
+        ),
+        // Indexed under "node" rather than "run": what someone searches for
+        // after a migration is the machine, and the run id is already the
+        // column this row is keyed by.
+        RunEvent::MigrationDeparted {
+            target_node_id,
+            checkpoint_id,
+            ..
+        } => (
+            "migration_departed",
+            "node",
+            format!("{target_node_id} {checkpoint_id}"),
+        ),
+        RunEvent::MigrationArrived {
+            origin_node_id,
+            origin_last_sequence,
+            ..
+        } => (
+            "migration_arrived",
+            "node",
+            format!("{origin_node_id} {origin_last_sequence}"),
         ),
     }
 }
@@ -3392,8 +3424,7 @@ mod tests {
         assert!(component_prefix_is_not_a_grant.is_empty());
 
         let no_attached_roots =
-            global_search_with_artifacts_scoped(&mut ledger, &artifacts, &request, &[])
-                .unwrap();
+            global_search_with_artifacts_scoped(&mut ledger, &artifacts, &request, &[]).unwrap();
         assert!(no_attached_roots.is_empty());
 
         let explicitly_detached = global_search_with_artifacts_scoped(
@@ -3584,7 +3615,11 @@ mod tests {
         // budget across unrelated PRs' CI runs) — widen the budget under CI
         // rather than chase a threshold no shared runner can hit reliably,
         // while keeping the tight local budget as the real regression signal.
-        let budget_ms = if std::env::var_os("CI").is_some() { 400 } else { 200 };
+        let budget_ms = if std::env::var_os("CI").is_some() {
+            400
+        } else {
+            200
+        };
         assert!(
             p95 < Duration::from_millis(budget_ms),
             "10k search p95 exceeded {budget_ms} ms: {p95:?}"
@@ -3652,6 +3687,7 @@ mod tests {
                 tool_rules: Vec::new(),
                 allow_network: false,
                 allow_external_mutations: false,
+                egress_allowlist: None,
             },
             budgets: RunBudgets {
                 wall_time_ms: 60_000,

@@ -23,7 +23,7 @@ import {
   type ArtifactRef,
 } from "../../lib/artifacts";
 import { sessionMessages, useSessionStore } from "../../store/sessionStore";
-import { getStoredTheme } from "../../lib/theme";
+import { useAppliedTheme } from "../../lib/theme";
 import { useT } from "../../lib/i18n";
 
 function formatError(err: unknown): string {
@@ -316,6 +316,8 @@ export function ArtifactPane() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [block?.ref.messageIndex, block?.ref.blockIndex, block?.content, block?.kind, refreshKey]);
 
+  const theme = useAppliedTheme();
+
   if (!active) return null;
 
   if (!block) {
@@ -390,7 +392,6 @@ export function ArtifactPane() {
     }
   };
 
-  const theme = getStoredTheme();
   const hasScript = containsScriptTag(block.content);
   // Whether THIS render should show the tier-2 (`sandbox="allow-scripts"`,
   // blob-loaded) iframe rather than the tier-1 (empty-sandbox `srcdoc`) one —

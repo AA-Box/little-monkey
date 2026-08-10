@@ -4,6 +4,7 @@
 // resolves the app-data directory through one shared `data_dir()` instead of
 // each hardcoding the same identifier string independently — see the module
 // doc for the drift risk this replaces.
+pub mod agent_worktrees;
 pub mod app_paths;
 // `pub` so a future `monkey-cli` parity command (matching `checkpoints`/`rules`/
 // `memory`/`web`/`verify` above) could reuse `publish_impl`/`remove_impl`
@@ -19,6 +20,10 @@ pub mod artifact_store;
 // activation and rollback. The manager is Tauri-free so desktop, CLI, and a
 // future user-owned runner share one ownership and integrity policy.
 pub mod asset_manager;
+// Measured benchmarking (ROADMAP #2): a timing sink over the hub's canonical
+// stream, so time-to-first-token, decode throughput and peak memory are read
+// off a real generation on this machine rather than a device-class table.
+pub mod benchmark;
 // Native in-app browser pane: real tabbed child webviews (Claude-Desktop-
 // style) overlaid on the main webview via the `unstable` multiwebview API.
 pub mod browser_pane;
@@ -42,7 +47,15 @@ pub mod runtime_adapter;
 // stable-diffusion.cpp runtime. Tauri-free so the CLI can share it.
 pub mod generation;
 mod generation_commands;
+pub mod studio_tools;
+// The two generation backends the app talks to but never ships: a ComfyUI the
+// user installed, and hosted OpenAI-compatible image APIs. HTTP only.
+mod generation_remote;
 pub mod managed_runtime;
+// K22: the startup self-integrity check every native launch path consults, and
+// the one-step rollback the in-app updater takes before it replaces the install.
+pub mod self_integrity;
+pub mod update_rollback;
 // The stack registry and the embedding path, shared by v1 Knowledge Stacks
 // (`stacks`) and Knowledge 2.0 (`knowledge_service`/`knowledge_pipeline`).
 // Extracted out of `stacks` so that nothing shared lives in the module the v1→v2
@@ -131,9 +144,10 @@ pub mod command_palette;
 // `m7_companion`. See `docs/safe-desktop-control-design.md` for the full
 // threat model and explicit non-goals.
 pub mod desktop_control;
-// Apple-Silicon-only MLX lifecycle adapter. The module reports explicit
-// unsupported capability on every other platform rather than implying a
-// portable backend.
+// Apple-Silicon-only MLX lifecycle adapter. It is compiled only into the macOS
+// build: MLX needs Metal, so a Windows or Linux binary that carried this module
+// would ship an implementation it can never run.
+#[cfg(target_os = "macos")]
 pub mod mlx_runtime;
 // Inbound OpenAI/Anthropic compatibility translations and the scoped,
 // authenticated LAN policy shared by the API server and user-owned runners.
@@ -141,6 +155,7 @@ mod artifact_commands;
 pub mod chat_template_lab;
 pub mod checkpoints;
 pub mod compatibility_hub;
+pub mod conformance;
 // `pub` only for the doc-comment convention every sibling module below
 // follows (a future `monkey-cli` command could call `install_if_needed`
 // directly, though none exists yet — the CLI installing itself onto its own
@@ -186,23 +201,40 @@ pub mod connectors;
 // of GitHub/Slack/Jira work queues built on the Connector Catalog above, plus
 // draft-only reply/comment/status-update generation. Every write goes through
 // `permissions::request_permission`, same as every other mutating tool.
-pub mod triage;
 pub mod model_sources;
-mod process_lock;
-mod models;
+// `pub` for `curated_models()` alone — monkey-cli's launcher offers the same
+// curated recommendations the desktop model tab does. Everything else in here
+// is Tauri commands the CLI can't call anyway.
+pub mod models;
 pub mod ollama;
+mod process_lock;
 pub mod providers;
+pub mod triage;
 // Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
 // Tauri-free static-registry + comparison logic shared by `providers.rs`'s
 // cloud-model command and `m3_runtime_hub.rs`'s local-model staleness check.
 pub mod model_retirement;
-// `pub` so a future `monkey-cli` `Stacks` subcommand (RAG design doc, slice 4)
-// can call `stacks::list_impl`/`reindex_impl`/`query_impl` directly, the
-// same AppHandle-free-core reasoning as `checkpoints`/`rules`/`memory`.
+// Remote node as a scheduled device (roadmap K17): the placement plane's wire
+// shapes and its pure decisions — which node qualifies, which one wins, whether
+// a node is still alive, and what a vanished node means for the work placed on
+// it. Tauri-free and I/O-free so the daemon binary, the CLI controller, and the
+// desktop all read the same contract, and so every decision is testable without
+// the second machine the rest of K17 genuinely needs.
+pub mod node_placement;
+// `pub` so `monkey-cli`'s `Stacks` subcommand (RAG design doc, slice 4) can call
+// `stacks::query_stacks` directly, the same AppHandle-free-core reasoning as
+// `checkpoints`/`rules`/`memory`. The registry half it also needs comes from
+// `knowledge_core`.
 pub mod stacks;
 // `pub` so `monkey-cli` (slice 4) can reuse `load_impl`/`PromptEntry` directly,
 // the same reasoning as `rules`/`checkpoints` above.
 pub mod prompts;
+// Local revision history (diff/restore/branch/compare) for everything the user
+// authors — personas, snippets, skills, workflow definitions (roadmap K24 /
+// ROADMAP #3). `pub` for the same reason as `prompts`: `WorkflowService` and
+// `monkey-cli` record into it without an `AppHandle`.
+pub mod config_revisions;
+mod login_path;
 mod sessions;
 mod system;
 mod terminal;
@@ -245,6 +277,7 @@ pub mod permissions;
 // `pub` (not `mod`, like `sessions`/`tools`/`system` above) so `monkey-cli`
 // (slice 5) can call `read_rules_impl`/`load_impl`/`add_fact_impl` directly
 // from `little_monkey_lib`, the same way it already reuses `checkpoints`.
+pub mod hooks;
 pub mod memory;
 pub mod rules;
 pub mod workspace;
@@ -273,17 +306,49 @@ pub mod run_protocol;
 // idempotency, leases, triggers, and the migration-controlled profile schema.
 // Like the protocol module, this remains reusable by non-Tauri clients.
 pub mod run_ledger;
+// The portable form of K13's frozen process image, plus the target node's
+// admission decision over it (roadmap K18). Kept out of `checkpoints` because
+// nothing here needs an AppHandle and both halves of a migration — the desktop
+// that freezes and the daemon's remote runner that receives — have to build the
+// same types.
+pub mod migration;
+// The one place a run-less subsystem writes to the unified event stream
+// (`run_ledger`'s `subsystem_events`). Public because the three writing contexts
+// — desktop, a process that owns its data directory, and a disabled test — do
+// not all live in this crate's Tauri half.
+pub mod subsystem_audit;
 // The one process abstraction shared by every execution surface — desktop
 // turns, daemon jobs, subagents, crew members, workflow runs/nodes, remote
 // runs, background shells, side tasks. Public for the same reason the two
 // modules above are: the CLI's `monkey ps` and the daemon both read it, and
 // neither should grow a second copy of the state machine.
-pub mod process_table;
 mod process_commands;
+pub mod process_table;
+// The measuring half of the process table's resource ledger: what one OS pid
+// actually cost, plus an explicit reason for every field this platform will not
+// report. Separate from `process_table` because it is all platform syscalls and
+// no storage.
+pub mod process_usage;
 // Policy shared by the two HTTP listeners, which default to the same port and
 // today report a bare "address already in use" naming neither the winner nor
 // the reason. Where the shared pieces accumulate as D1 collapses them into one.
 pub mod http_policy;
+// Pure, AppHandle-free allowlist and dispatch matrix shared by the legacy and
+// M3 HTTP implementations while D1 collapses them into one listener.
+pub mod http_route_registry;
+// The agent tool schemas. In the library rather than beside the agent loop
+// because `contract` generates the published tool contract from them.
+pub mod agent_tools;
+// The published, semver'd syscall ABI (K19), generated from the route table,
+// the remote plane's dispatch, the ACP methods and `agent_tools`.
+pub mod contract;
+// Pure union model catalog used by the same D1 HTTP merge.
+pub mod http_model_catalog;
+pub mod http_model_service;
+pub mod http_model_sources;
+// One lifecycle/endpoint plan for the primary loopback and optional LAN HTTP
+// surfaces. Multiple sockets remain one service and one admission domain.
+pub mod unified_http_server;
 // Migration-controlled authoritative profile/session/search storage. Kept
 // reusable by the desktop, CLI, daemon, export/import, and restore paths.
 pub mod portability;
@@ -292,6 +357,11 @@ pub mod portability;
 // CLI service from growing a second encryption, credential, or conflict path.
 pub mod portability_commands;
 mod profile_commands;
+// K23's identity boundary. `pub` because `monkey-cli` and the daemon resolve
+// the same active profile through it — a second copy of the resolution rule is
+// a second answer to "whose data is this".
+pub mod profiles;
+use crate::profiles::ProfileScopedPaths;
 pub mod profile_store;
 mod run_commands;
 // `pub` so a future `monkey-cli` `task schedule` subcommand could reuse
@@ -314,6 +384,18 @@ pub mod privacy_firewall;
 // action. Reuses `run_protocol`/`run_ledger` for run modeling exactly like
 // every other execution surface above.
 pub mod sandbox;
+// The Linux half of `sandbox`'s OS boundary (ROADMAP.md item K3): a Landlock
+// filesystem ruleset plus a seccomp-BPF network filter, installed in `pre_exec`
+// alongside `os_limits`. Linux-only because the crates behind it are, and
+// because a stub would just be a second place to claim confinement from.
+#[cfg(target_os = "linux")]
+pub mod sandbox_linux;
+// The Windows half, and a narrower promise than the other two: a job object
+// bounds the run's process tree, committed memory and window-station reach, but
+// no filesystem boundary exists here that does not require this crate owning its
+// own `CreateProcess`. Reported as `ProcessContained`, never `OsSandboxed`.
+#[cfg(target_os = "windows")]
+pub mod sandbox_windows;
 // Local, single-machine "Team, Family, and Organization Mode" (ROADMAP.md
 // Phase 6): a named local profile switcher, capability-checked roles, and a
 // redacted audit export layered over `run_ledger`/`permissions`. See the
@@ -339,6 +421,11 @@ pub mod runtime_pr_watcher;
 pub mod approval_chains;
 pub mod local_apps;
 
+// Shared unit-test fixtures. Chiefly the mock app every test must build
+// through, so no two of them share an app-data directory (or a run ledger).
+#[cfg(test)]
+mod test_support;
+
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
 // `mcp::disconnect_all`.
@@ -356,6 +443,10 @@ pub struct AppState {
     /// weight set is bound at launch, so switching models restarts it; see
     /// `generation::GenerationEngineState`.
     pub generation_engine: generation::GenerationEngineState,
+    /// The one running Studio tool sidecar — a face swapper, a detector, a
+    /// segmenter. Not diffusion and not the engine: a separate program
+    /// speaking `studio_tools`' small HTTP contract.
+    pub studio_tool: studio_tools::StudioToolState,
     pub llama: std::sync::Mutex<llama::LlamaState>,
     /// The second, embeddings-only managed `llama-server` instance (port
     /// 8091, started with `--embeddings --pooling mean`) used by
@@ -512,10 +603,7 @@ pub struct AppState {
     pub mcp_oauth_cancel: std::sync::Mutex<
         std::collections::HashMap<
             String,
-            (
-                std::sync::Arc<tokio_util::sync::CancellationToken>,
-                usize,
-            ),
+            (std::sync::Arc<tokio_util::sync::CancellationToken>, usize),
         >,
     >,
     /// Per-server async lock serializing OAuth access-token retrieval/refresh
@@ -585,23 +673,6 @@ pub struct AppState {
     /// the same ledger through `RunLedger` directly; Tauri commands serialize
     /// desktop mutations through this mutex and assign audit metadata in Rust.
     pub run_ledger: std::sync::Mutex<Option<run_ledger::RunLedger>>,
-    /// Lazily-loaded (chunks + vectors) cache for `stacks_query`, keyed by
-    /// stack id, invalidated (removed) whenever a stack is reindexed or
-    /// deleted — see `stacks.rs::load_stack_cached`.
-    pub stack_cache:
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<stacks::LoadedStack>>>,
-    /// Cancellation handles for in-flight `stacks_reindex` calls, keyed by
-    /// stack id — mirrors `stream_cancels`/`tool_cancel` above, but a
-    /// `tokio_util::sync::CancellationToken` rather than a plain
-    /// `tokio::sync::Notify`: a `CancellationToken`'s cancelled state is
-    /// persisted, so a cancel request is never silently lost just because it
-    /// arrived before anything happened to be awaiting it (`Notify`'s
-    /// `notify_waiters()` has exactly that gap — see
-    /// `stacks::reindex_impl`'s doc comment for the failure mode this
-    /// avoids). See `stacks::stacks_cancel_index`.
-    pub index_cancels: std::sync::Mutex<
-        std::collections::HashMap<String, std::sync::Arc<tokio_util::sync::CancellationToken>>,
-    >,
     /// In-flight Human Approval Chain stages (ROADMAP.md, Phase 3) — see
     /// `approval_chains.rs`'s module doc. A separate state machine from
     /// `permissions` above, not an extension of it.
@@ -650,6 +721,7 @@ impl Default for AppState {
     fn default() -> Self {
         AppState {
             generation_engine: Default::default(),
+            studio_tool: Default::default(),
             llama: Default::default(),
             embed_llama: std::sync::Mutex::new(llama::LlamaState::for_embeddings()),
             ollama: Default::default(),
@@ -679,8 +751,6 @@ impl Default for AppState {
             artifacts: Default::default(),
             durable_artifacts: Default::default(),
             run_ledger: Default::default(),
-            stack_cache: Default::default(),
-            index_cancels: Default::default(),
             approval_chains: Default::default(),
             local_apps_config_lock: Default::default(),
             privacy_firewall_lock: Default::default(),
@@ -694,6 +764,10 @@ impl Default for AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before anything else, and before any thread exists: a GUI launch hands us
+    // launchd's `PATH`, so every shell tool would miss the user's own binaries
+    // (`~/.local/bin`, Homebrew, version-manager shims) until this runs.
+    login_path::hydrate();
     let app_data_dir = app_paths::data_dir()
         .expect("the operating system must provide an application data directory");
     // Installed before anything that can refuse an outbound request, and the only
@@ -810,7 +884,7 @@ pub fn run() {
         .manage(AppState::default())
         .manage(m3_state)
         .manage(quantization_state)
-        .manage(m3_http_server::M3HttpServerState::default())
+        .manage(unified_http_server::UnifiedHttpServerState::default())
         .manage(m4_state)
         .manage(native_skills_state)
         .manage(browser_state)
@@ -836,12 +910,17 @@ pub fn run() {
             // `hosted_oauth.rs`'s module doc for the full flow.
             hosted_oauth::register(app.handle());
 
+            // Installed before any window can submit a run, so a run that declares
+            // an egress allowlist is enforced from its first request. Nothing here
+            // opens the ledger — the closure reads it on demand and caches per run.
+            run_commands::install_run_egress_policy_source(app.handle());
+
             // Verify and copy the bundled llama.cpp runtime into app data at
             // launch so the separately installed `monkey` CLI can use the
             // same app-owned runtime without Ollama or a system install.
             // A source/dev build may intentionally have no staged bundle;
             // model start still fails closed if a present bundle is invalid.
-            if let Ok(runtime_app_data) = app.path().app_data_dir() {
+            if let Ok(runtime_app_data) = app.profile_data_dir() {
                 let resource_dir = app.path().resource_dir().ok();
                 if let Err(error) = managed_runtime::materialize_bundled_runtime(
                     resource_dir.as_deref(),
@@ -850,6 +929,29 @@ pub fn run() {
                     eprintln!("Managed llama.cpp runtime setup failed: {error}");
                 }
             }
+
+            // K22 startup self-integrity check. Runs *after* materialization on
+            // purpose: materialization is the repair pass — it replaces an
+            // invalid installed tree with the bundle it verified — so checking
+            // first would latch a refusal on a fault that was about to be
+            // fixed. Nothing here executes a runtime; the first thing that
+            // tries waits on this same verdict (see `self_integrity`'s doc).
+            tauri::async_runtime::spawn_blocking(|| {
+                let report = self_integrity::report();
+                if report.refused {
+                    // Loud, because from here on every native runtime launch
+                    // refuses and the panel is the only other place that says
+                    // why.
+                    eprintln!(
+                        "Startup integrity check FAILED; native runtimes will not be launched:"
+                    );
+                    for component in &report.components {
+                        if component.status == self_integrity::IntegrityStatus::Mismatch {
+                            eprintln!("  {}: {}", component.id, component.detail);
+                        }
+                    }
+                }
+            });
 
             // Finish or roll back any portable-profile transaction interrupted
             // between staged file publication and its durable commit marker.
@@ -896,25 +998,13 @@ pub fn run() {
                 }
             });
 
-            // Autostart the local API server if `api_server.json` says to —
-            // the only reader of that file at launch time, since every
-            // other consumer (the Settings panel) fetches it on demand via
-            // `api_server_get_config`. Spawned rather than awaited here:
-            // `setup` must return promptly, and a bind failure just leaves
-            // the server in its default "stopped"/"error" state for the
-            // user to retry from the panel, the same as any other failed
-            // manual start.
+            // One startup reconciliation covers the primary compatibility
+            // endpoint and an optional persisted LAN/TLS policy endpoint.
+            // It owns one lifecycle, route authority and admission domain;
+            // there is deliberately no second M3 autostart task racing it.
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let Ok(path) = server::config_file_path(&app_handle) else {
-                    return;
-                };
-                let Ok(config) = server::load_config_impl(&path) else {
-                    return;
-                };
-                if config.autostart {
-                    let _ = server::api_server_start(app_handle).await;
-                }
+                let _ = server::autostart_unified_server(app_handle).await;
             });
 
             // A previous session's chat turns, subagents, crew members,
@@ -926,6 +1016,25 @@ pub fn run() {
                 let reap_app = app.handle().clone();
                 let reap_state = reap_app.state::<AppState>();
                 process_commands::reap_desktop_processes_at_startup(&reap_app, reap_state.inner());
+            }
+
+            // Move destinations for egress that belongs to no run onto the
+            // ledger. Attributed destinations ride their run's own drain, which
+            // an app making only unattributed requests never reaches — so
+            // without this the "where did the app itself go" half stays in
+            // memory and dies with the process.
+            {
+                static UNATTRIBUTED_DRAIN_STOP: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                let drain_app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    run_commands::run_unattributed_egress_drain(
+                        drain_app,
+                        run_commands::UNATTRIBUTED_DRAIN_INTERVAL,
+                        &UNATTRIBUTED_DRAIN_STOP,
+                    )
+                    .await;
+                });
             }
 
             // Reclaim browser sessions nothing is driving any more. Before this,
@@ -970,9 +1079,6 @@ pub fn run() {
                 });
             }
 
-            // A persisted M3 policy represents an explicit user opt-in. Start
-            // its separate, capability-scoped compatibility listener without
-            // blocking app launch; failures remain visible in Runtime Hub.
             // Reconciles every enabled `WatchedFolder` Knowledge Sync source
             // against the live filesystem-watcher registry so a watcher
             // started in a previous session resumes across app restarts —
@@ -980,18 +1086,6 @@ pub fn run() {
             // commands keep it in sync as the catalog changes.
             knowledge_service::sync_watched_folder_watchers(app.handle());
 
-            let m3_http_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let hub = m3_http_app
-                    .state::<m3_commands::M3CommandState>()
-                    .hub
-                    .clone();
-                if hub.lan_policy().ok().flatten().is_none() {
-                    return;
-                }
-                let server = m3_http_app.state::<m3_http_server::M3HttpServerState>();
-                let _ = m3_http_server::start_server_core(&server, hub).await;
-            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1079,6 +1173,7 @@ pub fn run() {
             process_commands::process_transition,
             process_commands::process_link_run,
             process_commands::process_reap_missing,
+            process_commands::process_usage_ledger,
             permissions::permission_respond,
             permissions::permission_dry_run,
             permissions::set_permission_mode,
@@ -1122,6 +1217,11 @@ pub fn run() {
             web::web_remove_brave_key,
             rules::rules_read,
             rules::rules_write,
+            rules::rules_current_revision,
+            rules::rules_revision_entity,
+            hooks::hooks_load,
+            hooks::hooks_save,
+            hooks::hook_exec,
             memory::memory_list,
             memory::memory_add,
             memory::memory_delete,
@@ -1134,6 +1234,12 @@ pub fn run() {
             memory::memory_import,
             sessions::sessions_load,
             sessions::sessions_save,
+            profiles::profiles_list,
+            profiles::profiles_create,
+            profiles::profiles_rename,
+            profiles::profiles_set_limits,
+            profiles::profiles_delete,
+            profiles::profiles_switch,
             profile_commands::profile_migration_status,
             profile_commands::profile_migrate,
             profile_commands::profile_global_search,
@@ -1156,10 +1262,25 @@ pub fn run() {
             prompts::prompts_save,
             prompts::prompts_read_external,
             prompts::prompts_write_external,
+            prompts::prompts_current_revision,
+            config_revisions::config_revisions_record,
+            config_revisions::config_revisions_history,
+            config_revisions::config_revisions_get,
+            config_revisions::config_revisions_head,
+            config_revisions::config_revisions_branch,
+            config_revisions::config_revisions_branches,
+            config_revisions::config_revisions_entities,
             checkpoints::checkpoint_begin,
             checkpoints::checkpoint_end,
             checkpoints::checkpoint_revert,
             checkpoints::checkpoint_reapply,
+            m3_commands::m3_context_policies,
+            checkpoints::checkpoint_freeze,
+            checkpoints::checkpoint_staged_task_suggestions,
+            checkpoints::checkpoint_record_task_suggestion,
+            checkpoints::checkpoint_freeze_live,
+            checkpoints::checkpoint_clear_freeze,
+            checkpoints::checkpoint_restorability,
             checkpoints::checkpoint_list,
             checkpoints::checkpoint_preview,
             checkpoints::checkpoint_compare,
@@ -1178,8 +1299,14 @@ pub fn run() {
             git::git_review,
             git::git_changed_files,
             git::git_file_diff,
+            agent_worktrees::worktree_create,
+            agent_worktrees::worktree_status,
+            agent_worktrees::worktree_remove,
+            agent_worktrees::worktree_apply,
             mcp::mcp_list_servers,
             mcp::mcp_add_server,
+            mcp::mcp_current_revision,
+            mcp::mcp_restore_config,
             mcp::mcp_update_server,
             mcp::mcp_remove_server,
             mcp::mcp_set_enabled,
@@ -1210,10 +1337,7 @@ pub fn run() {
             stacks::stacks_rename,
             stacks::stacks_add_source,
             stacks::stacks_remove_source,
-            stacks::stacks_reindex,
-            stacks::stacks_cancel_index,
             stacks::stacks_query,
-            stacks::stacks_is_stale,
             stacks::tool_search_docs,
             knowledge_service::knowledge_v2_list_sources,
             knowledge_service::knowledge_v2_add_source,
@@ -1224,6 +1348,7 @@ pub fn run() {
             knowledge_service::knowledge_v2_background_config_get,
             knowledge_service::knowledge_v2_background_config_save,
             knowledge_service::knowledge_v2_update_chunking,
+            knowledge_service::knowledge_v2_is_stale,
             knowledge_service::knowledge_v2_query,
             knowledge_service::knowledge_v2_cancel_query,
             knowledge_service::knowledge_v2_pii_preview,
@@ -1269,6 +1394,8 @@ pub fn run() {
             sandbox::sandbox_discard,
             m3_commands::m3_hardware_snapshot,
             m3_commands::m3_hardware_profile,
+            m3_commands::m3_benchmark_run,
+            m3_commands::m3_benchmark_history,
             m3_commands::m3_hardware_compatibility_report,
             m3_commands::m3_storage_status,
             m3_commands::m3_installed_models,
@@ -1304,6 +1431,7 @@ pub fn run() {
             m3_commands::m3_api_dispatch,
             m3_commands::m3_api_cancel_inference,
             m3_commands::m3_compatibility_matrix,
+            m3_commands::run_conformance_suite,
             m3_commands::m3_lan_validate_policy,
             m3_commands::m3_lan_configure,
             m3_commands::m3_lan_disable,
@@ -1325,6 +1453,10 @@ pub fn run() {
             m3_commands::m3_component_check_updates,
             m3_commands::m3_component_install,
             m3_commands::m3_component_activate_version,
+            #[cfg(target_os = "macos")]
+            m3_commands::m3_mlx_install,
+            #[cfg(target_os = "macos")]
+            m3_commands::m3_mlx_install_component,
             m3_commands::m3_telemetry_record_load,
             m3_commands::m3_telemetry_record_request,
             m3_commands::m3_telemetry_recent_traces,
@@ -1357,6 +1489,12 @@ pub fn run() {
             native_skill_commands::native_skills_rollback,
             native_skill_commands::native_skills_rollback_many,
             security_commands::security_audit,
+            self_integrity::self_integrity_report,
+            update_rollback::update_install_info,
+            update_rollback::update_snapshot_create,
+            update_rollback::update_rollback_status,
+            update_rollback::update_rollback_discard,
+            update_rollback::update_rollback_apply,
             diagnostics::diagnostics_run,
             diagnostics::diagnostics_apply_fix,
             diagnostics::diagnostics_export_bundle,
@@ -1417,6 +1555,7 @@ pub fn run() {
             browser_worker::browser_capture_evidence,
             browser_worker::browser_stop,
             daemon_commands::daemon_desktop_status,
+            daemon_commands::daemon_desktop_decisions,
             daemon_commands::daemon_desktop_install,
             daemon_commands::daemon_desktop_start,
             daemon_commands::daemon_desktop_stop,
@@ -1438,6 +1577,11 @@ pub fn run() {
             daemon_commands::remote_pair_revoke,
             daemon_commands::remote_pair_rotate,
             daemon_commands::remote_audit,
+            daemon_commands::remote_node_list,
+            daemon_commands::remote_placements,
+            daemon_commands::remote_node_refresh,
+            daemon_commands::remote_placement_sync,
+            daemon_commands::remote_node_label,
             m5_delivery::m5_delivery_prepare_mutation,
             m5_delivery::m5_delivery_execute_mutation,
             m5_delivery::m5_delivery_list_worktrees,
@@ -1493,12 +1637,24 @@ pub fn run() {
             generation_commands::generation_loras,
             generation_commands::generation_add_lora,
             generation_commands::generation_remove_lora,
+            generation_commands::generation_backends,
+            generation_commands::generation_add_backend,
+            generation_commands::generation_remove_backend,
             generation_commands::generation_run,
             generation_commands::generation_cancel,
             generation_commands::generation_gallery,
             generation_commands::generation_delete_entry,
             generation_commands::generation_media_data_url,
+            generation_commands::generation_capabilities,
             generation_commands::generation_unload_engine,
+            generation_commands::studio_tools,
+            generation_commands::studio_tool_add,
+            generation_commands::studio_tool_remove,
+            generation_commands::studio_tool_manifest,
+            generation_commands::studio_tool_run,
+            generation_commands::studio_tool_stop,
+            generation_commands::studio_tools_running,
+            generation_commands::studio_tool_import_catalog,
             m7_companion::m7_image_generate,
             m7_companion::m7_image_gallery,
             m7_companion::m7_image_data_url,
@@ -1542,8 +1698,7 @@ pub fn run() {
         // either process needs) — is the only chance those child processes
         // get to actually be killed before the process itself exits.
         if let tauri::RunEvent::Exit = event {
-            let m3_http = app_handle.state::<m3_http_server::M3HttpServerState>();
-            let _ = tauri::async_runtime::block_on(m3_http_server::stop_server_core(&m3_http));
+            let _ = tauri::async_runtime::block_on(server::shutdown_unified_server(app_handle));
 
             let m3 = app_handle.state::<m3_commands::M3CommandState>();
             let _ = m3.cancel_all_and_shutdown_owned(std::time::Duration::from_secs(5));
@@ -1567,4 +1722,147 @@ pub fn run() {
             llama::stop_all_blocking(state.inner());
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    /// A `#[tauri::command]` that is never named in `run`'s
+    /// `generate_handler!` list compiles, type-checks, and passes every unit
+    /// test written against it — while being unreachable from the frontend,
+    /// because `invoke` resolves against that list alone. The v1→v2 knowledge
+    /// import (since deleted along with v1) spent its whole life in that state:
+    /// fully implemented, 19 passing tests, documented as done, and impossible
+    /// for any user to run.
+    ///
+    /// # Why a source scan
+    ///
+    /// The gap is between two *lists* — the commands that exist and the commands
+    /// that are registered — and nothing at runtime compares them. Following the
+    /// precedent of `egress.rs`'s `no_new_bare_reqwest_client_can_be_added_unnoticed`
+    /// and `m3_http_server.rs`'s self-scans, this reads the tree and compares
+    /// them directly. It needs no allowlist: at the time it was written every
+    /// one of the crate's 531 commands was registered except the one bug above,
+    /// so the assertion is simply "the difference is empty".
+    ///
+    /// # What it covers
+    ///
+    /// Every `#[tauri::command]` in every `.rs` file under `src/`, including
+    /// files that do not exist yet — a new command in a brand-new module is the
+    /// likeliest way the next unregistered one arrives, which is why this walks
+    /// `CARGO_MANIFEST_DIR` instead of `include_str!`-ing a hard-coded list.
+    ///
+    /// # What it cannot cover
+    ///
+    /// * **Wrong module path.** It matches the bare function name, so
+    ///   `wrong_module::some_command` counts as registered. The compiler rejects
+    ///   that anyway.
+    /// * **Registered but uncalled.** A command in the list with no frontend
+    ///   `invoke` and no CLI subcommand is still dead code; "reachable" here
+    ///   means only "dispatchable".
+    /// * **A command declared inside `#[cfg(test)]`.** A text scan cannot see
+    ///   `cfg` gating, so such a command would be a false positive. None exist,
+    ///   and a test-only Tauri command would be meaningless.
+    #[test]
+    fn every_tauri_command_is_reachable_from_the_invoke_handler() {
+        const ATTRIBUTE: &str = "#[tauri::command";
+
+        let source = include_str!("lib.rs");
+        let handler = source
+            .split_once("tauri::generate_handler![")
+            .expect("run() builds its handler with generate_handler!")
+            .1
+            .split_once("\n        ])")
+            .expect("the handler list is closed at its opening indentation")
+            .0;
+        // Comment lines inside the list (there is one) survive the split as
+        // non-identifier text; requiring a bare identifier drops them.
+        let registered: std::collections::HashSet<&str> = handler
+            .lines()
+            .filter_map(|line| line.split(',').next())
+            .map(|entry| entry.rsplit("::").next().unwrap_or(entry).trim())
+            .filter(|entry| {
+                !entry.is_empty() && entry.chars().all(|c| c.is_alphanumeric() || c == '_')
+            })
+            .collect();
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut unregistered: Vec<String> = Vec::new();
+        for entry in walkdir::WalkDir::new(&src)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if entry.path().extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let file = std::fs::read_to_string(entry.path()).expect("source file reads");
+            for declaration in file.split(ATTRIBUTE).skip(1) {
+                let Some((between, signature)) = declaration.split_once(" fn ") else {
+                    continue;
+                };
+                // Everything the attribute itself may carry — an optional
+                // `(rename_all = "...")` and its closing `]` — then only
+                // `pub`/`async`. Anything else means this `#[tauri::command` was
+                // prose in a comment and the `fn` found belongs to someone else.
+                let residue = between
+                    .trim_start_matches(|c| c != ']')
+                    .trim_start_matches(']')
+                    .replace("pub", "")
+                    .replace("async", "");
+                if !residue.trim().is_empty() {
+                    continue;
+                }
+                let name: String = signature
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if name.is_empty() {
+                    continue;
+                }
+                if !registered.contains(name.as_str()) {
+                    let relative = entry
+                        .path()
+                        .strip_prefix(&src)
+                        .expect("walked path is under src/")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    unregistered.push(format!("{relative}::{name}"));
+                }
+                declared.insert(name);
+            }
+        }
+        unregistered.sort();
+
+        // The reverse direction, which is what keeps the scan above honest: if a
+        // future signature shape stops matching, the commands it can no longer
+        // see turn up here as "registered but never declared" instead of
+        // silently passing.
+        let mut phantom: Vec<&str> = registered
+            .iter()
+            .copied()
+            .filter(|name| !declared.contains(*name))
+            .collect();
+        phantom.sort_unstable();
+        assert!(
+            phantom.is_empty(),
+            "{} name(s) in `run`'s `generate_handler!` list match no `#[tauri::command]` under \
+             src/: {}.\nEither the entry is stale and should be deleted, or this test's scanner \
+             no longer recognizes how the command is written — fix the scanner, because until it \
+             is fixed those commands are unguarded.",
+            phantom.len(),
+            phantom.join(", "),
+        );
+
+        assert!(
+            unregistered.is_empty(),
+            "{} `#[tauri::command]`(s) are not in `run`'s `generate_handler!` list, so no \
+             frontend `invoke` can reach them:\n  {}\n\
+             Add each one to that list. If a command is deliberately not exposed to the \
+             frontend, it should not carry `#[tauri::command]` at all — make it a plain \
+             function and call it directly.",
+            unregistered.len(),
+            unregistered.join("\n  "),
+        );
+    }
 }

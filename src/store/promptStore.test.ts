@@ -13,6 +13,7 @@ import {
   findByCommand,
   hydratePrompts,
   ImportParseError,
+  parseEntrySnapshot,
   parseImportPayload,
   selectPersonas,
   selectSnippets,
@@ -27,7 +28,14 @@ function seed(entries: PromptEntry[] = []): void {
   // exercising the starter-persona seed path — that's covered separately in
   // the "hydratePrompts / starter personas" tests below, which manipulate it
   // explicitly.
-  usePromptStore.setState({ entries, defaultPersonaId: null, hasSeededDefaults: true, persistError: null });
+  usePromptStore.setState({
+    entries,
+    defaultPersonaId: null,
+    hasSeededDefaults: true,
+    persistError: null,
+    libraryRevisionId: null,
+    conflict: false,
+  });
 }
 
 beforeEach(() => {
@@ -389,5 +397,125 @@ describe("parseImportPayload", () => {
 
   it("does not misidentify an arbitrary array as Cherry Studio's shape", () => {
     expect(() => parseImportPayload(JSON.stringify([{ foo: "bar" }, 1, "two"]))).toThrow(ImportParseError);
+  });
+});
+
+describe("concurrent edit detection", () => {
+  /** The debounced write is what actually calls `prompts_save`; every test
+   * here has to get past it, so they all drive the timer directly. */
+  function flushDebounce(): void {
+    vi.advanceTimersByTime(1000);
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  it("saves against the revision it last saw, and adopts the one it gets back", async () => {
+    usePromptStore.setState({ libraryRevisionId: "rev-1" });
+    invokeMock.mockImplementation(async (command: unknown) =>
+      command === "prompts_save" ? "rev-2" : null,
+    );
+
+    usePromptStore.getState().addEntry({ kind: "snippet", name: "n", command: "n", content: "c" });
+    flushDebounce();
+    await vi.waitFor(() => expect(usePromptStore.getState().libraryRevisionId).toBe("rev-2"));
+
+    const save = invokeMock.mock.calls.find(([command]) => command === "prompts_save");
+    expect((save?.[1] as { baseRevisionId: string }).baseRevisionId).toBe("rev-1");
+    expect(usePromptStore.getState().conflict).toBe(false);
+  });
+
+  it("surfaces a refused save as a conflict and keeps the local edits", async () => {
+    usePromptStore.setState({ libraryRevisionId: "rev-1" });
+    invokeMock.mockImplementation(async (command: unknown) => {
+      if (command === "prompts_save") throw new Error("conflict: this was changed elsewhere");
+      return null;
+    });
+
+    usePromptStore.getState().addEntry({ kind: "snippet", name: "mine", command: "mine", content: "c" });
+    flushDebounce();
+    await vi.waitFor(() => expect(usePromptStore.getState().conflict).toBe(true));
+
+    // The edits are still here, unsaved — the whole point of refusing.
+    expect(usePromptStore.getState().entries).toHaveLength(1);
+    // ...and a conflict is not reported as a generic persistence failure.
+    expect(usePromptStore.getState().persistError).toBeNull();
+  });
+
+  it("reports a non-conflict save failure as a persist error, not a conflict", async () => {
+    invokeMock.mockImplementation(async (command: unknown) => {
+      if (command === "prompts_save") throw new Error("Failed to write prompts file: disk full");
+      return null;
+    });
+
+    usePromptStore.getState().addEntry({ kind: "snippet", name: "n", command: "n", content: "c" });
+    flushDebounce();
+    await vi.waitFor(() => expect(usePromptStore.getState().persistError).toContain("disk full"));
+    expect(usePromptStore.getState().conflict).toBe(false);
+  });
+
+  it("resolves a conflict by overwriting, which saves unconditionally", async () => {
+    usePromptStore.setState({ conflict: true, libraryRevisionId: "rev-1" });
+    invokeMock.mockImplementation(async (command: unknown) =>
+      command === "prompts_save" ? "rev-9" : null,
+    );
+
+    await usePromptStore.getState().overwriteAfterConflict();
+
+    const save = invokeMock.mock.calls.find(([command]) => command === "prompts_save");
+    expect((save?.[1] as { baseRevisionId: string | null }).baseRevisionId).toBeNull();
+    expect(usePromptStore.getState().conflict).toBe(false);
+    expect(usePromptStore.getState().libraryRevisionId).toBe("rev-9");
+  });
+
+  it("resolves a conflict by reloading, which takes the stored version", async () => {
+    usePromptStore.setState({
+      conflict: true,
+      entries: [{ id: "mine", kind: "snippet", name: "mine", command: "mine", content: "c", createdAt: 1, updatedAt: 1 }],
+    });
+    invokeMock.mockImplementation(async (command: unknown) => {
+      if (command === "prompts_load") {
+        return JSON.stringify({
+          version: 1,
+          entries: [{ id: "theirs", kind: "snippet", name: "theirs", command: "theirs", content: "c", createdAt: 1, updatedAt: 1 }],
+          defaultPersonaId: null,
+          hasSeededDefaults: true,
+        });
+      }
+      if (command === "prompts_current_revision") return "rev-theirs";
+      return null;
+    });
+
+    await usePromptStore.getState().reloadAfterConflict();
+
+    expect(usePromptStore.getState().entries.map((e) => e.id)).toEqual(["theirs"]);
+    expect(usePromptStore.getState().libraryRevisionId).toBe("rev-theirs");
+    expect(usePromptStore.getState().conflict).toBe(false);
+    // The discarded edits must not come back on a later flush.
+    flushDebounce();
+    expect(invokeMock.mock.calls.some(([command]) => command === "prompts_save")).toBe(false);
+  });
+});
+
+describe("parseEntrySnapshot", () => {
+  it("reads a snapshot written by prompts::entry_snapshot", () => {
+    const patch = parseEntrySnapshot(
+      JSON.stringify({ kind: "persona", name: "Reviewer", command: "rev", description: "d", content: "body" }),
+    );
+    expect(patch).toEqual({ kind: "persona", name: "Reviewer", command: "rev", description: "d", content: "body" });
+  });
+
+  it("refuses anything that is not an entry snapshot, rather than blanking fields", () => {
+    expect(parseEntrySnapshot("not json")).toBeNull();
+    expect(parseEntrySnapshot("[]")).toBeNull();
+    // A workflow definition revision restored onto a persona by mistake.
+    expect(parseEntrySnapshot(JSON.stringify({ workflow_id: "w", nodes: [] }))).toBeNull();
+  });
+
+  it("falls back to snippet for an unknown kind and drops an empty description", () => {
+    const patch = parseEntrySnapshot(JSON.stringify({ kind: "mystery", name: "n", content: "c", description: "" }));
+    expect(patch?.kind).toBe("snippet");
+    expect(patch?.description).toBeUndefined();
   });
 });

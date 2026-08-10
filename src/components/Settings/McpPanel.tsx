@@ -3,6 +3,7 @@ import {
   ChevronDown,
   Cloud,
   GitPullRequest,
+  History,
   Plug,
   RefreshCw,
   Terminal,
@@ -21,6 +22,12 @@ import {
 import { useT } from "../../lib/i18n";
 import { AddMcpServerForm, type McpServerDraft } from "./AddMcpServerForm";
 import { errorMessage } from "../../lib/errors";
+import { RevisionHistoryPanel } from "./RevisionHistoryPanel";
+import {
+  MCP_CONFIG_ENTITY,
+  MCP_CONFIG_KIND,
+  restoreMcpConfig,
+} from "../../store/configRevisionStore";
 
 /** No shared toggle-switch component exists in `ui/` yet — cloned from
  * `AutomationPanel.tsx`'s local `Toggle` rather than promoted prematurely. */
@@ -693,6 +700,64 @@ export function McpPanel() {
     setDraftVersion((version) => version + 1);
   }
 
+/**
+ * History of the whole `mcp_servers.json` document (roadmap K24).
+ *
+ * The *document*, not one server: a restore has to put back a coherent config,
+ * and restoring one server's snapshot into a file that has since gained and lost
+ * others would produce a state that never existed. The per-server logs
+ * (`MCP_SERVER_KIND`) are still recorded for reading "what changed about this
+ * server", which is a different question from "put the config back".
+ *
+ * Restore goes through `mcp_restore_config`, which validates the snapshot and
+ * then writes it through the ordinary save — so the restore is itself a
+ * revision, exactly as `RevisionHistoryPanel` requires of every owning store.
+ */
+function McpConfigHistory() {
+  const { t } = useT();
+  const refresh = useMcpStore((s) => s.refresh);
+  const [open, setOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function restore(snapshot: string) {
+    setError(null);
+    try {
+      await restoreMcpConfig(snapshot);
+      await refresh();
+      setOpen(false);
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  }
+
+  return (
+    <section className="rounded-lg border border-border bg-surface p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold text-foreground">{t("McpPanel.historyHeading")}</h3>
+          <p className="mt-1 text-xs leading-5 text-muted">{t("McpPanel.historyDescription")}</p>
+        </div>
+        <Button size="sm" variant="ghost" onClick={() => setOpen((value) => !value)}>
+          <History size={14} />
+          {t("McpPanel.historyButton")}
+        </Button>
+      </div>
+      {error && <p className="mt-2 text-xs text-danger">{error}</p>}
+      {open && (
+        <div className="mt-3">
+          <RevisionHistoryPanel
+            kind={MCP_CONFIG_KIND}
+            entityId={MCP_CONFIG_ENTITY}
+            title={t("McpPanel.historyHeading")}
+            onRestore={(snapshot) => void restore(snapshot)}
+            onClose={() => setOpen(false)}
+          />
+        </div>
+      )}
+    </section>
+  );
+}
+
   return (
     <div className="flex flex-col gap-3 py-2">
       <p className="text-xs text-muted">{t("McpPanel.description")}</p>
@@ -756,6 +821,8 @@ export function McpPanel() {
           ))}
         </div>
       )}
+
+      <McpConfigHistory />
 
       <AddMcpServerForm draft={draft} draftVersion={draftVersion} />
     </div>

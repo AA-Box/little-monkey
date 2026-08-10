@@ -1,3 +1,4 @@
+import { en } from "./en";
 import { crewLocale } from "./crew";
 import { runLocale } from "./runs";
 import { searchLocale } from "./search";
@@ -39,7 +40,8 @@ import { privacyFirewallLocale } from "./privacyFirewall";
 import { redTeamLabLocale } from "./redTeamLab";
 import { sandboxLocale } from "./sandbox";
 
-export const esES: Record<string, string> = {
+/** What this locale says in its own words — everything else falls back to English. */
+const translated: Record<string, string> = {
   ...dbAdminGuardrailsLocale,
   ...developerLocale,
   ...ecosystemLocale,
@@ -1084,6 +1086,11 @@ export const esES: Record<string, string> = {
   "MessageList.recipeStartedFromLocalApp": "Iniciado desde la receta: {{name}} · mediante la Local App \"{{appName}}\"",
   "SubagentRow.profileExplore": "exploración",
   "SubagentRow.profileCode": "código",
+  "SubagentRow.worktreeChanges": "Cambios en el worktree",
+  "SubagentRow.worktreeApply": "Aplicar",
+  "SubagentRow.worktreeDiscard": "Descartar",
+  "SubagentRow.worktreeApplied": "Aplicado al espacio de trabajo",
+  "SubagentRow.worktreeDiscarded": "Descartado",
   "SubagentRow.statusRunning": "En ejecución",
   "SubagentRow.statusDone": "Completado",
   "SubagentRow.statusFailed": "Fallido",
@@ -1100,6 +1107,8 @@ export const esES: Record<string, string> = {
   "BackgroundTasksPanel.finishedHeading": "Finalizadas",
   "BackgroundTasksPanel.clearButton": "Limpiar",
   "BackgroundTasksPanel.stopAriaLabel": "Detener \"{{name}}\"",
+  "BackgroundTasksPanel.steerPlaceholder": "Envía un mensaje a este agente…",
+  "BackgroundTasksPanel.steerSendAriaLabel": "Enviar mensaje a \"{{name}}\"",
   "BackgroundTasksPanel.shellKindLabel": "Shell",
   "BackgroundTasksPanel.agentKindLabel": "Agente",
   "BackgroundTasksPanel.exitCode": "salida {{code}}",
@@ -1120,6 +1129,20 @@ export const esES: Record<string, string> = {
   "BackgroundTasksPanel.agentStatusCompleted": "Completado",
   "BackgroundTasksPanel.agentStatusFailed": "Fallido",
   "BackgroundTasksPanel.agentStatusCancelled": "Cancelado",
+  "BackgroundTasksPanel.agentGroupTitle": "{{count}} agentes",
+  "BackgroundTasksPanel.workflowKindLabel": "Flujo de trabajo",
+  "BackgroundTasksPanel.savedWorkflowsHeading": "Flujos de trabajo guardados",
+  "BackgroundTasksPanel.saveWorkflowButton": "Guardar flujo de trabajo",
+  "BackgroundTasksPanel.savedWorkflowShape": "{{phases}} fases · {{agents}} agentes",
+  "BackgroundTasksPanel.savedWorkflowLastRun": "Última ejecución {{when}}",
+  "BackgroundTasksPanel.savedWorkflowNeverRun": "Aún sin ejecutar",
+  "BackgroundTasksPanel.savedWorkflowDeleteAriaLabel": "Eliminar el flujo de trabajo guardado \"{{name}}\"",
+  "BackgroundTasksPanel.phaseQueued": "En cola",
+  "BackgroundTasksPanel.stopAllAriaLabel": "Detener todos los agentes en ejecución",
+  "BackgroundTasksPanel.tableAgentHeader": "Agente",
+  "BackgroundTasksPanel.tableTokensHeader": "Tokens",
+  "BackgroundTasksPanel.tableToolsHeader": "Herramientas",
+  "BackgroundTasksPanel.tableTimeHeader": "Tiempo",
   "MessageList.emptyStateTitle": "Aún no hay nada aquí",
   "MessageList.emptyStateDescription": "Pide a Little Monkey que explique, escriba o corrija algo en tu espacio de trabajo para empezar.",
   "ModeSelector.modeManualLabel": "Manual",
@@ -1262,6 +1285,13 @@ export const esES: Record<string, string> = {
   "AddCustomProviderForm.addButton": "Añadir",
   "AddCustomProviderForm.helpText": "Cualquier URL base compatible con OpenAI — la aplicación añade /chat/completions y /models.",
   "AutomationPanel.reliabilityHeading": "Fiabilidad",
+  "AutomationPanel.hooksHeading": "Hooks",
+  "AutomationPanel.hooksDescription": "Comandos de shell que se ejecutan en eventos del ciclo de vida del agente. Un hook PreToolUse puede bloquear la llamada de herramienta (salida distinta de cero o {\"decision\":\"deny\"} en stdout); la salida de UserPromptSubmit se añade al contexto del turno. Tiempo límite de 10 segundos, sin solicitud de permiso.",
+  "AutomationPanel.hookEventLabel": "Evento",
+  "AutomationPanel.hookMatcherPlaceholder": "Filtro de herramienta (regex, opcional)",
+  "AutomationPanel.hookCommandPlaceholder": "Comando de shell",
+  "AutomationPanel.hookAddButton": "Añadir hook",
+  "AutomationPanel.hookDeleteAriaLabel": "Eliminar el hook \"{{command}}\"",
   "AutomationPanel.autoFailoverLabel": "Conmutación automática entre proveedores",
   "AutomationPanel.autoFailoverDescription": "Si un proveedor en la nube falla antes de responder, reintenta automáticamente con otro proveedor configurado en lugar de fallar el turno.",
   "AutomationPanel.autoVisionSwitchLabel": "Cambiar automáticamente a un modelo con visión para imágenes",
@@ -1326,6 +1356,10 @@ export const esES: Record<string, string> = {
   "AutomationPanel.subagentModelOverrideExploreLabel": "Perfil de exploración",
   "AutomationPanel.subagentModelOverrideCodeLabel": "Perfil de código",
   "AutomationPanel.subagentModelOverrideDefaultBadge": "Igual que el principal",
+  "AutomationPanel.customAgentsIntro": "Agentes personalizados de .monkey/agents/*.md en el espacio de trabajo abierto — cada uno se convierte en un perfil adicional que aceptan las herramientas task y workflow.",
+  "AutomationPanel.customAgentsRefreshButton": "Actualizar",
+  "AutomationPanel.customAgentsLoading": "Explorando .monkey/agents…",
+  "AutomationPanel.customAgentsEmpty": "No se han encontrado agentes personalizados. Añade un archivo markdown con frontmatter name, description y tools en .monkey/agents/ de tu espacio de trabajo.",
   "AutomationPanel.checkpointsHeading": "Puntos de control",
   "AutomationPanel.checkpointRetentionLabel": "Conservar los últimos",
   "AutomationPanel.checkpointRetentionDescription": "Cuántos puntos de control recientes conservar en disco antes de eliminar los más antiguos. Se aplica desde el próximo punto de control que se cree.",
@@ -1655,15 +1689,8 @@ export const esES: Record<string, string> = {
   "KnowledgePanel.addFileButton": "Añadir archivo",
   "KnowledgePanel.noSourcesHint": "Todavía no hay fuentes — añade una carpeta o archivo para indexar.",
   "KnowledgePanel.removeSourceAriaLabel": "Quitar fuente",
-  "KnowledgePanel.reindexButton": "Reindexar",
-  "KnowledgePanel.cancelIndexButton": "Cancelar indexación",
-  "KnowledgePanel.phaseWalking": "Explorando archivos…",
-  "KnowledgePanel.phaseChunking": "Dividiendo en fragmentos… ({{done}}/{{total}} archivos)",
-  "KnowledgePanel.phaseEmbedding": "Generando embeddings… ({{chunks}} fragmentos)",
-  "KnowledgePanel.phaseDone": "Indexado",
   "KnowledgePanel.neverIndexed": "Todavía no indexado",
   "KnowledgePanel.indexedAt": "Indexado {{when}} · {{count}} fragmentos",
-  "KnowledgePanel.staleIndexBadge": "Requiere reindexar",
   "KnowledgePanel.testSearchHeading": "Búsqueda de prueba",
   "KnowledgePanel.notIndexedForSearch": "Indexa este stack antes de buscar.",
   "KnowledgePanel.searchPlaceholder": "Buscar en este stack…",
@@ -2458,7 +2485,6 @@ export const esES: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "Habilitar presupuestos",
   "UsagePanel.dailyBudget": "Presupuesto diario (USD)",
   "UsagePanel.monthlyBudget": "Presupuesto mensual (USD)",
-  "UsagePanel.warningThreshold": "Avisar al (%)",
   "UsagePanel.enforcement": "Al llegar al límite",
   "UsagePanel.enforcementWarn": "Solo avisar",
   "UsagePanel.enforcementPause": "Pausar las llamadas a la nube",
@@ -2520,7 +2546,7 @@ export const esES: Record<string, string> = {
   "Studio.add.repoFilePlaceholder": "split_files/vae/wan2.2_vae.safetensors",
   "Studio.add.namePlaceholder": "Wan 2.2 TI2V 5B",
   "Studio.add.familyPlaceholder": "Wan",
-  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --offload-to-cpu",
+  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --threads 8 --offload-to-cpu",
   "Studio.speakerPlaceholder": "/Users/tu/voces/narrador.wav",
   "Studio.languagePlaceholder": "es",
   "Studio.add.name": "Nombre",
@@ -2642,3 +2668,34 @@ export const esES: Record<string, string> = {
   "Studio.unsupported.title": "Studio no está disponible en este equipo",
   "Studio.unsupported.body": "El motor de generación se distribuye precompilado para Mac con Apple silicon y para Windows y Linux x86-64. Chat y Código no se ven afectados."
 };
+
+/**
+ * Every key, so this locale's key set is identical to the base's *by
+ * construction* (roadmap K22).
+ *
+ * Before this, each locale carried only the keys somebody had translated, so
+ * the sets diverged by over a thousand entries and nothing could be enforced: a
+ * key renamed in `en` left ten locales pointing at one that no longer existed,
+ * and no check failed. `useT()` already fell back to English for a missing key,
+ * so **no user-visible text changes** — what changes is that the divergence is
+ * now impossible rather than merely unmeasured, and `localeSync.test.ts` holds
+ * it that way.
+ *
+ * `en` is imported by `index.ts` unconditionally as the runtime fallback, so
+ * spreading it here costs nothing at the bundle: those bytes were already
+ * loaded for every locale.
+ *
+ * The real translation gap stays countable: `TRANSLATED_KEYS` below is what this
+ * locale actually says in its own words, and everything else is showing English.
+ */
+export const esES: Record<string, string> = { ...en, ...translated };
+
+/**
+ * The keys this locale genuinely translates.
+ *
+ * Exported so the count of what is *not* translated is exact rather than
+ * inferred from "the string happens to equal English" — many real translations
+ * legitimately do ("OK", "Studio", a product name).
+ */
+export const esESTranslatedKeys: readonly string[] = Object.keys(translated);
+

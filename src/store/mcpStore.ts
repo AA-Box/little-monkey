@@ -2,6 +2,8 @@ import { create } from "zustand";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+import { mcpCurrentRevision } from "./configRevisionStore";
+
 /**
  * Mirrors the Rust `McpTransport` enum (src-tauri/src/mcp.rs) exactly — a
  * tagged union (`#[serde(tag = "type", rename_all = "snake_case")]`):
@@ -232,22 +234,29 @@ export const useMcpStore = create<McpStore>((set, get) => ({
   },
 
   addServer: async (entry) => {
-    await invoke("mcp_add_server", { entry });
+    await invoke("mcp_add_server", { entry, base_revision_id: await mcpCurrentRevision() });
     await get().refresh();
   },
 
   updateServer: async (entry) => {
-    await invoke("mcp_update_server", { entry });
+    await invoke("mcp_update_server", { entry, base_revision_id: await mcpCurrentRevision() });
     await get().refresh();
   },
 
   removeServer: async (id) => {
-    await invoke("mcp_remove_server", { server_id: id });
+    await invoke("mcp_remove_server", {
+      server_id: id,
+      base_revision_id: await mcpCurrentRevision(),
+    });
     await get().refresh();
   },
 
   setEnabled: async (id, enabled) => {
-    await invoke("mcp_set_enabled", { server_id: id, enabled });
+    await invoke("mcp_set_enabled", {
+      server_id: id,
+      enabled,
+      base_revision_id: await mcpCurrentRevision(),
+    });
     await get().refresh();
   },
 

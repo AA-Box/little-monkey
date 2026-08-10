@@ -1,3 +1,4 @@
+import { en } from "./en";
 import { crewLocale } from "./crew";
 import { runLocale } from "./runs";
 import { searchLocale } from "./search";
@@ -39,7 +40,8 @@ import { privacyFirewallLocale } from "./privacyFirewall";
 import { redTeamLabLocale } from "./redTeamLab";
 import { sandboxLocale } from "./sandbox";
 
-export const de: Record<string, string> = {
+/** What this locale says in its own words — everything else falls back to English. */
+const translated: Record<string, string> = {
   ...dbAdminGuardrailsLocale,
   ...developerLocale,
   ...ecosystemLocale,
@@ -1084,6 +1086,11 @@ export const de: Record<string, string> = {
   "MessageList.recipeStartedFromLocalApp": "Gestartet aus Rezept: {{name}} · über Local App „{{appName}}“",
   "SubagentRow.profileExplore": "Erkundung",
   "SubagentRow.profileCode": "Code",
+  "SubagentRow.worktreeChanges": "Änderungen im Worktree",
+  "SubagentRow.worktreeApply": "Übernehmen",
+  "SubagentRow.worktreeDiscard": "Verwerfen",
+  "SubagentRow.worktreeApplied": "In den Workspace übernommen",
+  "SubagentRow.worktreeDiscarded": "Verworfen",
   "SubagentRow.statusRunning": "Läuft",
   "SubagentRow.statusDone": "Fertig",
   "SubagentRow.statusFailed": "Fehlgeschlagen",
@@ -1100,6 +1107,8 @@ export const de: Record<string, string> = {
   "BackgroundTasksPanel.finishedHeading": "Abgeschlossen",
   "BackgroundTasksPanel.clearButton": "Leeren",
   "BackgroundTasksPanel.stopAriaLabel": "„{{name}}“ stoppen",
+  "BackgroundTasksPanel.steerPlaceholder": "Nachricht an diesen Agenten senden …",
+  "BackgroundTasksPanel.steerSendAriaLabel": "Nachricht an „{{name}}“ senden",
   "BackgroundTasksPanel.shellKindLabel": "Shell",
   "BackgroundTasksPanel.agentKindLabel": "Agent",
   "BackgroundTasksPanel.exitCode": "Exit {{code}}",
@@ -1120,6 +1129,20 @@ export const de: Record<string, string> = {
   "BackgroundTasksPanel.agentStatusCompleted": "Abgeschlossen",
   "BackgroundTasksPanel.agentStatusFailed": "Fehlgeschlagen",
   "BackgroundTasksPanel.agentStatusCancelled": "Abgebrochen",
+  "BackgroundTasksPanel.agentGroupTitle": "{{count}} Agenten",
+  "BackgroundTasksPanel.workflowKindLabel": "Workflow",
+  "BackgroundTasksPanel.savedWorkflowsHeading": "Gespeicherte Workflows",
+  "BackgroundTasksPanel.saveWorkflowButton": "Workflow speichern",
+  "BackgroundTasksPanel.savedWorkflowShape": "{{phases}} Phasen · {{agents}} Agenten",
+  "BackgroundTasksPanel.savedWorkflowLastRun": "Zuletzt ausgeführt {{when}}",
+  "BackgroundTasksPanel.savedWorkflowNeverRun": "Noch nicht ausgeführt",
+  "BackgroundTasksPanel.savedWorkflowDeleteAriaLabel": "Gespeicherten Workflow „{{name}}“ löschen",
+  "BackgroundTasksPanel.phaseQueued": "In Warteschlange",
+  "BackgroundTasksPanel.stopAllAriaLabel": "Alle laufenden Agenten stoppen",
+  "BackgroundTasksPanel.tableAgentHeader": "Agent",
+  "BackgroundTasksPanel.tableTokensHeader": "Token",
+  "BackgroundTasksPanel.tableToolsHeader": "Werkzeuge",
+  "BackgroundTasksPanel.tableTimeHeader": "Zeit",
   "MessageList.emptyStateTitle": "Noch nichts hier",
   "MessageList.emptyStateDescription": "Bitten Sie Little Monkey, etwas in Ihrem Arbeitsbereich zu erklären, zu schreiben oder zu beheben, um loszulegen.",
   "ModeSelector.modeManualLabel": "Manuell",
@@ -1262,6 +1285,13 @@ export const de: Record<string, string> = {
   "AddCustomProviderForm.addButton": "Hinzufügen",
   "AddCustomProviderForm.helpText": "Jede OpenAI-kompatible Basis-URL — die App ergänzt /chat/completions und /models.",
   "AutomationPanel.reliabilityHeading": "Zuverlässigkeit",
+  "AutomationPanel.hooksHeading": "Hooks",
+  "AutomationPanel.hooksDescription": "Shell-Befehle, die bei Agent-Lebenszyklus-Ereignissen ausgeführt werden. Ein PreToolUse-Hook kann den Tool-Aufruf blockieren (Exit-Code ungleich null oder {\"decision\":\"deny\"} auf stdout); die Ausgabe von UserPromptSubmit wird dem Kontext des Zugs hinzugefügt. 10 Sekunden Timeout, keine Berechtigungsabfrage.",
+  "AutomationPanel.hookEventLabel": "Ereignis",
+  "AutomationPanel.hookMatcherPlaceholder": "Tool-Matcher (Regex, optional)",
+  "AutomationPanel.hookCommandPlaceholder": "Shell-Befehl",
+  "AutomationPanel.hookAddButton": "Hook hinzufügen",
+  "AutomationPanel.hookDeleteAriaLabel": "Hook „{{command}}“ löschen",
   "AutomationPanel.autoFailoverLabel": "Automatischer Failover zwischen Anbietern",
   "AutomationPanel.autoFailoverDescription": "Wenn ein Cloud-Anbieter vor der Antwort einen Fehler meldet, wird automatisch mit einem anderen konfigurierten Anbieter erneut versucht, anstatt den Durchgang fehlschlagen zu lassen.",
   "AutomationPanel.autoVisionSwitchLabel": "Bei Bildern automatisch zu einem Vision-Modell wechseln",
@@ -1326,6 +1356,10 @@ export const de: Record<string, string> = {
   "AutomationPanel.subagentModelOverrideExploreLabel": "Explore-Profil",
   "AutomationPanel.subagentModelOverrideCodeLabel": "Code-Profil",
   "AutomationPanel.subagentModelOverrideDefaultBadge": "Wie übergeordnet",
+  "AutomationPanel.customAgentsIntro": "Benutzerdefinierte Agenten aus .monkey/agents/*.md im geöffneten Workspace — jeder wird ein zusätzliches Profil, das die Task- und Workflow-Tools akzeptieren.",
+  "AutomationPanel.customAgentsRefreshButton": "Aktualisieren",
+  "AutomationPanel.customAgentsLoading": ".monkey/agents wird durchsucht…",
+  "AutomationPanel.customAgentsEmpty": "Keine benutzerdefinierten Agenten gefunden. Lege eine Markdown-Datei mit name-, description- und tools-Frontmatter in .monkey/agents/ im Workspace an.",
   "AutomationPanel.checkpointsHeading": "Checkpoints",
   "AutomationPanel.checkpointRetentionLabel": "Letzte aufbewahren",
   "AutomationPanel.checkpointRetentionDescription": "Wie viele der letzten Checkpoints auf der Festplatte behalten werden, bevor die ältesten gelöscht werden. Gilt ab dem nächsten erstellten Checkpoint.",
@@ -1655,15 +1689,8 @@ export const de: Record<string, string> = {
   "KnowledgePanel.addFileButton": "Datei hinzufügen",
   "KnowledgePanel.noSourcesHint": "Noch keine Quellen — füge einen Ordner oder eine Datei zum Indexieren hinzu.",
   "KnowledgePanel.removeSourceAriaLabel": "Quelle entfernen",
-  "KnowledgePanel.reindexButton": "Neu indexieren",
-  "KnowledgePanel.cancelIndexButton": "Indexierung abbrechen",
-  "KnowledgePanel.phaseWalking": "Dateien werden durchsucht…",
-  "KnowledgePanel.phaseChunking": "Wird in Abschnitte zerlegt… ({{done}}/{{total}} Dateien)",
-  "KnowledgePanel.phaseEmbedding": "Wird eingebettet… ({{chunks}} Abschnitte)",
-  "KnowledgePanel.phaseDone": "Indexiert",
   "KnowledgePanel.neverIndexed": "Noch nicht indexiert",
   "KnowledgePanel.indexedAt": "Indexiert am {{when}} · {{count}} Abschnitte",
-  "KnowledgePanel.staleIndexBadge": "Neuindizierung nötig",
   "KnowledgePanel.testSearchHeading": "Testsuche",
   "KnowledgePanel.notIndexedForSearch": "Diesen Stack vor der Suche indexieren.",
   "KnowledgePanel.searchPlaceholder": "Diesen Stack durchsuchen…",
@@ -2458,7 +2485,6 @@ export const de: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "Budgets aktivieren",
   "UsagePanel.dailyBudget": "Tagesbudget (USD)",
   "UsagePanel.monthlyBudget": "Monatsbudget (USD)",
-  "UsagePanel.warningThreshold": "Warnen bei (%)",
   "UsagePanel.enforcement": "Bei Erreichen des Limits",
   "UsagePanel.enforcementWarn": "Nur warnen",
   "UsagePanel.enforcementPause": "Cloud-Aufrufe pausieren",
@@ -2520,7 +2546,7 @@ export const de: Record<string, string> = {
   "Studio.add.repoFilePlaceholder": "split_files/vae/wan2.2_vae.safetensors",
   "Studio.add.namePlaceholder": "Wan 2.2 TI2V 5B",
   "Studio.add.familyPlaceholder": "Wan",
-  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --offload-to-cpu",
+  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --threads 8 --offload-to-cpu",
   "Studio.speakerPlaceholder": "/Users/du/stimmen/sprecher.wav",
   "Studio.languagePlaceholder": "de",
   "Studio.add.name": "Name",
@@ -2642,3 +2668,34 @@ export const de: Record<string, string> = {
   "Studio.unsupported.title": "Studio ist auf diesem Rechner nicht verfügbar",
   "Studio.unsupported.body": "Die Generierungs-Engine wird vorgebaut für Macs mit Apple Silicon und für Windows und Linux auf x86-64 ausgeliefert. Chat und Code sind nicht betroffen."
 };
+
+/**
+ * Every key, so this locale's key set is identical to the base's *by
+ * construction* (roadmap K22).
+ *
+ * Before this, each locale carried only the keys somebody had translated, so
+ * the sets diverged by over a thousand entries and nothing could be enforced: a
+ * key renamed in `en` left ten locales pointing at one that no longer existed,
+ * and no check failed. `useT()` already fell back to English for a missing key,
+ * so **no user-visible text changes** — what changes is that the divergence is
+ * now impossible rather than merely unmeasured, and `localeSync.test.ts` holds
+ * it that way.
+ *
+ * `en` is imported by `index.ts` unconditionally as the runtime fallback, so
+ * spreading it here costs nothing at the bundle: those bytes were already
+ * loaded for every locale.
+ *
+ * The real translation gap stays countable: `TRANSLATED_KEYS` below is what this
+ * locale actually says in its own words, and everything else is showing English.
+ */
+export const de: Record<string, string> = { ...en, ...translated };
+
+/**
+ * The keys this locale genuinely translates.
+ *
+ * Exported so the count of what is *not* translated is exact rather than
+ * inferred from "the string happens to equal English" — many real translations
+ * legitimately do ("OK", "Studio", a product name).
+ */
+export const deTranslatedKeys: readonly string[] = Object.keys(translated);
+

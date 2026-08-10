@@ -19,12 +19,34 @@
 //! [`EgressRule`] is the third piece, and the one the other two were missing: a
 //! *name* for the rule that refused a request, so a refusal is a value and not
 //! only a sentence. See its doc comment for what could not be done without it.
+//!
+//! [`send`] and [`metered`] are the fourth, and the only part of this module that
+//! *measures* rather than decides: how many bytes a request actually moved, and
+//! which process row they belong to. See [`send`] for the byte unit — it is not
+//! the obvious one — and `Counted` for why counting a streamed body does not turn
+//! it into a buffered one.
+//!
+//! [`check_run_allowlist`] and `PinnedResolver` are the fifth, and they are the one
+//! part that is keyed to a **run** rather than to a URL or an address: the run's
+//! frozen host/port/protocol allowlist, enforced where every outbound request
+//! already converges, and its names pinned so an allowed one cannot be moved
+//! mid-run. See [`check_run_allowlist`] for which absences fail open and which fail
+//! closed, and `PinnedResolver` for what pinning costs a rotating CDN.
 
+use std::collections::BTreeMap;
 use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::future::Future;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use hyper::body::{Body as HttpBody, Buf, Frame, SizeHint};
 use reqwest::Url;
+
+use crate::run_scope::{self, Unattributed};
 
 /// Declares [`EgressRule`] together with its code and summary tables.
 ///
@@ -218,6 +240,23 @@ egress_rules! {
     /// here would happily allow, because *this run* said it would not use the
     /// network.
     RunNetworkDenied => "egress.run-network-denied", "this run was submitted without network permission";
+    /// The host is not on the run's frozen
+    /// [`EgressAllowlist`](crate::run_protocol::EgressAllowlist). Deny-by-default
+    /// *within* a declaration: a host the spec did not name is refused even though
+    /// every address rule above would have allowed it.
+    RunHostNotAllowlisted => "egress.run-host-not-allowlisted", "the host is not on this run's egress allowlist";
+    /// The effective port — the URL's own, or the scheme's default — is not on the
+    /// run's frozen allowlist.
+    RunPortNotAllowlisted => "egress.run-port-not-allowlisted", "the port is not on this run's egress allowlist";
+    /// The URL scheme is not on the run's frozen allowlist. Distinct from
+    /// [`SchemeNotAllowed`](EgressRule::SchemeNotAllowed), which is a *caller's*
+    /// fixed set (`web.rs` sends only `http`/`https`); this one is the run's.
+    RunProtocolNotAllowlisted => "egress.run-protocol-not-allowlisted", "the protocol is not on this run's egress allowlist";
+    /// A run is in scope and its frozen policy could not be read, so whether it
+    /// declared an allowlist is unknown. Refused rather than assumed — see
+    /// [`run_allowlist_verdict`] for why this one fails closed while an absent
+    /// declaration fails open.
+    RunPolicyUnavailable => "egress.run-policy-unavailable", "this run's frozen egress policy could not be read";
 }
 
 impl EgressRule {
@@ -303,7 +342,11 @@ impl EgressRule {
             | EgressRule::RedirectHopLimit
             | EgressRule::RedirectCrossOrigin
             | EgressRule::RedirectOriginUnknown
-            | EgressRule::RunNetworkDenied => false,
+            | EgressRule::RunNetworkDenied
+            | EgressRule::RunHostNotAllowlisted
+            | EgressRule::RunPortNotAllowlisted
+            | EgressRule::RunProtocolNotAllowlisted
+            | EgressRule::RunPolicyUnavailable => false,
         }
     }
 }
@@ -589,10 +632,21 @@ pub fn hardened() -> reqwest::ClientBuilder {
 /// a test. Kept private so no production caller can quietly widen a budget by
 /// reaching for this instead of [`hardened`].
 fn hardened_with_timeouts(connect: Duration, read: Duration) -> reqwest::ClientBuilder {
+    hardened_with_lookup(connect, read, system_lookup)
+}
+
+/// [`hardened_with_timeouts`] with the name lookup injected, so a test can pin a
+/// resolution it controls. Same reason `hardened_with_timeouts` itself exists.
+fn hardened_with_lookup(
+    connect: Duration,
+    read: Duration,
+    lookup: HostLookup,
+) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(connect)
         .read_timeout(read)
         .redirect(same_origin_redirect_policy())
+        .dns_resolver(std::sync::Arc::new(PinnedResolver { lookup }))
 }
 
 /// Follows a redirect only when it stays on the origin the request was already
@@ -633,6 +687,14 @@ fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
         // call. Returning early also keeps the message off the happy path: it is
         // built from owned `String`s and would otherwise be allocated on every
         // hop that gets followed.
+        // The run's allowlist again, on the hop rather than the request. Not
+        // redundant with the check in `send`: `may_follow` permits an
+        // `http` -> `https` upgrade on the same authority, and that changes the
+        // effective port (80 to 443), so a hop can reach a protocol and a port the
+        // original request never asked for.
+        if let Err(denial) = check_run_allowlist(attempt.url()) {
+            return attempt.error(refused(denial));
+        }
         if may_follow(previous, attempt.url()) {
             return attempt.follow();
         }
@@ -739,6 +801,902 @@ pub(crate) fn origin_label(url: &Url) -> String {
     }
 }
 
+/// What the installed source knows about one run's frozen egress policy.
+///
+/// Four answers and not two, because the two that look alike are the ones that must
+/// not behave alike: [`Unknown`](Self::Unknown) is "no such run", which is ordinary
+/// and permitted, while [`Unavailable`](Self::Unavailable) is "the row could not be
+/// read", which is refused. Collapsing them would either refuse every run id that is
+/// not a ledger entity (`browser_worker` and `m4_runtime` both scope work under ids
+/// the run ledger has never seen) or allow a declared policy to be skipped by
+/// breaking the ledger.
+pub enum RunEgressPolicy {
+    /// The run's frozen spec declares an allowlist.
+    Declared(std::sync::Arc<crate::run_protocol::EgressAllowlist>),
+    /// The run exists and its frozen spec declares nothing.
+    Undeclared,
+    /// No run by that id. A [`run_scope::RunScope::Run`] id is not necessarily a
+    /// row in the run ledger.
+    Unknown,
+    /// The frozen spec could not be read at all.
+    Unavailable,
+}
+
+type PolicySource = dyn Fn(&str) -> RunEgressPolicy + Send + Sync;
+
+/// The process-wide way to read a run's frozen policy, or `None` before one is
+/// installed.
+///
+/// A global for the reason `denial_sink`'s recorder is one, and the argument is
+/// stronger here: [`send`] is called from 92 sites whose signatures have no
+/// `AppHandle`, no `AppState` and no business acquiring either. The run *identity*
+/// arrives implicitly through [`run_scope`]; this is how the frozen row behind that
+/// identity is fetched, and it is installed once at startup by
+/// `run_commands::install_run_egress_policy_source`.
+///
+/// Unlike the sink, this global does decide something, so the direction of its
+/// absence matters: with no source installed there is no policy to enforce and
+/// [`send`] behaves exactly as it did before this existed. That is what keeps every
+/// unit test, the CLI, and any embedder that never opens a run ledger working, and
+/// it is not a hole a run can open — nothing reachable by a model, a skill or a
+/// package can uninstall a source, and the app installs one before it serves a
+/// window.
+static POLICY_SOURCE: OnceLock<std::sync::RwLock<Option<std::sync::Arc<PolicySource>>>> =
+    OnceLock::new();
+
+fn policy_source_slot() -> &'static std::sync::RwLock<Option<std::sync::Arc<PolicySource>>> {
+    POLICY_SOURCE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Frozen policies already read, so a ledger row is read once per run and not once
+/// per request.
+///
+/// Safe to cache at all only because a run spec is immutable: the row is written once
+/// at submission and there is no update path to it, so a cached answer cannot be
+/// stale in the direction that matters. Dropping an entry is therefore only ever a
+/// cost — the next request re-reads the same frozen answer, or fails closed if it
+/// cannot.
+///
+/// `None` covers both [`RunEgressPolicy::Undeclared`] and
+/// [`RunEgressPolicy::Unknown`]: both mean "no allowlist governs this run", and
+/// caching `Unknown` is sound because a scope is entered *after* its run row is
+/// written, so a real run cannot look unknown on its first request and declared on
+/// its second. [`RunEgressPolicy::Unavailable`] is never cached — a transient read
+/// failure must not be remembered as an answer.
+static POLICY_CACHE: OnceLock<
+    Mutex<
+        std::collections::HashMap<
+            String,
+            Option<std::sync::Arc<crate::run_protocol::EgressAllowlist>>,
+        >,
+    >,
+> = OnceLock::new();
+
+/// Cached runs kept. Concurrency here is a handful of runs, not thousands; the bound
+/// exists so a long-lived process that has seen ten thousand runs does not keep all
+/// of them.
+///
+/// ponytail: cleared wholesale at the bound rather than evicted per entry, because a
+/// dropped entry costs one re-read and can never widen a policy. Upgrade path if the
+/// re-read ever matters: an LRU, or eviction when a run reaches a terminal event.
+const MAX_CACHED_RUN_POLICIES: usize = 256;
+
+fn policy_cache() -> &'static Mutex<
+    std::collections::HashMap<String, Option<std::sync::Arc<crate::run_protocol::EgressAllowlist>>>,
+> {
+    POLICY_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Installs the process-wide policy source, replacing any previous one.
+///
+/// Clears the cache, because a new source may answer differently about the same run
+/// id — which in production never happens (it is installed once) and in tests
+/// happens constantly.
+pub fn install_run_policy_source<F>(source: F)
+where
+    F: Fn(&str) -> RunEgressPolicy + Send + Sync + 'static,
+{
+    if let Ok(mut slot) = policy_source_slot().write() {
+        *slot = Some(std::sync::Arc::new(source));
+    }
+    if let Ok(mut cache) = policy_cache().lock() {
+        cache.clear();
+    }
+}
+
+/// Uninstalls the source and forgets every cached answer.
+///
+/// Tests only, and they must hold `denial_sink::test_lock()` while they use it: the
+/// source is process-wide, so a test that left one installed would decide another
+/// test's requests.
+#[cfg(test)]
+pub(crate) fn clear_run_policy_source() {
+    if let Ok(mut slot) = policy_source_slot().write() {
+        *slot = None;
+    }
+    if let Ok(mut cache) = policy_cache().lock() {
+        cache.clear();
+    }
+}
+
+/// The allowlist governing `run_id`, `Ok(None)` when none does, and `Err` when the
+/// frozen policy could not be read.
+fn policy_for_run(
+    run_id: &str,
+) -> Result<Option<std::sync::Arc<crate::run_protocol::EgressAllowlist>>, EgressDenial> {
+    if let Ok(cache) = policy_cache().lock() {
+        if let Some(cached) = cache.get(run_id) {
+            return Ok(cached.clone());
+        }
+    }
+    let Some(source) = policy_source_slot()
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+    else {
+        // No source installed: nothing to enforce, and see `POLICY_SOURCE` for why
+        // that is the safe direction for this one absence.
+        return Ok(None);
+    };
+
+    let resolved = match source(run_id) {
+        RunEgressPolicy::Declared(allowlist) => Some(allowlist),
+        RunEgressPolicy::Undeclared | RunEgressPolicy::Unknown => None,
+        RunEgressPolicy::Unavailable => {
+            return Err(EgressDenial::about(
+                EgressRule::RunPolicyUnavailable,
+                format!("run {run_id}"),
+            ))
+        }
+    };
+    if let Ok(mut cache) = policy_cache().lock() {
+        if cache.len() >= MAX_CACHED_RUN_POLICIES {
+            cache.clear();
+        }
+        cache.insert(run_id.to_string(), resolved.clone());
+    }
+    Ok(resolved)
+}
+
+/// Whether one allowlist host entry matches `host`.
+///
+/// `host` must already be lowercased; entries are lowercase by validation, so no
+/// call site folds anything twice.
+///
+/// # The boundary is the whole point
+///
+/// A wildcard entry `*.example.com` matches a name that ends with `.example.com`
+/// *including the dot*, so `evil-example.com` does not match — the naive
+/// `ends_with("example.com")` would have said it did, and that is the classic
+/// suffix-matching bypass. The apex is deliberately excluded too: `*.example.com`
+/// does not match `example.com`, which must be named in its own right. Same shape as
+/// `http_route_registry`'s `ExactOrDescendant`, which checks for the `/` separator
+/// rather than trusting a prefix.
+#[must_use]
+pub fn allowlist_host_matches(entry: &str, host: &str) -> bool {
+    match entry.strip_prefix("*.") {
+        Some(suffix) => host
+            .strip_suffix(suffix)
+            .is_some_and(|label| label.ends_with('.') && label.len() > 1),
+        None => entry == host,
+    }
+}
+
+/// Names this gate in a denial record.
+const RUN_ALLOWLIST_GUARD: &str = "egress.run-allowlist";
+
+/// Refuses a request the ambient run's frozen allowlist does not permit, and writes
+/// the refusal down.
+///
+/// # Fail-closed and fail-open are both deliberate, and they are different cases
+///
+/// - **No run in scope** — behaves exactly as before. Some egress legitimately has
+///   no run and never will: timer-driven knowledge refresh, connector verification
+///   in Settings, model downloads, update checks, and every inbound request
+///   `server.rs` serves. Deny-by-default keyed to a run would silently disable all
+///   of them, which is why the run is the key and the absence of one is an answer.
+/// - **A run whose policy declares nothing** — also as before. Every run row frozen
+///   before this field existed says exactly this, and reading those as deny-all
+///   would refuse every in-flight run.
+/// - **A run whose policy cannot be read** — refused. This is the one that fails
+///   closed, and the cost is bounded by what it means: the frozen spec lives in the
+///   same ledger a run appends its events to, so a run whose spec cannot be read
+///   cannot record anything either. Refusing its egress is not the failure, it is a
+///   symptom of one.
+/// - **A declared allowlist** — deny-by-default within it, on all three dimensions.
+///
+/// Loopback is exempt, for [`is_loopback_target`]'s reason: a local-inference run
+/// talks to `127.0.0.1` and refusing that is a broken policy rather than a strict
+/// one.
+pub(crate) fn check_run_allowlist(url: &Url) -> Result<(), EgressDenial> {
+    let verdict = run_allowlist_verdict(url);
+    if let Err(denial) = &verdict {
+        // Recorded here, at the raise site, because by the time this reaches a
+        // command it is a `String` — `denial_sink`'s own finding. The run id comes
+        // from the ambient scope, so nothing has to be threaded.
+        crate::denial_sink::record(RUN_ALLOWLIST_GUARD, denial, None);
+    }
+    verdict
+}
+
+/// [`check_run_allowlist`] without the recording, so the rules can be tested as a
+/// pure function of a URL.
+fn run_allowlist_verdict(url: &Url) -> Result<(), EgressDenial> {
+    let Some(run_id) = run_scope::current_run_id() else {
+        return Ok(());
+    };
+    // Ahead of the policy read, not after it: the exemption holds whatever the policy
+    // says, so a local-inference run never reads a ledger row to be told what it is
+    // allowed to do on its own machine.
+    if is_loopback_target(url) {
+        return Ok(());
+    }
+    let Some(allowlist) = policy_for_run(&run_id)? else {
+        return Ok(());
+    };
+
+    let Some(host) = url.host_str() else {
+        return Err(EgressDenial::new(EgressRule::HostMissing));
+    };
+    let host = host.to_ascii_lowercase();
+    if !allowlist
+        .hosts
+        .iter()
+        .any(|entry| allowlist_host_matches(entry, &host))
+    {
+        return Err(EgressDenial::about(
+            EgressRule::RunHostNotAllowlisted,
+            format!(
+                "{host} is not among the {} hosts run {run_id} declared",
+                allowlist.hosts.len()
+            ),
+        ));
+    }
+
+    let Some(port) = url.port_or_known_default() else {
+        return Err(EgressDenial::new(EgressRule::PortMissing));
+    };
+    if !allowlist.ports.contains(&port) {
+        return Err(EgressDenial::about(
+            EgressRule::RunPortNotAllowlisted,
+            format!("port {port} is not among the ports run {run_id} declared"),
+        ));
+    }
+
+    let scheme = url.scheme();
+    if !allowlist
+        .protocols
+        .iter()
+        .any(|protocol| protocol == scheme)
+    {
+        return Err(EgressDenial::about(
+            EgressRule::RunProtocolNotAllowlisted,
+            format!("{scheme} is not among the protocols run {run_id} declared"),
+        ));
+    }
+    Ok(())
+}
+
+/// Host of the throwaway request [`refusal_error`] never sends.
+///
+/// `.invalid` is reserved by RFC 2606 and is never looked up: the resolver below
+/// refuses before any lookup happens, and the client is built `.no_proxy()` so a
+/// configured proxy cannot be handed the name instead.
+const REFUSAL_HOST: &str = "egress-denied.invalid";
+
+/// Turns a denial into the `reqwest::Error` a caller of [`send`] receives.
+///
+/// # Why this is a request and not a constructor
+///
+/// `reqwest::Error` has no public constructor — every one is built inside reqwest
+/// from a source it was handed. So a refusal reaches the caller the one way reqwest
+/// will carry somebody else's error: through a `dns_resolver` that refuses. The
+/// denial arrives on the far side as itself, recoverable with `downcast_ref` and
+/// rendered with its code, exactly like the redirect policy's refusals.
+///
+/// Nothing leaves this process. The throwaway request names [`REFUSAL_HOST`], the
+/// resolver refuses it without a lookup, and the denied target is never mentioned to
+/// anything outside this function.
+///
+/// ponytail: builds a client per refusal, because the denial has to be *in* the
+/// resolver and a shared client cannot hold a per-request one. A refusal already
+/// costs a sink insert, so this is not the expensive half. Upgrade path if it ever
+/// matters: one cached client per rule.
+async fn refusal_error(denial: EgressDenial) -> reqwest::Error {
+    struct AlwaysRefuse(EgressDenial);
+
+    impl reqwest::dns::Resolve for AlwaysRefuse {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let denial = self.0.clone();
+            Box::pin(
+                async move { Err(Box::new(denial) as Box<dyn std::error::Error + Send + Sync>) },
+            )
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .dns_resolver(std::sync::Arc::new(AlwaysRefuse(denial)))
+        .build();
+    match client {
+        Ok(client) => client
+            .get(format!("http://{REFUSAL_HOST}/"))
+            .send()
+            .await
+            // A resolver whose every answer is an error cannot produce a response,
+            // and the URL is a literal this function wrote.
+            .expect_err("a resolver that refuses every name cannot answer a request"),
+        // A `ClientBuilder` that will not build is itself a `reqwest::Error`, which
+        // is the right thing to return: the request is still refused, and the caller
+        // still gets an error rather than a response.
+        Err(error) => error,
+    }
+}
+
+/// Addresses pinned per `(run, host)` for the lifetime of the run.
+///
+/// See [`PinnedResolver`] for what this closes and what it costs.
+static DNS_PINS: OnceLock<Mutex<std::collections::HashMap<(String, String), Vec<SocketAddr>>>> =
+    OnceLock::new();
+
+/// Pins kept. A run touching more names than this is not the case this exists for.
+///
+/// ponytail: cleared wholesale at the bound, like [`POLICY_CACHE`]. Unlike that one
+/// a dropped pin is not merely a re-read — it is a re-resolution, which reopens the
+/// window this table closes for that name. Stated rather than hidden; upgrade path is
+/// eviction keyed to a run reaching a terminal event, which needs a hook this module
+/// does not have.
+const MAX_DNS_PINS: usize = 512;
+
+fn dns_pins() -> &'static Mutex<std::collections::HashMap<(String, String), Vec<SocketAddr>>> {
+    DNS_PINS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// How a name is resolved when no pin exists yet. A function pointer purely so a
+/// test can supply a resolver that answers differently on the second call, which is
+/// the only way to write a rebinding test that is not a mock of itself.
+type HostLookup =
+    fn(String) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+
+fn system_lookup(
+    host: String,
+) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> {
+    Box::pin(async move {
+        // Port `0`: reqwest replaces it with the URL's own port (its `Resolve` doc
+        // says so), which is also why a pin binds an *address* and not an endpoint.
+        // Formatted as an owned string so the returned future borrows nothing.
+        tokio::net::lookup_host(format!("{host}:0"))
+            .await
+            .map(|addresses| addresses.collect())
+    })
+}
+
+/// Resolves a name once per run and pins the answer for the rest of the run.
+///
+/// # The gap this closes
+///
+/// [`check_run_allowlist`] decides on a *name*. The connection is opened against an
+/// *address*, resolved afterwards, and an attacker who controls DNS for an
+/// allowlisted name (TTL 0, or a rebinding service) can answer the two lookups
+/// differently — so the name that passed the check and the address that gets
+/// connected to need not be the same place. Pinning removes the second lookup: the
+/// addresses handed back here are exactly what reqwest connects to, not a hint
+/// compared against a later answer, so there is no second resolution left to race.
+/// `web.rs`'s `SsrfGuardedResolver` closes the same gap for its own guard, and
+/// `browser_worker.rs` does it per Chromium launch with `--host-resolver-rules`.
+///
+/// # What it costs, which is real
+///
+/// A long run against a rotating CDN keeps the address it first saw. If that address
+/// is withdrawn mid-run the run's requests fail rather than following the rotation,
+/// and the fix is a new run — the pin is per run, so nothing outlives it. That is the
+/// deliberate trade: an allowed name that cannot be moved is worth more here than one
+/// that follows every answer, and a rebind is indistinguishable from a rotation at
+/// the resolver. Two further honest limits:
+///
+/// - **A pooled connection is not re-resolved at all.** reqwest keys its pool by
+///   scheme, host and port, so a request reusing a connection another run opened
+///   connects wherever that run's pin pointed. Both runs had to allow the same host
+///   for that to happen, and the address was a pinned answer for that name either
+///   way, so nothing unallowed is reached — but the pin that applies is the first
+///   run's.
+/// - **It applies to clients built from [`hardened`].** A caller that reaches for
+///   `Client::builder()` itself gets the default resolver and no pin; the ratchet at
+///   the bottom of this file is what keeps that set from growing quietly.
+struct PinnedResolver {
+    lookup: HostLookup,
+}
+
+impl reqwest::dns::Resolve for PinnedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        // Read synchronously, here, rather than inside the future: this call happens
+        // on the task that is driving the request, which is the task the scope was
+        // entered on.
+        let run = run_scope::current_run_id();
+        let host = name.as_str().to_ascii_lowercase();
+        let lookup = self.lookup;
+        Box::pin(async move {
+            let key = run.map(|run| (run, host.clone()));
+            if let Some(key) = &key {
+                if let Some(pinned) = dns_pins()
+                    .lock()
+                    .ok()
+                    .and_then(|pins| pins.get(key).cloned())
+                {
+                    return Ok(Box::new(pinned.into_iter()) as reqwest::dns::Addrs);
+                }
+            }
+
+            let addresses = lookup(host)
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            // An empty answer is passed through rather than pinned or renamed: the
+            // connector reports it, and pinning "nothing" would make one bad answer
+            // permanent for the run.
+            if let (Some(key), false) = (key, addresses.is_empty()) {
+                if let Ok(mut pins) = dns_pins().lock() {
+                    if pins.len() >= MAX_DNS_PINS {
+                        pins.clear();
+                    }
+                    pins.insert(key, addresses.clone());
+                }
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Bytes counted for work with no process row to charge, one tally per reason.
+///
+/// # Why these exist rather than a `return`
+///
+/// The ledger's whole claim is that a number in it was measured and a `NULL` in it
+/// says why it was not. Bytes that crossed the wire under no attribution are
+/// neither: dropping them on the floor would make the process rows *look*
+/// complete while the totals quietly disagreed with the network, and charging them
+/// to whichever process happened to be nearby would be worse. So they are counted
+/// here, under the reason they could not be attributed, where a support bundle can
+/// read them and where the tests below can prove nothing was silently lost.
+///
+/// Process-lifetime tallies and deliberately not ledger rows: there is no row to
+/// write them to, which is the whole point. `Relaxed` for the same reason
+/// [`run_scope::ProcessScope::charge_egress`] uses it — each tally has to be right,
+/// not ordered against anything else.
+///
+/// Sized from [`Unattributed::ALL`] plus the two cases that enum does not cover, so
+/// a reason added there gets a tally here without anyone remembering to widen this.
+static UNATTRIBUTED_EGRESS: [AtomicU64; UNATTRIBUTED_BUCKETS] =
+    [const { AtomicU64::new(0) }; UNATTRIBUTED_BUCKETS];
+
+const UNATTRIBUTED_BUCKETS: usize = Unattributed::ALL.len() + 2;
+
+/// A run was in scope but no process row was, so the ledger has nothing to charge.
+/// Distinct from every [`Unattributed`] reason, all of which explain the absence of
+/// a *run*.
+const RUN_WITHOUT_PROCESS: usize = Unattributed::ALL.len();
+
+/// No scope at all: a call site nobody has instrumented yet. Kept apart from
+/// `RUN_WITHOUT_PROCESS` for the reason `run_scope` keeps `None` apart from
+/// `Unattributed` — "we lost it" and "there is deliberately nothing" cannot be
+/// read out of one number.
+const NO_SCOPE: usize = Unattributed::ALL.len() + 1;
+
+/// The stable label of each tally, in [`UNATTRIBUTED_EGRESS`] order.
+fn unattributed_label(bucket: usize) -> &'static str {
+    match bucket {
+        RUN_WITHOUT_PROCESS => "egress.run-without-process",
+        NO_SCOPE => "egress.no-scope",
+        index => Unattributed::ALL[index].code(),
+    }
+}
+
+/// Every unattributable tally with its label, for a support bundle or a test.
+#[must_use]
+pub fn unattributed_egress_bytes() -> Vec<(&'static str, u64)> {
+    (0..UNATTRIBUTED_BUCKETS)
+        .map(|bucket| {
+            (
+                unattributed_label(bucket),
+                UNATTRIBUTED_EGRESS[bucket].load(Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
+/// Where a counted byte goes.
+///
+/// Resolved **once per request**, not once per frame, and that is a correctness
+/// property as much as a cost one. Reading the task-local per frame would charge a
+/// body that is consumed after the scope has been left — a response handed to a
+/// detached task, which this tree does routinely — to nobody, or worse to whatever
+/// scope that task happens to be in. Binding the destination when the request is
+/// made means the bytes follow the request that asked for them.
+#[derive(Clone)]
+enum Charge {
+    /// A process row exists and these are its bytes.
+    Process(run_scope::ProcessScope),
+    /// One of the [`UNATTRIBUTED_EGRESS`] tallies.
+    Unattributed(usize),
+}
+
+impl Charge {
+    /// Reads the ambient scope and picks the destination.
+    fn resolve() -> Self {
+        if let Some(process) = run_scope::current_process() {
+            return Charge::Process(process);
+        }
+        Charge::Unattributed(match run_scope::current() {
+            None => NO_SCOPE,
+            Some(scope) => match scope.unattributed() {
+                // `position` cannot miss: `ALL` is complete by construction (see
+                // `run_scope`'s own test). `NO_SCOPE` is the fallback purely so
+                // this is not an `unwrap` on a hot path.
+                Some(reason) => Unattributed::ALL
+                    .iter()
+                    .position(|candidate| *candidate == reason)
+                    .unwrap_or(NO_SCOPE),
+                None => RUN_WITHOUT_PROCESS,
+            },
+        })
+    }
+
+    fn add(&self, bytes: u64) {
+        match self {
+            Charge::Process(process) => process.charge_egress(bytes),
+            Charge::Unattributed(bucket) => {
+                UNATTRIBUTED_EGRESS[*bucket].fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Notes where an allowed request went, so the ledger records destinations
+    /// and not only volume.
+    ///
+    /// Both cases are recorded now. The attributed one hangs off the process row;
+    /// the unattributed one goes to [`UNATTRIBUTED_DESTINATIONS`], keyed by the
+    /// same reason its bytes are already counted under, so "how much" and "where"
+    /// for a given reason are two readings of one vocabulary rather than two
+    /// vocabularies.
+    ///
+    /// # The lock this takes, and why it is affordable
+    ///
+    /// `UNATTRIBUTED_EGRESS` is a fixed array of atomics precisely because
+    /// [`Self::add`] runs **per body frame** — an SSE stream calls it thousands of
+    /// times — and a map there would be a global lock on the hottest path in the
+    /// app. This is not that path: a destination is noted **once per request**,
+    /// beside a DNS lookup and a TLS handshake, and the map is bounded at
+    /// [`run_scope::MAX_DESTINATIONS`] so the critical section is a `BTreeMap`
+    /// probe over at most 128 entries. The split is deliberate rather than
+    /// incidental: volume stays lock-free, destinations pay a lock they can
+    /// afford.
+    fn note_destination(&self, url: &Url) {
+        // Both are absent for the same kind of url — one with no authority, like
+        // `data:` — and neither names a destination on its own.
+        let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+            return;
+        };
+        let host = host.to_ascii_lowercase();
+        match self {
+            Charge::Process(process) => process.note_destination(url.scheme(), &host, port),
+            Charge::Unattributed(bucket) => {
+                note_unattributed_destination(*bucket, url.scheme(), &host, port)
+            }
+        }
+    }
+}
+
+/// Where egress that belongs to no run went, by the reason it had none.
+///
+/// One log per [`UNATTRIBUTED_EGRESS`] bucket, so the destination list and the
+/// byte tally are indexed the same way and a reader correlating them never has to
+/// map between two orders.
+///
+/// A `Mutex` rather than atomics, unlike the byte tallies beside it, because a set
+/// of hosts is not a number. See [`Charge::note_destination`] for why the lock is
+/// affordable here and would not be there.
+static UNATTRIBUTED_DESTINATIONS: std::sync::Mutex<Option<Box<UnattributedDestinations>>> =
+    std::sync::Mutex::new(None);
+
+/// The per-bucket logs, boxed so the static costs one pointer until first use.
+///
+/// Allocated lazily for that reason and no other: a `monkey` subcommand that makes
+/// no unattributed request should not pay for 7 maps to prove it.
+struct UnattributedDestinations {
+    seen: [BTreeMap<run_scope::Destination, u64>; UNATTRIBUTED_BUCKETS],
+    overflowed: [u64; UNATTRIBUTED_BUCKETS],
+}
+
+impl Default for UnattributedDestinations {
+    fn default() -> Self {
+        UnattributedDestinations {
+            seen: std::array::from_fn(|_| BTreeMap::new()),
+            overflowed: [0; UNATTRIBUTED_BUCKETS],
+        }
+    }
+}
+
+/// Adds one request to `bucket`'s log, or to its overflow once the cap is reached.
+///
+/// The cap is [`run_scope::MAX_DESTINATIONS`] — the *same* ceiling a process gets,
+/// and shared rather than re-picked, because the thing being bounded is the same
+/// thing: a caller with no declared allowlist can be walked across arbitrarily many
+/// hosts by the content it fetches. Requests past it are counted and not named,
+/// never dropped: a truncated list that does not say it is truncated reads as a
+/// complete one.
+///
+/// Poisoning is absorbed with `into_inner`, matching every other lock in this tree:
+/// a panic elsewhere must not turn bookkeeping into a second panic.
+fn note_unattributed_destination(bucket: usize, scheme: &str, host: &str, port: u16) {
+    let Ok(mut guard) = UNATTRIBUTED_DESTINATIONS
+        .lock()
+        .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
+    else {
+        return;
+    };
+    let logs = guard.get_or_insert_with(Box::<UnattributedDestinations>::default);
+    let key = run_scope::Destination {
+        scheme: scheme.to_string(),
+        host: host.to_string(),
+        port,
+    };
+    if let Some(requests) = logs.seen[bucket].get_mut(&key) {
+        *requests += 1;
+        return;
+    }
+    if logs.seen[bucket].len() >= run_scope::MAX_DESTINATIONS {
+        logs.overflowed[bucket] += 1;
+        return;
+    }
+    logs.seen[bucket].insert(key, 1);
+}
+
+/// Takes every unattributed destination noted since the last call, with its label.
+///
+/// A drain rather than a read, for [`run_scope::ProcessScope::take_destinations`]'s
+/// reason: the ledger writer is additive, so a read that left the counts behind
+/// would write them again on the next flush.
+///
+/// Buckets with nothing to report are absent rather than present and empty, so a
+/// caller can skip a transaction entirely on the overwhelmingly common tick where
+/// the app talked to nobody outside a run.
+#[must_use]
+pub fn take_unattributed_destinations() -> Vec<(&'static str, run_scope::DestinationDrain)> {
+    let Ok(mut guard) = UNATTRIBUTED_DESTINATIONS
+        .lock()
+        .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
+    else {
+        return Vec::new();
+    };
+    let Some(logs) = guard.as_mut() else {
+        return Vec::new();
+    };
+    let mut drained = Vec::new();
+    for bucket in 0..UNATTRIBUTED_BUCKETS {
+        let seen: Vec<_> = std::mem::take(&mut logs.seen[bucket]).into_iter().collect();
+        let overflowed = std::mem::replace(&mut logs.overflowed[bucket], 0);
+        if seen.is_empty() && overflowed == 0 {
+            continue;
+        }
+        drained.push((
+            unattributed_label(bucket),
+            run_scope::DestinationDrain { seen, overflowed },
+        ));
+    }
+    drained
+}
+
+/// Puts a drain back, for a caller whose write of it failed.
+///
+/// The mirror of [`run_scope::ProcessScope::return_destinations`] and it inherits
+/// that method's rule: a returned destination past the cap becomes overflow rather
+/// than being silently dropped, because the cap is the invariant and a returned
+/// count must not be able to breach it.
+pub fn return_unattributed_destinations(label: &str, drain: run_scope::DestinationDrain) {
+    let Some(bucket) = (0..UNATTRIBUTED_BUCKETS).find(|index| unattributed_label(*index) == label)
+    else {
+        return;
+    };
+    let Ok(mut guard) = UNATTRIBUTED_DESTINATIONS
+        .lock()
+        .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
+    else {
+        return;
+    };
+    let logs = guard.get_or_insert_with(Box::<UnattributedDestinations>::default);
+    logs.overflowed[bucket] += drain.overflowed;
+    for (destination, requests) in drain.seen {
+        if let Some(existing) = logs.seen[bucket].get_mut(&destination) {
+            *existing += requests;
+        } else if logs.seen[bucket].len() < run_scope::MAX_DESTINATIONS {
+            logs.seen[bucket].insert(destination, requests);
+        } else {
+            logs.overflowed[bucket] += requests;
+        }
+    }
+}
+
+/// A body that counts what passes through it and passes it straight on.
+///
+/// # Why this is not a buffering wrapper
+///
+/// It would be a great deal easier to read the body to the end, count the length
+/// and hand back the bytes — and it would break the two things this app most needs
+/// a body for. An SSE stream never ends, so buffering it is a hang, not a delay;
+/// and a model download is gigabytes, so buffering it is an OOM. So this is a
+/// frame-by-frame passthrough: [`Self::poll_frame`] adds nothing to the pipeline
+/// except an addition, retains no data, and forwards `size_hint` and
+/// `is_end_stream` unchanged so nothing downstream can tell it is there. A test
+/// below asserts the first frame arrives long before the last one is sent, which
+/// is a test only a non-buffering implementation can pass.
+///
+/// # Why the count is of frames *delivered*
+///
+/// A caller may abandon a response — every byte cap in this tree does exactly that
+/// once its ceiling is reached — and the bytes it never polled were never handed
+/// over by the transport either. Counting per delivered frame therefore counts what
+/// crossed the socket into this process, rather than the `Content-Length` the peer
+/// promised or the subset the caller chose to keep.
+struct Counted<B> {
+    inner: B,
+    charge: Charge,
+}
+
+impl<B> HttpBody for Counted<B>
+where
+    B: HttpBody + Unpin,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // Both fields are `Unpin`, so the inner body can be re-pinned in place and
+        // this needs no projection macro (and no new dependency for one).
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(context);
+        if let Poll::Ready(Some(Ok(frame))) = &polled {
+            // Trailers carry no data and are not counted — see [`send`] on what
+            // the unit excludes.
+            if let Some(data) = frame.data_ref() {
+                this.charge.add(data.remaining() as u64);
+            }
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Sends a request and counts the bytes it moves, both ways.
+///
+/// # The unit, which is not the obvious one
+///
+/// Every number this module produces is **HTTP entity-body bytes, as they crossed
+/// the socket, undecoded**. Precisely:
+///
+/// - *Counted*: the request body written out and the response body read in, in the
+///   content coding the peer actually used.
+/// - *Not counted*: request and response headers, chunked-transfer or HTTP/2 frame
+///   overhead, TLS records, and TCP/IP. reqwest exposes none of those — its
+///   connector's `Conn` is a sealed type, so there is no supported way to wrap the
+///   socket itself — and a number that included some of them but not others would
+///   be worse than one whose exclusions are written down.
+///
+/// "Undecoded" needs saying out loud because it is a property of this crate's
+/// build rather than of the code here: `Cargo.toml` enables none of reqwest's
+/// `gzip`/`brotli`/`zstd`/`deflate` features, so reqwest never decompresses a
+/// response and the frames counted below are the compressed-on-the-wire bytes. If
+/// one of those features is ever enabled, this count silently becomes *decoded*
+/// bytes — larger than what the network carried — so enabling one means revisiting
+/// this comment and the tests that pin the unit.
+///
+/// # Attribution
+///
+/// The destination is resolved here, under the caller's scope, so a
+/// response whose body is read later — in a detached task, after the scope has
+/// ended — still charges the process that asked for it. A request made with no
+/// process in scope is counted under why it had none, never dropped and never
+/// charged to a process that did not make it.
+///
+/// # What a caller gives up
+///
+/// Nothing at the call site: `client.get(url).send().await` becomes
+/// `egress::send(client.get(url)).await` and the `Response` that comes back is an
+/// ordinary one, with its url, status, headers and extensions intact.
+///
+/// ponytail: an in-memory body replayed across a redirect is counted once, not
+/// once per hop. Counting the replay would mean wrapping a reusable body, which
+/// makes it unreusable (`reqwest::Body::try_clone` returns `None` for a streaming
+/// body) and would break the same-origin redirect this module deliberately
+/// follows. Upgrade path is counting in the redirect policy, which sees each hop.
+pub async fn send(request: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
+    let charge = Charge::resolve();
+    let (client, built) = request.build_split();
+    let mut built = built?;
+    // Before anything is written, resolved or connected: the run's own frozen
+    // allowlist. Checked on the built request's url rather than on whatever the
+    // caller believes it asked for, the same reason `provider_endpoint_for_run`
+    // reads the frozen endpoint instead of the claimed one.
+    if let Err(denial) = check_run_allowlist(built.url()) {
+        return Err(refusal_error(denial).await);
+    }
+    // After the guard, so this records what was *allowed* and never doubles up
+    // with `denial_sink`'s record of what was not. Before the send rather than
+    // after it, because a request that was permitted and then failed to connect
+    // still reached for that host, and a destination list that omitted it would
+    // be answering a different question than the one it is asked.
+    charge.note_destination(built.url());
+    if let Some(body) = built.body_mut().take() {
+        // An in-memory body is counted by its length and left alone, so it stays
+        // replayable across a redirect; only a streaming body is wrapped, which
+        // costs it nothing because a streaming body was never replayable.
+        let in_memory = body.as_bytes().map(|bytes| bytes.len() as u64);
+        *built.body_mut() = Some(match in_memory {
+            Some(length) => {
+                charge.add(length);
+                body
+            }
+            None => reqwest::Body::wrap(Counted {
+                inner: body,
+                charge: charge.clone(),
+            }),
+        });
+    }
+    let response = client.execute(built).await?;
+    Ok(metered_by(response, charge))
+}
+
+/// Counts a response's body without having sent the request through [`send`].
+///
+/// For a caller that already has a `Response` in hand. Same unit and same
+/// attribution rules; the request body is the caller's own to account for.
+#[must_use]
+pub fn metered(response: reqwest::Response) -> reqwest::Response {
+    metered_by(response, Charge::resolve())
+}
+
+/// Rebuilds `response` around a [`Counted`] body.
+///
+/// The round trip through `http::Response` is the only way in: `reqwest::Response`
+/// exposes no `body_mut`, so the body cannot be replaced in place. Url, status,
+/// version, headers and extensions are all carried across — the url explicitly,
+/// because reqwest keeps it beside the response rather than in it and the
+/// conversion drops it.
+fn metered_by(response: reqwest::Response, charge: Charge) -> reqwest::Response {
+    use reqwest::ResponseBuilderExt;
+
+    let url = response.url().clone();
+    let (parts, body) = hyper::http::Response::<reqwest::Body>::from(response).into_parts();
+    let mut builder = hyper::http::Response::builder()
+        .status(parts.status)
+        .version(parts.version);
+    if let Some(headers) = builder.headers_mut() {
+        *headers = parts.headers;
+    }
+    if let Some(extensions) = builder.extensions_mut() {
+        extensions.extend(parts.extensions);
+    }
+    let rebuilt = builder
+        .url(url)
+        .body(reqwest::Body::wrap(Counted {
+            inner: body,
+            charge,
+        }))
+        // `http::response::Builder` only fails on a status, header or version it
+        // could not accept, and every one of those came out of a response reqwest
+        // had already parsed — there is nothing here for it to reject.
+        .expect("a response reqwest parsed can be rebuilt from its own parts");
+    reqwest::Response::from(rebuilt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,6 +1753,10 @@ mod tests {
             "egress.redirect-cross-origin",
             "egress.redirect-origin-unknown",
             "egress.run-network-denied",
+            "egress.run-host-not-allowlisted",
+            "egress.run-port-not-allowlisted",
+            "egress.run-protocol-not-allowlisted",
+            "egress.run-policy-unavailable",
         ];
 
         #[test]
@@ -1309,6 +2271,7 @@ mod tests {
 
     mod wiring {
         use super::*;
+        use crate::run_scope::RunScope;
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1423,6 +2386,17 @@ mod tests {
 
             fn accepted(&self) -> usize {
                 self.accepted.load(Ordering::SeqCst)
+            }
+
+            /// The port, for a test that needs to aim a *hostname* at this fixture
+            /// rather than its literal address — a resolved address's port is
+            /// replaced by the URL's own, so the URL has to carry this one.
+            fn port(&self) -> u16 {
+                self.origin
+                    .rsplit(':')
+                    .next()
+                    .and_then(|port| port.parse().ok())
+                    .expect("the fixture origin ends in its port")
             }
         }
 
@@ -1599,6 +2573,610 @@ mod tests {
             assert_eq!(host.accepted(), 2, "one connection per hop");
         }
 
+        /// The count, against a peer that says exactly how many bytes it wrote.
+        ///
+        /// A body big enough to arrive in several frames, on purpose: a wrapper
+        /// that counted only the first frame, or only the last, passes a one-frame
+        /// test and undercounts every real transfer. The frame count is asserted
+        /// for the same reason — if the transport ever coalesced this into one
+        /// frame the test would stop testing what it claims to.
+        #[tokio::test]
+        async fn counted_bytes_on_a_streamed_response_are_the_bytes_the_peer_sent() {
+            use futures_util::StreamExt;
+
+            const SENT: usize = 40_000;
+            let host = FakeHost::start(vec![Answer::Trickle {
+                chunks: SENT,
+                gap: Duration::ZERO,
+            }]);
+            let client = hardened().build().expect("client builds");
+            let process = run_scope::ProcessScope::new("p-turn-count");
+
+            let (frames, received) = run_scope::scoped_with_process(
+                RunScope::run("run:count"),
+                process.clone(),
+                async {
+                    let response = send(client.get(&host.origin))
+                        .await
+                        .expect("the peer answers");
+                    let mut stream = response.bytes_stream();
+                    let (mut frames, mut received) = (0usize, 0usize);
+                    while let Some(chunk) = stream.next().await {
+                        frames += 1;
+                        received += chunk.expect("a frame arrives").len();
+                    }
+                    (frames, received)
+                },
+            )
+            .await;
+
+            assert_eq!(received, SENT, "the peer's whole body must arrive");
+            assert!(
+                frames > 1,
+                "a {SENT}-byte trickle arrived in {frames} frame(s); this test only \
+                 means something if the body is delivered in several"
+            );
+            assert_eq!(
+                process.take_egress(),
+                SENT as u64,
+                "the count must be the bytes the peer actually wrote"
+            );
+        }
+
+        /// A request that got out names where it went, and a refused one does not.
+        ///
+        /// Both halves in one test on purpose: the value of the destination list
+        /// is that it says what was *allowed*, so a denial leaking into it would
+        /// make it answer a different question than the one it is asked.
+        // The guard has to span the awaits: it is what serializes this test's
+        // global policy source against every other test's, and releasing it
+        // before the request is sent is the same as not taking it.
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn an_allowed_request_names_its_destination_and_a_refused_one_does_not() {
+            let _guard = crate::denial_sink::test_lock();
+            let host = FakeHost::start(vec![ok_body("first"), ok_body("second")]);
+            let client = hardened().build().expect("client builds");
+            let process = run_scope::ProcessScope::new("p-turn-destinations");
+            let target = Url::parse(&host.origin).expect("the fake host has a url");
+            let port = target.port_or_known_default().expect("http has a default");
+
+            run_scope::scoped_with_process(RunScope::run("run:destinations"), process.clone(), {
+                let client = client.clone();
+                let origin = host.origin.clone();
+                async move {
+                    for _ in 0..2 {
+                        send(client.get(&origin)).await.expect("the peer answers");
+                    }
+                }
+            })
+            .await;
+
+            let drain = process.take_destinations();
+            assert_eq!(
+                drain.seen,
+                vec![(
+                    run_scope::Destination {
+                        scheme: "http".to_string(),
+                        host: target.host_str().expect("the url has a host").to_string(),
+                        port,
+                    },
+                    2,
+                )],
+                "two requests to one host are one destination with a count of two"
+            );
+            assert_eq!(drain.overflowed, 0);
+
+            // A second run, under a policy that permits nothing this url is.
+            // Not the fake host: it is loopback, which `is_loopback_target`
+            // exempts ahead of the policy, so a refusal there is unreachable.
+            let refused = run_scope::ProcessScope::new("p-turn-refused");
+            let allowlist = crate::run_protocol::EgressAllowlist {
+                hosts: vec!["nowhere.example.com".to_string()],
+                ports: vec![443],
+                protocols: vec!["https".to_string()],
+            };
+            install_run_policy_source(move |_| {
+                RunEgressPolicy::Declared(Arc::new(allowlist.clone()))
+            });
+            run_scope::scoped_with_process(RunScope::run("run:refused"), refused.clone(), async {
+                send(client.get("https://api.example.com/v1"))
+                    .await
+                    .expect_err("the allowlist refuses this host");
+            })
+            .await;
+            clear_run_policy_source();
+            assert!(
+                refused.take_destinations().is_empty(),
+                "a refusal belongs to `denial_sink`, not to the allowed-destination list"
+            );
+        }
+
+        /// A cap that abandons a response still counts what crossed the wire.
+        ///
+        /// The claim is not "the whole `Content-Length`" — the peer never got to
+        /// send the rest — it is "everything that was handed over", which is what
+        /// the caller's own tally proves.
+        #[tokio::test]
+        async fn an_abandoned_response_still_counts_what_crossed_the_wire() {
+            use futures_util::StreamExt;
+
+            let host = FakeHost::start(vec![Answer::Trickle {
+                chunks: 20_000,
+                gap: Duration::ZERO,
+            }]);
+            let client = hardened().build().expect("client builds");
+            let process = run_scope::ProcessScope::new("p-turn-capped");
+
+            let received = run_scope::scoped_with_process(
+                RunScope::run("run:capped"),
+                process.clone(),
+                async {
+                    let response = send(client.get(&host.origin))
+                        .await
+                        .expect("the peer answers");
+                    let mut stream = response.bytes_stream();
+                    // One frame, then walk away — exactly what
+                    // `knowledge_service.rs` and `mcp_app_core.rs` do at their
+                    // ceilings.
+                    let first = stream
+                        .next()
+                        .await
+                        .expect("at least one frame")
+                        .expect("a frame arrives")
+                        .len();
+                    drop(stream);
+                    first
+                },
+            )
+            .await;
+
+            assert!(
+                received > 0,
+                "the test needs the peer to have sent something"
+            );
+            assert_eq!(
+                process.take_egress(),
+                received as u64,
+                "an abandoned body must be counted for what it delivered, neither \
+                 zero nor the length the peer promised"
+            );
+        }
+
+        /// Bytes with no process to charge are recorded under why they had none.
+        ///
+        /// Three distinct answers, and keeping them apart is the point: an
+        /// uninstrumented call site, deliberately unattributed work, and a run
+        /// whose process row nobody resolved are three different findings, and one
+        /// shared bucket would make all three unreadable.
+        #[tokio::test]
+        async fn a_request_with_no_process_in_scope_is_counted_under_why_it_had_none() {
+            fn tally(label: &str) -> u64 {
+                unattributed_egress_bytes()
+                    .into_iter()
+                    .find(|(name, _)| *name == label)
+                    .map(|(_, bytes)| bytes)
+                    .expect("every label has a tally")
+            }
+            async fn fetch(origin: &str) {
+                let client = hardened().build().expect("client builds");
+                let body = send(client.get(origin))
+                    .await
+                    .expect("the peer answers")
+                    .text()
+                    .await
+                    .expect("body reads");
+                assert_eq!(body, "hello");
+            }
+
+            // No scope at all: nobody has instrumented this site.
+            let host = FakeHost::start(vec![ok_body("hello")]);
+            let before = tally("egress.no-scope");
+            fetch(&host.origin).await;
+            assert_eq!(
+                tally("egress.no-scope") - before,
+                5,
+                "an uninstrumented request must still be counted somewhere"
+            );
+
+            // Deliberately no run, with the reason kept.
+            let host = FakeHost::start(vec![ok_body("hello")]);
+            let before = tally(Unattributed::Scheduled.code());
+            run_scope::scoped(
+                RunScope::Unattributed(Unattributed::Scheduled),
+                fetch(&host.origin),
+            )
+            .await;
+            assert_eq!(
+                tally(Unattributed::Scheduled.code()) - before,
+                5,
+                "unattributed work keeps its own reason as its tally"
+            );
+
+            // A run, but no process row: legitimate, and not the same finding.
+            let host = FakeHost::start(vec![ok_body("hello")]);
+            let before = tally("egress.run-without-process");
+            run_scope::scoped(RunScope::run("run:no-process"), fetch(&host.origin)).await;
+            assert_eq!(
+                tally("egress.run-without-process") - before,
+                5,
+                "a run with no process row must not be charged to another process"
+            );
+        }
+
+        /// The streaming property, as a test that a buffering implementation fails.
+        ///
+        /// The peer writes its head at once and then one byte per `gap`, so the
+        /// first frame is available five gaps before the last one is. A wrapper
+        /// that read the body to the end to count it would deliver nothing until
+        /// the whole transfer finished, and the first assertion below is what
+        /// notices.
+        #[tokio::test]
+        async fn counting_a_body_does_not_buffer_it() {
+            use futures_util::StreamExt;
+
+            let gap = Duration::from_millis(100);
+            let chunks = 5usize;
+            let host = FakeHost::start(vec![Answer::Trickle { chunks, gap }]);
+            let client = hardened().build().expect("client builds");
+            let process = run_scope::ProcessScope::new("p-turn-stream");
+
+            let (first_frame_at, whole_body_at) = run_scope::scoped_with_process(
+                RunScope::run("run:stream"),
+                process.clone(),
+                async {
+                    let response = send(client.get(&host.origin))
+                        .await
+                        .expect("the peer answers");
+                    let started = Instant::now();
+                    let mut stream = response.bytes_stream();
+                    let _first = stream
+                        .next()
+                        .await
+                        .expect("a first frame")
+                        .expect("a frame arrives");
+                    let first_frame_at = started.elapsed();
+                    while let Some(chunk) = stream.next().await {
+                        chunk.expect("a frame arrives");
+                    }
+                    (first_frame_at, started.elapsed())
+                },
+            )
+            .await;
+
+            assert!(
+                first_frame_at < gap * (chunks as u32 - 1),
+                "the first frame took {first_frame_at:?}, which is long enough that \
+                 the body was collected before being handed over"
+            );
+            assert!(
+                whole_body_at >= gap * (chunks as u32 - 1),
+                "the transfer finished in {whole_body_at:?}, too fast for the peer \
+                 to have trickled {chunks} bytes {gap:?} apart — the timing this \
+                 test rests on is not what it thinks"
+            );
+            assert_eq!(process.take_egress(), chunks as u64);
+        }
+
+        /// The other direction: a request body is counted as it goes out, and the
+        /// two halves add up in one tally.
+        #[tokio::test]
+        async fn a_request_body_is_counted_on_its_way_out() {
+            let host = FakeHost::start(vec![ok_body("ok")]);
+            let client = hardened().build().expect("client builds");
+            let process = run_scope::ProcessScope::new("p-turn-upload");
+            let payload = "x".repeat(1_000);
+
+            run_scope::scoped_with_process(RunScope::run("run:upload"), process.clone(), async {
+                let body = send(client.post(&host.origin).body(payload.clone()))
+                    .await
+                    .expect("the peer answers")
+                    .text()
+                    .await
+                    .expect("body reads");
+                assert_eq!(body, "ok");
+            })
+            .await;
+
+            assert_eq!(
+                process.take_egress(),
+                payload.len() as u64 + 2,
+                "the request body out plus the response body in"
+            );
+        }
+
+        /// Counting rebuilds the response, so everything a caller reads off one has
+        /// to survive the trip. The url is the one that does not come for free —
+        /// reqwest keeps it beside the response rather than in it.
+        #[tokio::test]
+        async fn a_metered_response_keeps_its_url_status_and_headers() {
+            let host = FakeHost::start(vec![Answer::Raw(
+                "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nX-Trace: abc\r\n\
+                 Content-Length: 2\r\nConnection: close\r\n\r\nhi"
+                    .to_string(),
+            )]);
+            let client = hardened().build().expect("client builds");
+            let process = run_scope::ProcessScope::new("p-turn-shape");
+
+            run_scope::scoped_with_process(RunScope::run("run:shape"), process.clone(), async {
+                let response = send(client.get(format!("{}/path?q=1", host.origin)))
+                    .await
+                    .expect("the peer answers");
+                assert_eq!(response.status().as_u16(), 201);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("x-trace")
+                        .map(|value| value.as_bytes()),
+                    Some(b"abc".as_ref())
+                );
+                assert_eq!(
+                    response.url().as_str(),
+                    format!("{}/path?q=1", host.origin),
+                    "the url must survive being rebuilt around a counting body"
+                );
+                assert_eq!(response.text().await.expect("body reads"), "hi");
+            })
+            .await;
+
+            assert_eq!(process.take_egress(), 2);
+        }
+
+        /// Serializes the tests that touch [`UNATTRIBUTED_DESTINATIONS`].
+        ///
+        /// It is process-wide state by design — unattributed traffic has no scope
+        /// to hang a log off, which is the whole reason this exists — so tests
+        /// that drain it would otherwise take each other's rows under cargo's
+        /// default parallelism. Poisoning is absorbed so one failing test reports
+        /// its own assertion rather than poisoning every sibling into a second,
+        /// misleading failure.
+        static UNATTRIBUTED_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        fn exclusive_log() -> std::sync::MutexGuard<'static, ()> {
+            let guard = UNATTRIBUTED_LOG_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Start from a known state rather than from whatever ran before.
+            let _ = take_unattributed_destinations();
+            guard
+        }
+
+        /// The gap this slice closed, end to end: a request made under a *reason*
+        /// rather than a run now names where it went.
+        ///
+        /// Before this, `UNATTRIBUTED_EGRESS` reported "how much, by reason" and
+        /// nothing at all about "where", so "which hosts does the app itself
+        /// reach outside a run" had no answer. This runs a real request under
+        /// `Unattributed::UserAction` and reads the host back out of the same
+        /// table the attributed case writes to.
+        #[tokio::test]
+        async fn a_request_with_no_run_records_its_destination_under_its_reason() {
+            use crate::process_table::ProcessTable;
+            use crate::run_ledger::RunLedger;
+
+            let _guard = exclusive_log();
+
+            let host = FakeHost::start(vec![ok_body("hi")]);
+            let client = hardened().build().expect("client builds");
+            run_scope::scoped(RunScope::Unattributed(Unattributed::UserAction), async {
+                send(client.get(&host.origin))
+                    .await
+                    .expect("the peer answers")
+                    .text()
+                    .await
+                    .expect("body reads");
+            })
+            .await;
+
+            let drained = take_unattributed_destinations();
+            let (label, drain) = drained
+                .iter()
+                .find(|(label, _)| *label == Unattributed::UserAction.code())
+                .expect("the request was logged under the reason it had no run");
+            assert_eq!(drain.seen.len(), 1);
+            assert_eq!(drain.overflowed, 0);
+
+            let ledger = RunLedger::open_in_memory().expect("an in-memory ledger opens");
+            let table = ProcessTable::new(ledger.connection());
+            table
+                .add_unattributed_egress_destinations(label, drain, 2_000)
+                .expect("the destination lands");
+
+            let stored = table
+                .unattributed_egress_destinations()
+                .expect("the ledger reads back");
+            let recorded = stored
+                .get(Unattributed::UserAction.code())
+                .expect("the reason has a destination list");
+            assert_eq!(recorded.destinations.len(), 1);
+            assert_eq!(recorded.destinations[0].host, "127.0.0.1");
+            assert_eq!(recorded.destinations[0].scheme, "http");
+            assert_eq!(recorded.destinations[0].requests, 1);
+            assert_eq!(recorded.dropped, 0);
+
+            // The drain is a drain: a second one reports nothing *for this
+            // reason*, so the additive writer cannot double-count. Scoped to the
+            // reason rather than asserting global emptiness, because other tests
+            // in this binary make scope-less requests into the same
+            // process-wide log — which is exactly the property that makes it
+            // useful in production and awkward in a test.
+            assert!(
+                take_unattributed_destinations()
+                    .iter()
+                    .all(|(label, _)| *label != Unattributed::UserAction.code()),
+                "a drained reason must not report its destinations twice"
+            );
+        }
+
+        /// The two vocabularies are one vocabulary. A reader correlating "how
+        /// much left under this reason" with "where it went" must be matching on
+        /// the same strings, or the correlation is a guess.
+        #[test]
+        fn destinations_and_byte_tallies_share_the_same_reason_labels() {
+            let _guard = exclusive_log();
+            for bucket in 0..UNATTRIBUTED_BUCKETS {
+                note_unattributed_destination(bucket, "https", "example.test", 443);
+            }
+            let drained = take_unattributed_destinations();
+            let destination_labels: Vec<&str> = drained.iter().map(|(label, _)| *label).collect();
+            let tally_labels: Vec<&str> = unattributed_egress_bytes()
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect();
+            assert_eq!(
+                destination_labels, tally_labels,
+                "every tally must have a destination log under the same label, in the same order"
+            );
+            // And they are the persisted `Unattributed` codes, not a second set
+            // invented here.
+            for reason in Unattributed::ALL {
+                assert!(
+                    destination_labels.contains(&reason.code()),
+                    "{} is missing from the destination labels",
+                    reason.code()
+                );
+            }
+        }
+
+        /// The cap is the same one a process gets, and past it requests are
+        /// counted rather than dropped: a truncated list that does not say it is
+        /// truncated reads as a complete one.
+        #[test]
+        fn the_unattributed_log_is_bounded_and_counts_what_it_could_not_name() {
+            let _guard = exclusive_log();
+            let bucket = 0;
+            for index in 0..run_scope::MAX_DESTINATIONS + 7 {
+                note_unattributed_destination(bucket, "https", &format!("host-{index}.test"), 443);
+            }
+            let drained = take_unattributed_destinations();
+            let (_, drain) = drained
+                .iter()
+                .find(|(label, _)| *label == unattributed_label(bucket))
+                .expect("the bucket reported");
+            assert_eq!(drain.seen.len(), run_scope::MAX_DESTINATIONS);
+            assert_eq!(drain.overflowed, 7, "the excess is counted, never dropped");
+        }
+
+        /// A failed write must delay the destinations to the next tick rather than
+        /// destroy them — the same contract `ProcessScope::return_destinations`
+        /// has, including that a return cannot breach the cap.
+        #[test]
+        fn a_returned_drain_is_recounted_and_still_respects_the_cap() {
+            let _guard = exclusive_log();
+            let label = Unattributed::Startup.code();
+            let bucket = (0..UNATTRIBUTED_BUCKETS)
+                .find(|index| unattributed_label(*index) == label)
+                .expect("startup has a bucket");
+
+            note_unattributed_destination(bucket, "https", "a.test", 443);
+            note_unattributed_destination(bucket, "https", "a.test", 443);
+            let drained = take_unattributed_destinations();
+            let (_, drain) = drained
+                .into_iter()
+                .find(|(candidate, _)| *candidate == label)
+                .expect("the bucket reported");
+            assert_eq!(drain.seen[0].1, 2);
+
+            return_unattributed_destinations(label, drain);
+            let again = take_unattributed_destinations();
+            let (_, drain) = again
+                .into_iter()
+                .find(|(candidate, _)| *candidate == label)
+                .expect("the returned drain is there to take again");
+            assert_eq!(drain.seen[0].1, 2, "a return must not lose the counts");
+
+            // A return into a full log becomes overflow rather than breaching the
+            // ceiling the cap exists to hold.
+            for index in 0..run_scope::MAX_DESTINATIONS {
+                note_unattributed_destination(bucket, "https", &format!("full-{index}.test"), 443);
+            }
+            return_unattributed_destinations(label, drain);
+            let final_drain = take_unattributed_destinations();
+            let (_, drain) = final_drain
+                .into_iter()
+                .find(|(candidate, _)| *candidate == label)
+                .expect("the bucket reported");
+            assert_eq!(drain.seen.len(), run_scope::MAX_DESTINATIONS);
+            assert_eq!(drain.overflowed, 2);
+        }
+
+        /// The whole path, ending in the column: bytes counted off a socket reach
+        /// `agent_processes.bytes_egressed` through the additive writer, and a row
+        /// nobody reported egress for keeps its `NULL`.
+        #[tokio::test]
+        async fn counted_bytes_reach_the_ledger_row_through_add_egress_bytes() {
+            use crate::process_table::{
+                AdmitProcess, ProcessKind, ProcessTable, ProcessUsageFilter,
+            };
+            use crate::run_ledger::RunLedger;
+
+            fn stored_egress(table: &ProcessTable<'_>, process_id: &str) -> Option<u64> {
+                table
+                    .usage_rows(&ProcessUsageFilter {
+                        process_id: Some(process_id.to_string()),
+                        ..ProcessUsageFilter::default()
+                    })
+                    .expect("the ledger row reads")
+                    .pop()
+                    .expect("the row exists")
+                    .usage
+                    .measured()
+                    .bytes_egressed
+            }
+
+            let ledger = RunLedger::open_in_memory().expect("an in-memory ledger opens");
+            let table = ProcessTable::new(ledger.connection());
+            let record = table
+                .admit(
+                    &AdmitProcess::new(ProcessKind::BackgroundShell, "bg-egress".to_string()),
+                    1_000,
+                )
+                .expect("a row is admitted");
+            let untouched = table
+                .admit(
+                    &AdmitProcess::new(ProcessKind::BackgroundShell, "bg-quiet".to_string()),
+                    1_000,
+                )
+                .expect("a second row is admitted");
+
+            let host = FakeHost::start(vec![ok_body("hello")]);
+            let client = hardened().build().expect("client builds");
+            let process = run_scope::ProcessScope::new(record.process_id.clone());
+
+            run_scope::scoped_with_process(RunScope::run("run:ledger"), process.clone(), async {
+                send(client.get(&host.origin))
+                    .await
+                    .expect("the peer answers")
+                    .text()
+                    .await
+                    .expect("body reads");
+            })
+            .await;
+
+            // What the scope owner does on its own schedule: drain and add. Twice,
+            // to prove the drain does not re-report the same bytes.
+            for _ in 0..2 {
+                let counted = process.take_egress();
+                if counted > 0 {
+                    table
+                        .add_egress_bytes(&record.process_id, counted, 2_000)
+                        .expect("the row takes the bytes");
+                }
+            }
+
+            assert_eq!(
+                stored_egress(&table, &record.process_id),
+                Some(5),
+                "the body's five bytes must land in the column exactly once"
+            );
+            assert_eq!(
+                stored_egress(&table, &untouched.process_id),
+                None,
+                "a process nobody reported egress for keeps its NULL rather than \
+                 being credited with a measured zero"
+            );
+        }
+
         /// The hop cap. `Policy::custom` does not inherit reqwest's loop cap, and
         /// since same-origin hops *are* followed, a self-redirect would otherwise
         /// run until the read timeout — ten minutes, in production.
@@ -1618,6 +3196,542 @@ mod tests {
                 "followed {} hops, which is past the {MAX_REDIRECT_HOPS}-hop cap",
                 host.accepted()
             );
+        }
+
+        /// K5's per-run allowlist: the deny-by-default half, its two deliberate
+        /// fail-open cases, and its one fail-closed case.
+        ///
+        /// Every test here installs a **process-wide** policy source, so they all take
+        /// `denial_sink::test_lock()` — the same lock and for the same reason that
+        /// module's own installing tests take it — and clear the source afterwards.
+        mod allowlist {
+            use super::*;
+            use crate::run_protocol::EgressAllowlist;
+            use std::sync::Arc;
+
+            fn declaring(hosts: &[&str], ports: &[u16], protocols: &[&str]) -> EgressAllowlist {
+                let list = EgressAllowlist {
+                    hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+                    ports: ports.to_vec(),
+                    protocols: protocols.iter().map(|p| (*p).to_string()).collect(),
+                };
+                list.validate().expect("the fixture must be a legal policy");
+                list
+            }
+
+            /// A source that answers for exactly one run and `Unknown` for anything
+            /// else, so a leaked install cannot decide another test's request.
+            fn install_declared(run_id: &str, allowlist: EgressAllowlist) {
+                let run_id = run_id.to_string();
+                install_run_policy_source(move |asked| {
+                    if asked == run_id {
+                        RunEgressPolicy::Declared(Arc::new(allowlist.clone()))
+                    } else {
+                        RunEgressPolicy::Unknown
+                    }
+                });
+            }
+
+            fn verdict_for(run_id: &str, url: &str) -> Result<(), EgressDenial> {
+                let url = Url::parse(url).expect("test url parses");
+                run_scope::scoped_sync(RunScope::run(run_id), || run_allowlist_verdict(&url))
+            }
+
+            fn rule_for(run_id: &str, url: &str) -> Option<EgressRule> {
+                verdict_for(run_id, url).err().map(|denial| denial.rule())
+            }
+
+            /// The empty declaration is the whole safety property: present-and-empty
+            /// denies, where absent permits. Both asserted here so the two cannot
+            /// quietly become one behaviour.
+            #[test]
+            fn an_empty_declaration_denies_and_an_absent_one_does_not() {
+                let _guard = crate::denial_sink::test_lock();
+                install_declared("run:empty", declaring(&[], &[], &[]));
+
+                assert_eq!(
+                    rule_for("run:empty", "https://api.example.com/v1"),
+                    Some(EgressRule::RunHostNotAllowlisted),
+                    "an empty allowlist must permit nothing"
+                );
+
+                install_run_policy_source(|_| RunEgressPolicy::Undeclared);
+                verdict_for("run:silent", "https://api.example.com/v1")
+                    .expect("a run that declares nothing keeps today's behaviour");
+
+                clear_run_policy_source();
+            }
+
+            #[test]
+            fn a_host_a_port_and_a_protocol_are_each_refused_by_their_own_rule() {
+                let _guard = crate::denial_sink::test_lock();
+                install_declared(
+                    "run:narrow",
+                    declaring(&["api.example.com"], &[443], &["https"]),
+                );
+
+                verdict_for("run:narrow", "https://api.example.com/v1/messages")
+                    .expect("the declared destination must be permitted");
+                assert_eq!(
+                    rule_for("run:narrow", "https://other.example.com/v1"),
+                    Some(EgressRule::RunHostNotAllowlisted)
+                );
+                assert_eq!(
+                    rule_for("run:narrow", "https://api.example.com:8443/v1"),
+                    Some(EgressRule::RunPortNotAllowlisted)
+                );
+                // Port 80 is not declared either, so the protocol case has to name a
+                // declared port explicitly to be a test of the protocol.
+                install_declared(
+                    "run:narrow",
+                    declaring(&["api.example.com"], &[443], &["https"]),
+                );
+                assert_eq!(
+                    rule_for("run:narrow", "http://api.example.com:443/v1"),
+                    Some(EgressRule::RunProtocolNotAllowlisted)
+                );
+
+                clear_run_policy_source();
+            }
+
+            /// **K17 S3's acceptance, at the only layer this repo can prove it.**
+            ///
+            /// The slice's own wording: *a run placed with a host allowlist is
+            /// refused by the node when it reaches outside it, proven by the
+            /// node's own denial record — not by the submitter's.* The two
+            /// halves that could break it are both here.
+            ///
+            /// First, the policy has to *survive the trip*. A placed spec
+            /// becomes a recipe on the node, and a recipe has nowhere to put an
+            /// allowlist — so the snapshot is round-tripped through the exact
+            /// JSON the node writes and the child reads, and the allowlist is
+            /// taken from the far side of that trip. A conversion that dropped
+            /// it would leave `declared` empty here and every assertion below
+            /// would pass vacuously against `Undeclared`, which is why the
+            /// permitted case is asserted too.
+            ///
+            /// Second, it has to be *enforced by this process*. Before K17 no
+            /// headless `monkey-cli task run` installed a policy source at all,
+            /// so a frozen allowlist was enforced in the desktop app and ignored
+            /// in the daemon's own children. `task::run_inner` now installs one
+            /// from the spec it just froze and runs the turn inside
+            /// `RunScope::run`; this reproduces both steps.
+            ///
+            /// What this is not: proof across two machines. There is one host
+            /// here, and the wire is exercised by the API tests in
+            /// `daemon/remote/api.rs`. This proves the enforcement that the wire
+            /// delivers work to.
+            #[test]
+            fn a_placed_runs_travelled_allowlist_is_enforced_by_the_node_that_received_it() {
+                let _guard = crate::denial_sink::test_lock();
+
+                let allowlist = declaring(&["api.example.com"], &[443], &["https"]);
+                let mut spec = crate::node_placement::tests_support::placement_spec("run:placed");
+                spec.permission_policy.egress_allowlist = Some(allowlist);
+
+                // The trip: spec -> snapshot -> the recipe JSON the node writes
+                // -> the snapshot the executing child reads back.
+                let snapshot = crate::node_placement::PlacedRunSnapshot::from_spec(&spec);
+                snapshot
+                    .validate()
+                    .expect("a placed snapshot must validate");
+                let wire = serde_json::to_vec(&snapshot).expect("the snapshot serializes");
+                let arrived: crate::node_placement::PlacedRunSnapshot =
+                    serde_json::from_slice(&wire).expect("the snapshot survives the trip");
+                let declared = arrived
+                    .permission_policy
+                    .egress_allowlist
+                    .clone()
+                    .expect("the allowlist must survive the conversion the node performs");
+
+                // The install `task::run_inner` performs for its own frozen spec.
+                install_declared("run:placed", declared);
+
+                verdict_for("run:placed", "https://api.example.com/v1/messages").expect(
+                    "the destination the submitter declared must still be reachable on the node",
+                );
+                assert_eq!(
+                    rule_for("run:placed", "https://exfiltrate.example.net/v1"),
+                    Some(EgressRule::RunHostNotAllowlisted),
+                    "the node must refuse a destination outside the travelled allowlist"
+                );
+                // And the refusal is the node's own record, carrying the rule
+                // that decided it rather than a generic failure.
+                let denial = verdict_for("run:placed", "https://exfiltrate.example.net/v1")
+                    .expect_err("the refusal is what is being recorded");
+                assert!(
+                    denial.rule().summary().len() > 8,
+                    "a denial record must say which rule refused it"
+                );
+
+                clear_run_policy_source();
+            }
+
+            /// The suffix-matching bypass, which is why the matcher checks for the
+            /// separator instead of trusting `ends_with`.
+            #[test]
+            fn a_wildcard_matches_at_a_label_boundary_and_nowhere_else() {
+                assert!(allowlist_host_matches("*.example.com", "api.example.com"));
+                assert!(allowlist_host_matches("*.example.com", "a.b.example.com"));
+                assert!(
+                    !allowlist_host_matches("*.example.com", "evil-example.com"),
+                    "the classic suffix bypass"
+                );
+                assert!(
+                    !allowlist_host_matches("*.example.com", "example.com"),
+                    "the apex must be named in its own right"
+                );
+                assert!(
+                    !allowlist_host_matches("*.example.com", ".example.com"),
+                    "an empty label is not a subdomain"
+                );
+                assert!(allowlist_host_matches("example.com", "example.com"));
+                assert!(!allowlist_host_matches("example.com", "api.example.com"));
+
+                // And through the real verdict, since a matcher that is right in
+                // isolation can still be called with the wrong argument.
+                let _guard = crate::denial_sink::test_lock();
+                install_declared(
+                    "run:wild",
+                    declaring(&["*.example.com"], &[443], &["https"]),
+                );
+                verdict_for("run:wild", "https://api.example.com/v1").expect("a subdomain");
+                assert_eq!(
+                    rule_for("run:wild", "https://evil-example.com/v1"),
+                    Some(EgressRule::RunHostNotAllowlisted)
+                );
+                clear_run_policy_source();
+            }
+
+            /// Loopback stays reachable under a deny-all declaration, for
+            /// [`is_loopback_target`]'s reason: a local-inference run legitimately
+            /// talks to this machine.
+            #[test]
+            fn loopback_survives_a_deny_all_declaration() {
+                let _guard = crate::denial_sink::test_lock();
+                install_declared("run:local", declaring(&[], &[], &[]));
+
+                for url in [
+                    "http://127.0.0.1:11434/api/chat",
+                    "http://localhost:8080/v1/chat/completions",
+                    "http://[::1]:1234/v1",
+                ] {
+                    verdict_for("run:local", url)
+                        .unwrap_or_else(|denial| panic!("{url} must stay reachable: {denial}"));
+                }
+
+                clear_run_policy_source();
+            }
+
+            /// Fail-closed, and the only case that does: a run is in scope, a source
+            /// is installed, and the frozen policy cannot be read — so whether it
+            /// declared anything is unknown and the request is refused.
+            #[test]
+            fn a_declared_policy_that_cannot_be_read_fails_closed() {
+                let _guard = crate::denial_sink::test_lock();
+                install_run_policy_source(|_| RunEgressPolicy::Unavailable);
+
+                assert_eq!(
+                    rule_for("run:blip", "https://api.example.com/v1"),
+                    Some(EgressRule::RunPolicyUnavailable)
+                );
+                // Not cached: the next read must be attempted again rather than
+                // remembering a transient failure as an answer.
+                assert_eq!(
+                    rule_for("run:blip", "https://api.example.com/v1"),
+                    Some(EgressRule::RunPolicyUnavailable)
+                );
+
+                clear_run_policy_source();
+            }
+
+            /// The two fail-open cases, asserted with a source installed so the pass
+            /// is about the *rules* and not about the source being absent.
+            #[test]
+            fn run_less_egress_behaves_exactly_as_it_did_before() {
+                let _guard = crate::denial_sink::test_lock();
+                // Deliberately hostile: this source would deny everything if it were
+                // ever consulted for work with no run.
+                install_run_policy_source(|_| {
+                    RunEgressPolicy::Declared(Arc::new(EgressAllowlist::default()))
+                });
+
+                let url = Url::parse("https://api.example.com/v1").expect("parses");
+                run_allowlist_verdict(&url).expect("no scope at all: today's behaviour");
+                run_scope::scoped_sync(
+                    RunScope::Unattributed(crate::run_scope::Unattributed::Scheduled),
+                    || {
+                        run_allowlist_verdict(&url)
+                            .expect("deliberately run-less work keeps its egress")
+                    },
+                );
+
+                clear_run_policy_source();
+            }
+
+            /// The frozen spec is immutable, so it is read once per run — a ledger
+            /// read on every request's hot path is the thing this cache exists to
+            /// avoid.
+            #[test]
+            fn a_frozen_policy_is_read_once_per_run_and_not_once_per_request() {
+                let _guard = crate::denial_sink::test_lock();
+                static READS: AtomicUsize = AtomicUsize::new(0);
+                READS.store(0, Ordering::SeqCst);
+                // Counted for this test's own run ids only. The source is
+                // process-wide, so a neighbouring test's run-scoped request would
+                // otherwise be counted here as well.
+                install_run_policy_source(|asked| {
+                    if !asked.starts_with("run:cached") {
+                        return RunEgressPolicy::Unknown;
+                    }
+                    READS.fetch_add(1, Ordering::SeqCst);
+                    RunEgressPolicy::Declared(Arc::new(EgressAllowlist {
+                        hosts: vec!["api.example.com".to_string()],
+                        ports: vec![443],
+                        protocols: vec!["https".to_string()],
+                    }))
+                });
+
+                for _ in 0..5 {
+                    verdict_for("run:cached", "https://api.example.com/v1").expect("permitted");
+                }
+                assert_eq!(READS.load(Ordering::SeqCst), 1);
+
+                // A different run is its own read, so the cache is keyed and not
+                // global.
+                verdict_for("run:cached-other", "https://api.example.com/v1").expect("permitted");
+                assert_eq!(READS.load(Ordering::SeqCst), 2);
+
+                clear_run_policy_source();
+            }
+
+            /// The choke point, end to end: a refused request must not reach its
+            /// target, and the caller must be able to ask *which rule* refused it
+            /// rather than substring-matching prose.
+            ///
+            /// The fake lookup points every name at the live fixture, so a missing
+            /// check would connect — `accepted()` is what proves the refusal happened
+            /// before the socket rather than after it.
+            #[tokio::test]
+            async fn a_denied_request_never_reaches_its_target_and_names_the_rule() {
+                fn to_the_fixture(
+                    _host: String,
+                ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+                {
+                    // Port `0`: reqwest substitutes the URL's own port.
+                    Box::pin(async { Ok(vec![SocketAddr::from(([127, 0, 0, 1], 0))]) })
+                }
+
+                let _guard = crate::denial_sink::test_lock();
+                let host = FakeHost::start(vec![ok_body("reached")]);
+                install_declared(
+                    "run:choke",
+                    declaring(&["allowed.test"], &[host.port()], &["http"]),
+                );
+
+                let client = hardened_with_lookup(
+                    Duration::from_millis(400),
+                    Duration::from_secs(2),
+                    to_the_fixture,
+                )
+                .build()
+                .expect("client builds");
+
+                // Entered *with* a process row, and every scope in this module does:
+                // a run with no process charges its bytes to a process-wide tally that
+                // a neighbouring test asserts exact numbers on, and tests run in
+                // parallel.
+                let error = run_scope::scoped_with_process(
+                    RunScope::run("run:choke"),
+                    crate::run_scope::ProcessScope::new("p-choke"),
+                    send(client.get(format!("http://blocked.test:{}/", host.port()))),
+                )
+                .await
+                .expect_err("a host the run never declared must be refused");
+
+                assert_eq!(
+                    host.accepted(),
+                    0,
+                    "the refusal must happen before anything is connected"
+                );
+                assert_eq!(
+                    denial_in(&error).map(|denial| denial.rule()),
+                    Some(EgressRule::RunHostNotAllowlisted),
+                    "the rule must survive the trip through reqwest: {error}"
+                );
+
+                // The counter-test: the same client, the same fixture, the declared
+                // host. Without it, "refuse everything" would pass the assertions
+                // above.
+                let response = run_scope::scoped_with_process(
+                    RunScope::run("run:choke"),
+                    crate::run_scope::ProcessScope::new("p-choke"),
+                    send(client.get(format!("http://allowed.test:{}/", host.port()))),
+                )
+                .await
+                .expect("the declared destination must still be reachable");
+                assert_eq!(response.text().await.expect("body"), "reached");
+                assert_eq!(host.accepted(), 1);
+
+                clear_run_policy_source();
+            }
+
+            /// Walks a `reqwest::Error`'s source chain for a denial, the way
+            /// `web.rs`'s helper does — `io::Error::source` delegates to its *inner*
+            /// error's source, so the inner one has to be unwrapped explicitly.
+            fn denial_in(error: &reqwest::Error) -> Option<&EgressDenial> {
+                let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+                while let Some(step) = current {
+                    if let Some(denial) = step.downcast_ref::<EgressDenial>() {
+                        return Some(denial);
+                    }
+                    if let Some(denial) = step
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(std::io::Error::get_ref)
+                        .and_then(|inner| inner.downcast_ref::<EgressDenial>())
+                    {
+                        return Some(denial);
+                    }
+                    current = step.source();
+                }
+                None
+            }
+
+            /// DNS pinning, exercised through a real connection rather than by reading
+            /// the pin table back.
+            ///
+            /// The lookup answers with the live fixture once and with `240.0.0.1` — a
+            /// reserved range nothing routes to — every time after, which is a rebind
+            /// in the only form a resolver can express one. The fixture answers
+            /// `Connection: close`, so the second request cannot reuse the first
+            /// connection: it must connect again, and `accepted() == 2` is what proves
+            /// it did.
+            #[tokio::test]
+            async fn a_pinned_name_keeps_its_address_when_resolution_moves() {
+                // Nothing here installs a policy source, but this makes a run-scoped
+                // request to a *non-loopback* name, so it must not overlap a test that
+                // has one installed — the source is process-wide and would decide this
+                // request too.
+                let _guard = crate::denial_sink::test_lock();
+                static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+                fn rebinding(
+                    _host: String,
+                ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+                {
+                    let first = CALLS.fetch_add(1, Ordering::SeqCst) == 0;
+                    Box::pin(async move {
+                        let address = if first {
+                            [127, 0, 0, 1]
+                        } else {
+                            [240, 0, 0, 1]
+                        };
+                        Ok(vec![SocketAddr::from((address, 0))])
+                    })
+                }
+
+                let host = FakeHost::start(vec![ok_body("pinned"), ok_body("pinned")]);
+                let client = hardened_with_lookup(
+                    Duration::from_millis(400),
+                    Duration::from_secs(2),
+                    rebinding,
+                )
+                .build()
+                .expect("client builds");
+                let url = format!("http://pinned.test:{}/", host.port());
+
+                let (first, second) = run_scope::scoped_with_process(
+                    RunScope::run("run:pin"),
+                    crate::run_scope::ProcessScope::new("p-pin"),
+                    async {
+                        let first = send(client.get(&url)).await.expect("first request");
+                        let first = first.text().await.expect("first body");
+                        let second = send(client.get(&url)).await.expect("second request");
+                        (first, second.text().await.expect("second body"))
+                    },
+                )
+                .await;
+
+                assert_eq!(first, "pinned");
+                assert_eq!(
+                    second, "pinned",
+                    "the second connection must have used the pinned address"
+                );
+                assert_eq!(
+                    host.accepted(),
+                    2,
+                    "the second request must be a new connection, or this proves nothing"
+                );
+                assert_eq!(
+                    CALLS.load(Ordering::SeqCst),
+                    1,
+                    "a pinned name must not be resolved a second time at all"
+                );
+            }
+
+            /// The counter-test that makes the pinning test mean something: with no run
+            /// in scope there is nothing to pin to, the second resolution is taken, and
+            /// the request lands on the moved address and fails. Same fixture, same
+            /// lookup, one difference.
+            #[tokio::test]
+            async fn without_a_run_the_same_rebind_moves_the_second_request() {
+                // Same reason as its sibling above, even though this one has no run: an
+                // installed source cannot decide a run-less request, but sharing the
+                // lock keeps the pair's timing comparable rather than only one of them
+                // serialized.
+                let _guard = crate::denial_sink::test_lock();
+                static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+                fn rebinding(
+                    _host: String,
+                ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+                {
+                    let first = CALLS.fetch_add(1, Ordering::SeqCst) == 0;
+                    Box::pin(async move {
+                        let address = if first {
+                            [127, 0, 0, 1]
+                        } else {
+                            [240, 0, 0, 1]
+                        };
+                        Ok(vec![SocketAddr::from((address, 0))])
+                    })
+                }
+
+                let host = FakeHost::start(vec![ok_body("unpinned"), ok_body("unpinned")]);
+                let client = hardened_with_lookup(
+                    Duration::from_millis(400),
+                    Duration::from_secs(2),
+                    rebinding,
+                )
+                .build()
+                .expect("client builds");
+                let url = format!("http://unpinned.test:{}/", host.port());
+
+                // No *run*, which is the one difference from the test above — and a
+                // process row all the same, so these bytes stay out of the
+                // process-wide tallies a neighbouring test asserts on.
+                let (first, moved) = run_scope::scoped_with_process(
+                    RunScope::Unattributed(Unattributed::UserAction),
+                    crate::run_scope::ProcessScope::new("p-unpinned"),
+                    async {
+                        let first = send(client.get(&url))
+                            .await
+                            .expect("first request")
+                            .text()
+                            .await
+                            .expect("first body");
+                        (first, send(client.get(&url)).await)
+                    },
+                )
+                .await;
+                assert_eq!(first, "unpinned");
+                assert!(
+                    moved.is_err(),
+                    "with no run there is no pin, so the rebind must be followed"
+                );
+                assert_eq!(host.accepted(), 1, "the fixture must not be reached twice");
+                assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+            }
         }
     }
 
@@ -1682,18 +3796,6 @@ mod tests {
             ("knowledge_core.rs", 1),
             // Bundled `llama-server` health/completion probes.
             ("llama.rs", 2),
-            // `ollama.rs` used to sit here with 2. Both were converted rather
-            // than justified: loopback-only earns a site an exemption from the
-            // *redirect* and credential rules, but not from having any deadline
-            // at all, and these two were `#[tauri::command]`s that would hang
-            // the UI forever against a daemon that went quiet. Every Ollama
-            // call now goes through `ollama_client`.
-            // The two API-server instances' `local_client`. Each was one client
-            // serving both loopback inference and cloud providers; the cloud half
-            // now starts from `hardened()` and these two are loopback-only by
-            // construction, which is what earns them a place in this list rather
-            // than the "owned by a different change" note they used to carry.
-            ("server.rs", 2),
         ];
 
         /// Everything after the first `#[cfg(test)]` is test code, and a test is
@@ -1792,15 +3894,41 @@ mod tests {
             // 1.5s on a loopback `/health` probe whose body is never read at all,
             // only `status()`. Nothing to truncate.
             ("diagnostics.rs", 1),
-            // 120s on Studio's job client and 10s on its cancel, both loopback to
-            // the `sd-server` child. The generation itself is not under either:
-            // the API is submit-and-poll, so a deadline here only ever covers one
-            // round trip, and the run is bounded by `JOB_TIMEOUT` (2h) in the
-            // polling loop. The largest body is the terminal poll, which carries
-            // the finished media base64 inside the JSON under `MAX_MEDIA_BYTES`
+            // 120s on Studio's job client, 10s on its cancel and 10s on its
+            // capabilities read, all loopback to the `sd-server` child. The
+            // generation itself is not under any of them: the API is
+            // submit-and-poll, so a deadline here only ever covers one round
+            // trip, and the run is bounded by `JOB_TIMEOUT` (2h) in the polling
+            // loop. The largest body is the terminal poll, which carries the
+            // finished media base64 inside the JSON under `MAX_MEDIA_BYTES`
             // (256 MiB) — 2.8 MB/s across a loopback socket, and fully buffered
             // by `json()`, so there is no stream for the deadline to truncate.
-            ("generation_commands.rs", 2),
+            // The capabilities body is the smallest of the three: a few KB of
+            // sampler and scheduler names, likewise buffered by `json()`.
+            //
+            // The fourth is `tool_client`, shared by both calls to a Studio tool
+            // sidecar — also loopback, to a child this process spawned on a port
+            // it reserved. 30s for the manifest, a page of JSON under
+            // `MAX_MANIFEST_BYTES` (256 KiB). `TOOL_RUN_TIMEOUT` (300s) for a
+            // run, and that one is (C): the tool contract is synchronous, so the
+            // deadline is a ceiling on the *operation* — a face swap, a
+            // segmentation — and not on transfer. Deliberately synchronous: these
+            // take seconds, and a submit-and-poll protocol to avoid a deadline
+            // nobody hits is protocol for its own sake. Neither body can outrun
+            // its deadline unnoticed — both are read by `studio_tools::read_capped`,
+            // which enforces its ceiling on a running total rather than trusting
+            // `Content-Length`.
+            ("generation_commands.rs", 4),
+            // 1800s on the hosted image API, and it is (B): the body is
+            // `MAX_IMAGE_BYTES` (32 MiB) of base64 inside a JSON object — 18 KB/s —
+            // and the deadline also covers the provider's own render time, which is
+            // what actually justifies the half hour rather than the transfer. Fully
+            // buffered by `bytes()`, so there is no stream for it to truncate; but
+            // the cap is checked *after* that buffer, so as in `browser_pane.rs` the
+            // deadline is doing the byte cap's job. The sibling ComfyUI client is
+            // not counted here — it bounds silence with `read_timeout` instead,
+            // because its `/history` poll and result download do stream.
+            ("generation_remote.rs", 1),
             // 30s for OAuth token/revocation JSON under a 1 MiB cap (35 KB/s), and
             // 120s on the workflow client — the second is (C): `run_model` posts
             // `"stream": false`, so that budget is a cap on how long a local model

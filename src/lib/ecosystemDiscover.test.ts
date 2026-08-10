@@ -159,9 +159,10 @@ describe("worstVulnerabilitySeverity", () => {
 
 describe("canApproveInstall", () => {
   it("requires both a loaded preview and an explicit review acknowledgement", () => {
-    expect(canApproveInstall(false, false)).toBe(false);
-    expect(canApproveInstall(true, false)).toBe(false);
-    expect(canApproveInstall(false, true)).toBe(false);
-    expect(canApproveInstall(true, true)).toBe(true);
+    expect(canApproveInstall(false, false, true)).toBe(false);
+    expect(canApproveInstall(true, false, true)).toBe(false);
+    expect(canApproveInstall(false, true, true)).toBe(false);
+    expect(canApproveInstall(true, true, false)).toBe(false);
+    expect(canApproveInstall(true, true, true)).toBe(true);
   });
 });

@@ -1,9 +1,11 @@
 import { useState, type ReactNode } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import oneDark from "react-syntax-highlighter/dist/esm/styles/prism/one-dark";
+import oneLight from "react-syntax-highlighter/dist/esm/styles/prism/one-light";
 import { Check, Copy } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
+import { useAppliedTheme } from "../../lib/theme";
 
 /** Fence language token -> display label shown in a `CodeBlock`'s header
  * (e.g. `bash` -> `Bash`). Falls back to capitalizing the raw token, and to
@@ -32,6 +34,11 @@ function displayLangLabel(lang: string): string {
 export default function CodeBlock({ lang, body, headerExtra }: { lang: string; body: string; headerExtra?: ReactNode }) {
   const { t } = useT();
   const [copied, setCopied] = useState(false);
+  // The block always sits on the chat's own `surface-2` (the same grey user
+  // bubbles and the composer use) rather than One Dark's `#282c34`, so it never
+  // punches a hole through the transcript in either theme; only the syntax
+  // token palette follows the theme.
+  const dark = useAppliedTheme() === "dark";
 
   const handleCopy = async () => {
     try {
@@ -45,9 +52,9 @@ export default function CodeBlock({ lang, body, headerExtra }: { lang: string; b
   };
 
   return (
-    <div className="my-2 overflow-hidden rounded-lg border border-border bg-[#282c34] not-prose">
-      <div className="flex items-center justify-between gap-2 border-b border-white/10 bg-black/20 px-3 py-1.5">
-        <span className="font-mono text-[11px] uppercase tracking-wide text-white/50">{displayLangLabel(lang)}</span>
+    <div className="my-2 overflow-hidden rounded-lg border border-border bg-surface-2 not-prose">
+      <div className="flex items-center justify-between gap-2 border-b border-border bg-foreground/[0.04] px-3 py-1.5">
+        <span className="font-mono text-[11px] uppercase tracking-wide text-muted">{displayLangLabel(lang)}</span>
         <div className="flex items-center gap-1">
           {headerExtra}
           <button
@@ -55,7 +62,7 @@ export default function CodeBlock({ lang, body, headerExtra }: { lang: string; b
             onClick={() => void handleCopy()}
             aria-label={copied ? t("MessageBubble.copiedLabel") : t("MessageBubble.copyButton")}
             title={copied ? t("MessageBubble.copiedLabel") : t("MessageBubble.copyButton")}
-            className="flex cursor-pointer items-center justify-center rounded-md p-1 text-white/50 transition-colors hover:bg-white/10 hover:text-white"
+            className="flex cursor-pointer items-center justify-center rounded-md p-1 text-muted transition-colors hover:bg-foreground/10 hover:text-foreground"
           >
             {copied ? <Check size={13} /> : <Copy size={13} />}
           </button>
@@ -63,7 +70,7 @@ export default function CodeBlock({ lang, body, headerExtra }: { lang: string; b
       </div>
       <SyntaxHighlighter
         language={lang || "text"}
-        style={oneDark}
+        style={dark ? oneDark : oneLight}
         customStyle={{ margin: 0, padding: "0.75rem", background: "transparent", fontSize: "12px" }}
       >
         {body}

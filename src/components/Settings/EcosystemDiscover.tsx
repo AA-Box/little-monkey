@@ -29,6 +29,7 @@ import {
   type TrustFilter,
 } from "../../lib/ecosystemDiscover";
 import { errorMessage } from "../../lib/errors";
+import { ResolutionSection } from "./PackageResolution";
 
 type PreviewIntent = "install" | "update";
 type DiscoverView = "browse" | "registries";
@@ -438,6 +439,7 @@ export function EcosystemDiscover() {
               </div>
             )}
             {installPreview.preview.warnings.map((warning) => <p key={warning} className="mt-2 text-xs text-warning">{warning}</p>)}
+            <ResolutionSection plan={installPreview.preview.plan} />
 
             <label className="mt-5 flex items-start gap-2 rounded-lg border border-border bg-surface p-3 text-xs text-foreground">
               <input
@@ -453,7 +455,7 @@ export function EcosystemDiscover() {
               <Button variant="ghost" onClick={closePreview}>{t("EcosystemPackages.deny")}</Button>
               <Button
                 variant="primary"
-                disabled={!canApproveInstall(true, reviewed) || busy["package-install"] || busy["package-update"]}
+                disabled={!canApproveInstall(true, reviewed, installPreview.preview.plan.satisfiable) || busy["package-install"] || busy["package-update"]}
                 onClick={() => void (previewIntent === "install"
                   ? installPackage(true)
                   : updatePackage(installPreview.preview.package_id, installPreview.preview.version, true))}

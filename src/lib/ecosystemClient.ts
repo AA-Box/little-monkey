@@ -66,6 +66,7 @@ export interface PackageManifest {
   assistant?: PackageAssistantComposition | null;
   permissions: PackagePermission[];
   vulnerability_notices?: VulnerabilityNotice[];
+  dependencies?: PackageDependency[];
   mcp_requirements: unknown[];
   provenance: {
     publisher: string;
@@ -100,6 +101,61 @@ export interface PermissionDiff {
   requires_new_approval: boolean;
 }
 
+/** Half-open range: `minimum <= version < maximum_exclusive`. */
+export interface VersionConstraint {
+  minimum: SemanticVersion;
+  maximum_exclusive?: SemanticVersion | null;
+}
+
+export interface PackageDependency {
+  package_id: string;
+  constraint: VersionConstraint;
+}
+
+export type SurfaceClaim = { slash_command: string } | { connector: string };
+
+export type PlanAction = "already_installed" | "install" | "update";
+
+export interface PlanStep {
+  package_id: string;
+  version: SemanticVersion;
+  action: PlanAction;
+  required_by: string[];
+}
+
+export interface DependencyRequirement {
+  required_by: string;
+  constraint: VersionConstraint;
+}
+
+/** Discriminated by `kind`; every variant names the specific conflict. */
+export type DependencyProblem =
+  | { kind: "unsatisfiable"; package_id: string; constraints: DependencyRequirement[]; available_versions: SemanticVersion[] }
+  | { kind: "pin_conflict"; package_id: string; pinned: SemanticVersion; constraints: DependencyRequirement[] }
+  | { kind: "disabled"; package_id: string; constraints: DependencyRequirement[] }
+  | { kind: "surface_collision"; claim: SurfaceClaim; package_ids: string[] }
+  | { kind: "contract_mismatch"; package_id: string; required: VersionConstraint; implemented: SemanticVersion }
+  | { kind: "too_complex"; package_id: string };
+
+export interface InstallPlan {
+  package_id: string;
+  version: SemanticVersion;
+  /** Dependency-first order; the package being installed is last. */
+  steps: PlanStep[];
+  problems: DependencyProblem[];
+  satisfiable: boolean;
+}
+
+export function versionConstraintLabel(constraint: VersionConstraint): string {
+  return constraint.maximum_exclusive
+    ? `>=${constraint.minimum}, <${constraint.maximum_exclusive}`
+    : `>=${constraint.minimum}`;
+}
+
+export function surfaceClaimLabel(claim: SurfaceClaim): string {
+  return "slash_command" in claim ? `/${claim.slash_command}` : `connector ${claim.connector}`;
+}
+
 export interface InstallPreview {
   package_id: string;
   version: SemanticVersion;
@@ -112,6 +168,7 @@ export interface InstallPreview {
   mcp_actions_separate: unknown[];
   file_count: number;
   total_bytes: number;
+  plan: InstallPlan;
   warnings: string[];
 }
 
