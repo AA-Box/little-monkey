@@ -475,7 +475,7 @@ export const TASK_TOOL: ToolDef = {
           type: 'string',
           enum: ['explore', 'code'],
           description:
-            "Tool access profile for the subagent. 'explore' gives read-only tools (read_file, list_dir, glob, grep) — use it for research and investigation. 'code' additionally allows write_file, edit_file, and run_shell — its edits land in this turn's own checkpoint and go through the same permission prompts as your own edits — use it for an independent, disjoint implementation subtask.",
+            "Tool access profile for the subagent. 'explore' gives read-only tools (read_file, list_dir, glob, grep) — use it for research and investigation. 'code' additionally allows write_file, edit_file, and run_shell — its edits land in this turn's own checkpoint and go through the same permission prompts as your own edits — use it for an independent, disjoint implementation subtask. A custom agent name from the system prompt's \"## Custom agents\" section is also accepted and runs that agent's declared tool set and instructions.",
         },
       },
       required: ['description', 'prompt', 'profile'],
@@ -544,7 +544,7 @@ export const WORKFLOW_TOOL: ToolDef = {
                     profile: {
                       type: 'string',
                       enum: ['explore', 'code'],
-                      description: "Tool access profile — same meaning as the task tool's profile.",
+                      description: "Tool access profile — same meaning as the task tool's profile, including custom agent names from the \"## Custom agents\" section.",
                     },
                     effort: {
                       type: 'string',

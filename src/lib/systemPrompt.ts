@@ -453,7 +453,13 @@ export function buildSubagentSystemPrompt(
   roots: PromptWorkspaceRoot[],
   osLabel: string,
   profile: 'explore' | 'code',
-  description: string
+  description: string,
+  /** Set when the child runs as a custom agent (`customAgents.ts`): its
+   * tool line names the def's EXACT granted tools instead of a built-in
+   * profile's set, and the def's body is appended as an addendum section.
+   * `profile` is then the def's BASE profile (routing class), used only for
+   * the mutating-tools permission caveat. */
+  custom?: { name: string; tools: string[]; addendum: string }
 ): string {
   const primary = roots.find((r) => r.is_primary) ?? null;
   const secondaries = roots.filter((r) => !r.is_primary);
@@ -471,8 +477,15 @@ export function buildSubagentSystemPrompt(
       ]
     : ['No workspace folder is open yet. Tools will fail until the user opens one — say so in your report instead of retrying.'];
 
-  const toolLines =
-    profile === 'code'
+  const toolLines = custom
+    ? [
+        `You have exactly these tools: ${custom.tools.join(', ')}. Calling any other tool fails.${
+          profile === 'code'
+            ? ' Mutating tools may prompt the user for permission and can be denied — if denied, stop and report that instead of retrying.'
+            : ''
+        }`,
+      ]
+    : profile === 'code'
       ? [
           'You have read-only tools (read_file, list_dir, glob, grep) plus write_file, edit_file, and run_shell to make changes. Mutating tools may prompt the user for permission and can be denied — if denied, stop and report that instead of retrying.',
         ]
@@ -486,6 +499,9 @@ export function buildSubagentSystemPrompt(
     '',
     `Your task: ${description}`,
     ...toolLines,
+    ...(custom && custom.addendum.length > 0
+      ? ['', `## Agent instructions (${custom.name})`, custom.addendum]
+      : []),
     '',
     'Complete the task, then reply with a final report of what you found or did. Your reply is returned to the coordinating agent, not shown directly to the user — do not ask questions; if you get blocked, report what you found and why you stopped, then stop.',
   ].join('\n');

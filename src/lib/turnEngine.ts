@@ -690,11 +690,13 @@ async function executeToolCallInner(
       }
       const description = typeof args.description === 'string' ? args.description : 'Subagent task';
       const taskPrompt = typeof args.prompt === 'string' ? args.prompt : '';
-      // Only 'explore' is offered by `TASK_TOOL`'s schema this slice (see
-      // `tools.ts`'s doc comment) — defensively re-validated here anyway,
-      // rather than trusting the model's own JSON, exactly like every other
-      // frontend-injected/validated field in this function.
-      const profile: 'explore' | 'code' = args.profile === 'code' ? 'code' : 'explore';
+      // Passed through as a string: besides the built-in 'explore'/'code',
+      // a loaded custom agent's name is valid too — `runSubagentTask`'s
+      // `resolveSubagentProfile` is the single validation point, and an
+      // unknown name comes back as a tool error naming the known profiles
+      // (never a silent fallback that would run a mutating task under the
+      // wrong tool set).
+      const profile = typeof args.profile === 'string' && args.profile.trim().length > 0 ? args.profile.trim() : 'explore';
       // The child's own turn id — NOT `turnId` (the parent's) — so its
       // tool calls get their own entry in the Rust per-turn `tool_cancel`/
       // permission maps (AppState, lib.rs), scoping Stop-button cancellation

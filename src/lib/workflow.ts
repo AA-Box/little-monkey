@@ -31,7 +31,10 @@ import { unwrapUntrustedContent } from './untrustedContent';
 export interface WorkflowAgentSpec {
   description: string;
   prompt: string;
-  profile: 'explore' | 'code';
+  /** `'explore'`, `'code'`, or a custom agent name — validated at dispatch
+   * by `runSubagentTask`'s `resolveSubagentProfile`, same as the `task`
+   * tool's own `profile`. */
+  profile: string;
   /** Optional per-agent reasoning-effort override, threaded straight to
    * `runSubagentTask`'s existing `effort` param — absent means "inherit the
    * parent turn's effort", exactly like v1 behaved. Model overrides were
@@ -93,7 +96,11 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
         typeof agent.description === 'string' && agent.description.trim().length > 0 ? agent.description.trim() : `${title} agent ${agentIndex + 1}`;
       const prompt = typeof agent.prompt === 'string' && agent.prompt.trim().length > 0 ? agent.prompt : null;
       if (!prompt) throw new Error(`workflow agent "${agentDescription}" requires a non-empty "prompt".`);
-      const profile: 'explore' | 'code' = agent.profile === 'code' ? 'code' : 'explore';
+      // Any non-empty string passes parse — an unknown profile fails at
+      // dispatch with a per-agent tool error naming the known profiles
+      // (see `resolveSubagentProfile`), which beats silently coercing a
+      // typo to 'explore'.
+      const profile = typeof agent.profile === 'string' && agent.profile.trim().length > 0 ? agent.profile.trim() : 'explore';
       const rawEffort = agent.effort;
       const effort: 'low' | 'medium' | 'high' | undefined =
         rawEffort === 'low' || rawEffort === 'medium' || rawEffort === 'high' ? rawEffort : undefined;

@@ -38,6 +38,8 @@ import type { RoutingDecision } from './modelRouting';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { protectToolResult } from './untrustedContent';
 import { mutationToolFailureReason } from './workspaceMutation';
+import { customAgentBaseProfile, toolsForCustomAgent, type CustomAgentDef } from './customAgents';
+import { useCustomAgentStore } from '../store/customAgentStore';
 
 /** Hard cap on model/tool round trips for a single subagent run — smaller
  * than the parent's own `MAX_ITERATIONS` (25, agentLoop.ts) since a
@@ -199,6 +201,27 @@ function emptyMcpRegistry(): McpToolRegistry {
  * The routing decision is returned rather than only its target, so the caller
  * can record *why* this subagent ran where it did.
  */
+/** How a `profile` string resolves before the child loop starts — exported
+ * (with `resolveSubagentProfile`) for the DOM-free logic tests. A custom
+ * def's `base` is the built-in profile its ROUTING rides (`code` iff the def
+ * grants a mutating tool): per-profile model pins and dispatch policies only
+ * know the two built-in task classes, and a custom agent is one of those two
+ * kinds of work as far as model choice is concerned. */
+export type ResolvedSubagentProfile =
+  | { kind: 'builtin'; profile: 'explore' | 'code' }
+  | { kind: 'custom'; def: CustomAgentDef; base: 'explore' | 'code' }
+  | { kind: 'unknown'; known: string[] };
+
+export function resolveSubagentProfile(
+  profile: string,
+  defs: Record<string, CustomAgentDef>,
+): ResolvedSubagentProfile {
+  if (profile === 'explore' || profile === 'code') return { kind: 'builtin', profile };
+  const def = defs[profile];
+  if (def) return { kind: 'custom', def, base: customAgentBaseProfile(def) };
+  return { kind: 'unknown', known: ['explore', 'code', ...Object.keys(defs).sort()] };
+}
+
 function resolveSubagentTarget(
   target: ResolvedTarget,
   profile: 'explore' | 'code',
@@ -306,7 +329,10 @@ export interface RunSubagentTaskParams {
    * one user message. The child has no access to the parent conversation
    * beyond this string. */
   prompt: string;
-  profile: 'explore' | 'code';
+  /** `'explore'`, `'code'`, or a loaded custom agent's name (see
+   * `customAgents.ts`). An unknown name resolves to a tool-error result
+   * naming the known profiles — never a silent fallback to a built-in. */
+  profile: string;
   /** THIS turn's already-resolved active target — passed down rather than
    * re-resolved, so a mid-turn manual model switch in the parent can never
    * split the parent and child across different targets mid-turn. */
@@ -462,17 +488,44 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
   };
 
   try {
+    // Resolved from the store ONCE, before the loop — a def file edited (or
+    // deleted) mid-run must not change an already-running agent's tools.
+    const resolvedProfile = resolveSubagentProfile(profile, useCustomAgentStore.getState().defs);
+    if (resolvedProfile.kind === 'unknown') {
+      return finish(
+        'error',
+        stringifyToolError(
+          new Error(`Unknown agent profile "${profile}". Known profiles: ${resolvedProfile.known.join(', ')}.`)
+        )
+      );
+    }
+    const baseProfile = resolvedProfile.kind === 'custom' ? resolvedProfile.base : resolvedProfile.profile;
     const roots: PromptWorkspaceRoot[] = useWorkspaceStore.getState().roots;
     const osLabel = detectOsLabel(typeof navigator !== 'undefined' ? navigator.platform : '');
-    const systemPrompt = buildSubagentSystemPrompt(roots, osLabel, profile, description);
-    const tools: ToolDef[] = toolsForProfile(profile);
+    const systemPrompt = buildSubagentSystemPrompt(
+      roots,
+      osLabel,
+      baseProfile,
+      description,
+      resolvedProfile.kind === 'custom' ? resolvedProfile.def : undefined,
+    );
+    // A custom def's list is re-intersected with the ceiling inside
+    // `toolsForCustomAgent` (defense in depth on top of load-time
+    // validation); `isToolCallAllowed` below then enforces exactly this list
+    // per call, so a granted-but-hallucinated name never dispatches either.
+    const tools: ToolDef[] =
+      resolvedProfile.kind === 'custom' ? toolsForCustomAgent(resolvedProfile.def) : toolsForProfile(resolvedProfile.profile);
+    // The def's own effort wins over the inherited turn effort — that's what
+    // declaring `effort` in the definition file is FOR; a caller has no way
+    // to signal "explicitly override the def" separately from "inherited".
+    const childEffort = resolvedProfile.kind === 'custom' ? (resolvedProfile.def.effort ?? effort) : effort;
     const mcpRegistry = emptyMcpRegistry();
     // Resolved once, up front — not re-checked every iteration — for the
     // same "never split-brain mid-run" reason `target` itself is passed down
     // rather than re-resolved (see `RunSubagentTaskParams.target`'s doc
     // comment): a settings change mid-run shouldn't retarget an
     // already-running subagent partway through its own loop.
-    const routed = resolveSubagentTarget(target, profile);
+    const routed = resolveSubagentTarget(target, baseProfile);
     const resolvedTarget = routed.target;
     // Onto the parent's run: a subagent has none of its own, and the decision
     // is about work the parent asked for.
@@ -501,7 +554,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
       // child attempt's usage must never clobber the PARENT session's
       // context-usage ring. `onDelta` is omitted: nothing renders the
       // child's in-progress streaming content anywhere in this slice.
-      const attempt = await attemptStream(resolvedTarget, wireHistory, tools, signal, effort, sessionId, undefined, false);
+      const attempt = await attemptStream(resolvedTarget, wireHistory, tools, signal, childEffort, sessionId, undefined, false);
 
       if (attempt.usage) {
         useSubagentStore.getState().accumulateUsage(storeKey, attempt.usage);

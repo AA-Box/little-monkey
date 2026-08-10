@@ -53,13 +53,14 @@ vi.mock("./turnEngine", () => ({
     target.kind === "local" ? "Local model" : target.kind === "ollama" ? `Ollama · ${target.model}` : `${target.providerId} · ${target.model}`,
 }));
 
-import { MAX_SUBAGENT_ITERATIONS, runSubagentTask, steerSubagentRun, type RunSubagentTaskParams } from "./subagent";
+import { MAX_SUBAGENT_ITERATIONS, resolveSubagentProfile, runSubagentTask, steerSubagentRun, type RunSubagentTaskParams } from "./subagent";
 import { clearPauseRegistryForTests, setPauseRequested } from "./pauseRegistry";
 import type { ResolvedTarget, RiskAnnotationContext } from "./turnEngine";
 import type { ChatMessage, ToolCall } from "./llamaClient";
 import { selectSubagentRun, useSubagentStore } from "../store/subagentStore";
 import { useSessionStore, type ChatSession } from "../store/sessionStore";
 import { useSettingsStore } from "../store/settingsStore";
+import { useCustomAgentStore } from "../store/customAgentStore";
 
 const fakeTarget: ResolvedTarget = { kind: "local", baseUrl: "http://localhost:8090" };
 
@@ -984,5 +985,93 @@ describe("runSubagentTask / mid-run steering", () => {
 
     const wire = attemptStreamMock.mock.calls[0][1] as ChatMessage[];
     expect(wire.some((m) => m.content === "never seen")).toBe(false);
+  });
+});
+
+describe("runSubagentTask / custom agent profiles", () => {
+  const docsDef = {
+    name: "docs-writer",
+    description: "Writes docs",
+    tools: ["read_file", "grep"],
+    effort: "low" as const,
+    addendum: "Always write in the imperative mood.",
+    sourcePath: ".monkey/agents/docs-writer.md",
+  };
+  const fixerDef = {
+    name: "fixer",
+    description: "Fixes bugs",
+    tools: ["read_file", "write_file"],
+    addendum: "",
+    sourcePath: ".monkey/agents/fixer.md",
+  };
+
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    routeFromActiveMock.mockClear();
+    // An earlier suite leaves a `code`-profile model pin behind, which would
+    // short-circuit routing entirely (pinned targets never consult K9).
+    useSettingsStore.setState({ subagentProfileModels: {} });
+    useCustomAgentStore.setState({ defs: { "docs-writer": docsDef, fixer: fixerDef }, errors: [], loadedAt: Date.now() });
+  });
+
+  afterEach(() => {
+    useCustomAgentStore.setState({ defs: {}, errors: [], loadedAt: null });
+  });
+
+  it("resolveSubagentProfile: builtin, custom, and unknown (with the known list sorted)", () => {
+    expect(resolveSubagentProfile("explore", {})).toEqual({ kind: "builtin", profile: "explore" });
+    expect(resolveSubagentProfile("code", {})).toEqual({ kind: "builtin", profile: "code" });
+    const custom = resolveSubagentProfile("docs-writer", { "docs-writer": docsDef });
+    expect(custom).toEqual({ kind: "custom", def: docsDef, base: "explore" });
+    const unknown = resolveSubagentProfile("nope", { zeta: docsDef, alpha: fixerDef });
+    expect(unknown).toEqual({ kind: "unknown", known: ["explore", "code", "alpha", "zeta"] });
+  });
+
+  it("an unknown profile finishes as an error naming the known profiles, without ever streaming", async () => {
+    const result = await runSubagentTask(baseParams({ profile: "not-an-agent", toolCallId: "call-unknown" }));
+
+    expect(JSON.parse(result).error).toContain('Unknown agent profile "not-an-agent"');
+    expect(JSON.parse(result).error).toContain("docs-writer");
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+    expect(useSubagentStore.getState().runs["call-unknown"]?.status).toBe("error");
+  });
+
+  it("offers the child exactly the def's tools, appends the addendum, and applies the def's effort", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "docs-writer", effort: "high" }));
+
+    const [, wireHistory, tools, , effort] = attemptStreamMock.mock.calls[0] as [unknown, ChatMessage[], { function: { name: string } }[], unknown, string];
+    expect(tools.map((t) => t.function.name).sort()).toEqual(["grep", "read_file"]);
+    expect(wireHistory[0].content).toContain("Always write in the imperative mood.");
+    expect(wireHistory[0].content).toContain("docs-writer");
+    // The def's own effort wins over the inherited turn effort — declaring
+    // effort in the definition file is the point of the field.
+    expect(effort).toBe("low");
+  });
+
+  it("routes a mutating custom agent as code-class work and a read-only one as explore-class", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "fixer" }));
+    expect((routeFromActiveMock.mock.calls[0][1] as { taskClass: string }).taskClass).toBe("subagent_code");
+
+    routeFromActiveMock.mockClear();
+    await runSubagentTask(baseParams({ profile: "docs-writer" }));
+    expect((routeFromActiveMock.mock.calls[0][1] as { taskClass: string }).taskClass).toBe("subagent_explore");
+  });
+
+  it("rejects a child call to a tool outside the def's list without executing it", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({ content: "", toolCalls: [toolCall("write_file")], streamError: null, contentStarted: true })
+      .mockResolvedValueOnce({ content: "ok", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "docs-writer" }));
+
+    expect(executeToolCallMock).not.toHaveBeenCalled();
+    const wire = attemptStreamMock.mock.calls[1][1] as ChatMessage[];
+    const rejection = wire.find((m) => m.role === "tool");
+    expect(rejection && JSON.parse(rejection.content as string).error).toContain('"write_file"');
   });
 });

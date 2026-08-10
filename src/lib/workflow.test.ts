@@ -61,14 +61,26 @@ beforeEach(() => {
 });
 
 describe("parseWorkflowSpec", () => {
-  it("normalizes a valid spec and defaults profile to explore", () => {
+  it("normalizes a valid spec, passing unknown profiles through for dispatch to validate", () => {
     const parsed = parseWorkflowSpec({
       name: " audit ",
       description: " d ",
-      phases: [{ title: "P", agents: [{ description: "a", prompt: "p", profile: "bogus" }] }],
+      phases: [{ title: "P", agents: [{ description: "a", prompt: "p", profile: "docs-writer" }] }],
     });
     expect(parsed.name).toBe("audit");
     expect(parsed.description).toBe("d");
+    // A custom agent name is valid (customAgents.ts); an unknown one fails
+    // at dispatch with an error naming the known profiles, not a silent
+    // coercion here.
+    expect(parsed.phases[0].agents[0].profile).toBe("docs-writer");
+  });
+
+  it("defaults a missing or blank profile to explore", () => {
+    const parsed = parseWorkflowSpec({
+      name: "audit",
+      description: "d",
+      phases: [{ title: "P", agents: [{ description: "a", prompt: "p" }] }],
+    });
     expect(parsed.phases[0].agents[0].profile).toBe("explore");
   });
 

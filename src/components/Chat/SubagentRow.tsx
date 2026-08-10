@@ -38,7 +38,8 @@ export interface SubagentRowProps {
 
 export interface ParsedTaskArgs {
   description: string;
-  profile: "explore" | "code";
+  /** Built-in profile or a custom agent name (`customAgents.ts`). */
+  profile: string;
 }
 
 /** Exported for `SubagentRow.test.ts` — this codebase's test setup runs
@@ -55,13 +56,23 @@ export function parseTaskArgs(args: string): ParsedTaskArgs {
       const candidate = parsed as Partial<ParsedTaskArgs>;
       return {
         description: typeof candidate.description === "string" && candidate.description.trim().length > 0 ? candidate.description : "Subagent task",
-        profile: candidate.profile === "code" ? "code" : "explore",
+        profile: typeof candidate.profile === "string" && candidate.profile.trim().length > 0 ? candidate.profile.trim() : "explore",
       };
     }
   } catch {
     // fall through to the default below
   }
   return { description: "Subagent task", profile: "explore" };
+}
+
+/** What the header's agent badge shows: the translated built-in profile
+ * label, or a custom agent's own name verbatim (a user-authored identifier,
+ * not translatable copy). Exported for `SubagentRow.test.ts`, same
+ * logic-not-JSX convention as `parseTaskArgs`. */
+export function profileBadge(profile: string): { i18nKey: string } | { raw: string } {
+  if (profile === "explore") return { i18nKey: "SubagentRow.profileExplore" };
+  if (profile === "code") return { i18nKey: "SubagentRow.profileCode" };
+  return { raw: profile };
 }
 
 export interface ChildToolCallRow {
@@ -239,7 +250,10 @@ const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result 
   // transient store is gone (post-restart), see ChatSession.subagentRunMeta.
   const persistedMeta = useSessionStore((state) => state.sessions.find((s) => s.id === sessionId)?.subagentRunMeta?.[taskId]);
 
-  const { description } = parseTaskArgs(args);
+  const { description, profile } = parseTaskArgs(args);
+  // The live/persisted run knows the ACTUAL profile it ran under (a custom
+  // name survives there even when the transcript args were minified away).
+  const badge = profileBadge(live?.profile ?? persistedMeta?.profile ?? profile);
   const status: SubagentStatus = resolveSubagentStatus(live?.status, result);
   const running = status === "running";
   const transcript = live?.liveMessages ?? persisted ?? [];
@@ -281,6 +295,9 @@ const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result 
           className="flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-[13px] text-muted transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent motion-reduce:transition-none"
         >
           <span className="min-w-0 truncate">{headerTitle}</span>
+          <span className="shrink-0 rounded-full border border-border px-1.5 text-[10px] font-medium text-faint">
+            {"i18nKey" in badge ? t(badge.i18nKey) : badge.raw}
+          </span>
           {running && (
             <span className="flex shrink-0 items-center gap-1" aria-hidden>
               <span className="h-1 w-1 animate-bounce rounded-full bg-faint [animation-delay:-0.3s]" />

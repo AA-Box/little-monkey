@@ -56,6 +56,8 @@ import { currentSystemPrompt, ULTRACODE_SYSTEM_SECTION, type AttachedStackPrompt
 import { composeSkillCatalog, composeSkillSystemPrompt, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
 import { composeSavedWorkflowCatalog } from './workflow';
 import { selectSavedWorkflowList, useSavedWorkflowStore } from '../store/savedWorkflowStore';
+import { composeCustomAgentCatalog } from './customAgents';
+import { selectCustomAgentList, useCustomAgentStore } from '../store/customAgentStore';
 import { collectUserPromptSubmitContext } from './userHooks';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { isBtwNotice } from './slashCommands';
@@ -2796,6 +2798,13 @@ async function runAgentTurnBody(
         // so the catalog rides the same `subagentsEnabled` gate.
         ...(settings.subagentsEnabled
           ? [composeSavedWorkflowCatalog(selectSavedWorkflowList(useSavedWorkflowStore.getState()))]
+          : []),
+        // Custom agents are `profile` values of TASK_TOOL/WORKFLOW_TOOL, so
+        // the catalog rides the same gate that offers those tools — which
+        // includes an Ultracode turn's force-offer (see `toolsForSettings`'s
+        // call above).
+        ...(settings.subagentsEnabled || ultracode
+          ? [composeCustomAgentCatalog(selectCustomAgentList(useCustomAgentStore.getState()))]
           : []),
         ...(userPromptHookContext ? [userPromptHookContext] : []),
       ]

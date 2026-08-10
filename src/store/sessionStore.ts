@@ -177,7 +177,7 @@ export interface SubagentRunMeta {
   /** Owning workflow run id — see `SubagentRun.workflowRunId`. */
   workflowRunId?: string;
   description: string;
-  profile: "explore" | "code";
+  profile: string; // built-in profile or custom agent name
   startedAt: number;
   finishedAt: number;
   toolCallCount: number;
@@ -1003,7 +1003,8 @@ function normalizeSubagentRunMeta(raw: unknown): Record<string, SubagentRunMeta>
     result[taskId] = {
       status: candidate.status,
       description: candidate.description,
-      profile: candidate.profile === "code" ? "code" : "explore",
+      // Any non-empty string is valid — a custom agent name persists as-is.
+      profile: typeof candidate.profile === "string" && candidate.profile.length > 0 ? candidate.profile : "explore",
       startedAt: candidate.startedAt as number,
       finishedAt: candidate.finishedAt as number,
       toolCallCount: Number.isFinite(candidate.toolCallCount) ? (candidate.toolCallCount as number) : 0,
