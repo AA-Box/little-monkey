@@ -479,3 +479,23 @@ describe("runWorkflow / resume (v2)", () => {
     expect(results[workflowAgentTaskId("call_journal", 0, 1)]?.promptHash).toBe(promptHash("Audit part B."));
   });
 });
+
+describe("parseWorkflowSpec / isolation", () => {
+  it("passes 'worktree' through and drops anything else", () => {
+    const parsed = parseWorkflowSpec({
+      name: "n",
+      description: "",
+      phases: [
+        {
+          title: "P",
+          agents: [
+            { description: "a", prompt: "p", profile: "code", isolation: "worktree" },
+            { description: "b", prompt: "p", profile: "code", isolation: "container" },
+          ],
+        },
+      ],
+    });
+    expect(parsed.phases[0].agents[0].isolation).toBe("worktree");
+    expect(parsed.phases[0].agents[1].isolation).toBeUndefined();
+  });
+});

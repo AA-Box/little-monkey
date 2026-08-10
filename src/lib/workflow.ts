@@ -44,6 +44,9 @@ export interface WorkflowAgentSpec {
    * dispatch policies already cover per-agent model choice inside
    * `resolveSubagentTarget`. */
   effort?: 'low' | 'medium' | 'high';
+  /** Optional worktree isolation — same meaning and validation as the `task`
+   * tool's `isolation` (see `RunSubagentTaskParams.isolation`). */
+  isolation?: 'worktree';
 }
 
 export interface WorkflowSpec {
@@ -104,7 +107,8 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
       const rawEffort = agent.effort;
       const effort: 'low' | 'medium' | 'high' | undefined =
         rawEffort === 'low' || rawEffort === 'medium' || rawEffort === 'high' ? rawEffort : undefined;
-      return { description: agentDescription, prompt, profile, effort };
+      const isolation: 'worktree' | undefined = agent.isolation === 'worktree' ? 'worktree' : undefined;
+      return { description: agentDescription, prompt, profile, effort, isolation };
     });
     totalAgents += agents.length;
     return { title, agents };
@@ -384,6 +388,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
             description: agent.description,
             prompt,
             profile: agent.profile,
+            isolation: agent.isolation,
             target,
             effort: agent.effort ?? effort,
             risk,

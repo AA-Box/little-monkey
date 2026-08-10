@@ -204,9 +204,11 @@ const MIGRATION_V17: i64 = 17;
 const MIGRATION_V17_CHECKSUM: &str = "context-budget-v17-2026-08-08";
 const MIGRATION_V18: i64 = 18;
 const MIGRATION_V18_CHECKSUM: &str = "browser-session-kind-v18-2026-08-09";
+const MIGRATION_V19: i64 = 19;
+const MIGRATION_V19_CHECKSUM: &str = "subsystem-worktree-v19-2026-08-10";
 
 /// The newest schema this binary knows how to write.
-const SCHEMA_VERSION: i64 = MIGRATION_V18;
+const SCHEMA_VERSION: i64 = MIGRATION_V19;
 
 /// Whether a migration keeps older binaries able to open the database.
 ///
@@ -724,6 +726,10 @@ pub enum Subsystem {
     Browser,
     Acp,
     Remote,
+    /// Agent worktree lifecycle (`agent_worktrees.rs`): create/remove/apply
+    /// are run-less filesystem+git mutations, exactly the class of action
+    /// this stream exists for.
+    Worktree,
 }
 
 impl Subsystem {
@@ -733,6 +739,7 @@ impl Subsystem {
         Subsystem::Browser,
         Subsystem::Acp,
         Subsystem::Remote,
+        Subsystem::Worktree,
     ];
 
     #[must_use]
@@ -743,6 +750,7 @@ impl Subsystem {
             Subsystem::Browser => "browser",
             Subsystem::Acp => "acp",
             Subsystem::Remote => "remote",
+            Subsystem::Worktree => "worktree",
         }
     }
 
@@ -2175,6 +2183,16 @@ const MIGRATION_LADDER: &[(i64, &str, Compatibility)] = &[
         MIGRATION_V18_CHECKSUM,
         Compatibility::RequiresThisVersion,
     ),
+    // Breaking for exactly V18's reason, one table over: it widens
+    // `subsystem_events.subsystem` to admit `worktree` (agent-worktree
+    // create/remove/apply — see `agent_worktrees.rs`), and an older binary's
+    // `Subsystem::parse` errors on any code it does not know, so a database
+    // containing worktree rows would fail that binary's every chain read.
+    (
+        MIGRATION_V19,
+        MIGRATION_V19_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
 ];
 
 /// The oldest binary that may open a database with `version` applied.
@@ -2725,6 +2743,43 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
                 MIGRATION_V18_CHECKSUM,
                 now_ms_i64()?,
                 min_reader_version_for(MIGRATION_V18)
+            ],
+        )?;
+    }
+
+    let has_v19 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V19],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v19 {
+        // Same probe idea as V18's: this migration widens a CHECK rather than
+        // adding a column, so the table's own DDL is the only thing that can
+        // say whether the rebuild already happened.
+        let already_wide = transaction
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'subsystem_events'
+                   AND sql LIKE '%worktree%'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !already_wide {
+            transaction.execute_batch(MIGRATION_V19_SQL)?;
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V19,
+                MIGRATION_V19_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V19)
             ],
         )?;
     }
@@ -3798,6 +3853,79 @@ END;
 -- Structural linkage, so it holds against a writer that never goes through
 -- Rust. SQLite cannot compute SHA-256, so the hash's *content* is
 -- `verify_subsystem_chain`'s job; "points at its predecessor" is the database's.
+CREATE TRIGGER subsystem_events_chain_links_to_its_predecessor
+BEFORE INSERT ON subsystem_events
+FOR EACH ROW
+WHEN NEW.prev_event_hash IS NOT (
+        SELECT event_hash FROM subsystem_events ORDER BY sequence DESC LIMIT 1
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'subsystem event must carry its predecessor''s hash');
+END;
+"#;
+
+/// V19: widens `subsystem_events.subsystem` to admit `'worktree'` — V18's
+/// table-rebuild recipe applied to the subsystem stream. `sequence` is copied
+/// verbatim so the hash chain's order (and `sqlite_sequence`'s counter, which
+/// SQLite advances past the copied maximum) survive the rebuild, and the
+/// append-only + chain-linkage triggers are re-stated because they die with
+/// the dropped table.
+const MIGRATION_V19_SQL: &str = r#"
+CREATE TABLE subsystem_events_v19 (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    subsystem TEXT NOT NULL CHECK (subsystem IN
+        ('http', 'mcp', 'browser', 'acp', 'remote', 'worktree')),
+    action TEXT NOT NULL CHECK (length(action) > 0),
+    occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms > 0),
+    run_id TEXT,
+    attribution TEXT NOT NULL CHECK (attribution IN (
+        'ledger-run', 'unregistered-run', 'unknown',
+        'unattributed.user-action', 'unattributed.scheduled',
+        'unattributed.inbound-request', 'unattributed.startup',
+        'unattributed.shared-transport'
+    )),
+    process_id TEXT,
+    permission_request_id TEXT,
+    outcome TEXT NOT NULL CHECK (outcome IN
+        ('succeeded', 'failed', 'denied', 'cancelled')),
+    detail_json BLOB,
+    event_hash TEXT NOT NULL CHECK (length(event_hash) = 64),
+    prev_event_hash TEXT CHECK (prev_event_hash IS NULL OR length(prev_event_hash) = 64),
+    CHECK ((attribution IN ('ledger-run', 'unregistered-run')) = (run_id IS NOT NULL))
+) STRICT;
+
+INSERT INTO subsystem_events_v19 (
+    sequence, event_id, subsystem, action, occurred_at_ms, run_id, attribution,
+    process_id, permission_request_id, outcome, detail_json, event_hash, prev_event_hash
+)
+SELECT
+    sequence, event_id, subsystem, action, occurred_at_ms, run_id, attribution,
+    process_id, permission_request_id, outcome, detail_json, event_hash, prev_event_hash
+FROM subsystem_events;
+
+DROP TABLE subsystem_events;
+ALTER TABLE subsystem_events_v19 RENAME TO subsystem_events;
+
+CREATE INDEX subsystem_events_time_idx ON subsystem_events(occurred_at_ms, sequence);
+CREATE INDEX subsystem_events_subsystem_idx ON subsystem_events(subsystem, sequence);
+CREATE INDEX subsystem_events_run_idx
+    ON subsystem_events(run_id, sequence) WHERE run_id IS NOT NULL;
+CREATE INDEX subsystem_events_permission_idx
+    ON subsystem_events(permission_request_id) WHERE permission_request_id IS NOT NULL;
+
+CREATE TRIGGER subsystem_events_forbid_update
+BEFORE UPDATE ON subsystem_events
+BEGIN
+    SELECT RAISE(ABORT, 'subsystem events are append-only');
+END;
+
+CREATE TRIGGER subsystem_events_forbid_delete
+BEFORE DELETE ON subsystem_events
+BEGIN
+    SELECT RAISE(ABORT, 'subsystem events are append-only');
+END;
+
 CREATE TRIGGER subsystem_events_chain_links_to_its_predecessor
 BEFORE INSERT ON subsystem_events
 FOR EACH ROW
@@ -6365,7 +6493,7 @@ mod tests {
                 .execute(
                     "INSERT INTO schema_migrations
                         (version, checksum, applied_at_ms, min_reader_version)
-                     VALUES (19, 'from-the-future-additive', 19, 18)",
+                     VALUES (20, 'from-the-future-additive', 20, 19)",
                     [],
                 )
                 .unwrap();
@@ -6379,7 +6507,7 @@ mod tests {
             let connection = Connection::open(&database.path).unwrap();
             connection
                 .execute(
-                    "UPDATE schema_migrations SET min_reader_version = 19 WHERE version = 19",
+                    "UPDATE schema_migrations SET min_reader_version = 20 WHERE version = 20",
                     [],
                 )
                 .unwrap();
@@ -6387,7 +6515,7 @@ mod tests {
         assert!(
             matches!(
                 RunLedger::open(&database.path),
-                Err(LedgerError::MigrationConflict { version: 19 })
+                Err(LedgerError::MigrationConflict { version: 20 })
             ),
             "a future migration that requires a newer binary must still refuse"
         );
@@ -6581,10 +6709,10 @@ mod tests {
         let required = required_reader_version(&ledger.connection)
             .unwrap()
             .unwrap();
-        // V18 is the newest breaking migration: it widened `agent_processes.kind`
-        // to admit `browser_session`, which a V17 binary's `ProcessKind::parse`
-        // rejects outright rather than ignoring.
-        assert_eq!(required, MIGRATION_V18);
+        // V19 is the newest breaking migration: it widened
+        // `subsystem_events.subsystem` to admit `worktree`, which an older
+        // binary's `Subsystem::parse` rejects outright rather than ignoring.
+        assert_eq!(required, MIGRATION_V19);
         assert!(required <= SCHEMA_VERSION);
 
         // No row may be left at the `DEFAULT 1` the ALTER used: that would claim
@@ -6608,13 +6736,13 @@ mod tests {
             let ledger = RunLedger::open(&database.path).unwrap();
             assert_eq!(
                 ledger.applied_migrations().unwrap(),
-                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
             );
         }
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
             "reopening must not re-apply or add a migration"
         );
 
@@ -6863,7 +6991,7 @@ mod tests {
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
             "opening a V10 database must apply every migration above it"
         );
         assert_eq!(

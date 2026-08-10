@@ -1273,3 +1273,62 @@ describe("executeToolCall / Plan Mode dispatch backstop", () => {
     }
   });
 });
+
+describe("executeToolCall / workspace_root_override reserved arg", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    usePermissionStore.setState({ mode: "manual" });
+  });
+
+  it("injects the frontend-supplied override for fs/shell tools", async () => {
+    invokeMock.mockResolvedValue("ok");
+    await executeToolCall(
+      call("write_file", { path: "a.ts", content: "x" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "/data/agent-worktrees/wt-1",
+    );
+    const [, args] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(args.workspace_root_override).toBe("/data/agent-worktrees/wt-1");
+  });
+
+  it("scrubs a model-supplied override — the model can never choose its own root", async () => {
+    invokeMock.mockResolvedValue("ok");
+    await executeToolCall(
+      call("read_file", { path: "a.ts", workspace_root_override: "/etc" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+    );
+    const [, args] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(args.workspace_root_override).toBeUndefined();
+  });
+
+  it("never attaches the override to tools with no workspace path (web_fetch)", async () => {
+    invokeMock.mockResolvedValue("ok");
+    await executeToolCall(
+      call("web_fetch", { url: "https://example.com" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "/data/agent-worktrees/wt-1",
+    );
+    const [, args] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(args.workspace_root_override).toBeUndefined();
+  });
+});
