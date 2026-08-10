@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { WorkflowSpec } from "../lib/workflow";
 
 /** One phase's shape inside a live/persisted workflow run: the model-supplied
  * title plus the `subagentStore` keys of the agents dispatched under it —
@@ -32,13 +33,19 @@ export interface WorkflowRun {
   /** Index into `phases` of the phase currently executing — agents of later
    * phases haven't been dispatched yet and have no `subagentStore` entry. */
   activePhaseIndex: number;
+  /** The full model-supplied spec (prompts included) — what the drawer's
+   * "Save workflow" button hands `savedWorkflowStore.upsert`. Live-only,
+   * deliberately NOT snapshotted into `ChatSession.workflowRunMeta`: full
+   * prompts would bloat every persisted session for a button that only
+   * matters while the run is still on screen. `undefined` on restored runs. */
+  spec?: WorkflowSpec;
 }
 
 interface WorkflowStoreState {
   runs: Record<string, WorkflowRun>;
   /** Registers a run as `'running'` on phase 0 — called once by
    * `runWorkflow` before any agent is dispatched. */
-  start: (params: { sessionId: string; runId: string; name: string; description: string; phases: WorkflowPhase[] }) => void;
+  start: (params: { sessionId: string; runId: string; name: string; description: string; phases: WorkflowPhase[]; spec?: WorkflowSpec }) => void;
   /** Advances the active-phase pointer — called by `runWorkflow` as each
    * phase's agents begin. No-ops on an unknown `runId`, same defensive
    * posture as `subagentStore.recordToolCall`. */
@@ -54,11 +61,11 @@ interface WorkflowStoreState {
 export const useWorkflowStore = create<WorkflowStoreState>((set) => ({
   runs: {},
 
-  start: ({ sessionId, runId, name, description, phases }) => {
+  start: ({ sessionId, runId, name, description, phases, spec }) => {
     set((state) => ({
       runs: {
         ...state.runs,
-        [runId]: { sessionId, runId, name, description, status: "running", startedAt: Date.now(), phases, activePhaseIndex: 0 },
+        [runId]: { sessionId, runId, name, description, status: "running", startedAt: Date.now(), phases, activePhaseIndex: 0, spec },
       },
     }));
   },

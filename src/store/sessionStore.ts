@@ -184,6 +184,22 @@ export interface SubagentRunMeta {
   usage?: UsageInfo;
 }
 
+/** One workflow agent's journaled outcome (workflow v2 resume) — keyed in
+ * `WorkflowRunMeta.agentResults` by the agent's deterministic taskId
+ * (`workflowAgentTaskId`). A later `workflow` call with `resume: "<runId>"`
+ * replays `done` entries whose `promptHash` still matches instead of
+ * re-dispatching those agents — see `runWorkflow` (lib/workflow.ts). */
+export interface WorkflowAgentResult {
+  /** Hash of the FULL composed prompt the agent was sent (spec prompt +
+   * injected prior-phase reports) — the per-agent "spec still matches" test. */
+  promptHash: string;
+  status: "done" | "error" | "cancelled";
+  /** The agent's report (or error payload), capped at `MAX_REPORT_CHARS`. */
+  report: string;
+  /** True when this entry was itself replayed from an earlier run's journal. */
+  reused?: boolean;
+}
+
 /** The shape `runWorkflow`'s finish helper snapshots — everything the
  * drawer's workflow card needs that the per-agent `SubagentRunMeta` entries
  * can't provide (name, description, phase structure, run-level status). */
@@ -194,6 +210,10 @@ export interface WorkflowRunMeta {
   startedAt: number;
   finishedAt: number;
   phases: { title: string; agents: { taskId: string; description: string }[] }[];
+  /** Per-agent journal (workflow v2) — written once, in the same terminal
+   * snapshot as the rest of this meta, so any terminal-with-failures run is
+   * resumable. Absent on runs persisted before v2. */
+  agentResults?: Record<string, WorkflowAgentResult>;
 }
 
 export interface MessageTranslation {
