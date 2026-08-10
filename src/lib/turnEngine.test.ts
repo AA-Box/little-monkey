@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
@@ -20,6 +20,7 @@ import {
   attemptStream,
   CANCELLED_TOOL_RESULT,
   executeToolCall,
+  isBlockedInPlanMode,
   isToolCallAllowed,
   PRESENT_PLAN_RESULT,
   stringifyToolError,
@@ -38,7 +39,11 @@ import {
   useCostControlStore,
 } from "../store/costControlStore";
 import { usePrivacyFirewallStore } from "../store/privacyFirewallStore";
+import { useWorkspaceStore } from "../store/workspaceStore";
+import { useSessionStore } from "../store/sessionStore";
 import { providerModelTargetKey } from "./modelTargets";
+import { useUserHooksStore } from "../store/userHooksStore";
+import { usePermissionStore } from "../store/permissionStore";
 
 const emptyMcpRegistry: McpToolRegistry = new Map();
 
@@ -863,13 +868,47 @@ describe("attemptStream / recordUsage", () => {
     ]);
   });
 
+  // K25: the recorded entry has to say WHERE to charge the call, and the two
+  // places are genuinely different — the folder open right now (which is what
+  // the process ledger stamps on the processes this turn spawns) and the
+  // folder the conversation belongs to.
+  it("attributes a call to the open workspace and to the session's own project folder", async () => {
+    useWorkspaceStore.setState({
+      roots: [{ id: "root-1", path: "/work/current", label: "current", is_primary: true }],
+    });
+    useSessionStore.setState({
+      sessions: [{ id: "session-cost", workspacePath: "/work/older" }],
+    } as unknown as Parameters<typeof useSessionStore.setState>[0]);
+
+    await attemptStream(fakeTarget, [], [], undefined, undefined, "session-cost");
+
+    expect(useCostControlStore.getState().entries[0]).toMatchObject({
+      workspacePath: "/work/current",
+      projectPath: "/work/older",
+    });
+  });
+
+  it("records no attribution rather than a guessed one when there is no folder or session", async () => {
+    useWorkspaceStore.setState({ roots: [] });
+    useSessionStore.setState({ sessions: [] } as unknown as Parameters<
+      typeof useSessionStore.setState
+    >[0]);
+
+    await attemptStream(fakeTarget, [], [], undefined, undefined, "session-unknown");
+
+    expect(useCostControlStore.getState().entries[0]).toMatchObject({
+      workspacePath: null,
+      projectPath: null,
+    });
+  });
+
   it("pauses a provider request before transport when a hard budget is reached", async () => {
     useCostControlStore.setState({
       policy: {
         enabled: true,
         dailyBudgetUsd: 1,
         monthlyBudgetUsd: null,
-        warningPercent: 0.8,
+        warningPercents: [0.8],
         enforcement: "pause",
       },
       entries: [
@@ -1101,5 +1140,195 @@ describe("attemptStream / privacy firewall choke point", () => {
     await attemptStream(localTarget, [{ role: "user", content: "sk-secret stays local" }], [], undefined, undefined, "session-privacy").catch(() => undefined);
 
     expect(invokeMock).not.toHaveBeenCalledWith("privacy_firewall_preview", expect.anything());
+  });
+});
+
+// User hooks wrap `executeToolCall`'s whole dispatch (see `userHooks.ts`):
+// an explicit PreToolUse deny must block the call BEFORE any `invoke`
+// dispatch and become the tool error; hook infrastructure failure must
+// proceed. Store-seeded directly — the store's own load/save is
+// `userHooks.test.ts`'s subject.
+describe("executeToolCall / user hooks", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    useUserHooksStore.setState({ hooks: [], loaded: true });
+  });
+
+  it("blocks the tool call and returns the hook's reason as the tool error on an explicit deny", async () => {
+    useUserHooksStore.setState({
+      hooks: [{ id: "h1", event: "PreToolUse", command: "guard.sh", matcher: "write_file" }],
+      loaded: true,
+    });
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "hook_exec") return { exit_code: 2, stdout: "", stderr: "protected file", timed_out: false };
+      throw new Error(`unexpected invoke: ${command}`);
+    });
+
+    const result = await executeToolCall(call("write_file", { path: "a.txt", content: "x" }), null, "turn-1", emptyMcpRegistry);
+
+    const parsed = JSON.parse(result) as { error: string };
+    expect(parsed.error).toContain("protected file");
+    // The gate held: nothing but the hook itself was ever invoked.
+    expect(invokeMock.mock.calls.every(([name]) => name === "hook_exec")).toBe(true);
+  });
+
+  it("proceeds to the normal dispatch when the hook times out", async () => {
+    useUserHooksStore.setState({
+      hooks: [{ id: "h1", event: "PreToolUse", command: "guard.sh" }],
+      loaded: true,
+    });
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "hook_exec") return { exit_code: null, stdout: "", stderr: "", timed_out: true };
+      if (command === "tool_read_file") return "file contents";
+      throw new Error(`unexpected invoke: ${command}`);
+    });
+
+    const result = await executeToolCall(call("read_file", { path: "a.txt" }), null, "turn-1", emptyMcpRegistry);
+
+    expect(result).toContain("file contents");
+  });
+
+  it("fires PostToolUse hooks with the result after a successful dispatch", async () => {
+    useUserHooksStore.setState({
+      hooks: [{ id: "h2", event: "PostToolUse", command: "log.sh" }],
+      loaded: true,
+    });
+    const hookPayloads: string[] = [];
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "hook_exec") {
+        hookPayloads.push((args as { payload: string }).payload);
+        return { exit_code: 0, stdout: "", stderr: "", timed_out: false };
+      }
+      if (command === "tool_read_file") return "file contents";
+      throw new Error(`unexpected invoke: ${command}`);
+    });
+
+    await executeToolCall(call("read_file", { path: "a.txt" }), null, "turn-1", emptyMcpRegistry);
+
+    await vi.waitFor(() => expect(hookPayloads.length).toBe(1));
+    const payload = JSON.parse(hookPayloads[0]) as Record<string, unknown>;
+    expect(payload.event).toBe("PostToolUse");
+    expect(payload.tool_name).toBe("read_file");
+    expect(typeof payload.result).toBe("string");
+  });
+
+  it("never consults hooks when none are configured", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_read_file") return "file contents";
+      throw new Error(`unexpected invoke: ${command}`);
+    });
+
+    await executeToolCall(call("read_file", { path: "a.txt" }), null, "turn-1", emptyMcpRegistry);
+
+    expect(invokeMock.mock.calls.some(([name]) => name === "hook_exec")).toBe(false);
+  });
+});
+
+describe("executeToolCall / Plan Mode dispatch backstop", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    usePermissionStore.setState({ mode: "plan" });
+  });
+
+  afterEach(() => {
+    usePermissionStore.setState({ mode: "manual" });
+  });
+
+  it.each(["write_file", "edit_file", "run_shell", "shell_kill", "remember", "web_fetch", "web_search"])(
+    "refuses %s without dispatching to Rust",
+    async (name) => {
+      const result = await executeToolCall(call(name, { path: "a.ts" }), null, "turn-1", emptyMcpRegistry);
+      expect(JSON.parse(result).error).toContain("Plan Mode");
+      expect(invokeMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("refuses an mcp__ tool without resolving or dispatching it", async () => {
+    const result = await executeToolCall(call("mcp__srv__write_row"), null, "turn-1", emptyMcpRegistry);
+    expect(JSON.parse(result).error).toContain("Plan Mode");
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("still dispatches read-only tools in plan mode", async () => {
+    invokeMock.mockResolvedValue("file contents");
+    const result = await executeToolCall(call("read_file", { path: "a.ts" }), null, "turn-1", emptyMcpRegistry);
+    expect(result).toBe("file contents");
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("dispatches the same mutating call normally once the mode is no longer plan — approval re-enables acting", async () => {
+    usePermissionStore.setState({ mode: "acceptEdits" });
+    invokeMock.mockResolvedValue("ok");
+    const result = await executeToolCall(call("write_file", { path: "a.ts", content: "x" }), null, "turn-1", emptyMcpRegistry);
+    expect(result).toBe("ok");
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("isBlockedInPlanMode: pins the exact blocked-name predicate", () => {
+    for (const name of ["write_file", "edit_file", "run_shell", "shell_kill", "remember", "web_fetch", "web_search", "mcp__x__y"]) {
+      expect(isBlockedInPlanMode(name), name).toBe(true);
+    }
+    for (const name of ["read_file", "list_dir", "glob", "grep", "shell_output", "task", "workflow", "skill", "present_plan", "spawn_task"]) {
+      expect(isBlockedInPlanMode(name), name).toBe(false);
+    }
+  });
+});
+
+describe("executeToolCall / workspace_root_override reserved arg", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    usePermissionStore.setState({ mode: "manual" });
+  });
+
+  it("injects the frontend-supplied override for fs/shell tools", async () => {
+    invokeMock.mockResolvedValue("ok");
+    await executeToolCall(
+      call("write_file", { path: "a.ts", content: "x" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "/data/agent-worktrees/wt-1",
+    );
+    const [, args] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(args.workspace_root_override).toBe("/data/agent-worktrees/wt-1");
+  });
+
+  it("scrubs a model-supplied override — the model can never choose its own root", async () => {
+    invokeMock.mockResolvedValue("ok");
+    await executeToolCall(
+      call("read_file", { path: "a.ts", workspace_root_override: "/etc" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+    );
+    const [, args] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(args.workspace_root_override).toBeUndefined();
+  });
+
+  it("never attaches the override to tools with no workspace path (web_fetch)", async () => {
+    invokeMock.mockResolvedValue("ok");
+    await executeToolCall(
+      call("web_fetch", { url: "https://example.com" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "/data/agent-worktrees/wt-1",
+    );
+    const [, args] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(args.workspace_root_override).toBeUndefined();
   });
 });

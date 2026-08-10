@@ -1,0 +1,142 @@
+# Builds, signs, and publishes the MLX service package.
+#
+# Kept out of release.yml on purpose: the app's release cadence and mlx-lm's
+# are unrelated, and rebuilding a 300 MB Python tree on every app tag — or
+# holding an app release for an MLX build — would couple two things that have
+# no reason to move together. The component hub versions this independently.
+#
+# The package is only installable if MLX_SIGNING_PRIVATE_KEY signs it with the
+# key whose public half is pinned in MLX_RELEASE_PUBLIC_KEY_HEX
+# (src-tauri/src/m3_production.rs). Generate the pair with `pnpm mlx:keygen`,
+# store the private half as a repository secret, and paste the printed hex into
+# that constant. Without the secret this workflow fails rather than publishing
+# an unsigned package that every client would reject after downloading it.
+name: MLX package
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Catalog channel to publish under
+        type: choice
+        options: [stable, beta]
+        default: beta
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Apple silicon: the manifest hard-pins macos/aarch64 and the installer
+    # re-checks it against the probed host, so an x86 runner would produce a
+    # package nothing can install.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      # Pinned to a commit rather than the `v4` tag the other workflows use.
+      # This is the one workflow that holds MLX_SIGNING_PRIVATE_KEY, and a
+      # mutable third-party tag can be repointed at any commit by its owner —
+      # which here would mean handing the signing key to whatever it points at.
+      # CodeQL flags exactly this (code-scanning alert 28). Bump deliberately.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          # Same pin as ci.yml and release.yml. Required, not optional: this
+          # repo's package.json has no `packageManager` field, so with no
+          # `version` the action has nothing to read and exits with "No pnpm
+          # version is specified" before installing anything.
+          version: 9
+
+      - run: pnpm install --frozen-lockfile
+
+      # Fails the build before the expensive venv step if the packaging
+      # canonicalizer has drifted from the Rust one, which would produce
+      # signatures no client can verify.
+      - run: pnpm test:mlx-package
+
+      - name: Build and sign
+        env:
+          MLX_SIGNING_KEY: ${{ secrets.MLX_SIGNING_PRIVATE_KEY }}
+          SOURCE_DATE_EPOCH: ${{ github.event.repository.pushed_at }}
+        run: |
+          if [ -z "$MLX_SIGNING_KEY" ]; then
+            echo "::error::MLX_SIGNING_PRIVATE_KEY is not set. See pnpm mlx:keygen."
+            exit 1
+          fi
+          pnpm mlx:package
+
+      - name: Publish the archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls packaging/mlx/mlx-runtime-*.tar.gz)
+          VERSION=$(basename "$ARCHIVE" .tar.gz)
+          gh release create "$VERSION" "$ARCHIVE" \
+            --title "$VERSION" \
+            --notes "MLX service package for Apple silicon. Installed from the Runtime Hub." \
+            || gh release upload "$VERSION" "$ARCHIVE" --clobber
+          echo "MLX_DOWNLOAD_URL=$(gh release view "$VERSION" --json assets \
+            --jq '.assets[0].url')" >> "$GITHUB_ENV"
+
+      # Re-emitted with the real asset URL now that one exists. The digest is
+      # unchanged — it is over the archive, which was not rebuilt.
+      - name: Write the catalog entry
+        env:
+          MLX_DOWNLOAD_URL: ${{ env.MLX_DOWNLOAD_URL }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs");
+            const path = "packaging/mlx/mlx-catalog.json";
+            const entries = JSON.parse(fs.readFileSync(path, "utf8"));
+            entries[0].downloadUrl = process.env.MLX_DOWNLOAD_URL;
+            entries[0].channel = process.env.CHANNEL;
+            entries[0].publishedAtMs = Date.now();
+            fs.writeFileSync(path, JSON.stringify(entries, null, 2) + "\n");
+          '
+          cat packaging/mlx/mlx-catalog.json
+
+      # The catalog names the archive and its digest. The app has no HTTP
+      # component source — the Runtime Hub's registry is local — so this is
+      # downloaded and imported through Components → Import catalog rather than
+      # subscribed to by URL. It is deliberately not signed: it only carries a
+      # URL and a digest, and the package it points at still has to satisfy the
+      # pinned publisher key before it installs.
+      - name: Publish the catalog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create mlx-catalog packaging/mlx/mlx-catalog.json \
+            --title "MLX catalog" \
+            --notes "Component catalog for the MLX runtime. Download this file, then import it in the Runtime Hub under Components → Import catalog." \
+            || gh release upload mlx-catalog packaging/mlx/mlx-catalog.json --clobber
+
+      # Both URLs in one place, because the pair is what a user needs and the
+      # catalog's own release page does not mention the archive's.
+      - name: Summarize
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MLX_DOWNLOAD_URL: ${{ env.MLX_DOWNLOAD_URL }}
+        run: |
+          set -euo pipefail
+          CATALOG_URL=$(gh release view mlx-catalog --json assets \
+            --jq '.assets[] | select(.name == "mlx-catalog.json") | .url')
+          {
+            echo "### MLX package published"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Archive | $MLX_DOWNLOAD_URL |"
+            echo "| Catalog | $CATALOG_URL |"
+            echo
+            echo "Install: download the catalog, then Runtime Hub → Components → **Import catalog**."
+            echo "The archive is only installable if it verifies against the release key pinned in"
+            echo '`MLX_RELEASE_PUBLIC_KEY_HEX` (src-tauri/src/m3_production.rs).'
+          } >> "$GITHUB_STEP_SUMMARY"

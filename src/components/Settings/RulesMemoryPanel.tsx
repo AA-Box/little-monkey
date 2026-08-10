@@ -1,7 +1,14 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Pencil, Plus, Trash2 } from "lucide-react";
+import { History, Pencil, Plus, Trash2 } from "lucide-react";
 import { Button } from "../ui";
+import { RevisionHistoryPanel } from "./RevisionHistoryPanel";
+import {
+  RULES_KIND,
+  isConflictError,
+  rulesCurrentRevision,
+  rulesRevisionEntity,
+} from "../../store/configRevisionStore";
 import { useT } from "../../lib/i18n";
 import { useRulesStore, type MemoryFact } from "../../store/rulesStore";
 import { useWorkspaceStore } from "../../store/workspaceStore";
@@ -82,17 +89,61 @@ interface RuleEditorProps {
    * "Save" vs "Create MONKEY.md" button label. */
   exists: boolean;
   onSave: (content: string) => Promise<void>;
+  /**
+   * How this editor finds its own revision log (roadmap K24).
+   *
+   * `scope`/`rootPath` are exactly what `rules_write` takes, so the history the
+   * panel shows and the file the Save button writes cannot drift apart.
+   */
+  scope: "global" | "project";
+  rootPath: string | null;
 }
 
 /** One MONKEY.md editor — reused for the global file and for each attached
  * project root. Local edit state only; the caller owns persistence. */
-function RuleEditor({ heading, description, placeholder, initialContent, truncated, exists, onSave }: RuleEditorProps) {
+function RuleEditor({
+  heading,
+  description,
+  placeholder,
+  initialContent,
+  truncated,
+  exists,
+  onSave,
+  scope,
+  rootPath,
+}: RuleEditorProps) {
   const { t } = useT();
   const [content, setContent] = useState(initialContent);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [justSaved, setJustSaved] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [entityId, setEntityId] = useState<string | null>(null);
+
+  // Resolved once per editor, and asked of the backend rather than derived
+  // here: the id is built from the file's *resolved* path, because two attached
+  // roots can both be labelled `src`.
+  useEffect(() => {
+    let cancelled = false;
+    void rulesRevisionEntity(scope, rootPath).then((id) => {
+      if (!cancelled) setEntityId(id);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [scope, rootPath]);
+
+  const restore = useCallback((snapshot: string) => {
+    // Loaded into the editor rather than written straight to disk, which is the
+    // rule `RevisionHistoryPanel` states: the history store never writes the
+    // live document. The user still presses Save, and that save records the
+    // restore as an ordinary revision.
+    setContent(snapshot);
+    setDirty(true);
+    setJustSaved(false);
+    setShowHistory(false);
+  }, []);
 
   // Picks up external edits to the file (or the freshly-created file after a
   // successful save) as long as the user isn't mid-edit locally.
@@ -150,14 +201,38 @@ function RuleEditor({ heading, description, placeholder, initialContent, truncat
             <span className="text-faint">{t("RulesMemoryPanel.savedStatus")}</span>
           ) : null}
         </span>
-        <Button size="sm" variant="primary" onClick={() => void handleSave()} disabled={saving || (!dirty && exists)}>
-          {saving
-            ? t("RulesMemoryPanel.savingButton")
-            : exists
-              ? t("RulesMemoryPanel.saveButton")
-              : t("RulesMemoryPanel.createButton")}
-        </Button>
+        <div className="flex items-center gap-2">
+          {entityId && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => setShowHistory((open) => !open)}
+              title={t("RulesMemoryPanel.historyButton")}
+            >
+              <History size={14} />
+              {t("RulesMemoryPanel.historyButton")}
+            </Button>
+          )}
+          <Button size="sm" variant="primary" onClick={() => void handleSave()} disabled={saving || (!dirty && exists)}>
+            {saving
+              ? t("RulesMemoryPanel.savingButton")
+              : exists
+                ? t("RulesMemoryPanel.saveButton")
+                : t("RulesMemoryPanel.createButton")}
+          </Button>
+        </div>
       </div>
+      {showHistory && entityId && (
+        <div className="mt-3">
+          <RevisionHistoryPanel
+            kind={RULES_KIND}
+            entityId={entityId}
+            title={heading}
+            onRestore={restore}
+            onClose={() => setShowHistory(false)}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -424,14 +499,38 @@ export function RulesMemoryPanel() {
   const globalRule = rules.find((r) => r.scope === "global") ?? null;
   const hasPrimaryRoot = roots.some((r) => r.is_primary);
 
-  async function saveGlobal(content: string) {
-    await invoke("rules_write", { scope: "global", rootPath: null, content });
+  /**
+   * Saves one rules file against the revision it was loaded from.
+   *
+   * The base is re-read immediately before the write rather than held from the
+   * initial render: this editor may have been open for minutes, and a base
+   * captured at mount would report a conflict for every save after the *user's
+   * own* previous one. Re-reading narrows the window to the save itself, which
+   * is the concurrent edit worth catching.
+   *
+   * A conflict is surfaced verbatim — `isConflictError`'s prefix is what tells
+   * a concurrent edit apart from a disk error — and the file on disk is left
+   * untouched by the backend, so nothing has been lost when the user re-reads.
+   */
+  async function saveRules(scope: "global" | "project", rootPath: string | null, content: string) {
+    const base = await rulesCurrentRevision(scope, rootPath);
+    try {
+      await invoke("rules_write", { scope, rootPath, content, baseRevisionId: base });
+    } catch (e) {
+      if (isConflictError(e)) {
+        await refreshRules();
+      }
+      throw e;
+    }
     await refreshRules();
   }
 
+  async function saveGlobal(content: string) {
+    await saveRules("global", null, content);
+  }
+
   async function saveProject(rootPath: string, content: string) {
-    await invoke("rules_write", { scope: "project", rootPath, content });
-    await refreshRules();
+    await saveRules("project", rootPath, content);
   }
 
   return (
@@ -448,6 +547,8 @@ export function RulesMemoryPanel() {
           truncated={globalRule?.truncated ?? false}
           exists={globalRule != null}
           onSave={saveGlobal}
+          scope="global"
+          rootPath={null}
         />
       </section>
 
@@ -475,6 +576,8 @@ export function RulesMemoryPanel() {
                   truncated={rule?.truncated ?? false}
                   exists={rule != null}
                   onSave={(content) => saveProject(rootPath, content)}
+                  scope="project"
+                  rootPath={rootPath}
                 />
               );
             })}

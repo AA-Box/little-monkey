@@ -57,8 +57,7 @@ fn scope_search_workspace(
     let (resolved, root) = crate::workspace::resolve_path_and_root(state, workspace_path)?;
     if resolved != root {
         return Err(
-            "Global search workspace filter must be an exact attached workspace root"
-                .to_string(),
+            "Global search workspace filter must be an exact attached workspace root".to_string(),
         );
     }
     request.workspace_path = Some(root.to_string_lossy().to_string());
@@ -162,13 +161,15 @@ mod tests {
         let canonical = attached.canonicalize().unwrap();
 
         let state = AppState::default();
-        state.workspace_roots.lock().unwrap().push(
-            crate::workspace::WorkspaceRoot {
+        state
+            .workspace_roots
+            .lock()
+            .unwrap()
+            .push(crate::workspace::WorkspaceRoot {
                 id: canonical.to_string_lossy().to_string(),
                 path: canonical.clone(),
                 label: "attached".to_string(),
-            },
-        );
+            });
         assert_eq!(
             attached_search_workspace_paths(&state).unwrap(),
             vec![canonical.to_string_lossy().to_string()],

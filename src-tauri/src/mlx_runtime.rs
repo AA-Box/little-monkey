@@ -305,7 +305,13 @@ impl Default for MlxInstallLimits {
             max_files: 20_000,
             max_file_bytes: 2 * 1024 * 1024 * 1024,
             max_total_bytes: 8 * 1024 * 1024 * 1024,
-            max_manifest_bytes: 2 * 1024 * 1024,
+            // Must be able to hold `max_files` entries, or the two limits
+            // contradict each other and the smaller one silently wins. Each
+            // entry is a path plus a 64-character digest — around 200 bytes —
+            // so 20,000 of them need roughly 4 MiB. At the previous 2 MiB a
+            // real package (a Python runtime is thousands of files) was
+            // rejected for its manifest length rather than anything about it.
+            max_manifest_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -377,6 +383,152 @@ pub struct MlxPackageInstaller {
     verifier: Arc<dyn MlxSignatureVerifier>,
     limits: MlxInstallLimits,
     operation_lock: Mutex<()>,
+}
+
+/// The manifest a built, not-yet-installed package carries at its root.
+///
+/// Deliberately not [`INSTALL_MANIFEST_FILE`]: that name marks a tree this
+/// installer has already published and verified, and reusing it would make a
+/// downloaded directory indistinguishable from an installed one.
+pub const MLX_SOURCE_MANIFEST_FILE: &str = "mlx-package.json";
+
+/// Unpacks a `.tar.gz` MLX package into `destination`.
+///
+/// This is the seam between the component hub, which downloads one opaque
+/// blob and proves only its SHA-256, and [`MlxPackageInstaller`], which wants
+/// a tree and proves the publisher signed it. The two checks layer: the digest
+/// says the bytes are the ones the catalog listed, the signature says the
+/// publisher made them. Neither substitutes for the other.
+///
+/// Every archive entry is treated as hostile data, because an archive is the
+/// classic path-traversal sink:
+///
+///   * the path is re-validated as a normal relative path, so `../` and
+///     absolute entries never reach a `join`
+///   * the joined result is confirmed to stay under `destination`, which
+///     catches anything the first check did not anticipate
+///   * only regular files are written — a symlink entry in an archive is how a
+///     later entry gets redirected outside the tree, and honoring one here
+///     would undo both checks above
+///   * entry count and byte totals are bounded before anything is written
+///
+/// Modes come from the manifest, never from the archive: the installer sets
+/// 0o700 or 0o600 per its own `executable` flag, so a tampered header cannot
+/// make a data file executable.
+pub fn extract_package_archive(
+    archive: &Path,
+    destination: &Path,
+    limits: &MlxInstallLimits,
+) -> MlxResult<()> {
+    let file =
+        File::open(archive).map_err(|source| io_at("open MLX package archive", archive, source))?;
+    let mut reader = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    ensure_private_directory(destination)?;
+
+    let mut count = 0_usize;
+    let mut total = 0_u64;
+    let entries = reader
+        .entries()
+        .map_err(|source| io_at("read MLX package archive", archive, source))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|source| io_at("read MLX package entry", archive, source))?;
+        // Directories are implied by the files inside them; anything that is
+        // neither a directory nor a regular file has no place in a package.
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err(invalid(
+                "archive.entry",
+                "package archives may contain only regular files",
+            ));
+        }
+        count += 1;
+        if count > limits.max_files {
+            return Err(limit(
+                "MLX package files",
+                count as u64,
+                limits.max_files as u64,
+            ));
+        }
+        let size = entry.header().size().unwrap_or(u64::MAX);
+        if size > limits.max_file_bytes {
+            return Err(limit("MLX package file bytes", size, limits.max_file_bytes));
+        }
+        total = total.saturating_add(size);
+        if total > limits.max_total_bytes {
+            return Err(limit("MLX package bytes", total, limits.max_total_bytes));
+        }
+
+        let raw = entry
+            .path()
+            .map_err(|_| invalid("archive.entry.path", "is not a usable path"))?
+            .to_string_lossy()
+            .to_string();
+        validate_relative_path(&raw, "archive.entry.path")?;
+        let path = destination.join(&raw);
+        // Belt and braces: `validate_relative_path` already rejects traversal,
+        // but this is the check that is true by construction rather than by
+        // reasoning about every path rule.
+        if !path.starts_with(destination) {
+            return Err(invalid("archive.entry.path", "escapes the package root"));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|source| io_at("create package directory", parent, source))?;
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut output = options
+            .open(&path)
+            .map_err(|source| io_at("create package file", &path, source))?;
+        io::copy(&mut entry, &mut output)
+            .map_err(|source| io_at("write package file", &path, source))?;
+    }
+    Ok(())
+}
+
+/// Reads a built package directory into the bundle [`MlxPackageInstaller`]
+/// installs.
+///
+/// The installer takes its input in memory and verifies the signature over it,
+/// so this reads rather than trusts: only the files the manifest declares are
+/// loaded, each is bounded by the same limits the install will re-check, and
+/// nothing outside the directory is reachable because every declared path has
+/// already been validated as a normal relative path. A file present on disk
+/// but absent from the manifest is not loaded and therefore cannot be
+/// installed — the signature covers the list, not the directory.
+pub fn read_package_directory(
+    directory: &Path,
+    limits: &MlxInstallLimits,
+) -> MlxResult<MlxPackageBundle> {
+    let manifest_path = directory.join(MLX_SOURCE_MANIFEST_FILE);
+    let manifest_bytes = read_regular_bounded(&manifest_path, limits.max_manifest_bytes)?;
+    let manifest: MlxPackageManifest = serde_json::from_slice(&manifest_bytes)?;
+    // Shape only. Whether this package matches *this* host is the installer's
+    // question, asked against a probed `MlxHostCapabilities` rather than
+    // against whatever the caller happens to be reading the directory on.
+    validate_manifest_target_shape(&manifest, limits)?;
+
+    let mut files = BTreeMap::new();
+    let mut total: u64 = 0;
+    for file in &manifest.files {
+        // Re-validated here even though the manifest shape check passed: this
+        // is the value about to be joined onto a real path on this machine.
+        validate_relative_path(&file.path, "files.path")?;
+        let bytes = read_regular_bounded(
+            &directory.join(&file.path),
+            usize::try_from(limits.max_file_bytes).unwrap_or(usize::MAX),
+        )?;
+        total = total.saturating_add(bytes.len() as u64);
+        if total > limits.max_total_bytes {
+            return Err(limit("MLX package bytes", total, limits.max_total_bytes));
+        }
+        files.insert(file.path.clone(), bytes);
+    }
+    Ok(MlxPackageBundle { manifest, files })
 }
 
 impl MlxPackageInstaller {
@@ -1946,6 +2098,269 @@ mod tests {
             TestSignatureVerifier::sign(&manifest.signature_key_id, &payload),
         );
         MlxPackageBundle { manifest, files }
+    }
+
+    /// Both canonicalizers must agree byte for byte, or packages built by the
+    /// script verify nowhere.
+    ///
+    /// The signature covers exactly these bytes. `scripts/lib/mlxPackage.mjs`
+    /// produces them in JavaScript and its own test asserts the identical
+    /// string, so a change to either implementation breaks one of the two
+    /// tests. Without that pairing the failure surfaces only as an installer
+    /// reporting "signature is invalid" for a package that was signed
+    /// correctly — indistinguishable from a tampered one.
+    #[test]
+    fn canonical_manifest_bytes_match_the_packaging_script() {
+        const FIXTURE: &str = concat!(
+            r#"{"files":[{"executable":true,"path":"bin/python","sha256":"#,
+            r#""0000000000000000000000000000000000000000000000000000000000000000","#,
+            r#""sizeBytes":3}],"packageVersion":"mlx-0.1.0","pythonExecutable":"bin/python","#,
+            r#""schemaVersion":1,"serviceEntry":"service/mlx_server.py","#,
+            r#""signatureAlgorithm":"ed25519","signatureKeyId":"release-2026-1","#,
+            r#""targetArchitecture":"aarch64","targetOs":"macos"}"#
+        );
+        let manifest = MlxPackageManifest {
+            schema_version: 1,
+            package_version: "mlx-0.1.0".to_string(),
+            target_os: "macos".to_string(),
+            target_architecture: "aarch64".to_string(),
+            python_executable: "bin/python".to_string(),
+            service_entry: "service/mlx_server.py".to_string(),
+            files: vec![MlxPackageFile {
+                path: "bin/python".to_string(),
+                size_bytes: 3,
+                sha256: "0".repeat(64),
+                executable: true,
+            }],
+            signature_algorithm: "ed25519".to_string(),
+            signature_key_id: "release-2026-1".to_string(),
+            // Present, and still absent from the signed bytes: the unsigned
+            // view drops the key rather than blanking it.
+            signature_base64: "must-not-appear".to_string(),
+        };
+        let payload =
+            canonical_json(&UnsignedMlxPackageManifest::from(&manifest)).expect("canonical");
+        assert_eq!(String::from_utf8(payload).unwrap(), FIXTURE);
+    }
+
+    /// A built package directory is read into exactly the bundle the installer
+    /// takes — and a directory is not trusted for what it contains, only for
+    /// what its signed manifest declares.
+    #[test]
+    fn a_package_directory_is_read_into_an_installable_bundle() {
+        let root = std::env::temp_dir().join(format!("mlx-src-{}", Uuid::new_v4().simple()));
+        let bundle = package();
+        for (path, bytes) in &bundle.files {
+            let full = root.join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(&full, bytes).unwrap();
+        }
+        // A file nobody signed for. It must not travel with the bundle.
+        fs::write(root.join("service/extra.py"), b"print('unsigned')").unwrap();
+        fs::write(
+            root.join(MLX_SOURCE_MANIFEST_FILE),
+            canonical_json(&bundle.manifest).unwrap(),
+        )
+        .unwrap();
+
+        let limits = MlxInstallLimits::default();
+        let read = read_package_directory(&root, &limits).expect("read package directory");
+        assert_eq!(read.manifest, bundle.manifest);
+        assert_eq!(read.files, bundle.files);
+        assert!(
+            !read.files.contains_key("service/extra.py"),
+            "only manifest-declared files are packaged"
+        );
+        // ...and the round trip really installs, which is the whole point of
+        // reading it in this shape.
+        let installer = installer(&root.join("installed"));
+        installer
+            .install_and_activate(&read, &supported_host())
+            .expect("install the directory that was read");
+
+        // A directory whose bytes no longer match its manifest is refused
+        // before anything is written.
+        fs::write(root.join("service/mlx_server.py"), b"print('swapped')").unwrap();
+        let tampered = read_package_directory(&root, &limits).expect("still reads");
+        assert!(installer
+            .install_and_activate(&tampered, &supported_host())
+            .is_err());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A package archive is untrusted input, and unpacking is where that bites.
+    ///
+    /// The digest the component hub checks proves the bytes match the catalog;
+    /// it proves nothing about what the catalog listed. So a traversal entry, a
+    /// symlink, or an absolute path has to be refused by the extractor itself —
+    /// by the time the signature is checked, a careless unpack has already
+    /// written outside the tree.
+    #[test]
+    fn a_hostile_archive_cannot_write_outside_the_package_root() {
+        let base = std::env::temp_dir().join(format!("mlx-tar-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&base).unwrap();
+        let limits = MlxInstallLimits::default();
+
+        // Names are written straight into the header rather than through
+        // `append_data`, whose own guard rejects `..` before it is written.
+        // An attacker has no such guard — the bytes on the wire are whatever
+        // they chose — so a test that could only produce well-formed names
+        // would be testing the tar crate's writer, not this extractor.
+        let build = |name: &str, entries: Vec<(&str, &[u8])>| -> PathBuf {
+            let path = base.join(name);
+            let encoder = flate2::write::GzEncoder::new(
+                File::create(&path).unwrap(),
+                flate2::Compression::fast(),
+            );
+            let mut archive = tar::Builder::new(encoder);
+            for (entry_path, bytes) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_entry_type(tar::EntryType::Regular);
+                let raw = entry_path.as_bytes();
+                header.as_gnu_mut().unwrap().name[..raw.len()].copy_from_slice(raw);
+                header.set_cksum();
+                archive.append(&header, bytes).unwrap();
+            }
+            archive.into_inner().unwrap().finish().unwrap();
+            path
+        };
+
+        // The ordinary case still works, or the checks below prove nothing.
+        let good = build(
+            "good.tar.gz",
+            vec![("service/mlx_server.py", b"print(1)" as &[u8])],
+        );
+        let out = base.join("good-out");
+        extract_package_archive(&good, &out, &limits).expect("a normal archive unpacks");
+        assert_eq!(
+            fs::read(out.join("service/mlx_server.py")).unwrap(),
+            b"print(1)"
+        );
+
+        // Escapes, refused before any write reaches the parent.
+        let canary = base.join("pwned.txt");
+        for (name, entry) in [
+            ("dotdot.tar.gz", "../pwned.txt"),
+            ("nested.tar.gz", "service/../../pwned.txt"),
+            ("absolute.tar.gz", "/tmp/pwned.txt"),
+        ] {
+            let archive = build(name, vec![(entry, b"owned" as &[u8])]);
+            assert!(
+                extract_package_archive(&archive, &base.join(name), &limits).is_err(),
+                "{entry} must be refused"
+            );
+            assert!(!canary.exists(), "{entry} wrote outside the package root");
+        }
+
+        // A symlink entry is how a *later* entry gets redirected out of the
+        // tree, so the entry type is refused rather than followed.
+        let link = base.join("link.tar.gz");
+        {
+            let encoder = flate2::write::GzEncoder::new(
+                File::create(&link).unwrap(),
+                flate2::Compression::fast(),
+            );
+            let mut archive = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            archive
+                .append_link(&mut header, "escape", "/tmp/pwned.txt")
+                .unwrap();
+            archive.into_inner().unwrap().finish().unwrap();
+        }
+        assert!(
+            extract_package_archive(&link, &base.join("link-out"), &limits).is_err(),
+            "a symlink entry must be refused, not followed"
+        );
+
+        // Bounds are enforced from the headers, before the bytes are written.
+        let many = build(
+            "many.tar.gz",
+            (0..5).map(|_| ("f", b"x" as &[u8])).collect::<Vec<_>>(),
+        );
+        let tight = MlxInstallLimits {
+            max_files: 2,
+            ..MlxInstallLimits::default()
+        };
+        assert!(extract_package_archive(&many, &base.join("many-out"), &tight).is_err());
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Installs a real package built by `pnpm mlx:package`.
+    ///
+    /// Ignored by default because it needs a built tree — a bundled
+    /// interpreter and mlx-lm, ten thousand files and a gigabyte — but it is
+    /// the only check that runs the actual artifact through the actual
+    /// installer, digests and Ed25519 and all. The fixtures above prove the
+    /// logic; this proves the packaging script and this module agree.
+    ///
+    /// ```text
+    /// MLX_SIGNING_KEY=… pnpm mlx:package
+    /// MLX_PACKAGE_DIR=packaging/mlx/dist MLX_PACKAGE_PUBKEY_HEX=… \
+    ///   cargo test --lib mlx_runtime -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a package built by pnpm mlx:package"]
+    fn a_real_built_package_installs_and_verifies() {
+        let (Ok(directory), Ok(public_key_hex)) = (
+            std::env::var("MLX_PACKAGE_DIR"),
+            std::env::var("MLX_PACKAGE_PUBKEY_HEX"),
+        ) else {
+            panic!("set MLX_PACKAGE_DIR and MLX_PACKAGE_PUBKEY_HEX");
+        };
+
+        struct RealKeyVerifier(Vec<u8>);
+        impl MlxSignatureVerifier for RealKeyVerifier {
+            fn verify(
+                &self,
+                algorithm: &str,
+                _key_id: &str,
+                payload: &[u8],
+                signature: &[u8],
+            ) -> Result<(), String> {
+                if algorithm != "ed25519" {
+                    return Err(format!("unexpected algorithm {algorithm}"));
+                }
+                ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &self.0)
+                    .verify(payload, signature)
+                    .map_err(|_| "signature is invalid".to_string())
+            }
+        }
+
+        let key = (0..public_key_hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&public_key_hex[at..at + 2], 16).expect("hex"))
+            .collect::<Vec<_>>();
+        let limits = MlxInstallLimits::default();
+        let bundle =
+            read_package_directory(Path::new(&directory), &limits).expect("read built package");
+        println!(
+            "read {} files, version {}",
+            bundle.files.len(),
+            bundle.manifest.package_version
+        );
+
+        let root = std::env::temp_dir().join(format!("mlx-real-{}", Uuid::new_v4().simple()));
+        let installer = Arc::new(
+            MlxPackageInstaller::new(&root, Arc::new(RealKeyVerifier(key)), limits)
+                .expect("installer"),
+        );
+        let installed = installer
+            .install_and_activate(&bundle, &supported_host())
+            .expect("install the real package");
+        // The interpreter and the entry point are what the runtime execs, so
+        // an install that does not leave both on disk installed nothing usable.
+        assert!(installed.python_executable.is_file());
+        assert!(installed.service_entry.is_file());
+        installer.verify_active().expect("re-verify from disk");
+        println!("installed and re-verified {}", installed.package_version);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     fn installer(root: &Path) -> Arc<MlxPackageInstaller> {

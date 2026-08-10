@@ -162,8 +162,26 @@ fn daemon_ready(value: &Value) -> Result<(), String> {
                 .to_string(),
         );
     }
+    // Kept as its own check even though `backpressure.reason == "kill_switch"` now
+    // says the same thing: the signal is allowed to be absent (an older sidecar,
+    // per `backpressure_signal`) and losing the kill-switch refusal in that case
+    // would be a real regression, while this boolean is a required status field.
     if value.get("kill_switch").and_then(Value::as_bool) == Some(true) {
         return Err("The M6A global kill switch is engaged".to_string());
+    }
+    // This is an *interactive* producer, so the two backpressure states are not
+    // symmetric: `closed` refuses, but `slow` deliberately proceeds — a person is
+    // waiting on this turn and has nothing to defer it to, so deferring would be a
+    // refusal they never asked for. (Batch producers make the opposite call; see
+    // `m5_delivery::reviewer::patch_backpressure`.) Refusing `closed` here only
+    // buys a better message and saves writing the snapshot: the daemon's own
+    // `enqueue` is the guard and would refuse this run anyway.
+    if let Some(signal) = crate::daemon_commands::backpressure_signal(value) {
+        if signal.state == crate::daemon_commands::DesktopBackpressureState::Closed {
+            return Err(signal
+                .detail
+                .unwrap_or_else(|| "The M6A resident runner is not accepting work".to_string()));
+        }
     }
     Ok(())
 }
@@ -260,6 +278,44 @@ mod tests {
             "kill_switch": true
         }))
         .is_err());
+    }
+
+    /// The interactive asymmetry: `slow` proceeds, `closed` refuses.
+    ///
+    /// The `slow` half is the one worth a test. Treating it as a refusal is the
+    /// easy mistake, and it would deny a turn the daemon is still accepting to a
+    /// person sitting in front of the app with nothing to defer to.
+    #[test]
+    fn an_interactive_turn_proceeds_on_slow_and_refuses_on_closed() {
+        let status = |backpressure: &str| -> Value {
+            serde_json::from_str(&format!(
+                r#"{{"installed":true,"service_running":true,"heartbeat_fresh":true,
+                     "kill_switch":false,"backpressure":{backpressure}}}"#
+            ))
+            .unwrap()
+        };
+
+        // Verbatim CLI spelling — snake_case inside this object.
+        assert!(daemon_ready(&status(
+            r#"{"state":"slow","accepting":true,"reason":"queue_deep",
+                "detail":"104 of 128 queue slots are in use; slow down",
+                "retry_after_ms":26000,"queue_depth":104,"queue_capacity":128,
+                "queued":100,"held":0}"#
+        ))
+        .is_ok());
+
+        let refusal = daemon_ready(&status(
+            r#"{"state":"closed","accepting":false,"reason":"queue_full",
+                "detail":"128 of 128 queue slots are in use; wait for a run or cancel one",
+                "retry_after_ms":32000,"queue_depth":128,"queue_capacity":128,
+                "queued":124,"held":0}"#,
+        ))
+        .unwrap_err();
+        // The daemon's own sentence, not one invented here.
+        assert!(refusal.contains("128 of 128 queue slots"));
+
+        // A signal that goes absent must never block the app.
+        assert!(daemon_ready(&status("null")).is_ok());
     }
 
     #[test]

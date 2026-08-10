@@ -87,6 +87,7 @@ describe("localAppsStore", () => {
       template: "form",
       paramBindings: { target: "Target file" },
     });
+    expect(invokeMock).not.toHaveBeenCalledWith("api_server_create_token", expect.anything());
     expect(result).toEqual(published);
     expect(useLocalAppsStore.getState().apps).toEqual([published]);
   });

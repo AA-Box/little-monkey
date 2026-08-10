@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { selectTurnStatus, useTurnStatusStore } from "./turnStatusStore";
+import { liveTurnTokens, selectTurnStatus, useTurnStatusStore } from "./turnStatusStore";
 
 beforeEach(() => {
   useTurnStatusStore.setState({ turns: {} });
@@ -15,8 +15,36 @@ describe("turnStatusStore", () => {
       sessionId: "s1",
       startedAt: expect.any(Number),
       totalTokens: 0,
+      streamedChars: 0,
       activity: "",
       lastEventAt: expect.any(Number),
+    });
+  });
+
+  it("estimates tokens from streamed text until the exact usage lands", () => {
+    useTurnStatusStore.getState().noteStreamedChars("s1", 400);
+    expect(selectTurnStatus("s1")(useTurnStatusStore.getState())).toBeUndefined();
+
+    useTurnStatusStore.getState().begin("s1");
+    useTurnStatusStore.getState().noteStreamedChars("s1", 400);
+    useTurnStatusStore.getState().noteStreamedChars("s1", 200);
+    expect(liveTurnTokens(selectTurnStatus("s1")(useTurnStatusStore.getState())!)).toEqual({
+      tokens: 150,
+      estimated: true,
+    });
+
+    // The reported number replaces the guess rather than stacking on top of it.
+    useTurnStatusStore.getState().addTokens("s1", 900);
+    expect(liveTurnTokens(selectTurnStatus("s1")(useTurnStatusStore.getState())!)).toEqual({
+      tokens: 900,
+      estimated: false,
+    });
+
+    // The next attempt's stream estimates on top of that exact total again.
+    useTurnStatusStore.getState().noteStreamedChars("s1", 400);
+    expect(liveTurnTokens(selectTurnStatus("s1")(useTurnStatusStore.getState())!)).toEqual({
+      tokens: 1000,
+      estimated: true,
     });
   });
 

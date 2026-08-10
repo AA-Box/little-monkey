@@ -149,7 +149,11 @@ pub fn parse_issue_url(value: &str) -> Result<(String, String, u32), String> {
     if number == 0 {
         return Err("Issue number must be a positive integer".to_string());
     }
-    Ok((owner.to_ascii_lowercase(), repo.to_ascii_lowercase(), number))
+    Ok((
+        owner.to_ascii_lowercase(),
+        repo.to_ascii_lowercase(),
+        number,
+    ))
 }
 
 fn is_terminal(status: &str) -> bool {
@@ -565,7 +569,8 @@ pub async fn issue_to_pr_run_checks(
                 enabled: true,
                 timeout_secs: None,
             };
-            let result = run_command_impl(state.inner(), &root, &verify_command, Some(&run_id)).await;
+            let result =
+                run_command_impl(state.inner(), &root, &verify_command, Some(&run_id)).await;
             let passed = result.code == Some(0) && !result.timed_out;
             all_passed = all_passed && passed;
             outcomes.push(CheckOutcome {
@@ -650,7 +655,12 @@ mod tests {
         ))
     }
 
-    fn fixture_run(repository_slug: &str, issue_number: u32, created_at_ms: u64, status: &str) -> IssueToPrRun {
+    fn fixture_run(
+        repository_slug: &str,
+        issue_number: u32,
+        created_at_ms: u64,
+        status: &str,
+    ) -> IssueToPrRun {
         IssueToPrRun {
             run_id: format!("i2p-{created_at_ms}"),
             issue_url: format!("https://github.com/{repository_slug}/issues/{issue_number}"),
@@ -679,8 +689,10 @@ mod tests {
             ("owner".to_string(), "repo".to_string(), 42)
         );
         assert_eq!(
-            parse_issue_url("  http://www.github.com/owner/repo/issues/7/?tab=comments#issuecomment-1 ")
-                .unwrap(),
+            parse_issue_url(
+                "  http://www.github.com/owner/repo/issues/7/?tab=comments#issuecomment-1 "
+            )
+            .unwrap(),
             ("owner".to_string(), "repo".to_string(), 7)
         );
         assert_eq!(
@@ -715,29 +727,58 @@ mod tests {
 
     #[test]
     fn state_machine_allows_a_non_terminal_status_to_self_report_but_never_a_terminal_one() {
-        for status in ["planning", "implementing", "checking", "opening_pr", "awaiting_review"] {
+        for status in [
+            "planning",
+            "implementing",
+            "checking",
+            "opening_pr",
+            "awaiting_review",
+        ] {
             assert!(valid_transition(status, status), "{status} -> {status}");
         }
         for terminal in ["done", "failed", "cancelled"] {
-            assert!(!valid_transition(terminal, terminal), "{terminal} -> {terminal}");
+            assert!(
+                !valid_transition(terminal, terminal),
+                "{terminal} -> {terminal}"
+            );
         }
     }
 
     #[test]
-    fn state_machine_allows_cancelling_or_failing_from_any_non_terminal_status_but_never_from_terminal() {
-        for status in ["planning", "implementing", "checking", "opening_pr", "awaiting_review"] {
-            assert!(valid_transition(status, "cancelled"), "{status} -> cancelled");
+    fn state_machine_allows_cancelling_or_failing_from_any_non_terminal_status_but_never_from_terminal(
+    ) {
+        for status in [
+            "planning",
+            "implementing",
+            "checking",
+            "opening_pr",
+            "awaiting_review",
+        ] {
+            assert!(
+                valid_transition(status, "cancelled"),
+                "{status} -> cancelled"
+            );
             assert!(valid_transition(status, "failed"), "{status} -> failed");
         }
         for terminal in ["done", "failed", "cancelled"] {
-            assert!(!valid_transition(terminal, "cancelled"), "{terminal} -> cancelled");
-            assert!(!valid_transition(terminal, "failed"), "{terminal} -> failed");
-            assert!(!valid_transition(terminal, "implementing"), "{terminal} -> implementing");
+            assert!(
+                !valid_transition(terminal, "cancelled"),
+                "{terminal} -> cancelled"
+            );
+            assert!(
+                !valid_transition(terminal, "failed"),
+                "{terminal} -> failed"
+            );
+            assert!(
+                !valid_transition(terminal, "implementing"),
+                "{terminal} -> implementing"
+            );
         }
     }
 
     #[test]
-    fn find_reusable_worktree_picks_the_most_recent_matching_run_and_ignores_other_repos_or_issues() {
+    fn find_reusable_worktree_picks_the_most_recent_matching_run_and_ignores_other_repos_or_issues()
+    {
         let runs = vec![
             fixture_run("owner/repo", 1, 1_000, "done"),
             fixture_run("owner/repo", 1, 2_000, "failed"),

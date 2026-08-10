@@ -71,7 +71,12 @@ use crate::AppState;
 /// Same keychain service every credential in this app lives under (see
 /// `mcp.rs`/`providers.rs`) — entries are disambiguated by *account*, not
 /// service, hence this module's own `mcp-oauth:<id>` account prefix.
-const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.app"));
 
 /// Bound on how long [`mcp_oauth_connect`] waits for the browser to redirect
 /// back to the loopback listener after being opened — the user has to
@@ -105,7 +110,7 @@ fn manual_client_keychain_account(server_id: &str) -> String {
 }
 
 fn oauth_credentials_entry(server_id: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+    keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(server_id))
         .map_err(|e| format!("Failed to access keychain: {e}"))
 }
 
@@ -157,8 +162,11 @@ pub struct ManualClientRegistration {
 }
 
 fn manual_client_entry(server_id: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, &manual_client_keychain_account(server_id))
-        .map_err(|e| format!("Failed to access keychain: {e}"))
+    keyring::Entry::new(
+        &KEYCHAIN_SERVICE,
+        &manual_client_keychain_account(server_id),
+    )
+    .map_err(|e| format!("Failed to access keychain: {e}"))
 }
 
 /// Reads server `id`'s saved OAuth client registration, if any. Absence is
@@ -267,7 +275,7 @@ impl KeychainCredentialStore {
     }
 
     fn entry(&self) -> Result<keyring::Entry, AuthError> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(&self.server_id))
+        keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(&self.server_id))
             .map_err(|e| AuthError::InternalError(format!("Failed to access keychain: {e}")))
     }
 }
@@ -314,7 +322,7 @@ impl CredentialStore for KeychainCredentialStore {
 /// "absence is normal, not an error" stance, collapsed to a bool for
 /// `McpServerInfo::has_oauth`.
 pub fn has_oauth_credentials(server_id: &str) -> bool {
-    keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+    keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(server_id))
         .ok()
         .and_then(|e| e.get_password().ok())
         .is_some()
@@ -336,7 +344,7 @@ pub(crate) fn remove_oauth_credentials_impl(server_id: &str) -> Result<(), Strin
         || load_manual_client_record(server_id),
         || remove_manual_client(server_id),
         || {
-            let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+            let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(server_id))
                 .map_err(|e| format!("Failed to access keychain: {e}"))?;
             match entry.delete_credential() {
                 Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -1530,7 +1538,7 @@ mod tests {
         assert_eq!(loaded.token_received_at, Some(1_700_000_000));
 
         let raw_entry =
-            keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(&server_id)).unwrap();
+            keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(&server_id)).unwrap();
         let raw_json = raw_entry.get_password().unwrap();
         assert!(
             raw_json.contains("test-client-id"),

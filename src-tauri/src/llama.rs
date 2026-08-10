@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::profiles::ProfileScopedPaths;
 use crate::AppState;
 
 /// Port the managed chat `llama-server` instance listens on.
@@ -41,6 +42,10 @@ pub const EMBED_PORT: u16 = 8091;
 /// so `monkey-cli`'s `embed_cli::start` can build the exact same args via
 /// [`embed_server_args`].
 pub const EMBED_CTX: u32 = 2048;
+/// Layers the embeddings server offloads. Embedding models are a few hundred
+/// megabytes, so all of them fit; llama.cpp clamps an overshoot to the layers
+/// the model has, and a build with no GPU backend ignores the flag.
+pub const EMBED_GPU_LAYERS: u32 = 999;
 /// Upper bound for the startup identity response. A local process on the
 /// fixed port is untrusted until it proves the exact alias we passed to the
 /// child, so never buffer an arbitrarily large `/v1/models` body.
@@ -127,6 +132,13 @@ pub fn embed_server_args(model_path: &str, alias: &str) -> Vec<String> {
         EMBED_CTX.to_string(),
         "-ub".into(),
         EMBED_CTX.to_string(),
+        // Chat passes `-ngl` and embeddings did not, so on a Metal or CUDA
+        // build the same binary ran the chat model on the GPU and the
+        // embedding model on the CPU. Embedding models are small enough that
+        // "all layers" fits wherever the flag does anything, and indexing a
+        // corpus is the one place throughput is the whole experience.
+        "-ngl".into(),
+        EMBED_GPU_LAYERS.to_string(),
         "--embeddings".into(),
         "--pooling".into(),
         "mean".into(),
@@ -183,6 +195,10 @@ impl LlamaState {
 /// `monkey-cli`'s `embed_cli::start` (RAG design doc slice 4 CLI parity) can
 /// resolve the same binary without re-implementing this search.
 pub fn find_llama_server_binary() -> Result<String, String> {
+    // K22: nothing native starts while the startup self-integrity check says a
+    // component is tampered with — including the PATH fallback below, which
+    // would otherwise be a way past a refused managed tree.
+    crate::self_integrity::ensure_loadable()?;
     if let Some(app_data_dir) = crate::app_paths::data_dir() {
         let _ = crate::managed_runtime::materialize_bundled_runtime(None, &app_data_dir);
         if let Some(path) = crate::managed_runtime::find_managed_llama_server(Some(&app_data_dir)) {
@@ -222,23 +238,28 @@ pub fn find_llama_server_binary() -> Result<String, String> {
 /// materialization makes the same runtime available to the standalone CLI.
 fn find_llama_server_binary_for_app(app: &AppHandle) -> Result<String, String> {
     let app_data_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     let resource_dir = app.path().resource_dir().ok();
-    match crate::managed_runtime::materialize_bundled_runtime(
+    // A bundle that fails verification must not be the end of the search: an
+    // already-published app-data tree, the `LITTLE_MONKEY_LLAMA_RUNTIME`
+    // override and a system llama.cpp are all still valid answers, and a single
+    // bad bundle used to mask every one of them (leaving no workaround at all).
+    let bundle_error = match crate::managed_runtime::materialize_bundled_runtime(
         resource_dir.as_deref(),
         &app_data_dir,
     ) {
         Ok(Some(path)) => return Ok(path.to_string_lossy().into_owned()),
-        Ok(None) => {}
-        Err(error) => {
-            return Err(format!(
-                "Little Monkey's bundled llama.cpp runtime failed verification: {error}"
-            ))
-        }
-    }
-    find_llama_server_binary()
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+    find_llama_server_binary().map_err(|fallback_error| match bundle_error {
+        Some(bundle_error) => format!(
+            "Little Monkey's bundled llama.cpp runtime failed verification: {bundle_error}. \
+             {fallback_error}"
+        ),
+        None => fallback_error,
+    })
 }
 
 /// Emit a status event (`llama://status` or `embed://status`) to all windows
@@ -284,15 +305,11 @@ pub async fn server_reports_alias(
     expected_alias: &str,
 ) -> bool {
     let models_url = format!("http://127.0.0.1:{port}/v1/models");
-    let mut response = match client
-        .get(models_url)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-    {
-        Ok(response) if response.status().is_success() => response,
-        _ => return false,
-    };
+    let mut response =
+        match crate::egress::send(client.get(models_url).timeout(Duration::from_secs(2))).await {
+            Ok(response) if response.status().is_success() => response,
+            _ => return false,
+        };
     if response
         .content_length()
         .is_some_and(|length| length > MAX_MODELS_RESPONSE_BYTES as u64)
@@ -422,11 +439,8 @@ async fn spawn_and_wait_healthy(
             break;
         }
 
-        if let Ok(resp) = client
-            .get(&health_url)
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await
+        if let Ok(resp) =
+            crate::egress::send(client.get(&health_url).timeout(Duration::from_secs(2))).await
         {
             if resp.status().is_success()
                 && server_reports_alias(&client, port, expected_alias).await
@@ -607,12 +621,13 @@ pub async fn embed_server_start(
     .await?;
 
     let client = reqwest::Client::new();
-    let verify = client
-        .post(format!("http://127.0.0.1:{EMBED_PORT}/v1/embeddings"))
-        .json(&json!({ "model": startup_alias, "input": ["ready check"] }))
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await;
+    let verify = crate::egress::send(
+        client
+            .post(format!("http://127.0.0.1:{EMBED_PORT}/v1/embeddings"))
+            .json(&json!({ "model": startup_alias, "input": ["ready check"] }))
+            .timeout(Duration::from_secs(10)),
+    )
+    .await;
 
     let verified = matches!(verify, Ok(resp) if resp.status().is_success());
     if !verified {
@@ -761,6 +776,10 @@ mod tests {
                 "2048",
                 "-ub",
                 "2048",
+                // Embeddings offload like chat does. The CLI builds its args
+                // from this same function, so both get the GPU or neither does.
+                "-ngl",
+                "999",
                 "--embeddings",
                 "--pooling",
                 "mean",
@@ -801,7 +820,11 @@ mod tests {
     /// `quantization::sniff_gguf_file` to parse, mirroring
     /// `quantization::tests::build_minimal_gguf_full` without depending on
     /// that module's private test helpers.
-    fn write_minimal_gguf_with_context_length(path: &std::path::Path, architecture: &str, context_length: u32) {
+    fn write_minimal_gguf_with_context_length(
+        path: &std::path::Path,
+        architecture: &str,
+        context_length: u32,
+    ) {
         let mut buffer = Vec::new();
         buffer.extend_from_slice(b"GGUF");
         buffer.extend_from_slice(&3_u32.to_le_bytes()); // version

@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { ChevronRight, Loader2, Square, TerminalSquare, X } from "lucide-react";
+import { ChevronRight, CornerDownLeft, Loader2, Square, TerminalSquare, Trash2, X } from "lucide-react";
 
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
 import {
@@ -20,10 +20,14 @@ import {
 } from "../../store/subagentStore";
 import { useSessionStore } from "../../store/sessionStore";
 import { useT } from "../../lib/i18n";
-import { cancelSubagentRun } from "../../lib/subagent";
+import { cancelSubagentRun, steerSubagentRun } from "../../lib/subagent";
 import { formatCompactTokens, formatElapsed } from "../../lib/taskFormat";
 import { textContent, type ChatMessage } from "../../lib/llamaClient";
 import { ToolCallRow } from "../Chat/MessageList";
+import { dotClass, resolveGroupStatus } from "../Chat/SubagentGroupCard";
+import { selectWorkflowRunList, useWorkflowStore, type WorkflowPhase, type WorkflowStatus } from "../../store/workflowStore";
+import { selectSavedWorkflowList, useSavedWorkflowStore, type SavedWorkflow } from "../../store/savedWorkflowStore";
+import type { WorkflowSpec } from "../../lib/workflow";
 
 /**
  * Background tasks: work the APP is doing on its own behalf while the user
@@ -214,6 +218,68 @@ function buildTranscriptRows(messages: ChatMessage[]): TranscriptRow[] {
   return rows;
 }
 
+/** The transcript body shared by `AgentTaskCard` and `AgentGroupCard`'s
+ * expanded rows — one element per `buildTranscriptRows` entry. */
+function TranscriptRowsView({ rows }: { rows: TranscriptRow[] }) {
+  return (
+    <>
+      {rows.map((row) =>
+        row.kind === "tool" ? (
+          <ToolCallRow key={row.key} name={row.name} args={row.args} result={row.result} />
+        ) : (
+          <p
+            key={row.key}
+            className={`whitespace-pre-wrap rounded-md border border-border bg-background p-2 ${
+              row.kind === "prompt" ? "font-mono text-[11px] text-muted" : "text-xs text-foreground"
+            }`}
+          >
+            {row.text}
+          </p>
+        ),
+      )}
+    </>
+  );
+}
+
+/** One-line mid-run composer for a live subagent run — queues a user message
+ * the child model sees at the top of its next loop iteration (see
+ * `steerSubagentRun` in subagent.ts). Rendered only while the run is
+ * `'running'`; additionally disabled when `cancelId` is empty (a restored
+ * run from a previous app session, which cannot be steered). */
+function SteerInput({ run }: { run: SubagentRun }) {
+  const { t } = useT();
+  const [text, setText] = useState("");
+  const disabled = run.cancelId === "";
+  const send = () => {
+    const trimmed = text.trim();
+    if (!trimmed || disabled) return;
+    if (steerSubagentRun(run.cancelId, trimmed)) setText("");
+  };
+  return (
+    <div className="mt-2 flex items-center gap-1.5">
+      <input
+        type="text"
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") send();
+        }}
+        placeholder={t("BackgroundTasksPanel.steerPlaceholder")}
+        disabled={disabled}
+        className="min-w-0 flex-1 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground placeholder:text-faint focus:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
+      />
+      <IconButton
+        size="sm"
+        aria-label={t("BackgroundTasksPanel.steerSendAriaLabel", { name: run.description })}
+        onClick={send}
+        disabled={disabled || text.trim().length === 0}
+      >
+        <CornerDownLeft size={12} />
+      </IconButton>
+    </div>
+  );
+}
+
 /**
  * One `task`-tool subagent run — the model's own delegated work. Same card
  * shape as `ShellTaskCard` above so the two kinds read as one list: title,
@@ -266,24 +332,314 @@ function AgentTaskCard({ run }: { run: SubagentRun }) {
         )}
       </div>
       {running && run.lastActivity && <div className="mt-1 truncate font-mono text-[11px] text-faint">{run.lastActivity}</div>}
+      {running && <SteerInput run={run} />}
       {showTranscript && (
         <div className="mt-2 space-y-1.5 border-t border-border pt-2">
-          {transcriptRows.map((row) =>
-            row.kind === "tool" ? (
-              <ToolCallRow key={row.key} name={row.name} args={row.args} result={row.result} />
-            ) : (
-              <p
-                key={row.key}
-                className={`whitespace-pre-wrap rounded-md border border-border bg-background p-2 ${
-                  row.kind === "prompt" ? "font-mono text-[11px] text-muted" : "text-xs text-foreground"
-                }`}
-              >
-                {row.text}
-              </p>
-            ),
-          )}
+          <TranscriptRowsView rows={transcriptRows} />
         </div>
       )}
+    </div>
+  );
+}
+
+/** One agent-list entry after grouping: a lone run, or one parallel round's
+ * same-`groupId` runs (see `SubagentRun.groupId`). */
+export type AgentPanelEntry = { kind: "single"; run: SubagentRun } | { kind: "group"; groupId: string; runs: SubagentRun[] };
+
+/** Groups same-`groupId` runs (one parallel round's `task` calls) into one
+ * entry, preserving the input's order by each group's first appearance. A
+ * group with only one member left (e.g. after Clear dropped the others)
+ * renders as a plain card. Exported for the DOM-free logic tests — see
+ * `SubagentRow.test.ts`'s top comment for the convention. */
+export function groupAgentRuns(runs: SubagentRun[]): AgentPanelEntry[] {
+  const members = new Map<string, SubagentRun[]>();
+  const entries: AgentPanelEntry[] = [];
+  for (const run of runs) {
+    if (!run.groupId) {
+      entries.push({ kind: "single", run });
+      continue;
+    }
+    const existing = members.get(run.groupId);
+    if (existing) {
+      existing.push(run);
+      continue;
+    }
+    const group: SubagentRun[] = [run];
+    members.set(run.groupId, group);
+    entries.push({ kind: "group", groupId: run.groupId, runs: group });
+  }
+  return entries.map((entry) => (entry.kind === "group" && entry.runs.length === 1 ? { kind: "single", run: entry.runs[0] } : entry));
+}
+
+/** True when any member is still in flight — the whole group card stays in
+ * the Running section until its last member settles. */
+export function agentEntryRunning(entry: AgentPanelEntry): boolean {
+  return entry.kind === "group" ? entry.runs.some((run) => run.status === "running") : entry.run.status === "running";
+}
+
+/** The compact per-agent table (agent / tokens / tool uses / time) shared by
+ * `AgentGroupCard` and `WorkflowRunCard`'s phase sections — rows expand to
+ * that run's full transcript. */
+function AgentTable({ runs }: { runs: SubagentRun[] }) {
+  const { t } = useT();
+  const [openTaskId, setOpenTaskId] = useState<string | null>(null);
+  return (
+    <table className="mt-2 w-full table-fixed border-collapse text-xs">
+        <thead>
+          <tr className="text-left text-[11px] uppercase tracking-wider text-faint">
+            <th scope="col" className="w-1/2 py-1 pr-2 font-medium">{t("BackgroundTasksPanel.tableAgentHeader")}</th>
+            <th scope="col" className="py-1 pr-2 text-right font-medium">{t("BackgroundTasksPanel.tableTokensHeader")}</th>
+            <th scope="col" className="py-1 pr-2 text-right font-medium">{t("BackgroundTasksPanel.tableToolsHeader")}</th>
+            <th scope="col" className="py-1 text-right font-medium">{t("BackgroundTasksPanel.tableTimeHeader")}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {runs.map((run) => {
+            const open = openTaskId === run.taskId;
+            return (
+              <Fragment key={run.taskId}>
+                <tr className="border-t border-border">
+                  <td className="py-1 pr-2">
+                    <button
+                      type="button"
+                      aria-expanded={open}
+                      onClick={() => setOpenTaskId(open ? null : run.taskId)}
+                      className="flex w-full min-w-0 cursor-pointer items-center gap-1.5 text-left text-foreground transition-colors duration-150 hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent motion-reduce:transition-none"
+                    >
+                      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotClass(run.status)}`} aria-hidden />
+                      <span className="min-w-0 truncate">{run.description}</span>
+                    </button>
+                  </td>
+                  <td className="py-1 pr-2 text-right font-mono text-muted">{formatCompactTokens(run.usage?.totalTokens ?? 0)}</td>
+                  <td className="py-1 pr-2 text-right font-mono text-muted">{run.toolCallCount}</td>
+                  <td className="py-1 text-right font-mono text-muted">{formatElapsed((run.finishedAt ?? Date.now()) - run.startedAt)}</td>
+                </tr>
+                {open && (
+                  <tr>
+                    <td colSpan={4} className="pb-2">
+                      <div className="space-y-1.5 border-t border-border pt-2">
+                        <TranscriptRowsView rows={buildTranscriptRows(run.liveMessages)} />
+                      </div>
+                      {run.status === "running" && <SteerInput run={run} />}
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            );
+          })}
+        </tbody>
+    </table>
+  );
+}
+
+/** A live `workflowStore` entry or a restored `ChatSession.workflowRunMeta`
+ * snapshot, normalized to what `WorkflowRunCard` renders. */
+export interface WorkflowRunView {
+  runId: string;
+  name: string;
+  description: string;
+  status: WorkflowStatus;
+  startedAt: number;
+  finishedAt?: number;
+  phases: WorkflowPhase[];
+  /** Defined only for a live, running entry. */
+  activePhaseIndex?: number;
+  /** The full spec (prompts included) — live entries only (see
+   * `WorkflowRun.spec`); what the card's "Save workflow" button saves. */
+  spec?: WorkflowSpec;
+}
+
+/**
+ * One `workflow` tool call as a single card — name, description, run-level
+ * stats, then one section per phase: title, per-agent dots, and the shared
+ * `AgentTable` for the agents already dispatched (later phases' agents show
+ * as queued rows until their phase begins). The stop square cancels every
+ * still-running member; remaining phases never dispatch (the runner checks
+ * the parent signal between phases).
+ */
+function WorkflowRunCard({ view, agentsByTaskId }: { view: WorkflowRunView; agentsByTaskId: ReadonlyMap<string, SubagentRun> }) {
+  const { t } = useT();
+  const running = view.status === "running";
+  useLiveTick(running);
+  // Save is offered only when the full spec is at hand (live entries) and
+  // this name isn't saved yet — a fully-successful run auto-saves itself
+  // (see `runWorkflow`), so this button mostly serves failed/cancelled runs
+  // the user still wants to keep.
+  const alreadySaved = useSavedWorkflowStore((state) => Boolean(state.workflows[view.name]));
+  const savableSpec = view.spec;
+
+  const memberRuns = view.phases.flatMap((phase) => phase.agents.map((agent) => agentsByTaskId.get(agent.taskId)).filter(Boolean) as SubagentRun[]);
+  const totalTokens = memberRuns.reduce((sum, run) => sum + (run.usage?.totalTokens ?? 0), 0);
+  const agentCount = view.phases.reduce((sum, phase) => sum + phase.agents.length, 0);
+  const elapsed = formatElapsed((running ? Date.now() : (view.finishedAt ?? Date.now())) - view.startedAt);
+
+  const stopAll = () => {
+    for (const run of memberRuns) {
+      if (run.status === "running" && run.cancelId) cancelSubagentRun(run.cancelId);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-border bg-surface-2 p-3">
+      <div className="flex items-center gap-2">
+        <span className="min-w-0 flex-1 truncate text-sm font-medium leading-snug text-foreground">{view.name}</span>
+        {running ? (
+          <IconButton size="sm" aria-label={t("BackgroundTasksPanel.stopAllAriaLabel")} onClick={stopAll}>
+            <Square size={12} />
+          </IconButton>
+        ) : (
+          <StatusPill tone={subagentStatusTone(view.status)}>{subagentStatusLabel(t, view.status)}</StatusPill>
+        )}
+      </div>
+      {view.description.length > 0 && <p className="mt-0.5 truncate text-xs text-faint">{view.description}</p>}
+      <div className="mt-1 flex items-center gap-2 text-xs">
+        <span className="text-muted">{t("BackgroundTasksPanel.workflowKindLabel")}</span>
+        <span className="text-faint">{t("BackgroundTasksPanel.agentGroupTitle", { count: agentCount })}</span>
+        <span className="text-faint">{elapsed}</span>
+        <span className="text-faint">{t("BackgroundTasksPanel.tokenUsage", { count: formatCompactTokens(totalTokens) })}</span>
+        {running && <Loader2 size={11} className="shrink-0 animate-spin text-warning" />}
+        {savableSpec && !alreadySaved && (
+          <button
+            type="button"
+            onClick={() => useSavedWorkflowStore.getState().upsert(savableSpec)}
+            className="cursor-pointer text-accent hover:underline"
+          >
+            {t("BackgroundTasksPanel.saveWorkflowButton")}
+          </button>
+        )}
+      </div>
+      <div className="mt-2 space-y-2">
+        {view.phases.map((phase, phaseIndex) => {
+          const phaseRuns = phase.agents.map((agent) => agentsByTaskId.get(agent.taskId)).filter(Boolean) as SubagentRun[];
+          const queued = phase.agents.filter((agent) => !agentsByTaskId.has(agent.taskId));
+          const isActive = running && view.activePhaseIndex === phaseIndex;
+          return (
+            <div key={`${view.runId}-phase-${phaseIndex}`} className="rounded-md border border-border bg-background px-2 py-1.5">
+              <div className="flex items-center gap-2">
+                <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">{phase.title}</span>
+                {isActive && <Loader2 size={10} className="shrink-0 animate-spin text-warning" />}
+                <span className="flex shrink-0 items-center gap-1" aria-hidden>
+                  {phase.agents.map((agent) => {
+                    const run = agentsByTaskId.get(agent.taskId);
+                    return <span key={agent.taskId} className={`h-1.5 w-1.5 rounded-full ${run ? dotClass(run.status) : "bg-faint"}`} />;
+                  })}
+                </span>
+              </div>
+              {phaseRuns.length > 0 && <AgentTable runs={phaseRuns} />}
+              {queued.length > 0 && (
+                <div className="mt-1 space-y-0.5">
+                  {queued.map((agent) => (
+                    <div key={agent.taskId} className="flex items-center gap-1.5 text-xs text-faint">
+                      <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-faint" aria-hidden />
+                      <span className="min-w-0 truncate">{agent.description}</span>
+                      <span className="ml-auto shrink-0">{t("BackgroundTasksPanel.phaseQueued")}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One parallel round's `task` runs as a single card — the panel counterpart
+ * of the chat's `SubagentGroupCard`: header with agent count, per-agent
+ * status dots, group elapsed and summed tokens, then a compact per-agent
+ * table (agent / tokens / tool uses / time) whose rows expand to that run's
+ * full transcript. The stop square cancels every still-running member.
+ */
+function AgentGroupCard({ runs }: { runs: SubagentRun[] }) {
+  const { t } = useT();
+  const groupStatus = resolveGroupStatus(runs.map((run) => run.status));
+  const running = groupStatus === "running";
+  useLiveTick(running);
+
+  const startedAt = Math.min(...runs.map((run) => run.startedAt));
+  const endTimes = runs.map((run) => run.finishedAt);
+  const settledAt = !running && endTimes.every((time) => time !== undefined) ? Math.max(...(endTimes as number[])) : null;
+  const totalTokens = runs.reduce((sum, run) => sum + (run.usage?.totalTokens ?? 0), 0);
+
+  const stopAll = () => {
+    for (const run of runs) {
+      if (run.status === "running" && run.cancelId) cancelSubagentRun(run.cancelId);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-border bg-surface-2 p-3">
+      <div className="flex items-center gap-2">
+        <span className="min-w-0 flex-1 truncate text-sm font-medium leading-snug text-foreground">
+          {t("BackgroundTasksPanel.agentGroupTitle", { count: runs.length })}
+        </span>
+        <span className="flex shrink-0 items-center gap-1" aria-hidden>
+          {runs.map((run) => (
+            <span key={run.taskId} className={`h-1.5 w-1.5 rounded-full ${dotClass(run.status)}`} />
+          ))}
+        </span>
+        {running ? (
+          <IconButton size="sm" aria-label={t("BackgroundTasksPanel.stopAllAriaLabel")} onClick={stopAll}>
+            <Square size={12} />
+          </IconButton>
+        ) : (
+          <StatusPill tone={subagentStatusTone(groupStatus)}>{subagentStatusLabel(t, groupStatus)}</StatusPill>
+        )}
+      </div>
+      <div className="mt-1 flex items-center gap-2 text-xs">
+        <span className="text-muted">{t("BackgroundTasksPanel.workflowKindLabel")}</span>
+        <span className="text-faint">{formatElapsed((settledAt ?? Date.now()) - startedAt)}</span>
+        <span className="text-faint">{t("BackgroundTasksPanel.tokenUsage", { count: formatCompactTokens(totalTokens) })}</span>
+        {running && <Loader2 size={11} className="shrink-0 animate-spin text-warning" />}
+      </div>
+      <AgentTable runs={runs} />
+    </div>
+  );
+}
+
+/** The drawer's "Saved workflows" section — the manage surface for
+ * `savedWorkflowStore`: name, description, shape, last run, delete. Runs are
+ * model-invoked only in this slice (the `workflow` tool's `saved` argument);
+ * there is no Run button because a workflow needs a live parent turn's
+ * `SubagentContext` to execute under. Hidden entirely while nothing is
+ * saved. */
+function SavedWorkflowsSection() {
+  const { t } = useT();
+  const saved = useSavedWorkflowStore(useShallow(selectSavedWorkflowList));
+  if (saved.length === 0) return null;
+  return (
+    <div>
+      <div className="text-[11px] font-medium uppercase tracking-wider text-faint">{t("BackgroundTasksPanel.savedWorkflowsHeading")}</div>
+      <div className="mt-1 space-y-1.5">
+        {saved.map((entry: SavedWorkflow) => {
+          const agents = entry.spec.phases.reduce((sum, phase) => sum + phase.agents.length, 0);
+          return (
+            <div key={entry.spec.name} className="rounded-xl border border-border bg-surface-2 p-3">
+              <div className="flex items-start gap-2">
+                <span className="min-w-0 flex-1 truncate text-sm font-medium leading-snug text-foreground">{entry.spec.name}</span>
+                <IconButton
+                  size="sm"
+                  aria-label={t("BackgroundTasksPanel.savedWorkflowDeleteAriaLabel", { name: entry.spec.name })}
+                  onClick={() => useSavedWorkflowStore.getState().remove(entry.spec.name)}
+                >
+                  <Trash2 size={12} />
+                </IconButton>
+              </div>
+              {entry.spec.description.length > 0 && <p className="mt-0.5 truncate text-xs text-faint">{entry.spec.description}</p>}
+              <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-faint">
+                <span>{t("BackgroundTasksPanel.savedWorkflowShape", { phases: entry.spec.phases.length, agents })}</span>
+                <span>
+                  {entry.lastRunAt !== undefined
+                    ? t("BackgroundTasksPanel.savedWorkflowLastRun", { when: new Date(entry.lastRunAt).toLocaleString() })
+                    : t("BackgroundTasksPanel.savedWorkflowNeverRun")}
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -305,6 +661,7 @@ export function BackgroundTasksPanel({ sessionId, onClose }: BackgroundTasksPane
   const finishedShell = useBackgroundShellStore(useShallow(selectFinishedShellTasks));
   const shellError = useBackgroundShellStore((state) => state.error);
   const liveSubagentRuns = useSubagentStore(useShallow(selectSubagentRunList));
+  const liveWorkflowRuns = useWorkflowStore(useShallow(selectWorkflowRunList));
 
   // Rust owns the processes, so the panel asks for the current truth on mount
   // rather than assuming this window started everything it can see.
@@ -319,6 +676,7 @@ export function BackgroundTasksPanel({ sessionId, onClose }: BackgroundTasksPane
   // re-render the panel; both references only change on `setSubagentRun`.
   const persistedMeta = useSessionStore((state) => state.sessions.find((s) => s.id === sessionId)?.subagentRunMeta);
   const persistedTranscripts = useSessionStore((state) => state.sessions.find((s) => s.id === sessionId)?.subagentRuns);
+  const persistedWorkflowMeta = useSessionStore((state) => state.sessions.find((s) => s.id === sessionId)?.workflowRunMeta);
   const subagentRuns = useMemo(() => {
     const liveIds = new Set(liveSubagentRuns.map((run) => run.taskId));
     const restored: SubagentRun[] = Object.entries(persistedMeta ?? {})
@@ -329,6 +687,8 @@ export function BackgroundTasksPanel({ sessionId, onClose }: BackgroundTasksPane
         // Empty cancelId: a restored run is terminal, Stop stays disabled and
         // `cancelSubagentRun("")` would be a no-op regardless.
         cancelId: "",
+        groupId: meta.groupId,
+        workflowRunId: meta.workflowRunId,
         description: meta.description,
         profile: meta.profile,
         status: meta.status,
@@ -345,18 +705,71 @@ export function BackgroundTasksPanel({ sessionId, onClose }: BackgroundTasksPane
   const runningCount = useBackgroundShellStore(selectRunningShellTaskCount) + useSubagentStore(selectRunningSubagentCount);
   const [finishedOpen, setFinishedOpen] = useState(false);
 
-  const runningAgents = subagentRuns.filter((run) => run.status === "running");
-  const finishedAgents = subagentRuns.filter((run) => run.status !== "running");
+  // Workflow runs render as their own cards; their member agents are looked
+  // up by taskId and EXCLUDED from the plain agent list below, so one
+  // workflow never doubles as a pile of loose agent cards.
+  const agentsByTaskId = useMemo(() => new Map(subagentRuns.map((run) => [run.taskId, run])), [subagentRuns]);
+  const workflowViews = useMemo(() => {
+    const liveIds = new Set(liveWorkflowRuns.map((run) => run.runId));
+    const restored: WorkflowRunView[] = Object.entries(persistedWorkflowMeta ?? {})
+      .filter(([runId]) => !liveIds.has(runId))
+      .map(([runId, meta]) => ({
+        runId,
+        name: meta.name,
+        description: meta.description,
+        status: meta.status,
+        startedAt: meta.startedAt,
+        finishedAt: meta.finishedAt,
+        phases: meta.phases,
+      }));
+    const live: WorkflowRunView[] = liveWorkflowRuns.map((run) => ({
+      runId: run.runId,
+      name: run.name,
+      description: run.description,
+      status: run.status,
+      startedAt: run.startedAt,
+      finishedAt: run.finishedAt,
+      phases: run.phases,
+      activePhaseIndex: run.status === "running" ? run.activePhaseIndex : undefined,
+      spec: run.spec,
+    }));
+    return [...live, ...restored];
+  }, [liveWorkflowRuns, persistedWorkflowMeta]);
 
-  type Entry = { kind: "shell"; at: number; task: BackgroundShellTask } | { kind: "agent"; at: number; run: SubagentRun };
+  // One parallel round's runs collapse into a single group entry — the
+  // group stays in Running until its LAST member settles (see
+  // `agentEntryRunning`), so a half-finished round never splits across the
+  // two sections.
+  const agentEntries = groupAgentRuns(subagentRuns.filter((run) => !run.workflowRunId));
+  const runningAgentEntries = agentEntries.filter(agentEntryRunning);
+  const finishedAgentEntries = agentEntries.filter((entry) => !agentEntryRunning(entry));
+
+  type Entry =
+    | { kind: "shell"; at: number; task: BackgroundShellTask }
+    | { kind: "agent"; at: number; run: SubagentRun }
+    | { kind: "agentGroup"; at: number; groupId: string; runs: SubagentRun[] }
+    | { kind: "workflow"; at: number; view: WorkflowRunView };
   const byNewest = (a: Entry, b: Entry) => b.at - a.at;
+  const toAgentEntry = (entry: AgentPanelEntry, finished: boolean): Entry =>
+    entry.kind === "group"
+      ? {
+          kind: "agentGroup",
+          at: Math.max(...entry.runs.map((run) => (finished ? (run.finishedAt ?? run.startedAt) : run.startedAt))),
+          groupId: entry.groupId,
+          runs: entry.runs,
+        }
+      : { kind: "agent", at: finished ? (entry.run.finishedAt ?? entry.run.startedAt) : entry.run.startedAt, run: entry.run };
   const runningEntries: Entry[] = [
     ...runningShell.map((task): Entry => ({ kind: "shell", at: task.started_at_ms, task })),
-    ...runningAgents.map((run): Entry => ({ kind: "agent", at: run.startedAt, run })),
+    ...runningAgentEntries.map((entry) => toAgentEntry(entry, false)),
+    ...workflowViews.filter((view) => view.status === "running").map((view): Entry => ({ kind: "workflow", at: view.startedAt, view })),
   ].sort(byNewest);
   const finishedEntries: Entry[] = [
     ...finishedShell.map((task): Entry => ({ kind: "shell", at: task.finished_at_ms ?? task.started_at_ms, task })),
-    ...finishedAgents.map((run): Entry => ({ kind: "agent", at: run.finishedAt ?? run.startedAt, run })),
+    ...finishedAgentEntries.map((entry) => toAgentEntry(entry, true)),
+    ...workflowViews
+      .filter((view) => view.status !== "running")
+      .map((view): Entry => ({ kind: "workflow", at: view.finishedAt ?? view.startedAt, view })),
   ].sort(byNewest);
   const finishedCount = finishedEntries.length;
   const hasAnyTask = runningEntries.length > 0 || finishedCount > 0;
@@ -368,12 +781,18 @@ export function BackgroundTasksPanel({ sessionId, onClose }: BackgroundTasksPane
   const clearFinished = () => {
     void useBackgroundShellStore.getState().clearFinished();
     useSubagentStore.getState().clearFinished();
+    useWorkflowStore.getState().clearFinished();
     useSessionStore.getState().clearSubagentRunMeta(sessionId);
+    useSessionStore.getState().clearWorkflowRunMeta(sessionId);
   };
 
   const renderEntry = (entry: Entry) =>
     entry.kind === "shell" ? (
       <ShellTaskCard key={`shell-${entry.task.id}`} task={entry.task} />
+    ) : entry.kind === "workflow" ? (
+      <WorkflowRunCard key={`workflow-${entry.view.runId}`} view={entry.view} agentsByTaskId={agentsByTaskId} />
+    ) : entry.kind === "agentGroup" ? (
+      <AgentGroupCard key={`group-${entry.groupId}`} runs={entry.runs} />
     ) : (
       <AgentTaskCard key={`agent-${entry.run.taskId}`} run={entry.run} />
     );
@@ -396,6 +815,8 @@ export function BackgroundTasksPanel({ sessionId, onClose }: BackgroundTasksPane
         {shellError && (
           <p className="rounded-md border border-danger bg-danger-soft p-2 text-xs text-danger">{shellError}</p>
         )}
+
+        <SavedWorkflowsSection />
 
         {!hasAnyTask && (
           <div className="flex flex-1 flex-col items-center justify-center py-12 text-center">

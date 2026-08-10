@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { revertCheckpoint } from "../../lib/checkpointCompensation";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -223,7 +223,7 @@ export function CheckpointPreviewModal({ sessionId, checkpoint, onClose, onChang
       let filesOk = true;
       if (scope !== "conversation") {
         try {
-          await invoke("checkpoint_revert", { id: checkpoint.id });
+          await revertCheckpoint(checkpoint.id);
         } catch (err) {
           filesOk = false;
           setActionError(t("CheckpointPreview.restoreFailed", { error: errorMessage(err) }));
@@ -434,6 +434,39 @@ export function CheckpointPreviewModal({ sessionId, checkpoint, onClose, onChang
                             >
                               <AlertTriangle size={12} />
                             </span>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {/* The recorded effects, which outlive the transcript the
+                      warning above is derived from. Each carries the reason
+                      nothing undoes it, rather than one generic caveat. */}
+                  {simulation.externalEffects.length > 0 && (
+                    <ul className="mt-2 flex flex-col gap-1 border-t border-border pt-2">
+                      {simulation.externalEffects.map((effect) => (
+                        <li
+                          key={effect.kind}
+                          /* An effect with a real undo is not a warning. Colouring
+                             it the same as the ones nothing can reverse is what
+                             would make the warnings stop being read. */
+                          className={`text-[11px] leading-snug ${
+                            effect.compensation.kind === "undo" ? "text-muted" : "text-warning"
+                          }`}
+                        >
+                          <span className="font-medium">
+                            {t(`CheckpointPreview.effectKind.${effect.kind}`)}
+                          </span>
+                          {" — "}
+                          {effect.compensation.kind === "undo"
+                            ? t("CheckpointPreview.willUndo", { action: effect.compensation.action })
+                            : effect.compensation.reason}
+                          {/* Only the unfinished case is worth a line. "Committed"
+                              is the ordinary outcome, and "unobserved" is every
+                              checkpoint written before the commit phase — saying
+                              so on each of those would be noise, not information. */}
+                          {effect.status === "declared" && (
+                            <span className="text-muted"> {t("CheckpointPreview.effectUnconfirmed")}</span>
                           )}
                         </li>
                       ))}

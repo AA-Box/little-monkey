@@ -25,6 +25,18 @@ pub const PACKAGE_STATE_VERSION: u32 = 1;
 pub const PORTABLE_EXPORT_VERSION: u32 = 1;
 pub const CONNECTOR_CONTRACT_VERSION: u32 = 1;
 
+/// The agent tool + external route contract this build implements.
+///
+/// K19 will generate the published schema set that *documents* this contract;
+/// K20 only needs a number a package can declare and be refused against, so
+/// the number lives here until K19 owns it. Bump the major when an already
+/// published tool or route changes incompatibly.
+pub const AGENT_CONTRACT_VERSION: SemanticVersion = SemanticVersion::new(1, 0, 0);
+
+/// Bound on the dependency solver's re-selection rounds. Constraints only
+/// accumulate, so selection converges; this is a runaway guard, not a policy.
+const MAX_RESOLUTION_ROUNDS: usize = 512;
+
 const CACHE_DIR: &str = "cache";
 const STATE_DIR: &str = "state";
 const STATE_PREFIX: &str = "state-";
@@ -44,6 +56,13 @@ pub enum PackageError {
     NotInstalled(String),
     Conflict(String),
     LimitExceeded(String),
+    /// The package declares a contract range this build does not implement.
+    /// The message always names the range the package needs.
+    ContractMismatch(String),
+    /// The dependency closure cannot be satisfied, or two packages claim the
+    /// same command/connector surface. The message names the specific
+    /// conflict rather than reporting a generic install failure.
+    Unresolvable(String),
     Io(String),
     Json(String),
     Verifier(String),
@@ -66,6 +85,12 @@ impl fmt::Display for PackageError {
             Self::NotInstalled(message) => write!(formatter, "package not installed: {message}"),
             Self::Conflict(message) => write!(formatter, "package state conflict: {message}"),
             Self::LimitExceeded(message) => write!(formatter, "package limit exceeded: {message}"),
+            Self::ContractMismatch(message) => {
+                write!(formatter, "unsupported contract version: {message}")
+            }
+            Self::Unresolvable(message) => {
+                write!(formatter, "package dependencies unresolvable: {message}")
+            }
             Self::Io(message) => write!(formatter, "package I/O error: {message}"),
             Self::Json(message) => write!(formatter, "package JSON error: {message}"),
             Self::Verifier(message) => write!(formatter, "signature verifier error: {message}"),
@@ -394,6 +419,69 @@ pub struct VulnerabilityNotice {
     pub advisory_url: Option<String>,
 }
 
+/// A half-open version range: `minimum <= version < maximum_exclusive`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct VersionConstraint {
+    pub minimum: SemanticVersion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_exclusive: Option<SemanticVersion>,
+}
+
+impl VersionConstraint {
+    /// Any version. Used for dependencies a package states without a range,
+    /// including the implicit ones an assistant composition declares.
+    pub const ANY: Self = Self {
+        minimum: SemanticVersion::new(0, 0, 0),
+        maximum_exclusive: None,
+    };
+
+    pub const fn at_least(minimum: SemanticVersion) -> Self {
+        Self {
+            minimum,
+            maximum_exclusive: None,
+        }
+    }
+
+    pub fn matches(&self, version: SemanticVersion) -> bool {
+        version >= self.minimum
+            && self
+                .maximum_exclusive
+                .is_none_or(|maximum| version < maximum)
+    }
+
+    fn validate(&self) -> PackageResult<()> {
+        if self
+            .maximum_exclusive
+            .is_some_and(|maximum| maximum <= self.minimum)
+        {
+            return Err(PackageError::InvalidManifest(format!(
+                "version constraint {self} is empty"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for VersionConstraint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.maximum_exclusive {
+            Some(maximum) => write!(formatter, ">={}, <{maximum}", self.minimum),
+            None => write!(formatter, ">={}", self.minimum),
+        }
+    }
+}
+
+/// One declared inter-package dependency. Dependencies are resolved, never
+/// fetched: the depended-on package has to be in the catalog or already
+/// installed, because acquiring it is its own trust decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct PackageDependency {
+    pub package_id: String,
+    pub constraint: VersionConstraint,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Compatibility {
@@ -401,6 +489,13 @@ pub struct Compatibility {
     pub maximum_app_version_exclusive: Option<SemanticVersion>,
     pub platforms: BTreeSet<String>,
     pub architectures: BTreeSet<String>,
+    /// Range of [`AGENT_CONTRACT_VERSION`] this package was built against.
+    /// Field-defaulted and skipped when absent so manifests written before
+    /// the gate existed keep deserializing and keep producing byte-identical
+    /// signing payloads — the shipped first-party release signatures are over
+    /// those exact bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<VersionConstraint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -444,6 +539,12 @@ pub struct PackageManifest {
     pub mcp_requirements: Vec<McpRequirement>,
     pub ui_resources: Vec<UiResourceDeclaration>,
     pub model_requirements: Vec<ModelRequirement>,
+    /// Declared inter-package dependencies. Field-defaulted and skipped when
+    /// empty for the same signing-payload reason as
+    /// [`Compatibility::contract`]. An assistant's `skill_package_ids` are
+    /// unconstrained dependencies too and do not need repeating here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<PackageDependency>,
     pub permissions: BTreeSet<PackagePermission>,
     /// Publisher-declared, manifest-signed security notices. Absent from
     /// older/imported manifests that predate this field, hence the field
@@ -548,6 +649,27 @@ impl PackageManifest {
                     permission.kind
                 )));
             }
+        }
+        if self.dependencies.len() > 64 {
+            return Err(PackageError::LimitExceeded(
+                "manifest declares too many dependencies".to_string(),
+            ));
+        }
+        let mut declared = BTreeSet::new();
+        for dependency in &self.dependencies {
+            validate_package_id(&dependency.package_id)?;
+            if dependency.package_id == self.package_id {
+                return Err(PackageError::InvalidManifest(
+                    "a package cannot depend on itself".to_string(),
+                ));
+            }
+            if !declared.insert(&dependency.package_id) {
+                return Err(PackageError::InvalidManifest(format!(
+                    "duplicate dependency on {}",
+                    dependency.package_id
+                )));
+            }
+            dependency.constraint.validate()?;
         }
         if self.vulnerability_notices.len() > 64 {
             return Err(PackageError::LimitExceeded(
@@ -878,6 +1000,9 @@ fn validate_compatibility(compatibility: &Compatibility) -> PackageResult<()> {
         return Err(PackageError::InvalidManifest(
             "invalid package compatibility range".to_string(),
         ));
+    }
+    if let Some(contract) = &compatibility.contract {
+        contract.validate()?;
     }
     Ok(())
 }
@@ -1401,6 +1526,14 @@ pub struct InstallEnvironment {
     pub app_version: SemanticVersion,
     pub platform: String,
     pub architecture: String,
+    /// Contract version this build implements. Field-defaulted so an
+    /// environment persisted before the gate existed still deserializes.
+    #[serde(default = "default_contract_version")]
+    pub contract_version: SemanticVersion,
+}
+
+fn default_contract_version() -> SemanticVersion {
+    AGENT_CONTRACT_VERSION
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1489,6 +1622,7 @@ pub fn verify_package(
             manifest.package_id, manifest.version
         )));
     }
+    contract_gate(manifest, environment.contract_version)?;
     let revocation = revocation_knowledge(manifest, registry, now_unix_ms);
     if let RevocationKnowledge::Revoked { reason, .. } = &revocation {
         return Err(PackageError::Revoked(reason.clone()));
@@ -1602,6 +1736,584 @@ pub fn verify_package(
     })
 }
 
+/// Hard gate on the contract version. A package built against an ABI this
+/// build does not implement is refused, and the refusal names the range the
+/// package needs so the reader knows which build would accept it.
+fn contract_gate(manifest: &PackageManifest, implemented: SemanticVersion) -> PackageResult<()> {
+    let Some(contract) = &manifest.compatibility.contract else {
+        return Ok(());
+    };
+    if contract.matches(implemented) {
+        return Ok(());
+    }
+    Err(PackageError::ContractMismatch(format!(
+        "{} {} requires agent contract {contract}; this build implements {implemented}",
+        manifest.package_id, manifest.version
+    )))
+}
+
+/// Slash command a skill package activates as, or `None` when the package id
+/// cannot form one. This is the single derivation: the runtime skill table,
+/// the plugin health view, and collision detection all key by it, so two
+/// packages that collide here really are ambiguous at run time.
+pub fn skill_command(package_id: &str) -> Option<String> {
+    let tail = package_id.rsplit('.').next().unwrap_or(package_id);
+    let mut command = String::new();
+    let mut previous_dash = false;
+    for character in tail.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            command.push(character);
+            previous_dash = false;
+        } else if !previous_dash && !command.is_empty() {
+            command.push('-');
+            previous_dash = true;
+        }
+        if command.len() >= 32 {
+            break;
+        }
+    }
+    while command.ends_with('-') {
+        command.pop();
+    }
+    (!command.is_empty()).then_some(command)
+}
+
+/// A globally addressable name a package claims. Two enabled packages
+/// claiming the same one are ambiguous, so the resolver refuses the install
+/// that would create the ambiguity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceClaim {
+    /// The `/command` a skill activates as.
+    SlashCommand(String),
+    /// A connector slug. OAuth binding matches on it and every operation
+    /// address lives under it, so two connectors sharing a slug collide
+    /// whole rather than per operation.
+    Connector(String),
+}
+
+impl fmt::Display for SurfaceClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SlashCommand(command) => write!(formatter, "/{command}"),
+            Self::Connector(slug) => write!(formatter, "connector {slug}"),
+        }
+    }
+}
+
+pub fn claimed_surface(manifest: &PackageManifest) -> BTreeSet<SurfaceClaim> {
+    let mut claims = BTreeSet::new();
+    match manifest.kind {
+        PackageKind::Skill => {
+            if let Some(command) = skill_command(&manifest.package_id) {
+                claims.insert(SurfaceClaim::SlashCommand(command));
+            }
+        }
+        PackageKind::Connector => {
+            let slug = manifest
+                .package_id
+                .rsplit('.')
+                .next()
+                .unwrap_or(&manifest.package_id);
+            claims.insert(SurfaceClaim::Connector(slug.to_string()));
+        }
+        PackageKind::Assistant | PackageKind::Collection => {}
+    }
+    claims
+}
+
+/// Every dependency a manifest states, declared or implied. An assistant's
+/// `skill_package_ids` are real dependencies — the assistant does not work
+/// without them — so they resolve like any other, unconstrained.
+fn declared_dependencies(manifest: &PackageManifest) -> Vec<PackageDependency> {
+    let mut dependencies = manifest.dependencies.clone();
+    if let Some(assistant) = &manifest.assistant {
+        for package_id in &assistant.skill_package_ids {
+            if !dependencies
+                .iter()
+                .any(|dependency| &dependency.package_id == package_id)
+            {
+                dependencies.push(PackageDependency {
+                    package_id: package_id.clone(),
+                    constraint: VersionConstraint::ANY,
+                });
+            }
+        }
+    }
+    dependencies
+}
+
+/// One installed package as the resolver sees it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstalledPackageView {
+    pub manifest: PackageManifest,
+    /// Enabled *and* not revoked: a disabled dependency cannot satisfy a
+    /// requirement, because nothing loads it.
+    pub enabled: bool,
+    pub pinned_version: Option<SemanticVersion>,
+}
+
+pub struct ResolutionRequest<'a> {
+    /// Every manifest the catalog can offer, all versions.
+    pub catalog: &'a [PackageManifest],
+    /// Active manifest of every installed, non-tombstoned package.
+    pub installed: &'a [InstalledPackageView],
+    pub contract_version: SemanticVersion,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanAction {
+    AlreadyInstalled,
+    Install,
+    Update,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanStep {
+    pub package_id: String,
+    pub version: SemanticVersion,
+    pub action: PlanAction,
+    /// Package ids that require this one; empty for the package being
+    /// installed.
+    pub required_by: Vec<String>,
+}
+
+/// Why a dependency set is unsatisfiable. Each variant names the packages,
+/// the constraints and what was actually available, so the refusal is a
+/// specific conflict rather than a generic failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum DependencyProblem {
+    /// No available version satisfies the accumulated constraints.
+    Unsatisfiable {
+        package_id: String,
+        constraints: Vec<DependencyRequirement>,
+        available_versions: Vec<SemanticVersion>,
+    },
+    /// A satisfying version exists but the package is pinned elsewhere.
+    PinConflict {
+        package_id: String,
+        pinned: SemanticVersion,
+        constraints: Vec<DependencyRequirement>,
+    },
+    /// Installed at a satisfying version, but disabled or revoked.
+    Disabled {
+        package_id: String,
+        constraints: Vec<DependencyRequirement>,
+    },
+    /// Two packages claim the same command or connector surface.
+    SurfaceCollision {
+        claim: SurfaceClaim,
+        package_ids: Vec<String>,
+    },
+    /// The package was built against a contract this build does not
+    /// implement.
+    ContractMismatch {
+        package_id: String,
+        required: VersionConstraint,
+        implemented: SemanticVersion,
+    },
+    /// The resolver hit its round bound. Reported rather than silently
+    /// truncated so an unsatisfiable set never looks satisfiable.
+    TooComplex { package_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependencyRequirement {
+    pub required_by: String,
+    pub constraint: VersionConstraint,
+}
+
+impl fmt::Display for DependencyProblem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn render(requirements: &[DependencyRequirement]) -> String {
+            requirements
+                .iter()
+                .map(|requirement| {
+                    format!(
+                        "{} needs {}",
+                        requirement.required_by, requirement.constraint
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+        match self {
+            Self::Unsatisfiable {
+                package_id,
+                constraints,
+                available_versions,
+            } => write!(
+                formatter,
+                "no version of {package_id} satisfies {} (available: {})",
+                render(constraints),
+                if available_versions.is_empty() {
+                    "none".to_string()
+                } else {
+                    available_versions
+                        .iter()
+                        .map(SemanticVersion::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ),
+            Self::PinConflict {
+                package_id,
+                pinned,
+                constraints,
+            } => write!(
+                formatter,
+                "{package_id} is pinned to {pinned}, which does not satisfy {}",
+                render(constraints)
+            ),
+            Self::Disabled {
+                package_id,
+                constraints,
+            } => write!(
+                formatter,
+                "{package_id} is installed but disabled or revoked, and {}",
+                render(constraints)
+            ),
+            Self::SurfaceCollision { claim, package_ids } => write!(
+                formatter,
+                "{} is claimed by more than one package: {}",
+                claim,
+                package_ids.join(", ")
+            ),
+            Self::ContractMismatch {
+                package_id,
+                required,
+                implemented,
+            } => write!(
+                formatter,
+                "{package_id} requires agent contract {required}; this build implements {implemented}"
+            ),
+            Self::TooComplex { package_id } => write!(
+                formatter,
+                "resolving {package_id} exceeded the dependency solver's round bound"
+            ),
+        }
+    }
+}
+
+/// A resolved install: what has to happen, in order, and every reason it
+/// cannot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstallPlan {
+    pub package_id: String,
+    pub version: SemanticVersion,
+    /// Dependency-first order; the package being installed is last.
+    pub steps: Vec<PlanStep>,
+    pub problems: Vec<DependencyProblem>,
+    pub satisfiable: bool,
+}
+
+impl InstallPlan {
+    /// The problems rendered as one line, for an error message or a log.
+    pub fn problem_summary(&self) -> String {
+        self.problems
+            .iter()
+            .map(DependencyProblem::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+}
+
+/// Resolves the dependency closure of `root` against the catalog and the
+/// installed set.
+///
+/// Dependencies are never fetched — acquiring a package is its own trust
+/// decision — so an unsatisfied dependency is reported, with the versions
+/// that *were* available, rather than downloaded.
+pub fn resolve_install(root: &PackageManifest, request: &ResolutionRequest<'_>) -> InstallPlan {
+    let installed = request
+        .installed
+        .iter()
+        .map(|view| (view.manifest.package_id.as_str(), view))
+        .collect::<BTreeMap<_, _>>();
+    let mut catalog: BTreeMap<&str, Vec<&PackageManifest>> = BTreeMap::new();
+    for manifest in request.catalog {
+        catalog
+            .entry(manifest.package_id.as_str())
+            .or_default()
+            .push(manifest);
+    }
+    for versions in catalog.values_mut() {
+        versions.sort_by_key(|manifest| manifest.version);
+    }
+
+    let mut requirements: BTreeMap<String, Vec<DependencyRequirement>> = BTreeMap::new();
+    let mut chosen: BTreeMap<String, (PackageManifest, PlanAction)> = BTreeMap::new();
+    let mut problems: Vec<DependencyProblem> = Vec::new();
+    let mut queue: Vec<String> = Vec::new();
+
+    let push_dependencies = |manifest: &PackageManifest,
+                             requirements: &mut BTreeMap<String, Vec<DependencyRequirement>>,
+                             queue: &mut Vec<String>| {
+        for dependency in declared_dependencies(manifest) {
+            let entry = requirements
+                .entry(dependency.package_id.clone())
+                .or_default();
+            let requirement = DependencyRequirement {
+                required_by: manifest.package_id.clone(),
+                constraint: dependency.constraint,
+            };
+            if !entry.contains(&requirement) {
+                entry.push(requirement);
+                queue.push(dependency.package_id.clone());
+            }
+        }
+    };
+
+    chosen.insert(
+        root.package_id.clone(),
+        (
+            root.clone(),
+            if installed.contains_key(root.package_id.as_str()) {
+                PlanAction::Update
+            } else {
+                PlanAction::Install
+            },
+        ),
+    );
+    if let Err(problem) = contract_problem(root, request.contract_version) {
+        problems.push(problem);
+    }
+    push_dependencies(root, &mut requirements, &mut queue);
+
+    let mut rounds = 0_usize;
+    while let Some(package_id) = queue.pop() {
+        rounds += 1;
+        if rounds > MAX_RESOLUTION_ROUNDS {
+            problems.push(DependencyProblem::TooComplex {
+                package_id: root.package_id.clone(),
+            });
+            break;
+        }
+        let constraints = requirements.get(&package_id).cloned().unwrap_or_default();
+        let satisfied = |version: SemanticVersion| {
+            constraints
+                .iter()
+                .all(|entry| entry.constraint.matches(version))
+        };
+
+        // A dependency cycle back onto the package being installed: its
+        // version is fixed, so it is checked rather than re-selected.
+        if package_id == root.package_id {
+            if !satisfied(root.version) {
+                push_unique(
+                    &mut problems,
+                    DependencyProblem::Unsatisfiable {
+                        package_id: package_id.clone(),
+                        constraints,
+                        available_versions: vec![root.version],
+                    },
+                );
+            }
+            continue;
+        }
+
+        let view = installed.get(package_id.as_str()).copied();
+        let candidates = catalog
+            .get(package_id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        let selection = match view.filter(|view| satisfied(view.manifest.version)) {
+            Some(view) => Some((view.manifest.clone(), PlanAction::AlreadyInstalled)),
+            None => candidates
+                .iter()
+                .rev()
+                .find(|manifest| satisfied(manifest.version))
+                .filter(|manifest| {
+                    // A downgrade is not something the store can perform.
+                    view.is_none_or(|view| manifest.version > view.manifest.version)
+                })
+                .map(|manifest| {
+                    (
+                        (*manifest).clone(),
+                        if view.is_some() {
+                            PlanAction::Update
+                        } else {
+                            PlanAction::Install
+                        },
+                    )
+                }),
+        };
+        let Some((manifest, action)) = selection else {
+            let mut available_versions = candidates
+                .iter()
+                .map(|manifest| manifest.version)
+                .collect::<Vec<_>>();
+            if let Some(view) = view {
+                if !available_versions.contains(&view.manifest.version) {
+                    available_versions.push(view.manifest.version);
+                }
+            }
+            available_versions.sort_unstable();
+            push_unique(
+                &mut problems,
+                DependencyProblem::Unsatisfiable {
+                    package_id: package_id.clone(),
+                    constraints,
+                    available_versions,
+                },
+            );
+            continue;
+        };
+        if let Some(view) = view {
+            if !view.enabled {
+                push_unique(
+                    &mut problems,
+                    DependencyProblem::Disabled {
+                        package_id: package_id.clone(),
+                        constraints: constraints.clone(),
+                    },
+                );
+            }
+            if let Some(pinned) = view.pinned_version {
+                if pinned != manifest.version {
+                    push_unique(
+                        &mut problems,
+                        DependencyProblem::PinConflict {
+                            package_id: package_id.clone(),
+                            pinned,
+                            constraints: constraints.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        if let Err(problem) = contract_problem(&manifest, request.contract_version) {
+            push_unique(&mut problems, problem);
+        }
+        let unchanged = chosen
+            .get(&package_id)
+            .is_some_and(|(current, _)| current.version == manifest.version);
+        if unchanged {
+            continue;
+        }
+        push_dependencies(&manifest, &mut requirements, &mut queue);
+        chosen.insert(package_id.clone(), (manifest, action));
+    }
+
+    problems.extend(surface_collisions(&chosen, request.installed));
+    let steps = plan_order(root, &chosen, &requirements);
+    InstallPlan {
+        package_id: root.package_id.clone(),
+        version: root.version,
+        steps,
+        satisfiable: problems.is_empty(),
+        problems,
+    }
+}
+
+fn push_unique(problems: &mut Vec<DependencyProblem>, problem: DependencyProblem) {
+    if !problems.contains(&problem) {
+        problems.push(problem);
+    }
+}
+
+fn contract_problem(
+    manifest: &PackageManifest,
+    implemented: SemanticVersion,
+) -> Result<(), DependencyProblem> {
+    match &manifest.compatibility.contract {
+        Some(contract) if !contract.matches(implemented) => {
+            Err(DependencyProblem::ContractMismatch {
+                package_id: manifest.package_id.clone(),
+                required: contract.clone(),
+                implemented,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Collisions between what this plan would activate and what is already
+/// enabled. Keyed by package id, so a package updating itself never collides
+/// with its own installed copy.
+fn surface_collisions(
+    chosen: &BTreeMap<String, (PackageManifest, PlanAction)>,
+    installed: &[InstalledPackageView],
+) -> Vec<DependencyProblem> {
+    let mut owners: BTreeMap<SurfaceClaim, BTreeSet<String>> = BTreeMap::new();
+    for (manifest, _) in chosen.values() {
+        for claim in claimed_surface(manifest) {
+            owners
+                .entry(claim)
+                .or_default()
+                .insert(manifest.package_id.clone());
+        }
+    }
+    for view in installed {
+        if !view.enabled || chosen.contains_key(&view.manifest.package_id) {
+            continue;
+        }
+        for claim in claimed_surface(&view.manifest) {
+            owners
+                .entry(claim)
+                .or_default()
+                .insert(view.manifest.package_id.clone());
+        }
+    }
+    owners
+        .into_iter()
+        .filter(|(_, package_ids)| package_ids.len() > 1)
+        .map(|(claim, package_ids)| DependencyProblem::SurfaceCollision {
+            claim,
+            package_ids: package_ids.into_iter().collect(),
+        })
+        .collect()
+}
+
+/// Post-order walk from the root, so every dependency precedes its dependent
+/// and the root is last. Cycles terminate on the visited set.
+fn plan_order(
+    root: &PackageManifest,
+    chosen: &BTreeMap<String, (PackageManifest, PlanAction)>,
+    requirements: &BTreeMap<String, Vec<DependencyRequirement>>,
+) -> Vec<PlanStep> {
+    let mut steps = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![(root.package_id.clone(), false)];
+    while let Some((package_id, expanded)) = stack.pop() {
+        if expanded {
+            if let Some((manifest, action)) = chosen.get(&package_id) {
+                steps.push(PlanStep {
+                    package_id: package_id.clone(),
+                    version: manifest.version,
+                    action: *action,
+                    required_by: requirements
+                        .get(&package_id)
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .map(|entry| entry.required_by.clone())
+                                .collect::<BTreeSet<_>>()
+                                .into_iter()
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                });
+            }
+            continue;
+        }
+        if !visited.insert(package_id.clone()) {
+            continue;
+        }
+        stack.push((package_id.clone(), true));
+        if let Some((manifest, _)) = chosen.get(&package_id) {
+            for dependency in declared_dependencies(manifest) {
+                if !visited.contains(&dependency.package_id) {
+                    stack.push((dependency.package_id, false));
+                }
+            }
+        }
+    }
+    steps
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PermissionDiff {
     pub added: BTreeSet<PackagePermission>,
@@ -1644,12 +2356,17 @@ pub struct InstallPreview {
     pub mcp_actions_separate: Vec<McpRequirement>,
     pub file_count: usize,
     pub total_bytes: u64,
+    /// Resolved dependency closure and every reason it cannot be installed.
+    /// It is part of the previewed bytes, so approving a preview approves a
+    /// specific resolution and a later catalog change invalidates it.
+    pub plan: InstallPlan,
     pub warnings: Vec<String>,
 }
 
 pub fn install_preview(
     package: &VerifiedPackage,
     installed: Option<&InstalledPackageState>,
+    plan: InstallPlan,
 ) -> PackageResult<InstallPreview> {
     let manifest = package.manifest();
     let permission_diff = installed
@@ -1687,6 +2404,16 @@ pub fn install_preview(
                 .to_string(),
         );
     }
+    // Resolution problems are not folded into `warnings`: they are structured
+    // on `plan`, and every consumer renders them from there.
+    if plan.steps.iter().any(|step| {
+        step.action != PlanAction::AlreadyInstalled && step.package_id != manifest.package_id
+    }) {
+        warnings.push(
+            "Dependencies are resolved, never fetched: install each listed dependency first."
+                .to_string(),
+        );
+    }
     Ok(InstallPreview {
         package_id: manifest.package_id.clone(),
         version: manifest.version,
@@ -1704,6 +2431,7 @@ pub fn install_preview(
             .values()
             .map(|bytes| bytes.len() as u64)
             .sum(),
+        plan,
         warnings,
     })
 }
@@ -2673,6 +3401,7 @@ fn fixture_compatibility() -> Compatibility {
             .into_iter()
             .map(str::to_string)
             .collect(),
+        contract: None,
     }
 }
 
@@ -2728,6 +3457,7 @@ fn skill_fixture(slug: &str, display_name: &str, instructions: &str) -> FirstPar
             minimum_context_tokens: Some(4_096),
             local_compatible: true,
         }],
+        dependencies: Vec::new(),
         permissions: BTreeSet::new(),
         vulnerability_notices: Vec::new(),
         compatibility: fixture_compatibility(),
@@ -2748,6 +3478,19 @@ fn skill_fixture(slug: &str, display_name: &str, instructions: &str) -> FirstPar
 mod tests {
     use super::*;
 
+    /// A resolution with nothing to resolve, for the preview tests that are
+    /// about trust rendering rather than dependencies.
+    fn empty_plan(manifest: &PackageManifest) -> InstallPlan {
+        resolve_install(
+            manifest,
+            &ResolutionRequest {
+                catalog: &[],
+                installed: &[],
+                contract_version: AGENT_CONTRACT_VERSION,
+            },
+        )
+    }
+
     #[test]
     fn signed_first_party_catalog_has_a_real_verifiable_chain() {
         let (trust, snapshot, bundles) = signed_first_party_catalog().expect("catalog");
@@ -2765,6 +3508,7 @@ mod tests {
             app_version: SemanticVersion::new(0, 1, 0),
             platform: "macos".to_string(),
             architecture: "aarch64".to_string(),
+            contract_version: AGENT_CONTRACT_VERSION,
         };
         for bundle in bundles {
             let verified = verify_package(
@@ -2851,6 +3595,7 @@ mod tests {
             app_version: SemanticVersion::new(1, 0, 0),
             platform: "macos".to_string(),
             architecture: "aarch64".to_string(),
+            contract_version: AGENT_CONTRACT_VERSION,
         }
     }
 
@@ -3104,11 +3849,13 @@ mod tests {
             verified.trust().revocation,
             RevocationKnowledge::UnknownNeverDownloaded
         );
-        assert!(install_preview(&verified, None)
-            .expect("preview")
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("never been downloaded")));
+        assert!(
+            install_preview(&verified, None, empty_plan(verified.manifest()))
+                .expect("preview")
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("never been downloaded"))
+        );
 
         let mut invalid = bundle;
         invalid.manifest.mcp_requirements.push(McpRequirement {
@@ -3218,14 +3965,20 @@ mod tests {
     #[test]
     fn vulnerability_notices_are_validated_and_surfaced_on_the_manifest() {
         let mut bundle = first_party_package_fixtures().remove(0).bundle;
-        bundle.manifest.vulnerability_notices.push(VulnerabilityNotice {
-            notice_id: "notice-1".to_string(),
-            severity: VulnerabilitySeverity::High,
-            summary: "Sample dependency has a known issue".to_string(),
-            affected_versions: BTreeSet::from([SemanticVersion::new(1, 0, 0)]),
-            advisory_url: Some("https://example.com/advisories/1".to_string()),
-        });
-        bundle.manifest.validate(&PackageLimits::default()).expect("valid notice");
+        bundle
+            .manifest
+            .vulnerability_notices
+            .push(VulnerabilityNotice {
+                notice_id: "notice-1".to_string(),
+                severity: VulnerabilitySeverity::High,
+                summary: "Sample dependency has a known issue".to_string(),
+                affected_versions: BTreeSet::from([SemanticVersion::new(1, 0, 0)]),
+                advisory_url: Some("https://example.com/advisories/1".to_string()),
+            });
+        bundle
+            .manifest
+            .validate(&PackageLimits::default())
+            .expect("valid notice");
         let verified = verify_local(&bundle);
         assert_eq!(verified.manifest().vulnerability_notices.len(), 1);
 
@@ -3240,7 +3993,9 @@ mod tests {
         insecure_advisory.manifest.vulnerability_notices[0].advisory_url =
             Some("http://example.com/advisories/1".to_string());
         assert!(matches!(
-            insecure_advisory.manifest.validate(&PackageLimits::default()),
+            insecure_advisory
+                .manifest
+                .validate(&PackageLimits::default()),
             Err(PackageError::InvalidManifest(_))
         ));
     }
@@ -3249,7 +4004,10 @@ mod tests {
     fn additional_registry_sources_require_the_existing_verification_chain() {
         let directory = TestDirectory::new("registry-sources");
         let store = PackageStore::new(&directory.0).expect("store");
-        assert!(store.list_registry_sources().expect("empty list").is_empty());
+        assert!(store
+            .list_registry_sources()
+            .expect("empty list")
+            .is_empty());
 
         let source = AdditionalRegistrySource {
             source_id: "team-catalog".to_string(),
@@ -3318,8 +4076,9 @@ mod tests {
         assert!(after_failed[0].verified.is_none());
         assert!(after_failed[0].last_verification_error.is_some());
 
-        let verified = verify_registry_snapshot(&snapshot, &trust_store(), None, &DigestVerifier, 1_000)
-            .expect("verify team-catalog snapshot through the existing Ed25519 chain");
+        let verified =
+            verify_registry_snapshot(&snapshot, &trust_store(), None, &DigestVerifier, 1_000)
+                .expect("verify team-catalog snapshot through the existing Ed25519 chain");
         let updated = store
             .record_registry_verification(&source.source_id, Some(verified), None)
             .expect("record success");
@@ -3333,10 +4092,368 @@ mod tests {
         assert!(store
             .remove_registry_source(&source.source_id)
             .expect("remove"));
-        assert!(store.list_registry_sources().expect("empty again").is_empty());
+        assert!(store
+            .list_registry_sources()
+            .expect("empty again")
+            .is_empty());
         assert!(!store
             .remove_registry_source(&source.source_id)
             .expect("remove missing is a no-op"));
+    }
+
+    fn manifest_of(slug: &str) -> PackageManifest {
+        skill_fixture(slug, slug, "Fixture instructions.")
+            .bundle
+            .manifest
+    }
+
+    fn at(mut manifest: PackageManifest, version: SemanticVersion) -> PackageManifest {
+        manifest.version = version;
+        manifest
+    }
+
+    fn needs(
+        mut manifest: PackageManifest,
+        package_id: &str,
+        constraint: VersionConstraint,
+    ) -> PackageManifest {
+        manifest.dependencies.push(PackageDependency {
+            package_id: package_id.to_string(),
+            constraint,
+        });
+        manifest
+    }
+
+    fn resolve(
+        root: &PackageManifest,
+        catalog: &[PackageManifest],
+        installed: &[InstalledPackageView],
+    ) -> InstallPlan {
+        resolve_install(
+            root,
+            &ResolutionRequest {
+                catalog,
+                installed,
+                contract_version: AGENT_CONTRACT_VERSION,
+            },
+        )
+    }
+
+    fn installed_view(manifest: PackageManifest, enabled: bool) -> InstalledPackageView {
+        InstalledPackageView {
+            manifest,
+            enabled,
+            pinned_version: None,
+        }
+    }
+
+    #[test]
+    fn a_satisfiable_plan_orders_dependencies_before_the_package_that_needs_them() {
+        let leaf = manifest_of("leaf");
+        let middle = needs(
+            manifest_of("middle"),
+            &leaf.package_id,
+            VersionConstraint::at_least(SemanticVersion::new(1, 0, 0)),
+        );
+        let root = needs(
+            manifest_of("root"),
+            &middle.package_id,
+            VersionConstraint::ANY,
+        );
+        let plan = resolve(&root, &[leaf.clone(), middle.clone()], &[]);
+
+        assert!(plan.satisfiable, "{}", plan.problem_summary());
+        let order = plan
+            .steps
+            .iter()
+            .map(|step| step.package_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![
+                leaf.package_id.as_str(),
+                middle.package_id.as_str(),
+                root.package_id.as_str()
+            ]
+        );
+        assert!(plan
+            .steps
+            .iter()
+            .all(|step| step.action == PlanAction::Install));
+        assert_eq!(
+            plan.steps[0].required_by,
+            vec![middle.package_id.clone()],
+            "a step names who required it"
+        );
+    }
+
+    #[test]
+    fn an_unsatisfiable_set_names_the_conflict_rather_than_failing_generically() {
+        // Two requirers disagree: one needs <2.0.0, the other needs >=2.0.0.
+        let dependency = manifest_of("shared");
+        let old = needs(
+            manifest_of("old-consumer"),
+            &dependency.package_id,
+            VersionConstraint {
+                minimum: SemanticVersion::new(1, 0, 0),
+                maximum_exclusive: Some(SemanticVersion::new(2, 0, 0)),
+            },
+        );
+        let root = needs(
+            needs(manifest_of("root"), &old.package_id, VersionConstraint::ANY),
+            &dependency.package_id,
+            VersionConstraint::at_least(SemanticVersion::new(2, 0, 0)),
+        );
+        let catalog = vec![
+            at(dependency.clone(), SemanticVersion::new(1, 0, 0)),
+            at(dependency.clone(), SemanticVersion::new(2, 1, 0)),
+            old,
+        ];
+        let plan = resolve(&root, &catalog, &[]);
+
+        assert!(!plan.satisfiable);
+        let summary = plan.problem_summary();
+        assert!(summary.contains(&dependency.package_id), "{summary}");
+        assert!(summary.contains(">=2.0.0"), "{summary}");
+        assert!(summary.contains(">=1.0.0, <2.0.0"), "{summary}");
+        assert!(summary.contains("1.0.0, 2.1.0"), "{summary}");
+
+        // A missing dependency is reported with the versions that did exist.
+        let orphan = needs(
+            manifest_of("orphan"),
+            "com.littlemonkey.skill.absent",
+            VersionConstraint::ANY,
+        );
+        let plan = resolve(&orphan, &[], &[]);
+        assert!(!plan.satisfiable);
+        assert!(
+            plan.problem_summary().contains("available: none"),
+            "{}",
+            plan.problem_summary()
+        );
+    }
+
+    #[test]
+    fn a_pinned_or_disabled_dependency_blocks_the_install_by_name() {
+        let dependency = manifest_of("dependency");
+        let root = needs(
+            manifest_of("root"),
+            &dependency.package_id,
+            VersionConstraint::at_least(SemanticVersion::new(2, 0, 0)),
+        );
+        let catalog = vec![at(dependency.clone(), SemanticVersion::new(2, 0, 0))];
+
+        let pinned = InstalledPackageView {
+            manifest: at(dependency.clone(), SemanticVersion::new(1, 0, 0)),
+            enabled: true,
+            pinned_version: Some(SemanticVersion::new(1, 0, 0)),
+        };
+        let plan = resolve(&root, &catalog, std::slice::from_ref(&pinned));
+        assert!(!plan.satisfiable);
+        assert!(
+            plan.problem_summary().contains("pinned to 1.0.0"),
+            "{}",
+            plan.problem_summary()
+        );
+
+        let disabled = installed_view(at(dependency.clone(), SemanticVersion::new(2, 0, 0)), false);
+        let plan = resolve(&root, &catalog, std::slice::from_ref(&disabled));
+        assert!(!plan.satisfiable);
+        assert!(
+            plan.problem_summary().contains("disabled or revoked"),
+            "{}",
+            plan.problem_summary()
+        );
+
+        // Enabled and satisfying: nothing to install, nothing to report.
+        let enabled = installed_view(at(dependency, SemanticVersion::new(2, 0, 0)), true);
+        let plan = resolve(&root, &catalog, std::slice::from_ref(&enabled));
+        assert!(plan.satisfiable, "{}", plan.problem_summary());
+        assert_eq!(plan.steps[0].action, PlanAction::AlreadyInstalled);
+    }
+
+    #[test]
+    fn two_packages_claiming_one_command_or_connector_slug_collide() {
+        // Different package ids, same trailing segment: same slash command.
+        let mut twin = manifest_of("review");
+        twin.package_id = "com.otherpublisher.skill.review".to_string();
+        let installed = installed_view(manifest_of("review"), true);
+        let plan = resolve(&twin, &[], std::slice::from_ref(&installed));
+
+        assert!(!plan.satisfiable);
+        let summary = plan.problem_summary();
+        assert!(summary.contains("/review"), "{summary}");
+        assert!(
+            summary.contains("com.otherpublisher.skill.review"),
+            "{summary}"
+        );
+
+        // A disabled incumbent claims nothing, so the same install is clean.
+        let disabled = installed_view(manifest_of("review"), false);
+        assert!(resolve(&twin, &[], std::slice::from_ref(&disabled)).satisfiable);
+
+        // Updating a package never collides with its own installed copy.
+        let same = installed_view(manifest_of("review"), true);
+        let update = at(manifest_of("review"), SemanticVersion::new(2, 0, 0));
+        assert!(resolve(&update, &[], std::slice::from_ref(&same)).satisfiable);
+
+        // Connectors collide on their slug, which is what OAuth binds to.
+        let mut connector =
+            connector_fixture("github", ConnectorKind::Github, "https://api.github.com")
+                .bundle
+                .manifest;
+        let incumbent = installed_view(connector.clone(), true);
+        connector.package_id = "com.otherpublisher.connector.github".to_string();
+        let plan = resolve(&connector, &[], std::slice::from_ref(&incumbent));
+        assert!(!plan.satisfiable);
+        assert!(
+            plan.problem_summary().contains("connector github"),
+            "{}",
+            plan.problem_summary()
+        );
+    }
+
+    #[test]
+    fn a_package_built_against_another_contract_is_refused_with_the_version_it_needs() {
+        let mut future = manifest_of("future");
+        future.compatibility.contract = Some(VersionConstraint::at_least(SemanticVersion::new(
+            AGENT_CONTRACT_VERSION.major + 1,
+            0,
+            0,
+        )));
+
+        let plan = resolve(&future, &[], &[]);
+        assert!(!plan.satisfiable);
+        let summary = plan.problem_summary();
+        assert!(summary.contains(&format!(">={}.0.0", AGENT_CONTRACT_VERSION.major + 1)));
+        assert!(
+            summary.contains(&AGENT_CONTRACT_VERSION.to_string()),
+            "{summary}"
+        );
+
+        // The same gate refuses the package at verification, before any
+        // resolution runs, so an import cannot walk past it.
+        let mut bundle = skill_fixture("future", "future", "Fixture instructions.").bundle;
+        bundle.manifest.compatibility.contract = future.compatibility.contract.clone();
+        let error = verify_package(
+            &bundle,
+            &trust_store(),
+            None,
+            &environment(),
+            &InstallTrustPolicy::default(),
+            &PackageLimits::default(),
+            &DigestVerifier,
+            1_000,
+        )
+        .expect_err("a newer contract is refused");
+        assert!(
+            matches!(&error, PackageError::ContractMismatch(message) if message.contains("requires agent contract")),
+            "{error}"
+        );
+
+        // The range this build does implement is accepted.
+        bundle.manifest.compatibility.contract = Some(VersionConstraint {
+            minimum: SemanticVersion::new(1, 0, 0),
+            maximum_exclusive: Some(SemanticVersion::new(AGENT_CONTRACT_VERSION.major + 1, 0, 0)),
+        });
+        verify_local(&bundle);
+    }
+
+    #[test]
+    fn an_assistant_composition_resolves_as_dependencies_and_a_cycle_terminates() {
+        let skill = manifest_of("review");
+        let mut assistant = manifest_of("assistant");
+        assistant.kind = PackageKind::Assistant;
+        assistant.assistant = Some(AssistantComposition {
+            persona_content_path: assistant.content[0].path.clone(),
+            skill_package_ids: BTreeSet::from([skill.package_id.clone()]),
+            starter_workflow_paths: Vec::new(),
+            knowledge_template_path: None,
+        });
+
+        let plan = resolve(&assistant, &[], &[]);
+        assert!(!plan.satisfiable, "a missing composed skill blocks install");
+        assert!(plan.problem_summary().contains(&skill.package_id));
+
+        let plan = resolve(&assistant, std::slice::from_ref(&skill), &[]);
+        assert!(plan.satisfiable, "{}", plan.problem_summary());
+        assert_eq!(plan.steps.len(), 2);
+
+        // A dependency that points back at the root terminates and is checked
+        // rather than re-selected.
+        let back = needs(
+            manifest_of("back"),
+            &assistant.package_id,
+            VersionConstraint::ANY,
+        );
+        let cyclic = needs(assistant.clone(), &back.package_id, VersionConstraint::ANY);
+        let plan = resolve(&cyclic, &[skill, back], &[]);
+        assert!(plan.satisfiable, "{}", plan.problem_summary());
+
+        // …and an impossible back-constraint is reported, not looped on.
+        let back = needs(
+            manifest_of("back"),
+            &assistant.package_id,
+            VersionConstraint::at_least(SemanticVersion::new(9, 0, 0)),
+        );
+        let cyclic = needs(assistant, &back.package_id, VersionConstraint::ANY);
+        let plan = resolve(&cyclic, &[manifest_of("review"), back], &[]);
+        assert!(!plan.satisfiable);
+        assert!(
+            plan.problem_summary().contains(">=9.0.0"),
+            "{}",
+            plan.problem_summary()
+        );
+    }
+
+    #[test]
+    fn dependency_declarations_are_validated_and_stay_out_of_unchanged_signing_bytes() {
+        let base = manifest_of("review");
+        let before = base.signing_payload().expect("payload");
+        let mut with_empty = base.clone();
+        with_empty.dependencies = Vec::new();
+        with_empty.compatibility.contract = None;
+        assert_eq!(
+            before,
+            with_empty.signing_payload().expect("payload"),
+            "declaring nothing must not change the signed bytes"
+        );
+
+        let limits = PackageLimits::default();
+        let mut self_dependency = base.clone();
+        self_dependency.dependencies.push(PackageDependency {
+            package_id: base.package_id.clone(),
+            constraint: VersionConstraint::ANY,
+        });
+        assert!(matches!(
+            self_dependency.validate(&limits),
+            Err(PackageError::InvalidManifest(_))
+        ));
+
+        let mut duplicate = needs(
+            base.clone(),
+            "com.littlemonkey.skill.other",
+            VersionConstraint::ANY,
+        );
+        duplicate = needs(
+            duplicate,
+            "com.littlemonkey.skill.other",
+            VersionConstraint::ANY,
+        );
+        assert!(matches!(
+            duplicate.validate(&limits),
+            Err(PackageError::InvalidManifest(_))
+        ));
+
+        let mut empty_range = base;
+        empty_range.compatibility.contract = Some(VersionConstraint {
+            minimum: SemanticVersion::new(2, 0, 0),
+            maximum_exclusive: Some(SemanticVersion::new(1, 0, 0)),
+        });
+        assert!(matches!(
+            empty_range.validate(&limits),
+            Err(PackageError::InvalidManifest(_))
+        ));
     }
 }
 
@@ -3382,6 +4499,7 @@ fn connector_fixture(slug: &str, kind: ConnectorKind, origin: &str) -> FirstPart
         mcp_requirements: Vec::new(),
         ui_resources: Vec::new(),
         model_requirements: Vec::new(),
+        dependencies: Vec::new(),
         permissions: [permission].into_iter().collect(),
         vulnerability_notices: Vec::new(),
         compatibility: fixture_compatibility(),

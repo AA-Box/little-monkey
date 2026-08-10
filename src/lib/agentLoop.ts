@@ -26,7 +26,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { GENERATE_IMAGE_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, buildTools } from './tools';
+import { GENERATE_IMAGE_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools } from './tools';
 import { mcpToolDefs } from './mcpTools';
 import { isVisionCapableLocalModel, isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
@@ -34,7 +34,9 @@ import {
   abortedPromise,
   attemptStream,
   CANCELLED_TOOL_RESULT,
+  describeUsageTarget,
   executeToolCall,
+  isBlockedInPlanMode,
   isToolCallAllowed,
   PRESENT_PLAN_RESULT,
   stringifyToolError,
@@ -53,10 +55,15 @@ import {
 } from './mentions';
 import { currentSystemPrompt, ULTRACODE_SYSTEM_SECTION, type AttachedStackPromptInfo } from './systemPrompt';
 import { composeSkillCatalog, composeSkillSystemPrompt, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
+import { composeSavedWorkflowCatalog } from './workflow';
+import { selectSavedWorkflowList, useSavedWorkflowStore } from '../store/savedWorkflowStore';
+import { composeCustomAgentCatalog } from './customAgents';
+import { selectCustomAgentList, useCustomAgentStore } from '../store/customAgentStore';
+import { collectUserPromptSubmitContext } from './userHooks';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { isBtwNotice } from './slashCommands';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
-import { effortForTarget, getActiveChatTarget, useModelStore } from '../store/modelStore';
+import { effortForTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { useTurnStatusStore } from '../store/turnStatusStore';
@@ -67,8 +74,8 @@ import { usePermissionStore, type PermissionMode } from '../store/permissionStor
 import { useStackStore, type StackQueryResult } from '../store/stackStore';
 import { useMcpStore } from '../store/mcpStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
-import { admitProcess, exitProcess, exitStatusFor, markProcessRunning, reconcileProcess } from './processTable';
-import { honourPause, forgetPause } from './pauseRegistry';
+import { admitProcess, exitProcess, exitStatusFor, linkProcessRun, markProcessRunning, reconcileProcess } from './processTable';
+import { honourPause, forgetPause, isPauseRequested } from './pauseRegistry';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import {
   gatePrivacyWireMessages,
@@ -82,10 +89,29 @@ import {
 import type { VerifyConfig } from '../store/verifyStore';
 import { extractArtifacts } from './artifacts';
 import { useArtifactStore } from '../store/artifactStore';
+// K9 target resolution and dispatch policy, lifted into their own module so
+// `subagent.ts` can route without importing this one — see `targetRouting.ts`.
+// Re-exported below because ~70 modules already read them through here.
 import {
-  buildModelTargetInventory,
-  type ModelTargetSnapshot,
-} from './modelTargets';
+  applyTargetSwitch,
+  resolveTarget,
+  resolvedTargetSupportsVision,
+  routeFromActive,
+  routeTarget,
+  snapshotForResolvedTarget,
+  targetLabel,
+  type RoutedTarget,
+  type RoutingContext,
+} from './targetRouting';
+
+export {
+  resolveTarget,
+  routeFromActive,
+  routeTarget,
+  snapshotForResolvedTarget,
+  type RoutedTarget,
+  type RoutingContext,
+};
 import { beginDurableRun, type DurableRunRecorder } from './durableRun';
 import { daemonCancel } from './daemonClient';
 import { requestRunCancellation } from './runProtocol';
@@ -116,9 +142,6 @@ import { errorMessage } from "./errors";
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
 const MAX_ITERATIONS = 25;
 
-/** Mirrors `LlamaState::default()` in src-tauri/src/llama.rs. */
-const DEFAULT_LLAMA_PORT = 8090;
-
 /** Prefix identifying a synthetic model-switch notice (auto-failover or
  * vision auto-switch) inserted into the transcript — mirrors
  * `contextTrimmer.ts`'s `COMPACTION_MARKER_PREFIX` pattern so `MessageList`
@@ -126,6 +149,23 @@ const DEFAULT_LLAMA_PORT = 8090;
  * a real (currently nonexistent, but defensively still hidden) system
  * message. */
 export const SWITCH_NOTE_PREFIX = '[Model switch]';
+
+/** Marks the notice a resumed turn writes — see {@link ResumedTurn}. Lives here
+ * rather than in `frozenTurn.ts` so the edge between the two modules runs one
+ * way: `frozenTurn` needs `runAgentTurn`, and a constant read during module
+ * initialization on the way back would be the half of a cycle that bites. */
+export const RESUME_NOTE_PREFIX = '[Resume]';
+
+/** A re-entry into a turn frozen at a tool boundary (roadmap K13), passed to
+ * {@link runAgentTurn} by `frozenTurn.ts` and by nothing else. */
+export interface ResumedTurn {
+  /** The image being continued. Already cleared by the caller — held here for
+   * the transcript notice and for anything that later wants to name it. */
+  resumedFromCheckpointId: string;
+  /** `checkpoint_restorability`'s statement of what a resume does *not*
+   * reproduce, written into the transcript beside the continuation. */
+  determinismCaveats: string[];
+}
 
 export function isSwitchNotice(message: ChatMessage): boolean {
   return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(SWITCH_NOTE_PREFIX);
@@ -390,7 +430,14 @@ export function toolCallPlanArgs(toolCall: ToolCall): { title: string; plan: str
  * function's output feeds into, alongside `toolsForSettings`).
  */
 export function toolsForMode(tools: ToolDef[], mode: PermissionMode): ToolDef[] {
-  return mode === 'plan' ? [...tools, PRESENT_PLAN_TOOL] : tools;
+  if (mode !== 'plan') return tools;
+  // Fail closed at the OFFER level too, not just at Rust's mode gate: a tool
+  // Plan Mode would refuse anyway (see `isBlockedInPlanMode` — mutating and
+  // permission-gated names, `shell_kill`, and every un-marked `mcp__` tool)
+  // is not even shown to the model, so a well-behaved model never wastes a
+  // round trip on a doomed call. `executeToolCall`'s own check remains the
+  // dispatch backstop for a model that emits one regardless.
+  return [...tools.filter((tool) => !isBlockedInPlanMode(tool.function.name)), PRESENT_PLAN_TOOL];
 }
 
 /** Prefix identifying a synthetic notice inserted right after a successful
@@ -535,7 +582,7 @@ export function toolsForSettings(
   });
   return [
     ...filtered,
-    ...(subagentsEnabled ? [TASK_TOOL] : []),
+    ...(subagentsEnabled ? [TASK_TOOL, WORKFLOW_TOOL] : []),
     ...(skillToolEnabled ? [SKILL_INVOKE_TOOL] : []),
     ...(readSkillResourceToolEnabled ? [READ_SKILL_RESOURCE_TOOL] : []),
   ];
@@ -997,73 +1044,8 @@ export async function runVerificationPhase(
   return firstFailure;
 }
 
-/** Shape returned by the `llama_status` Tauri command. */
-interface LlamaStatusPayload {
-  status: 'stopped' | 'starting' | 'ready' | 'error';
-  port: number;
-  model_path: string | null;
-}
 
-/**
- * Resolves the base URL of the locally running llama-server by asking the
- * Rust backend for its current status, which is the source of truth for the
- * port it actually bound to. Falls back to the documented default port if
- * the status can't be read for any reason (e.g. server not started yet),
- * so a subsequent request simply fails with a clear connection error rather
- * than this function throwing before the user ever sees why.
- */
-async function resolveBaseUrl(): Promise<string> {
-  try {
-    const status = await invoke<LlamaStatusPayload>('llama_status');
-    const port =
-      typeof status?.port === 'number' && Number.isFinite(status.port) && status.port > 0
-        ? status.port
-        : DEFAULT_LLAMA_PORT;
-    return `http://127.0.0.1:${port}`;
-  } catch {
-    return `http://127.0.0.1:${DEFAULT_LLAMA_PORT}`;
-  }
-}
 
-/**
- * Resolves the active chat target into exactly what's needed to stream a
- * turn. Cloud providers go through the Rust-proxied `streamProviderChat`
- * (its API key lives in the OS keychain, never here); local llama.cpp and
- * the unauthenticated local Ollama daemon both use the direct-`fetch`
- * `streamChat` path.
- *
- * Exported so `sideTaskRunner.ts` can default a newly-started side task onto
- * whatever model the main chat is currently using, without re-implementing
- * this resolution logic (or the local-runtime `resolveBaseUrl` lookup a
- * from-scratch version would need) a second time — a side task's own loop is
- * deliberately independent of the parent turn (see that module's doc
- * comment), but "which model is active right now" is still a single, shared
- * piece of app state both should read the same way.
- */
-/** Exported (in addition to the module's own uses above) so
- * `issueToPrRunner.ts` can resolve the exact same active-target rules for
- * its own headless, panel-driven agent turn — see that module's doc comment
- * for why it reuses this rather than re-deriving target resolution. */
-export async function resolveTarget(): Promise<ResolvedTarget> {
-  const target = getActiveChatTarget();
-
-  if (target.kind === 'provider') {
-    if (!target.providerId || !target.model) {
-      throw new Error('No AI provider model selected');
-    }
-    return { kind: 'provider', providerId: target.providerId, model: target.model };
-  }
-
-  if (target.kind === 'ollama') {
-    if (!target.model) {
-      throw new Error('No Ollama model selected');
-    }
-    return { kind: 'ollama', baseUrl: target.baseUrl, model: target.model };
-  }
-
-  const baseUrl = await resolveBaseUrl();
-  return { kind: 'local', baseUrl, modelLabel: useModelStore.getState().active?.name ?? 'Local model' };
-}
 
 /** Deterministic `/compact` entry point. It reuses the same compaction and
  * one-shot summary path as automatic context trimming, but never appends a
@@ -1081,7 +1063,16 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
   const privacyWorkspaceId =
     primaryRoot(useWorkspaceStore.getState().roots)?.path ?? 'global';
   const privacyWireCache: PrivacyWireCache = new Map();
-  let target = await resolveTarget();
+  // Summarization is its own K9 task class: it is bulk, throwaway work that a
+  // user may well want on a cheaper or local model than the conversation
+  // itself. It offers no tools and never carries an image. Not applied to the
+  // global active target — compacting a chat must not change what the next
+  // real turn runs on.
+  let target = routeFromActive(await resolveTarget(), {
+    taskClass: 'summarize',
+    requiresVision: false,
+    requiresTools: false,
+  }).target;
   const result = await applyContextCompaction(history, {
     strategy: settings.contextTrimStrategy,
     contextLimit: useUsageStore.getState().contextLimit,
@@ -1154,73 +1145,10 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
   };
 }
 
-/** Resolves a streaming target back to the immutable inventory record that
- * contains its endpoint/model/capability evidence. The inventory is built
- * once at run start; later global model changes cannot rewrite the ledger
- * snapshot. */
-/** Exported so `issueToPrRunner.ts` can build the `target` field
- * `beginDurableRun` needs for its own headless run, the same reuse reasoning
- * as `resolveTarget` above. */
-export function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot | null {
-  const state = useModelStore.getState();
-  const inventory = buildModelTargetInventory({
-    installed: state.installed,
-    active: state.active,
-    llamaStatus: state.llamaStatus,
-    ollamaModels: state.ollamaModels,
-    ollamaReachable: state.ollamaReachable,
-    providers: state.providers,
-    providerModels: state.providerModels,
-    effortByTarget: state.effortByTarget,
-  });
-  if (target.kind === 'local') {
-    return inventory.targets.find((candidate) => candidate.kind === 'local') ?? null;
-  }
-  if (target.kind === 'ollama') {
-    return inventory.targets.find(
-      (candidate) => candidate.kind === 'ollama' && candidate.model === target.model,
-    ) ?? null;
-  }
-  return inventory.targets.find(
-    (candidate) =>
-      candidate.kind === 'provider' &&
-      candidate.providerId === target.providerId &&
-      candidate.model === target.model,
-  ) ?? null;
-}
 
-/** Human-readable label for a switch notice. */
-function targetLabel(target: ResolvedTarget): string {
-  if (target.kind === 'provider') return `${target.providerId} (${target.model})`;
-  if (target.kind === 'ollama') return `Ollama (${target.model})`;
-  return 'the local model';
-}
 
-/** Applies `target` as the app's active chat target — the same store setters a manual switch in the UI would call, which is exactly what makes the switch "sticky" across subsequent turns (session affinity) with no separate mechanism needed. */
-function applyTargetSwitch(target: ResolvedTarget): void {
-  if (target.kind === 'provider') {
-    useModelStore.getState().useProviderModel(target.providerId, target.model);
-  } else if (target.kind === 'ollama') {
-    useModelStore.getState().useOllamaModel(target.model);
-  }
-  // 'local' is never produced as a switch target — see buildFailoverChain/findVisionCandidate.
-}
 
-/** Whether `target` (an already-*resolved* target, unlike `activeTargetSatisfiesVision`
- * below which reads live store state) can see images — used to decide whether
- * older image-bearing turns still in `history` need stripping before this
- * particular target sees them. See `stripImagesForTextOnlyTarget`. */
-function resolvedTargetSupportsVision(target: ResolvedTarget): boolean {
-  if (target.kind === 'provider') return isVisionCapableProviderModel(target.providerId, target.model);
-  if (target.kind === 'ollama') {
-    const model = useModelStore.getState().ollamaModels.find((m) => m.name === target.model);
-    return model ? isVisionCapableOllamaModel(model) : false;
-  }
-  // Deliberately delegated (rather than a literal `false`) so the day
-  // `llama.rs` gains projector-backed vision chat, flipping
-  // `isVisionCapableLocalModel` updates every vision decision at once.
-  return isVisionCapableLocalModel();
-}
+
 
 /**
  * A conversation can carry an image from an earlier turn (sent to a
@@ -1343,6 +1271,19 @@ function findVisionCandidate(): ResolvedTarget | null {
 
   return null;
 }
+
+/** Prefix identifying a synthetic dispatch-policy notice (K9 — see
+ * `modelRouting.ts`). Reuses `SWITCH_NOTE_PREFIX` rather than minting a fourth
+ * prefix: a routed target IS a model switch as far as the transcript and
+ * `MessageList`'s rendering are concerned, and the sentence names the policy
+ * that caused it. */
+export const ROUTING_NOTE_PREFIX = SWITCH_NOTE_PREFIX;
+
+
+
+
+
+
 
 /** An explicit attachment (from the "+" attach menu), as opposed to a text-derived "@"-mention. */
 export interface AttachmentRef {
@@ -1541,6 +1482,14 @@ export async function runAgentTurn(
   // own Rust-side prompt/tools and isn't part of this feature yet, same
   // stance as `availableSkills` above.
   ultracode = false,
+  // Set only by `frozenTurn.ts`: this call is not a new question, it is the
+  // continuation of a turn that was frozen at a tool boundary and is being
+  // re-entered from its image. It suppresses the user message this function
+  // otherwise appends — the conversation is already whole, and a blank one would
+  // be a turn the user never took — and writes the determinism caveats into the
+  // transcript, because whoever reads the continuation is the person who needs
+  // to know what a resume does not reproduce.
+  resume: ResumedTurn | null = null,
 ): Promise<void> {
   // Hard invariant: at most one turn per session, ever. Two turns streaming
   // into one transcript interleave their `updateLastMessage` patches and
@@ -1618,7 +1567,11 @@ export async function runAgentTurn(
     // that a requested write happened. Keep explicit mutation turns on the
     // in-process desktop loop, where the bounded corrective retry and
     // mutation-success guard below are enforced.
-    if (route === 'daemon' && !mutationRequired) {
+    // A resumed turn stays on the in-process loop whatever the route says: the
+    // image it is continuing was written by this loop's own checkpoint, and the
+    // daemon path composes its history Rust-side from a task string it was never
+    // given here.
+    if (route === 'daemon' && !mutationRequired && resume === null) {
       await runDaemonAgentTurn(sessionId, userText, attachments, controller.signal, turnId, skillInvocations);
     } else {
       await runTurnGuarded(
@@ -1631,6 +1584,7 @@ export async function runAgentTurn(
         availableSkills,
         ultracode,
         mutationRequired,
+        resume,
       );
     }
   } catch (error) {
@@ -1736,7 +1690,21 @@ async function runDaemonAgentTurn(
     const candidate = findVisionCandidate();
     if (candidate) applyTargetSwitch(candidate);
   }
-  let resolvedTarget = await resolveTarget();
+  // Same K9 dispatch policy as the local turn path, and in the same position:
+  // after the vision auto-switch, before the Privacy Firewall gate below.
+  const routed = routeFromActive(await resolveTarget(), {
+    taskClass: 'chat',
+    requiresVision: images.length > 0,
+    requiresTools: true,
+  });
+  let resolvedTarget = routed.target;
+  if (routed.decision.changedFromActive) {
+    applyTargetSwitch(resolvedTarget);
+    store.addMessage(sessionId, {
+      role: 'system',
+      content: `${ROUTING_NOTE_PREFIX} ${routed.decision.reason}`,
+    });
+  }
   let targetSnapshot = snapshotForResolvedTarget(resolvedTarget);
   if (!targetSnapshot) {
     throw new Error('The selected model target could not be frozen for the resident runner.');
@@ -2026,6 +1994,7 @@ async function runTurnGuarded(
   availableSkills: SlashSkill[] = [],
   ultracode = false,
   mutationRequired = false,
+  resume: ResumedTurn | null = null,
 ): Promise<void> {
   // The index this turn's user message will land at — captured before
   // `addMessage` so it can anchor a later "Rewind conversation" back to the
@@ -2036,7 +2005,20 @@ async function runTurnGuarded(
   // in the turn body does async file/image reads) — if there's at least one
   // image, it's promoted in place, right after, to a `ChatContentPart[]` so
   // the chat UI actually shows what was attached, not just what was typed.
-  useSessionStore.getState().addMessage(sessionId, { role: 'user', content: userText });
+  if (resume === null) {
+    useSessionStore.getState().addMessage(sessionId, { role: 'user', content: userText });
+  } else {
+    // The caveats are the whole reason `checkpoint_restorability` returns them
+    // rather than a doc holding them: a resumed turn is a fresh generation from
+    // the frozen point, not a replay of the one that was interrupted, and the
+    // transcript is where the person reading the continuation will be.
+    useSessionStore.getState().addMessage(sessionId, {
+      role: 'system',
+      content: [`${RESUME_NOTE_PREFIX} Resumed from a frozen image.`, ...resume.determinismCaveats].join(
+        '\n',
+      ),
+    });
+  }
 
   // Open a per-turn file checkpoint (see src-tauri/src/checkpoints.rs) so
   // every write_file/edit_file this turn makes can be reverted in one click.
@@ -2209,7 +2191,21 @@ async function runAgentTurnBody(
   // once per turn and only advanced (never rebuilt) on a pre-first-token
   // failure, so a target that succeeds stays in use for every subsequent
   // tool round trip within this same turn.
-  let primaryTarget = await resolveTarget();
+  //
+  // K9 dispatch policy runs here: after the vision auto-switch (so a policy
+  // sees the target the user would actually have run) and before the Privacy
+  // Firewall gate below (so the firewall still owns the final say over a
+  // routed target, including its own switch-to-local).
+  const routed = await routeTarget({
+    taskClass: 'chat',
+    requiresVision: requireVision,
+    requiresTools: true,
+  });
+  let primaryTarget = routed.target;
+  if (routed.decision.changedFromActive) {
+    applyTargetSwitch(primaryTarget);
+    addMessage({ role: 'system', content: `${ROUTING_NOTE_PREFIX} ${routed.decision.reason}` });
+  }
 
   // Distinct from the block above: that one is about a NEW image attached
   // THIS turn; this one is an OLDER image already sitting in history from a
@@ -2294,20 +2290,34 @@ async function runAgentTurnBody(
 
   const initialProviderTarget =
     primaryTarget.kind === 'provider' ? primaryTarget : null;
-  let sequence: ResolvedTarget[] =
-    settings.autoFailoverEnabled && initialProviderTarget
-      ? [
-          initialProviderTarget,
-          ...buildFailoverChain(requireVision).filter(
-            (candidate) =>
-              !(
-                candidate.kind === 'provider'
-                && candidate.providerId === initialProviderTarget.providerId
-                && candidate.model === initialProviderTarget.model
-              ),
+  // A matched K9 policy supplies this turn's attempt order, replacing the
+  // fixed provider chain — "failover follows a fixed sequence" was the other
+  // half of what K9 owed. Ignored when the Privacy Firewall redirected this
+  // turn (it reassigns `primaryTarget` above, and its decision outranks any
+  // policy), and still gated on the same `autoFailoverEnabled` toggle, so
+  // turning failover off means one attempt whether a policy matched or not.
+  const policySequence =
+    primaryTarget === routed.target && routed.sequence.length > 0 ? routed.sequence : null;
+  let sequence: ResolvedTarget[];
+  if (!settings.autoFailoverEnabled) {
+    sequence = [primaryTarget];
+  } else if (policySequence) {
+    sequence = policySequence;
+  } else if (initialProviderTarget) {
+    sequence = [
+      initialProviderTarget,
+      ...buildFailoverChain(requireVision).filter(
+        (candidate) =>
+          !(
+            candidate.kind === 'provider'
+            && candidate.providerId === initialProviderTarget.providerId
+            && candidate.model === initialProviderTarget.model
           ),
-        ]
-      : [primaryTarget];
+      ),
+    ];
+  } else {
+    sequence = [primaryTarget];
+  }
   let sequenceIndex = 0;
   let target = sequence[0];
 
@@ -2353,6 +2363,31 @@ async function runAgentTurnBody(
     console.error('Failed to start durable run', error);
     return null;
   });
+  // Recorded here rather than at the `routeTarget` call above, because the run
+  // it belongs to did not exist yet up there. The *what* — the frozen
+  // `ModelTargetSnapshot` — was written by `startDurableRecorder` a line ago;
+  // this is the *why*, which K9's entry named as the half missing from the
+  // ledger. Recorded even when no policy matched: "nothing routed this" is the
+  // answer for a fresh profile, and an absent event cannot be told apart from
+  // one that was never written.
+  durable.recorder?.recordRoutingDecision(routed.decision);
+  // Now that the run row exists, point this turn's process row at it, so the
+  // per-process resource ledger can charge this run's measured usage (CPU, RSS,
+  // egress bytes) to the turn that caused it. It cannot be done at admission
+  // time: `runAgentTurn` mints the row before any run exists, and
+  // `agent_processes.run_id` is a foreign key into `runs` — see
+  // `linkProcessRun`.
+  //
+  // Exactly one link, for this first run only. `switchTurnToLocalForPrivacy`
+  // below starts a SECOND durable run and deliberately does not re-link: moving
+  // the row would leave this run's already-measured bytes claimed by nobody,
+  // which the ledger buckets as unattributed just like a double claim. The
+  // daemon route never reaches here at all, and must not — the `daemon_job` row
+  // is the single claimant of the daemon's run id.
+  if (durable.recorder) {
+    const turnProcessId = chatTurnProcesses.get(turnId);
+    if (turnProcessId) await linkProcessRun(turnProcessId, durable.recorder.runId);
+  }
 
   const switchTurnToLocalForPrivacy = async (
     blockedTarget: ResolvedTarget,
@@ -2672,8 +2707,47 @@ async function runAgentTurnBody(
   // a "keep trying until it passes" loop.
   let verifyRound = 0;
 
+  /**
+   * The turn's safe point: freeze first if a suspend is latched, then park.
+   *
+   * This *is* the tool boundary K13's acceptance names. The previous round's
+   * tool calls and their permission prompts have all resolved by here, which is
+   * what makes the image coherent — and why it records no pending approvals
+   * rather than recording an empty list as a shortcut.
+   *
+   * The image is written before the wait, not after it. A process parked in
+   * memory is exactly the state a quit or a crash destroys, so an image written
+   * on the way out would be written at the one moment it is too late.
+   * Best-effort by construction: a freeze that fails leaves a turn that pauses
+   * and resumes in memory, which is what happened before it existed.
+   */
+  async function parkHere(): Promise<void> {
+    if (!signal) return;
+    const processId = chatTurnProcesses.get(turnId) ?? null;
+    if (isPauseRequested(turnId) && checkpointId !== null && processId !== null) {
+      await invoke('checkpoint_freeze_live', {
+        id: checkpointId,
+        resume: {
+          processId,
+          frozenAtMs: Date.now(),
+          model: describeUsageTarget(primaryTarget),
+          runtimeId: primaryTarget.kind,
+          workspace: primaryRoot(useWorkspaceStore.getState().roots)?.path ?? null,
+          pendingApprovals: [],
+        },
+      }).catch(() => undefined);
+    }
+    await honourPause(turnId, processId, signal);
+  }
+
+  // UserPromptSubmit hooks fire once per turn, before the first round trip;
+  // their stdout joins the system prompt's sections below for EVERY iteration
+  // of this turn (a hook that fails or times out contributes nothing — see
+  // `userHooks.ts`'s failure posture).
+  const userPromptHookContext = await collectUserPromptSubmitContext(sessionId);
+
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
-    if (signal) await honourPause(turnId, chatTurnProcesses.get(turnId) ?? null, signal);
+    if (signal) await parkHere();
     // Stop button fired while a tool call was executing (between model
     // round trips, where there's no stream to abort) — don't start another.
     if (signal?.aborted) return;
@@ -2728,6 +2802,19 @@ async function runAgentTurnBody(
         ),
         ...(ultracode ? [ULTRACODE_SYSTEM_SECTION] : []),
         ...(settings.skillAutoInvokeEnabled ? [composeSkillCatalog(availableSkills, invokedSkillCommands)] : []),
+        // Saved workflows are only actionable when WORKFLOW_TOOL is offered,
+        // so the catalog rides the same `subagentsEnabled` gate.
+        ...(settings.subagentsEnabled
+          ? [composeSavedWorkflowCatalog(selectSavedWorkflowList(useSavedWorkflowStore.getState()))]
+          : []),
+        // Custom agents are `profile` values of TASK_TOOL/WORKFLOW_TOOL, so
+        // the catalog rides the same gate that offers those tools — which
+        // includes an Ultracode turn's force-offer (see `toolsForSettings`'s
+        // call above).
+        ...(settings.subagentsEnabled || ultracode
+          ? [composeCustomAgentCatalog(selectCustomAgentList(useCustomAgentStore.getState()))]
+          : []),
+        ...(userPromptHookContext ? [userPromptHookContext] : []),
       ]
         .filter(Boolean)
         .join('\n\n'),
@@ -2999,6 +3086,13 @@ async function runAgentTurnBody(
     // (bounded by `settings.maxConcurrentSubagents`), everything else stays
     // sequential — see `runToolCallsForRound`'s own doc comment for why, and
     // for the order-preservation guarantee the rest of this loop depends on.
+    // One shared group id for this round's parallel `task` calls (two or
+    // more — a lone one stays ungrouped), so the Background-tasks drawer can
+    // render them as one card. A fresh UUID rather than any tool-call id:
+    // provider-fallback ids (`call_0`) repeat across rounds and would merge
+    // unrelated groups. See `SubagentContext.taskGroupId`.
+    const roundTaskCallCount = toolCalls.filter((call) => call.function.name === 'task').length;
+    const taskGroupId = roundTaskCallCount > 1 ? crypto.randomUUID() : undefined;
     const results = await runToolCallsForRound(toolCalls, settings.maxConcurrentSubagents, async (toolCall) => {
       const toolStartedAt = Date.now();
       const recorder = durable.recorder;
@@ -3056,9 +3150,14 @@ async function runAgentTurnBody(
       const subagentContext: SubagentContext = {
         sessionId,
         runId: durable.recorder?.runId,
+        taskGroupId,
         target,
         effort,
         risk: riskAnnotation,
+        // The child's own dispatch decision, onto this turn's run. A subagent
+        // has no durable run of its own — it already borrows this one's id for
+        // permission and cancellation audit.
+        onRoutingDecision: (decision) => durable.recorder?.recordRoutingDecision(decision),
         onMutatedPath: (path) => {
           mutatedFiles.add(path);
           mutationSucceeded = true;
@@ -3168,7 +3267,7 @@ async function runAgentTurnBody(
       }
     }
 
-    if (signal) await honourPause(turnId, chatTurnProcesses.get(turnId) ?? null, signal);
+    if (signal) await parkHere();
     if (signal?.aborted) return;
 
     // Loop again: the model gets the tool results appended to its history.

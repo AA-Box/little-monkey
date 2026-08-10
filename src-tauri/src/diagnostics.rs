@@ -29,7 +29,12 @@ pub const DIAGNOSTICS_SCHEMA_VERSION: u32 = 1;
 
 /// Keychain service identifier — same constant Little Monkey uses everywhere
 /// else it touches the OS keychain (see `mcp.rs::KEYCHAIN_SERVICE`).
-const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.app"));
 /// A single fixed, namespaced, never-user-facing account used only for the
 /// write/read/delete round trip below. Never holds anything but a fresh
 /// random probe value, and is deleted again before the probe returns.
@@ -427,23 +432,20 @@ fn audit_mcp(
     }
 }
 
-/// A knowledge stack whose registry entry claims to be indexed
-/// (`indexed_at.is_some()`) but whose on-disk `chunks.jsonl`/`vectors.bin`
-/// are missing is corrupt relative to its own manifest. A stack that has
-/// simply never been indexed (`indexed_at` is `None`) is not a health
-/// problem — it's just unused.
 /// Whether a stack marked indexed actually has an index behind it.
 ///
-/// `indexed_at` is set by *both* pipeline generations, so the presence of v1's
-/// `chunks.jsonl`/`vectors.bin` is not evidence either way on its own. A stack
-/// is healthy if either store has it; only a stack with neither is corrupt.
-fn stack_index_is_healthy(v1_files_present: bool, active_v2_generation: bool) -> bool {
-    v1_files_present || active_v2_generation
+/// `indexed_at` is set when a Knowledge 2.0 generation is published
+/// (`knowledge_core::mark_v2_indexed_impl`), so a stack claiming to be indexed
+/// with no active generation is corrupt relative to its own registry entry. A
+/// stack that has simply never been indexed (`indexed_at` is `None`) is not a
+/// health problem — it's just unused.
+fn stack_index_is_healthy(active_v2_generation: bool) -> bool {
+    active_v2_generation
 }
 
 fn audit_knowledge_index(app_data: &Path, findings: &mut Vec<DiagnosticFinding>) {
     let base = app_data.join("stacks");
-    let stacks = match crate::stacks::list_impl(&base) {
+    let stacks = match crate::knowledge_core::list_impl(&base) {
         Ok(stacks) => stacks,
         Err(error) => {
             findings.push(finding(
@@ -458,13 +460,6 @@ fn audit_knowledge_index(app_data: &Path, findings: &mut Vec<DiagnosticFinding>)
             return;
         }
     };
-    // A stack can be indexed by either generation of the pipeline, and
-    // `indexed_at` is set by both (`stacks::mark_v2_indexed_impl` sets it for a
-    // v2 index too). Checking only for v1's `chunks.jsonl`/`vectors.bin`
-    // therefore reported every v2-only stack as permanently corrupt — and the
-    // "safe fix" it offered, `stacks_reindex`, then failed with "No indexable
-    // files found" because a v2 stack has no v1 sources to walk. So ask both
-    // stores before calling anything corrupt.
     let v2_indexes = app_data.join("knowledge-v2").join("indexes");
     let v2_store = v2_indexes
         .is_dir()
@@ -483,9 +478,7 @@ fn audit_knowledge_index(app_data: &Path, findings: &mut Vec<DiagnosticFinding>)
         if stack.indexed_at.is_none() {
             continue;
         }
-        let dir = base.join(&stack.id);
-        let v1_ok = dir.join("chunks.jsonl").is_file() && dir.join("vectors.bin").is_file();
-        if stack_index_is_healthy(v1_ok, has_active_v2_generation(&stack.id)) {
+        if stack_index_is_healthy(has_active_v2_generation(&stack.id)) {
             healthy += 1;
         } else {
             corrupt.push(stack);
@@ -496,7 +489,7 @@ fn audit_knowledge_index(app_data: &Path, findings: &mut Vec<DiagnosticFinding>)
             "knowledge_index.healthy",
             "knowledge_index",
             "Knowledge stack indexes are intact",
-            &format!("Checked {healthy} indexed stack(s); their chunk and vector files are present."),
+            &format!("Checked {healthy} indexed stack(s); each has an active generation."),
             DiagnosticStatus::Pass,
             false,
             None,
@@ -509,7 +502,7 @@ fn audit_knowledge_index(app_data: &Path, findings: &mut Vec<DiagnosticFinding>)
             "knowledge_index",
             "Knowledge stack index is missing or corrupt",
             &format!(
-                "'{}' is marked as indexed in the stacks registry, but its chunk or vector file is missing on disk.",
+                "'{}' is marked as indexed in the stacks registry, but it has no active Knowledge 2.0 generation on disk.",
                 stack.name
             ),
             DiagnosticStatus::Critical,
@@ -640,9 +633,7 @@ async fn probe_health(port: u16) -> bool {
         Ok(client) => client,
         Err(_) => return false,
     };
-    client
-        .get(format!("http://127.0.0.1:{port}/health"))
-        .send()
+    crate::egress::send(client.get(format!("http://127.0.0.1:{port}/health")))
         .await
         .map(|response| response.status().is_success())
         .unwrap_or(false)
@@ -653,7 +644,7 @@ async fn probe_health(port: u16) -> bool {
 /// writable without touching any real credential. Deletes its own entry
 /// before returning, success or failure, so no probe residue survives a run.
 fn probe_keychain() -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_PROBE_ACCOUNT)
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, KEYCHAIN_PROBE_ACCOUNT)
         .map_err(|error| format!("Could not open a keychain entry: {error}"))?;
     let probe_value = format!("lm-diagnostics-{}", uuid::Uuid::new_v4());
     let write_result = entry
@@ -706,7 +697,10 @@ async fn gather_runtime_snapshot(
     runtime.ollama_reachable = ollama_status.reachable;
 
     {
-        let guard = state.llama.lock().map_err(|_| "Llama state lock poisoned".to_string())?;
+        let guard = state
+            .llama
+            .lock()
+            .map_err(|_| "Llama state lock poisoned".to_string())?;
         runtime.llama.status = guard.status.clone();
         runtime.llama.model_path = guard.model_path.clone();
     }
@@ -829,8 +823,17 @@ pub async fn diagnostics_apply_fix(
     }
 
     if let Some(server_id) = finding_id.strip_prefix("mcp.") {
-        crate::mcp::mcp_set_enabled(app.clone(), state.clone(), server_id.to_string(), false)
-            .await?;
+        crate::mcp::mcp_set_enabled(
+            app.clone(),
+            state.clone(),
+            server_id.to_string(),
+            false,
+            // No base: a diagnostic quarantine is not a user edit racing another
+            // window, and refusing to disable a misbehaving server because the
+            // config changed elsewhere would be the wrong failure.
+            None,
+        )
+        .await?;
         return Ok(fixed_finding(
             &finding_id,
             "mcp",
@@ -840,12 +843,12 @@ pub async fn diagnostics_apply_fix(
     }
 
     if let Some(stack_id) = finding_id.strip_prefix("knowledge_index.") {
-        crate::stacks::stacks_reindex(app.clone(), state.clone(), stack_id.to_string()).await?;
+        crate::knowledge_service::knowledge_v2_refresh(app.clone(), stack_id.to_string()).await?;
         return Ok(fixed_finding(
             &finding_id,
             "knowledge_index",
             "Reindexed the knowledge stack",
-            "Triggered a full reindex to rebuild the missing or corrupt index files.",
+            "Triggered a Knowledge 2.0 refresh to rebuild the missing generation.",
         ));
     }
 
@@ -1000,7 +1003,10 @@ mod tests {
         audit.runtime.llama.status = "ready".to_string();
         audit.runtime.llama.health_reachable = Some(true);
         let report = run_diagnostics(&audit).unwrap();
-        assert_eq!(find(&report, "llama.reachability").status, DiagnosticStatus::Pass);
+        assert_eq!(
+            find(&report, "llama.reachability").status,
+            DiagnosticStatus::Pass
+        );
     }
 
     #[test]
@@ -1101,10 +1107,19 @@ mod tests {
         )
         .unwrap();
         let mut audit = request(&temp.0);
-        audit.runtime.mcp_connected_ids.insert("healthy".to_string());
+        audit
+            .runtime
+            .mcp_connected_ids
+            .insert("healthy".to_string());
         let report = run_diagnostics(&audit).unwrap();
-        assert_eq!(find(&report, "mcp.connected").status, DiagnosticStatus::Pass);
-        assert!(!report.findings.iter().any(|f| f.id.starts_with("mcp.") && f.id != "mcp.connected"));
+        assert_eq!(
+            find(&report, "mcp.connected").status,
+            DiagnosticStatus::Pass
+        );
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.id.starts_with("mcp.") && f.id != "mcp.connected"));
     }
 
     #[test]
@@ -1134,7 +1149,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        // Deliberately no chunks.jsonl/vectors.bin written for this stack.
+        // Deliberately no `knowledge-v2/indexes` generation for this stack.
         let report = run_diagnostics(&request(&temp.0)).unwrap();
         let finding = find(&report, &format!("knowledge_index.{stack_id}"));
         assert_eq!(finding.status, DiagnosticStatus::Critical);
@@ -1143,23 +1158,20 @@ mod tests {
 
     #[test]
     fn a_stack_indexed_only_by_the_v2_pipeline_is_not_reported_corrupt() {
-        // The regression this replaces: `indexed_at` is set by
-        // `stacks::mark_v2_indexed_impl` too, so checking only for v1's files
-        // marked every v2-only stack Critical forever — and the "safe fix" it
-        // offered then failed with "No indexable files found", because a v2 stack
-        // has no v1 sources to walk. There was no way for a user to clear it.
+        // The regression this replaces: `indexed_at` is set when a v2
+        // generation is published, so an audit that looked for the old v1 index
+        // files marked every v2-only stack Critical forever — and the "safe fix"
+        // it offered then failed with "No indexable files found", because a v2
+        // stack has no v1 sources to walk. There was no way for a user to clear
+        // it. Now there is one store to ask, and it is the one that sets the
+        // flag.
         assert!(
-            stack_index_is_healthy(false, true),
-            "a stack with a live v2 generation and no v1 files must be healthy"
+            stack_index_is_healthy(true),
+            "a stack with a live v2 generation must be healthy"
         );
         assert!(
-            stack_index_is_healthy(true, false),
-            "a v1-only stack must stay healthy"
-        );
-        assert!(stack_index_is_healthy(true, true));
-        assert!(
-            !stack_index_is_healthy(false, false),
-            "a stack with neither index is genuinely corrupt and must still be reported"
+            !stack_index_is_healthy(false),
+            "a stack marked indexed with no generation is genuinely corrupt"
         );
     }
 
@@ -1190,7 +1202,10 @@ mod tests {
         )
         .unwrap();
         let report = run_diagnostics(&request(&temp.0)).unwrap();
-        assert_eq!(find(&report, "knowledge_index.healthy").status, DiagnosticStatus::Pass);
+        assert_eq!(
+            find(&report, "knowledge_index.healthy").status,
+            DiagnosticStatus::Pass
+        );
     }
 
     #[test]
@@ -1239,7 +1254,13 @@ mod tests {
     /// exercised instead by each owning module's own tests.
     #[test]
     fn every_fixable_finding_id_routes_to_a_known_existing_command_prefix() {
-        let known_prefixes = ["llama.", "embed_llama.", "api_server.", "mcp.", "knowledge_index."];
+        let known_prefixes = [
+            "llama.",
+            "embed_llama.",
+            "api_server.",
+            "mcp.",
+            "knowledge_index.",
+        ];
         for prefix in known_prefixes {
             assert!(
                 "llama.reachability".starts_with(prefix)
@@ -1266,8 +1287,11 @@ mod tests {
         // Calling it again must still succeed (overwrite-then-clean, not
         // "already exists" failure) and must not leave the entry behind.
         assert!(probe_keychain().is_ok());
-        let leftover = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_PROBE_ACCOUNT)
+        let leftover = keyring::Entry::new(&KEYCHAIN_SERVICE, KEYCHAIN_PROBE_ACCOUNT)
             .and_then(|entry| entry.get_password());
-        assert!(leftover.is_err(), "probe entry must be deleted after the round trip");
+        assert!(
+            leftover.is_err(),
+            "probe entry must be deleted after the round trip"
+        );
     }
 }

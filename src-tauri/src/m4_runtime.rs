@@ -37,7 +37,8 @@ use crate::mcp_app_core::{
 };
 use crate::package_ecosystem::{
     signed_first_party_catalog, InstallEnvironment, InstallTrustPolicy, PackageLimits,
-    RingEd25519SignatureVerifier, SemanticVersion, FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS,
+    RingEd25519SignatureVerifier, SemanticVersion, AGENT_CONTRACT_VERSION,
+    FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS,
 };
 use crate::process_table::{LedgerProcessProjector, LedgerSignalSource};
 use crate::run_scope::{RunScope, Unattributed};
@@ -49,7 +50,12 @@ use crate::workflow_core::{
 };
 
 const OAUTH_VAULT_ID: &str = "os-keychain";
-const OAUTH_KEYCHAIN_SERVICE: &str = "com.littlemonkey.m4-oauth";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static OAUTH_KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.m4-oauth"));
 const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
 const UI_APPROVAL_TTL_MS: u64 = 10 * 60 * 1_000;
 const WORKFLOW_APPROVAL_TTL_MS: u64 = 30 * 60 * 1_000;
@@ -243,7 +249,7 @@ pub struct KeychainOAuthVault;
 
 impl KeychainOAuthVault {
     fn entry(reference_id: &str) -> Result<keyring::Entry, String> {
-        keyring::Entry::new(OAUTH_KEYCHAIN_SERVICE, reference_id)
+        keyring::Entry::new(&OAUTH_KEYCHAIN_SERVICE, reference_id)
             .map_err(|e| format!("open OAuth keychain entry: {e}"))
     }
 
@@ -589,10 +595,7 @@ impl OAuthTransport for ReqwestOAuthTransport {
             ("code_verifier", request.pkce_verifier.expose().to_string()),
         ];
         run_async_worker("oauth-code-exchange", Self::CONNECTOR_SCOPE, async move {
-            let response = client
-                .post(request.token_endpoint)
-                .form(&form)
-                .send()
+            let response = crate::egress::send(client.post(request.token_endpoint).form(&form))
                 .await
                 .map_err(|e| format!("OAuth code exchange failed: {e}"))?;
             let status = response.status();
@@ -620,10 +623,7 @@ impl OAuthTransport for ReqwestOAuthTransport {
             ),
         ];
         run_async_worker("oauth-refresh", Self::CONNECTOR_SCOPE, async move {
-            let response = client
-                .post(request.token_endpoint)
-                .form(&form)
-                .send()
+            let response = crate::egress::send(client.post(request.token_endpoint).form(&form))
                 .await
                 .map_err(|e| format!("OAuth refresh failed: {e}"))?;
             let status = response.status();
@@ -646,10 +646,7 @@ impl OAuthTransport for ReqwestOAuthTransport {
             ("token", token.expose().to_string()),
         ];
         run_async_worker("oauth-revoke", Self::CONNECTOR_SCOPE, async move {
-            let response = client
-                .post(endpoint)
-                .form(&form)
-                .send()
+            let response = crate::egress::send(client.post(endpoint).form(&form))
                 .await
                 .map_err(|e| format!("OAuth revocation failed: {e}"))?;
             let status = response.status();
@@ -881,7 +878,9 @@ impl WorkflowHumanApprovalBroker for InMemoryWorkflowApprovalBroker {
         let now = system_now_unix_ms();
         let mut records = lock(&self.records, "workflow approval broker")?;
         Self::purge_expired(&mut records, now);
-        Ok(records.get(challenge_id).map(|record| record.challenge.clone()))
+        Ok(records
+            .get(challenge_id)
+            .map(|record| record.challenge.clone()))
     }
 
     fn decide(&self, challenge_id: &str, approved: bool) -> Result<(), String> {
@@ -1180,8 +1179,7 @@ impl ProductionWorkflowNodeExecutor {
             if let Some(token) = bearer {
                 request = request.bearer_auth(token);
             }
-            let response = request
-                .send()
+            let response = crate::egress::send(request)
                 .await
                 .map_err(|e| format!("model request failed: {e}"))?;
             let status = response.status();
@@ -1242,11 +1240,11 @@ impl ProductionWorkflowNodeExecutor {
         }
         let client = self.http.clone();
         run_async_worker("workflow-model-discovery", scope, async move {
-            let response = client
-                .get(format!("{}/api/tags", crate::ollama::OLLAMA_BASE_URL))
-                .send()
-                .await
-                .map_err(|error| format!("discover Ollama models: {error}"))?;
+            let response = crate::egress::send(
+                client.get(format!("{}/api/tags", crate::ollama::OLLAMA_BASE_URL)),
+            )
+            .await
+            .map_err(|error| format!("discover Ollama models: {error}"))?;
             let status = response.status();
             let bytes = bounded_response_bytes(response).await?;
             if !status.is_success() {
@@ -2284,7 +2282,12 @@ fn production_workflow_service_with_browser(
     // level boundary see a pause requested from any of them.
     .with_signal_source(Arc::new(LedgerSignalSource::new(
         app_data_dir.join("profile-v1.sqlite3"),
-    )));
+    )))
+    // Same "every production path reaches this service" reasoning: attaching
+    // the shared revision store here is what gives a workflow definition the
+    // same history (diff/restore/branch) a persona has, whether it was saved
+    // from the desktop, the CLI, or a daemon-hosted trigger.
+    .with_revision_store(crate::config_revisions::revision_root(app_data_dir));
     let service = Arc::new(service);
     Ok((service, browser))
 }
@@ -2306,6 +2309,7 @@ pub fn production_m4_services(app_data_dir: &Path) -> Result<ProductionM4Service
                 app_version,
                 platform: std::env::consts::OS.to_string(),
                 architecture: std::env::consts::ARCH.to_string(),
+                contract_version: AGENT_CONTRACT_VERSION,
             },
             InstallTrustPolicy {
                 // Local developer packages remain data-only, checksum-bound,
@@ -2561,7 +2565,7 @@ mod tests {
                 timeout_secs: Some(30),
             }],
         };
-        crate::mcp::save_config_impl(&directory.0.join("mcp_servers.json"), &config).unwrap();
+        crate::mcp::save_config_impl(&directory.0.join("mcp_servers.json"), &config, None).unwrap();
         let catalog = production_workflow_capabilities(&directory.0).unwrap();
         assert_eq!(
             catalog.mcp_tools.get("fixture:lookup"),

@@ -155,7 +155,9 @@ pub struct LlamaCppLiveContextState {
 }
 
 fn as_u32(value: Option<&Value>) -> Option<u32> {
-    value.and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok())
+    value
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
 }
 
 /// Parses a `llama-server` `GET /props` response body. Returns
@@ -186,8 +188,8 @@ pub fn parse_llama_slots_body(body: &[u8]) -> Option<Vec<LlamaCppSlotState>> {
             .iter()
             .map(|entry| {
                 let params = entry.get("params");
-                let context_tokens =
-                    as_u32(entry.get("n_ctx")).or_else(|| params.and_then(|params| as_u32(params.get("n_ctx"))));
+                let context_tokens = as_u32(entry.get("n_ctx"))
+                    .or_else(|| params.and_then(|params| as_u32(params.get("n_ctx"))));
                 let tokens_in_use = as_u32(entry.get("n_past"))
                     .or_else(|| as_u32(entry.get("tokens_evaluated")))
                     .or_else(|| as_u32(entry.get("n_ctx_used")));
@@ -212,9 +214,12 @@ const LLAMA_CPP_MAX_RESPONSE_BYTES: usize = 512 * 1024;
 /// Best-effort live query of a managed `llama-server`'s `/props` and
 /// `/slots` endpoints. Never returns an error: any transport failure, non-2xx
 /// status, or unrecognized body simply leaves the corresponding fields
-/// `None`/empty, since a disabled `/slots` endpoint (the common case — it
-/// requires `--slots` and is off by default) is an expected, not exceptional,
-/// outcome.
+/// `None`/empty, since a `/slots` endpoint that does not answer is an expected,
+/// not exceptional, outcome — a server started with `--no-slots`, or one this app
+/// does not manage. (The doc here used to say `--slots` was off by default; it is
+/// *on* by default in the `llama.cpp` build
+/// [`crate::managed_runtime::MANAGED_LLAMA_VERSION`] pins, which was checked
+/// against that binary's own `--help` rather than assumed.)
 pub async fn fetch_llama_cpp_live_context_state(
     endpoint: &EndpointOrigin,
     transport: &dyn HttpTransport,
@@ -330,7 +335,10 @@ pub struct ContextFailureInput {
 }
 
 fn contains_any(haystack: &str, needles: &'static [&'static str]) -> Option<&'static str> {
-    needles.iter().find(|needle| haystack.contains(**needle)).copied()
+    needles
+        .iter()
+        .find(|needle| haystack.contains(**needle))
+        .copied()
 }
 
 const CONTEXT_SHIFT_PHRASES: &[&str] = &[
@@ -386,8 +394,14 @@ const RUNTIME_LIMITATION_PHRASES: &[&str] = &[
 /// the available evidence gives no reason to believe context/cache/memory
 /// was the cause (so callers should leave an unrelated error message
 /// untouched rather than force a misleading label onto it).
-pub fn classify_context_failure(input: &ContextFailureInput) -> Option<ContextFailureClassification> {
-    let lower = input.error_text.as_deref().map(str::to_lowercase).unwrap_or_default();
+pub fn classify_context_failure(
+    input: &ContextFailureInput,
+) -> Option<ContextFailureClassification> {
+    let lower = input
+        .error_text
+        .as_deref()
+        .map(str::to_lowercase)
+        .unwrap_or_default();
 
     // 1. Cache exhausted / context shift: the conversation outgrew the
     //    window and the runtime rolled it, with or without a hard error.
@@ -419,7 +433,10 @@ pub fn classify_context_failure(input: &ContextFailureInput) -> Option<ContextFa
     if prompt_exceeds_numeric {
         return Some(ContextFailureClassification {
             class: ContextFailureClass::PromptTooLong,
-            explanation: prompt_too_long_explanation(input.prompt_tokens, input.configured_context_tokens),
+            explanation: prompt_too_long_explanation(
+                input.prompt_tokens,
+                input.configured_context_tokens,
+            ),
             evidence: vec![format!(
                 "prompt is {} tokens, at or beyond the configured {} token context window",
                 input.prompt_tokens.unwrap_or_default(),
@@ -430,7 +447,10 @@ pub fn classify_context_failure(input: &ContextFailureInput) -> Option<ContextFa
     if let Some(phrase) = contains_any(&lower, PROMPT_TOO_LONG_PHRASES) {
         return Some(ContextFailureClassification {
             class: ContextFailureClass::PromptTooLong,
-            explanation: prompt_too_long_explanation(input.prompt_tokens, input.configured_context_tokens),
+            explanation: prompt_too_long_explanation(
+                input.prompt_tokens,
+                input.configured_context_tokens,
+            ),
             evidence: vec![format!("error text matched \"{phrase}\"")],
         });
     }
@@ -453,7 +473,9 @@ pub fn classify_context_failure(input: &ContextFailureInput) -> Option<ContextFa
                 input.available_vram_bytes,
                 input.required_vram_bytes,
             ),
-            evidence: vec!["available memory is below what the configured context requires".to_string()],
+            evidence: vec![
+                "available memory is below what the configured context requires".to_string(),
+            ],
         });
     }
     if let Some(phrase) = contains_any(&lower, MEMORY_PRESSURE_PHRASES) {
@@ -471,9 +493,10 @@ pub fn classify_context_failure(input: &ContextFailureInput) -> Option<ContextFa
 
     // 4. Model metadata limit: the model's own advertised max context is
     //    smaller than what was requested.
-    if let (Some(requested), Some(model_max)) =
-        (input.requested_context_tokens, input.model_metadata_max_context_tokens)
-    {
+    if let (Some(requested), Some(model_max)) = (
+        input.requested_context_tokens,
+        input.model_metadata_max_context_tokens,
+    ) {
         if requested > model_max {
             return Some(ContextFailureClassification {
                 class: ContextFailureClass::ModelMetadataLimit,
@@ -516,7 +539,10 @@ fn context_shift_explanation(configured_context_tokens: Option<u32>) -> String {
     }
 }
 
-fn prompt_too_long_explanation(prompt_tokens: Option<u64>, configured_context_tokens: Option<u32>) -> String {
+fn prompt_too_long_explanation(
+    prompt_tokens: Option<u64>,
+    configured_context_tokens: Option<u32>,
+) -> String {
     match (prompt_tokens, configured_context_tokens) {
         (Some(prompt), Some(configured)) => format!(
             "The prompt itself is about {prompt} tokens, at or beyond the {configured}-token configured context window. Shorten the prompt or increase the context size for this model."
@@ -603,18 +629,24 @@ pub fn resolve_effective_context(input: &EffectiveContextInput) -> EffectiveCont
         if max < tokens {
             tokens = max;
             capped_by.push("runtime_setting_max".to_string());
-            rationale.push(format!("Reduced to {tokens} tokens, the runtime's configured maximum."));
+            rationale.push(format!(
+                "Reduced to {tokens} tokens, the runtime's configured maximum."
+            ));
         }
     }
     if let Some(min) = input.runtime_setting_min_tokens {
         if min > tokens {
             tokens = min;
             capped_by.push("runtime_setting_min".to_string());
-            rationale.push(format!("Raised to {tokens} tokens, the runtime's configured minimum."));
+            rationale.push(format!(
+                "Raised to {tokens} tokens, the runtime's configured minimum."
+            ));
         }
     }
     if capped_by.is_empty() {
-        rationale.push(format!("Using the requested {tokens} tokens; no known bound reduced it further."));
+        rationale.push(format!(
+            "Using the requested {tokens} tokens; no known bound reduced it further."
+        ));
     }
 
     EffectiveContextResolution {
@@ -653,8 +685,265 @@ pub struct ContextCacheView {
     pub context_headroom_tokens: Option<u32>,
     pub context_shift_detected: Option<bool>,
     pub total_slots: Option<u32>,
+    /// Whether two of this app's processes on one resident model can reuse each
+    /// other's prompt prefix (roadmap K11).
+    pub prefix_sharing: PrefixSharing,
+    /// Whether a per-process context budget can be enforced against this runtime
+    /// — a different question from whether one is set (roadmap K11).
+    pub context_budget: ContextBudgetEnforcement,
     pub notes: Vec<String>,
     pub sampled_at_ms: u64,
+}
+
+/// Whether a runtime lets two processes on one resident model reuse each
+/// other's cached prompt prefix, read-only.
+///
+/// A tagged union rather than a `bool` with prose beside it, for the reason
+/// `RenderedMeasurement` and `ChainVerification` are: a caller cannot render
+/// "supported" without also having the mechanism that makes it true, and cannot
+/// render "unsupported" without the reason. Both arms carry `&'static str`
+/// because both are settled facts about a pinned runtime, not per-sample
+/// observations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum PrefixSharing {
+    Supported { mechanism: &'static str },
+    Unsupported { reason: &'static str },
+}
+
+/// What a process class does when its context fills (roadmap K11).
+///
+/// Two outcomes, because there are only two honest ones once the context is
+/// full: keep going with less of the conversation, or stop. A third — carry on
+/// and let the runtime silently drop the oldest turns — is what
+/// `ContextFailureClass::CacheExhaustedContextShift` exists to *report*, and it
+/// is the outcome this policy exists to replace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "action")]
+pub enum ContextPolicy {
+    /// Summarize the oldest turns and continue. The conversation survives with
+    /// less detail.
+    Compact { rationale: &'static str },
+    /// Stop, and say so. The work does not continue in a degraded form.
+    Refuse { rationale: &'static str },
+}
+
+impl ContextPolicy {
+    #[must_use]
+    pub fn compacts(&self) -> bool {
+        matches!(self, ContextPolicy::Compact { .. })
+    }
+
+    /// The error code a refused request carries, so a client can act on the
+    /// policy instead of parsing the sentence that explains it.
+    ///
+    /// The only consumer of a context budget is an API client on this app's own
+    /// OpenAI-compatible server (the budget guards `dispatch_api`, not the
+    /// desktop chat loop), and that client owns the conversation this app is
+    /// refusing. It is the only party that *can* compact. So the policy has to
+    /// reach it as something machine-readable, and `error.code` is where an API
+    /// client already looks — see [`crate::m3_http_server`]'s error envelope.
+    ///
+    /// Encodes the *policy*, not merely "budget exceeded": which class chose it
+    /// is a fact only this app has, and leaving the client to guess would put
+    /// the argument in two places and let them disagree.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            ContextPolicy::Compact { .. } => "context_budget_compact",
+            ContextPolicy::Refuse { .. } => "context_budget_refuse",
+        }
+    }
+
+    #[must_use]
+    pub fn rationale(&self) -> &'static str {
+        match self {
+            ContextPolicy::Compact { rationale } | ContextPolicy::Refuse { rationale } => rationale,
+        }
+    }
+}
+
+/// The stated policy per class.
+///
+/// **Every arm is argued from that class's own definition in
+/// [`crate::run_protocol::ProcessClass`], not from a preference.** The classes
+/// already say who is waiting and what a deferral costs, and those two facts
+/// decide the answer — which is the whole reason the policy is per class rather
+/// than a global setting.
+pub fn context_policy(class: crate::run_protocol::ProcessClass) -> ContextPolicy {
+    use crate::run_protocol::ProcessClass;
+    match class {
+        // "Something is blocked on the answer: a person at a desktop turn."
+        // Refusing throws away a conversation the person is in the middle of and
+        // can still see on screen; compacting costs them the oldest detail. The
+        // person is present to notice a bad summary and to say so, which is
+        // exactly what nobody downstream of the other three classes can do.
+        ProcessClass::Interactive => ContextPolicy::Compact {
+            rationale: "Someone is waiting on this turn and can see the conversation, so it continues with the oldest exchanges summarized rather than ending. Compaction loses detail, and it is visible when it does.",
+        },
+        // "Submitted work that wants throughput. Nobody is waiting on any
+        // individual turn." Nobody is watching either, and that is the point: a
+        // batch job that quietly compacts produces a result whose degradation
+        // nobody sees until it is acted on. It still compacts rather than
+        // failing a long batch outright — throughput is what the class is for —
+        // but the compaction is a recorded fact about the run, not a silent one.
+        ProcessClass::Batch => ContextPolicy::Compact {
+            rationale: "Finishing the batch is what this class is for, so it continues with the oldest exchanges summarized — and the compaction is recorded on the run, because nobody is watching this turn to notice the result got thinner.",
+        },
+        // "Opportunistic. Runs when there is room, and is the first thing asked
+        // to step aside." A process that is already the first to yield should
+        // not spend a scarce context window on a degraded answer. Stopping is
+        // cheap here in a way it is nowhere else.
+        ProcessClass::Background => ContextPolicy::Refuse {
+            rationale: "Nothing is waiting on this, and it is already the first work asked to step aside. It stops rather than continuing on a summary, because a degraded background answer costs more to trust than it costs to run again.",
+        },
+        // "May always be deferred, because the next occurrence will come around
+        // anyway." The class's own definition is the argument: a compacted
+        // maintenance pass would write a worse result into a place a later,
+        // whole one would have written a good one.
+        ProcessClass::Maintenance => ContextPolicy::Refuse {
+            rationale: "This is scheduled housekeeping, and the next occurrence comes around anyway. It stops rather than writing a result derived from a summary, which a later whole run would have done properly.",
+        },
+    }
+}
+
+/// Whether a per-process context budget can be *enforced* against this runtime,
+/// which is a different question from whether one is set.
+///
+/// Enforcement needs an exact prompt-token count before the request, and only a
+/// runtime that will tokenize on demand can give one. A tagged union for
+/// [`PrefixSharing`]'s reason: a budget that cannot be enforced must never be
+/// displayed as if it were, and the caller has to hold the reason to say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum ContextBudgetEnforcement {
+    /// The runtime counts tokens exactly, so a budget is checked before sending.
+    Enforceable,
+    /// It does not, and this says why. A budget set on such a process is reported
+    /// as unenforceable rather than silently ignored — and never estimated, since
+    /// an estimated limit refuses real work for a made-up reason.
+    Unenforceable { reason: &'static str },
+}
+
+pub fn context_budget_enforcement(kind: ContextRuntimeKind) -> ContextBudgetEnforcement {
+    match kind {
+        // `POST /tokenize` returns the exact token list, and `POST /apply-template`
+        // renders the exact prompt a completion would send, so the count is the
+        // runtime's own rather than a heuristic over string length. Both were
+        // measured against the pinned build; `/tokenize` answered in 0.5 ms on
+        // loopback, which is why a pre-flight is affordable per turn.
+        ContextRuntimeKind::LlamaCpp => ContextBudgetEnforcement::Enforceable,
+        ContextRuntimeKind::Ollama => ContextBudgetEnforcement::Unenforceable {
+            reason: "Ollama's API exposes no tokenizer, so this app cannot count a prompt exactly before sending it. A budget would have to be enforced against a guess at the token count, which would refuse real work for a made-up reason.",
+        },
+        ContextRuntimeKind::Mlx => ContextBudgetEnforcement::Unenforceable {
+            reason: "The MLX runtime in this build exposes no tokenize endpoint, so a prompt cannot be counted before it is sent.",
+        },
+    }
+}
+
+/// Whether one request fits the process's prompt-token budget.
+///
+/// Pure, and separate from the counting so the decision is testable without a
+/// runtime. `None` for `budget` is the overwhelmingly common case — no budget is
+/// set — and it is `Within`, not a refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextBudgetVerdict {
+    Within,
+    /// The prompt is over. Carries both numbers because a refusal a user cannot
+    /// check against is indistinguishable from a bug.
+    Exceeded {
+        prompt_tokens: u64,
+        budget: u64,
+    },
+}
+
+/// `>` and not `>=`: a prompt of exactly the budget fits. A budget is a ceiling
+/// on the prompt, and refusing the request that lands exactly on it would make
+/// the configured number mean one less than it says.
+pub fn check_context_budget(prompt_tokens: u64, budget: Option<u64>) -> ContextBudgetVerdict {
+    match budget {
+        Some(budget) if prompt_tokens > budget => ContextBudgetVerdict::Exceeded {
+            prompt_tokens,
+            budget,
+        },
+        _ => ContextBudgetVerdict::Within,
+    }
+}
+
+impl ContextBudgetVerdict {
+    /// The refusal, with the class's stated policy appended when the class is
+    /// known (roadmap K11).
+    ///
+    /// The policy is what turns a bare "over budget" into an actionable answer:
+    /// a class that compacts is being told to compact and retry, and one that
+    /// refuses is being told this is the end of the work. `None` for the class
+    /// means the process has no run to derive one from, and the refusal stays the
+    /// bare one rather than assuming a policy.
+    #[must_use]
+    pub fn refusal_under(&self, policy: Option<ContextPolicy>) -> Option<String> {
+        let refusal = self.refusal()?;
+        Some(match policy {
+            Some(policy) => format!("{refusal} {}", policy.rationale()),
+            None => refusal,
+        })
+    }
+
+    /// The refusal a user sees. Names both numbers and what to do, because this
+    /// is a limit the user configured and can raise.
+    #[must_use]
+    pub fn refusal(&self) -> Option<String> {
+        match self {
+            ContextBudgetVerdict::Within => None,
+            ContextBudgetVerdict::Exceeded {
+                prompt_tokens,
+                budget,
+            } => Some(format!(
+                "This request's prompt is {prompt_tokens} tokens, over the {budget}-token context budget set for this process. It was refused before being sent, so nothing was generated and no context was dropped. Raise the budget, shorten the conversation, or start a new one."
+            )),
+        }
+    }
+}
+
+/// What each runtime actually does about prefix sharing.
+///
+/// # llama.cpp does this already, and the app's job is not to break it
+///
+/// Verified against the build [`crate::managed_runtime::MANAGED_LLAMA_VERSION`]
+/// pins, by running it: with no `--parallel` argument — which is what
+/// `runtime_adapter::llama_args` passes — b9637 resolves `n_parallel` to `auto`
+/// and reports `total_slots = 4` with a unified KV cache, and it routes each
+/// request to the slot whose cached prefix matches best ("selected slot by LCP
+/// similarity" in its own log), while `--cache-idle-slots` saves an idle slot's
+/// KV into a server-wide RAM cache. Two different conversations sharing a
+/// 454-token prefix were measured at 451 of 456 prompt tokens reused on the
+/// second, on a slot the first had warmed.
+///
+/// So the sharing is the runtime's, it is read-only (no KV is copied between
+/// sequences — the *request* is routed to where the prefix already is), and this
+/// app gets it by **not** doing two things: pinning `id_slot`, and disabling
+/// `cache_prompt`. `openai_request_body` does neither, and a test asserts that,
+/// because either one would silently cost the whole feature with nothing failing.
+///
+/// A first probe of this pinned `id_slot` and saw zero reuse, which looked like
+/// "the runtime cannot share across slots". It was the pin itself defeating the
+/// router — worth recording, since that is exactly the mistake the guard exists
+/// to prevent.
+pub fn prefix_sharing(kind: ContextRuntimeKind) -> PrefixSharing {
+    match kind {
+        ContextRuntimeKind::LlamaCpp => PrefixSharing::Supported {
+            mechanism: "llama-server routes each request to the slot whose cached prompt prefix matches it best, and saves an idle slot's cache into a server-wide pool, so a second conversation that starts with the same prefix reuses it instead of re-evaluating it. Nothing is copied between sequences and no request can read another's tokens.",
+        },
+        // Not "we did not implement it" — Ollama's HTTP API exposes neither slots
+        // nor prompt-cache state, so there is nothing here to observe or steer.
+        // Whatever its server does internally, this app cannot claim it.
+        ContextRuntimeKind::Ollama => PrefixSharing::Unsupported {
+            reason: "Ollama's API exposes no slot or prompt-cache surface, so this app cannot observe or influence whether two of its processes reuse a prompt prefix, and will not claim reuse it cannot see.",
+        },
+        ContextRuntimeKind::Mlx => PrefixSharing::Unsupported {
+            reason: "The MLX runtime in this build keeps no prompt cache between requests, so every request evaluates its whole prompt and there is no prefix to share.",
+        },
+    }
 }
 
 /// Setting-key candidates to try, in priority order, per runtime kind — the
@@ -670,7 +959,10 @@ pub fn configured_context_key_candidates(kind: ContextRuntimeKind) -> &'static [
 
 /// Builds the honest, non-fabricated per-runtime notes describing what live
 /// data is and is not available, given what was actually observed.
-pub fn context_cache_notes(kind: ContextRuntimeKind, live: Option<&LlamaCppLiveContextState>) -> Vec<String> {
+pub fn context_cache_notes(
+    kind: ContextRuntimeKind,
+    live: Option<&LlamaCppLiveContextState>,
+) -> Vec<String> {
     match kind {
         ContextRuntimeKind::Mlx => vec![
             "The MLX runtime does not expose a configurable context window or live KV-cache state today; only generation token counts are available per request.".to_string(),
@@ -693,7 +985,7 @@ pub fn context_cache_notes(kind: ContextRuntimeKind, live: Option<&LlamaCppLiveC
                     notes.push("Live per-slot token usage and context-shift state read from llama-server's /slots endpoint.".to_string());
                 }
                 _ => notes.push(
-                    "llama-server's /slots endpoint is unavailable (commonly because it requires --slots), so live token-in-use and context-shift state are unknown, not zero.".to_string(),
+                    "llama-server's /slots endpoint did not answer (it is on by default in the version this app manages, so the likely causes are --no-slots or a server that is not reachable), leaving live token-in-use and context-shift state unknown, not zero.".to_string(),
                 ),
             }
             notes
@@ -726,7 +1018,10 @@ mod tests {
     fn resolve_configured_context_prefers_persisted_value_over_default() {
         let schema = vec![capability("context_size", 4_096, 128, 1_048_576)];
         let mut persisted = BTreeMap::new();
-        persisted.insert("context_size".to_string(), SettingValue::Integer { value: 16_384 });
+        persisted.insert(
+            "context_size".to_string(),
+            SettingValue::Integer { value: 16_384 },
+        );
         let resolved = resolve_configured_context(&schema, Some(&persisted), &["context_size"]);
         assert_eq!(resolved.tokens, Some(16_384));
         assert_eq!(resolved.source, ContextLimitSource::RuntimeConfigured);
@@ -825,12 +1120,26 @@ mod tests {
             request: HttpRequest,
             _cancellation: &'a CancellationToken,
         ) -> RuntimeFuture<'a, crate::runtime_adapter::HttpResponse> {
-            let path = request.url.rsplit_once('/').map(|(_, tail)| format!("/{tail}"));
-            let found = path.and_then(|path| self.by_path.lock().expect("lock fixture transport").get(&path).cloned());
+            let path = request
+                .url
+                .rsplit_once('/')
+                .map(|(_, tail)| format!("/{tail}"));
+            let found = path.and_then(|path| {
+                self.by_path
+                    .lock()
+                    .expect("lock fixture transport")
+                    .get(&path)
+                    .cloned()
+            });
             Box::pin(async move {
                 match found {
-                    Some((status, body)) => Ok(crate::runtime_adapter::HttpResponse { status, body }),
-                    None => Ok(crate::runtime_adapter::HttpResponse { status: 404, body: b"not found".to_vec() }),
+                    Some((status, body)) => {
+                        Ok(crate::runtime_adapter::HttpResponse { status, body })
+                    }
+                    None => Ok(crate::runtime_adapter::HttpResponse {
+                        status: 404,
+                        body: b"not found".to_vec(),
+                    }),
                 }
             })
         }
@@ -844,8 +1153,13 @@ mod tests {
             200,
             br#"{"default_generation_settings":{"n_ctx":8192},"total_slots":1}"#,
         );
-        transport.respond("/slots", 200, br#"[{"id":0,"n_ctx":8192,"n_past":100,"truncated":false}]"#);
-        let endpoint = EndpointOrigin::parse("http://127.0.0.1:8090", EndpointPolicy::LoopbackOnly).expect("endpoint");
+        transport.respond(
+            "/slots",
+            200,
+            br#"[{"id":0,"n_ctx":8192,"n_past":100,"truncated":false}]"#,
+        );
+        let endpoint = EndpointOrigin::parse("http://127.0.0.1:8090", EndpointPolicy::LoopbackOnly)
+            .expect("endpoint");
         let cancellation = CancellationToken::new();
         let state = fetch_llama_cpp_live_context_state(&endpoint, &transport, &cancellation).await;
         assert_eq!(state.reported_context_tokens, Some(8_192));
@@ -865,7 +1179,8 @@ mod tests {
             br#"{"default_generation_settings":{"n_ctx":4096},"total_slots":1}"#,
         );
         transport.respond("/slots", 501, b"Not Implemented");
-        let endpoint = EndpointOrigin::parse("http://127.0.0.1:8090", EndpointPolicy::LoopbackOnly).expect("endpoint");
+        let endpoint = EndpointOrigin::parse("http://127.0.0.1:8090", EndpointPolicy::LoopbackOnly)
+            .expect("endpoint");
         let cancellation = CancellationToken::new();
         let state = fetch_llama_cpp_live_context_state(&endpoint, &transport, &cancellation).await;
         assert_eq!(state.reported_context_tokens, Some(4_096));
@@ -877,7 +1192,8 @@ mod tests {
     async fn fetch_llama_cpp_live_context_state_all_unavailable_when_unreachable() {
         let transport = FixtureTransport::default();
         // No fixtures registered at all: every request 404s.
-        let endpoint = EndpointOrigin::parse("http://127.0.0.1:8090", EndpointPolicy::LoopbackOnly).expect("endpoint");
+        let endpoint = EndpointOrigin::parse("http://127.0.0.1:8090", EndpointPolicy::LoopbackOnly)
+            .expect("endpoint");
         let cancellation = CancellationToken::new();
         let state = fetch_llama_cpp_live_context_state(&endpoint, &transport, &cancellation).await;
         assert_eq!(state, LlamaCppLiveContextState::default());
@@ -907,7 +1223,10 @@ mod tests {
         };
         let classification = classify_context_failure(&input).expect("should classify");
         assert_eq!(classification.class, ContextFailureClass::PromptTooLong);
-        assert!(classification.explanation.contains("9000") || classification.explanation.contains("9,000"));
+        assert!(
+            classification.explanation.contains("9000")
+                || classification.explanation.contains("9,000")
+        );
     }
 
     #[test]
@@ -918,7 +1237,10 @@ mod tests {
             ..Default::default()
         };
         let classification = classify_context_failure(&input).expect("should classify");
-        assert_eq!(classification.class, ContextFailureClass::CacheExhaustedContextShift);
+        assert_eq!(
+            classification.class,
+            ContextFailureClass::CacheExhaustedContextShift
+        );
         assert!(classification.explanation.contains("8192"));
     }
 
@@ -951,7 +1273,10 @@ mod tests {
             ..Default::default()
         };
         let classification = classify_context_failure(&input).expect("should classify");
-        assert_eq!(classification.class, ContextFailureClass::ModelMetadataLimit);
+        assert_eq!(
+            classification.class,
+            ContextFailureClass::ModelMetadataLimit
+        );
     }
 
     #[test]
@@ -996,7 +1321,10 @@ mod tests {
             ..Default::default()
         };
         let classification = classify_context_failure(&input).expect("should classify");
-        assert_eq!(classification.class, ContextFailureClass::CacheExhaustedContextShift);
+        assert_eq!(
+            classification.class,
+            ContextFailureClass::CacheExhaustedContextShift
+        );
     }
 
     // -- resolve_effective_context --------------------------------------
@@ -1057,7 +1385,10 @@ mod tests {
         };
         let resolution = resolve_effective_context(&input);
         assert_eq!(resolution.effective_tokens, 128);
-        assert_eq!(resolution.capped_by, vec!["runtime_setting_min".to_string()]);
+        assert_eq!(
+            resolution.capped_by,
+            vec!["runtime_setting_min".to_string()]
+        );
     }
 
     // -- context_cache_notes ---------------------------------------------
@@ -1069,12 +1400,208 @@ mod tests {
         assert!(notes[0].contains("does not expose"));
     }
 
+    /// The policy per class, argued from each class's own definition. Interactive
+    /// and Batch have someone or something that wants the work *finished*;
+    /// Background and Maintenance are both defined as deferrable, and the
+    /// Maintenance doc says outright that "the next occurrence will come around
+    /// anyway".
+    #[test]
+    fn the_policy_follows_each_classs_own_definition() {
+        use crate::run_protocol::ProcessClass;
+        assert!(context_policy(ProcessClass::Interactive).compacts());
+        assert!(context_policy(ProcessClass::Batch).compacts());
+        assert!(!context_policy(ProcessClass::Background).compacts());
+        assert!(!context_policy(ProcessClass::Maintenance).compacts());
+        // Both arms carry prose. A policy with an empty rationale is a preference
+        // wearing a type.
+        for class in [
+            ProcessClass::Interactive,
+            ProcessClass::Batch,
+            ProcessClass::Background,
+            ProcessClass::Maintenance,
+        ] {
+            assert!(
+                context_policy(class).rationale().len() > 40,
+                "{class:?} states no rationale"
+            );
+        }
+    }
+
+    /// The refusal carries the policy so a caller can act on it, and stays bare
+    /// when the class is unknown rather than assuming one.
+    #[test]
+    fn a_refusal_carries_the_policy_only_when_the_class_is_known() {
+        use crate::run_protocol::ProcessClass;
+        let verdict = check_context_budget(9_000, Some(8_192));
+        let bare = verdict.refusal_under(None).expect("a refusal");
+        assert!(bare.contains("9000"));
+        assert!(!bare.contains("summarized"));
+
+        let interactive = verdict
+            .refusal_under(Some(context_policy(ProcessClass::Interactive)))
+            .expect("a refusal");
+        assert!(interactive.contains("summarized"), "{interactive}");
+
+        let maintenance = verdict
+            .refusal_under(Some(context_policy(ProcessClass::Maintenance)))
+            .expect("a refusal");
+        assert!(maintenance.contains("next occurrence"), "{maintenance}");
+
+        // A verdict that is not a refusal has nothing to say under any policy.
+        assert_eq!(
+            ContextBudgetVerdict::Within
+                .refusal_under(Some(context_policy(ProcessClass::Interactive))),
+            None
+        );
+    }
+
+    /// The code says which policy, not merely that a budget was hit — an API
+    /// client that must decide between compacting and stopping gets the answer
+    /// without parsing the sentence that argues for it.
+    #[test]
+    fn the_policys_error_code_distinguishes_compacting_from_stopping() {
+        use crate::run_protocol::ProcessClass;
+        for class in [ProcessClass::Interactive, ProcessClass::Batch] {
+            assert_eq!(context_policy(class).code(), "context_budget_compact");
+        }
+        for class in [ProcessClass::Background, ProcessClass::Maintenance] {
+            assert_eq!(context_policy(class).code(), "context_budget_refuse");
+        }
+    }
+
+    /// No budget is the common case and is not a refusal, and a prompt landing
+    /// exactly on the budget fits — `>` not `>=`, or the configured number would
+    /// mean one less than it says.
+    #[test]
+    fn a_context_budget_refuses_only_what_is_over_it() {
+        assert_eq!(
+            check_context_budget(9_000, None),
+            ContextBudgetVerdict::Within
+        );
+        assert_eq!(
+            check_context_budget(0, Some(8_192)),
+            ContextBudgetVerdict::Within
+        );
+        assert_eq!(
+            check_context_budget(8_192, Some(8_192)),
+            ContextBudgetVerdict::Within,
+            "a prompt exactly on the budget fits"
+        );
+        assert_eq!(
+            check_context_budget(8_193, Some(8_192)),
+            ContextBudgetVerdict::Exceeded {
+                prompt_tokens: 8_193,
+                budget: 8_192
+            }
+        );
+    }
+
+    /// A refusal a user cannot check against is indistinguishable from a bug, so
+    /// both numbers are in it — and it says nothing was generated, because the
+    /// whole point is that the request never left.
+    #[test]
+    fn the_refusal_names_both_numbers_and_what_happened() {
+        assert_eq!(ContextBudgetVerdict::Within.refusal(), None);
+        let refusal = check_context_budget(9_000, Some(8_192))
+            .refusal()
+            .expect("an exceeded verdict refuses");
+        assert!(refusal.contains("9000"));
+        assert!(refusal.contains("8192"));
+        assert!(refusal.contains("refused before being sent"));
+    }
+
+    /// Only a runtime that will tokenize can have a budget enforced against it,
+    /// and the other two say why rather than accepting one and ignoring it.
+    #[test]
+    fn only_a_runtime_that_tokenizes_can_enforce_a_budget() {
+        assert_eq!(
+            context_budget_enforcement(ContextRuntimeKind::LlamaCpp),
+            ContextBudgetEnforcement::Enforceable
+        );
+        for kind in [ContextRuntimeKind::Ollama, ContextRuntimeKind::Mlx] {
+            match context_budget_enforcement(kind) {
+                ContextBudgetEnforcement::Unenforceable { reason } => {
+                    assert!(
+                        !reason.trim().is_empty(),
+                        "{kind:?} refuses without a reason"
+                    )
+                }
+                ContextBudgetEnforcement::Enforceable => {
+                    panic!("{kind:?} has no tokenizer and must not claim enforcement")
+                }
+            }
+        }
+    }
+
+    /// Every runtime resolves to one arm or the other, and neither arm can be
+    /// rendered without the prose that justifies it — an `unsupported` with no
+    /// reason is the shape this union exists to make unconstructible.
+    #[test]
+    fn every_runtime_states_its_prefix_sharing_with_a_reason() {
+        for kind in [
+            ContextRuntimeKind::LlamaCpp,
+            ContextRuntimeKind::Ollama,
+            ContextRuntimeKind::Mlx,
+        ] {
+            match prefix_sharing(kind) {
+                PrefixSharing::Supported { mechanism } => assert!(
+                    !mechanism.trim().is_empty(),
+                    "{kind:?} claims support without naming the mechanism"
+                ),
+                PrefixSharing::Unsupported { reason } => {
+                    assert!(
+                        !reason.trim().is_empty(),
+                        "{kind:?} refuses without a reason"
+                    )
+                }
+            }
+        }
+        // The one runtime this app can actually observe is the one that supports
+        // it; the other two are honest refusals, not unimplemented work.
+        assert!(matches!(
+            prefix_sharing(ContextRuntimeKind::LlamaCpp),
+            PrefixSharing::Supported { .. }
+        ));
+        assert!(matches!(
+            prefix_sharing(ContextRuntimeKind::Ollama),
+            PrefixSharing::Unsupported { .. }
+        ));
+        assert!(matches!(
+            prefix_sharing(ContextRuntimeKind::Mlx),
+            PrefixSharing::Unsupported { .. }
+        ));
+    }
+
+    /// The wire shape the UI switches on. A bare boolean would let a caller show
+    /// "supported" with no mechanism beside it.
+    #[test]
+    fn prefix_sharing_serializes_as_a_tagged_union() {
+        let json =
+            serde_json::to_value(prefix_sharing(ContextRuntimeKind::Mlx)).expect("serialize");
+        assert_eq!(json["state"], "unsupported");
+        assert!(json["reason"]
+            .as_str()
+            .expect("a reason")
+            .contains("no prompt cache"));
+        let json =
+            serde_json::to_value(prefix_sharing(ContextRuntimeKind::LlamaCpp)).expect("serialize");
+        assert_eq!(json["state"], "supported");
+        assert!(
+            json.get("reason").is_none(),
+            "the supported arm carries no reason field"
+        );
+    }
+
     #[test]
     fn llama_cpp_notes_reflect_which_endpoints_answered() {
         let mut live = LlamaCppLiveContextState::default();
         live.endpoints_reachable.push("/props".to_string());
         let notes = context_cache_notes(ContextRuntimeKind::LlamaCpp, Some(&live));
         assert!(notes[0].contains("confirmed"));
-        assert!(notes[1].contains("unavailable"));
+        assert!(notes[1].contains("did not answer"));
+        assert!(
+            notes[1].contains("unknown, not zero"),
+            "the unavailable branch must still refuse to read as a zero"
+        );
     }
 }

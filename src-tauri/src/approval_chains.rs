@@ -382,7 +382,10 @@ fn load_stage_decisions(
 }
 
 #[cfg(test)]
-fn load_chain_run(ledger: &RunLedger, chain_id: &str) -> Result<Option<ApprovalChainRun>, LedgerError> {
+fn load_chain_run(
+    ledger: &RunLedger,
+    chain_id: &str,
+) -> Result<Option<ApprovalChainRun>, LedgerError> {
     let row = ledger
         .connection()
         .query_row(
@@ -458,12 +461,13 @@ pub async fn run_approval_chain<R: tauri::Runtime>(
             .ok_or_else(|| "Approval chain stage expiry exceeds protocol bounds".to_string())?;
 
         let (tx, rx) = oneshot::channel::<(bool, ClientIdentity)>();
-        state
-            .approval_chains
-            .pending
-            .lock()
-            .unwrap()
-            .insert(chain_id.clone(), PendingChainStage { stage_index, sender: tx });
+        state.approval_chains.pending.lock().unwrap().insert(
+            chain_id.clone(),
+            PendingChainStage {
+                stage_index,
+                sender: tx,
+            },
+        );
 
         let payload = ApprovalChainStagePayload {
             chain_id: chain_id.clone(),
@@ -478,7 +482,12 @@ pub async fn run_approval_chain<R: tauri::Runtime>(
         };
 
         if app.emit("approval-chain://stage", payload.clone()).is_err() {
-            state.approval_chains.pending.lock().unwrap().remove(&chain_id);
+            state
+                .approval_chains
+                .pending
+                .lock()
+                .unwrap()
+                .remove(&chain_id);
             let finished_at = crate::run_commands::unix_time_ms()?;
             crate::run_commands::with_ledger(app, state, |ledger| {
                 finish_chain_run(ledger, &chain_id, ChainStatus::Rejected, finished_at)
@@ -516,7 +525,12 @@ pub async fn run_approval_chain<R: tauri::Runtime>(
 
         let outcome = tokio::time::timeout(Duration::from_secs(stage.timeout_secs), rx).await;
         stage_resolved.store(true, Ordering::SeqCst);
-        state.approval_chains.pending.lock().unwrap().remove(&chain_id);
+        state
+            .approval_chains
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&chain_id);
 
         let (decision, allowed, decided_by) = match outcome {
             Ok(Ok((true, identity))) => (StageDecisionKind::Allow, true, Some(identity)),
@@ -698,7 +712,16 @@ mod tests {
     #[test]
     fn ledger_round_trips_a_chain_run_and_its_stage_decisions() {
         let mut ledger = RunLedger::open_in_memory().unwrap();
-        insert_chain_run(&mut ledger, "chain-1", "double_confirm", &"a".repeat(64), "do the thing", 2, 1_000).unwrap();
+        insert_chain_run(
+            &mut ledger,
+            "chain-1",
+            "double_confirm",
+            &"a".repeat(64),
+            "do the thing",
+            2,
+            1_000,
+        )
+        .unwrap();
 
         let loaded = load_chain_run(&ledger, "chain-1").unwrap().unwrap();
         assert_eq!(loaded.status, ChainStatus::Pending);
@@ -740,9 +763,36 @@ mod tests {
     #[test]
     fn history_orders_most_recent_first_and_respects_the_limit() {
         let mut ledger = RunLedger::open_in_memory().unwrap();
-        insert_chain_run(&mut ledger, "chain-a", "double_confirm", &"a".repeat(64), "first", 1, 1_000).unwrap();
-        insert_chain_run(&mut ledger, "chain-b", "double_confirm", &"b".repeat(64), "second", 1, 2_000).unwrap();
-        insert_chain_run(&mut ledger, "chain-c", "double_confirm", &"c".repeat(64), "third", 1, 3_000).unwrap();
+        insert_chain_run(
+            &mut ledger,
+            "chain-a",
+            "double_confirm",
+            &"a".repeat(64),
+            "first",
+            1,
+            1_000,
+        )
+        .unwrap();
+        insert_chain_run(
+            &mut ledger,
+            "chain-b",
+            "double_confirm",
+            &"b".repeat(64),
+            "second",
+            1,
+            2_000,
+        )
+        .unwrap();
+        insert_chain_run(
+            &mut ledger,
+            "chain-c",
+            "double_confirm",
+            &"c".repeat(64),
+            "third",
+            1,
+            3_000,
+        )
+        .unwrap();
 
         let history = load_chain_runs(&ledger, 2).unwrap();
         assert_eq!(history.len(), 2);
@@ -753,17 +803,24 @@ mod tests {
     #[tokio::test]
     async fn a_deny_at_the_first_stage_never_reaches_the_second_stage() {
         let state = std::sync::Arc::new(AppState::default());
-        // Pre-seed an in-memory ledger so `with_ledger` never resolves
-        // `mock_app()`'s real (unscoped) app-data directory on disk — see
-        // this module's own tests for why that matters.
+        // Pre-seed an in-memory ledger: this test needs no durable rows,
+        // and an in-memory one keeps it off disk entirely. (The mock app's
+        // app-data directory is per-test either way — see `test_support`.)
         *state.run_ledger.lock().unwrap() = Some(RunLedger::open_in_memory().unwrap());
-        let handle = tauri::test::mock_app().handle().clone();
+        let handle = crate::test_support::mock_app().handle().clone();
         let tmpl = template("deny-first", vec![stage("Stage 1", 5), stage("Stage 2", 5)]);
 
         let task_state = state.clone();
         let task_handle = handle.clone();
         let task = tokio::spawn(async move {
-            run_approval_chain(&task_handle, &task_state, &tmpl, "d".repeat(64), "do it".to_string()).await
+            run_approval_chain(
+                &task_handle,
+                &task_state,
+                &tmpl,
+                "d".repeat(64),
+                "do it".to_string(),
+            )
+            .await
         });
 
         let mut chain_id = None;
@@ -789,7 +846,9 @@ mod tests {
         // stage 0 stopped the chain before stage 1 was ever reached.
         assert!(state.approval_chains.pending.lock().unwrap().is_empty());
 
-        let history = crate::run_commands::with_ledger(&handle, &state, |ledger| load_chain_runs(ledger, 10)).unwrap();
+        let history =
+            crate::run_commands::with_ledger(&handle, &state, |ledger| load_chain_runs(ledger, 10))
+                .unwrap();
         let run = history.iter().find(|r| r.id == chain_id).unwrap();
         assert_eq!(run.status, ChainStatus::Rejected);
         assert_eq!(run.decisions.len(), 1);
@@ -800,17 +859,24 @@ mod tests {
     #[tokio::test]
     async fn allowing_every_stage_approves_the_whole_chain_in_order() {
         let state = std::sync::Arc::new(AppState::default());
-        // Pre-seed an in-memory ledger so `with_ledger` never resolves
-        // `mock_app()`'s real (unscoped) app-data directory on disk — see
-        // this module's own tests for why that matters.
+        // Pre-seed an in-memory ledger: this test needs no durable rows,
+        // and an in-memory one keeps it off disk entirely. (The mock app's
+        // app-data directory is per-test either way — see `test_support`.)
         *state.run_ledger.lock().unwrap() = Some(RunLedger::open_in_memory().unwrap());
-        let handle = tauri::test::mock_app().handle().clone();
+        let handle = crate::test_support::mock_app().handle().clone();
         let tmpl = template("allow-both", vec![stage("Stage 1", 5), stage("Stage 2", 5)]);
 
         let task_state = state.clone();
         let task_handle = handle.clone();
         let task = tokio::spawn(async move {
-            run_approval_chain(&task_handle, &task_state, &tmpl, "d".repeat(64), "do it".to_string()).await
+            run_approval_chain(
+                &task_handle,
+                &task_state,
+                &tmpl,
+                "d".repeat(64),
+                "do it".to_string(),
+            )
+            .await
         });
 
         for expected_stage in 0..2 {
@@ -826,36 +892,45 @@ mod tests {
                 drop(pending);
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            let chain_id = chain_id.unwrap_or_else(|| panic!("chain never reached stage {expected_stage}"));
+            let chain_id =
+                chain_id.unwrap_or_else(|| panic!("chain never reached stage {expected_stage}"));
             approval_chain_respond_for_test(&state, &chain_id, true);
         }
 
         let result = task.await.unwrap().unwrap();
         assert_eq!(result, true);
 
-        let history = crate::run_commands::with_ledger(&handle, &state, |ledger| load_chain_runs(ledger, 10)).unwrap();
+        let history =
+            crate::run_commands::with_ledger(&handle, &state, |ledger| load_chain_runs(ledger, 10))
+                .unwrap();
         let run = history.first().unwrap();
         assert_eq!(run.status, ChainStatus::Approved);
         assert_eq!(run.decisions.len(), 2);
-        assert!(run.decisions.iter().all(|d| d.decision == StageDecisionKind::Allow));
+        assert!(run
+            .decisions
+            .iter()
+            .all(|d| d.decision == StageDecisionKind::Allow));
     }
 
     #[tokio::test]
     async fn an_unanswered_stage_expires_and_rejects_the_chain() {
         let state = std::sync::Arc::new(AppState::default());
-        // Pre-seed an in-memory ledger so `with_ledger` never resolves
-        // `mock_app()`'s real (unscoped) app-data directory on disk — see
-        // this module's own tests for why that matters.
+        // Pre-seed an in-memory ledger: this test needs no durable rows,
+        // and an in-memory one keeps it off disk entirely. (The mock app's
+        // app-data directory is per-test either way — see `test_support`.)
         *state.run_ledger.lock().unwrap() = Some(RunLedger::open_in_memory().unwrap());
-        let handle = tauri::test::mock_app().handle().clone();
+        let handle = crate::test_support::mock_app().handle().clone();
         let tmpl = template("times-out", vec![stage("Stage 1", 0), stage("Stage 2", 5)]);
 
-        let result = run_approval_chain(&handle, &state, &tmpl, "d".repeat(64), "do it".to_string())
-            .await
-            .unwrap();
+        let result =
+            run_approval_chain(&handle, &state, &tmpl, "d".repeat(64), "do it".to_string())
+                .await
+                .unwrap();
         assert_eq!(result, false);
 
-        let history = crate::run_commands::with_ledger(&handle, &state, |ledger| load_chain_runs(ledger, 10)).unwrap();
+        let history =
+            crate::run_commands::with_ledger(&handle, &state, |ledger| load_chain_runs(ledger, 10))
+                .unwrap();
         let run = history.first().unwrap();
         assert_eq!(run.status, ChainStatus::Expired);
         assert_eq!(run.decisions.len(), 1);
@@ -866,11 +941,11 @@ mod tests {
     #[tokio::test]
     async fn escalation_re_emits_the_same_stage_before_its_timeout() {
         let state = std::sync::Arc::new(AppState::default());
-        // Pre-seed an in-memory ledger so `with_ledger` never resolves
-        // `mock_app()`'s real (unscoped) app-data directory on disk — see
-        // this module's own tests for why that matters.
+        // Pre-seed an in-memory ledger: this test needs no durable rows,
+        // and an in-memory one keeps it off disk entirely. (The mock app's
+        // app-data directory is per-test either way — see `test_support`.)
         *state.run_ledger.lock().unwrap() = Some(RunLedger::open_in_memory().unwrap());
-        let handle = tauri::test::mock_app().handle().clone();
+        let handle = crate::test_support::mock_app().handle().clone();
         let tmpl = template(
             "escalates",
             vec![ChainStage {
@@ -884,7 +959,14 @@ mod tests {
         let task_state = state.clone();
         let task_handle = handle.clone();
         let task = tokio::spawn(async move {
-            run_approval_chain(&task_handle, &task_state, &tmpl, "d".repeat(64), "do it".to_string()).await
+            run_approval_chain(
+                &task_handle,
+                &task_state,
+                &tmpl,
+                "d".repeat(64),
+                "do it".to_string(),
+            )
+            .await
         });
 
         // Let the escalation timer (1s) fire, then approve before the 3s
@@ -893,7 +975,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         let chain_id = {
             let pending = state.approval_chains.pending.lock().unwrap();
-            pending.keys().next().cloned().expect("stage still pending after escalation")
+            pending
+                .keys()
+                .next()
+                .cloned()
+                .expect("stage still pending after escalation")
         };
         approval_chain_respond_for_test(&state, &chain_id, true);
 
@@ -906,7 +992,12 @@ mod tests {
     /// stamp `decided_by`, which unit tests running under `MockRuntime` have
     /// no reason to stand up).
     fn approval_chain_respond_for_test(state: &AppState, chain_id: &str, allow: bool) {
-        let pending = state.approval_chains.pending.lock().unwrap().remove(chain_id);
+        let pending = state
+            .approval_chains
+            .pending
+            .lock()
+            .unwrap()
+            .remove(chain_id);
         let pending = pending.expect("no pending approval chain stage");
         let _ = pending.sender.send((allow, test_identity()));
     }

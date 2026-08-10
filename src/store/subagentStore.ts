@@ -31,8 +31,19 @@ export interface SubagentRun {
    * two concurrent turns' subagents, and cancelling by a collided key would
    * abort the wrong run. */
   cancelId: string;
+  /** Shared id linking the parallel `task` calls of one assistant round —
+   * `undefined` for a lone call. Generated per round by `agentLoop.ts` (a
+   * fresh UUID, never a tool-call id: provider-fallback ids like `call_0`
+   * repeat across rounds and would merge unrelated groups). The
+   * Background-tasks drawer groups same-`groupId` runs into one card, the
+   * panel counterpart of the chat's `SubagentGroupCard`. */
+  groupId?: string;
+  /** Set when this run is one agent of a `workflow` tool call (the owning
+   * `WorkflowRun.runId`) — the Background-tasks drawer renders it inside
+   * that workflow's card and excludes it from the plain agent list. */
+  workflowRunId?: string;
   description: string;
-  profile: "explore" | "code";
+  profile: string; // built-in profile or custom agent name
   status: SubagentStatus;
   /** When `start` registered this run — drives the elapsed-time column in
    * the Background-tasks drawer and the grouped-agents card. Wall-clock
@@ -74,7 +85,7 @@ interface SubagentStoreState {
   runs: Record<string, SubagentRun>;
   /** Registers a new run as `'running'` with an empty activity log — called
    * once by `runSubagentTask` right before it starts the child's loop. */
-  start: (params: { sessionId: string; taskId: string; cancelId: string; description: string; profile: "explore" | "code" }) => void;
+  start: (params: { sessionId: string; taskId: string; cancelId: string; groupId?: string; workflowRunId?: string; description: string; profile: string }) => void;
   /** Updates `lastActivity` and bumps `toolCallCount` by one — called once
    * per child tool call `runSubagentTask` is about to execute. No-ops if
    * `taskId` was never `start`-ed (defensive; should not happen). */
@@ -103,11 +114,11 @@ interface SubagentStoreState {
 export const useSubagentStore = create<SubagentStoreState>((set) => ({
   runs: {},
 
-  start: ({ sessionId, taskId, cancelId, description, profile }) => {
+  start: ({ sessionId, taskId, cancelId, groupId, workflowRunId, description, profile }) => {
     set((state) => ({
       runs: {
         ...state.runs,
-        [taskId]: { sessionId, taskId, cancelId, description, profile, status: "running", startedAt: Date.now(), lastActivity: "", toolCallCount: 0, usage: undefined, liveMessages: [] },
+        [taskId]: { sessionId, taskId, cancelId, groupId, workflowRunId, description, profile, status: "running", startedAt: Date.now(), lastActivity: "", toolCallCount: 0, usage: undefined, liveMessages: [] },
       },
     }));
   },

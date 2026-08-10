@@ -7,14 +7,16 @@ import {
   type AgentTool,
   type GeneratedAgentConfig,
   type BackendDescriptor,
+  type ConformanceReport,
+  type ConformanceSectionId,
   type ConversionReport,
   type ChatTemplateLabReport,
   type HardwareProfile,
   type HardwareSnapshot,
   type LanServerPolicy,
-  type M3ApiDispatchRequest,
+  type M3DiagnosticDispatchRequest,
   type M3ApiDispatchResponse,
-  type M3CancelInferenceRequest,
+  type M3DiagnosticCancelRequest,
   type M3CatalogSourceConfig,
   type M3CatalogMatch,
   type M3CleanupReport,
@@ -73,6 +75,7 @@ export type RuntimeHubSection =
   | "lan"
   | "quantization"
   | "telemetry"
+  | "benchmark"
   | "agents"
   | "upstream-watcher";
 
@@ -112,6 +115,7 @@ interface RuntimeHubStoreState {
   catalogResults: M3CatalogMatch[];
   apiResult: M3ApiDispatchResponse | null;
   compatibilityMatrix: M3CompatibilityMatrixReport | null;
+  conformanceReport: ConformanceReport | null;
   lanPolicy: LanServerPolicy | null;
   lanTokens: ScopedToken[];
   lanAudit: SecurityAuditEvent[];
@@ -173,6 +177,8 @@ interface RuntimeHubStoreState {
   replaceCatalogSources: (sources: M3CatalogSourceConfig[]) => Promise<void>;
   refreshComponents: () => Promise<void>;
   installComponent: (entry: M3ComponentCatalogEntry) => Promise<void>;
+  /** Installs a signed MLX service package from a directory on this machine. */
+  installMlxPackage: (packageDirectory: string) => Promise<void>;
   activateComponentVersion: (componentId: string, versionKey: string) => Promise<void>;
   replaceComponentRegistry: (entries: M3ComponentCatalogEntry[]) => Promise<void>;
   planSchedule: (input: M3SchedulingInput) => Promise<void>;
@@ -187,9 +193,15 @@ interface RuntimeHubStoreState {
   loadModel: (request: M3LoadModelRequest) => Promise<void>;
   unloadModel: (request: M3UnloadModelRequest) => Promise<void>;
   setRuntimeConfig: (runtimeId: string, values: Record<string, SettingValue>) => Promise<void>;
-  dispatchApi: (request: M3ApiDispatchRequest) => Promise<void>;
-  cancelInference: (request: M3CancelInferenceRequest) => Promise<boolean>;
+  dispatchApi: (request: M3DiagnosticDispatchRequest) => Promise<void>;
+  cancelInference: (request: M3DiagnosticCancelRequest) => Promise<boolean>;
   refreshCompatibilityMatrix: () => Promise<void>;
+  runConformanceSuite: (
+    baseUrl: string,
+    token: string | null,
+    sections: ConformanceSectionId[],
+  ) => Promise<void>;
+  clearConformanceReport: () => void;
   refreshLan: () => Promise<void>;
   validateLanPolicy: (policy: LanServerPolicy) => Promise<void>;
   configureLan: (policy: LanServerPolicy) => Promise<void>;
@@ -363,6 +375,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     catalogResults: [],
     apiResult: null,
     compatibilityMatrix: null,
+    conformanceReport: null,
     lanPolicy: null,
     lanTokens: [],
     lanAudit: [],
@@ -612,7 +625,33 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           timeoutMs: null,
           request: { entry },
         });
+        // An MLX component arrives as an archive rather than the single blob
+        // every other kind is: downloading it leaves nothing runnable until
+        // it is unpacked through the signature-verifying installer. Chained
+        // here so one click installs, rather than leaving the user with a
+        // downloaded component and a runtime still reporting Not Installed.
+        if (entry.kind === "mlx_runtime") {
+          await runtimeHubClient.mlxInstallComponent(entry.componentId);
+          await get().refreshRuntime("mlx");
+        }
         await get().refreshComponents();
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    installMlxPackage: async (packageDirectory) => {
+      const key = "mlx-install";
+      begin(key);
+      try {
+        await runtimeHubClient.mlxInstall(packageDirectory);
+        // The MLX driver reports its state from `verify_active()` on the next
+        // status read, so refreshing the runtime is what turns the card from
+        // Not Installed into a version.
+        await get().refreshRuntime("mlx");
       } catch (error) {
         fail(key, error);
         throw error;
@@ -971,6 +1010,21 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       }
     },
 
+    runConformanceSuite: async (baseUrl, token, sections) => {
+      const key = "conformance-suite";
+      begin(key);
+      try {
+        const conformanceReport = await runtimeHubClient.runConformanceSuite(baseUrl, token, sections);
+        set({ conformanceReport });
+      } catch (error) {
+        fail(key, error);
+      } finally {
+        finish(key);
+      }
+    },
+
+    clearConformanceReport: () => set({ conformanceReport: null }),
+
     refreshLan: async () => {
       const key = "lan-refresh";
       begin(key);
@@ -1010,8 +1064,10 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         await runtimeHubClient.lanValidatePolicy(policy);
         const lanPolicy = await runtimeHubClient.lanConfigure(policy);
         set({ lanPolicy });
-        const httpServerStatus = await runtimeHubClient.httpServerStart();
-        set({ lanPolicy, httpServerStatus });
+        // `m3_lan_configure` is a backend transaction: policy persistence,
+        // listener reconciliation, and rollback on bind failure complete
+        // before it returns. A second start call would reopen the race that
+        // transaction exists to remove.
         await get().refreshLan();
       } catch (error) {
         try {
@@ -1031,10 +1087,13 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       const key = "lan-disable";
       begin(key);
       try {
-        const httpServerStatus = await runtimeHubClient.httpServerStop();
-        set({ httpServerStatus });
+        // Disable + listener reconciliation is likewise one backend
+        // transaction. Publish the durable policy result immediately, then
+        // refresh the status projection from the unified server.
         await runtimeHubClient.lanDisable("DISABLE LAN API");
-        set({ lanPolicy: null, lanTokens: [], pairingChallenge: null, pairedToken: null, httpServerStatus });
+        set({ lanPolicy: null, lanTokens: [], pairingChallenge: null, pairedToken: null });
+        const httpServerStatus = await runtimeHubClient.httpServerStatus();
+        set({ httpServerStatus });
       } catch (error) {
         fail(key, error);
         throw error;

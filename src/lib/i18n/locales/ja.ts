@@ -1,3 +1,4 @@
+import { en } from "./en";
 import { crewLocale } from "./crew";
 import { runLocale } from "./runs";
 import { searchLocale } from "./search";
@@ -39,7 +40,8 @@ import { privacyFirewallLocale } from "./privacyFirewall";
 import { redTeamLabLocale } from "./redTeamLab";
 import { sandboxLocale } from "./sandbox";
 
-export const ja: Record<string, string> = {
+/** What this locale says in its own words — everything else falls back to English. */
+const translated: Record<string, string> = {
   ...dbAdminGuardrailsLocale,
   ...developerLocale,
   ...ecosystemLocale,
@@ -1083,6 +1085,11 @@ export const ja: Record<string, string> = {
   "MessageList.recipeStartedFromLocalApp": "レシピから開始: {{name}} · ローカルアプリ「{{appName}}」経由",
   "SubagentRow.profileExplore": "探索",
   "SubagentRow.profileCode": "コード",
+  "SubagentRow.worktreeChanges": "ワークツリー内の変更",
+  "SubagentRow.worktreeApply": "適用",
+  "SubagentRow.worktreeDiscard": "破棄",
+  "SubagentRow.worktreeApplied": "ワークスペースに適用済み",
+  "SubagentRow.worktreeDiscarded": "破棄済み",
   "SubagentRow.statusRunning": "実行中",
   "SubagentRow.statusDone": "完了",
   "SubagentRow.statusFailed": "失敗",
@@ -1099,6 +1106,8 @@ export const ja: Record<string, string> = {
   "BackgroundTasksPanel.finishedHeading": "完了",
   "BackgroundTasksPanel.clearButton": "クリア",
   "BackgroundTasksPanel.stopAriaLabel": "「{{name}}」を停止",
+  "BackgroundTasksPanel.steerPlaceholder": "このエージェントにメッセージを送信…",
+  "BackgroundTasksPanel.steerSendAriaLabel": "「{{name}}」にメッセージを送信",
   "BackgroundTasksPanel.shellKindLabel": "シェル",
   "BackgroundTasksPanel.agentKindLabel": "エージェント",
   "BackgroundTasksPanel.exitCode": "終了コード {{code}}",
@@ -1119,6 +1128,20 @@ export const ja: Record<string, string> = {
   "BackgroundTasksPanel.agentStatusCompleted": "完了",
   "BackgroundTasksPanel.agentStatusFailed": "失敗",
   "BackgroundTasksPanel.agentStatusCancelled": "キャンセル済み",
+  "BackgroundTasksPanel.agentGroupTitle": "{{count}} エージェント",
+  "BackgroundTasksPanel.workflowKindLabel": "ワークフロー",
+  "BackgroundTasksPanel.savedWorkflowsHeading": "保存済みワークフロー",
+  "BackgroundTasksPanel.saveWorkflowButton": "ワークフローを保存",
+  "BackgroundTasksPanel.savedWorkflowShape": "{{phases}} フェーズ · {{agents}} エージェント",
+  "BackgroundTasksPanel.savedWorkflowLastRun": "最終実行 {{when}}",
+  "BackgroundTasksPanel.savedWorkflowNeverRun": "未実行",
+  "BackgroundTasksPanel.savedWorkflowDeleteAriaLabel": "保存済みワークフロー「{{name}}」を削除",
+  "BackgroundTasksPanel.phaseQueued": "待機中",
+  "BackgroundTasksPanel.stopAllAriaLabel": "実行中のエージェントをすべて停止",
+  "BackgroundTasksPanel.tableAgentHeader": "エージェント",
+  "BackgroundTasksPanel.tableTokensHeader": "トークン",
+  "BackgroundTasksPanel.tableToolsHeader": "ツール",
+  "BackgroundTasksPanel.tableTimeHeader": "時間",
   "MessageList.emptyStateTitle": "まだ何もありません",
   "MessageList.emptyStateDescription": "Little Monkeyにワークスペース内の説明・作成・修正を依頼して始めましょう。",
   "ModeSelector.modeManualLabel": "手動",
@@ -1261,6 +1284,13 @@ export const ja: Record<string, string> = {
   "AddCustomProviderForm.addButton": "追加",
   "AddCustomProviderForm.helpText": "OpenAI互換のベースURLであれば利用できます — アプリが自動的に/chat/completionsと/modelsを付加します。",
   "AutomationPanel.reliabilityHeading": "信頼性",
+  "AutomationPanel.hooksHeading": "フック",
+  "AutomationPanel.hooksDescription": "エージェントのライフサイクルイベントで実行されるシェルコマンド。PreToolUse フックはツール呼び出しをブロックできます（非ゼロ終了、または stdout への {\"decision\":\"deny\"}）。UserPromptSubmit の出力はターンのコンテキストに追加されます。タイムアウト 10 秒、許可プロンプトなし。",
+  "AutomationPanel.hookEventLabel": "イベント",
+  "AutomationPanel.hookMatcherPlaceholder": "ツールマッチャー（正規表現、任意）",
+  "AutomationPanel.hookCommandPlaceholder": "シェルコマンド",
+  "AutomationPanel.hookAddButton": "フックを追加",
+  "AutomationPanel.hookDeleteAriaLabel": "フック「{{command}}」を削除",
   "AutomationPanel.autoFailoverLabel": "プロバイダー間の自動フェイルオーバー",
   "AutomationPanel.autoFailoverDescription": "クラウドプロバイダーが応答前にエラーになった場合、ターンを失敗させずに、設定済みの別のプロバイダーで自動的に再試行します。",
   "AutomationPanel.autoVisionSwitchLabel": "画像用にビジョンモデルへ自動切り替え",
@@ -1325,6 +1355,10 @@ export const ja: Record<string, string> = {
   "AutomationPanel.subagentModelOverrideExploreLabel": "Exploreプロファイル",
   "AutomationPanel.subagentModelOverrideCodeLabel": "Codeプロファイル",
   "AutomationPanel.subagentModelOverrideDefaultBadge": "親と同じ",
+  "AutomationPanel.customAgentsIntro": "開いているワークスペースの .monkey/agents/*.md によるカスタムエージェント — それぞれが task・workflow ツールで使える追加プロファイルになります。",
+  "AutomationPanel.customAgentsRefreshButton": "更新",
+  "AutomationPanel.customAgentsLoading": ".monkey/agents をスキャン中…",
+  "AutomationPanel.customAgentsEmpty": "カスタムエージェントが見つかりません。ワークスペースの .monkey/agents/ に name・description・tools のフロントマターを持つ markdown ファイルを追加してください。",
   "AutomationPanel.checkpointsHeading": "チェックポイント",
   "AutomationPanel.checkpointRetentionLabel": "保持する件数",
   "AutomationPanel.checkpointRetentionDescription": "古いものが削除される前にディスク上に保持する最近のチェックポイントの数です。次に作成されるチェックポイントから適用されます。",
@@ -1654,15 +1688,8 @@ export const ja: Record<string, string> = {
   "KnowledgePanel.addFileButton": "ファイルを追加",
   "KnowledgePanel.noSourcesHint": "ソースがまだありません — インデックスするフォルダまたはファイルを追加してください。",
   "KnowledgePanel.removeSourceAriaLabel": "ソースを削除",
-  "KnowledgePanel.reindexButton": "再インデックス",
-  "KnowledgePanel.cancelIndexButton": "インデックス作成を中止",
-  "KnowledgePanel.phaseWalking": "ファイルをスキャン中…",
-  "KnowledgePanel.phaseChunking": "分割中…（{{done}}/{{total}} ファイル）",
-  "KnowledgePanel.phaseEmbedding": "埋め込み中…（{{chunks}} チャンク）",
-  "KnowledgePanel.phaseDone": "インデックス済み",
   "KnowledgePanel.neverIndexed": "未インデックス",
   "KnowledgePanel.indexedAt": "{{when}} にインデックス済み · {{count}} チャンク",
-  "KnowledgePanel.staleIndexBadge": "再インデックスが必要",
   "KnowledgePanel.testSearchHeading": "テスト検索",
   "KnowledgePanel.notIndexedForSearch": "検索する前にこのスタックをインデックスしてください。",
   "KnowledgePanel.searchPlaceholder": "このスタックを検索…",
@@ -2459,7 +2486,6 @@ export const ja: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "予算を有効にする",
   "UsagePanel.dailyBudget": "日次予算(USD)",
   "UsagePanel.monthlyBudget": "月次予算(USD)",
-  "UsagePanel.warningThreshold": "警告しきい値(%)",
   "UsagePanel.enforcement": "上限到達時",
   "UsagePanel.enforcementWarn": "警告のみ",
   "UsagePanel.enforcementPause": "クラウド呼び出しを一時停止",
@@ -2519,7 +2545,7 @@ export const ja: Record<string, string> = {
   "Studio.add.repoFilePlaceholder": "split_files/vae/wan2.2_vae.safetensors",
   "Studio.add.namePlaceholder": "Wan 2.2 TI2V 5B",
   "Studio.add.familyPlaceholder": "Wan",
-  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --offload-to-cpu",
+  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --threads 8 --offload-to-cpu",
   "Studio.speakerPlaceholder": "/Users/you/voices/narrator.wav",
   "Studio.languagePlaceholder": "ja",
   "Studio.add.name": "名前",
@@ -2641,3 +2667,34 @@ export const ja: Record<string, string> = {
   "Studio.unsupported.title": "このマシンではスタジオを利用できません",
   "Studio.unsupported.body": "生成エンジンは Apple シリコンの Mac と x86-64 の Windows・Linux 向けにビルド済みで配布されています。チャットとコードには影響ありません。"
 };
+
+/**
+ * Every key, so this locale's key set is identical to the base's *by
+ * construction* (roadmap K22).
+ *
+ * Before this, each locale carried only the keys somebody had translated, so
+ * the sets diverged by over a thousand entries and nothing could be enforced: a
+ * key renamed in `en` left ten locales pointing at one that no longer existed,
+ * and no check failed. `useT()` already fell back to English for a missing key,
+ * so **no user-visible text changes** — what changes is that the divergence is
+ * now impossible rather than merely unmeasured, and `localeSync.test.ts` holds
+ * it that way.
+ *
+ * `en` is imported by `index.ts` unconditionally as the runtime fallback, so
+ * spreading it here costs nothing at the bundle: those bytes were already
+ * loaded for every locale.
+ *
+ * The real translation gap stays countable: `TRANSLATED_KEYS` below is what this
+ * locale actually says in its own words, and everything else is showing English.
+ */
+export const ja: Record<string, string> = { ...en, ...translated };
+
+/**
+ * The keys this locale genuinely translates.
+ *
+ * Exported so the count of what is *not* translated is exact rather than
+ * inferred from "the string happens to equal English" — many real translations
+ * legitimately do ("OK", "Studio", a product name).
+ */
+export const jaTranslatedKeys: readonly string[] = Object.keys(translated);
+

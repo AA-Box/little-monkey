@@ -1,3 +1,4 @@
+import { en } from "./en";
 import { crewLocale } from "./crew";
 import { runLocale } from "./runs";
 import { searchLocale } from "./search";
@@ -39,7 +40,8 @@ import { privacyFirewallLocale } from "./privacyFirewall";
 import { redTeamLabLocale } from "./redTeamLab";
 import { sandboxLocale } from "./sandbox";
 
-export const id: Record<string, string> = {
+/** What this locale says in its own words — everything else falls back to English. */
+const translated: Record<string, string> = {
   ...dbAdminGuardrailsLocale,
   ...developerLocale,
   ...ecosystemLocale,
@@ -1084,6 +1086,11 @@ export const id: Record<string, string> = {
   "MessageList.recipeStartedFromLocalApp": "Dimulai dari resep: {{name}} · melalui Local App \"{{appName}}\"",
   "SubagentRow.profileExplore": "eksplorasi",
   "SubagentRow.profileCode": "kode",
+  "SubagentRow.worktreeChanges": "Perubahan di worktree",
+  "SubagentRow.worktreeApply": "Terapkan",
+  "SubagentRow.worktreeDiscard": "Buang",
+  "SubagentRow.worktreeApplied": "Diterapkan ke ruang kerja",
+  "SubagentRow.worktreeDiscarded": "Dibuang",
   "SubagentRow.statusRunning": "Berjalan",
   "SubagentRow.statusDone": "Selesai",
   "SubagentRow.statusFailed": "Gagal",
@@ -1100,6 +1107,8 @@ export const id: Record<string, string> = {
   "BackgroundTasksPanel.finishedHeading": "Selesai",
   "BackgroundTasksPanel.clearButton": "Bersihkan",
   "BackgroundTasksPanel.stopAriaLabel": "Hentikan \"{{name}}\"",
+  "BackgroundTasksPanel.steerPlaceholder": "Kirim pesan ke agen ini…",
+  "BackgroundTasksPanel.steerSendAriaLabel": "Kirim pesan ke \"{{name}}\"",
   "BackgroundTasksPanel.shellKindLabel": "Shell",
   "BackgroundTasksPanel.agentKindLabel": "Agen",
   "BackgroundTasksPanel.exitCode": "exit {{code}}",
@@ -1120,6 +1129,20 @@ export const id: Record<string, string> = {
   "BackgroundTasksPanel.agentStatusCompleted": "Selesai",
   "BackgroundTasksPanel.agentStatusFailed": "Gagal",
   "BackgroundTasksPanel.agentStatusCancelled": "Dibatalkan",
+  "BackgroundTasksPanel.agentGroupTitle": "{{count}} agen",
+  "BackgroundTasksPanel.workflowKindLabel": "Alur kerja",
+  "BackgroundTasksPanel.savedWorkflowsHeading": "Alur kerja tersimpan",
+  "BackgroundTasksPanel.saveWorkflowButton": "Simpan alur kerja",
+  "BackgroundTasksPanel.savedWorkflowShape": "{{phases}} fase · {{agents}} agen",
+  "BackgroundTasksPanel.savedWorkflowLastRun": "Terakhir dijalankan {{when}}",
+  "BackgroundTasksPanel.savedWorkflowNeverRun": "Belum pernah dijalankan",
+  "BackgroundTasksPanel.savedWorkflowDeleteAriaLabel": "Hapus alur kerja tersimpan \"{{name}}\"",
+  "BackgroundTasksPanel.phaseQueued": "Dalam antrean",
+  "BackgroundTasksPanel.stopAllAriaLabel": "Hentikan semua agen yang berjalan",
+  "BackgroundTasksPanel.tableAgentHeader": "Agen",
+  "BackgroundTasksPanel.tableTokensHeader": "Token",
+  "BackgroundTasksPanel.tableToolsHeader": "Alat",
+  "BackgroundTasksPanel.tableTimeHeader": "Waktu",
   "MessageList.emptyStateTitle": "Belum ada apa pun di sini",
   "MessageList.emptyStateDescription": "Minta Little Monkey menjelaskan, menulis, atau memperbaiki sesuatu di ruang kerja Anda untuk memulai.",
   "ModeSelector.modeManualLabel": "Manual",
@@ -1262,6 +1285,13 @@ export const id: Record<string, string> = {
   "AddCustomProviderForm.addButton": "Tambah",
   "AddCustomProviderForm.helpText": "URL dasar apa pun yang kompatibel dengan OpenAI — aplikasi akan menambahkan /chat/completions dan /models.",
   "AutomationPanel.reliabilityHeading": "Keandalan",
+  "AutomationPanel.hooksHeading": "Hook",
+  "AutomationPanel.hooksDescription": "Perintah shell yang berjalan pada peristiwa siklus hidup agen. Hook PreToolUse dapat memblokir panggilan alat (keluaran bukan nol, atau {\"decision\":\"deny\"} di stdout); keluaran UserPromptSubmit ditambahkan ke konteks giliran. Batas waktu 10 detik, tanpa permintaan izin.",
+  "AutomationPanel.hookEventLabel": "Peristiwa",
+  "AutomationPanel.hookMatcherPlaceholder": "Pencocok alat (regex, opsional)",
+  "AutomationPanel.hookCommandPlaceholder": "Perintah shell",
+  "AutomationPanel.hookAddButton": "Tambah hook",
+  "AutomationPanel.hookDeleteAriaLabel": "Hapus hook \"{{command}}\"",
   "AutomationPanel.autoFailoverLabel": "Failover otomatis antar-penyedia",
   "AutomationPanel.autoFailoverDescription": "Jika penyedia cloud mengalami kesalahan sebelum merespons, coba lagi secara otomatis dengan penyedia lain yang telah dikonfigurasi alih-alih menggagalkan giliran ini.",
   "AutomationPanel.autoVisionSwitchLabel": "Beralih otomatis ke model visi untuk gambar",
@@ -1326,6 +1356,10 @@ export const id: Record<string, string> = {
   "AutomationPanel.subagentModelOverrideExploreLabel": "Profil explore",
   "AutomationPanel.subagentModelOverrideCodeLabel": "Profil code",
   "AutomationPanel.subagentModelOverrideDefaultBadge": "Sama seperti induk",
+  "AutomationPanel.customAgentsIntro": "Agen kustom dari .monkey/agents/*.md di ruang kerja yang terbuka — masing-masing menjadi profil tambahan yang diterima alat task dan workflow.",
+  "AutomationPanel.customAgentsRefreshButton": "Segarkan",
+  "AutomationPanel.customAgentsLoading": "Memindai .monkey/agents…",
+  "AutomationPanel.customAgentsEmpty": "Tidak ada agen kustom yang ditemukan. Tambahkan file markdown dengan frontmatter name, description, dan tools ke .monkey/agents/ di ruang kerja Anda.",
   "AutomationPanel.checkpointsHeading": "Checkpoint",
   "AutomationPanel.checkpointRetentionLabel": "Simpan yang terbaru",
   "AutomationPanel.checkpointRetentionDescription": "Berapa banyak checkpoint terbaru yang disimpan di disk sebelum yang terlama dihapus. Berlaku mulai checkpoint berikutnya yang dibuat.",
@@ -1657,15 +1691,8 @@ export const id: Record<string, string> = {
   "KnowledgePanel.addFileButton": "Tambah file",
   "KnowledgePanel.noSourcesHint": "Belum ada sumber — tambahkan folder atau file untuk diindeks.",
   "KnowledgePanel.removeSourceAriaLabel": "Hapus sumber",
-  "KnowledgePanel.reindexButton": "Indeks ulang",
-  "KnowledgePanel.cancelIndexButton": "Batalkan pengindeksan",
-  "KnowledgePanel.phaseWalking": "Memindai file…",
-  "KnowledgePanel.phaseChunking": "Membagi menjadi potongan… ({{done}}/{{total}} file)",
-  "KnowledgePanel.phaseEmbedding": "Membuat embedding… ({{chunks}} potongan)",
-  "KnowledgePanel.phaseDone": "Terindeks",
   "KnowledgePanel.neverIndexed": "Belum diindeks",
   "KnowledgePanel.indexedAt": "Diindeks {{when}} · {{count}} potongan",
-  "KnowledgePanel.staleIndexBadge": "Perlu diindeks ulang",
   "KnowledgePanel.testSearchHeading": "Uji pencarian",
   "KnowledgePanel.notIndexedForSearch": "Indeks stack ini sebelum mencari.",
   "KnowledgePanel.searchPlaceholder": "Cari di stack ini…",
@@ -2460,7 +2487,6 @@ export const id: Record<string, string> = {
   "UsagePanel.costControlsEnabled": "Aktifkan anggaran",
   "UsagePanel.dailyBudget": "Anggaran harian (USD)",
   "UsagePanel.monthlyBudget": "Anggaran bulanan (USD)",
-  "UsagePanel.warningThreshold": "Peringatkan pada (%)",
   "UsagePanel.enforcement": "Saat batas tercapai",
   "UsagePanel.enforcementWarn": "Hanya peringatkan",
   "UsagePanel.enforcementPause": "Jeda panggilan cloud",
@@ -2520,7 +2546,7 @@ export const id: Record<string, string> = {
   "Studio.add.repoFilePlaceholder": "split_files/vae/wan2.2_vae.safetensors",
   "Studio.add.namePlaceholder": "Wan 2.2 TI2V 5B",
   "Studio.add.familyPlaceholder": "Wan",
-  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --offload-to-cpu",
+  "Studio.add.engineArgsPlaceholder": "--diffusion-fa --threads 8 --offload-to-cpu",
   "Studio.speakerPlaceholder": "/Users/anda/suara/narator.wav",
   "Studio.languagePlaceholder": "id",
   "Studio.add.name": "Nama",
@@ -2642,3 +2668,34 @@ export const id: Record<string, string> = {
   "Studio.unsupported.title": "Studio tidak tersedia di mesin ini",
   "Studio.unsupported.body": "Mesin generasi dikirim dalam bentuk terbangun untuk Mac Apple silicon serta Windows dan Linux x86-64. Chat dan Code tidak terpengaruh."
 };
+
+/**
+ * Every key, so this locale's key set is identical to the base's *by
+ * construction* (roadmap K22).
+ *
+ * Before this, each locale carried only the keys somebody had translated, so
+ * the sets diverged by over a thousand entries and nothing could be enforced: a
+ * key renamed in `en` left ten locales pointing at one that no longer existed,
+ * and no check failed. `useT()` already fell back to English for a missing key,
+ * so **no user-visible text changes** — what changes is that the divergence is
+ * now impossible rather than merely unmeasured, and `localeSync.test.ts` holds
+ * it that way.
+ *
+ * `en` is imported by `index.ts` unconditionally as the runtime fallback, so
+ * spreading it here costs nothing at the bundle: those bytes were already
+ * loaded for every locale.
+ *
+ * The real translation gap stays countable: `TRANSLATED_KEYS` below is what this
+ * locale actually says in its own words, and everything else is showing English.
+ */
+export const id: Record<string, string> = { ...en, ...translated };
+
+/**
+ * The keys this locale genuinely translates.
+ *
+ * Exported so the count of what is *not* translated is exact rather than
+ * inferred from "the string happens to equal English" — many real translations
+ * legitimately do ("OK", "Studio", a product name).
+ */
+export const idTranslatedKeys: readonly string[] = Object.keys(translated);
+

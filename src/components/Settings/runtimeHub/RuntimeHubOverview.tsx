@@ -1,8 +1,10 @@
+import { useEffect, useState } from "react";
 import { Boxes, Cpu, Database, Gauge, HardDrive, Server } from "lucide-react";
 import { StatusPill } from "../../ui";
 import { useRuntimeHubStore } from "../../../store/runtimeHubStore";
 import { resolveEdgeRuntimeProfile } from "../../../lib/runtimeEdgeProfiles";
-import type { M3AcceleratorStatus } from "../../../lib/runtimeHubClient";
+import type { BenchmarkHistoryEntry, M3AcceleratorStatus } from "../../../lib/runtimeHubClient";
+import { runtimeHubClient } from "../../../lib/runtimeHubClient";
 import { ErrorNotice, formatBytes, labelize, SectionHeading } from "./RuntimeHubShared";
 
 const COMPATIBILITY_TONE: Record<M3AcceleratorStatus, "success" | "warning" | "danger" | "neutral"> = {
@@ -54,6 +56,24 @@ export function RuntimeHubOverview() {
   const compatibilityReport = useRuntimeHubStore((state) => state.compatibilityReport);
   const compatibilityError = useRuntimeHubStore((state) => state.errors.compatibility);
 
+  // The edge profile's throughput line defers to "the local benchmark" — this is
+  // what lets it stop deferring once one has actually been run. A read failure
+  // leaves the list empty, which is the same state as "never benchmarked" and
+  // renders the same hedge, so there is nothing to report.
+  const [benchmarks, setBenchmarks] = useState<BenchmarkHistoryEntry[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    runtimeHubClient
+      .benchmarkHistory()
+      .then((entries) => {
+        if (!cancelled) setBenchmarks(entries);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const usedPercent = storage?.quotaBytes
     ? Math.min(100, Math.max(0, (storage.usedBytes / storage.quotaBytes) * 100))
     : 0;
@@ -79,7 +99,7 @@ export function RuntimeHubOverview() {
     },
   ];
   const edgeProfile = hardware && profile
-    ? resolveEdgeRuntimeProfile(hardware, profile, compatibilityReport)
+    ? resolveEdgeRuntimeProfile(hardware, profile, compatibilityReport, benchmarks)
     : null;
 
   return (
@@ -238,6 +258,7 @@ export function RuntimeHubOverview() {
               <tr className="border-b border-border">
                 <th className="px-2 py-2 font-medium">Backend</th>
                 <th className="px-2 py-2 font-medium">Status</th>
+                <th className="px-2 py-2 font-medium">Runs work here</th>
                 <th className="px-2 py-2 font-medium">Driver / compute</th>
                 <th className="px-2 py-2 font-medium">Details</th>
               </tr>
@@ -253,15 +274,35 @@ export function RuntimeHubOverview() {
                         {!accelerator.confirmed ? " (unconfirmed)" : ""}
                       </StatusPill>
                     </td>
+                    {/* Deliberately its own column rather than folded into the
+                        status pill: "detected" and "this app can use it" are
+                        different facts, and three of the six backends are the
+                        first without being the second. */}
+                    <td className="px-2 py-3">
+                      <StatusPill tone={accelerator.execution.state === "executes" ? "success" : "neutral"}>
+                        {accelerator.execution.state === "executes" ? "Yes" : "Detection only"}
+                      </StatusPill>
+                    </td>
                     <td className="px-2 py-3 text-muted">
                       {[accelerator.driverVersion, accelerator.computeCapability].filter(Boolean).join(" · ") || "—"}
                     </td>
-                    <td className="px-2 py-3 text-muted">{accelerator.summary}</td>
+                    <td className="px-2 py-3 text-muted">
+                      {accelerator.summary}
+                      {/* The reason, next to the claim it qualifies. A backend
+                          nothing runs on is the case a user most needs an
+                          explanation for, and it is the one the summary — which
+                          describes the *hardware* — cannot give. */}
+                      <span className="mt-1 block text-faint">
+                        {accelerator.execution.state === "executes"
+                          ? `Runs on ${accelerator.execution.via}.`
+                          : accelerator.execution.reason}
+                      </span>
+                    </td>
                   </tr>
                 ))
               ) : (
                 <tr>
-                  <td colSpan={4} className="px-2 py-3 text-muted">Detecting hardware compatibility…</td>
+                  <td colSpan={5} className="px-2 py-3 text-muted">Detecting hardware compatibility…</td>
                 </tr>
               )}
             </tbody>

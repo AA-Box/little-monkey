@@ -246,6 +246,9 @@ function timelineSummary(envelope: RunEventEnvelopeWire): { title: string; summa
     };
     case "permission_requested": return { title: "Approval requested", summary: `${event.payload.tool_name}: ${shortText(event.payload.detail)}` };
     case "permission_decided": return { title: "Approval decided", summary: event.payload.decision.replace(/_/g, " ") };
+    // The reason is the whole point of the event: it is the sentence that names
+    // the policy, which is what "which policy chose this target" asks for.
+    case "routing_decided": return { title: "Dispatch decided", summary: shortText(event.payload.reason) };
     case "tool_started": return { title: "Tool started", summary: event.payload.tool_call_id };
     case "tool_finished": return { title: "Tool finished", summary: `${event.payload.outcome} in ${event.payload.duration_ms} ms` };
     case "artifact_added": return { title: "Artifact captured", summary: `${event.payload.name} · ${event.payload.media_type}` };
@@ -259,6 +262,10 @@ function timelineSummary(envelope: RunEventEnvelopeWire): { title: string; summa
       summary: `${event.payload.usage.input_tokens + event.payload.usage.output_tokens} tokens · ${event.payload.usage.tool_calls} tool calls`,
     };
     case "cancellation_requested": return { title: "Cancellation requested", summary: event.payload.reason ?? "No reason recorded." };
+    // The other node is the fact a reader of a migrated run needs; the run id
+    // is already the thing they are looking at.
+    case "migration_departed": return { title: "Migrated away", summary: `Handed to node ${event.payload.target_node_id}.` };
+    case "migration_arrived": return { title: "Migrated here", summary: `Received from node ${event.payload.origin_node_id}, continuing its chain from sequence ${event.payload.origin_last_sequence}.` };
     case "external_mutation_prepared": return { title: "External effect prepared", summary: event.payload.summary };
     case "external_mutation_confirmed": return { title: "External effect confirmed", summary: event.payload.summary };
     case "awaiting_approval": return { title: "Awaiting approval", summary: event.payload.reason ?? event.payload.request_id };

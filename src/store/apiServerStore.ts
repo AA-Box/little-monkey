@@ -5,9 +5,8 @@ import { listen } from "@tauri-apps/api/event";
 /** Mirrors the Rust `ApiServerStatusPayload` struct (src-tauri/src/server.rs)
  * exactly — the shape both `api_server_start`/`_stop`/`_status` return and
  * the `apiserver://status` event carries, same convention as
- * `llama.rs`/`ollama.rs`'s own status payloads. No token material lives
- * here (that was a phase-1-only stopgap) — see `mintedToken` below for the
- * "show once" flow. */
+ * `llama.rs`/`ollama.rs`'s own status payloads. No token plaintext ever
+ * enters this compatibility store. */
 export interface ApiServerStatus {
   status: "stopped" | "starting" | "running" | "error";
   port: number;
@@ -68,24 +67,15 @@ export interface TokenAuditEntry {
 }
 
 /** Mirrors the Rust `ApiServerConfigView` struct — the subset of
- * `api_server.json` the Settings panel gets/sets directly. Tokens are
- * managed separately via their own create/revoke/list commands. */
+ * `api_server.json` the Settings panel gets/sets directly. Existing legacy
+ * tokens remain listable/revocable during migration, but new client
+ * credentials are issued only by Runtime Hub pairing. */
 export interface ApiServerConfig {
   port: number;
   autostart: boolean;
   require_token: boolean;
   expose_ollama: boolean;
   expose_providers: boolean;
-}
-
-/** Mirrors the Rust `CreateTokenResult` struct — the plaintext token,
- * returned exactly once by `api_server_create_token`. Held in
- * `mintedToken` until the user dismisses it; never persisted anywhere on
- * the frontend (not even to `localStorage`) and never refetchable — only
- * `entry.sha256`'s absence-from-the-frontend digest lives on afterward. */
-export interface MintedToken {
-  token: string;
-  entry: TokenEntry;
 }
 
 /** LM Studio-compatible default, matching `server.rs::DEFAULT_PORT` — used
@@ -115,10 +105,6 @@ export interface ApiServerStore {
   tokens: TokenEntry[];
   /** Whether `refresh()` has resolved at least once. */
   loaded: boolean;
-  /** The most recently minted token's plaintext, shown once by the panel's
-   * "copy it now" banner. Cleared by `dismissMintedToken()` (the user
-   * closing the banner) or by minting another one. */
-  mintedToken: MintedToken | null;
 
   refresh: () => Promise<void>;
   start: () => Promise<void>;
@@ -129,9 +115,7 @@ export interface ApiServerStore {
    * gracefully restarts it with the new settings (the `apiserver://status`
    * event subscription below picks up the resulting status change live). */
   setConfig: (config: ApiServerConfig) => Promise<void>;
-  createToken: (label: string, scopes: Scope[], backends: Backend[], expiresAt?: number | null) => Promise<void>;
   revokeToken: (id: string) => Promise<void>;
-  dismissMintedToken: () => void;
   /** Fetches the redacted revoke-and-active audit log for export/preview in
    * the panel — never includes the digest or plaintext. */
   exportAudit: () => Promise<TokenAuditEntry[]>;
@@ -142,7 +126,6 @@ export const useApiServerStore = create<ApiServerStore>((set) => ({
   config: DEFAULT_API_SERVER_CONFIG,
   tokens: [],
   loaded: false,
-  mintedToken: null,
 
   refresh: async () => {
     const [status, config, tokens] = await Promise.all([
@@ -168,22 +151,10 @@ export const useApiServerStore = create<ApiServerStore>((set) => ({
     set({ config: updated });
   },
 
-  createToken: async (label, scopes, backends, expiresAt = null) => {
-    const result = await invoke<MintedToken>("api_server_create_token", {
-      label,
-      scopes,
-      backends,
-      expiresAt,
-    });
-    set((state) => ({ mintedToken: result, tokens: [...state.tokens, result.entry] }));
-  },
-
   revokeToken: async (id) => {
     await invoke("api_server_revoke_token", { id });
     set((state) => ({ tokens: state.tokens.filter((t) => t.id !== id) }));
   },
-
-  dismissMintedToken: () => set({ mintedToken: null }),
 
   exportAudit: () => invoke<TokenAuditEntry[]>("api_server_export_audit"),
 }));

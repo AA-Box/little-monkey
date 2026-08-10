@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { Plus, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronUp, Plus, Trash2 } from "lucide-react";
 import { Button, StatusPill } from "../ui";
 import {
   MAX_CHECKPOINT_RETENTION,
   MAX_MAX_CONCURRENT_SUBAGENTS,
+  MAX_PROCESS_WALL_BUDGET_HOURS,
   MAX_VERIFY_MAX_ROUNDS,
   MIN_CHECKPOINT_RETENTION,
   MIN_MAX_CONCURRENT_SUBAGENTS,
+  MIN_PROCESS_WALL_BUDGET_HOURS,
   MIN_VERIFY_MAX_ROUNDS,
   useSettingsStore,
   type ContextTrimStrategy,
@@ -19,6 +21,15 @@ import { useCliInstallStore } from "../../store/cliInstallStore";
 import { providerModelKey } from "../../lib/visionModels";
 import { useT } from "../../lib/i18n";
 import { errorMessage } from "../../lib/errors";
+import {
+  ROUTING_TASK_CLASSES,
+  type RoutingPolicy,
+  type RoutingTaskClass,
+} from "../../lib/modelRouting";
+import { buildModelTargetInventory } from "../../lib/modelTargets";
+import { useRoutingPolicyStore } from "../../store/routingPolicyStore";
+import { USER_HOOK_EVENTS, useUserHooksStore, type UserHookEvent } from "../../store/userHooksStore";
+import { useCustomAgentStore } from "../../store/customAgentStore";
 
 /** No shared toggle-switch component exists in `ui/` yet — this one is small and specific enough to keep local rather than promote prematurely. */
 function Toggle({
@@ -250,6 +261,65 @@ function SubagentModelOverrideRow({
         <StatusPill tone="neutral">{t("AutomationPanel.subagentModelOverrideDefaultBadge")}</StatusPill>
       )}
     </div>
+  );
+}
+
+/**
+ * Loaded `.monkey/agents/*.md` custom agent definitions plus their per-file
+ * load errors — the visibility half of the "fail the def with a visible
+ * warning, not silently" contract (`customAgents.ts`). Refreshes on mount so
+ * opening Settings always reflects the files on disk, and offers a manual
+ * refresh for mid-session edits.
+ */
+function CustomAgentsSection() {
+  const { t } = useT();
+  const defs = useCustomAgentStore((state) => state.defs);
+  const errors = useCustomAgentStore((state) => state.errors);
+  const loadedAt = useCustomAgentStore((state) => state.loadedAt);
+  useEffect(() => {
+    void useCustomAgentStore.getState().refresh();
+  }, []);
+  const list = useMemo(() => Object.values(defs).sort((a, b) => a.name.localeCompare(b.name)), [defs]);
+
+  return (
+    <>
+      <div className="mb-1 mt-3 flex items-center justify-between gap-2">
+        <p className="text-xs text-muted">{t("AutomationPanel.customAgentsIntro")}</p>
+        <button
+          type="button"
+          onClick={() => void useCustomAgentStore.getState().refresh()}
+          className="shrink-0 cursor-pointer text-xs text-faint hover:text-foreground"
+        >
+          {t("AutomationPanel.customAgentsRefreshButton")}
+        </button>
+      </div>
+      <div className="rounded-lg border border-border bg-background px-3">
+        {list.length === 0 && errors.length === 0 ? (
+          <p className="py-2.5 text-xs text-faint">
+            {loadedAt === null ? t("AutomationPanel.customAgentsLoading") : t("AutomationPanel.customAgentsEmpty")}
+          </p>
+        ) : (
+          <>
+            {list.map((def) => (
+              <div key={def.name} className="flex flex-col gap-0.5 border-t border-border py-2.5 first:border-t-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium text-foreground">{def.name}</span>
+                  {def.effort && <StatusPill tone="neutral">{def.effort}</StatusPill>}
+                  <span className="ml-auto font-mono text-[10px] text-faint">{def.sourcePath}</span>
+                </div>
+                <span className="text-xs text-muted">{def.description}</span>
+                <span className="font-mono text-[10px] text-faint">{def.tools.join(", ")}</span>
+              </div>
+            ))}
+            {errors.map((error) => (
+              <p key={error.path} className="my-2 rounded border border-danger bg-danger-soft px-2 py-1 text-xs text-danger">
+                {error.path}: {error.message}
+              </p>
+            ))}
+          </>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -532,6 +602,298 @@ function CliInstallSection() {
   );
 }
 
+/** Numeric policy field: empty input means "no ceiling", which is a real,
+ * distinct state from zero — a `0` ceiling would exclude every paid model. */
+function CeilingInput({
+  value,
+  onChange,
+  placeholder,
+  step,
+}: {
+  value: number | null;
+  onChange: (value: number | null) => void;
+  placeholder: string;
+  step?: string;
+}) {
+  return (
+    <input
+      type="number"
+      min={0}
+      step={step ?? "0.01"}
+      value={value === null ? "" : value}
+      placeholder={placeholder}
+      onChange={(event) => {
+        const parsed = Number(event.target.value);
+        onChange(
+          event.target.value === "" || !Number.isFinite(parsed) || parsed <= 0 ? null : parsed,
+        );
+      }}
+      className="h-8 w-28 rounded-md border border-border bg-surface px-2 text-right text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+    />
+  );
+}
+
+/**
+ * K9 (docs/agent-os-roadmap.md) — authoring surface for dispatch policies.
+ *
+ * The list order is the evaluation order (`matchPolicy` takes the first
+ * enabled policy covering a task class), which is why the reorder buttons are
+ * the whole precedence story and no priority field exists to disagree with
+ * what is on screen. Every policy is created disabled, so authoring one can
+ * never change where a turn goes until the user says so.
+ */
+function DispatchPolicySection() {
+  const { t } = useT();
+  const policies = useRoutingPolicyStore((s) => s.policies);
+  const addPolicy = useRoutingPolicyStore((s) => s.addPolicy);
+  const updatePolicy = useRoutingPolicyStore((s) => s.updatePolicy);
+  const removePolicy = useRoutingPolicyStore((s) => s.removePolicy);
+  const movePolicy = useRoutingPolicyStore((s) => s.movePolicy);
+  const lastDecision = useRoutingPolicyStore((s) => s.lastDecision);
+
+  const installed = useModelStore((s) => s.installed);
+  const active = useModelStore((s) => s.active);
+  const llamaStatus = useModelStore((s) => s.llamaStatus);
+  const ollamaModels = useModelStore((s) => s.ollamaModels);
+  const ollamaReachable = useModelStore((s) => s.ollamaReachable);
+  const providers = useModelStore((s) => s.providers);
+  const providerModels = useModelStore((s) => s.providerModels);
+
+  // The same inventory dispatch itself routes over, so a key offered here is
+  // by construction a target a policy can actually reach.
+  const targets = useMemo(
+    () =>
+      buildModelTargetInventory({
+        installed,
+        active,
+        llamaStatus,
+        ollamaModels,
+        ollamaReachable,
+        providers,
+        providerModels,
+      }).targets,
+    [installed, active, llamaStatus, ollamaModels, ollamaReachable, providers, providerModels],
+  );
+  const labelFor = (key: string) =>
+    targets.find((target) => target.key === key)
+      ? `${targets.find((target) => target.key === key)!.label} · ${targets.find((target) => target.key === key)!.displayName}`
+      : key;
+
+  const toggleTaskClass = (policy: RoutingPolicy, taskClass: RoutingTaskClass) => {
+    const next = policy.taskClasses.includes(taskClass)
+      ? policy.taskClasses.filter((entry) => entry !== taskClass)
+      : [...policy.taskClasses, taskClass];
+    updatePolicy(policy.id, { taskClasses: next });
+  };
+
+  return (
+    <section>
+      <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">
+        {t("AutomationPanel.dispatchPolicyHeading")}
+      </h3>
+      <p className="mb-2 text-xs text-muted">{t("AutomationPanel.dispatchPolicyIntro")}</p>
+
+      {lastDecision && (
+        <div className="mb-2 rounded-lg border border-border bg-background p-3 text-xs">
+          <span className="font-semibold text-foreground">
+            {t("AutomationPanel.dispatchLastDecisionLabel")}
+          </span>{" "}
+          <span className="text-muted">{lastDecision.reason}</span>
+          {lastDecision.rejected.length > 0 && (
+            <ul className="mt-1.5 flex flex-col gap-0.5 text-faint">
+              {lastDecision.rejected.map((rejection) => (
+                <li key={rejection.key}>
+                  {labelFor(rejection.key)} — {rejection.reason}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      <div className="flex flex-col gap-2">
+        {policies.map((policy, index) => (
+          <div key={policy.id} className="rounded-lg border border-border bg-background p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                value={policy.name}
+                onChange={(event) => updatePolicy(policy.id, { name: event.target.value })}
+                className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+              />
+              <StatusPill tone={policy.enabled ? "success" : "neutral"}>
+                {policy.enabled
+                  ? t("AutomationPanel.dispatchEnabledBadge")
+                  : t("AutomationPanel.dispatchDisabledBadge")}
+              </StatusPill>
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => updatePolicy(policy.id, { enabled: !policy.enabled })}
+              >
+                {policy.enabled
+                  ? t("AutomationPanel.dispatchDisableButton")
+                  : t("AutomationPanel.dispatchEnableButton")}
+              </Button>
+              <button
+                type="button"
+                aria-label={t("AutomationPanel.dispatchMoveUpLabel")}
+                disabled={index === 0}
+                onClick={() => movePolicy(policy.id, -1)}
+                className="cursor-pointer text-faint hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <ChevronUp className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                aria-label={t("AutomationPanel.dispatchMoveDownLabel")}
+                disabled={index === policies.length - 1}
+                onClick={() => movePolicy(policy.id, 1)}
+                className="cursor-pointer text-faint hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <ChevronDown className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                aria-label={t("AutomationPanel.dispatchRemoveLabel")}
+                onClick={() => removePolicy(policy.id)}
+                className="cursor-pointer text-faint hover:text-danger"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+              <span className="text-muted">{t("AutomationPanel.dispatchAppliesToLabel")}</span>
+              {ROUTING_TASK_CLASSES.map((taskClass) => (
+                <button
+                  key={taskClass}
+                  type="button"
+                  onClick={() => toggleTaskClass(policy, taskClass)}
+                  className={`cursor-pointer rounded-md border px-2 py-1 ${
+                    policy.taskClasses.includes(taskClass)
+                      ? "border-accent text-foreground"
+                      : "border-border text-faint"
+                  }`}
+                >
+                  {t(`AutomationPanel.dispatchTaskClass_${taskClass}`)}
+                </button>
+              ))}
+              {policy.taskClasses.length === 0 && (
+                <span className="text-faint">{t("AutomationPanel.dispatchEveryClassNote")}</span>
+              )}
+            </div>
+
+            <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3 text-xs">
+              <label className="flex items-center justify-between gap-2">
+                <span className="text-muted">{t("AutomationPanel.dispatchSensitivityLabel")}</span>
+                <select
+                  value={policy.sensitivity}
+                  onChange={(event) =>
+                    updatePolicy(policy.id, {
+                      sensitivity: event.target.value === "local_only" ? "local_only" : "any",
+                    })
+                  }
+                  className="h-8 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+                >
+                  <option value="any">{t("AutomationPanel.dispatchSensitivityAny")}</option>
+                  <option value="local_only">
+                    {t("AutomationPanel.dispatchSensitivityLocalOnly")}
+                  </option>
+                </select>
+              </label>
+              <label className="flex items-center justify-between gap-2">
+                <span className="text-muted">{t("AutomationPanel.dispatchRequiresToolsLabel")}</span>
+                <input
+                  type="checkbox"
+                  checked={policy.requiresTools}
+                  onChange={(event) =>
+                    updatePolicy(policy.id, { requiresTools: event.target.checked })
+                  }
+                  className="h-4 w-4 accent-accent"
+                />
+              </label>
+              <label className="flex items-center justify-between gap-2">
+                <span className="text-muted">{t("AutomationPanel.dispatchMaxInputLabel")}</span>
+                <CeilingInput
+                  value={policy.maxInputPerMillionUsd}
+                  onChange={(value) => updatePolicy(policy.id, { maxInputPerMillionUsd: value })}
+                  placeholder={t("AutomationPanel.dispatchNoCeilingPlaceholder")}
+                />
+              </label>
+              <label className="flex items-center justify-between gap-2">
+                <span className="text-muted">{t("AutomationPanel.dispatchMaxOutputLabel")}</span>
+                <CeilingInput
+                  value={policy.maxOutputPerMillionUsd}
+                  onChange={(value) => updatePolicy(policy.id, { maxOutputPerMillionUsd: value })}
+                  placeholder={t("AutomationPanel.dispatchNoCeilingPlaceholder")}
+                />
+              </label>
+              <label className="flex items-center justify-between gap-2">
+                <span className="text-muted">{t("AutomationPanel.dispatchMaxTtftLabel")}</span>
+                <CeilingInput
+                  value={policy.maxTimeToFirstTokenMs}
+                  step="50"
+                  onChange={(value) => updatePolicy(policy.id, { maxTimeToFirstTokenMs: value })}
+                  placeholder={t("AutomationPanel.dispatchNoCeilingPlaceholder")}
+                />
+              </label>
+              <p className="text-faint">{t("AutomationPanel.dispatchMeasuredLatencyNote")}</p>
+            </div>
+
+            <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3 text-xs">
+              <span className="text-muted">{t("AutomationPanel.dispatchPreferredLabel")}</span>
+              <select
+                value=""
+                onChange={(event) => {
+                  if (!event.target.value) return;
+                  updatePolicy(policy.id, {
+                    preferredTargetKeys: [...policy.preferredTargetKeys, event.target.value],
+                  });
+                }}
+                className="h-8 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+              >
+                <option value="">{t("AutomationPanel.dispatchAddPreferredOption")}</option>
+                {targets
+                  .filter((target) => !policy.preferredTargetKeys.includes(target.key))
+                  .map((target) => (
+                    <option key={target.key} value={target.key}>
+                      {target.label} · {target.displayName}
+                    </option>
+                  ))}
+              </select>
+              {policy.preferredTargetKeys.map((key, keyIndex) => (
+                <div key={key} className="flex items-center justify-between gap-2">
+                  <span className="truncate text-muted">
+                    {keyIndex + 1}. {labelFor(key)}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updatePolicy(policy.id, {
+                        preferredTargetKeys: policy.preferredTargetKeys.filter(
+                          (entry) => entry !== key,
+                        ),
+                      })
+                    }
+                    className="cursor-pointer text-faint hover:text-danger"
+                  >
+                    {t("AutomationPanel.clearButton")}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <Button size="sm" variant="secondary" className="mt-2" onClick={() => addPolicy()}>
+        <Plus className="h-3.5 w-3.5" />
+        {t("AutomationPanel.dispatchAddPolicyButton")}
+      </Button>
+    </section>
+  );
+}
+
 /**
  * Settings tab for the client-side reliability behaviors this app ported
  * from the idea of a server-side multi-provider gateway: auto-failover,
@@ -553,6 +915,10 @@ export function AutomationPanel() {
   const setContextTrimStrategy = useSettingsStore((s) => s.setContextTrimStrategy);
   const checkpointRetention = useSettingsStore((s) => s.checkpointRetention);
   const setCheckpointRetention = useSettingsStore((s) => s.setCheckpointRetention);
+  const processWallBudgetEnabled = useSettingsStore((s) => s.processWallBudgetEnabled);
+  const setProcessWallBudgetEnabled = useSettingsStore((s) => s.setProcessWallBudgetEnabled);
+  const processWallBudgetHours = useSettingsStore((s) => s.processWallBudgetHours);
+  const setProcessWallBudgetHours = useSettingsStore((s) => s.setProcessWallBudgetHours);
   const rateLimitWarningsEnabled = useSettingsStore((s) => s.rateLimitWarningsEnabled);
   const setRateLimitWarningsEnabled = useSettingsStore((s) => s.setRateLimitWarningsEnabled);
   const providerRateLimits = useSettingsStore((s) => s.providerRateLimits);
@@ -790,6 +1156,7 @@ export function AutomationPanel() {
             onClear={() => clearSubagentProfileModel("code")}
           />
         </div>
+        <CustomAgentsSection />
       </section>
 
       <section>
@@ -822,6 +1189,37 @@ export function AutomationPanel() {
                 className="h-8 w-16 rounded-md border border-border bg-surface px-2 text-right text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
               />
               <span className="text-muted">{t("AutomationPanel.checkpointRetentionUnit")}</span>
+            </span>
+          </label>
+        </div>
+      </section>
+
+      <section>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.processWallBudgetHeading")}</h3>
+        <p className="mb-2 text-xs text-muted">{t("AutomationPanel.processWallBudgetIntro")}</p>
+        <div className="divide-y divide-border rounded-lg border border-border bg-background px-3">
+          <Toggle
+            checked={processWallBudgetEnabled}
+            onChange={setProcessWallBudgetEnabled}
+            label={t("AutomationPanel.processWallBudgetEnabledLabel")}
+            description={t("AutomationPanel.processWallBudgetEnabledDescription")}
+          />
+          <label className="flex items-center justify-between gap-3 py-2.5 text-sm">
+            <span className="flex flex-col">
+              <span className="text-foreground">{t("AutomationPanel.processWallBudgetHoursLabel")}</span>
+              <span className="text-xs text-muted">{t("AutomationPanel.processWallBudgetHoursDescription")}</span>
+            </span>
+            <span className="flex shrink-0 items-center gap-1.5">
+              <input
+                type="number"
+                min={MIN_PROCESS_WALL_BUDGET_HOURS}
+                max={MAX_PROCESS_WALL_BUDGET_HOURS}
+                value={processWallBudgetHours}
+                disabled={!processWallBudgetEnabled}
+                onChange={(event) => setProcessWallBudgetHours(Number(event.target.value))}
+                className="h-8 w-16 rounded-md border border-border bg-surface px-2 text-right text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent disabled:opacity-50"
+              />
+              <span className="text-muted">{t("AutomationPanel.processWallBudgetHoursUnit")}</span>
             </span>
           </label>
         </div>
@@ -944,9 +1342,110 @@ export function AutomationPanel() {
         </div>
       </section>
 
+      <DispatchPolicySection />
+      <UserHooksSection />
       <WebSettingsSection />
       <CliInstallSection />
     </div>
+  );
+}
+
+/** Minimal editor for user lifecycle hooks (see `lib/userHooks.ts`): list +
+ * add/remove. Command string, event, optional tool matcher — no inline
+ * editing in this slice; delete and re-add. */
+function UserHooksSection() {
+  const { t } = useT();
+  const hooks = useUserHooksStore((state) => state.hooks);
+  const loaded = useUserHooksStore((state) => state.loaded);
+  const [event, setEvent] = useState<UserHookEvent>("PreToolUse");
+  const [command, setCommand] = useState("");
+  const [matcher, setMatcher] = useState("");
+
+  useEffect(() => {
+    if (!loaded) void useUserHooksStore.getState().initialize();
+  }, [loaded]);
+
+  const matcherApplies = event === "PreToolUse" || event === "PostToolUse";
+  const add = () => {
+    const trimmed = command.trim();
+    if (!trimmed) return;
+    useUserHooksStore.getState().add({
+      event,
+      command: trimmed,
+      matcher: matcherApplies && matcher.trim().length > 0 ? matcher.trim() : undefined,
+    });
+    setCommand("");
+    setMatcher("");
+  };
+
+  return (
+    <section>
+      <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.hooksHeading")}</h3>
+      <div className="rounded-lg border border-border bg-background px-3 py-3">
+        <p className="text-xs text-muted">{t("AutomationPanel.hooksDescription")}</p>
+
+        {hooks.length > 0 && (
+          <div className="mt-3 flex flex-col gap-1.5 border-t border-border pt-3">
+            {hooks.map((hook) => (
+              <div key={hook.id} className="flex items-center justify-between gap-2 text-xs">
+                <span className="flex min-w-0 items-center gap-2">
+                  <StatusPill tone="neutral">{hook.event}</StatusPill>
+                  {hook.matcher && <span className="shrink-0 font-mono text-faint">{hook.matcher}</span>}
+                  <span className="truncate font-mono text-muted">{hook.command}</span>
+                </span>
+                <button
+                  type="button"
+                  aria-label={t("AutomationPanel.hookDeleteAriaLabel", { command: hook.command })}
+                  onClick={() => useUserHooksStore.getState().remove(hook.id)}
+                  className="shrink-0 cursor-pointer text-faint hover:text-danger"
+                >
+                  <Trash2 size={13} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3">
+          <div className="flex items-center gap-2">
+            <select
+              value={event}
+              onChange={(e) => setEvent(e.target.value as UserHookEvent)}
+              aria-label={t("AutomationPanel.hookEventLabel")}
+              className="h-8 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+            >
+              {USER_HOOK_EVENTS.map((value) => (
+                <option key={value} value={value}>
+                  {value}
+                </option>
+              ))}
+            </select>
+            {matcherApplies && (
+              <input
+                type="text"
+                value={matcher}
+                onChange={(e) => setMatcher(e.target.value)}
+                placeholder={t("AutomationPanel.hookMatcherPlaceholder")}
+                className="h-8 w-40 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+              />
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={command}
+              onChange={(e) => setCommand(e.target.value)}
+              placeholder={t("AutomationPanel.hookCommandPlaceholder")}
+              className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+            />
+            <Button size="sm" onClick={add} disabled={command.trim().length === 0}>
+              <Plus size={13} />
+              {t("AutomationPanel.hookAddButton")}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 

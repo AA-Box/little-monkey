@@ -17,7 +17,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{Emitter, Manager};
+use tauri::Emitter;
 use url::Url;
 use uuid::Uuid;
 
@@ -29,8 +29,14 @@ use crate::portability::{
     PortableDataV1, PortableSession, SnapshotFileInfo, SnapshotRetentionPolicy,
     SnapshotWriteOutcome,
 };
+use crate::profiles::ProfileScopedPaths;
 
-const KEYCHAIN_SERVICE: &str = "com.littlemonkey.backup";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.backup"));
 const BACKUP_KEY_ACCOUNT: &str = "portable-snapshot-aes256gcm-v1";
 const BACKUP_CONFIG_FILE: &str = "backup_config.json";
 const SNAPSHOT_DIRECTORY: &str = "backups";
@@ -306,7 +312,7 @@ pub struct PortableRestoreRequest {
     pub previous_sessions_payload: String,
     pub prompts_payload: String,
     #[serde(default)]
-    pub stacks: Vec<crate::stacks::KnowledgeStack>,
+    pub stacks: Vec<crate::knowledge_core::KnowledgeStack>,
     pub settings: Option<PortableRestoreSettingsRequest>,
 }
 
@@ -323,7 +329,7 @@ pub struct PendingPortableRestoreSettings {
 #[serde(rename_all = "camelCase")]
 pub struct PortableRestoreOutcome {
     pub transaction_id: String,
-    pub stacks: Vec<crate::stacks::KnowledgeStack>,
+    pub stacks: Vec<crate::knowledge_core::KnowledgeStack>,
     pub profile_counts: crate::profile_store::ProfileCounts,
     pub settings_pending: bool,
 }
@@ -391,11 +397,11 @@ struct PublishedRestore {
     base: PathBuf,
     transaction_root: PathBuf,
     journal: RestoreJournal,
-    stacks: Vec<crate::stacks::KnowledgeStack>,
+    stacks: Vec<crate::knowledge_core::KnowledgeStack>,
 }
 
 fn app_data_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let root = app.path().app_data_dir().map_err(command_error)?;
+    let root = app.profile_data_dir().map_err(command_error)?;
     fs::create_dir_all(&root)
         .map_err(|error| format!("Failed to create {}: {error}", root.display()))?;
     Ok(root)
@@ -596,9 +602,9 @@ fn validated_pending_settings(
 fn prepare_stack_registry(
     base: &Path,
     transaction_root: &Path,
-    incoming: Vec<crate::stacks::KnowledgeStack>,
+    incoming: Vec<crate::knowledge_core::KnowledgeStack>,
     replace: bool,
-) -> Result<(Vec<crate::stacks::KnowledgeStack>, Vec<u8>), String> {
+) -> Result<(Vec<crate::knowledge_core::KnowledgeStack>, Vec<u8>), String> {
     let planning_root = transaction_root.join("stack-plan");
     fs::create_dir_all(&planning_root)
         .map_err(|error| format!("Failed to create {}: {error}", planning_root.display()))?;
@@ -607,7 +613,7 @@ fn prepare_stack_registry(
         fs::copy(&current, planning_root.join("index.json"))
             .map_err(|error| format!("Failed to stage {}: {error}", current.display()))?;
     }
-    let stacks = crate::stacks::import_definitions_impl(&planning_root, incoming, replace)?;
+    let stacks = crate::knowledge_core::import_definitions_impl(&planning_root, incoming, replace)?;
     let bytes = read_regular_bounded(&planning_root.join("index.json"), MAX_STACK_REGISTRY_BYTES)?;
     Ok((stacks, bytes))
 }
@@ -927,19 +933,6 @@ pub fn portable_restore_apply(
     let (published, profile_counts, settings_pending) =
         publish_restore_at(&app_data_root(&app)?, request, None)?;
 
-    if let Err(error) = state
-        .stack_cache
-        .lock()
-        .map_err(|_| "Stack-cache lock poisoned".to_string())
-        .map(|mut cache| cache.clear())
-    {
-        let rollback = published.rollback();
-        return Err(match rollback {
-            Ok(_) => error,
-            Err(rollback) => format!("{error}; rollback also failed: {rollback}"),
-        });
-    }
-
     let sessions_payload =
         fs::read_to_string(restore_target(&published.base, RestoreFileKind::Sessions))
             .map_err(command_error)?;
@@ -1079,7 +1072,7 @@ struct KeychainAes256Gcm {
 
 impl KeychainAes256Gcm {
     fn load_or_create() -> Result<Self, String> {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, BACKUP_KEY_ACCOUNT)
+        let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, BACKUP_KEY_ACCOUNT)
             .map_err(|error| format!("Failed to access backup keychain entry: {error}"))?;
         let key_bytes = match entry.get_password() {
             Ok(encoded) => base64::engine::general_purpose::STANDARD
@@ -1175,8 +1168,7 @@ impl CryptoProvider for KeychainAes256Gcm {
 }
 
 fn snapshot_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
+    app.profile_data_dir()
         .map(|path| snapshot_root_at(&path))
         .map_err(command_error)
 }
@@ -1407,8 +1399,7 @@ enum BackupClaimOutcome {
 }
 
 fn config_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
+    app.profile_data_dir()
         .map(|path| config_path_at(&path))
         .map_err(command_error)
 }
@@ -1782,7 +1773,7 @@ fn credential_account(config: &WebDavBackupConfig) -> String {
 }
 
 fn load_webdav_password(config: &WebDavBackupConfig) -> Result<String, String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, &credential_account(config))
+    keyring::Entry::new(&KEYCHAIN_SERVICE, &credential_account(config))
         .map_err(|error| format!("Failed to access WebDAV keychain entry: {error}"))?
         .get_password()
         .map_err(|error| format!("Failed to read WebDAV password from keychain: {error}"))
@@ -1833,7 +1824,7 @@ pub fn portable_snapshot_stage_source(
     app: tauri::AppHandle,
     request: PortableBundleRequest,
 ) -> Result<WebDavStagedSnapshot, String> {
-    let app_data = app.path().app_data_dir().map_err(command_error)?;
+    let app_data = app.profile_data_dir().map_err(command_error)?;
     stage_webdav_snapshot_at(&app_data, request)
 }
 
@@ -1869,7 +1860,7 @@ pub fn webdav_backup_status_at(app_data: &Path) -> Result<WebDavBackupStatus, St
 
 #[tauri::command]
 pub fn portable_webdav_status_get(app: tauri::AppHandle) -> Result<WebDavBackupStatus, String> {
-    let app_data = app.path().app_data_dir().map_err(command_error)?;
+    let app_data = app.profile_data_dir().map_err(command_error)?;
     webdav_backup_status_at(&app_data)
 }
 
@@ -1878,7 +1869,7 @@ pub fn portable_webdav_config_save(
     app: tauri::AppHandle,
     request: SaveWebDavConfigRequest,
 ) -> Result<WebDavBackupConfig, String> {
-    let app_data = app.path().app_data_dir().map_err(command_error)?;
+    let app_data = app.profile_data_dir().map_err(command_error)?;
     let mut claim = match acquire_backup_claim(
         &app_data,
         &format!("desktop-config-{}", Uuid::new_v4()),
@@ -1938,7 +1929,7 @@ pub fn portable_webdav_config_save(
         if password.is_empty() || password.len() > 16_384 {
             return Err("WebDAV password must be 1..=16384 characters".to_string());
         }
-        keyring::Entry::new(KEYCHAIN_SERVICE, &credential_account(&config))
+        keyring::Entry::new(&KEYCHAIN_SERVICE, &credential_account(&config))
             .map_err(|error| format!("Failed to access WebDAV keychain entry: {error}"))?
             .set_password(&password)
             .map_err(|error| format!("Failed to save WebDAV password in the keychain: {error}"))?;
@@ -2019,7 +2010,7 @@ async fn put_webdav(
         Some(etag) => request.header(IF_MATCH, etag),
         None => request.header(IF_NONE_MATCH, "*"),
     };
-    let response = request.send().await.map_err(command_error)?;
+    let response = crate::egress::send(request).await.map_err(command_error)?;
     if response.status().is_redirection() {
         return Err(
             "WebDAV redirects are disabled to keep credentials on the configured origin"
@@ -2209,12 +2200,13 @@ async fn probe_remote_snapshot(
     password: &str,
     remote_path: &str,
 ) -> Result<RemoteSnapshotProbe, String> {
-    let response = client
-        .get(remote_url(config, remote_path)?)
-        .basic_auth(&config.username, Some(password))
-        .send()
-        .await
-        .map_err(command_error)?;
+    let response = crate::egress::send(
+        client
+            .get(remote_url(config, remote_path)?)
+            .basic_auth(&config.username, Some(password)),
+    )
+    .await
+    .map_err(command_error)?;
     if response.status().is_redirection() {
         return Err("WebDAV redirects are disabled to protect credentials".to_string());
     }
@@ -2598,7 +2590,7 @@ pub async fn portable_webdav_run_due(
     app: tauri::AppHandle,
     force: bool,
 ) -> Result<WebDavBackgroundRunOutcome, String> {
-    let app_data = app.path().app_data_dir().map_err(command_error)?;
+    let app_data = app.profile_data_dir().map_err(command_error)?;
     run_due_webdav_backup(
         &app_data,
         &format!("desktop-{}-{}", std::process::id(), Uuid::new_v4()),
@@ -2612,15 +2604,16 @@ pub async fn portable_webdav_run_due(
 pub async fn portable_webdav_test(app: tauri::AppHandle) -> Result<(), String> {
     let config = validate_stored_config(load_webdav_config(&app)?)?;
     let password = load_webdav_password(&config)?;
-    let response = webdav_client()?
-        .request(
-            reqwest::Method::OPTIONS,
-            Url::parse(&config.base_url).map_err(command_error)?,
-        )
-        .basic_auth(&config.username, Some(password))
-        .send()
-        .await
-        .map_err(command_error)?;
+    let response = crate::egress::send(
+        webdav_client()?
+            .request(
+                reqwest::Method::OPTIONS,
+                Url::parse(&config.base_url).map_err(command_error)?,
+            )
+            .basic_auth(&config.username, Some(password)),
+    )
+    .await
+    .map_err(command_error)?;
     if response.status().is_redirection() {
         return Err("WebDAV redirects are disabled to protect credentials".to_string());
     }
@@ -2646,7 +2639,7 @@ pub enum WebDavDownloadResponse {
 pub async fn portable_webdav_download_snapshot(
     app: tauri::AppHandle,
 ) -> Result<WebDavDownloadResponse, String> {
-    let app_data = app.path().app_data_dir().map_err(command_error)?;
+    let app_data = app.profile_data_dir().map_err(command_error)?;
     let mut claim = match acquire_backup_claim(
         &app_data,
         &format!("desktop-download-{}", Uuid::new_v4()),
@@ -2668,7 +2661,7 @@ pub async fn portable_webdav_download_snapshot(
     if let Some(etag) = config.known_etag.as_deref() {
         request = request.header(IF_NONE_MATCH, etag);
     }
-    let response = request.send().await.map_err(command_error)?;
+    let response = crate::egress::send(request).await.map_err(command_error)?;
     if response.status().is_redirection() {
         return Err("WebDAV redirects are disabled to protect credentials".to_string());
     }
@@ -2823,13 +2816,13 @@ mod tests {
         .to_string()
     }
 
-    fn stack(id: &str, name: &str) -> crate::stacks::KnowledgeStack {
-        crate::stacks::KnowledgeStack {
+    fn stack(id: &str, name: &str) -> crate::knowledge_core::KnowledgeStack {
+        crate::knowledge_core::KnowledgeStack {
             id: id.to_string(),
             name: name.to_string(),
             sources: Vec::new(),
-            embedding: crate::stacks::EmbeddingSpec {
-                backend: crate::stacks::EmbeddingBackend::Ollama,
+            embedding: crate::knowledge_core::EmbeddingSpec {
+                backend: crate::knowledge_core::EmbeddingBackend::Ollama,
                 model_id_or_tag: "nomic-embed-text".to_string(),
                 dim: 768,
                 query_prefix: "search_query: ".to_string(),
@@ -3097,7 +3090,7 @@ mod tests {
             fs::read_to_string(restore_target(&directory.path, RestoreFileKind::Prompts)).unwrap(),
             expected_prompts
         );
-        let stacks: Vec<crate::stacks::KnowledgeStack> = serde_json::from_slice(
+        let stacks: Vec<crate::knowledge_core::KnowledgeStack> = serde_json::from_slice(
             &fs::read(restore_target(&directory.path, RestoreFileKind::Stacks)).unwrap(),
         )
         .unwrap();

@@ -1,26 +1,41 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import {
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
   ChevronDown,
   Download,
   Loader2,
   Plus,
   RectangleHorizontal,
   RectangleVertical,
+  Redo2,
   Shuffle,
   Sparkles,
   Square,
   Trash2,
+  Undo2,
   Upload,
   Wand2,
 } from "lucide-react";
 
-import { Button, IconButton, Listbox, StatusPill, Tabs } from "../ui";
+import { Button, IconButton, Listbox, StatusPill } from "../ui";
+import { AddBackendForm } from "./AddBackendForm";
 import { AddModelForm } from "./AddModelForm";
 import { LoraStack } from "./LoraStack";
+import { MaskCanvas } from "./MaskCanvas";
 import { ModelFiles } from "./ModelFiles";
+import { SettingsCard } from "./SettingsCard";
+import type { StudioMode } from "./StudioNav";
+import { ToolPanel } from "./ToolPanel";
 import { useT } from "../../lib/i18n";
 import { describeWeightFile } from "../../lib/weightFileHints";
+import { PREPROCESSORS, runPreprocessor, type Preprocessor } from "../../lib/preprocess";
+import { NO_MARGINS, runOutpaint, type Margins } from "../../lib/outpaint";
+import { pickImageBase64 } from "../../lib/imageAttachment";
 import {
   componentFileName,
   editTaskFor,
@@ -32,10 +47,14 @@ import {
   normalizeVideoFrames,
   toSpec,
   ASPECT_PRESETS,
+  MAX_BATCH_COUNT,
+  MAX_REF_IMAGES,
   SAMPLERS,
   SCHEDULERS,
   studioClient,
   UPSCALERS,
+  engineSupports,
+  type EngineCapabilities,
   type GenerationEngineStatus,
   type GenerationEntry,
   type GenerationModel,
@@ -44,11 +63,16 @@ import {
   type LoraAsset,
   type LoraSelection,
   type ModelComponent,
+  availableConditioning,
   choosableSlots,
   COMPONENT_SLOTS,
   type ComponentOverride,
   type ComponentSlot,
+  type ConditioningImage,
   type PartAsset,
+  backendModels,
+  isRemoteModelId,
+  type RemoteBackend,
 } from "../../lib/studioClient";
 
 /** The canvas and sampling controls for one run. Seeded from the model but
@@ -124,6 +148,175 @@ function SliderField({
   );
 }
 
+/** A thumbnail of a chosen conditioning image, small enough to sit inline in
+ *  the controls column. */
+function Thumbnail({ base64, alt }: { base64: string; alt: string }) {
+  return (
+    <img
+      src={`data:image/png;base64,${base64}`}
+      alt={alt}
+      className="h-12 w-12 shrink-0 rounded border border-border object-cover"
+    />
+  );
+}
+
+/** One conditioning image plus how strongly it applies. Shared by the control
+ *  image and the IP-Adapter reference, which differ only in wording — the two
+ *  are read by different weights but chosen the same way. */
+function ConditioningImageField({
+  label,
+  hint,
+  value,
+  onPick,
+  onClear,
+  strength,
+  onStrength,
+  strengthLabel,
+  onPreprocess,
+}: {
+  label: string;
+  hint: string;
+  value: string | null;
+  onPick: () => void;
+  onClear: () => void;
+  strength: number;
+  onStrength: (value: number) => void;
+  strengthLabel: string;
+  /** Offered only where a hint map is what the slot wants. ControlNet takes an
+   *  edge or depth map rather than a photograph; IP-Adapter and PhotoMaker take
+   *  the picture itself, and running an edge detector over those would throw
+   *  away the very thing they read. */
+  onPreprocess?: (kind: Preprocessor) => void;
+}) {
+  const { t } = useT();
+  return (
+    <SettingsCard title={label} hint={hint}>
+      <div className="flex items-center gap-2">
+        {value && <Thumbnail base64={value} alt={label} />}
+        <Button size="sm" variant="secondary" onClick={onPick}>
+          <Upload size={13} />
+          {t("Studio.chooseImage")}
+        </Button>
+        {value && (
+          <IconButton size="sm" aria-label={t("Studio.clearImage")} onClick={onClear}>
+            <Trash2 size={12} />
+          </IconButton>
+        )}
+      </div>
+      {value && onPreprocess && (
+        <label className="grid gap-1">
+          <span className="text-[11px] font-medium text-muted">
+            {t("Studio.preprocess.label")}
+          </span>
+          <Listbox
+            ariaLabel={t("Studio.preprocess.label")}
+            value=""
+            placeholder={t("Studio.preprocess.placeholder")}
+            options={PREPROCESSORS.filter((kind) => kind !== "none").map((kind) => ({
+              value: kind,
+              label: t(`Studio.preprocess.${kind}`),
+            }))}
+            onChange={(kind) => onPreprocess(kind as Preprocessor)}
+          />
+        </label>
+      )}
+      {value && (
+        <SliderField
+          label={strengthLabel}
+          value={strength}
+          min={0}
+          max={1}
+          step={0.05}
+          onChange={onStrength}
+        />
+      )}
+    </SettingsCard>
+  );
+}
+
+/** The reference-image list for the identity- and edit-conditioned models,
+ *  which take several rather than one. */
+function ReferenceImages({
+  images,
+  onAdd,
+  onRemove,
+  numbered,
+  onNumberedChange,
+}: {
+  images: string[];
+  onAdd: () => void;
+  onRemove: (index: number) => void;
+  numbered: boolean;
+  onNumberedChange: (numbered: boolean) => void;
+}) {
+  const { t } = useT();
+  const full = images.length >= MAX_REF_IMAGES;
+  // One reference has nothing to be told apart from, so the control only earns
+  // its space once there are two. The badges are the point of showing it: they
+  // are the numbers the prompt refers to, so the setting's effect is visible
+  // rather than something the user has to take on trust.
+  const canNumber = images.length > 1;
+  return (
+    <SettingsCard title={t("Studio.reference.title")} hint={t("Studio.reference.hint")}>
+      <div className="flex flex-wrap items-center gap-2">
+        {images.map((image, index) => (
+          <span key={`${index}-${image.slice(0, 16)}`} className="relative">
+            <Thumbnail
+              base64={image}
+              alt={
+                canNumber && numbered
+                  ? t("Studio.reference.numberedAlt", { index: String(index + 1) })
+                  : t("Studio.reference.title")
+              }
+            />
+            {canNumber && numbered && (
+              <span
+                aria-hidden="true"
+                className="absolute -bottom-1 -left-1 flex h-4 min-w-4 items-center justify-center rounded-full border border-border bg-surface-2 px-1 font-mono text-[10px] font-medium text-foreground"
+              >
+                {index + 1}
+              </span>
+            )}
+            <IconButton
+              size="sm"
+              className="absolute -right-1 -top-1"
+              aria-label={t("Studio.reference.remove")}
+              onClick={() => onRemove(index)}
+            >
+              <Trash2 size={10} />
+            </IconButton>
+          </span>
+        ))}
+        <Button size="sm" variant="secondary" disabled={full} onClick={onAdd}>
+          <Plus size={13} />
+          {t("Studio.reference.add")}
+        </Button>
+      </div>
+      {canNumber && (
+        <label className="flex min-h-11 items-center gap-2 text-xs text-muted">
+          <input
+            type="checkbox"
+            checked={numbered}
+            onChange={(event) => onNumberedChange(event.target.checked)}
+            className="h-4 w-4 rounded border-border accent-[var(--color-accent)]"
+          />
+          {t("Studio.reference.numbered")}
+        </label>
+      )}
+      {/* Only the two stateful lines stay visible — that the list is full, or
+          what numbering did. The plain explanation is on the card's info icon,
+          where it is not re-read on every glance. */}
+      {full || (canNumber && numbered) ? (
+        <p className="text-[11px] text-faint">
+          {full
+            ? t("Studio.reference.full", { max: String(MAX_REF_IMAGES) })
+            : t("Studio.reference.numberedHint")}
+        </p>
+      ) : null}
+    </SettingsCard>
+  );
+}
+
 function Select({
   value,
   onChange,
@@ -179,18 +372,38 @@ function componentNames(model: GenerationModel): string[] {
   return model.components.map(componentFileName);
 }
 
-export type StudioMode = "models" | "image" | "video" | "audio";
-
-/** Which tasks each making-tab covers. The models tab makes nothing, so it
- *  has no entry and its model list is never filtered. */
-const MODE_TASKS: Record<Exclude<StudioMode, "models">, GenerationTask[]> = {
+/** Which tasks each section covers. The two library sections generate
+ *  nothing, so neither has an entry and neither filters the model list. */
+const MODE_TASKS: Record<Exclude<StudioMode, "models" | "tools">, GenerationTask[]> = {
   image: ["text_to_image", "image_to_image"],
   video: ["text_to_video", "image_to_video"],
   audio: ["text_to_speech"],
 };
 
+/** How far one press extends. Multiples of 64 so a picture that was already a
+ *  valid size stays one — the engine works in 64-pixel blocks, and an odd
+ *  margin would have it resize the result behind the user's back. */
+const OUTPAINT_STEPS = [64, 128, 256] as const;
+
+/** One point in the extension history: the picture and the size the form was
+ *  set to while it was the picture. Both, because an extension moves the
+ *  requested size with it and restoring one without the other hands the engine
+ *  a mismatch. */
+interface OutpaintState {
+  image: string;
+  width: number;
+  height: number;
+}
+
+const OUTPAINT_SIDES = [
+  { side: "left", labelKey: "Studio.outpaint.left", icon: ArrowLeft },
+  { side: "right", labelKey: "Studio.outpaint.right", icon: ArrowRight },
+  { side: "top", labelKey: "Studio.outpaint.up", icon: ArrowUp },
+  { side: "bottom", labelKey: "Studio.outpaint.down", icon: ArrowDown },
+] as const satisfies readonly { side: keyof Margins; labelKey: string; icon: unknown }[];
+
 const tasksFor = (mode: StudioMode): GenerationTask[] =>
-  mode === "models" ? [] : MODE_TASKS[mode];
+  mode === "models" || mode === "tools" ? [] : MODE_TASKS[mode];
 
 /** Studio talks to the engine over Tauri commands, which only exist inside the
  *  desktop window. In a plain browser tab every call throws a bare TypeError
@@ -199,11 +412,24 @@ const tasksFor = (mode: StudioMode): GenerationTask[] =>
 const IN_DESKTOP_APP =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-export function StudioPanel() {
+interface Props {
+  /** Which section is showing. Owned by `App`, because the control that
+   *  switches it is the sidebar nav rather than anything in here. */
+  mode: StudioMode;
+  /** Sidebar node to render the settings rail into. Null until the sidebar has
+   *  mounted, and in Chat, where there is no rail to show. */
+  railSlot: HTMLElement | null;
+}
+
+export function StudioPanel({ mode, railSlot }: Props) {
   const { t } = useT();
-  const [mode, setMode] = useState<StudioMode>("image");
   const [status, setStatus] = useState<GenerationEngineStatus | null>(null);
+  /** What the running engine says it supports. Null until one has run — the
+   *  pickers fall back to the compiled-in lists until then. */
+  const [capabilities, setCapabilities] = useState<EngineCapabilities | null>(null);
   const [models, setModels] = useState<GenerationModel[]>([]);
+  const [backends, setBackends] = useState<RemoteBackend[]>([]);
+  const [addingBackend, setAddingBackend] = useState(false);
   const [gallery, setGallery] = useState<GenerationEntry[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [task, setTask] = useState<GenerationTask>("text_to_image");
@@ -213,7 +439,38 @@ export function StudioPanel() {
   // A string rather than a number so "empty means random" is expressible, the
   // way every other generation tool spells it.
   const [seed, setSeed] = useState("");
+  /** Images sampled from one prompt. The engine runs them serially, so this
+   *  multiplies the wait as well as the output. */
+  const [batchCount, setBatchCount] = useState(1);
   const [initImage, setInitImage] = useState<string | null>(null);
+  const [adPrompt, setAdPrompt] = useState("");
+  const [adNegativePrompt, setAdNegativePrompt] = useState("");
+  /** Inpainting: white is repainted, black is kept. Only ever set while an
+   *  init image exists, because it is a mask *over* that image. */
+  const [maskImage, setMaskImage] = useState<string | null>(null);
+  const [outpaintStep, setOutpaintStep] = useState<number>(OUTPAINT_STEPS[1]);
+  const [extending, setExtending] = useState(false);
+  /** One entry per extension, so a mis-aimed arrow is undoable, and one per
+   *  undo so it is redoable. The mask is not kept in either: it was generated
+   *  for the step being stepped over, and the image is handed back unmasked.
+   *
+   *  A fresh extension drops the redo stack — the branch it belonged to is
+   *  gone, and offering to "redo" onto a different image would paste the wrong
+   *  picture back. */
+  const [outpaintHistory, setOutpaintHistory] = useState<OutpaintState[]>([]);
+  const [outpaintFuture, setOutpaintFuture] = useState<OutpaintState[]>([]);
+  /** Structure to follow — already a depth map, pose skeleton or edge map. The
+   *  engine runs no detector, so a plain photo is followed as if it were one. */
+  const [controlImage, setControlImage] = useState<string | null>(null);
+  const [controlStrength, setControlStrength] = useState(0.9);
+  /** Style/content to borrow, read through the IP-Adapter. */
+  const [ipAdapterImage, setIpAdapterImage] = useState<string | null>(null);
+  const [ipAdapterStrength, setIpAdapterStrength] = useState(1);
+  /** Subjects to keep consistent, for the identity-conditioned architectures. */
+  const [refImages, setRefImages] = useState<string[]>([]);
+  /** Whether each reference gets its own index, so a prompt can address them
+   *  individually ("the jacket from image 2"). Only meaningful past one. */
+  const [numberRefImages, setNumberRefImages] = useState(false);
   const [speakerFile, setSpeakerFile] = useState("");
   const [language, setLanguage] = useState("");
   const [loras, setLoras] = useState<LoraSelection[]>([]);
@@ -238,7 +495,6 @@ export function StudioPanel() {
   const [error, setError] = useState<string | null>(null);
   const [previews, setPreviews] = useState<Record<string, string>>({});
   const [lightbox, setLightbox] = useState<GenerationEntry | null>(null);
-  const fileInput = useRef<HTMLInputElement>(null);
   const lightboxRef = useRef<HTMLDialogElement>(null);
 
   // `showModal` is the only way into the top layer, so open and close are
@@ -263,6 +519,11 @@ export function StudioPanel() {
     () => visible.find((model) => model.id === selectedId) ?? null,
     [visible, selectedId],
   );
+  // LoRAs, slot swaps and the hires pass are all `sd-server` features applied
+  // to weight files the app holds. A remote backend runs somebody else's
+  // process against weights this app never sees, so those controls are hidden
+  // rather than shown and then silently dropped on the way out.
+  const remote = isRemoteModelId(selected?.id ?? null);
   // This tab's results, newest first: the newest fills the canvas, the rest is
   // the strip under it.
   const shownGallery = useMemo(
@@ -271,6 +532,54 @@ export function StudioPanel() {
   );
   const shown = shownGallery[0] ?? null;
   const shownHistory = shownGallery.slice(1);
+
+  // Which conditioning images this run can actually use. Read off the slots
+  // that will be *loaded* — the model's own plus anything overridden for this
+  // run — because a ControlNet chosen from the library counts exactly as much
+  // as one the model entry names. A remote backend has none of them: its
+  // conditioning fields are dropped on the way out, so offering the inputs
+  // would promise something the backend is never sent.
+  const conditioning = useMemo(() => {
+    if (remote || !selected) return new Set<ConditioningImage>();
+    return availableConditioning(
+      [
+        ...selected.components.map((component) => component.slot),
+        ...overrides.map((override) => override.slot),
+      ],
+      // The second gate, and an independent one: weights decide whether the
+      // model can read the image, the engine's own flags decide whether this
+      // build accepts the field at all.
+      capabilities,
+    );
+  }, [remote, selected, overrides, capabilities]);
+
+  // ADetailer re-renders each region its detector finds. The detector is a
+  // launch flag, so this asks the same question the conditioning memo does —
+  // the model's own slots plus anything picked for this run — but it is not a
+  // conditioning *image*, so it cannot ride that set.
+  const hasDetector = useMemo(
+    () =>
+      !remote &&
+      [...(selected?.components ?? []), ...overrides].some(
+        (component) => component.slot === "ad_model",
+      ),
+    [remote, selected, overrides],
+  );
+
+  // Inpainting. Offered only for the still-image edit task — a mask over the
+  // first frame of a clip describes one frame out of thirty-three — and only
+  // where the engine takes a `mask_image` at all, so an older build is never
+  // sent a field it rejects.
+  const canMask =
+    task === "image_to_image" && !remote && engineSupports(capabilities, "mask_image");
+
+  // The lists the pickers offer: the running engine's own, falling back to the
+  // pinned build's while nothing is running. An engine answering with an empty
+  // list is treated as not having answered — an empty sampler picker is never
+  // the right thing to show.
+  const samplers = capabilities?.samplers.length ? capabilities.samplers : SAMPLERS;
+  const schedulers = capabilities?.schedulers.length ? capabilities.schedulers : SCHEDULERS;
+  const upscalers = capabilities?.upscalers.length ? capabilities.upscalers : UPSCALERS;
 
   // One chooser per slot the library has a part for. Not per slot the *model*
   // has: a checkpoint that needs a separate VAE does not name one, so keying
@@ -287,14 +596,26 @@ export function StudioPanel() {
 
   const refresh = useCallback(async () => {
     try {
-      const [engine, list, entries, assets, loose] = await Promise.all([
+      const [engine, library, entries, assets, loose, remotes, reported] = await Promise.all([
         studioClient.engineStatus(),
         studioClient.models(),
         studioClient.gallery(),
         studioClient.loras(),
         studioClient.parts(),
+        studioClient.backends(),
+        // An engine that is up but not answering must not take the whole panel
+        // down with it: the lists have a fallback, so a failed ask is the same
+        // as no engine at all.
+        studioClient.capabilities().catch(() => null),
       ]);
+      // A backend's models join the library list rather than sitting beside it:
+      // the picker, the task filter and the run path then need no notion of a
+      // backend at all, and the one place that does — which controls make sense
+      // for the selection — asks the id.
+      const list = [...library, ...backendModels(remotes)];
       setStatus(engine);
+      setCapabilities(reported);
+      setBackends(remotes);
       setModels(list);
       setGallery([...entries].reverse());
       setLoraLibrary(assets);
@@ -476,14 +797,111 @@ export function StudioPanel() {
     }
   };
 
-  const pickImage = async (file: File) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result ?? "");
-      const comma = result.indexOf(",");
-      setInitImage(comma < 0 ? null : result.slice(comma + 1));
+  /** Reads a chosen file as bare base64 and hands it to whichever image slot
+   *  asked. One reader for the init image, the control image, the IP-Adapter
+   *  reference and the reference list — they differ only in where the bytes
+   *  land. */
+  /** Replaces a conditioning image with its hint map, in place.
+   *
+   *  Destructive on purpose: the run sends one image, so keeping the original
+   *  beside the processed one would only raise the question of which is used.
+   *  Re-picking the file is the undo. */
+  const preprocessInto = async (
+    current: string | null,
+    kind: Preprocessor,
+    receive: (base64: string) => void,
+  ) => {
+    if (!current) return;
+    try {
+      receive(await runPreprocessor(current, kind));
+    } catch (cause) {
+      setError(String(cause));
+    }
+  };
+
+  const pickImage = async (receive: (base64: string) => void) => {
+    try {
+      const base64 = await pickImageBase64();
+      if (base64) receive(base64);
+    } catch (cause) {
+      setError(String(cause));
+    }
+  };
+
+  /** Extends the source image on one side and marks the new ground for the
+   *  model to fill.
+   *
+   *  Outpainting is inpainting on a bigger canvas, so this replaces the source,
+   *  supplies the mask, and moves the requested size to match — all three, or
+   *  the engine is handed a mask that does not line up with what it is given.
+   *  Repeat to keep going, which is what dragging a frame outward amounts to. */
+  const extend = async (side: keyof Margins) => {
+    if (!initImage) return;
+    setExtending(true);
+    setError(null);
+    try {
+      const result = await runOutpaint(initImage, { ...NO_MARGINS, [side]: outpaintStep });
+      if (settings)
+        setOutpaintHistory((current) => [
+          ...current,
+          { image: initImage, width: settings.width, height: settings.height },
+        ]);
+      setOutpaintFuture([]);
+      setInitImage(result.initImageBase64);
+      setMaskImage(result.maskImageBase64);
+      // Null only before a model is chosen, and the button that got here is
+      // not reachable then — so leaving it null is right rather than
+      // fabricating a settings object out of two dimensions.
+      setSettings((current) =>
+        current ? { ...current, width: result.width, height: result.height } : current,
+      );
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setExtending(false);
+    }
+  };
+
+  /** Moves one step along the extension history, in either direction.
+   *
+   *  Undo and redo are the same move with the stacks swapped, so they are one
+   *  function: take the top of one stack, put where you were on the other, and
+   *  restore. Writing them apart is how the two drift. */
+  const stepExtension = (direction: "undo" | "redo") => {
+    if (!initImage || !settings) return;
+    const from = direction === "undo" ? outpaintHistory : outpaintFuture;
+    const target = from[from.length - 1];
+    if (!target) return;
+    const here: OutpaintState = {
+      image: initImage,
+      width: settings.width,
+      height: settings.height,
     };
-    reader.readAsDataURL(file);
+    const drop = (current: OutpaintState[]) => current.slice(0, -1);
+    const push = (current: OutpaintState[]) => [...current, here];
+    if (direction === "undo") {
+      setOutpaintHistory(drop);
+      setOutpaintFuture(push);
+    } else {
+      setOutpaintFuture(drop);
+      setOutpaintHistory(push);
+    }
+    setInitImage(target.image);
+    setMaskImage(null);
+    setSettings((current) =>
+      current ? { ...current, width: target.width, height: target.height } : current,
+    );
+  };
+
+  /** Dropping the source image drops the mask with it: a mask addresses that
+   *  image's pixels, so keeping it would silently repaint the wrong region of
+   *  whatever came next. Both extension stacks go too — they hold states of an
+   *  image that is no longer loaded. */
+  const changeInitImage = (next: string | null) => {
+    setInitImage(next);
+    setMaskImage(null);
+    setOutpaintHistory([]);
+    setOutpaintFuture([]);
   };
 
   const generate = async () => {
@@ -494,7 +912,7 @@ export function StudioPanel() {
     setPercent(null);
     setPhase(t("Studio.phase.submitted"));
     try {
-      const entry = await studioClient.run({
+      const entries = await studioClient.run({
         modelId: selected.id,
         task,
         prompt,
@@ -511,6 +929,9 @@ export function StudioPanel() {
         hires: settings.hires,
         // Blank asks the engine for a fresh seed rather than pinning one.
         seed: seed.trim() === "" ? -1 : Number(seed),
+        // A clip and an utterance are one artifact per run whatever the
+        // control last said, and the backend normalizes it to 1 regardless.
+        batchCount: isVideoTask(task) || isSpeechTask(task) ? 1 : batchCount,
         videoFrames: isVideoTask(task)
           ? normalizeVideoFrames(selected.defaults.frameGrid, seconds * selected.defaults.fps)
           : 1,
@@ -518,12 +939,38 @@ export function StudioPanel() {
         speakerFile: isSpeechTask(task) ? speakerFile.trim() || null : null,
         language: isSpeechTask(task) ? language.trim() || null : null,
         initImageBase64: needsInitImage(task) ? initImage : null,
+        // Each conditioning input is sent only where its own control was
+        // offered, so a mask painted before switching task and a control image
+        // chosen before switching model cannot follow the run somewhere they
+        // mean nothing. The backend refuses them again on its own side.
+        maskImageBase64: canMask && initImage ? maskImage : null,
+        // Blank inherits the main prompt inside the engine, so an untouched
+        // field is sent as null rather than as an empty string it would have
+        // to interpret.
+        adPrompt: hasDetector && adPrompt.trim() ? adPrompt.trim() : null,
+        adNegativePrompt:
+          hasDetector && adNegativePrompt.trim() ? adNegativePrompt.trim() : null,
+        controlImageBase64: conditioning.has("control") ? controlImage : null,
+        controlStrength: conditioning.has("control") && controlImage ? controlStrength : null,
+        ipAdapterImageBase64: conditioning.has("ip_adapter") ? ipAdapterImage : null,
+        ipAdapterStrength:
+          conditioning.has("ip_adapter") && ipAdapterImage ? ipAdapterStrength : null,
+        refImagesBase64: conditioning.has("reference") ? refImages : [],
+        // Only meaningful when there is more than one reference to tell apart,
+        // which is also the only time the control is shown.
+        increaseRefIndex:
+          conditioning.has("reference") && refImages.length > 1 && numberRefImages,
         // Blank rows are a half-typed path, not a LoRA the user meant.
         loras: loras.filter((lora) => lora.path.trim().length > 0),
         componentOverrides: overrides,
       });
-      setGallery((current) => [entry, ...current]);
-      void loadPreview(entry);
+      // Newest first, and within one batch the engine's own order — which
+      // reversing the run's entries preserves once they are prepended.
+      setGallery((current) => [...[...entries].reverse(), ...current]);
+      // Only the last is previewed: it is the one the gallery shows first, and
+      // decoding eight images to data URLs to show one is eight times the work.
+      const newest = entries[entries.length - 1];
+      if (newest) void loadPreview(newest);
     } catch (reason) {
       if (!stopped.current) setError(errorText(reason));
     } finally {
@@ -588,7 +1035,7 @@ export function StudioPanel() {
     try {
       const dataUrl = previews[entry.artifactId] ?? (await studioClient.mediaDataUrl(entry.artifactId));
       setPreviews((current) => ({ ...current, [entry.artifactId]: dataUrl }));
-      setInitImage(dataUrl.slice(dataUrl.indexOf(",") + 1));
+      changeInitImage(dataUrl.slice(dataUrl.indexOf(",") + 1));
       setTask(next);
       setPrompt(entry.prompt);
     } catch (reason) {
@@ -629,23 +1076,19 @@ export function StudioPanel() {
     !busy &&
     (!needsInitImage(task) || !!initImage);
 
+  // Tools share nothing with generation — no model, no prompt, no sampler —
+  // so the section is its own panel rather than another branch threaded
+  // through this one. After every hook above it, so the hook order is the same
+  // whichever section is showing.
+  if (mode === "tools") return <ToolPanel railSlot={railSlot} />;
+
   return (
     <div
       className={`flex min-h-0 flex-1 flex-col p-4 ${
         mode === "models" ? "overflow-y-auto" : "overflow-hidden"
       }`}
     >
-      <Tabs
-        active={mode}
-        onChange={(next) => setMode(next as StudioMode)}
-        tabs={[
-          { id: "image", label: t("Studio.tab.image") },
-          { id: "video", label: t("Studio.tab.video") },
-          { id: "audio", label: t("Studio.tab.audio") },
-          { id: "models", label: t("Studio.tab.models") },
-        ]}
-      />
-      <header className="mb-4 mt-3">
+      <header className="mb-4">
         <h1 className="text-sm font-medium">{t(`Studio.${mode}.title`)}</h1>
         <p className="mt-1 text-xs text-muted">{t(`Studio.${mode}.subtitle`)}</p>
       </header>
@@ -702,18 +1145,22 @@ export function StudioPanel() {
                     </span>
                   </span>
                   <span className="flex shrink-0 items-center gap-2">
-                    <IconButton
-                      size="sm"
-                      aria-label={t("Studio.forget")}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void studioClient.removeModel(model.id).then(refresh).catch((reason) =>
-                          setError(errorText(reason)),
-                        );
-                      }}
-                    >
-                      <Trash2 size={12} />
-                    </IconButton>
+                    {/* A backend's models are not library entries and are not
+                        forgotten one at a time — the backend below owns them. */}
+                    {!isRemoteModelId(model.id) && (
+                      <IconButton
+                        size="sm"
+                        aria-label={t("Studio.forget")}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void studioClient.removeModel(model.id).then(refresh).catch((reason) =>
+                            setError(errorText(reason)),
+                          );
+                        }}
+                      >
+                        <Trash2 size={12} />
+                      </IconButton>
+                    )}
                     {model.installed ? (
                       <StatusPill tone="success">{t("Studio.installed")}</StatusPill>
                     ) : (
@@ -725,8 +1172,9 @@ export function StudioPanel() {
                 </button>
 
                 {/* Adding and swapping files happens here and only here. The
-                    generation tabs pick from what this produces. */}
-                <details className="mt-2">
+                    generation tabs pick from what this produces. A backend's
+                    models have no files here to swap. */}
+                <details className="mt-2" hidden={isRemoteModelId(model.id)}>
                   <summary className="cursor-pointer text-[11px] text-muted">
                     {t("Studio.parts")}
                     <span className="ml-1.5 text-faint">
@@ -832,6 +1280,72 @@ export function StudioPanel() {
           })}
         </div>
 
+        {/* Remote backends. Nothing here is bundled: a ComfyUI is a server the
+            user installed and runs, and a hosted endpoint is somebody else's.
+            Both are reached over HTTP, which is what fills the gaps the managed
+            engine cannot — architectures it has no support for, and machines
+            with no GPU at all. */}
+        <div className="mt-6">
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="text-xs font-medium text-muted">{t("Studio.backends")}</h2>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => setAddingBackend((open) => !open)}
+            >
+              {addingBackend ? t("Studio.add.cancel") : t("Studio.backendAdd")}
+            </Button>
+          </div>
+          {addingBackend && (
+            <div className="mb-2">
+              <AddBackendForm
+                onSaved={() => {
+                  setAddingBackend(false);
+                  void refresh();
+                }}
+              />
+            </div>
+          )}
+          {backends.length === 0 && !addingBackend && (
+            <p className="text-xs text-faint">{t("Studio.backendsEmpty")}</p>
+          )}
+          <div className="grid gap-2">
+            {backends.map((backend) => (
+              <div
+                key={backend.id}
+                className="flex items-start justify-between gap-3 rounded border border-border p-3"
+              >
+                <span className="min-w-0">
+                  <span className="block text-xs font-medium">{backend.label}</span>
+                  <span className="mt-0.5 block truncate text-[11px] text-faint">
+                    {t(
+                      backend.kind === "comfy_ui"
+                        ? "Studio.backend.kindComfy"
+                        : "Studio.backend.kindOpenAi",
+                    )}
+                    {backend.baseUrl ? ` · ${backend.baseUrl}` : ""}
+                    {` · ${t("Studio.backendModelCount", {
+                      count: String(backend.models.length),
+                    })}`}
+                  </span>
+                </span>
+                <IconButton
+                  size="sm"
+                  aria-label={t("Studio.forget")}
+                  onClick={() =>
+                    void studioClient
+                      .removeBackend(backend.id)
+                      .then(refresh)
+                      .catch((reason) => setError(errorText(reason)))
+                  }
+                >
+                  <Trash2 size={12} />
+                </IconButton>
+              </div>
+            ))}
+          </div>
+        </div>
+
         {/* The loose files: CLIPs, text encoders, VAEs. A model entry has to
             be a whole model, so the pieces shared between models are added
             here and chosen per generation. */}
@@ -934,10 +1448,24 @@ export function StudioPanel() {
           )}
         </div>
       </section>
-      ) : (
-        <section className="mb-3">
-          <label className="grid gap-1 text-[11px] text-muted">
-            {t("Studio.models")}
+      ) : null}
+
+      {/* The canvas keeps the prompt, the button and the result together where
+          the work happens. The rail of controls that used to sit beside it is
+          portalled into the sidebar below, so this gets the full width. */}
+      {mode !== "models" && (
+      <div className="flex min-h-0 flex-1 gap-4 overflow-hidden p-1">
+        {/* The rail renders into the sidebar rather than here. It stays part of
+            this component — every control below reads state this component owns
+            — and only its DOM position moves.
+            `[&>*]:min-w-0`: a grid item's default minimum is its own
+            min-content, so one wide control anywhere in the rail would size the
+            whole column to itself and every box would overflow together. */}
+        {railSlot ? createPortal(
+        <div className="grid content-start gap-3 [&>*]:min-w-0">
+          {/* Outside the `selected` guard below: with nothing chosen this is the
+              one control that has to be reachable, or there is no way to choose. */}
+          <SettingsCard title={t("Studio.models")}>
             {/* A native popup is drawn by the platform and sized to its widest
                 option, never to the control, so this one is ours. */}
             <Listbox
@@ -957,27 +1485,10 @@ export function StudioPanel() {
                   .join(" · "),
               }))}
             />
-          </label>
-        </section>
-      )}
+          </SettingsCard>
 
-      {/* The shape every local generation tool settles on: a narrow rail of
-          controls that scrolls on its own, and a canvas that keeps the prompt,
-          the button and the result together where the work happens. */}
-      {mode !== "models" && (
-      <div className="flex min-h-0 flex-1 gap-4 overflow-hidden p-1">
-        {/* `overflow-y: auto` computes overflow-x to auto as well, so the rail
-            clips sideways too and its controls need room for a focus ring. */}
-        {selected && (
-        // `pr-3` is not decoration. A macOS overlay scrollbar reserves no
-        // space, so it is drawn *on top of* whatever reaches the right edge —
-        // which is why the size hint and every number stepper looked sliced
-        // off. `scrollbar-gutter` covers the other setting, where the bar is
-        // solid and takes width instead.
-        // `[&>*]:min-w-0` is the other half: a grid item's default minimum is
-        // its own min-content, so one wide control anywhere in the rail sizes
-        // the whole column to itself and every box overflows together.
-        <aside className="grid w-80 shrink-0 content-start gap-3 overflow-y-auto pb-4 pl-1 pr-3 [scrollbar-gutter:stable] [&>*]:min-w-0">
+          {selected && (
+          <>
           <div className="flex flex-wrap gap-1.5">
             {selected.tasks
               .filter((entry) => tasksFor(mode).includes(entry))
@@ -1023,17 +1534,11 @@ export function StudioPanel() {
 
           {needsInitImage(task) && (
             <div className="flex items-center gap-2">
-              <input
-                ref={fileInput}
-                type="file"
-                accept="image/png,image/jpeg,image/webp"
-                className="hidden"
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  if (file) void pickImage(file);
-                }}
-              />
-              <Button size="sm" variant="secondary" onClick={() => fileInput.current?.click()}>
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => void pickImage(changeInitImage)}
+              >
                 <Upload size={13} />
                 {t("Studio.chooseImage")}
               </Button>
@@ -1043,13 +1548,144 @@ export function StudioPanel() {
                   <IconButton
                     size="sm"
                     aria-label={t("Studio.clearImage")}
-                    onClick={() => setInitImage(null)}
+                    onClick={() => changeInitImage(null)}
                   >
                     <Trash2 size={12} />
                   </IconButton>
                 </>
               )}
             </div>
+          )}
+
+          {canMask && initImage && (
+            <SettingsCard title={t("Studio.outpaint.title")} hint={t("Studio.outpaint.hint")}>
+              {/* One row, always. Nine controls only fit this panel if
+                  something gives, and it is the size buttons: they hold two or
+                  three digits, so padding can go, while an icon narrower than
+                  its glyph is a target too small to hit. Hence `flex-1 min-w-0`
+                  on the sizes and `shrink-0` on the icons — measured to hold
+                  down to a 288px card, below which the digits clip rather than
+                  spill over their neighbours. The unit moved into the card's
+                  hint: a row this tight has no room for a word that never
+                  changes. */}
+              <div className="flex items-center gap-1">
+                {OUTPAINT_STEPS.map((step) => (
+                  <Button
+                    key={step}
+                    size="xs"
+                    className="min-w-0 flex-1 overflow-hidden"
+                    variant={outpaintStep === step ? "primary" : "secondary"}
+                    onClick={() => setOutpaintStep(step)}
+                  >
+                    {step}
+                  </Button>
+                ))}
+                {OUTPAINT_SIDES.map(({ side, labelKey, icon: Icon }) => (
+                  <IconButton
+                    key={side}
+                    size="xs"
+                    className="shrink-0"
+                    aria-label={t(labelKey)}
+                    title={t(labelKey)}
+                    disabled={extending}
+                    onClick={() => void extend(side)}
+                  >
+                    <Icon size={13} />
+                  </IconButton>
+                ))}
+                <IconButton
+                  size="xs"
+                  className="shrink-0"
+                  aria-label={t("Studio.outpaint.undo")}
+                  title={t("Studio.outpaint.undo")}
+                  disabled={extending || outpaintHistory.length === 0}
+                  onClick={() => stepExtension("undo")}
+                >
+                  <Undo2 size={13} />
+                </IconButton>
+                <IconButton
+                  size="xs"
+                  className="shrink-0"
+                  aria-label={t("Studio.outpaint.redo")}
+                  title={t("Studio.outpaint.redo")}
+                  disabled={extending || outpaintFuture.length === 0}
+                  onClick={() => stepExtension("redo")}
+                >
+                  <Redo2 size={13} />
+                </IconButton>
+              </div>
+            </SettingsCard>
+          )}
+
+          {canMask && initImage && (
+            <div className="grid gap-2">
+              <span className="text-xs text-muted">{t("Studio.mask.title")}</span>
+              <MaskCanvas imageBase64={initImage} value={maskImage} onChange={setMaskImage} />
+            </div>
+          )}
+
+          {hasDetector && (
+            <SettingsCard title={t("Studio.adetailer.title")} hint={t("Studio.adetailer.hint")}>
+              <input
+                className="w-full rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+                placeholder={t("Studio.adetailer.promptPlaceholder")}
+                aria-label={t("Studio.adetailer.prompt")}
+                value={adPrompt}
+                onChange={(event) => setAdPrompt(event.target.value)}
+              />
+              <input
+                className="w-full rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+                placeholder={t("Studio.adetailer.negativePlaceholder")}
+                aria-label={t("Studio.adetailer.negative")}
+                value={adNegativePrompt}
+                onChange={(event) => setAdNegativePrompt(event.target.value)}
+              />
+            </SettingsCard>
+          )}
+
+          {conditioning.has("control") && (
+            <ConditioningImageField
+              label={t("Studio.control.title")}
+              hint={t("Studio.control.hint")}
+              value={controlImage}
+              onPick={() => void pickImage(setControlImage)}
+              onClear={() => setControlImage(null)}
+              onPreprocess={(kind) => void preprocessInto(controlImage, kind, setControlImage)}
+              strength={controlStrength}
+              onStrength={setControlStrength}
+              strengthLabel={t("Studio.control.strength")}
+            />
+          )}
+
+          {conditioning.has("ip_adapter") && (
+            <ConditioningImageField
+              label={t("Studio.ipAdapter.title")}
+              hint={t("Studio.ipAdapter.hint")}
+              value={ipAdapterImage}
+              onPick={() => void pickImage(setIpAdapterImage)}
+              onClear={() => setIpAdapterImage(null)}
+              strength={ipAdapterStrength}
+              onStrength={setIpAdapterStrength}
+              strengthLabel={t("Studio.ipAdapter.strength")}
+            />
+          )}
+
+          {conditioning.has("reference") && (
+            <ReferenceImages
+              images={refImages}
+              onAdd={() =>
+                void pickImage((base64) =>
+                  setRefImages((current) =>
+                    current.length >= MAX_REF_IMAGES ? current : [...current, base64],
+                  ),
+                )
+              }
+              onRemove={(index) =>
+                setRefImages((current) => current.filter((_, at) => at !== index))
+              }
+              numbered={numberRefImages}
+              onNumberedChange={setNumberRefImages}
+            />
           )}
 
           {isVideoTask(task) && (
@@ -1078,6 +1714,7 @@ export function StudioPanel() {
           {/* Every one of these is a per-run choice, not a property of the
               model — the library entry only supplies the starting values. */}
           {settings && !isSpeechTask(task) && (
+            <>
             <details open className="rounded border border-border p-3">
               <summary className="cursor-pointer text-xs font-medium">
                 {t("Studio.settings")}
@@ -1142,9 +1779,9 @@ export function StudioPanel() {
                 >
                   {/* A model may name a sampler this build does not list; keep
                       it selectable rather than silently switching it. */}
-                  {(SAMPLERS.includes(settings.sampler)
-                    ? SAMPLERS
-                    : [settings.sampler, ...SAMPLERS]
+                  {(samplers.includes(settings.sampler)
+                    ? samplers
+                    : [settings.sampler, ...samplers]
                   ).map((entry) => (
                     <option key={entry} value={entry}>
                       {entry}
@@ -1172,6 +1809,19 @@ export function StudioPanel() {
                 />
               </div>
 
+              {/* Images only: a clip and an utterance are one artifact per
+                  run, so a batch control on them would promise nothing. */}
+              {!isVideoTask(task) && !isSpeechTask(task) && (
+                <SliderField
+                  label={t("Studio.batch")}
+                  value={batchCount}
+                  min={1}
+                  max={MAX_BATCH_COUNT}
+                  step={1}
+                  onChange={setBatchCount}
+                />
+              )}
+
               {needsInitImage(task) && (
                 <SliderField
                   label={t("Studio.denoise")}
@@ -1183,27 +1833,7 @@ export function StudioPanel() {
                 />
               )}
 
-              <label className="grid gap-1 text-[11px] text-muted">
-                {t("Studio.seed")}
-                <span className="flex items-center gap-2">
-                  <input
-                    className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
-                    placeholder={t("Studio.seedPlaceholder")}
-                    value={seed}
-                    inputMode="numeric"
-                    onChange={(event) => setSeed(event.target.value.replace(/[^\d-]/g, ""))}
-                  />
-                  <IconButton
-                    size="sm"
-                    aria-label={t("Studio.seedShuffle")}
-                    onClick={() => setSeed(String(Math.floor(Math.random() * 2_147_483_647)))}
-                  >
-                    <Shuffle size={12} />
-                  </IconButton>
-                </span>
-              </label>
-
-              <details className="grid gap-2">
+              <details className="grid gap-2" hidden={remote}>
                 <summary className="cursor-pointer text-[11px] text-muted">
                   {t("Studio.advanced")}
                 </summary>
@@ -1216,7 +1846,7 @@ export function StudioPanel() {
                       onChange={(scheduler) => setSettings({ ...settings, scheduler })}
                     >
                       <option value="">{t("Studio.engineDefault")}</option>
-                      {SCHEDULERS.map((entry) => (
+                      {schedulers.map((entry) => (
                         <option key={entry} value={entry}>
                           {entry}
                         </option>
@@ -1289,7 +1919,7 @@ export function StudioPanel() {
                         }
                       />
                       <datalist id="studio-upscalers">
-                        {UPSCALERS.map((entry) => (
+                        {upscalers.map((entry) => (
                           <option key={entry} value={entry} />
                         ))}
                       </datalist>
@@ -1328,9 +1958,33 @@ export function StudioPanel() {
               </div>
               </div>
             </details>
+
+            {/* Its own card: the seed is the one setting people reach for
+                between runs — reroll, or paste one back to reproduce a result —
+                so it does not belong buried under the sampler. */}
+            <SettingsCard title={t("Studio.seed")}>
+              <span className="flex items-center gap-2">
+                <input
+                  className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
+                  placeholder={t("Studio.seedPlaceholder")}
+                  aria-label={t("Studio.seed")}
+                  value={seed}
+                  inputMode="numeric"
+                  onChange={(event) => setSeed(event.target.value.replace(/[^\d-]/g, ""))}
+                />
+                <IconButton
+                  size="sm"
+                  aria-label={t("Studio.seedShuffle")}
+                  onClick={() => setSeed(String(Math.floor(Math.random() * 2_147_483_647)))}
+                >
+                  <Shuffle size={12} />
+                </IconButton>
+              </span>
+            </SettingsCard>
+            </>
           )}
 
-          {!isSpeechTask(task) && (
+          {!isSpeechTask(task) && !remote && (
             <details className="rounded border border-border p-3">
               <summary className="cursor-pointer text-xs font-medium">
                 {t("Studio.lora.title")}
@@ -1353,7 +2007,7 @@ export function StudioPanel() {
               setting — so this offers the alternatives the library holds and
               nothing else. Hidden entirely when there are none, because a
               column of fixed dropdowns is just noise. */}
-          {choosable.length > 0 && (
+          {choosable.length > 0 && !remote && (
             <details open className="rounded border border-border p-3">
               <summary className="cursor-pointer text-xs font-medium">
                 {t("Studio.parts")}
@@ -1390,13 +2044,14 @@ export function StudioPanel() {
               </div>
             </details>
           )}
-
-        </aside>
-        )}
+          </>
+          )}
+        </div>,
+        railSlot,
+        ) : null}
 
         {/* `min-w-0`: a flex item's floor is its content, so without this a
-            wide result pushes the whole row past the pane and the rail is what
-            gets cut off the left of it. */}
+            wide result pushes the whole row past the pane. */}
         <section className="flex min-h-0 min-w-0 flex-1 flex-col gap-2">
           {/* Each button sits with the field it belongs to and stretches to
               its height, so the row reads as one control rather than two. */}
@@ -1404,6 +2059,14 @@ export function StudioPanel() {
             <textarea
               className="min-h-16 min-w-0 flex-1 resize-none rounded border border-border bg-background p-2 text-xs"
               placeholder={t("Studio.promptPlaceholder")}
+              // A placeholder is not a label: it disappears on the first
+              // keystroke and screen readers may never announce it.
+              aria-label={isSpeechTask(task) ? t("Studio.speechText") : t("Studio.prompt")}
+              // The engine parses `(word:1.3)` inside the prompt itself —
+              // verified against the pinned build, which exports
+              // `parse_prompt_attention`. It costs nothing to expose and is
+              // invisible otherwise. Speech has no sampler to weight.
+              title={isSpeechTask(task) ? undefined : t("Studio.promptWeighting")}
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
             />
@@ -1423,6 +2086,8 @@ export function StudioPanel() {
               <input
                 className="min-w-0 flex-1 rounded border border-border bg-background p-2 text-xs"
                 placeholder={t("Studio.negativePlaceholder")}
+                aria-label={t("Studio.negativePrompt")}
+                title={t("Studio.promptWeighting")}
                 value={negativePrompt}
                 onChange={(event) => setNegativePrompt(event.target.value)}
               />

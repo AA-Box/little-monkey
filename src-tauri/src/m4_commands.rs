@@ -425,7 +425,10 @@ pub fn m4_packages_set_team_approved(
 pub fn m4_registries_list(
     state: tauri::State<'_, M4CommandState>,
 ) -> Result<Vec<AdditionalRegistryRecord>, String> {
-    state.packages.list_registry_sources().map_err(command_error)
+    state
+        .packages
+        .list_registry_sources()
+        .map_err(command_error)
 }
 
 #[tauri::command]

@@ -201,6 +201,21 @@ export type RunEventWire =
       decision: PermissionDecision;
       decided_by: ClientIdentityWire;
     }>
+  /** Mirrors `RunEvent::RoutingDecided` — which dispatch policy chose this
+   * run's target and why (roadmap K9). Every field but the two the reader
+   * cannot do without is nullable, because "no policy matched" is a real
+   * answer rather than a missing one. */
+  | Event<
+      "routing_decided",
+      {
+        task_class: string;
+        policy_id: string | null;
+        policy_name: string | null;
+        chosen_key: string | null;
+        changed_from_active: boolean;
+        reason: string;
+      }
+    >
   | Event<"tool_started", { tool_call_id: string }>
   | Event<"tool_finished", {
       tool_call_id: string;
@@ -256,7 +271,25 @@ export type RunEventWire =
   | Event<"completed", { summary: string | null; result_artifact_ids: string[]; usage: UsageSnapshotWire }>
   | Event<"failed", { code: string; message: string; retryable: boolean }>
   | Event<"cancelled", { reason: string | null }>
-  | Event<"needs_reconciliation", { mutation_id: string; reason: string }>;
+  | Event<"needs_reconciliation", { mutation_id: string; reason: string }>
+  /** Mirrors `RunEvent::MigrationDeparted` — this run's frozen process image
+   * left for another owned node (roadmap K18). Not terminal: the target can
+   * still refuse it, and a run whose move was refused carries on here. */
+  | Event<"migration_departed", {
+      target_node_id: string;
+      payload_sha256: string;
+      checkpoint_id: string;
+    }>
+  /** Mirrors `RunEvent::MigrationArrived` — the first event of the target's
+   * half. `origin_last_event_hash` is the seam: it names the origin's chain
+   * tip, and because it sits inside the hashed envelope the two halves are one
+   * chain without any column spanning both machines. */
+  | Event<"migration_arrived", {
+      origin_node_id: string;
+      origin_last_sequence: number;
+      origin_last_event_hash: string;
+      payload_sha256: string;
+    }>;
 
 export interface RunEventEnvelopeWire {
   schema_version: typeof RUN_PROTOCOL_SCHEMA_VERSION;

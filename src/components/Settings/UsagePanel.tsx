@@ -1,16 +1,26 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Cpu } from "lucide-react";
 import { Button } from "../ui";
 import { useUsageHistoryStore } from "../../store/usageHistoryStore";
 import { useSessionStore } from "../../store/sessionStore";
 import {
+  compareBillingForMonth,
   evaluateCostBudget,
+  monthKey,
+  sanitizeWarningPercents,
   useCostControlStore,
+  type CostAttributionScope,
 } from "../../store/costControlStore";
+import { useResourceLedgerStore } from "../../store/resourceLedgerStore";
 import { useModelStore } from "../../store/modelStore";
 import { providerModelTargetKey } from "../../lib/modelTargets";
 import { useT } from "../../lib/i18n";
 import { formatDuration } from "../../lib/format";
+import { renderTotal, type UsageTotalField } from "../../lib/processUsage";
+import {
+  accountByWorkspace,
+  workspaceDisplayName,
+} from "../../lib/workspaceAccounting";
 
 /** A full trailing year, matching the "Aug ... Jul" span of a GitHub-style contribution graph. */
 const WEEKS = 52;
@@ -104,6 +114,22 @@ const LEVEL_CLASSES = ["bg-surface-2", "bg-accent/25", "bg-accent/50", "bg-accen
 
 const MODES: ActivityMode[] = ["daily", "weekly", "cumulative"];
 
+const ATTRIBUTION_SCOPES: CostAttributionScope[] = ["workspace", "project", "session", "target"];
+
+/** The device measurements shown beside a workspace's token bill. Wall and CPU
+ * time answer "how long did this workspace hold the machine"; GPU device time
+ * is the one that a token bill can never stand in for, since a local model's
+ * whole cost is device time. */
+const DEVICE_FIELDS: UsageTotalField[] = ["wallTimeMs", "cpuTimeMs", "gpuDeviceMs"];
+
+function usd(value: number): string {
+  return `$${value.toFixed(4)}`;
+}
+
+function percent(fraction: number): string {
+  return `${Math.round(fraction * 100)}%`;
+}
+
 /**
  * Settings "Usage" tab: lifetime/peak/longest-task/streak stats, a
  * GitHub-style daily activity heatmap over the trailing year (with
@@ -128,16 +154,33 @@ export function UsagePanel() {
   const costPolicy = useCostControlStore((s) => s.policy);
   const costRates = useCostControlStore((s) => s.rates);
   const costEntries = useCostControlStore((s) => s.entries);
+  const costReconciliations = useCostControlStore((s) => s.reconciliations);
   const setCostPolicy = useCostControlStore((s) => s.setPolicy);
   const setCostRate = useCostControlStore((s) => s.setRate);
+  const setReconciliation = useCostControlStore((s) => s.setReconciliation);
   const clearCostUsage = useCostControlStore((s) => s.clearUsage);
   const providers = useModelStore((s) => s.providers);
   const providerModels = useModelStore((s) => s.providerModels);
   const chatSessions = useSessionStore((s) => s.sessions.length);
+  const sessions = useSessionStore((s) => s.sessions);
+  const ledgerRows = useResourceLedgerStore((s) => s.rows);
+  const refreshLedger = useResourceLedgerStore((s) => s.refreshLedger);
+  const ledgerError = useResourceLedgerStore((s) => s.ledgerError);
 
   const [confirmingClear, setConfirmingClear] = useState(false);
   const [mode, setMode] = useState<ActivityMode>("daily");
   const [selectedCostTarget, setSelectedCostTarget] = useState("");
+  const [attributionScope, setAttributionScope] = useState<CostAttributionScope>("workspace");
+  // Held as text so a half-typed list ("50, 8") is not rewritten under the
+  // cursor by the sanitizer; committed on blur.
+  const [tiersDraft, setTiersDraft] = useState<string | null>(null);
+
+  // Read once when the tab opens. The resource ledger is not a live dashboard
+  // (see `resourceLedgerStore.ts`) — it is read when somebody asks what
+  // something cost, which is exactly what opening this tab is.
+  useEffect(() => {
+    void refreshLedger();
+  }, [refreshLedger]);
   const gridWrapRef = useRef<HTMLDivElement>(null);
   const [cellHover, setCellHover] = useState<{ x: number; y: number; label: string } | null>(null);
 
@@ -239,6 +282,40 @@ export function UsagePanel() {
     [costEntries, costPolicy],
   );
 
+  const currentMonth = useMemo(() => monthKey(Date.now()), []);
+
+  const attributionRows = useMemo(
+    () => accountByWorkspace(costEntries, ledgerRows, attributionScope),
+    [attributionScope, costEntries, ledgerRows],
+  );
+
+  const sessionTitles = useMemo(
+    () => new Map(sessions.map((session) => [session.id, session.title])),
+    [sessions],
+  );
+
+  const billingRows = useMemo(
+    () => compareBillingForMonth(costEntries, costReconciliations, currentMonth),
+    [costEntries, costReconciliations, currentMonth],
+  );
+
+  /** Every provider with a key configured, so a month can be reconciled even
+   * before the app has recorded a single priced call against it. */
+  const reconcilableProviders = useMemo(() => {
+    const ids = new Set(billingRows.map((row) => row.providerId));
+    for (const provider of providers) if (provider.has_key) ids.add(provider.id);
+    return Array.from(ids).sort();
+  }, [billingRows, providers]);
+
+  function attributionLabel(key: string): string {
+    if (key === "") return t("UsagePanel.unattributed");
+    if (attributionScope === "session") return sessionTitles.get(key) ?? key;
+    if (attributionScope === "target") {
+      return costEntries.find((entry) => entry.targetKey === key)?.targetLabel ?? key;
+    }
+    return workspaceDisplayName(key);
+  }
+
   function handleClear() {
     clear();
     clearCostUsage();
@@ -320,16 +397,29 @@ export function UsagePanel() {
             />
           </label>
           <label className="text-xs text-muted">
-            <span className="mb-1 block">{t("UsagePanel.warningThreshold")}</span>
+            <span className="mb-1 block">{t("UsagePanel.warningThresholds")}</span>
             <input
-              type="number"
-              min="10"
-              max="99"
-              step="1"
-              value={Math.round(costPolicy.warningPercent * 100)}
-              onChange={(event) =>
-                setCostPolicy({ warningPercent: Number(event.target.value) / 100 })
+              type="text"
+              inputMode="numeric"
+              value={
+                tiersDraft
+                ?? costPolicy.warningPercents.map((tier) => Math.round(tier * 100)).join(", ")
               }
+              onChange={(event) => setTiersDraft(event.target.value)}
+              onBlur={(event) => {
+                setCostPolicy({
+                  warningPercents: sanitizeWarningPercents(
+                    event.target.value
+                      .split(",")
+                      .map((part) => Number(part.trim()) / 100)
+                      .filter((value) => Number.isFinite(value) && value > 0),
+                  ),
+                });
+                // Dropped so the field re-renders from the sanitized policy —
+                // the user sees exactly the tiers that will be enforced, not
+                // the text they typed.
+                setTiersDraft(null);
+              }}
               className="w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground"
             />
           </label>
@@ -382,6 +472,13 @@ export function UsagePanel() {
             >
               {t(`UsagePanel.costStatus.${costEvaluation.status}`)}
             </p>
+            {costEvaluation.highestTier !== null && (
+              <p className="mt-1 text-[11px] text-muted">
+                {t("UsagePanel.tierCrossed", {
+                  percent: percent(costEvaluation.highestTier),
+                })}
+              </p>
+            )}
             {costEvaluation.monthly.unknownCalls > 0 && (
               <p className="mt-1 text-[11px] text-warning">
                 {t("UsagePanel.unknownPricedCalls", {
@@ -456,6 +553,207 @@ export function UsagePanel() {
             <p className="mt-3 text-xs text-faint">
               {t("UsagePanel.noProviderModels")}
             </p>
+          )}
+        </div>
+
+        <div className="mt-4 border-t border-border pt-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h4 className="text-xs font-semibold text-foreground">
+                {t("UsagePanel.attributionHeading")}
+              </h4>
+              <p className="mt-1 max-w-2xl text-[11px] leading-relaxed text-faint">
+                {t("UsagePanel.attributionDescription")}
+              </p>
+            </div>
+            <div className="flex items-center gap-2.5">
+              {ATTRIBUTION_SCOPES.map((scope) => (
+                <button
+                  key={scope}
+                  type="button"
+                  onClick={() => setAttributionScope(scope)}
+                  className={`text-xs transition-colors ${
+                    attributionScope === scope
+                      ? "font-medium text-foreground"
+                      : "text-faint hover:text-muted"
+                  }`}
+                >
+                  {t(`UsagePanel.scope.${scope}`)}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {attributionScope === "workspace" && ledgerError && (
+            // The device half failed to read. Said out loud rather than shown
+            // as an empty column, which would read as "this workspace used no
+            // device time".
+            <p className="mt-2 text-[11px] text-warning">
+              {t("UsagePanel.deviceLedgerUnavailable", { reason: ledgerError })}
+            </p>
+          )}
+
+          {attributionRows.length === 0 ? (
+            <p className="mt-3 text-xs text-faint">{t("UsagePanel.attributionEmpty")}</p>
+          ) : (
+            <div className="mt-3 overflow-x-auto">
+              <table className="w-full min-w-[40rem] border-collapse text-left text-xs">
+                <thead>
+                  <tr className="text-[11px] uppercase tracking-wide text-faint">
+                    <th className="py-1.5 pr-3 font-normal">
+                      {t(`UsagePanel.scope.${attributionScope}`)}
+                    </th>
+                    <th className="py-1.5 pr-3 text-right font-normal">
+                      {t("UsagePanel.colEstimatedSpend")}
+                    </th>
+                    <th className="py-1.5 pr-3 text-right font-normal">
+                      {t("UsagePanel.colTokens")}
+                    </th>
+                    <th className="py-1.5 pr-3 text-right font-normal">
+                      {t("UsagePanel.colUnpricedCalls")}
+                    </th>
+                    {attributionScope === "workspace"
+                      && DEVICE_FIELDS.map((field) => (
+                        <th key={field} className="py-1.5 pr-3 text-right font-normal">
+                          {t(`UsagePanel.colDevice_${field}`)}
+                        </th>
+                      ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border">
+                  {attributionRows.map((row) => (
+                    <tr key={row.key || "unattributed"}>
+                      <td className="max-w-[16rem] truncate py-2 pr-3 text-foreground" title={row.key}>
+                        {attributionLabel(row.key)}
+                      </td>
+                      <td className="py-2 pr-3 text-right font-mono text-foreground">
+                        {row.cost ? usd(row.cost.spentUsd) : t("UsagePanel.noRecordedCalls")}
+                      </td>
+                      <td className="py-2 pr-3 text-right font-mono text-muted">
+                        {row.cost ? formatTokens(row.cost.totalTokens) : "—"}
+                      </td>
+                      <td className="py-2 pr-3 text-right font-mono text-muted">
+                        {row.cost
+                          ? row.cost.unknownCalls > 0
+                            ? String(row.cost.unknownCalls)
+                            : "0"
+                          : "—"}
+                      </td>
+                      {attributionScope === "workspace"
+                        && DEVICE_FIELDS.map((field) => {
+                          // Same rule as the resource ledger panel: an
+                          // unmeasured total renders as its reason, never as a
+                          // zero. A workspace with no process rows at all gets
+                          // the "no rows" reason rather than a blank cell.
+                          const rendered = row.device
+                            ? renderTotal(
+                                row.device[field],
+                                "duration",
+                                t("UsagePanel.deviceUnmeasured"),
+                              )
+                            : { available: false as const, reason: t("UsagePanel.deviceNoRows") };
+                          return (
+                            <td key={field} className="py-2 pr-3 text-right">
+                              {rendered.available ? (
+                                <span className="font-mono text-foreground">{rendered.text}</span>
+                              ) : (
+                                <span className="text-[11px] text-warning">{rendered.reason}</span>
+                              )}
+                            </td>
+                          );
+                        })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        <div className="mt-4 border-t border-border pt-4">
+          <h4 className="text-xs font-semibold text-foreground">
+            {t("UsagePanel.reconciliationHeading")}
+          </h4>
+          <p className="mt-1 max-w-2xl text-[11px] leading-relaxed text-faint">
+            {t("UsagePanel.reconciliationDescription", { month: currentMonth })}
+          </p>
+          {reconcilableProviders.length === 0 ? (
+            <p className="mt-3 text-xs text-faint">{t("UsagePanel.reconciliationEmpty")}</p>
+          ) : (
+            <div className="mt-3 overflow-x-auto">
+              <table className="w-full min-w-[34rem] border-collapse text-left text-xs">
+                <thead>
+                  <tr className="text-[11px] uppercase tracking-wide text-faint">
+                    <th className="py-1.5 pr-3 font-normal">{t("UsagePanel.colProvider")}</th>
+                    <th className="py-1.5 pr-3 text-right font-normal">
+                      {t("UsagePanel.colEstimatedSpend")}
+                    </th>
+                    <th className="py-1.5 pr-3 text-right font-normal">
+                      {t("UsagePanel.colActualBilled")}
+                    </th>
+                    <th className="py-1.5 pr-3 text-right font-normal">
+                      {t("UsagePanel.colDrift")}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border">
+                  {reconcilableProviders.map((providerId) => {
+                    const row = billingRows.find((candidate) => candidate.providerId === providerId);
+                    const estimated = row?.estimatedUsd ?? 0;
+                    const unknownCalls = row?.unknownCalls ?? 0;
+                    return (
+                      <tr key={providerId}>
+                        <td className="py-2 pr-3 text-foreground">
+                          {providers.find((provider) => provider.id === providerId)?.label
+                            ?? providerId}
+                          {unknownCalls > 0 && (
+                            <span className="ml-2 text-[11px] text-warning">
+                              {t("UsagePanel.unknownPricedCalls", { count: unknownCalls })}
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2 pr-3 text-right font-mono text-muted">
+                          {usd(estimated)}
+                        </td>
+                        <td className="py-2 pr-3 text-right">
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            placeholder={t("UsagePanel.actualBilledPlaceholder")}
+                            value={row?.actualBilledUsd ?? ""}
+                            onChange={(event) =>
+                              setReconciliation(
+                                providerId,
+                                currentMonth,
+                                event.target.value === "" ? null : Number(event.target.value),
+                              )
+                            }
+                            className="w-28 rounded-md border border-border bg-background px-2 py-1 text-right text-xs text-foreground"
+                          />
+                        </td>
+                        <td className="py-2 pr-3 text-right font-mono">
+                          {row?.driftUsd === null || row?.driftUsd === undefined ? (
+                            <span className="text-faint">—</span>
+                          ) : (
+                            <span
+                              className={
+                                Math.abs(row.driftUsd) > 0.005 ? "text-warning" : "text-muted"
+                              }
+                            >
+                              {row.driftUsd >= 0 ? "+" : "−"}
+                              {usd(Math.abs(row.driftUsd))}
+                              {row.driftFraction !== null
+                                && ` (${percent(Math.abs(row.driftFraction))})`}
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
       </section>

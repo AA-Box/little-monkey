@@ -38,7 +38,7 @@ export const FILE_TOOL_NAMES = new Set(['write_file', 'edit_file']);
 /** What kind of non-file side effect an external-effect tool has — shown in
  * the UI so "a shell command ran" and "a network call happened" read as
  * distinct, specific warnings rather than one generic caveat. */
-export type ExternalEffectKind = 'shell' | 'network' | 'memory' | 'mcp';
+export type ExternalEffectKind = 'shell' | 'network' | 'memory' | 'mcp' | 'task-suggestion';
 
 /** Plain (non-MCP) tool names with a real side effect outside the
  * checkpointed workspace, and the kind each one is:
@@ -47,12 +47,16 @@ export type ExternalEffectKind = 'shell' | 'network' | 'memory' | 'mcp';
  * - `web_fetch`/`web_search`: network calls — an HTTP request already
  *   happened and can't be un-sent.
  * - `remember`: writes to this app's own persistent memory store, a form of
- *   state that lives outside the checkpointed workspace files. */
+ *   state that lives outside the checkpointed workspace files.
+ * - `spawn_task`: stages a follow-up chip. Nothing runs until the user clicks
+ *   it, but the chip outlives the turn — a reverted turn that keeps proposing
+ *   work is proposing it on the strength of something the user took back. */
 const EXTERNAL_TOOL_KINDS: Record<string, ExternalEffectKind> = {
   run_shell: 'shell',
   web_fetch: 'network',
   web_search: 'network',
   remember: 'memory',
+  spawn_task: 'task-suggestion',
 };
 
 /** MCP tool calls (`mcp__<server>__<tool>`) are always external: an MCP

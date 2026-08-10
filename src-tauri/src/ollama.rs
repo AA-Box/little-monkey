@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
+use crate::profiles::ProfileScopedPaths;
 use crate::AppState;
 
 /// Base URL for Ollama's local daemon (native API + OpenAI-compatible
@@ -86,11 +87,7 @@ async fn check_reachable() -> (bool, Option<String>) {
         Err(_) => return (false, None),
     };
 
-    match client
-        .get(format!("{OLLAMA_BASE_URL}/api/version"))
-        .send()
-        .await
-    {
+    match crate::egress::send(client.get(format!("{OLLAMA_BASE_URL}/api/version"))).await {
         Ok(resp) if resp.status().is_success() => {
             let version = resp.json::<serde_json::Value>().await.ok().and_then(|v| {
                 v.get("version")
@@ -281,11 +278,12 @@ struct RawShowResponse {
 /// `vision` defaults to `false` in that case, since guessing a model can see
 /// images when it can't would be a worse failure mode than the reverse.
 async fn check_capabilities(client: &reqwest::Client, name: &str) -> (bool, bool) {
-    let resp = client
-        .post(format!("{OLLAMA_BASE_URL}/api/show"))
-        .json(&json!({ "model": name }))
-        .send()
-        .await;
+    let resp = crate::egress::send(
+        client
+            .post(format!("{OLLAMA_BASE_URL}/api/show"))
+            .json(&json!({ "model": name })),
+    )
+    .await;
 
     match resp {
         Ok(r) if r.status().is_success() => match r.json::<RawShowResponse>().await {
@@ -308,9 +306,7 @@ pub async fn ollama_list_models() -> Result<Vec<OllamaModelInfo>, String> {
     // `check_capabilities` borrows this same client.
     let client = ollama_client(Duration::from_secs(10))?;
 
-    let resp = client
-        .get(format!("{OLLAMA_BASE_URL}/api/tags"))
-        .send()
+    let resp = crate::egress::send(client.get(format!("{OLLAMA_BASE_URL}/api/tags")))
         .await
         .map_err(|_| "Ollama isn't running — start it first".to_string())?;
 
@@ -383,9 +379,7 @@ fn normalize_running_models(parsed: RawRunningModelsResponse) -> Vec<OllamaRunni
 async fn fetch_running_models(
     client: &reqwest::Client,
 ) -> Result<Vec<OllamaRunningModelInfo>, String> {
-    let resp = client
-        .get(format!("{OLLAMA_BASE_URL}/api/ps"))
-        .send()
+    let resp = crate::egress::send(client.get(format!("{OLLAMA_BASE_URL}/api/ps")))
         .await
         .map_err(|_| "Ollama isn't running — start it first".to_string())?;
 
@@ -475,12 +469,13 @@ pub async fn ollama_unload_model(model: String) -> Result<(), String> {
         return Ok(());
     }
 
-    let resp = client
-        .post(format!("{OLLAMA_BASE_URL}/api/chat"))
-        .json(&unload_request_body(&model))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach Ollama while unloading '{model}': {e}"))?;
+    let resp = crate::egress::send(
+        client
+            .post(format!("{OLLAMA_BASE_URL}/api/chat"))
+            .json(&unload_request_body(&model)),
+    )
+    .await
+    .map_err(|e| format!("Failed to reach Ollama while unloading '{model}': {e}"))?;
 
     if resp.status().is_success() {
         Ok(())
@@ -503,11 +498,21 @@ pub async fn ollama_unload_model(model: String) -> Result<(), String> {
 /// client listing servable model ids has no use for the tool-calling/vision
 /// UI hints those probes exist for.
 pub async fn list_tag_names(client: &reqwest::Client) -> Result<Vec<String>, String> {
-    let resp = client
-        .get(format!("{OLLAMA_BASE_URL}/api/tags"))
-        .send()
-        .await
-        .map_err(|_| "Ollama isn't running — start it first".to_string())?;
+    list_tag_names_at(client, OLLAMA_BASE_URL).await
+}
+
+/// Endpoint-injected form of [`list_tag_names`]. Production callers use the
+/// built-in loopback origin; the unified CLI compatibility harness supplies an
+/// ephemeral loopback fake so its byte pins never depend on, or talk to, a
+/// developer's real Ollama daemon.
+pub async fn list_tag_names_at(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<Vec<String>, String> {
+    let resp =
+        crate::egress::send(client.get(format!("{}/api/tags", base_url.trim_end_matches('/'))))
+            .await
+            .map_err(|_| "Ollama isn't running — start it first".to_string())?;
 
     if !resp.status().is_success() {
         return Err("Ollama isn't running — start it first".to_string());
@@ -555,12 +560,13 @@ pub async fn embed(model: &str, inputs: &[String]) -> Result<Vec<Vec<f32>>, Stri
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
-    let resp = client
-        .post(format!("{OLLAMA_BASE_URL}/api/embed"))
-        .json(&json!({ "model": model, "input": inputs }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach Ollama for embeddings: {e}"))?;
+    let resp = crate::egress::send(
+        client
+            .post(format!("{OLLAMA_BASE_URL}/api/embed"))
+            .json(&json!({ "model": model, "input": inputs })),
+    )
+    .await
+    .map_err(|e| format!("Failed to reach Ollama for embeddings: {e}"))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -813,8 +819,7 @@ pub async fn ollama_import_model(app: AppHandle, name: String, path: String) -> 
         .map_err(|e| format!("Path not found: {path} ({e})"))?;
 
     let app_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     std::fs::create_dir_all(&app_dir).map_err(|e| {
         format!(
@@ -865,7 +870,8 @@ pub async fn ollama_create_from_modelfile(
     short_name: String,
     modelfile_text: String,
 ) -> Result<(), String> {
-    let short_name = crate::modelfile::validate_short_name(&short_name).map_err(|e| e.to_string())?;
+    let short_name =
+        crate::modelfile::validate_short_name(&short_name).map_err(|e| e.to_string())?;
     let parsed = crate::modelfile::parse_modelfile(&modelfile_text).map_err(|e| e.to_string())?;
     crate::modelfile::validate_modelfile(&parsed).map_err(|e| e.to_string())?;
     let resolved = parsed
@@ -874,8 +880,7 @@ pub async fn ollama_create_from_modelfile(
     let rendered = resolved.render();
 
     let app_dir = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     std::fs::create_dir_all(&app_dir).map_err(|e| {
         format!(
@@ -919,12 +924,13 @@ pub async fn ollama_remove_model(tag: String) -> Result<(), String> {
     // Longer than the read-only calls: Ollama unlinks the tag's blobs before it
     // answers, and a large model's blobs are large files.
     let client = ollama_client(Duration::from_secs(60))?;
-    let resp = client
-        .delete(format!("{OLLAMA_BASE_URL}/api/delete"))
-        .json(&json!({ "model": tag }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach Ollama: {e}"))?;
+    let resp = crate::egress::send(
+        client
+            .delete(format!("{OLLAMA_BASE_URL}/api/delete"))
+            .json(&json!({ "model": tag })),
+    )
+    .await
+    .map_err(|e| format!("Failed to reach Ollama: {e}"))?;
 
     if resp.status().is_success() {
         Ok(())

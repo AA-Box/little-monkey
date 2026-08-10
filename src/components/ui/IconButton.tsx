@@ -1,7 +1,7 @@
 import type { ButtonHTMLAttributes, ReactNode } from "react";
 import type { ButtonVariant } from "./Button";
 
-export type IconButtonSize = "sm" | "md";
+export type IconButtonSize = "xs" | "sm" | "md";
 
 /** `active` = a toggled-on toolbar button (Claude-Desktop-style accent tint). */
 export type IconButtonVariant = ButtonVariant | "active";
@@ -16,7 +16,11 @@ export interface IconButtonProps extends ButtonHTMLAttributes<HTMLButtonElement>
 const BASE_CLASSES =
   "inline-flex items-center justify-center gap-1.5 rounded-md font-medium transition-colors duration-150 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background";
 
+/** `xs` is the toolbar size: narrower than it is tall, because width is what a
+ *  crowded row runs out of. 24px is the floor — the minimum a pointer target
+ *  wants — and a row of six only fits beside anything else at that width. */
 const SIZE_CLASSES: Record<IconButtonSize, string> = {
+  xs: "h-7 w-6",
   sm: "h-8 w-8",
   md: "h-9 w-9",
 };

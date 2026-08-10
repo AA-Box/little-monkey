@@ -25,10 +25,16 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Notify;
 
+use crate::profiles::ProfileScopedPaths;
 use crate::run_scope::{RunScope, Unattributed};
 use crate::AppState;
 
-const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.app"));
 
 /// Valid values for the app's effort scale — the five levels Anthropic's
 /// native `output_config.effort` field accepts. Other providers with a
@@ -114,6 +120,25 @@ struct ProvidersFile {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderModelInfo {
     pub id: String,
+    /// What the provider itself says about image input, when it says anything
+    /// at all. `None` for the providers whose `/models` returns an id and
+    /// nothing else (OpenAI, Gemini's OpenAI-compatible shim, most custom base
+    /// URLs) — the frontend falls back to `visionModels.ts`'s name heuristic
+    /// there, which is a guess and is wrong every time a new family ships.
+    /// Skipped rather than serialized as `null` so the TS mirror can be
+    /// optional: every `{ id }` literal in the existing tests stays valid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
+    /// The model's context window, when the provider publishes one. Drives
+    /// `usageStore`'s `contextLimit`, which is what `contextTrimmer.ts`'s
+    /// `shouldTrim` needs before it will compact anything — a cloud model
+    /// without this never auto-trims. Same skip/optional treatment as
+    /// `vision`, and likewise for `tool_calling`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    /// Whether the provider says this model accepts tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calling: Option<bool>,
 }
 
 /// Minimal shape of an OpenAI-style `GET /models` response — same defensive,
@@ -128,13 +153,79 @@ struct RawModelsResponse {
 struct RawModelEntry {
     #[serde(default)]
     id: Option<String>,
+    /// OpenRouter: `architecture.input_modalities: ["text", "image"]`.
+    #[serde(default)]
+    architecture: Option<RawArchitecture>,
+    /// Anthropic: `capabilities.image_input.supported`.
+    #[serde(default)]
+    capabilities: Option<RawCapabilities>,
+    /// OpenRouter's context window.
+    #[serde(default)]
+    context_length: Option<u64>,
+    /// Anthropic's, under a different name.
+    #[serde(default)]
+    max_input_tokens: Option<u64>,
+    /// OpenRouter: `supported_parameters: ["tools", "tool_choice", ...]`.
+    #[serde(default)]
+    supported_parameters: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct RawArchitecture {
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct RawCapabilities {
+    #[serde(default)]
+    image_input: Option<RawSupported>,
+}
+
+#[derive(Deserialize)]
+struct RawSupported {
+    #[serde(default)]
+    supported: Option<bool>,
+}
+
+impl RawModelEntry {
+    /// The provider's own vision answer, or `None` if it didn't give one.
+    /// An entry that carries the field but says "no image input" is a real
+    /// `Some(false)` — it overrides the name heuristic just as `Some(true)`
+    /// does, since the provider knows better than a regex either way.
+    fn vision(&self) -> Option<bool> {
+        if let Some(supported) = self
+            .capabilities
+            .as_ref()
+            .and_then(|c| c.image_input.as_ref())
+            .and_then(|image| image.supported)
+        {
+            return Some(supported);
+        }
+        self.architecture
+            .as_ref()
+            .and_then(|a| a.input_modalities.as_ref())
+            .map(|modalities| modalities.iter().any(|m| m == "image"))
+    }
+
+    /// The context window under whichever name the provider gave it.
+    fn context_length(&self) -> Option<u64> {
+        self.context_length.or(self.max_input_tokens)
+    }
+
+    /// Only OpenRouter answers this one — Anthropic's `capabilities` tree has
+    /// no tool-use entry, so its models stay unknown rather than guessed at.
+    fn tool_calling(&self) -> Option<bool> {
+        self.supported_parameters
+            .as_ref()
+            .map(|params| params.iter().any(|p| p == "tools"))
+    }
 }
 
 /// Resolves (and creates, if missing) `<app_data_dir>/providers.json`'s path.
 fn providers_file_path(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
-        .path()
-        .app_data_dir()
+        .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     if !base.exists() {
         std::fs::create_dir_all(&base).map_err(|e| {
@@ -191,6 +282,21 @@ pub fn resolve_base_url(id: &str, custom: &[CustomProviderEntry]) -> Result<Stri
         .ok_or_else(|| format!("Unknown provider '{id}'"))
 }
 
+/// The custom provider list read straight off disk, for callers with no
+/// `AppHandle` to resolve the app data dir through.
+///
+/// A missing or unreadable `providers.json` is an empty list rather than an
+/// error: the presets are still resolvable without it, and a caller that then
+/// fails to find its provider says so with a better message than "no file".
+pub fn configured_custom_providers() -> Vec<CustomProviderEntry> {
+    crate::app_paths::data_dir()
+        .and_then(|dir| std::fs::read_to_string(dir.join("providers.json")).ok())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value.get("custom").cloned())
+        .and_then(|value| serde_json::from_value::<Vec<CustomProviderEntry>>(value).ok())
+        .unwrap_or_default()
+}
+
 fn find_base_url(app: &AppHandle, id: &str) -> Result<String, String> {
     let custom = read_custom_providers(app)?;
     resolve_base_url(id, &custom)
@@ -200,7 +306,7 @@ fn find_base_url(app: &AppHandle, id: &str) -> Result<String, String> {
 /// actual credential remains in the OS keychain and is still loaded only for
 /// the lifetime of one request.
 pub fn credential_ref_id(id: &str) -> String {
-    format!("keychain:{KEYCHAIN_SERVICE}:{id}")
+    format!("keychain:{}:{id}", *KEYCHAIN_SERVICE)
 }
 
 pub fn configured_endpoint(app: &AppHandle, id: &str) -> Result<String, String> {
@@ -208,13 +314,13 @@ pub fn configured_endpoint(app: &AppHandle, id: &str) -> Result<String, String> 
 }
 
 pub fn has_key(id: &str) -> bool {
-    keyring::Entry::new(KEYCHAIN_SERVICE, id)
+    keyring::Entry::new(&KEYCHAIN_SERVICE, id)
         .and_then(|e| e.get_password())
         .is_ok()
 }
 
 pub fn read_key(provider_id: &str) -> Result<String, String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, provider_id)
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, provider_id)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     entry.get_password().map_err(|e| match e {
         keyring::Error::NoEntry => {
@@ -264,7 +370,7 @@ pub fn read_key_with_env(provider_id: &str) -> Result<String, String> {
 }
 
 fn remove_key_impl(provider_id: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, provider_id)
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, provider_id)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     match entry.delete_credential() {
         Ok(()) => Ok(()),
@@ -352,7 +458,9 @@ pub fn add_anthropic_headers(
     }
 }
 
-/// GETs `${base_url}/models` and parses the OpenAI-style `data[].id` list.
+/// GETs `${base_url}/models` and parses the OpenAI-style `data[].id` list,
+/// plus whatever that entry says about image input (see
+/// [`RawModelEntry::vision`]).
 /// `pub` so `server.rs`'s `GET /v1/models` (phase 3) can list cloud provider
 /// models the same keychain-authed way `providers_list_models` already does
 /// — no behavior change.
@@ -377,8 +485,7 @@ pub async fn fetch_models(
         api_key,
     );
 
-    let response = request
-        .send()
+    let response = crate::egress::send(request)
         .await
         .map_err(|e| format!("Failed to reach {base_url}: {e}"))?;
 
@@ -403,7 +510,17 @@ pub async fn fetch_models(
     let mut models: Vec<ProviderModelInfo> = parsed
         .data
         .into_iter()
-        .filter_map(|entry| entry.id.map(|id| ProviderModelInfo { id }))
+        .filter_map(|entry| {
+            let vision = entry.vision();
+            let context_length = entry.context_length();
+            let tool_calling = entry.tool_calling();
+            entry.id.map(|id| ProviderModelInfo {
+                id,
+                vision,
+                context_length,
+                tool_calling,
+            })
+        })
         .collect();
     models.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(models)
@@ -524,7 +641,7 @@ pub async fn providers_set_key(
     let base_url = find_base_url(&app, &id)?;
     let models = fetch_models(&base_url, &id, &api_key).await?;
 
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &id)
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &id)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     entry
         .set_password(&api_key)
@@ -662,7 +779,13 @@ pub async fn providers_stream_chat(
         Some(run_id) => RunScope::run(run_id),
         None => RunScope::Unattributed(Unattributed::UserAction),
     };
-    let result = crate::run_scope::scoped(
+    // `scoped_with_egress` rather than `scoped`: it attaches the run's process row
+    // when there is one, so the bytes this stream moves reach
+    // `agent_processes.bytes_egressed` instead of an unattributed tally. See its
+    // doc for what that column counts and how often it is written.
+    let result = crate::run_commands::scoped_with_egress(
+        &app,
+        state.inner(),
         scope,
         run_stream_chat(
             &app,
@@ -821,7 +944,7 @@ async fn run_stream_chat(
             );
             return Ok(());
         }
-        result = request.send() => {
+        result = crate::egress::send(request) => {
             result.map_err(|e| format!("Failed to reach {base_url}: {e}"))?
         }
     };
@@ -895,6 +1018,64 @@ mod tests {
             assert!(ids.insert(preset.id), "duplicate preset id '{}'", preset.id);
             assert!(validate_base_url(preset.base_url).is_ok());
         }
+    }
+
+    /// The two providers that answer the vision question themselves, in their
+    /// own shapes, plus the OpenAI shape that answers nothing — a `None` there
+    /// is what keeps the name heuristic in play for them.
+    #[test]
+    fn model_entries_report_vision_when_the_provider_says_so() {
+        let parsed: RawModelsResponse = serde_json::from_str(
+            r#"{"data": [
+                {"id": "anthropic/claude-opus-5",
+                 "architecture": {"input_modalities": ["text", "image"]}},
+                {"id": "openai/gpt-oss-120b",
+                 "architecture": {"input_modalities": ["text"]}},
+                {"id": "claude-opus-5",
+                 "capabilities": {"image_input": {"supported": true}}},
+                {"id": "claude-instant-1.2",
+                 "capabilities": {"image_input": {"supported": false}}},
+                {"id": "gpt-4o", "object": "model", "owned_by": "openai"}
+            ]}"#,
+        )
+        .expect("the fixture is a valid /models response");
+        let vision: Vec<Option<bool>> = parsed.data.iter().map(RawModelEntry::vision).collect();
+        assert_eq!(
+            vision,
+            vec![Some(true), Some(false), Some(true), Some(false), None]
+        );
+    }
+
+    /// Context window and tool support, under each provider's own field name.
+    /// The OpenAI-shaped entry answers neither, which is what leaves those
+    /// capabilities "unknown" in the UI rather than guessed at.
+    #[test]
+    fn model_entries_report_context_length_and_tool_calling() {
+        let parsed: RawModelsResponse = serde_json::from_str(
+            r#"{"data": [
+                {"id": "anthropic/claude-opus-5", "context_length": 1000000,
+                 "supported_parameters": ["max_tokens", "tools", "tool_choice"]},
+                {"id": "vendor/no-tools", "context_length": 8192,
+                 "supported_parameters": ["max_tokens"]},
+                {"id": "claude-opus-5", "max_input_tokens": 1000000},
+                {"id": "gpt-4o", "object": "model", "owned_by": "openai"}
+            ]}"#,
+        )
+        .expect("the fixture is a valid /models response");
+        let read: Vec<(Option<u64>, Option<bool>)> = parsed
+            .data
+            .iter()
+            .map(|entry| (entry.context_length(), entry.tool_calling()))
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                (Some(1_000_000), Some(true)),
+                (Some(8192), Some(false)),
+                (Some(1_000_000), None),
+                (None, None),
+            ]
+        );
     }
 
     #[test]

@@ -48,7 +48,12 @@ use crate::AppState;
 /// Same keychain service every credential in this app lives under (see
 /// `mcp_oauth.rs`/`mcp.rs`/`providers.rs`) — entries are disambiguated by
 /// *account*, not service.
-const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.app"));
 
 /// Public client ids — not secret, visible in every authorize URL a browser
 /// ever sends anyway. Only the matching `client_secret`s (held by the
@@ -89,7 +94,12 @@ pub struct PendingHostedOAuth {
     created_at: std::time::Instant,
 }
 
-fn emit_progress<R: Runtime>(app: &AppHandle<R>, server_id: &str, phase: &str, error: Option<String>) {
+fn emit_progress<R: Runtime>(
+    app: &AppHandle<R>,
+    server_id: &str,
+    phase: &str,
+    error: Option<String>,
+) {
     let _ = app.emit(
         "hosted-oauth://status",
         serde_json::json!({ "serverId": server_id, "phase": phase, "error": error }),
@@ -113,19 +123,21 @@ struct StoredHostedCredentials {
 }
 
 fn load_credentials(server_id: &str) -> Result<Option<StoredHostedCredentials>, String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(server_id))
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     match entry.get_password() {
         Ok(json) => serde_json::from_str(&json)
             .map(Some)
             .map_err(|e| format!("Corrupt stored hosted-OAuth credentials: {e}")),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("Failed to read hosted-OAuth credentials from keychain: {e}")),
+        Err(e) => Err(format!(
+            "Failed to read hosted-OAuth credentials from keychain: {e}"
+        )),
     }
 }
 
 fn save_credentials(server_id: &str, credentials: &StoredHostedCredentials) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(server_id))
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     let json = serde_json::to_string(credentials)
         .map_err(|e| format!("Failed to serialize hosted-OAuth credentials: {e}"))?;
@@ -140,7 +152,7 @@ fn save_credentials(server_id: &str, credentials: &StoredHostedCredentials) -> R
 /// server id only ever uses one flow, but the check itself doesn't know
 /// which without trying both).
 pub fn has_oauth_credentials(server_id: &str) -> bool {
-    keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+    keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(server_id))
         .ok()
         .and_then(|e| e.get_password().ok())
         .is_some()
@@ -149,7 +161,7 @@ pub fn has_oauth_credentials(server_id: &str) -> bool {
 /// Clears server `id`'s saved hosted-OAuth credentials. A no-op success if
 /// none were saved.
 pub fn remove_oauth_credentials(server_id: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &keychain_account(server_id))
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     match entry.delete_credential() {
         Ok(()) => Ok(()),
@@ -258,12 +270,13 @@ fn relay_client() -> Result<reqwest::Client, String> {
 }
 
 async fn redeem_handoff(handoff: &str) -> Result<BackendTokenResponse, String> {
-    let response = relay_client()?
-        .post(format!("{BACKEND_BASE}/mcp/oauth/exchange"))
-        .json(&serde_json::json!({ "handoff": handoff }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach the OAuth relay: {e}"))?;
+    let response = crate::egress::send(
+        relay_client()?
+            .post(format!("{BACKEND_BASE}/mcp/oauth/exchange"))
+            .json(&serde_json::json!({ "handoff": handoff })),
+    )
+    .await
+    .map_err(|e| format!("Failed to reach the OAuth relay: {e}"))?;
     let body: BackendTokenResponse = response
         .json()
         .await
@@ -274,13 +287,17 @@ async fn redeem_handoff(handoff: &str) -> Result<BackendTokenResponse, String> {
     Ok(body)
 }
 
-async fn refresh_via_backend(provider: &str, refresh_token: &str) -> Result<BackendTokenResponse, String> {
-    let response = relay_client()?
-        .post(format!("{BACKEND_BASE}/mcp/oauth/refresh"))
-        .json(&serde_json::json!({ "provider": provider, "refresh_token": refresh_token }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach the OAuth relay: {e}"))?;
+async fn refresh_via_backend(
+    provider: &str,
+    refresh_token: &str,
+) -> Result<BackendTokenResponse, String> {
+    let response = crate::egress::send(
+        relay_client()?
+            .post(format!("{BACKEND_BASE}/mcp/oauth/refresh"))
+            .json(&serde_json::json!({ "provider": provider, "refresh_token": refresh_token })),
+    )
+    .await
+    .map_err(|e| format!("Failed to reach the OAuth relay: {e}"))?;
     let body: BackendTokenResponse = response
         .json()
         .await
@@ -395,7 +412,11 @@ pub fn hosted_oauth_connect<R: Runtime>(
 /// just makes a later, now-unwanted deep-link callback a no-op and resets
 /// the UI's "waiting" state.
 #[tauri::command(rename_all = "snake_case")]
-pub fn hosted_oauth_cancel<R: Runtime>(app: AppHandle<R>, state: tauri::State<'_, AppState>, server_id: String) -> Result<(), String> {
+pub fn hosted_oauth_cancel<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    server_id: String,
+) -> Result<(), String> {
     let mut pending = state
         .hosted_oauth_pending
         .lock()
@@ -432,7 +453,8 @@ pub fn handle_deep_link_urls<R: Runtime>(app: &AppHandle<R>, urls: Vec<url::Url>
 }
 
 async fn handle_callback_url<R: Runtime>(app: &AppHandle<R>, url: &url::Url) {
-    let params: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    let params: std::collections::HashMap<String, String> =
+        url.query_pairs().into_owned().collect();
     let Some(csrf_state) = params.get("state").cloned() else {
         return;
     };

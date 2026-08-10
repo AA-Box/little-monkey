@@ -13,19 +13,26 @@ use crate::compatibility_hub::{
 use crate::context_cache::{classify_context_failure, ContextFailureInput};
 use crate::m3_commands::{M3CommandState, M3OwnedProcessShutdown};
 use crate::m3_runtime_hub::{
-    DefaultM3LanAccessFactory, HttpM3CatalogSource, M3AcceleratorCompatibility, M3AcceleratorStatus,
-    M3CanonicalStreamSink, M3CatalogSource, M3Clock, M3ComponentCatalogEntry, M3ComponentHub,
-    M3ComponentHubDependencies, M3ComponentSource, M3HardwareCompatibilityReport, M3HardwareProbe,
-    M3HubConfig, M3HubError, M3HubFuture, M3HubResult, M3InferenceEngine, M3InstalledModelView,
-    M3JetsonInfo, M3ModelCapabilities, M3OperationContext, M3RuntimeDriver, M3RuntimeHub,
-    M3RuntimeHubDependencies, M3RuntimeKind, M3RuntimeReconciler, M3RuntimeStatusView, MlxM3Driver,
-    ReqwestM3DownloadTransport, RuntimeAdapterM3Driver, StaticM3ComponentSource, SystemM3Clock,
+    DefaultM3LanAccessFactory, HttpM3CatalogSource, M3AcceleratorCompatibility,
+    M3AcceleratorStatus, M3CanonicalStreamSink, M3CatalogSource, M3Clock, M3ComponentCatalogEntry,
+    M3ComponentHub, M3ComponentHubDependencies, M3ComponentSource, M3HardwareCompatibilityReport,
+    M3HardwareProbe, M3HubConfig, M3HubError, M3HubFuture, M3HubResult, M3InferenceEngine,
+    M3InstalledModelView, M3JetsonInfo, M3ModelCapabilities, M3OperationContext, M3RuntimeDriver,
+    M3RuntimeHub, M3RuntimeHubDependencies, M3RuntimeKind, M3RuntimeReconciler,
+    M3RuntimeStatusView, ReqwestM3DownloadTransport, RuntimeAdapterM3Driver,
+    StaticM3ComponentSource, SystemM3Clock,
 };
+// MLX is Metal-only, so the module and everything that assembles it are compiled
+// into the macOS build alone.
+#[cfg(target_os = "macos")]
+use crate::m3_runtime_hub::MlxM3Driver;
+#[cfg(target_os = "macos")]
 use crate::mlx_runtime::{
-    CurrentHostMlxProbe, MlxError, MlxFuture, MlxGenerationRequest, MlxGenerationSummary,
-    MlxInstallLimits, MlxLaunchSpec, MlxModelCapabilities, MlxModelRecord, MlxOperationContext,
-    MlxPackageInstaller, MlxProcessHandle, MlxProcessMetrics, MlxRuntimeAdapter, MlxRuntimeConfig,
-    MlxServiceController, MlxSignatureVerifier, MlxStreamEvent, MlxStreamSink,
+    self, CurrentHostMlxProbe, MlxError, MlxFuture, MlxGenerationRequest, MlxGenerationSummary,
+    MlxHostCapabilities, MlxInstallLimits, MlxLaunchSpec, MlxModelCapabilities, MlxModelRecord,
+    MlxOperationContext, MlxPackageInstaller, MlxProcessHandle, MlxProcessMetrics,
+    MlxRuntimeAdapter, MlxRuntimeConfig, MlxServiceController, MlxSignatureVerifier,
+    MlxStreamEvent, MlxStreamSink,
 };
 use crate::runtime_adapter::{
     AcceleratorKind, EndpointOrigin, EndpointPolicy, HardwareSnapshot, HttpTransport,
@@ -37,8 +44,11 @@ use crate::runtime_adapter::{
 };
 use base64::Engine as _;
 use futures_util::StreamExt;
+use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
-use ring::{hmac, signature};
+// Only the MLX release-key verifier checks a signature here.
+#[cfg(target_os = "macos")]
+use ring::signature;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -47,6 +57,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+// Only the MLX service controller counts generated tokens atomically.
+#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -56,7 +68,8 @@ use uuid::Uuid;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-#[cfg(unix)]
+// `ps`-based resident-memory sampling, reached only from MLX metrics.
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 const M3_DIRECTORY: &str = "m3";
@@ -75,11 +88,18 @@ const LLAMA_ENDPOINT: &str = "http://127.0.0.1:8090";
 const LLAMA_PORT: u16 = 8_090;
 const MAX_INFERENCE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_INFERENCE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-const KEYCHAIN_SERVICE: &str = "com.littlemonkey.m3-lan";
+/// Profile-scoped (K23). The default profile keeps this exact service name, so
+/// every credential stored before profiles existed still resolves; any other
+/// profile's secrets live under `<service>.profile.<id>`, which is a different
+/// keychain item that this profile's code never names.
+static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.m3-lan"));
 const KEYCHAIN_ACCOUNT: &str = "lan-state-hmac-v1";
+#[cfg(target_os = "macos")]
 const MLX_RELEASE_KEY_ID: &str = "release-2026-1";
+#[cfg(target_os = "macos")]
 const MLX_RELEASE_PUBLIC_KEY_HEX: &str =
-    "0fd1a0b2a2e6a90c5f61eb8e9db503bf4e123c4cee11888650748c2f0efc669e";
+    "84db8c4dfdca72589631be1513f45083e893c9c373ba5be6e49928e43c7b828c";
 
 fn lock<T>(mutex: &Mutex<T>) -> M3HubResult<MutexGuard<'_, T>> {
     mutex.lock().map_err(|_| M3HubError::LockPoisoned)
@@ -132,6 +152,16 @@ impl crate::m3_runtime_hub::M3HardwareProbe for SystemM3HardwareProbe {
             device_names: vec!["Apple Silicon unified GPU".to_string()],
             total_memory_bytes: Some(total_ram_bytes),
             available_memory_bytes: Some(available_ram_bytes),
+            // One device, and the sum above is not a lie for it: Apple Silicon
+            // has a single unified pool, so the largest device *is* the total.
+            // Enumerated anyway, so a reader never has to special-case "this
+            // kind cannot be split" separately from "this kind has one device".
+            devices: vec![crate::runtime_adapter::AcceleratorDevice {
+                index: 0,
+                name: "Apple Silicon unified GPU".to_string(),
+                total_memory_bytes: Some(total_ram_bytes),
+                available_memory_bytes: Some(available_ram_bytes),
+            }],
         }];
         if let Some(cuda) = detect_nvidia_accelerator() {
             accelerators.push(cuda);
@@ -199,6 +229,7 @@ fn unsupported_accelerator(
 ) -> M3AcceleratorCompatibility {
     M3AcceleratorCompatibility {
         kind,
+        execution: crate::runtime_adapter::execution_support(kind),
         status: M3AcceleratorStatus::Unsupported,
         summary: summary.into(),
         device_names: Vec::new(),
@@ -214,6 +245,7 @@ fn tool_missing_accelerator(
 ) -> M3AcceleratorCompatibility {
     M3AcceleratorCompatibility {
         kind,
+        execution: crate::runtime_adapter::execution_support(kind),
         status: M3AcceleratorStatus::ToolMissing,
         summary: summary.into(),
         device_names: Vec::new(),
@@ -229,6 +261,7 @@ fn not_detected_accelerator(
 ) -> M3AcceleratorCompatibility {
     M3AcceleratorCompatibility {
         kind,
+        execution: crate::runtime_adapter::execution_support(kind),
         status: M3AcceleratorStatus::NotDetected,
         summary: summary.into(),
         device_names: Vec::new(),
@@ -252,6 +285,25 @@ fn build_compatibility_report(snapshot: &HardwareSnapshot) -> M3HardwareCompatib
         rocm_compatibility(os),
         vulkan_compatibility(os),
         directml_compatibility(os),
+        // Never probed, and listed anyway (roadmap K16). Every other row here
+        // answers "is it there"; this one answers the question a user actually
+        // asks about the Neural Engine, which is "can it be used" — and the
+        // answer is no, for a reason that is about this app rather than about
+        // their Mac. Leaving it off the report was the ambiguous state K16
+        // asked to remove: absent reads as an oversight, not as an answer.
+        unsupported_accelerator(
+            AcceleratorKind::AppleNeuralEngine,
+            match crate::runtime_adapter::execution_support(AcceleratorKind::AppleNeuralEngine) {
+                crate::runtime_adapter::ExecutionSupport::DetectionOnly { reason } => reason,
+                // Unreachable while `execution_support` says what it says, and
+                // written as a match rather than an unwrap so that teaching this
+                // app a Core ML runtime is a compile-time prompt to revisit the
+                // row instead of a summary that contradicts the field beside it.
+                crate::runtime_adapter::ExecutionSupport::Executes { via } => {
+                    format!("Runs on the Neural Engine via {via}.")
+                }
+            },
+        ),
     ];
 
     let jetson = jetson_info(os);
@@ -275,12 +327,12 @@ fn build_compatibility_report(snapshot: &HardwareSnapshot) -> M3HardwareCompatib
         }
     }
 
-    let cuda_available = accelerators
-        .iter()
-        .any(|entry| entry.kind == AcceleratorKind::Cuda && entry.status == M3AcceleratorStatus::Available);
-    let rocm_available = accelerators
-        .iter()
-        .any(|entry| entry.kind == AcceleratorKind::Rocm && entry.status == M3AcceleratorStatus::Available);
+    let cuda_available = accelerators.iter().any(|entry| {
+        entry.kind == AcceleratorKind::Cuda && entry.status == M3AcceleratorStatus::Available
+    });
+    let rocm_available = accelerators.iter().any(|entry| {
+        entry.kind == AcceleratorKind::Rocm && entry.status == M3AcceleratorStatus::Available
+    });
     if cuda_available && rocm_available {
         notes.push(
             "Both NVIDIA (CUDA) and AMD (ROCm) GPUs were detected. Little Monkey selects one runtime per model; mixed-vendor acceleration within a single model load is not supported."
@@ -360,6 +412,7 @@ fn metal_compatibility(os: &str) -> M3AcceleratorCompatibility {
             let metal_family = gpus.iter().find_map(|gpu| gpu.metal_family.clone());
             return M3AcceleratorCompatibility {
                 kind: AcceleratorKind::Metal,
+                execution: crate::runtime_adapter::execution_support(AcceleratorKind::Metal),
                 status: M3AcceleratorStatus::Available,
                 summary: match &metal_family {
                     Some(family) => format!("Metal is available ({family})."),
@@ -381,6 +434,7 @@ fn metal_compatibility(os: &str) -> M3AcceleratorCompatibility {
     if assumed_available {
         M3AcceleratorCompatibility {
             kind: AcceleratorKind::Metal,
+            execution: crate::runtime_adapter::execution_support(AcceleratorKind::Metal),
             status: M3AcceleratorStatus::Available,
             summary: "system_profiler was unavailable; assuming Metal is available because this is Apple Silicon macOS.".to_string(),
             device_names: vec!["Apple Silicon unified GPU (assumed)".to_string()],
@@ -391,6 +445,7 @@ fn metal_compatibility(os: &str) -> M3AcceleratorCompatibility {
     } else {
         M3AcceleratorCompatibility {
             kind: AcceleratorKind::Metal,
+            execution: crate::runtime_adapter::execution_support(AcceleratorKind::Metal),
             status: M3AcceleratorStatus::NotDetected,
             summary: "system_profiler was unavailable and this is not Apple Silicon; Metal support could not be confirmed.".to_string(),
             device_names: Vec::new(),
@@ -493,12 +548,14 @@ fn cuda_compatibility(os: &str) -> M3AcceleratorCompatibility {
                     .min_compute_capability
                     .as_deref()
                     .and_then(|value| value.parse::<f64>().ok());
-                let driver_too_old = driver_major.is_some_and(|major| major < MIN_CUDA_DRIVER_MAJOR);
+                let driver_too_old =
+                    driver_major.is_some_and(|major| major < MIN_CUDA_DRIVER_MAJOR);
                 let compute_too_old =
                     compute_cap_value.is_some_and(|value| value < MIN_CUDA_COMPUTE_CAPABILITY);
                 if driver_too_old || compute_too_old {
                     M3AcceleratorCompatibility {
                         kind: AcceleratorKind::Cuda,
+                        execution: crate::runtime_adapter::execution_support(AcceleratorKind::Cuda),
                         status: M3AcceleratorStatus::DriverTooOld,
                         summary: format!(
                             "NVIDIA GPU detected, but {} below what this app expects (driver >= {MIN_CUDA_DRIVER_MAJOR}.x, compute capability >= {MIN_CUDA_COMPUTE_CAPABILITY:.1}). CUDA acceleration may fail or fall back to CPU.",
@@ -516,6 +573,7 @@ fn cuda_compatibility(os: &str) -> M3AcceleratorCompatibility {
                 } else {
                     M3AcceleratorCompatibility {
                         kind: AcceleratorKind::Cuda,
+                        execution: crate::runtime_adapter::execution_support(AcceleratorKind::Cuda),
                         status: M3AcceleratorStatus::Available,
                         summary: "CUDA is available.".to_string(),
                         device_names: info.device_names,
@@ -598,6 +656,7 @@ fn rocm_compatibility(os: &str) -> M3AcceleratorCompatibility {
             ),
             Some(info) => M3AcceleratorCompatibility {
                 kind: AcceleratorKind::Rocm,
+                execution: crate::runtime_adapter::execution_support(AcceleratorKind::Rocm),
                 status: M3AcceleratorStatus::Available,
                 summary: match &info.driver_version {
                     Some(version) => format!("ROCm is available (driver {version})."),
@@ -694,23 +753,29 @@ fn vulkan_compatibility(os: &str) -> M3AcceleratorCompatibility {
             Some(devices) => {
                 let device_names = devices.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
                 let driver_version = devices.first().and_then(|d| d.driver_version.clone());
-                let has_discrete = devices
-                    .iter()
-                    .any(|d| d.device_type.as_deref().is_some_and(|t| t.contains("DISCRETE")));
-                let has_integrated = devices
-                    .iter()
-                    .any(|d| d.device_type.as_deref().is_some_and(|t| t.contains("INTEGRATED")));
+                let has_discrete = devices.iter().any(|d| {
+                    d.device_type
+                        .as_deref()
+                        .is_some_and(|t| t.contains("DISCRETE"))
+                });
+                let has_integrated = devices.iter().any(|d| {
+                    d.device_type
+                        .as_deref()
+                        .is_some_and(|t| t.contains("INTEGRATED"))
+                });
                 let mut summary = format!(
                     "Vulkan is available ({} device{}).",
                     devices.len(),
                     if devices.len() == 1 { "" } else { "s" }
                 );
                 if has_discrete && has_integrated {
-                    summary
-                        .push_str(" Both an integrated and a discrete GPU were reported (hybrid graphics).");
+                    summary.push_str(
+                        " Both an integrated and a discrete GPU were reported (hybrid graphics).",
+                    );
                 }
                 M3AcceleratorCompatibility {
                     kind: AcceleratorKind::Vulkan,
+                    execution: crate::runtime_adapter::execution_support(AcceleratorKind::Vulkan),
                     status: M3AcceleratorStatus::Available,
                     summary,
                     device_names,
@@ -763,6 +828,7 @@ fn directml_compatibility(os: &str) -> M3AcceleratorCompatibility {
             } else {
                 M3AcceleratorCompatibility {
                     kind: AcceleratorKind::DirectMl,
+                    execution: crate::runtime_adapter::execution_support(AcceleratorKind::DirectMl),
                     status: M3AcceleratorStatus::Available,
                     // Deliberately not overclaiming: only a display adapter's
                     // presence was confirmed, not that the DirectML runtime
@@ -853,6 +919,7 @@ fn detect_nvidia_accelerator() -> Option<crate::runtime_adapter::AcceleratorCapa
 fn parse_nvidia_smi(output: &str) -> Option<crate::runtime_adapter::AcceleratorCapability> {
     const MIB: u64 = 1024 * 1024;
     let mut device_names = Vec::new();
+    let mut devices: Vec<crate::runtime_adapter::AcceleratorDevice> = Vec::new();
     let mut total_memory_bytes = 0_u64;
     let mut available_memory_bytes = 0_u64;
     for line in output
@@ -868,6 +935,17 @@ fn parse_nvidia_smi(output: &str) -> Option<crate::runtime_adapter::AcceleratorC
             return None;
         }
         device_names.push(name.to_string());
+        // Kept per device as well as summed (roadmap K15). The sum alone is what
+        // made two 24 GB cards read as one 48 GB pool — the exact figure that
+        // makes a 40 GB model look like it fits when no single device can hold
+        // it. `nvidia-smi` lists devices in ordinal order, which is the same
+        // order `--main-gpu` and `--tensor-split` index by.
+        devices.push(crate::runtime_adapter::AcceleratorDevice {
+            index: u32::try_from(devices.len()).unwrap_or(u32::MAX),
+            name: name.to_string(),
+            total_memory_bytes: Some(total_mib.saturating_mul(MIB)),
+            available_memory_bytes: Some(free_mib.saturating_mul(MIB)),
+        });
         total_memory_bytes = total_memory_bytes.saturating_add(total_mib.saturating_mul(MIB));
         available_memory_bytes =
             available_memory_bytes.saturating_add(free_mib.saturating_mul(MIB));
@@ -881,6 +959,7 @@ fn parse_nvidia_smi(output: &str) -> Option<crate::runtime_adapter::AcceleratorC
         device_names,
         total_memory_bytes: Some(total_memory_bytes),
         available_memory_bytes: Some(available_memory_bytes),
+        devices,
     })
 }
 
@@ -893,7 +972,7 @@ pub struct KeychainLanStateProtector {
 
 impl KeychainLanStateProtector {
     pub fn load_or_create() -> M3HubResult<Self> {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+        let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
             .map_err(|error| M3HubError::State(format!("access M3 LAN keychain: {error}")))?;
         let key_bytes = match entry.get_password() {
             Ok(encoded) => base64::engine::general_purpose::STANDARD
@@ -1156,8 +1235,36 @@ pub fn component_registry_entries(root: &Path) -> M3HubResult<Vec<M3ComponentCat
         ));
     }
     // Constructing the source is the canonical validation for every entry.
-    StaticM3ComponentSource::new(COMPONENT_REGISTRY_SOURCE_ID, registry.entries.clone())?;
-    Ok(registry.entries)
+    let entries = adopt_into_registry(registry.entries);
+    StaticM3ComponentSource::new(COMPONENT_REGISTRY_SOURCE_ID, entries.clone())?;
+    Ok(entries)
+}
+
+/// Restamps every entry as belonging to the local registry.
+///
+/// A catalog file is written by whoever published the component and carries
+/// *their* `sourceId` — the MLX release workflow, for one, publishes
+/// `little-monkey-mlx`. The local registry is a single source whose id is
+/// [`COMPONENT_REGISTRY_SOURCE_ID`], and `StaticM3ComponentSource::new` refuses
+/// any entry claiming a different one. Without this, importing a published
+/// catalog fails with "entry source differs from the configured source" and the
+/// component is uninstallable — which is what happened to every catalog this
+/// project has ever published.
+///
+/// Rewriting rather than rejecting is right because the field is the
+/// publisher's claim about where the entry came from, and once it is in this
+/// file the answer is "the local registry" no matter who wrote it. Nothing else
+/// reads `source_id`: identity is `component_id`, and a version is keyed on
+/// version/digest/URL. The digest and the publisher-key check that actually
+/// establish trust are untouched.
+fn adopt_into_registry(entries: Vec<M3ComponentCatalogEntry>) -> Vec<M3ComponentCatalogEntry> {
+    entries
+        .into_iter()
+        .map(|mut entry| {
+            entry.source_id = COMPONENT_REGISTRY_SOURCE_ID.to_string();
+            entry
+        })
+        .collect()
 }
 
 fn component_sources_from_entries(
@@ -1183,6 +1290,11 @@ pub fn replace_component_registry_entries(
     hub: &M3ComponentHub,
     entries: Vec<M3ComponentCatalogEntry>,
 ) -> M3HubResult<Vec<M3ComponentCatalogEntry>> {
+    // Restamped before validation, so a catalog published by someone else
+    // imports instead of being refused over a field this registry owns. The
+    // persisted file, the in-memory source and the value returned to the caller
+    // are all the restamped set, so none of the three can disagree.
+    let entries = adopt_into_registry(entries);
     let sources = component_sources_from_entries(&entries)?;
     let document = ProductionComponentRegistry {
         schema_version: COMPONENT_REGISTRY_SCHEMA_VERSION,
@@ -1300,6 +1412,154 @@ impl OpenAiCompatibleM3InferenceEngine {
         }
     }
 
+    /// Refuses the request before it is sent when its prompt is over the process's
+    /// context budget (roadmap K11).
+    ///
+    /// # Why before, and why an exact count
+    ///
+    /// The acceptance asks for a budget "enforced as a limit rather than
+    /// discovered as a failure". Discovering it means the runtime evaluates the
+    /// prompt, refuses or shifts its context, and `classify_context_failure`
+    /// explains what already happened. Enforcing it means the request never
+    /// leaves.
+    ///
+    /// That needs the exact prompt length, which only the runtime can give:
+    /// `POST /apply-template` renders the exact string a completion would send
+    /// (template included — the template alone is tens of tokens), and
+    /// `POST /tokenize` returns its exact tokens. This app has no tokenizer, and
+    /// enforcing a limit against an estimate would refuse real work for a made-up
+    /// reason.
+    ///
+    /// # Fail-closed, and why that is the honest direction here
+    ///
+    /// A process with no budget — every process today — returns immediately,
+    /// having sent nothing. Only when a budget *is* set do the two pre-flight
+    /// calls happen, and if either cannot produce a count the request is refused
+    /// with that reason rather than sent unchecked. A runtime without a tokenizer
+    /// (Ollama, MLX) therefore reports that the budget cannot be enforced instead
+    /// of quietly not enforcing it — "I set a limit and it silently did nothing"
+    /// is the failure this direction exists to prevent.
+    async fn enforce_context_budget(
+        &self,
+        body: &Value,
+        cancellation: &CancellationToken,
+        context: &M3OperationContext,
+    ) -> M3HubResult<()> {
+        let Some(budget) =
+            crate::run_scope::current_process().and_then(|process| process.max_context_tokens())
+        else {
+            return Ok(());
+        };
+        let prompt_tokens = self
+            .count_prompt_tokens(body, cancellation, context)
+            .await?;
+        match crate::context_cache::check_context_budget(prompt_tokens, Some(budget)) {
+            crate::context_cache::ContextBudgetVerdict::Within => Ok(()),
+            verdict => {
+                // The class's policy decides what being over the budget *means*:
+                // compact and carry on, or stop. Carrying it in the refusal is
+                // what lets a caller act rather than only report.
+                let policy = crate::run_scope::current_process()
+                    .and_then(|process| process.class())
+                    .map(crate::context_cache::context_policy);
+                Err(M3HubError::ContextBudget {
+                    // No class, no policy: the bare code says a budget was hit
+                    // and stops there, rather than defaulting to one of the two
+                    // answers and telling a client to act on a guess.
+                    code: policy.map_or("context_budget", |policy| policy.code()),
+                    message: verdict
+                        .refusal_under(policy)
+                        .unwrap_or_else(|| "context budget exceeded".to_string()),
+                })
+            }
+        }
+    }
+
+    /// The exact prompt-token count for `body`, from the runtime itself.
+    ///
+    /// Two loopback calls, measured at well under a millisecond each against the
+    /// pinned build — affordable per turn, and only paid when a budget is set.
+    /// Both are `POST`s the OpenAI-compatible surface does not define, so a
+    /// non-2xx here means "this runtime has no tokenizer", which is reported as
+    /// an unenforceable budget rather than swallowed.
+    async fn count_prompt_tokens(
+        &self,
+        body: &Value,
+        cancellation: &CancellationToken,
+        context: &M3OperationContext,
+    ) -> M3HubResult<u64> {
+        let messages = body.get("messages").cloned().unwrap_or(Value::Null);
+        let rendered = self
+            .post_json(
+                "/apply-template",
+                &json!({ "messages": messages }),
+                cancellation,
+                context,
+            )
+            .await?;
+        // llama-server answers with the rendered string under `prompt`.
+        let prompt = rendered.get("prompt").and_then(Value::as_str).ok_or_else(|| {
+            M3HubError::Runtime(
+                "this runtime did not render a prompt, so the context budget set for this process cannot be enforced against it".to_string(),
+            )
+        })?;
+        let tokenized = self
+            .post_json(
+                "/tokenize",
+                &json!({ "content": prompt }),
+                cancellation,
+                context,
+            )
+            .await?;
+        let tokens = tokenized.get("tokens").and_then(Value::as_array).ok_or_else(|| {
+            M3HubError::Runtime(
+                "this runtime did not return a token count, so the context budget set for this process cannot be enforced against it".to_string(),
+            )
+        })?;
+        Ok(tokens.len() as u64)
+    }
+
+    /// One bounded loopback `POST`, for the two pre-flight endpoints.
+    async fn post_json(
+        &self,
+        path: &str,
+        body: &Value,
+        cancellation: &CancellationToken,
+        context: &M3OperationContext,
+    ) -> M3HubResult<Value> {
+        let url = self.endpoint.url(path).map_err(runtime_error)?;
+        let encoded = serde_json::to_vec(body)?;
+        let operation = async {
+            tokio::select! {
+                _ = context.cancellation.cancelled() => Err(M3HubError::Cancelled { operation: format!("local {path} request") }),
+                _ = cancellation.cancelled() => Err(M3HubError::Cancelled { operation: format!("local {path} request") }),
+                response = crate::egress::send(self.client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").body(encoded)) => {
+                    response.map_err(|error| M3HubError::Transport(error.to_string()))
+                }
+            }
+        };
+        let response = tokio::time::timeout(Duration::from_millis(context.timeout_ms), operation)
+            .await
+            .map_err(|_| M3HubError::Timeout {
+                operation: format!("local {path} request"),
+                timeout_ms: context.timeout_ms,
+            })??;
+        if !response.status().is_success() {
+            return Err(M3HubError::Runtime(format!(
+                "this runtime has no {path} endpoint (HTTP {}), so the context budget set for this process cannot be enforced against it",
+                response.status()
+            )));
+        }
+        let bytes = read_bounded_response(
+            response,
+            MAX_INFERENCE_RESPONSE_BYTES,
+            cancellation,
+            context,
+        )
+        .await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     async fn send(
         &self,
         request: &CanonicalInferenceRequest,
@@ -1308,6 +1568,8 @@ impl OpenAiCompatibleM3InferenceEngine {
         context: &M3OperationContext,
     ) -> M3HubResult<reqwest::Response> {
         let body = openai_request_body(request, stream)?;
+        self.enforce_context_budget(&body, cancellation, context)
+            .await?;
         let encoded = serde_json::to_vec(&body)?;
         if encoded.len() > MAX_INFERENCE_REQUEST_BYTES {
             return Err(M3HubError::Runtime(
@@ -1322,7 +1584,7 @@ impl OpenAiCompatibleM3InferenceEngine {
             tokio::select! {
                 _ = context.cancellation.cancelled() => Err(M3HubError::Cancelled { operation: "local inference request".to_string() }),
                 _ = cancellation.cancelled() => Err(M3HubError::Cancelled { operation: "local inference request".to_string() }),
-                response = self.client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").body(encoded).send() => {
+                response = crate::egress::send(self.client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").body(encoded)) => {
                     response.map_err(|error| M3HubError::Transport(error.to_string()))
                 }
             }
@@ -1376,7 +1638,9 @@ impl OpenAiCompatibleM3InferenceEngine {
         )
         .await?;
         let value: Value = serde_json::from_slice(&bytes)?;
-        parse_openai_response(&value, request)
+        let response = parse_openai_response(&value, request)?;
+        note_measured_reuse(&response.usage);
+        Ok(response)
     }
 
     async fn stream_inner(
@@ -1419,7 +1683,7 @@ impl OpenAiCompatibleM3InferenceEngine {
             tokio::select! {
                 _ = context.cancellation.cancelled() => Err(M3HubError::Cancelled { operation: "local embeddings request".to_string() }),
                 _ = cancellation.cancelled() => Err(M3HubError::Cancelled { operation: "local embeddings request".to_string() }),
-                response = self.client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").body(encoded).send() => {
+                response = crate::egress::send(self.client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").body(encoded)) => {
                     response.map_err(|error| M3HubError::Transport(error.to_string()))
                 }
             }
@@ -1875,7 +2139,7 @@ pub(crate) fn parse_openai_response(
             .and_then(Value::as_str)
             .unwrap_or("stop")
             .to_string(),
-        usage: parse_usage(value.get("usage")),
+        usage: parse_usage(value),
         created_at_seconds: value
             .get("created")
             .and_then(Value::as_u64)
@@ -1927,7 +2191,7 @@ fn parse_openai_embeddings_response(
     Ok(CanonicalEmbeddingResponse {
         model,
         data: items,
-        usage: parse_usage(value.get("usage")),
+        usage: parse_usage(value),
     })
 }
 
@@ -1939,17 +2203,75 @@ fn required_string<'a>(value: &'a Value, key: &str, label: &str) -> M3HubResult<
         .ok_or_else(|| M3HubError::Runtime(format!("{label} is missing")))
 }
 
-fn parse_usage(value: Option<&Value>) -> CanonicalUsage {
+/// Reads token accounting off a response (or a final stream chunk) root.
+///
+/// Takes the root rather than the `usage` object because the prompt-cache
+/// measurement does not always live inside `usage`: llama-server reports it as
+/// `timings.cache_n`, and on a streamed response it sends `timings` in the final
+/// chunk *without* a `usage` object at all. Reading only `usage` there would
+/// report a stream as having consumed zero tokens.
+fn parse_usage(root: &Value) -> CanonicalUsage {
+    let usage = root.get("usage");
+    let timings = root.get("timings");
+    // `cache_n` + `prompt_n` is llama-server's own decomposition of the prompt:
+    // reused from the cache, and actually evaluated. Their sum is the prompt
+    // length, which is why it can stand in for `prompt_tokens`.
+    let reused = timings
+        .and_then(|timings| timings.get("cache_n"))
+        .and_then(Value::as_u64);
+    let evaluated = timings
+        .and_then(|timings| timings.get("prompt_n"))
+        .and_then(Value::as_u64);
+    let input_tokens = usage
+        .and_then(|usage| usage.get("prompt_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| match (reused, evaluated) {
+            (Some(reused), Some(evaluated)) => Some(reused.saturating_add(evaluated)),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let output_tokens = usage
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            timings
+                .and_then(|timings| timings.get("predicted_n"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
+    let cached_input_tokens = reused
+        .or_else(|| {
+            usage
+                .and_then(|usage| usage.get("prompt_tokens_details"))
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        })
+        // A runtime cannot have reused more prompt than the prompt had. Clamping
+        // rather than trusting keeps one malformed response from producing a hit
+        // rate above 1 for every process it is later summed into.
+        .map(|reused| reused.min(input_tokens));
     CanonicalUsage {
-        input_tokens: value
-            .and_then(|value| value.get("prompt_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output_tokens: value
-            .and_then(|value| value.get("completion_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
     }
+}
+
+/// Charges one completion's measured prompt-cache split to the process that ran
+/// it (roadmap K11), when the runtime reported one and a process owns the scope.
+///
+/// A no-op in both of the cases that are not a measurement: a runtime that
+/// reports no reuse figure (`cached_input_tokens` is `None` — Ollama and MLX), and
+/// a completion outside any process scope. Neither writes a zero, because a zero
+/// in this column claims the runtime measured no reuse.
+fn note_measured_reuse(usage: &CanonicalUsage) {
+    let Some(reused) = usage.cached_input_tokens else {
+        return;
+    };
+    let Some(process) = crate::run_scope::current_process() else {
+        return;
+    };
+    process.note_context_reuse(reused, usage.input_tokens.saturating_sub(reused));
 }
 
 async fn read_bounded_response(
@@ -2009,10 +2331,7 @@ impl Default for OpenAiStreamState {
             text_index: None,
             tools: BTreeMap::new(),
             finish_reason: None,
-            usage: CanonicalUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-            },
+            usage: CanonicalUsage::default(),
             saw_done: false,
         }
     }
@@ -2080,8 +2399,11 @@ impl OpenAiStreamState {
         sink: &mut dyn M3CanonicalStreamSink,
     ) -> M3HubResult<()> {
         self.ensure_started(chunk, request, sink)?;
-        if chunk.get("usage").is_some() {
-            self.usage = parse_usage(chunk.get("usage"));
+        // `timings` as well as `usage`: llama-server puts its token accounting
+        // (including the prompt-cache measurement) only in `timings` on a
+        // streamed response, and sends it on the final chunk.
+        if chunk.get("usage").is_some() || chunk.get("timings").is_some() {
+            self.usage = parse_usage(chunk);
         }
         let Some(choice) = chunk
             .get("choices")
@@ -2241,6 +2563,7 @@ impl OpenAiStreamState {
             })
             .map_err(M3HubError::Runtime)?;
         }
+        note_measured_reuse(&self.usage);
         sink.emit(CanonicalStreamEvent::ResponseCompleted {
             response_id: self
                 .response_id
@@ -2853,9 +3176,11 @@ fn ensure_private_directory(path: &Path) -> M3HubResult<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Default)]
 struct ProductionMlxSignatureVerifier;
 
+#[cfg(target_os = "macos")]
 impl MlxSignatureVerifier for ProductionMlxSignatureVerifier {
     fn verify(
         &self,
@@ -2874,6 +3199,7 @@ impl MlxSignatureVerifier for ProductionMlxSignatureVerifier {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("pinned key is not valid hexadecimal".to_string());
@@ -2896,6 +3222,7 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
 /// process is supervised by the same structured process boundary as
 /// llama.cpp; generation uses a loopback-only SSE endpoint whose data values
 /// are the versioned [`MlxStreamEvent`] schema.
+#[cfg(target_os = "macos")]
 struct ProductionMlxServiceController {
     process: Arc<SystemManagedProcessController>,
     handles: Mutex<BTreeMap<String, ManagedProcessHandle>>,
@@ -2904,6 +3231,7 @@ struct ProductionMlxServiceController {
     client: reqwest::Client,
 }
 
+#[cfg(target_os = "macos")]
 impl ProductionMlxServiceController {
     fn new(process: Arc<SystemManagedProcessController>) -> M3HubResult<Self> {
         let client = reqwest::Client::builder()
@@ -2935,6 +3263,7 @@ impl ProductionMlxServiceController {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl MlxServiceController for ProductionMlxServiceController {
     fn port_owner<'a>(&'a self, port: u16) -> MlxFuture<'a, Option<String>> {
         Box::pin(async move {
@@ -3051,7 +3380,7 @@ impl MlxServiceController for ProductionMlxServiceController {
                 let response = tokio::select! {
                     _ = context.cancellation.cancelled() => return Err(MlxError::Cancelled { operation: "stream".to_string() }),
                     _ = cancellation.cancelled() => return Err(MlxError::Cancelled { operation: "stream".to_string() }),
-                    response = self.client.post(format!("http://127.0.0.1:{}/v1/generate", handle.port)).json(request).send() => {
+                    response = crate::egress::send(self.client.post(format!("http://127.0.0.1:{}/v1/generate", handle.port)).json(request)) => {
                         response.map_err(|error| Self::controller_error("start MLX stream", error))?
                     }
                 };
@@ -3196,6 +3525,7 @@ impl MlxServiceController for ProductionMlxServiceController {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn ingest_mlx_service_line(
     raw_line: &[u8],
     sink: &mut dyn MlxStreamSink,
@@ -3226,7 +3556,9 @@ fn ingest_mlx_service_line(
     sink.emit(event).map_err(MlxError::StreamProtocol)
 }
 
-#[cfg(unix)]
+// MLX metrics only; macOS is always unix, so there is no non-unix variant to
+// keep alive here.
+#[cfg(target_os = "macos")]
 fn process_resident_memory_bytes(pid: u32) -> Option<u64> {
     let output = Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
@@ -3243,11 +3575,7 @@ fn process_resident_memory_bytes(pid: u32) -> Option<u64> {
         .checked_mul(1_024)
 }
 
-#[cfg(not(unix))]
-fn process_resident_memory_bytes(_pid: u32) -> Option<u64> {
-    None
-}
-
+#[cfg(target_os = "macos")]
 struct ProductionMlxComponents {
     installer: Arc<MlxPackageInstaller>,
     controller: Arc<ProductionMlxServiceController>,
@@ -3255,6 +3583,9 @@ struct ProductionMlxComponents {
 
 struct ProductionRuntimeFactory {
     root: PathBuf,
+    // Only the MLX driver needs a clock; the other drivers take their timestamps
+    // from the runtime adapter they wrap.
+    #[cfg(target_os = "macos")]
     clock: Arc<dyn M3Clock>,
     process_controller: Arc<SystemManagedProcessController>,
 }
@@ -3306,6 +3637,7 @@ impl ProductionRuntimeFactory {
             drivers.push(Arc::new(RuntimeAdapterM3Driver::new(adapter, inference)?)
                 as Arc<dyn M3RuntimeDriver>);
         }
+        #[cfg(target_os = "macos")]
         if let Some(mlx) = production_mlx_components(&self.root, self.process_controller.clone())? {
             let models = mlx_models(installed)?;
             let adapter = Arc::new(
@@ -3383,6 +3715,7 @@ impl M3RuntimeReconciler for ProductionRuntimeReconciler {
                     M3RuntimeStatusView::Adapter { running_models, .. } => {
                         !running_models.is_empty()
                     }
+                    #[cfg(target_os = "macos")]
                     M3RuntimeStatusView::Mlx { status } => {
                         matches!(status, crate::mlx_runtime::MlxRuntimeStatus::Running { .. })
                     }
@@ -3453,6 +3786,7 @@ fn runtime_models(
         .collect()
 }
 
+#[cfg(target_os = "macos")]
 fn mlx_models(installed: &[M3InstalledModelView]) -> M3HubResult<Vec<MlxModelRecord>> {
     let mut model_ids = BTreeSet::new();
     installed
@@ -3537,6 +3871,111 @@ fn find_production_llama_binary(root: &Path) -> M3HubResult<Option<PathBuf>> {
     }
 }
 
+/// The one installer every MLX path goes through, install and status alike.
+///
+/// Factored out so the Tauri install command and the driver that reads
+/// `verify_active()` cannot drift onto different roots, verifiers, or limits —
+/// three settings where a mismatch would either silently install somewhere
+/// nothing reads or reject a package the rest of the app considers valid.
+///
+/// ponytail: a fresh instance per caller, so the installer's in-process
+/// operation lock does not span them. Safe because the on-disk protocol is
+/// already atomic — staging directory, rename into place, atomic `active.json`
+/// write — and installs are user-initiated and rare. Hand out a shared `Arc`
+/// if concurrent installs ever become a real path.
+#[cfg(target_os = "macos")]
+pub fn production_mlx_installer(root: &Path) -> M3HubResult<Arc<MlxPackageInstaller>> {
+    Ok(Arc::new(
+        MlxPackageInstaller::new(
+            root.join("runtimes").join("mlx"),
+            Arc::new(ProductionMlxSignatureVerifier),
+            MlxInstallLimits::default(),
+        )
+        .map_err(|error| M3HubError::Runtime(error.to_string()))?,
+    ))
+}
+
+/// What an install reports back. Paths stay inside the app's private tree, so
+/// only the identity of the package crosses to the UI.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MlxInstalledPackageView {
+    pub package_version: String,
+    pub manifest_sha256: String,
+}
+
+/// Installs a built MLX package directory and makes it the active one.
+///
+/// `package_directory` is a tree the user points at — the output of
+/// `pnpm mlx:package`. Its trustworthiness is not a property of where it came
+/// from: the manifest inside it must be signed by the pinned release key, and
+/// every file's digest must match, or nothing is written. That is why an
+/// arbitrary caller-supplied path is safe here in a way it would not be for,
+/// say, a directory of binaries copied into place.
+#[cfg(target_os = "macos")]
+pub fn install_mlx_package(
+    app_data_dir: &Path,
+    package_directory: &Path,
+) -> M3HubResult<MlxInstalledPackageView> {
+    let host = MlxHostCapabilities::current();
+    // Derived the same way `build_m3_command_state` derives it, so an install
+    // lands in the tree the running driver reads rather than beside it.
+    let installer = production_mlx_installer(&app_data_dir.join(M3_DIRECTORY))?;
+    let bundle =
+        mlx_runtime::read_package_directory(package_directory, &MlxInstallLimits::default())
+            .map_err(|error| M3HubError::Runtime(error.to_string()))?;
+    let installed = installer
+        .install_and_activate(&bundle, &host)
+        .map_err(|error| M3HubError::Runtime(error.to_string()))?;
+    Ok(MlxInstalledPackageView {
+        package_version: installed.package_version,
+        manifest_sha256: installed.manifest_sha256,
+    })
+}
+
+/// Installs an MLX package from a `.tar.gz` the component hub downloaded.
+///
+/// This is what makes an artifact feed reach MLX. The component hub already
+/// fetches by URL with resume, refuses a body whose length or SHA-256 does not
+/// match the catalog entry, and keeps versions and channels — so nothing about
+/// downloading is reimplemented here. What was missing is only this: unpack
+/// that blob and put it through the signature-verifying installer.
+///
+/// The extraction goes to a temporary directory that is removed on every path,
+/// success or failure. Nothing under it is trusted: `read_package_directory`
+/// loads only manifest-declared files and `install_and_activate` re-derives
+/// every digest and verifies the publisher signature before publishing a byte.
+#[cfg(target_os = "macos")]
+pub fn install_mlx_from_artifact(
+    app_data_dir: &Path,
+    artifact_path: &Path,
+) -> M3HubResult<MlxInstalledPackageView> {
+    let limits = MlxInstallLimits::default();
+    let staging = std::env::temp_dir().join(format!("mlx-unpack-{}", uuid::Uuid::new_v4()));
+    let unpacked = (|| {
+        mlx_runtime::extract_package_archive(artifact_path, &staging, &limits)?;
+        mlx_runtime::read_package_directory(&staging, &limits)
+    })();
+    let bundle = match unpacked {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(M3HubError::Runtime(error.to_string()));
+        }
+    };
+    let installed = production_mlx_installer(&app_data_dir.join(M3_DIRECTORY))?
+        .install_and_activate(&bundle, &MlxHostCapabilities::current())
+        .map_err(|error| M3HubError::Runtime(error.to_string()));
+    let _ = fs::remove_dir_all(&staging);
+    let installed = installed?;
+    Ok(MlxInstalledPackageView {
+        package_version: installed.package_version,
+        manifest_sha256: installed.manifest_sha256,
+    })
+}
+
+#[cfg(target_os = "macos")]
 fn production_mlx_components(
     root: &Path,
     process: Arc<SystemManagedProcessController>,
@@ -3544,14 +3983,7 @@ fn production_mlx_components(
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         return Ok(None);
     }
-    let installer = Arc::new(
-        MlxPackageInstaller::new(
-            root.join("runtimes").join("mlx"),
-            Arc::new(ProductionMlxSignatureVerifier),
-            MlxInstallLimits::default(),
-        )
-        .map_err(|error| M3HubError::Runtime(error.to_string()))?,
-    );
+    let installer = production_mlx_installer(root)?;
     match installer.verify_active() {
         Ok(_) | Err(MlxError::NotInstalled) => Ok(Some(ProductionMlxComponents {
             installer,
@@ -3638,6 +4070,7 @@ pub fn build_m3_command_state(app_data_dir: impl AsRef<Path>) -> M3HubResult<M3C
     let process = Arc::new(SystemManagedProcessController::new(root.join("logs"))?);
     let factory = Arc::new(ProductionRuntimeFactory {
         root: root.clone(),
+        #[cfg(target_os = "macos")]
         clock: clock.clone(),
         process_controller: process.clone(),
     });
@@ -3721,7 +4154,9 @@ pub fn build_quantization_command_state(
     backends.push(Arc::new(crate::quantization::PassthroughGgufRequantize));
 
     let workbench = crate::quantization::QuantizationWorkbench::new(root, backends);
-    Ok(crate::m3_commands::M3QuantizationCommandState::new(workbench))
+    Ok(crate::m3_commands::M3QuantizationCommandState::new(
+        workbench,
+    ))
 }
 
 #[cfg(test)]
@@ -3730,6 +4165,7 @@ mod tests {
     use crate::compatibility_hub::{
         CanonicalToolDefinition, CompatibilityProtocol, COMPATIBILITY_SCHEMA_VERSION,
     };
+    use crate::m3_runtime_hub::{M3ComponentChannel, M3ComponentKind};
     use http_body_util::{BodyExt, Full};
     use hyper::body::{Bytes, Incoming};
     use hyper::service::service_fn;
@@ -3862,6 +4298,227 @@ mod tests {
             }
         });
         (format!("http://{address}"), slow_started, task)
+    }
+
+    /// A fixture that routes by path and records every path it was asked for, so
+    /// a test can assert what was *not* sent.
+    ///
+    /// `/tokenize` answers with `token_count` tokens regardless of content: the
+    /// count is the fixture's whole job here, and the real tokenizer's fidelity is
+    /// llama.cpp's business rather than something this app can test.
+    async fn spawn_budget_fixture(
+        token_count: usize,
+    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let recorder = recorder.clone();
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(move |request: Request<Incoming>| {
+                                let recorder = recorder.clone();
+                                async move {
+                                    let path = request.uri().path().to_string();
+                                    recorder.lock().expect("record path").push(path.clone());
+                                    let _ = request.into_body().collect().await;
+                                    let body = match path.as_str() {
+                                        "/apply-template" => json!({"prompt": "<rendered prompt>"}),
+                                        "/tokenize" => {
+                                            json!({"tokens": vec![0_u32; token_count]})
+                                        }
+                                        _ => json!({
+                                            "id":"chatcmpl-budget","created":123,"model":"local-model",
+                                            "choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
+                                            "usage":{"prompt_tokens":2,"completion_tokens":1}
+                                        }),
+                                    };
+                                    Ok::<_, Infallible>(
+                                        Response::builder()
+                                            .header("content-type", "application/json")
+                                            .body(Full::new(Bytes::from(body.to_string())))
+                                            .expect("fixture response"),
+                                    )
+                                }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        (format!("http://{address}"), seen, task)
+    }
+
+    /// The acceptance's actual words: enforced as a limit, not discovered as a
+    /// failure. So the assertion that matters is not the error text — it is that
+    /// `/v1/chat/completions` was never reached.
+    #[tokio::test]
+    async fn an_over_budget_prompt_is_refused_before_the_request_is_sent() {
+        let (endpoint, seen, server) = spawn_budget_fixture(9_000).await;
+        let engine = OpenAiCompatibleM3InferenceEngine::new(&endpoint).expect("production engine");
+        let context = M3OperationContext::new(10_000);
+
+        let process =
+            crate::run_scope::ProcessScope::new("p-budget").with_context_budget(Some(8_192));
+        let result = crate::run_scope::scoped_with_process(
+            crate::run_scope::RunScope::run("run:budget"),
+            process,
+            engine.complete(&request("over", "local-model", false), &context),
+        )
+        .await;
+
+        let message = match result {
+            // Its own variant, not `Runtime`: nothing on this side failed, and a
+            // client needs to tell "your prompt is too long" from "our runtime
+            // broke" — they are a 413 and a 502 and call for opposite responses.
+            Err(M3HubError::ContextBudget { code, message }) => {
+                // No class on this scope, so no policy — and the code says that
+                // rather than defaulting to one of the two answers.
+                assert_eq!(code, "context_budget");
+                message
+            }
+            other => panic!("expected a budget refusal, got {other:?}"),
+        };
+        assert!(
+            message.contains("9000") && message.contains("8192"),
+            "{message}"
+        );
+        let paths = seen.lock().expect("read paths").clone();
+        assert_eq!(
+            paths,
+            vec!["/apply-template".to_string(), "/tokenize".to_string()],
+            "the completion must never have been sent"
+        );
+        server.abort();
+    }
+
+    /// The class travels with the process, so the refusal a client receives
+    /// carries the policy that class chose.
+    ///
+    /// Without this the code is the bare `context_budget`, which tells a client
+    /// a limit was hit and nothing about whether shortening the conversation is
+    /// the intended response — and for `Background` and `Maintenance` it is not:
+    /// their stated policy is to stop rather than continue on a summary.
+    #[tokio::test]
+    async fn a_refusal_carries_the_policy_of_the_class_running_it() {
+        for (class, expected) in [
+            (
+                crate::run_protocol::ProcessClass::Interactive,
+                "context_budget_compact",
+            ),
+            (
+                crate::run_protocol::ProcessClass::Maintenance,
+                "context_budget_refuse",
+            ),
+        ] {
+            let (endpoint, _seen, server) = spawn_budget_fixture(9_000).await;
+            let engine =
+                OpenAiCompatibleM3InferenceEngine::new(&endpoint).expect("production engine");
+            let context = M3OperationContext::new(10_000);
+
+            let process = crate::run_scope::ProcessScope::new("p-budget-class")
+                .with_context_budget(Some(8_192))
+                .with_class(Some(class));
+            let result = crate::run_scope::scoped_with_process(
+                crate::run_scope::RunScope::run("run:budget-class"),
+                process,
+                engine.complete(&request("over", "local-model", false), &context),
+            )
+            .await;
+
+            match result {
+                Err(M3HubError::ContextBudget { code, message }) => {
+                    assert_eq!(code, expected, "{class:?}");
+                    assert!(
+                        message.contains(crate::context_cache::context_policy(class).rationale()),
+                        "the rationale a person reads must travel with the code a client matches: {message}"
+                    );
+                }
+                other => panic!("expected a budget refusal for {class:?}, got {other:?}"),
+            }
+            server.abort();
+        }
+    }
+
+    /// The common path: no budget, so not even the two pre-flight calls happen.
+    /// A limit nobody set must cost nothing at all.
+    #[tokio::test]
+    async fn a_process_with_no_budget_pays_for_no_pre_flight() {
+        let (endpoint, seen, server) = spawn_budget_fixture(9_000).await;
+        let engine = OpenAiCompatibleM3InferenceEngine::new(&endpoint).expect("production engine");
+        let context = M3OperationContext::new(10_000);
+        let process = crate::run_scope::ProcessScope::new("p-no-budget");
+        crate::run_scope::scoped_with_process(
+            crate::run_scope::RunScope::run("run:no-budget"),
+            process,
+            engine.complete(&request("under", "local-model", false), &context),
+        )
+        .await
+        .expect("a process with no budget completes");
+        assert_eq!(
+            seen.lock().expect("read paths").clone(),
+            vec!["/v1/chat/completions".to_string()],
+            "no budget means no pre-flight"
+        );
+        server.abort();
+    }
+
+    /// A runtime with no tokenizer refuses the request and says the budget cannot
+    /// be enforced, rather than sending it unchecked. "I set a limit and it
+    /// silently did nothing" is the outcome this direction exists to prevent.
+    #[tokio::test]
+    async fn a_runtime_without_a_tokenizer_refuses_rather_than_ignoring_the_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(|request: Request<Incoming>| async move {
+                                let _ = request.into_body().collect().await;
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(404)
+                                        .body(Full::new(Bytes::from("not found")))
+                                        .expect("fixture response"),
+                                )
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        let engine = OpenAiCompatibleM3InferenceEngine::new(&format!("http://{address}"))
+            .expect("production engine");
+        let process =
+            crate::run_scope::ProcessScope::new("p-no-tokenizer").with_context_budget(Some(8_192));
+        let result = crate::run_scope::scoped_with_process(
+            crate::run_scope::RunScope::run("run:no-tokenizer"),
+            process,
+            engine.complete(
+                &request("untokenizable", "local-model", false),
+                &M3OperationContext::new(10_000),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("cannot be enforced")),
+            "expected an unenforceable-budget refusal, got {result:?}"
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -4060,6 +4717,50 @@ mod tests {
         assert!(parse_nvidia_smi("GPU, N/A, N/A").is_none());
     }
 
+    /// Roadmap K15: the sum is display-only, and each card's own memory is what
+    /// a placement decision is allowed to read.
+    ///
+    /// Summing was not merely lossy, it was wrong in a specific direction: a
+    /// 24 GB card beside an 8 GB card reports 32 GB, and a 20 GB model then
+    /// looks like it fits when neither card can hold it.
+    #[test]
+    fn nvidia_inventory_keeps_each_cards_own_memory_beside_the_sum() {
+        let cuda = parse_nvidia_smi("NVIDIA RTX 4090, 24564, 20100\nNVIDIA RTX 4060, 8188, 4096\n")
+            .expect("valid nvidia-smi inventory");
+
+        let devices: Vec<_> = cuda
+            .devices
+            .iter()
+            .map(|device| {
+                (
+                    device.index,
+                    device.name.as_str(),
+                    device.available_memory_bytes,
+                )
+            })
+            .collect();
+        assert_eq!(
+            devices,
+            vec![
+                (0, "NVIDIA RTX 4090", Some(20_100 * 1024 * 1024)),
+                (1, "NVIDIA RTX 4060", Some(4_096 * 1024 * 1024)),
+            ],
+            "ordinal order, because that is what --main-gpu and --tensor-split index by"
+        );
+
+        // The honest budget for a runtime that cannot split: the biggest card,
+        // not the pair.
+        assert_eq!(
+            cuda.largest_device_memory(),
+            Some(20_100 * 1024 * 1024),
+            "the largest single device, never the sum"
+        );
+        assert!(
+            cuda.largest_device_memory().unwrap() < cuda.available_memory_bytes.unwrap(),
+            "if these were ever equal this test would be asserting nothing"
+        );
+    }
+
     // --- Hardware Compatibility Matrix / Driver Doctor -------------------
     //
     // These tests exercise the parsers with fixture strings (no real
@@ -4216,12 +4917,16 @@ GPU1:
         )
         .expect("fixture parses");
         assert_eq!(devices.len(), 2);
-        let has_discrete = devices
-            .iter()
-            .any(|d| d.device_type.as_deref().is_some_and(|t| t.contains("DISCRETE")));
-        let has_integrated = devices
-            .iter()
-            .any(|d| d.device_type.as_deref().is_some_and(|t| t.contains("INTEGRATED")));
+        let has_discrete = devices.iter().any(|d| {
+            d.device_type
+                .as_deref()
+                .is_some_and(|t| t.contains("DISCRETE"))
+        });
+        let has_integrated = devices.iter().any(|d| {
+            d.device_type
+                .as_deref()
+                .is_some_and(|t| t.contains("INTEGRATED"))
+        });
         assert!(has_discrete && has_integrated);
     }
 
@@ -4245,7 +4950,10 @@ GPU1:
         let names = parse_windows_video_controllers(
             "Intel(R) UHD Graphics 630\nNVIDIA GeForce RTX 3070\n\n",
         );
-        assert_eq!(names, ["Intel(R) UHD Graphics 630", "NVIDIA GeForce RTX 3070"]);
+        assert_eq!(
+            names,
+            ["Intel(R) UHD Graphics 630", "NVIDIA GeForce RTX 3070"]
+        );
         assert!(parse_windows_video_controllers("").is_empty());
     }
 
@@ -4373,10 +5081,16 @@ GPU1:
         // rather than crashing.
         let snapshot = SystemM3HardwareProbe.snapshot().expect("hardware snapshot");
         let report = build_compatibility_report(&snapshot);
-        assert_eq!(report.accelerators.len(), 5);
+        assert_eq!(report.accelerators.len(), 6);
         for entry in &report.accelerators {
             match entry.kind {
                 AcceleratorKind::Metal => {}
+                // Never probed: it is on the report to state that nothing here
+                // executes on it, which is a fact about this build and the same
+                // on every machine.
+                AcceleratorKind::AppleNeuralEngine => {
+                    assert_eq!(entry.status, M3AcceleratorStatus::Unsupported);
+                }
                 AcceleratorKind::Cuda | AcceleratorKind::Rocm | AcceleratorKind::Vulkan => {
                     assert!(matches!(
                         entry.status,
@@ -4446,6 +5160,7 @@ GPU1:
                             device_names: Vec::new(),
                             total_memory_bytes: None,
                             available_memory_bytes: None,
+                            devices: Vec::new(),
                         }],
                     ),
                 })
@@ -4464,7 +5179,17 @@ GPU1:
         let probe = SystemM3HardwareProbe;
         let report = crate::m3_runtime_hub::M3HardwareProbe::compatibility_report(&probe)
             .expect("compatibility report");
-        assert_eq!(report.accelerators.len(), 5);
+        assert_eq!(report.accelerators.len(), 6);
+        // Roadmap K16: every backend resolves, and the row says so in its own
+        // field rather than leaving a reader to infer it from `status`.
+        for entry in &report.accelerators {
+            assert_eq!(
+                entry.execution,
+                crate::runtime_adapter::execution_support(entry.kind),
+                "{:?}'s execution support must be derived from its kind, never set by hand",
+                entry.kind
+            );
+        }
     }
 
     /// ROADMAP Phase 8 item 12 (Multimodal Projector and Vision Model
@@ -4501,7 +5226,46 @@ GPU1:
         // existing non-vision fixture/driver is unaffected.
         let text_only = request("req-text", "text-model", false);
         let text_body = openai_request_body(&text_only, false).expect("compose text request");
-        assert_eq!(text_body["messages"][0]["content"], Value::String("hello".to_string()));
+        assert_eq!(
+            text_body["messages"][0]["content"],
+            Value::String("hello".to_string())
+        );
+    }
+
+    /// K11's read-only prefix sharing is the runtime's, and this app gets it by
+    /// not defeating it — so the guard is on the request body rather than on any
+    /// code of ours.
+    ///
+    /// Two fields would each silently cost the whole feature. `id_slot` pins the
+    /// request to one slot, which bypasses llama-server's "route to the slot whose
+    /// cached prefix matches best" selection — measured: pinning it dropped a
+    /// 454-token shared prefix from 451 tokens reused to zero. `cache_prompt:
+    /// false` turns prompt caching off outright. Neither failure shows up as an
+    /// error; the only symptom is a hit rate that quietly goes to nothing, which is
+    /// why this is asserted rather than left to review.
+    #[test]
+    fn the_request_body_never_defeats_the_runtimes_prefix_sharing() {
+        for stream in [false, true] {
+            let body = openai_request_body(&request("req-share", "local-model", stream), stream)
+                .expect("compose request");
+            let object = body.as_object().expect("a JSON object");
+            assert!(
+                !object.contains_key("id_slot"),
+                "pinning a slot bypasses llama-server's longest-prefix slot selection"
+            );
+            assert!(
+                !object.contains_key("slot_id"),
+                "the same pin under llama.cpp's older spelling"
+            );
+            // Absent is correct rather than `true`: `--cache-prompt` is on by
+            // default in the pinned build, so the body only has to avoid turning it
+            // off. What must never appear is the `false`.
+            assert_ne!(
+                object.get("cache_prompt"),
+                Some(&Value::Bool(false)),
+                "prompt caching off means no prefix to share at all"
+            );
+        }
     }
 
     /// The MLX driver's flattened wire message has no native text slot for
@@ -4510,6 +5274,7 @@ GPU1:
     /// than only in m3_runtime_hub.rs) because this is the other real
     /// composition path the roadmap's "at least one real backend" bar
     /// applies to, alongside the OpenAI-compatible wire above.
+    #[cfg(target_os = "macos")]
     #[test]
     fn canonical_message_to_mlx_carries_inline_images_separately_from_text() {
         let message = CanonicalMessage {
@@ -4524,9 +5289,13 @@ GPU1:
                 },
             ],
         };
-        let mlx_message = crate::m3_runtime_hub::canonical_message_to_mlx(&message).expect("flatten");
+        let mlx_message =
+            crate::m3_runtime_hub::canonical_message_to_mlx(&message).expect("flatten");
         assert_eq!(mlx_message.text, "what is this?");
-        assert_eq!(mlx_message.images, vec!["data:image/jpeg;base64,Zm9v".to_string()]);
+        assert_eq!(
+            mlx_message.images,
+            vec!["data:image/jpeg;base64,Zm9v".to_string()]
+        );
     }
 
     // ------------------------------------------------------------------
@@ -4933,6 +5702,152 @@ GPU1:
         );
     }
 
+    // -- measured prompt-cache reuse (K11) ---------------------------------
+    //
+    // The `timings` bodies below are verbatim from llama-server b9637 — the
+    // version `managed_runtime::MANAGED_LLAMA_VERSION` pins — answering
+    // `POST /v1/chat/completions` for a repeated prompt prefix. They are copied
+    // rather than invented because the whole point of the column they feed is
+    // that the figures are the runtime's own.
+
+    /// llama-server always re-evaluates the last prompt token even when the rest
+    /// of the prefix was a cache hit, so a *measured* rate is 9/10 where an
+    /// app-side guess at "identical prefix" would have said 10/10. That one-token
+    /// difference is the reason this is read from the response at all.
+    #[test]
+    fn usage_reads_the_runtimes_own_prompt_cache_split() {
+        let usage = parse_usage(&json!({
+            "usage": {"completion_tokens": 8, "prompt_tokens": 10, "total_tokens": 18},
+            "timings": {"cache_n": 9, "prompt_n": 1, "predicted_n": 8}
+        }));
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.cached_input_tokens, Some(9));
+    }
+
+    /// A cold prompt reports a measured zero, which is a different fact from a
+    /// runtime that reports nothing — and must stay distinguishable from it.
+    #[test]
+    fn a_cold_prompt_reports_a_measured_zero_not_an_absence() {
+        let usage = parse_usage(&json!({
+            "usage": {"completion_tokens": 4, "prompt_tokens": 11},
+            "timings": {"cache_n": 0, "prompt_n": 11, "predicted_n": 4}
+        }));
+        assert_eq!(usage.cached_input_tokens, Some(0));
+    }
+
+    #[test]
+    fn a_runtime_that_reports_no_reuse_figure_leaves_it_unknown() {
+        let usage = parse_usage(&json!({
+            "usage": {"completion_tokens": 4, "prompt_tokens": 11}
+        }));
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(
+            usage.cached_input_tokens, None,
+            "no reported figure must not become a measured zero"
+        );
+    }
+
+    /// The OpenAI-shaped spelling of the same measurement, for a runtime that
+    /// reports `cached_tokens` without llama.cpp's `timings`.
+    #[test]
+    fn usage_falls_back_to_the_openai_cached_tokens_detail() {
+        let usage = parse_usage(&json!({
+            "usage": {
+                "completion_tokens": 4,
+                "prompt_tokens": 38,
+                "prompt_tokens_details": {"cached_tokens": 1}
+            }
+        }));
+        assert_eq!(usage.cached_input_tokens, Some(1));
+    }
+
+    /// A response claiming more reuse than it had prompt is malformed; clamping
+    /// keeps it from producing a hit rate above 1 once summed into a process.
+    #[test]
+    fn reuse_is_clamped_to_the_prompt_it_claims_to_have_reused() {
+        let usage = parse_usage(&json!({
+            "usage": {"completion_tokens": 1, "prompt_tokens": 5},
+            "timings": {"cache_n": 900, "prompt_n": 1, "predicted_n": 1}
+        }));
+        assert_eq!(usage.cached_input_tokens, Some(5));
+    }
+
+    /// llama-server always sends `timings` on the final chunk, and adds `usage`
+    /// only when the caller asked for `stream_options.include_usage`.
+    /// `openai_request_body` does ask, so this is the fallback rather than the
+    /// common path: it covers a caller that omits the option — this module's own
+    /// synthetic lines, or a third-party server that ignores it — and it is why the
+    /// reuse figure does not depend on an optional field.
+    #[test]
+    fn a_streamed_final_chunk_yields_usage_from_timings_alone() {
+        let request = request_with_tools(&[]);
+        let body = format!(
+            "{}{}",
+            sse_line(&json!({
+                "id":"resp-stream-timings","model":"local-model",
+                "choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]
+            })),
+            sse_line(&json!({
+                "choices":[{"index":0,"delta":{},"finish_reason":"length"}],
+                "timings":{"cache_n":37,"prompt_n":1,"predicted_n":3}
+            })),
+        );
+        let events = feed_openai_sse_bytes(&[body.as_bytes()], &request).expect("stream parses");
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                CanonicalStreamEvent::ResponseCompleted { usage, .. } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("a completed event");
+        assert_eq!(usage.input_tokens, 38, "cache_n + prompt_n is the prompt");
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.cached_input_tokens, Some(37));
+    }
+
+    /// The measurement reaches the process that ran the completion, and a runtime
+    /// that reported nothing charges nothing — the two cases the ledger column
+    /// exists to keep apart.
+    #[tokio::test]
+    async fn a_measured_split_is_charged_to_the_running_process_and_an_unknown_one_is_not() {
+        let process = crate::run_scope::ProcessScope::new("p-reuse-e2e");
+        crate::run_scope::scoped_with_process(
+            crate::run_scope::RunScope::run("run:reuse"),
+            process.clone(),
+            async {
+                note_measured_reuse(&CanonicalUsage {
+                    input_tokens: 10,
+                    output_tokens: 8,
+                    cached_input_tokens: Some(9),
+                });
+                note_measured_reuse(&CanonicalUsage {
+                    input_tokens: 500,
+                    output_tokens: 4,
+                    cached_input_tokens: None,
+                });
+            },
+        )
+        .await;
+        assert_eq!(
+            process.take_context_reuse(),
+            crate::run_scope::ContextReuse {
+                reused_tokens: 9,
+                evaluated_tokens: 1
+            },
+            "only the completion whose runtime measured the split is charged"
+        );
+
+        // And a completion outside any process scope charges nobody rather than
+        // the nearest row.
+        note_measured_reuse(&CanonicalUsage {
+            input_tokens: 10,
+            output_tokens: 1,
+            cached_input_tokens: Some(9),
+        });
+        assert!(process.take_context_reuse().is_empty());
+    }
+
     #[test]
     fn non_streaming_tool_call_naming_an_unoffered_tool_is_rejected() {
         let request = request_with_tools(&["weather"]);
@@ -4994,5 +5909,49 @@ GPU1:
             events.last(),
             Some(CanonicalStreamEvent::ResponseCompleted { .. })
         ));
+    }
+    /// The MLX release workflow publishes a catalog whose entries carry its own
+    /// `sourceId` (`little-monkey-mlx`), and the local registry is a single
+    /// source named `local` whose constructor refuses any entry claiming
+    /// another. Before this was restamped on ingest, importing a published
+    /// catalog failed with "entry source differs from the configured source" —
+    /// so every catalog this project has ever published was uninstallable.
+    #[test]
+    fn a_catalog_published_by_someone_else_is_adopted_into_the_local_registry() {
+        let published = M3ComponentCatalogEntry {
+            schema_version: 1,
+            source_id: "little-monkey-mlx".to_string(),
+            component_id: "mlx-runtime-apple-silicon".to_string(),
+            kind: M3ComponentKind::MlxRuntime,
+            display_name: "MLX runtime (Apple silicon)".to_string(),
+            accelerator: None,
+            version: "0.28.4".to_string(),
+            channel: M3ComponentChannel::Beta,
+            download_url: "https://github.com/AA-Box/little-monkey/releases/download/mlx-runtime-0.28.4/mlx-runtime-0.28.4.tar.gz".to_string(),
+            sha256: "a".repeat(64),
+            size_bytes: 314_572_800,
+            published_at_ms: 1_754_000_000_000,
+            compatibility_note: Some("Requires Apple silicon.".to_string()),
+            metadata: BTreeMap::new(),
+        };
+
+        // The exact rejection this fixes: a foreign source id, unchanged.
+        assert!(
+            StaticM3ComponentSource::new(COMPONENT_REGISTRY_SOURCE_ID, vec![published.clone()])
+                .is_err(),
+            "the foreign source id must still be what the source constructor refuses"
+        );
+
+        let adopted = adopt_into_registry(vec![published.clone()]);
+        assert_eq!(adopted[0].source_id, COMPONENT_REGISTRY_SOURCE_ID);
+        assert!(component_sources_from_entries(&adopted).is_ok());
+
+        // Nothing else about the entry moves: the digest, URL and version are
+        // what establish trust and identity downstream.
+        assert_eq!(adopted[0].sha256, published.sha256);
+        assert_eq!(adopted[0].download_url, published.download_url);
+        assert_eq!(adopted[0].version, published.version);
+        assert_eq!(adopted[0].component_id, published.component_id);
+        assert_eq!(adopted[0].kind, published.kind);
     }
 }

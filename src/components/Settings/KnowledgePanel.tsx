@@ -6,6 +6,7 @@ import type { PillTone } from "../ui";
 import { KnowledgeV2Panel } from "./KnowledgeV2Panel";
 import { useT } from "../../lib/i18n";
 import { useModelStore } from "../../store/modelStore";
+import { useKnowledgeV2Store, type KnowledgeV2Staleness } from "../../store/knowledgeV2Store";
 import {
   CURATED_EMBEDDING_SPECS,
   useStackStore,
@@ -31,25 +32,19 @@ function formatIndexedAt(ms: number | null): string | null {
 /**
  * "Knowledge" settings tab (RAG slice 1): create/rename/delete stacks,
  * manage each stack's folder/file sources, download + run the local
- * embedding model, reindex with live progress, and a test-search box —
- * verifiable end-to-end before any agent wiring (`search_docs`, doc-chat
- * mode) exists.
+ * embedding model, and a test-search box. Indexing itself belongs to the
+ * Knowledge 2.0 section below each stack (`KnowledgeV2Panel`), which owns the
+ * one index the reader and the agent both answer from.
  */
 export function KnowledgePanel() {
   const { t } = useT();
   const stacks = useStackStore((s) => s.stacks);
-  const indexProgress = useStackStore((s) => s.indexProgress);
-  const reindexError = useStackStore((s) => s.reindexError);
-  const staleById = useStackStore((s) => s.staleById);
   const refresh = useStackStore((s) => s.refresh);
-  const refreshStale = useStackStore((s) => s.refreshStale);
   const createStack = useStackStore((s) => s.create);
   const removeStack = useStackStore((s) => s.remove);
   const renameStack = useStackStore((s) => s.rename);
   const addSource = useStackStore((s) => s.addSource);
   const removeSource = useStackStore((s) => s.removeSource);
-  const reindex = useStackStore((s) => s.reindex);
-  const cancelIndex = useStackStore((s) => s.cancelIndex);
   const queryStack = useStackStore((s) => s.query);
 
   const embedStatus = useStackStore((s) => s.embedStatus);
@@ -65,11 +60,16 @@ export function KnowledgePanel() {
   const refreshModels = useModelStore((s) => s.refresh);
   const downloadModel = useModelStore((s) => s.download);
 
+  const v2Staleness = useKnowledgeV2Store((s) => s.v2Staleness);
+  const refreshV2Staleness = useKnowledgeV2Store((s) => s.refreshV2Staleness);
+
   useEffect(() => {
-    void refresh().then(() => void refreshStale());
+    void refresh().then(() => {
+      void refreshV2Staleness();
+    });
     void refreshModels();
     void refreshEmbedStatus();
-  }, [refresh, refreshStale, refreshModels, refreshEmbedStatus]);
+  }, [refresh, refreshV2Staleness, refreshModels, refreshEmbedStatus]);
 
   const embeddingModels = useMemo(
     () => (curatedModels.length > 0 ? curatedModels : []).filter((m) => m.kind === "embedding"),
@@ -81,6 +81,12 @@ export function KnowledgePanel() {
   );
 
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  // One selection for both halves of the panel: the expanded row *is* the stack
+  // the Knowledge 2.0 section configures, so the two can no longer be pointed at
+  // different stacks at once. Derived rather than an effect, so a stack deleted
+  // out from under the selection just stops being selected.
+  const selectedId = expandedId != null && stacks.some((s) => s.id === expandedId) ? expandedId : null;
+  const v2StackId = selectedId ?? stacks[0]?.id ?? "";
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
   const [newBackend, setNewBackend] = useState<EmbeddingBackend>("llama");
@@ -333,62 +339,60 @@ export function KnowledgePanel() {
             <StackRow
               key={stack.id}
               stack={stack}
-              expanded={expandedId === stack.id}
-              onToggle={() => setExpandedId(expandedId === stack.id ? null : stack.id)}
+              expanded={selectedId === stack.id}
+              v2Staleness={v2Staleness[stack.id]}
+              onToggle={() => setExpandedId(selectedId === stack.id ? null : stack.id)}
               onDelete={() => void handleDelete(stack)}
               onRename={() => void handleRename(stack)}
               onAddFolder={() => void handleAddFolder(stack.id)}
               onAddFile={() => void handleAddFile(stack.id)}
               onRemoveSource={(path) => void removeSource(stack.id, path)}
-              onReindex={() => void reindex(stack.id)}
-              onCancelIndex={() => void cancelIndex(stack.id)}
-              progress={indexProgress[stack.id]}
-              error={reindexError[stack.id]}
-              stale={staleById[stack.id] ?? false}
               onQuery={queryStack}
             />
           ))
         )}
       </section>
-      <KnowledgeV2Panel stacks={stacks} />
+      <KnowledgeV2Panel stacks={stacks} stackId={v2StackId} onStackChange={setExpandedId} />
     </div>
   );
 }
 
+/** Tone per v2 staleness answer. `unknown` is neutral, not success and not
+ * warning: a remote connector's upstream state cannot be compared without network
+ * I/O, so the badge is not entitled to claim either. Rendering it as success is
+ * the one reading `KnowledgeV2Staleness` explicitly forbids. */
+const V2_STALENESS_TONE: Record<Exclude<KnowledgeV2Staleness, "notIndexed">, PillTone> = {
+  fresh: "success",
+  stalePipeline: "warning",
+  staleSources: "warning",
+  unknown: "neutral",
+};
+
 interface StackRowProps {
   stack: KnowledgeStack;
   expanded: boolean;
+  /** This stack's index answer, or `undefined` when it has not been probed.
+   * `"notIndexed"` means nothing answers for this stack yet. */
+  v2Staleness?: KnowledgeV2Staleness;
   onToggle: () => void;
   onDelete: () => void;
   onRename: () => void;
   onAddFolder: () => void;
   onAddFile: () => void;
   onRemoveSource: (path: string) => void;
-  onReindex: () => void;
-  onCancelIndex: () => void;
-  progress?: { files_done: number; files_total: number; chunks: number; phase: string };
-  error?: string;
-  /** True when `stacks_is_stale` reports a source file modified after this
-   * stack's `indexed_at` — renders a small warning badge next to the
-   * indexed-at line prompting a reindex (RAG design doc slice 4). */
-  stale?: boolean;
   onQuery: (stackIds: string[], query: string, k?: number) => Promise<StackQueryResult[]>;
 }
 
 function StackRow({
   stack,
   expanded,
+  v2Staleness,
   onToggle,
   onDelete,
   onRename,
   onAddFolder,
   onAddFile,
   onRemoveSource,
-  onReindex,
-  onCancelIndex,
-  progress,
-  error,
-  stale,
   onQuery,
 }: StackRowProps) {
   const { t } = useT();
@@ -397,18 +401,7 @@ function StackRow({
   const [searchError, setSearchError] = useState<string | null>(null);
   const [results, setResults] = useState<StackQueryResult[] | null>(null);
 
-  const isIndexing = progress != null && progress.phase !== "done";
   const indexedAt = formatIndexedAt(stack.indexed_at);
-
-  const phaseLabel = (() => {
-    if (!progress) return null;
-    if (progress.phase === "walking") return t("KnowledgePanel.phaseWalking");
-    if (progress.phase === "chunking") {
-      return t("KnowledgePanel.phaseChunking", { done: progress.files_done, total: progress.files_total });
-    }
-    if (progress.phase === "embedding") return t("KnowledgePanel.phaseEmbedding", { chunks: progress.chunks });
-    return t("KnowledgePanel.phaseDone");
-  })();
 
   const handleSearch = useCallback(async () => {
     const query = searchText.trim();
@@ -442,8 +435,10 @@ function StackRow({
                 : t("KnowledgePanel.neverIndexed")}
             </p>
           </div>
-          {stale && !isIndexing && (
-            <StatusPill tone="warning">{t("KnowledgePanel.staleIndexBadge")}</StatusPill>
+          {v2Staleness != null && v2Staleness !== "notIndexed" && (
+            <StatusPill tone={V2_STALENESS_TONE[v2Staleness]}>
+              {t(`KnowledgePanel.v2Badge_${v2Staleness}`)}
+            </StatusPill>
           )}
         </div>
         <span className="shrink-0 font-mono text-[11px] text-faint">{stack.embedding.model_id_or_tag}</span>
@@ -497,22 +492,6 @@ function StackRow({
                 ))}
               </ul>
             )}
-          </div>
-
-          <div>
-            <div className="flex items-center gap-2">
-              {isIndexing ? (
-                <Button variant="danger" size="sm" onClick={onCancelIndex}>
-                  {t("KnowledgePanel.cancelIndexButton")}
-                </Button>
-              ) : (
-                <Button variant="primary" size="sm" onClick={onReindex} disabled={stack.sources.length === 0}>
-                  {t("KnowledgePanel.reindexButton")}
-                </Button>
-              )}
-              {phaseLabel && <span className="text-xs text-muted">{phaseLabel}</span>}
-            </div>
-            {error && <p className="mt-1.5 text-xs text-danger">{error}</p>}
           </div>
 
           <div className="border-t border-border pt-2.5">

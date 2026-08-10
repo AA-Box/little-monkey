@@ -255,6 +255,22 @@ export interface KnowledgeOcrConfig {
   low_confidence_micros: number;
 }
 
+/**
+ * Mirrors the Rust `KnowledgeV2Staleness`. `"notIndexed"` doubles as "this stack
+ * has no active v2 generation", which is what the read path branches on — so it
+ * is also the answer to "is this stack served from v2 or from v1?".
+ *
+ * `"unknown"` must render as unknown and never as fresh: a remote connector's
+ * upstream state cannot be compared without network I/O, so neither "fresh" nor
+ * "stale" is a true statement about a stack that has one.
+ */
+export type KnowledgeV2Staleness =
+  | "notIndexed"
+  | "fresh"
+  | "stalePipeline"
+  | "staleSources"
+  | "unknown";
+
 export interface OcrInstallRequest {
   url: string;
   version: string;
@@ -273,6 +289,11 @@ interface KnowledgeV2Store {
   errors: Record<string, string>;
   loading: boolean;
   backgroundConfig: KnowledgeBackgroundRefreshConfig | null;
+  /** Per stack, keyed by stack id. Absent means "not asked yet", which the panel
+   * renders as neither served-by-v2 nor stale — the same distinction the run
+   * ledger draws between unavailable and zero. */
+  v2Staleness: Record<string, KnowledgeV2Staleness>;
+  refreshV2Staleness: () => Promise<void>;
   refreshSources: (stackId?: string) => Promise<void>;
   addSource: (
     stackId: string,
@@ -323,9 +344,29 @@ export const useKnowledgeV2Store = create<KnowledgeV2Store>((set, get) => ({
   sources: [],
   progress: {},
   reports: {},
+  v1Imports: {},
   errors: {},
   loading: false,
   backgroundConfig: null,
+  v2Staleness: {},
+
+  // One probe per stack, which is what `v2_staleness_impl` was written for — it
+  // reads the manifest through `active_manifest` rather than `active` precisely
+  // so this fan-out does not revalidate every stored chunk. A stack that errors
+  // is left absent rather than reported fresh.
+  refreshV2Staleness: async () => {
+    const stacks = useStackStore.getState().stacks;
+    const answers = await Promise.all(
+      stacks.map(async (stack) => {
+        try {
+          return [stack.id, await invoke<KnowledgeV2Staleness>("knowledge_v2_is_stale", { stackId: stack.id })] as const;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    set({ v2Staleness: Object.fromEntries(answers.filter((entry) => entry != null)) });
+  },
 
   refreshSources: async (stackId) => {
     set({ loading: true });
@@ -379,6 +420,9 @@ export const useKnowledgeV2Store = create<KnowledgeV2Store>((set, get) => ({
       const report = await invoke<KnowledgeRefreshReport>("knowledge_v2_refresh", { stackId });
       set((state) => ({ reports: { ...state.reports, [stackId]: report } }));
       await Promise.all([get().refreshSources(), useStackStore.getState().refresh()]);
+      // A first successful refresh is how a stack starts being served, so
+      // re-probe its staleness here.
+      await get().refreshV2Staleness();
       return report;
     } catch (error) {
       const message = errorText(error);
@@ -387,7 +431,10 @@ export const useKnowledgeV2Store = create<KnowledgeV2Store>((set, get) => ({
     }
   },
 
-  cancelRefresh: async (stackId) => invoke<boolean>("knowledge_v2_cancel_refresh", { stackId }),
+  // Same shape as `refreshStack`: errors land in `errors[stackId]` for the
+  // panel's existing error slot, and both stores are re-read afterwards because
+  // the import seeds v2 sources and updates the stack's legacy readiness badge.
+cancelRefresh: async (stackId) => invoke<boolean>("knowledge_v2_cancel_refresh", { stackId }),
 
   updateChunking: async (stackId, chunkChars, chunkOverlap) => {
     const stack = await invoke<KnowledgeStack>("knowledge_v2_update_chunking", {

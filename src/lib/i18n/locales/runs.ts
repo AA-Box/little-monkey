@@ -134,4 +134,18 @@ export const runLocale: Record<string, string> = {
   "RunCapsule.metric": "Metric",
   "RunCapsule.changedMetrics": "{{count}} comparison metrics changed.",
   "RunCapsule.limitations": "Recorded limitations",
+
+  // Remote node placement (roadmap K17). `liveness`, the deciding key, and the
+  // placement state are shown as the daemon's own tokens rather than
+  // re-worded here: they are the vocabulary the CLI and the ledger use, and a
+  // prettier synonym would make an operator's `monkey daemon remote` output
+  // stop matching what they see on screen.
+  "RunCenter.nodesTitle": "Paired nodes",
+  "RunCenter.nodesDescribe": "Describe nodes",
+  "RunCenter.placementsSync": "Sync placements",
+  "RunCenter.nodeResidency": "residency",
+  "RunCenter.nodeQueue": "queue",
+  "RunCenter.nodeRefusing": "refusing work",
+  "RunCenter.placementOn": "on",
+  "RunCenter.placementAttempt": "attempt",
 };

@@ -37,6 +37,109 @@ pub struct DaemonDesktopStatus {
     #[serde(default)]
     pub managed_run_ids: Vec<String>,
     pub platform: Value,
+    /// The K8 scheduler backpressure signal, carried through verbatim.
+    ///
+    /// Not `Option`, deliberately. A missing signal must break loudly here
+    /// rather than decode as "accepting": the bundled sidecar ships in lockstep
+    /// with this binary (see [`cli_path`]), so an absent field means the two
+    /// disagree about the payload, and defaulting a *safety* signal to its
+    /// permissive value is how a producer ends up ignoring backpressure without
+    /// anybody noticing. Every other queue counter above is required for the
+    /// same reason.
+    pub backpressure: DesktopBackpressure,
+}
+
+/// What the daemon is currently willing to accept.
+///
+/// Mirrors `monkey-cli`'s `daemon::scheduler::BackpressureState`. It cannot be
+/// reused from there: `monkey-cli` is a binary that depends on this library, so
+/// nothing under `src/bin/` is reachable from here.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+// Both directions, not just deserialize: every token is a single lowercase word,
+// so snake_case and camelCase render identically and one attribute is honest for
+// both. Do not "fix" this to a split serialize/deserialize pair — it would read
+// as though the two sides differ when they do not.
+#[serde(rename_all = "snake_case")]
+pub enum DesktopBackpressureState {
+    Accepting,
+    /// Work is still accepted. Advisory: only a producer knows if it can wait.
+    Slow,
+    /// Refused. `enqueue` fails daemon-side, so a producer that submits anyway
+    /// gets an error rather than an overfull queue.
+    Closed,
+}
+
+/// The backpressure signal as `monkey daemon status --json` emits it.
+///
+/// The CLI emits **snake_case** inside this object (`retry_after_ms`,
+/// `queue_depth`, `queue_capacity`), so this needs its parent's split
+/// `rename_all` and not the plain `rename_all = "camelCase"` that the request
+/// structs below use. serde container attributes do not inherit, and a plain
+/// camelCase spelling here would look right while failing to decode three of
+/// the eight fields — which is why the test asserts against a real CLI payload
+/// rather than a round trip of this struct's own output.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub struct DesktopBackpressure {
+    pub state: DesktopBackpressureState,
+    /// Convenience mirror of `state != Closed`, carried through as sent.
+    pub accepting: bool,
+    /// Stable machine token (`kill_switch`, `queue_full`, `memory_saturated`,
+    /// `queue_deep`), or `None` when accepting freely. A `String` rather than an
+    /// enum because nothing on this side of the bridge branches on it — the
+    /// desktop branches on `state` and displays `detail` — so mirroring the four
+    /// tokens here would only add a second place for them to drift from
+    /// `daemon::scheduler`, which owns them.
+    pub reason: Option<String>,
+    /// A human sentence. Display it; never branch on it.
+    pub detail: Option<String>,
+    /// Advisory delay, derived from poll interval × backlog. Not a prediction of
+    /// when any particular job finishes.
+    pub retry_after_ms: Option<u64>,
+    pub queue_depth: u32,
+    pub queue_capacity: u32,
+    pub queued: u32,
+    pub held: u32,
+}
+
+/// The K8 backpressure signal out of a raw `daemon status --json` value, or
+/// `None` when the field is absent or does not decode.
+///
+/// `None` means **accepting**, and every caller must read it that way: a signal
+/// that goes away must never block the app, and `closed` is enforced daemon-side
+/// by `enqueue` regardless of what any producer checks. Branch on
+/// [`DesktopBackpressure::state`] and `reason`; never on `detail`, which is prose
+/// for a human.
+///
+/// Producers that already poll `daemon status` for other reasons — see
+/// [`crate::m6a_desktop_bridge`] and `m5_delivery::reviewer` — use this instead
+/// of re-spelling the field names, which is where the casing bugs come from.
+pub fn backpressure_signal(status: &Value) -> Option<DesktopBackpressure> {
+    serde_json::from_value(status.get("backpressure")?.clone()).ok()
+}
+
+/// One arbitration decision as `monkey daemon decisions --json` prints it.
+///
+/// Mirrors `SchedulerDecision` in the CLI's `daemon/store.rs`, which carries a
+/// plain `rename_all = "camelCase"` — unlike [`DesktopBackpressure`] above, whose
+/// CLI-side spelling is snake_case. So this one is camelCase in *both* directions
+/// and the test below proves it against verbatim CLI bytes; the SQLite
+/// `decision_id` column is deliberately not in the CLI's SELECT, so there is no
+/// field for it here.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopSchedulerDecision {
+    pub decided_at_ms: u64,
+    pub job_id: String,
+    pub outcome: String,
+    pub process_class: String,
+    pub effective_class: String,
+    pub workspace: Option<String>,
+    pub passed_over: Vec<String>,
+    pub detail: String,
+    pub measurement: String,
+    pub measured_value: Option<u64>,
+    pub measured_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -304,9 +407,48 @@ fn validate_output_path(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The desktop producer's view of the queue, including K8 backpressure.
+///
+/// # How the desktop honours the signal
+///
+/// This poll is the whole mechanism, because the desktop is the only producer
+/// with somewhere to *show* the signal before work is committed:
+///
+/// - **`closed`** is refused by the daemon's own `enqueue`, before it creates a
+///   worktree or a snapshot, and the refusal names the reason and a retry delay.
+///   [`daemon_desktop_queue`] deliberately does not preflight that here — see its
+///   doc comment.
+/// - **`slow`** is advisory and reaches the desktop only through this payload. It
+///   is the reason the field exists: nothing else can act on it, since the daemon
+///   by definition still accepts the work. The UI's job is to surface `detail`
+///   and `retry_after_ms` and let the operator decide, which is the correct
+///   answer for a producer whose submissions are batch work a human queues.
+///
+/// Until [`DesktopBackpressure`] was added, this deserializer dropped the whole
+/// object silently, so `slow` was unobservable from the desktop and the panel
+/// could not distinguish "queue nearly full" from "queue idle".
 #[tauri::command]
 pub async fn daemon_desktop_status() -> Result<DaemonDesktopStatus, String> {
     let output = command(vec!["daemon".into(), "status".into(), "--json".into()]).await?;
+    serde_json::from_str(output.trim()).map_err(|error| error.to_string())
+}
+
+/// The scheduling decision log, newest first.
+///
+/// Its own command and not more fields on [`daemon_desktop_status`] for the same
+/// reason it is its own CLI subcommand: status is polled several times a second
+/// and a decision log is read when somebody is asking why.
+#[tauri::command]
+pub async fn daemon_desktop_decisions(limit: u32) -> Result<Vec<DesktopSchedulerDecision>, String> {
+    // The CLI clamps the limit to 1..=512 itself, so there is nothing to bound here.
+    let output = command(vec![
+        "daemon".into(),
+        "decisions".into(),
+        "--limit".into(),
+        limit.to_string(),
+        "--json".into(),
+    ])
+    .await?;
     serde_json::from_str(output.trim()).map_err(|error| error.to_string())
 }
 
@@ -372,6 +514,24 @@ pub async fn daemon_desktop_uninstall(
     Ok(output)
 }
 
+/// Queues one recipe run as the desktop producer.
+///
+/// # Why there is no backpressure preflight here
+///
+/// `closed` is already honoured, authoritatively, one layer down: the daemon's
+/// `enqueue` consults the same signal and returns its `detail` plus a retry delay
+/// as an error *before* creating a worktree or snapshot, and [`run_cli`] surfaces
+/// that stderr verbatim as this command's `Err` — which is already the desktop's
+/// error vocabulary, since every command in this module returns
+/// `Result<_, String>` for the UI to display.
+///
+/// Adding a `daemon status` poll before the `daemon run` below would therefore buy
+/// no new refusal, spawn a second subprocess per queue, and introduce a race the
+/// authoritative check does not have: the queue can fill between the two calls, so
+/// the preflight would be advisory anyway while reading as though it were the
+/// guard. `slow` is not actionable at this point either — the operator has already
+/// committed to queueing, and the daemon still accepts the work. It is surfaced
+/// ahead of that decision by [`daemon_desktop_status`] instead.
 #[tauri::command]
 pub async fn daemon_desktop_queue(request: DaemonQueueRequest) -> Result<Value, String> {
     validate_token("recipe", &request.recipe, 16 * 1024)?;
@@ -977,6 +1137,90 @@ pub async fn remote_pair_rotate(device_id: String, output: String) -> Result<Str
     .await
 }
 
+// --- Roadmap K17: the placement plane, for the desktop ---------------------
+//
+// Thin wrappers over the CLI's own JSON, exactly like every command above. The
+// node and placement tables live in the daemon's remote database, which this
+// library cannot open — `RemoteStore` is a `monkey-cli` type — so the sidecar
+// that already owns that state is also the one that answers for it. That is the
+// same reasoning `remote_host_status` and `remote_audit` follow, and it keeps
+// one implementation of the placement rules rather than a second one here.
+
+#[tauri::command]
+pub async fn remote_node_list() -> Result<Value, String> {
+    parse_json(
+        &command(vec![
+            "daemon".into(),
+            "remote".into(),
+            "node-list".into(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn remote_placements() -> Result<Value, String> {
+    parse_json(
+        &command(vec![
+            "daemon".into(),
+            "remote".into(),
+            "placements".into(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Re-describes one paired node, or every one when `alias` is absent.
+///
+/// This is the call that reaches other machines, so it is the slow one; the
+/// listing above only reads what a previous refresh stored.
+#[tauri::command]
+pub async fn remote_node_refresh(alias: Option<String>) -> Result<String, String> {
+    let mut args = vec!["daemon".into(), "remote".into(), "node-refresh".into()];
+    if let Some(alias) = alias {
+        validate_id("node alias", &alias)?;
+        args.push(alias);
+    }
+    command(args).await
+}
+
+#[tauri::command]
+pub async fn remote_placement_sync() -> Result<String, String> {
+    command(vec![
+        "daemon".into(),
+        "remote".into(),
+        "placement-sync".into(),
+    ])
+    .await
+}
+
+/// States what this machine advertises to schedulers allowed to place work on
+/// it. Both values are operator statements — nothing infers a machine's
+/// jurisdiction — so both are validated here before they reach the sidecar.
+#[tauri::command]
+pub async fn remote_node_label(
+    name: Option<String>,
+    residency: Option<String>,
+) -> Result<String, String> {
+    let mut args = vec!["daemon".into(), "remote".into(), "node-label".into()];
+    if let Some(name) = name {
+        validate_token("node name", &name, 128)?;
+        args.push("--name".into());
+        args.push(name);
+    }
+    if let Some(residency) = residency {
+        crate::node_placement::validate_residency(&residency)?;
+        args.push("--residency".into());
+        args.push(residency);
+    }
+    if args.len() == 3 {
+        return Err("Set a node name, a data-residency label, or both".to_string());
+    }
+    command(args).await
+}
+
 #[tauri::command]
 pub async fn remote_audit(limit: u32) -> Result<Value, String> {
     if !(1..=10_000).contains(&limit) {
@@ -1037,18 +1281,180 @@ mod tests {
         assert!(validate_remote_pair_request(&unknown_mobile).is_err());
 
         let mut granted_mobile = valid;
-        granted_mobile.mobile_capabilities =
-            vec!["view-sessions".to_string(), "chat".to_string()];
+        granted_mobile.mobile_capabilities = vec!["view-sessions".to_string(), "chat".to_string()];
         assert!(validate_remote_pair_request(&granted_mobile).is_ok());
+    }
+
+    /// A verbatim `monkey daemon status --json` payload, as a string.
+    ///
+    /// A string and not `json!` on purpose: this is the CLI's wire bytes, and the
+    /// whole point of the test below is to decode what the CLI actually sends
+    /// rather than something re-spelled on this side of the bridge.
+    fn cli_status_json(backpressure: &str) -> String {
+        format!(
+            r#"{{"installed":true,"service_running":true,"heartbeat_fresh":true,"pid":1,
+               "kill_switch":false,"queued":0,"active":1,"waiting_approval":0,"paused":0,
+               "managed_run_ids":["run-one"],"platform":"macos","backpressure":{backpressure}}}"#
+        )
     }
 
     #[test]
     fn status_deserializes_cli_shape_and_serializes_ui_shape() {
-        let status: DaemonDesktopStatus=serde_json::from_value(serde_json::json!({"installed":true,"service_running":true,"heartbeat_fresh":true,"pid":1,"kill_switch":false,"queued":0,"active":1,"waiting_approval":0,"paused":0,"managed_run_ids":["run-one"],"platform":"macos"})).unwrap();
+        let status: DaemonDesktopStatus = serde_json::from_str(&cli_status_json(
+            r#"{"state":"accepting","accepting":true,"reason":null,"detail":null,
+                "retry_after_ms":null,"queue_depth":0,"queue_capacity":128,"queued":0,"held":0}"#,
+        ))
+        .unwrap();
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["serviceRunning"], true);
         assert_eq!(value["managedRunIds"], serde_json::json!(["run-one"]));
         assert!(value.get("service_running").is_none());
+    }
+
+    /// The regression this exists for: `backpressure` decoding as absent.
+    ///
+    /// Before the field was added, `DaemonDesktopStatus` had no
+    /// `deny_unknown_fields`, so the CLI's `backpressure` object was silently
+    /// dropped and the desktop could not see the signal at all — nothing failed,
+    /// which is exactly why nobody noticed. Spelling the nested struct's
+    /// `rename_all` as a plain `camelCase` reintroduces the same class of bug for
+    /// `retry_after_ms`/`queue_depth`/`queue_capacity`, so this asserts on the
+    /// three multi-word fields specifically and not just on `state`.
+    #[test]
+    fn status_carries_the_snake_case_backpressure_signal_the_cli_emits() {
+        let closed: DaemonDesktopStatus = serde_json::from_str(&cli_status_json(
+            r#"{"state":"closed","accepting":false,"reason":"queue_full",
+                "detail":"128 of 128 queue slots are in use; wait for a run or cancel one",
+                "retry_after_ms":32000,"queue_depth":128,"queue_capacity":128,
+                "queued":124,"held":0}"#,
+        ))
+        .unwrap();
+
+        // The signal arrived populated — not defaulted, not dropped.
+        assert_eq!(closed.backpressure.state, DesktopBackpressureState::Closed);
+        assert!(!closed.backpressure.accepting);
+        assert_eq!(closed.backpressure.reason.as_deref(), Some("queue_full"));
+        assert!(closed.backpressure.detail.is_some());
+        // The three fields a plain `rename_all = "camelCase"` would have lost.
+        assert_eq!(closed.backpressure.retry_after_ms, Some(32_000));
+        assert_eq!(closed.backpressure.queue_depth, 128);
+        assert_eq!(closed.backpressure.queue_capacity, 128);
+        assert_eq!(closed.backpressure.queued, 124);
+
+        // Re-serialization is the UI's camelCase, with nothing lost in between.
+        let value = serde_json::to_value(&closed).unwrap();
+        assert_eq!(value["backpressure"]["state"], "closed");
+        assert_eq!(value["backpressure"]["retryAfterMs"], 32_000);
+        assert_eq!(value["backpressure"]["queueDepth"], 128);
+        assert_eq!(value["backpressure"]["queueCapacity"], 128);
+        assert!(value["backpressure"].get("retry_after_ms").is_none());
+
+        // `slow` is a distinct third state, not a flavour of either other one: a
+        // producer that collapsed it into `closed` would refuse work the daemon
+        // is still accepting.
+        let slow: DaemonDesktopStatus = serde_json::from_str(&cli_status_json(
+            r#"{"state":"slow","accepting":true,"reason":"memory_saturated",
+                "detail":"all 4 queued runs are waiting on memory; more work will queue but not start",
+                "retry_after_ms":1000,"queue_depth":8,"queue_capacity":128,"queued":4,"held":4}"#,
+        ))
+        .unwrap();
+        assert_eq!(slow.backpressure.state, DesktopBackpressureState::Slow);
+        assert!(
+            slow.backpressure.accepting,
+            "`slow` still accepts; only `closed` refuses"
+        );
+        assert_eq!(slow.backpressure.held, 4);
+
+        // A missing signal is an error, never a permissive default. See the
+        // field's doc comment for why this is not an `Option`.
+        assert!(serde_json::from_str::<DaemonDesktopStatus>(
+            &cli_status_json("null").replace(",\"backpressure\":null", "")
+        )
+        .is_err());
+    }
+
+    /// The casing trap, for the decision log this time.
+    ///
+    /// A verbatim `monkey daemon decisions --json` row as a string, not a `json!`
+    /// macro: re-spelling the payload on this side of the bridge would test the
+    /// mirror against itself. `SchedulerDecision` carries a plain
+    /// `rename_all = "camelCase"`, so unlike the backpressure block above this is
+    /// camelCase on the wire — and getting it wrong here shows up as a panel full
+    /// of empty rows rather than as an error, which is why it is asserted field by
+    /// field. The CLI end of the same contract is pinned in
+    /// `daemon/store.rs::the_decision_log_is_bounded_and_retains_the_newest`.
+    #[test]
+    fn decisions_deserialize_the_camel_case_shape_the_cli_emits() {
+        let decisions: Vec<DesktopSchedulerDecision> = serde_json::from_str(
+            r#"[
+              {
+                "decidedAtMs": 1750000000000,
+                "jobId": "job-one",
+                "outcome": "admitted",
+                "processClass": "interactive",
+                "effectiveClass": "batch",
+                "workspace": "/Users/x/repo",
+                "passedOver": ["job-two", "job-three"],
+                "detail": "admitted over 2 jobs; available RAM read 9.2 GiB",
+                "measurement": "available_ram_bytes",
+                "measuredValue": 9878424780,
+                "measuredAtMs": 1749999999000
+              }
+            ]"#,
+        )
+        .unwrap();
+
+        let decision = &decisions[0];
+        assert_eq!(decision.decided_at_ms, 1_750_000_000_000);
+        assert_eq!(decision.job_id, "job-one");
+        assert_eq!(decision.outcome, "admitted");
+        assert_eq!(decision.process_class, "interactive");
+        assert_eq!(decision.effective_class, "batch");
+        assert_eq!(decision.workspace.as_deref(), Some("/Users/x/repo"));
+        assert_eq!(decision.passed_over, ["job-two", "job-three"]);
+        assert!(decision.detail.contains("available RAM"));
+        assert_eq!(decision.measurement, "available_ram_bytes");
+        assert_eq!(decision.measured_value, Some(9_878_424_780));
+        // The observation's own time, never re-stamped as the decision time.
+        assert_eq!(decision.measured_at_ms, Some(1_749_999_999_000));
+
+        // Back out to the UI in the same spelling the TS interface declares.
+        let value = serde_json::to_value(decision).unwrap();
+        assert_eq!(
+            value["passedOver"],
+            serde_json::json!(["job-two", "job-three"])
+        );
+        assert_eq!(value["measuredAtMs"], 1_749_999_999_000_u64);
+        assert!(value.get("measured_at_ms").is_none());
+
+        // Nullable columns arrive null, and an empty log is an empty array.
+        let sparse: Vec<DesktopSchedulerDecision> = serde_json::from_str(
+            r#"[{"decidedAtMs":1,"jobId":"j","outcome":"rejected","processClass":"batch",
+                 "effectiveClass":"batch","workspace":null,"passedOver":[],"detail":"d",
+                 "measurement":"none","measuredValue":null,"measuredAtMs":null}]"#,
+        )
+        .unwrap();
+        assert!(sparse[0].workspace.is_none() && sparse[0].measured_value.is_none());
+        assert!(serde_json::from_str::<Vec<DesktopSchedulerDecision>>("[]")
+            .unwrap()
+            .is_empty());
+    }
+
+    /// An absent signal reads as accepting; only an explicit `closed` refuses.
+    #[test]
+    fn backpressure_signal_is_absent_rather_than_permissive_by_accident() {
+        assert!(backpressure_signal(&serde_json::json!({ "installed": true })).is_none());
+        let signal = backpressure_signal(&serde_json::json!({
+            "backpressure": {
+                "state": "slow", "accepting": true, "reason": "queue_deep",
+                "detail": "104 of 128 queue slots are in use; slow down",
+                "retry_after_ms": 26000, "queue_depth": 104, "queue_capacity": 128,
+                "queued": 100, "held": 0
+            }
+        }))
+        .expect("the signal decodes from a raw status value");
+        assert_eq!(signal.state, DesktopBackpressureState::Slow);
+        assert_eq!(signal.retry_after_ms, Some(26_000));
     }
 
     fn fixture_schedule(path: &Path, entry_id: &str, cron: &str) -> DaemonRecipeSchedule {

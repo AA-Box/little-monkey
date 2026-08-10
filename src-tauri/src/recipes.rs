@@ -25,8 +25,9 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use sha2::{Digest, Sha256};
-use tauri::{Emitter, Manager};
+use tauri::Emitter;
 
+use crate::profiles::ProfileScopedPaths;
 use crate::run_protocol::{
     ModelTargetSnapshot, PermissionMode as RunPermissionMode, PermissionPolicySnapshot,
     WorkspaceContext,
@@ -52,30 +53,61 @@ pub struct RecipeTarget {
     pub ollama: Option<String>,
     #[serde(default)]
     pub local_url: Option<String>,
+    /// A model id installed in **this machine's** managed runtime hub, served by
+    /// the app's own verified `llama-server` for the life of the run.
+    ///
+    /// # Why this is a fourth option rather than a `local_url`
+    ///
+    /// `local_url` names an origin that is *already listening*. The managed
+    /// runtime is not: it is started on a fresh loopback port when the run
+    /// starts and killed when it ends, so its origin does not exist at the time
+    /// the recipe is written. A recipe that tried to express it as a `local_url`
+    /// would have to invent a port and would be wrong by the time it ran.
+    ///
+    /// This is also what a run placed by another owned machine needs (roadmap
+    /// K17). A placed `ModelTargetSnapshot::ManagedLlama` names a model id and a
+    /// `model_path` **on the submitter's disk**; the path is meaningless here, so
+    /// the receiving node resolves the id against its own hub inventory and lets
+    /// the executing process start the runtime. Before this field existed there
+    /// was no recipe target that could say that, so placements naming the
+    /// managed runtime had to be refused outright.
+    #[serde(default)]
+    pub managed_model: Option<String>,
 }
 
 impl RecipeTarget {
     /// Enforces the design doc's XOR constraint: `provider: openrouter #
-    /// XOR ollama: "qwen2.5:14b" XOR local_url: "http://127.0.0.1:8090"`.
+    /// XOR ollama: "qwen2.5:14b" XOR local_url: "http://127.0.0.1:8090"` —
+    /// plus `managed_model: "<hub model id>"` as a fourth, mutually exclusive
+    /// option.
     pub fn validate(&self) -> Result<(), String> {
         let set_count = [
             self.provider.is_some(),
             self.ollama.is_some(),
             self.local_url.is_some(),
+            self.managed_model.is_some(),
         ]
         .iter()
         .filter(|set| **set)
         .count();
         if set_count == 0 {
             return Err(
-                "recipe target must set exactly one of provider, ollama, or local_url".to_string(),
+                "recipe target must set exactly one of provider, ollama, local_url, or managed_model"
+                    .to_string(),
             );
         }
         if set_count > 1 {
-            return Err("recipe target must set exactly one of provider, ollama, or local_url — not more than one".to_string());
+            return Err("recipe target must set exactly one of provider, ollama, local_url, or managed_model — not more than one".to_string());
         }
         if self.provider.is_some() && self.model.is_none() {
             return Err("recipe target with 'provider' must also set 'model'".to_string());
+        }
+        if self
+            .managed_model
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty() || value.len() > 512)
+        {
+            return Err("recipe target 'managed_model' must be a non-empty model id".to_string());
         }
         Ok(())
     }
@@ -620,6 +652,24 @@ pub struct Recipe {
     /// daemon. Hand-authored/scheduled recipes remain unchanged.
     #[serde(default)]
     pub desktop_turn: Option<DesktopTurnSnapshot>,
+    /// Present only for a run **placed on this node by another machine we own**
+    /// (roadmap K17 S2/S3). Written by the node's own placement route; never
+    /// hand-authored, and rejected on any recipe that also carries a
+    /// `desktop_turn`.
+    ///
+    /// # Why the frozen spec has to ride here rather than be re-derived
+    ///
+    /// The node's queue takes recipes, and the executing process builds the
+    /// `RunSpec` from the recipe it was handed. A recipe carries a permission
+    /// *mode* and a timeout and nothing else — no egress allowlist, no token or
+    /// cost budget — so a placed spec converted to a recipe and back would come
+    /// out wearing the **node's** defaults. The submitter's policy would have
+    /// travelled and then been silently discarded at the last step, which is
+    /// worse than never travelling: it reads as a guarantee. These four fields
+    /// ride verbatim so the executing process builds its spec from the
+    /// submitter's policy and budgets.
+    #[serde(default)]
+    pub placed_run: Option<crate::node_placement::PlacedRunSnapshot>,
 }
 
 fn is_valid_recipe_name(name: &str) -> bool {
@@ -677,6 +727,15 @@ pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
     }
     if let Some(snapshot) = &recipe.desktop_turn {
         snapshot.validate_for_recipe(recipe)?;
+    }
+    if let Some(placed) = &recipe.placed_run {
+        if recipe.desktop_turn.is_some() {
+            // Both freeze the same four fields, and a recipe carrying both
+            // would leave "which one wins" to the order of two `unwrap_or_else`
+            // chains in `task.rs`. Refused here so that question never arises.
+            return Err("a recipe cannot be both a desktop turn and a placed run".to_string());
+        }
+        placed.validate()?;
     }
     Ok(())
 }
@@ -988,8 +1047,7 @@ pub fn delete_recipe_impl(app_data_dir: &Path, name: &str) -> Result<(), String>
 // ---------------------------------------------------------------------------
 
 fn app_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
+    app.profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {e}"))
 }
 
@@ -1109,6 +1167,7 @@ mod tests {
             model: Some("anthropic/claude-sonnet".to_string()),
             ollama: None,
             local_url: None,
+            managed_model: None,
         }
     }
 
@@ -1127,7 +1186,63 @@ mod tests {
             timeout_seconds: None,
             output: RecipeOutput::default(),
             desktop_turn: None,
+            placed_run: None,
         }
+    }
+
+    /// **The policy really does survive the trip** (roadmap K17 S3).
+    ///
+    /// The node writes this recipe to disk and the executing child parses it
+    /// back, so the round trip is the actual mechanism, not a stand-in for one.
+    /// The egress allowlist and the budgets are the two fields a recipe has
+    /// nowhere else to put — re-deriving either on the node would silently swap
+    /// the submitter's policy for this machine's defaults, which is the failure
+    /// the whole slice exists to prevent.
+    #[test]
+    fn a_placed_runs_policy_and_budgets_survive_the_recipe_round_trip() {
+        let spec = crate::node_placement::tests_support::placement_spec("run:placed");
+        let mut spec = spec;
+        spec.permission_policy.egress_allowlist = Some(crate::run_protocol::EgressAllowlist {
+            hosts: vec!["api.example.com".to_string()],
+            ports: vec![443],
+            protocols: vec!["https".to_string()],
+        });
+        spec.budgets.max_output_tokens = 4_321;
+
+        let mut recipe = valid_recipe();
+        recipe.placed_run = Some(crate::node_placement::PlacedRunSnapshot::from_spec(&spec));
+        validate_recipe(&recipe).expect("a placed recipe must validate");
+
+        let written = serde_json::to_string(&recipe).expect("the node writes JSON");
+        let parsed = parse_recipe(&written, "json").expect("the child parses it back");
+        let placed = parsed.placed_run.expect("the placement snapshot survives");
+        assert_eq!(
+            placed
+                .permission_policy
+                .egress_allowlist
+                .as_ref()
+                .map(|list| list.hosts.clone()),
+            Some(vec!["api.example.com".to_string()]),
+            "the travelled allowlist must reach the executing process"
+        );
+        assert_eq!(placed.budgets.max_output_tokens, 4_321);
+        assert_eq!(placed.submitted_run_id, "run:placed");
+    }
+
+    /// Both snapshots freeze the same four fields, so a recipe carrying both
+    /// would leave "which wins" to the order of two fallback chains in
+    /// `task.rs`. Refused at parse time so that question never arises.
+    #[test]
+    fn a_recipe_cannot_be_both_a_desktop_turn_and_a_placed_run() {
+        let spec = crate::node_placement::tests_support::placement_spec("run:placed");
+        let mut recipe = desktop_recipe();
+        validate_recipe(&recipe).expect("the desktop half alone is valid");
+        recipe.placed_run = Some(crate::node_placement::PlacedRunSnapshot::from_spec(&spec));
+        let error = validate_recipe(&recipe).unwrap_err();
+        assert!(
+            error.contains("desktop turn") && error.contains("placed run"),
+            "the refusal must name both: {error}"
+        );
     }
 
     fn unknown_capability() -> crate::run_protocol::CapabilityAssessment {
@@ -1199,6 +1314,7 @@ mod tests {
                 tool_rules: Vec::new(),
                 allow_network: false,
                 allow_external_mutations: false,
+                egress_allowlist: None,
             },
             generation: DesktopGenerationSettingsSnapshot {
                 temperature: None,
@@ -1357,6 +1473,7 @@ mod tests {
             model: Some("x".to_string()),
             ollama: Some("qwen2.5:14b".to_string()),
             local_url: None,
+            managed_model: None,
         };
         assert!(t.validate().is_err());
     }
@@ -1368,6 +1485,7 @@ mod tests {
             model: None,
             ollama: None,
             local_url: None,
+            managed_model: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("model"));
@@ -1380,8 +1498,37 @@ mod tests {
             model: None,
             ollama: Some("qwen2.5:14b".to_string()),
             local_url: None,
+            managed_model: None,
         };
         assert!(t.validate().is_ok());
+    }
+
+    /// The fourth option, and why it is one: `managed_model` names a model this
+    /// machine has installed rather than an origin that is already listening,
+    /// because the managed runtime is started on a fresh loopback port for the
+    /// life of the run. It is still mutually exclusive with the other three.
+    #[test]
+    fn target_accepts_a_managed_model_alone_and_never_beside_another() {
+        let managed = RecipeTarget {
+            provider: None,
+            model: None,
+            ollama: None,
+            local_url: None,
+            managed_model: Some("qwen3-8b".to_string()),
+        };
+        assert!(managed.validate().is_ok());
+
+        let both = RecipeTarget {
+            local_url: Some("http://127.0.0.1:8090".to_string()),
+            ..managed.clone()
+        };
+        assert!(both.validate().is_err());
+
+        let empty = RecipeTarget {
+            managed_model: Some("   ".to_string()),
+            ..managed
+        };
+        assert!(empty.validate().unwrap_err().contains("managed_model"));
     }
 
     #[test]
@@ -1391,6 +1538,7 @@ mod tests {
             model: None,
             ollama: None,
             local_url: Some("http://127.0.0.1:8090".to_string()),
+            managed_model: None,
         };
         assert!(t.validate().is_ok());
     }

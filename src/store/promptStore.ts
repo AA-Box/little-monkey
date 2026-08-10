@@ -3,6 +3,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { errorMessage } from "../lib/errors";
+import { isConflictError } from "./configRevisionStore";
 
 /** Emitted by the backend after every successful `prompts_save`, with the
  * saving window's label as payload (see src-tauri/src/prompts.rs). Other
@@ -92,6 +93,23 @@ export interface PromptStore {
   /** Last file-persistence failure, surfaced in the UI instead of silently
    * dropping a save; cleared by the next successful save. */
   persistError: string | null;
+  /** The library revision this window last saw (see
+   * `src-tauri/src/config_revisions.rs`). Sent as the base of every save, which
+   * is what lets the backend refuse a write that would clobber someone else's
+   * — roadmap K24 / ROADMAP #3. `null` before the first save on a library that
+   * predates versioning; the backend then treats the save as unconditional. */
+  libraryRevisionId: string | null;
+  /** Set when a save was REFUSED because another window (or the CLI) saved
+   * first. The local edits are still in `entries` and still unsaved — the UI
+   * must offer a choice, not pick one silently. Cleared by either resolver. */
+  conflict: boolean;
+  /** Conflict resolution: discard this window's unsaved edits and take the
+   * version already on disk. */
+  reloadAfterConflict: () => Promise<void>;
+  /** Conflict resolution: keep this window's edits and write them over the
+   * other save. The overwritten version stays in the revision history, so this
+   * is recoverable — which is the reason it can be offered at all. */
+  overwriteAfterConflict: () => Promise<void>;
   /** Create a new entry and persist it. Returns the created entry (its
    * generated `id` is otherwise unobservable until the next render). */
   addEntry: (input: NewPromptInput) => PromptEntry;
@@ -314,6 +332,31 @@ function normalizeEntry(raw: Partial<PromptEntry>): PromptEntry {
   };
 }
 
+/** Reads a revision snapshot written by `prompts::entry_snapshot` (the
+ * authored fields only — no id, no timestamps) back into a patch.
+ *
+ * Returns `null` for anything that isn't that shape, so restoring a revision
+ * belonging to some other kind can't quietly blank out a persona's fields —
+ * the same "recognize it or refuse it" stance `parseImportPayload` takes. */
+export function parseEntrySnapshot(content: string): PromptEntryPatch | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const raw = parsed as Record<string, unknown>;
+  if (typeof raw.name !== "string" || typeof raw.content !== "string") return null;
+  return {
+    kind: raw.kind === "persona" || raw.kind === "skill" ? (raw.kind as PromptKind) : "snippet",
+    name: raw.name,
+    command: typeof raw.command === "string" ? raw.command : "",
+    content: raw.content,
+    description: typeof raw.description === "string" && raw.description.length > 0 ? raw.description : undefined,
+  };
+}
+
 /** Parses and validates a persisted `{ version, entries, defaultPersonaId }`
  * JSON blob. Returns `null` for anything absent, corrupt, or missing an
  * `entries` array. */
@@ -418,13 +461,25 @@ function flushPersist(): void {
   pendingPayload = null;
   if (payload === null) return;
 
-  invoke("prompts_save", { payload })
-    .then(() => {
-      if (usePromptStore.getState().persistError !== null) {
-        usePromptStore.setState({ persistError: null });
-      }
+  writePayload(payload, usePromptStore.getState().libraryRevisionId);
+}
+
+/** The one place the library blob is written. `baseRevisionId` of `null` is an
+ * unconditional write (first save, import, conflict override); anything else
+ * asks the backend to refuse the write if that revision is no longer the head. */
+function writePayload(payload: string, baseRevisionId: string | null): Promise<void> {
+  return invoke<string>("prompts_save", { payload, baseRevisionId })
+    .then((revisionId) => {
+      usePromptStore.setState({ libraryRevisionId: revisionId, persistError: null, conflict: false });
     })
     .catch((err: unknown) => {
+      if (isConflictError(err)) {
+        // The edits are still in memory and still unsaved. Surfacing this is
+        // the whole point — the alternative (retrying with a fresh base) is
+        // exactly the silent overwrite K24 exists to stop.
+        usePromptStore.setState({ conflict: true, persistError: null });
+        return;
+      }
       usePromptStore.setState({ persistError: errorMessage(err) });
     });
 }
@@ -470,6 +525,20 @@ async function rehydrateFromFile(): Promise<void> {
     defaultPersonaId: fromFile.defaultPersonaId,
     hasSeededDefaults: fromFile.hasSeededDefaults,
   });
+  await refreshLibraryRevision();
+}
+
+/** Re-reads the current library revision id, so this window's next save is
+ * based on what is actually on disk. */
+async function refreshLibraryRevision(): Promise<void> {
+  try {
+    const revisionId = await invoke<string | null>("prompts_current_revision");
+    usePromptStore.setState({ libraryRevisionId: revisionId });
+  } catch {
+    // A history that can't be read must not block editing: the next save just
+    // falls back to an unconditional write.
+    usePromptStore.setState({ libraryRevisionId: null });
+  }
 }
 
 /** Starts listening for other windows' saves. Called once per window from
@@ -526,6 +595,9 @@ export async function hydratePrompts(): Promise<void> {
         hasSeededDefaults: fromFile.hasSeededDefaults,
       });
     }
+    // Before the first save, so this window saves against the revision that is
+    // actually current rather than against nothing.
+    await refreshLibraryRevision();
     // No file yet (first run) — keep the empty initial state. Unlike
     // `sessionStore.ts` there's no legacy localStorage blob to migrate from:
     // this feature never persisted anywhere before this file existed.
@@ -565,6 +637,36 @@ export const usePromptStore = create<PromptStore>((set, get) => ({
   defaultPersonaId: null,
   hasSeededDefaults: false,
   persistError: null,
+  libraryRevisionId: null,
+  conflict: false,
+
+  reloadAfterConflict: async () => {
+    // Drop the queued write first: rehydrating and then flushing the discarded
+    // edits would put them straight back.
+    pendingPayload = null;
+    if (persistTimer !== null) {
+      clearTimeout(persistTimer);
+      persistTimer = null;
+    }
+    await rehydrateFromFile();
+    set({ conflict: false, persistError: null });
+  },
+
+  overwriteAfterConflict: async () => {
+    const state = get();
+    const payload = JSON.stringify({
+      version: 1,
+      entries: state.entries,
+      defaultPersonaId: state.defaultPersonaId,
+      hasSeededDefaults: state.hasSeededDefaults,
+    });
+    pendingPayload = null;
+    if (persistTimer !== null) {
+      clearTimeout(persistTimer);
+      persistTimer = null;
+    }
+    await writePayload(payload, null);
+  },
 
   addEntry: (input) => {
     const now = Date.now();

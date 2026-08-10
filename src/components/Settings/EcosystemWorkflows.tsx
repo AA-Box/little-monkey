@@ -20,6 +20,8 @@ import { makeWorkflowNode, newWorkflowDefinition, useEcosystemStore } from "../.
 import { useEvalHarnessStore } from "../../store/evalHarnessStore";
 import { useMcpStore } from "../../store/mcpStore";
 import { errorMessage } from "../../lib/errors";
+import { RevisionHistoryPanel } from "./RevisionHistoryPanel";
+import { WORKFLOW_KIND, isConflictError } from "../../store/configRevisionStore";
 
 const FIELD = "h-9 w-full rounded-lg border border-border bg-surface-2 px-3 text-sm text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent";
 const AREA = "w-full rounded-lg border border-border bg-surface-2 px-3 py-2 font-mono text-xs text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent";
@@ -192,6 +194,8 @@ export function EcosystemWorkflowDesigner() {
   const [legacyText, setLegacyText] = useState(JSON.stringify({ version: 1, name: "imported-recipe", target: { provider: null, model: null, ollama: "qwen2.5:7b", local_url: null }, permission_mode: "ask", system: null, prompt: "{{prompt}}", params: { prompt: null }, maximum_iterations: 1, timeout_seconds: 60 } satisfies LegacyRecipeV1, null, 2));
   const [showLegacy, setShowLegacy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [saveConflict, setSaveConflict] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const [triggerIds, setTriggerIds] = useState<string[]>([]);
   const [triggerStatus, setTriggerStatus] = useState<string | null>(null);
@@ -440,7 +444,29 @@ export function EcosystemWorkflowDesigner() {
     const saving = exists ? { ...draft, workflow_version: definition.workflow_version + 1 } : draft;
     try {
       await saveWorkflow(saving, exists);
+      setSaveConflict(false);
       loadDefinition(saving);
+    } catch (error) {
+      // A refused save because someone else saved first is a different thing
+      // from a validation failure, and gets its own resolution (roadmap K24).
+      if (isConflictError(error)) {
+        setSaveConflict(true);
+        setLocalError(null);
+        return;
+      }
+      setLocalError(errorMessage(error));
+    }
+  }
+
+  /** Conflict resolution: take the definition that is actually stored, losing
+   * the unsaved edits. Keeping them instead is "bump the version past theirs
+   * and save again" — both of their versions stay in the revision history. */
+  async function reloadStoredDefinition() {
+    try {
+      await refreshWorkflows();
+      const stored = await ecosystemClient.loadWorkflow(definition.workflow_id);
+      loadDefinition(stored);
+      setSaveConflict(false);
     } catch (error) { setLocalError(errorMessage(error)); }
   }
 
@@ -546,9 +572,50 @@ export function EcosystemWorkflowDesigner() {
                 <select value={addKind} onChange={(event) => setAddKind(event.target.value as AddableNodeKind)} className={FIELD + " !w-auto"}>{NODE_KINDS.map((kind) => <option key={kind} value={kind}>{kind}</option>)}</select>
                 <Button size="sm" onClick={addNode}><Plus size={14} />{t("EcosystemWorkflow.addNode")}</Button>
               </div>
-              <div className="flex flex-wrap gap-2"><Button size="sm" disabled={busy["workflow-validate"]} onClick={() => void validate()}><Check size={14} />{t("EcosystemWorkflow.validate")}</Button><Button size="sm" variant="primary" disabled={busy["workflow-save"]} onClick={() => void save()}><Save size={14} />{exists ? t("EcosystemWorkflow.saveNewVersion") : t("EcosystemWorkflow.create")}</Button>{exists && (confirmDelete ? <span className="inline-flex items-center gap-1 rounded-lg border border-danger/30 bg-danger-soft p-1"><Button size="sm" variant="danger" onClick={() => void deleteWorkflow(definition.workflow_id).then(() => loadDefinition(newWorkflowDefinition()))}>{t("EcosystemWorkflow.confirmDelete")}</Button><Button size="sm" variant="ghost" onClick={() => setConfirmDelete(false)}>{t("EcosystemWorkflow.cancel")}</Button></span> : <Button size="sm" variant="danger" onClick={() => setConfirmDelete(true)}><Trash2 size={14} />{t("EcosystemWorkflow.delete")}</Button>)}</div>
+              <div className="flex flex-wrap gap-2"><Button size="sm" disabled={busy["workflow-validate"]} onClick={() => void validate()}><Check size={14} />{t("EcosystemWorkflow.validate")}</Button><Button size="sm" variant="primary" disabled={busy["workflow-save"]} onClick={() => void save()}><Save size={14} />{exists ? t("EcosystemWorkflow.saveNewVersion") : t("EcosystemWorkflow.create")}</Button>{exists && <Button size="sm" onClick={() => setShowHistory((value) => !value)}><History size={14} />History</Button>}{exists && (confirmDelete ? <span className="inline-flex items-center gap-1 rounded-lg border border-danger/30 bg-danger-soft p-1"><Button size="sm" variant="danger" onClick={() => void deleteWorkflow(definition.workflow_id).then(() => loadDefinition(newWorkflowDefinition()))}>{t("EcosystemWorkflow.confirmDelete")}</Button><Button size="sm" variant="ghost" onClick={() => setConfirmDelete(false)}>{t("EcosystemWorkflow.cancel")}</Button></span> : <Button size="sm" variant="danger" onClick={() => setConfirmDelete(true)}><Trash2 size={14} />{t("EcosystemWorkflow.delete")}</Button>)}</div>
             </div>
           </section>
+
+          {saveConflict && (
+            <section className="rounded-xl border border-warning/40 bg-warning-soft p-4">
+              <p className="text-xs text-warning">
+                {definition.workflow_id} was changed somewhere else after you loaded it, so this
+                save was refused instead of overwriting it. Your edits are still in the editor.
+                Load the stored version, or save again to publish yours on top of it — both stay in
+                the history either way.
+              </p>
+              <div className="mt-2 flex justify-end gap-2">
+                <Button size="sm" variant="ghost" onClick={() => void reloadStoredDefinition()}>
+                  Load the stored version
+                </Button>
+                <Button size="sm" onClick={() => setShowHistory(true)}>
+                  Compare in history
+                </Button>
+              </div>
+            </section>
+          )}
+
+          {showHistory && exists && (
+            <RevisionHistoryPanel
+              kind={WORKFLOW_KIND}
+              entityId={definition.workflow_id}
+              title={definition.name}
+              onClose={() => setShowHistory(false)}
+              onRestore={(content) => {
+                try {
+                  // Loaded into the editor, not written straight to the store:
+                  // the user still validates and saves it, which is what makes
+                  // the restore a normal, versioned save. The version stays at
+                  // the currently-loaded one so that save lands ABOVE what is
+                  // stored — restoring old content must not also try to move
+                  // the version backwards, which the store would refuse.
+                  const restored = JSON.parse(content) as WorkflowDefinition;
+                  loadDefinition({ ...restored, workflow_version: definition.workflow_version });
+                  setLocalError(null);
+                } catch (error) { setLocalError(errorMessage(error)); }
+              }}
+            />
+          )}
 
           <WorkflowDag definition={definition} selectedNodeId={selectedNodeId} onSelect={setSelectedNodeId} />
 

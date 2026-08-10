@@ -4,12 +4,10 @@
  * convention; see `sdk/widget/chat-widget.js`'s doc comment for what the
  * referenced script actually does).
  *
- * Deliberately never receives a `TokenEntry` — only ever the plaintext the
- * caller already has in hand (freshly minted, or manually pasted by the
- * user) — because Little Monkey never persists or re-reveals a token's
- * plaintext after creation (see `server.rs`'s `TokenEntry::sha256` doc
- * comment). There is no way to "look up" a token's plaintext to embed here,
- * by design. */
+ * Deliberately never receives a stored token record — only the scoped
+ * plaintext returned once by Runtime Hub pairing and manually pasted by
+ * the user. Little Monkey never persists or re-reveals that plaintext, so
+ * there is no token lookup path here by design. */
 export interface WidgetEmbedOptions {
   /** e.g. "http://127.0.0.1:1234/v1" — the same value the Connection
    * section's "Base URL" field shows. */
@@ -52,24 +50,4 @@ export function buildWidgetEmbedSnippet(options: WidgetEmbedOptions): string {
     "</script>",
     '<script src="./chat-widget.js"></script>',
   ].join("\n");
-}
-
-/** Millisecond expiry presets offered by the create-token form's "Expires"
- * select. `"never"` maps to `null` (`TokenEntry::expires_at`'s "never
- * expires" value). */
-export type TokenExpiryPreset = "never" | "1h" | "1d" | "7d" | "30d" | "90d";
-
-const EXPIRY_PRESET_MS: Record<Exclude<TokenExpiryPreset, "never">, number> = {
-  "1h": 60 * 60 * 1000,
-  "1d": 24 * 60 * 60 * 1000,
-  "7d": 7 * 24 * 60 * 60 * 1000,
-  "30d": 30 * 24 * 60 * 60 * 1000,
-  "90d": 90 * 24 * 60 * 60 * 1000,
-};
-
-/** Resolves a preset to an absolute epoch-millisecond `expiresAt`, or `null`
- * for `"never"` — `now` is injectable so this stays deterministic in tests. */
-export function resolveExpiryPreset(preset: TokenExpiryPreset, now: number = Date.now()): number | null {
-  if (preset === "never") return null;
-  return now + EXPIRY_PRESET_MS[preset];
 }

@@ -45,10 +45,11 @@
  */
 import { invoke, isTauri } from "@tauri-apps/api/core";
 
-import { cancelRegisteredRun } from "./runCancellationRegistry";
+import { cancelRegisteredRun, hasRegisteredRun } from "./runCancellationRegistry";
 import { cancelSubagentRun } from "./subagent";
 import { cancelSideTask, pauseSideTask, resumeSideTask } from "./sideTaskRunner";
 import { isPauseRequested, setPauseRequested } from "./pauseRegistry";
+import { resumeFrozenTurn } from "./frozenTurn";
 import { enforceWallBudgets } from "./processWallBudget";
 import { type ProcessKind, type ProcessRecord, pendingProcessSignals } from "./processTable";
 
@@ -268,10 +269,10 @@ export async function deliverProcessSignal(
  *   no intent, so it cannot re-trigger the sweep that called it, and it is a
  *   no-op when the OS state already agrees with the latch.
  */
-function deliverPause(
+async function deliverPause(
   record: ProcessRecord,
   signal: "suspend" | "resume",
-): ProcessSignalDelivery {
+): Promise<ProcessSignalDelivery> {
   switch (record.kind) {
     case "side_task":
       if (signal === "suspend") {
@@ -289,6 +290,12 @@ function deliverPause(
         setPauseRequested(record.externalId, true);
         return "suspended";
       }
+      // No loop behind this row. Clearing a latch nobody holds and reporting
+      // "resumed" is what this arm used to do after a restart, and it was a lie
+      // twice over: nothing continued, and every sweep said it had. A chat turn
+      // frozen at a tool boundary can be re-entered from its image instead —
+      // which is the whole of K13's second half.
+      if (!hasRegisteredRun(record.externalId)) return deliverResumeFromImage(record);
       // Clears the latch and wakes anyone parked on it. The entry itself is
       // dropped by the loop's own teardown (`forgetPause`), which is the only
       // place that knows the turn is actually over — a resume just means keep
@@ -311,6 +318,33 @@ function deliverPause(
       // next level boundary, whichever process wrote it.
       return "delivered-elsewhere";
   }
+}
+
+/**
+ * Resumes a cooperative process whose loop is gone — after a restart, or after
+ * the window that held it closed.
+ *
+ * Only a chat turn has an image to come back from: `checkpoint_freeze_live` is
+ * written by the agent loop's own safe point, and a subagent or crew actor has
+ * no checkpoint of its own to write one into. For those, and for a chat turn
+ * that was suspended before it ever froze, `no-live-target` is the honest
+ * answer — the same one every other kind gives when the thing that would act is
+ * not here.
+ *
+ * Deliberately does **not** clear the latch on a miss. The record keeps reading
+ * as pending and the next sweep tries again, which is what should happen while
+ * another window may still hold the loop; the alternative is one window's miss
+ * silently consuming a resume meant for another's turn.
+ */
+async function deliverResumeFromImage(
+  record: ProcessRecord,
+): Promise<ProcessSignalDelivery> {
+  if (record.kind !== "chat_turn") return "no-live-target";
+  const outcome = await resumeFrozenTurn(record).catch(() => "no-image" as const);
+  // A blocked restore counts as delivered: the refusal and its reasons are in
+  // the transcript, the user has been answered, and re-delivering every two
+  // seconds would append the same refusal forever.
+  return outcome === "no-image" ? "no-live-target" : "resumed";
 }
 
 /**

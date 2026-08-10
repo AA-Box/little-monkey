@@ -82,6 +82,7 @@ import { useSideTaskStore } from "../../store/sideTaskStore";
 import { useMcpStore } from "../../store/mcpStore";
 import { useTerminalStore } from "../../store/terminalStore";
 import { nativeSkillsClient, type NativeSkillDescriptor } from "../../lib/nativeSkillsClient";
+import { useCustomAgentStore } from "../../store/customAgentStore";
 import type { SettingsTab } from "../Settings";
 import { visibleProviderModelsForProvider } from "../../lib/providerModelSelection";
 import { errorMessage } from "../../lib/errors";
@@ -407,6 +408,10 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       ecosystemClient.activePluginSnapshots().catch(() => [] as ActivePluginRuntimeSnapshot[]),
       ecosystemClient.pluginRuntime().catch(() => [] as PluginRuntimeDescriptor[]),
       nativeSkillsClient.discover().catch(() => [] as NativeSkillDescriptor[]),
+      // Custom agent defs ride the same discovery pass (and the same
+      // workspace-change deps) as skills; the store keeps its own state, so
+      // nothing is destructured from this slot.
+      useCustomAgentStore.getState().refresh(),
     ])
       .then(([packageEntries, pluginSnapshots, runtimes, nativeEntries]) => {
         if (!cancelled) {
@@ -1421,6 +1426,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         onRetry={handleRetry}
         onStartSideTask={handleStartSideTask}
         onEditGeneratedImage={handleEditGeneratedImage}
+        onOpenBackgroundTasks={onOpenBackgroundTasks}
       />
 
       {error && (

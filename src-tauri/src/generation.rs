@@ -24,7 +24,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -45,9 +45,22 @@ const MAX_INIT_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 /// LoRAs per generation. The engine accepts an unbounded list; this exists so
 /// one request cannot make the engine open an arbitrary number of files.
 const MAX_LORAS: usize = 32;
+/// Reference images per generation. Each one is decoded and held in memory
+/// beside the others, so the bound is on the whole set rather than only on the
+/// size of any single image.
+const MAX_REF_IMAGES: usize = 8;
 /// A 15 s 2K clip with audio stays far under this; it exists so a runaway
 /// server response can never be buffered without bound.
 const MAX_MEDIA_BYTES: usize = 256 * 1024 * 1024;
+/// Images one request may ask for. The engine samples a batch serially, so a
+/// large count is a long run rather than a parallel one; this keeps a
+/// mistyped number from turning into an hour of sampling.
+const MAX_BATCH_COUNT: u32 = 8;
+/// Layers `llama-tts` is asked to put on the GPU. Speech backbones are around
+/// a billion parameters, so "all of them" fits everywhere the flag does
+/// anything, and llama.cpp clamps the number to the layers a model actually
+/// has rather than erroring on an overshoot.
+const SPEECH_GPU_LAYERS: u32 = 999;
 /// Weights are tens of gigabytes and are read lazily from disk on first use,
 /// so first-token latency after launch is dominated by IO, not compute.
 const READY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -70,10 +83,38 @@ pub enum ComponentSlot {
     /// A large language model used as the text encoder (Qwen3-VL for MiniMax
     /// H3, Qwen2.5-VL for Qwen Image, Mistral for FLUX.2).
     Llm,
+    /// The vision tower beside an [`Self::Llm`] text encoder, for the
+    /// architectures whose LLM reads an image as well as the prompt.
+    LlmVision,
+    /// A second, unconditional diffusion model some distilled architectures
+    /// pair with the main one.
+    UncondDiffusionModel,
+    /// LTXAV's embeddings connectors.
+    EmbeddingsConnectors,
+    /// AnimateDiff's motion module, which is what turns an SD 1.5 checkpoint
+    /// into a video model.
+    MotionModule,
     Vae,
     /// Models that generate synchronized audio decode it through its own VAE.
     AudioVae,
     Taesd,
+    /// Structural conditioning: the run supplies a pre-processed control image
+    /// (a depth map, a pose skeleton, an edge map) and the sampler is held to
+    /// it. Loading this is what makes `control_image` mean anything.
+    ControlNet,
+    /// Reference-image conditioning. `--ip-adapter` requires
+    /// [`Self::ClipVision`] alongside it — see [`validate_model_spec`].
+    IpAdapter,
+    /// Subject identity from reference photographs (PhotoMaker).
+    PhotoMaker,
+    /// Subject identity, the FLUX-family alternative to
+    /// [`Self::PhotoMaker`].
+    PulidWeights,
+    /// The YOLOv8 detector ADetailer re-renders around: faces, hands, whatever
+    /// the model was trained to find. Loaded at launch rather than per run
+    /// because `ad_model_path` is the one ADetailer field the server does not
+    /// read from the request body — the prompts beside it are per run.
+    AdModel,
     /// Speech only: the multimodal projector beside a TTS backbone. Belongs to
     /// a different engine than every slot above it.
     Mmproj,
@@ -95,11 +136,33 @@ impl ComponentSlot {
             Self::ClipVision => "--clip_vision",
             Self::T5xxl => "--t5xxl",
             Self::Llm => "--llm",
+            Self::LlmVision => "--llm_vision",
+            Self::UncondDiffusionModel => "--uncond-diffusion-model",
+            Self::EmbeddingsConnectors => "--embeddings-connectors",
+            Self::MotionModule => "--motion-module",
             Self::Vae => "--vae",
             Self::AudioVae => "--audio-vae",
             Self::Taesd => "--taesd",
+            Self::ControlNet => "--control-net",
+            Self::IpAdapter => "--ip-adapter",
+            Self::PhotoMaker => "--photo-maker",
+            Self::PulidWeights => "--pulid-weights",
+            Self::AdModel => "--ad-model",
             Self::Mmproj => "--mmproj",
             Self::Vocoder => "--model-vocoder",
+        }
+    }
+
+    /// Whether filling this slot enables a per-run conditioning image rather
+    /// than contributing to the model itself. The generation form asks this to
+    /// decide which conditioning inputs to offer, and [`validate_request`] asks
+    /// it to refuse an image the loaded engine would silently discard.
+    pub fn conditioning_image(self) -> Option<ConditioningImage> {
+        match self {
+            Self::ControlNet => Some(ConditioningImage::Control),
+            Self::IpAdapter => Some(ConditioningImage::IpAdapter),
+            Self::PhotoMaker | Self::PulidWeights => Some(ConditioningImage::Reference),
+            _ => None,
         }
     }
 
@@ -109,6 +172,20 @@ impl ComponentSlot {
     pub fn is_speech_only(self) -> bool {
         matches!(self, Self::Mmproj | Self::Vocoder)
     }
+}
+
+/// Which per-run image a loaded conditioning slot unlocks. Named rather than
+/// boolean because the three are not interchangeable: the engine reads them
+/// from three different request fields with three different meanings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditioningImage {
+    /// `control_image`: structure to follow.
+    Control,
+    /// `ip_adapter_image`: style/content to borrow.
+    IpAdapter,
+    /// `ref_images`: subjects to keep consistent.
+    Reference,
 }
 
 /// One downloadable weight file filling one slot.
@@ -159,19 +236,16 @@ impl ModelComponent {
             ComponentSource::HuggingFace { file, .. } => {
                 file.rsplit('/').next().unwrap_or(file.as_str())
             }
-            ComponentSource::LocalFile { path } => path
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(path.as_str()),
+            ComponentSource::LocalFile { path } => {
+                path.rsplit(['/', '\\']).next().unwrap_or(path.as_str())
+            }
         }
     }
 
     /// Where this component actually lives once available.
     pub fn resolved_path(&self, model_root: &Path, model_id: &str) -> PathBuf {
         match &self.source {
-            ComponentSource::HuggingFace { .. } => {
-                model_root.join(model_id).join(self.file_name())
-            }
+            ComponentSource::HuggingFace { .. } => model_root.join(model_id).join(self.file_name()),
             ComponentSource::LocalFile { path } => PathBuf::from(path),
         }
     }
@@ -419,9 +493,7 @@ pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
         })
         .count();
     if denoisers != 1 {
-        return Err(
-            "Exactly one file must be the checkpoint or the diffusion model".to_string(),
-        );
+        return Err("Exactly one file must be the checkpoint or the diffusion model".to_string());
     }
     let mut slots = BTreeSet::new();
     let mut names = BTreeSet::new();
@@ -435,7 +507,10 @@ pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
         // Components land in one flat directory per model, so two files
         // sharing a basename would overwrite each other.
         if !names.insert(component.file_name().to_string()) {
-            return Err(format!("Two files are both named {}", component.file_name()));
+            return Err(format!(
+                "Two files are both named {}",
+                component.file_name()
+            ));
         }
         match &component.source {
             ComponentSource::HuggingFace { repo, file } => {
@@ -459,10 +534,20 @@ pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
     if spec.defaults.fps == 0 || spec.defaults.fps > MAX_FPS {
         return Err(format!("Frame rate must be between 1 and {MAX_FPS}"));
     }
-    if spec.defaults.sample_method.trim().is_empty()
-        || spec.defaults.sample_method.len() > 64
-    {
+    if spec.defaults.sample_method.trim().is_empty() || spec.defaults.sample_method.len() > 64 {
         return Err("A model needs a sampling method".to_string());
+    }
+    // The engine's own constraint: an IP-Adapter reads its reference image
+    // through a CLIP vision tower, and `--ip-adapter` without `--clip_vision`
+    // fails inside `sd-server` at load. Caught here so the model is rejected
+    // while it is being added rather than the first time it is run.
+    let slots: BTreeSet<ComponentSlot> = spec
+        .components
+        .iter()
+        .map(|component| component.slot)
+        .collect();
+    if slots.contains(&ComponentSlot::IpAdapter) && !slots.contains(&ComponentSlot::ClipVision) {
+        return Err("An IP-Adapter also needs a CLIP vision encoder".to_string());
     }
     for argument in &spec.extra_launch_args {
         if argument.trim().is_empty() || argument.len() > 256 {
@@ -538,7 +623,15 @@ pub fn speech_args(
     request: &GenerationRequest,
     output: &Path,
 ) -> Result<Vec<String>, String> {
-    let mut args = Vec::new();
+    // `llama-tts` is llama.cpp, and llama.cpp offloads nothing unless asked.
+    // The macOS arm64 archive this app pins ships `libggml-metal.dylib`, so
+    // without this speech synthesizes on the CPU of a machine holding a GPU
+    // that already has the weights' worth of unified memory. A build with no
+    // GPU backend parses the flag and ignores it, so this is safe on every
+    // target rather than gated to one. `extra_launch_args` is appended after,
+    // and llama.cpp takes the last occurrence of a flag, so a model that wants
+    // a different split — or none — still sets one.
+    let mut args = vec!["-ngl".to_string(), SPEECH_GPU_LAYERS.to_string()];
     for component in &spec.components {
         if !component.slot.is_speech_only() && component.slot != ComponentSlot::Checkpoint {
             continue;
@@ -672,6 +765,12 @@ pub struct GenerationRequest {
     pub hires: Option<HiresSettings>,
     /// Negative asks the backend for a random seed.
     pub seed: i64,
+    /// How many images to sample from this one prompt. Image tasks only:
+    /// video and speech produce one artifact per run by construction. Each
+    /// image after the first uses the next seed, so a pinned seed still
+    /// yields a varied batch rather than the same picture N times.
+    #[serde(default = "default_batch_count")]
+    pub batch_count: u32,
     #[serde(default)]
     pub video_frames: u32,
     #[serde(default)]
@@ -685,6 +784,43 @@ pub struct GenerationRequest {
     /// Base64 PNG/JPEG starting frame, required by the image-driven tasks.
     #[serde(default)]
     pub init_image_base64: Option<String>,
+    /// Base64 single-channel mask over [`Self::init_image_base64`]: white is
+    /// repainted, black is kept. This is inpainting — it is meaningless without
+    /// an init image to mask, and [`validate_request`] enforces that rather
+    /// than letting the engine silently ignore it.
+    #[serde(default)]
+    pub mask_image_base64: Option<String>,
+    /// What ADetailer paints into each region its detector found. Empty
+    /// inherits the main prompt, which is the engine's own default, so this is
+    /// sent only when the user wrote something different.
+    #[serde(default)]
+    pub ad_prompt: Option<String>,
+    /// The negative prompt for those same regions. Inherits the main one when
+    /// absent, exactly as `ad_prompt` does.
+    #[serde(default)]
+    pub ad_negative_prompt: Option<String>,
+    /// Base64 *pre-processed* control image — a depth map, a pose skeleton, a
+    /// Canny edge map. Not a photograph: the engine applies no detector, so
+    /// whatever is sent is taken as the structure to follow verbatim.
+    #[serde(default)]
+    pub control_image_base64: Option<String>,
+    /// How strongly the control image binds. `None` leaves the engine default.
+    #[serde(default)]
+    pub control_strength: Option<f64>,
+    /// Base64 reference image whose style/content is borrowed.
+    #[serde(default)]
+    pub ip_adapter_image_base64: Option<String>,
+    /// How strongly the IP-Adapter image applies. `None` leaves the default.
+    #[serde(default)]
+    pub ip_adapter_strength: Option<f64>,
+    /// Base64 reference images for the identity- and edit-conditioned
+    /// architectures (PhotoMaker, PuLID, Kontext, Qwen-Edit).
+    #[serde(default)]
+    pub ref_images_base64: Vec<String>,
+    /// Whether each reference image gets its own index rather than sharing
+    /// one. Architecture-specific; the engine's own default is `false`.
+    #[serde(default)]
+    pub increase_ref_index: bool,
     /// LoRAs to apply, in order. Any model can take any number.
     #[serde(default)]
     pub loras: Vec<LoraSelection>,
@@ -746,7 +882,11 @@ pub fn apply_component_overrides(
             .iter()
             .find(|entry| entry.slot == choice.slot && entry.path == choice.path)
             .ok_or_else(|| {
-                format!("{} is not a {} in your library", choice.path, choice.slot.flag())
+                format!(
+                    "{} is not a {} in your library",
+                    choice.path,
+                    choice.slot.flag()
+                )
             })?;
         // A denoiser is what the model *is*; replacing it from a per-run
         // dropdown would silently make this a different model.
@@ -778,10 +918,83 @@ pub fn apply_component_overrides(
     Ok(effective)
 }
 
+/// Refuses a conditioning image the loaded engine has no weights to read it
+/// with.
+///
+/// Separate from [`validate_request`] because it is the only check that needs
+/// the *effective* spec: a ControlNet can arrive from the model entry or from a
+/// per-run component override, and overrides are resolved after the request is
+/// validated. Called by the run command once both are known.
+///
+/// This matters more than a normal input check. `sd-server` accepts
+/// `control_image` whether or not `--control-net` was passed and simply ignores
+/// it when it was not, so the failure is a perfectly ordinary-looking image
+/// that took three minutes to sample and followed none of the structure it was
+/// given — with nothing anywhere saying why.
+pub fn validate_conditioning(
+    spec: &GenerationModelSpec,
+    request: &GenerationRequest,
+) -> Result<(), String> {
+    let available: BTreeSet<ConditioningImage> = spec
+        .components
+        .iter()
+        .filter_map(|component| component.slot.conditioning_image())
+        .collect();
+    let required = [
+        (
+            request.control_image_base64.is_some(),
+            ConditioningImage::Control,
+            "a control image",
+            "ControlNet",
+        ),
+        (
+            request.ip_adapter_image_base64.is_some(),
+            ConditioningImage::IpAdapter,
+            "a reference image",
+            "IP-Adapter",
+        ),
+        (
+            !request.ref_images_base64.is_empty(),
+            ConditioningImage::Reference,
+            "reference images",
+            "PhotoMaker or PuLID",
+        ),
+    ];
+    for (sent, kind, what, weights) in required {
+        if sent && !available.contains(&kind) {
+            return Err(format!(
+                "{} has no {weights} weights, so {what} would be ignored. Add one to the model or pick one for this run.",
+                spec.name
+            ));
+        }
+    }
+    // ADetailer fails the same silent way, but is not a conditioning *image* so
+    // it cannot ride the table above: its prompts are request fields while the
+    // detector they need is a launch flag, and an engine started without
+    // `--ad-model` has nothing to detect with and drops the prompts.
+    if (request.ad_prompt.is_some() || request.ad_negative_prompt.is_some())
+        && !spec
+            .components
+            .iter()
+            .any(|component| component.slot == ComponentSlot::AdModel)
+    {
+        return Err(format!(
+            "{} has no ADetailer detector, so its prompt would be ignored. Add one to the model or pick one for this run.",
+            spec.name
+        ));
+    }
+    Ok(())
+}
+
 /// `-1` means "whatever the model was trained with", which is the only sane
 /// default for a setting most models do not want changed.
 fn default_clip_skip() -> i32 {
     -1
+}
+
+/// One image, matching every request written before batching existed.
+fn default_batch_count() -> u32 {
+    1
 }
 
 /// Rejects a request that is out of bounds, and returns it with dimensions and
@@ -823,7 +1036,13 @@ pub fn validate_request(
         normalized.height = 0;
         normalized.video_frames = 1;
         normalized.fps = 1;
+        normalized.batch_count = 1;
         return Ok(normalized);
+    }
+    if !(1..=MAX_BATCH_COUNT).contains(&request.batch_count) {
+        return Err(format!(
+            "Batch size must be between 1 and {MAX_BATCH_COUNT}"
+        ));
     }
     if request.sample_method.len() > 64 || request.scheduler.len() > 64 {
         return Err("Sampler name is too long".to_string());
@@ -848,8 +1067,7 @@ pub fn validate_request(
         if hires.steps > MAX_STEPS {
             return Err(format!("Upscale steps may not exceed {MAX_STEPS}"));
         }
-        if !hires.denoising_strength.is_finite()
-            || !(0.0..=1.0).contains(&hires.denoising_strength)
+        if !hires.denoising_strength.is_finite() || !(0.0..=1.0).contains(&hires.denoising_strength)
         {
             return Err("Upscale denoising strength must be between 0 and 1".to_string());
         }
@@ -884,6 +1102,49 @@ pub fn validate_request(
         _ => {}
     }
 
+    // A mask names which pixels of the source image to repaint, so without one
+    // there is nothing for it to address. The engine would take the pair and
+    // ignore the mask, which reads as "inpainting is broken" rather than as the
+    // request being incomplete.
+    if request.mask_image_base64.is_some() && request.init_image_base64.is_none() {
+        return Err("A mask needs a source image to paint over".to_string());
+    }
+    for (label, image) in [
+        ("Mask", &request.mask_image_base64),
+        ("Control image", &request.control_image_base64),
+        ("Reference image", &request.ip_adapter_image_base64),
+    ] {
+        if image
+            .as_ref()
+            .is_some_and(|encoded| encoded.len() > MAX_INIT_IMAGE_BYTES)
+        {
+            return Err(format!("{label} exceeds its size limit"));
+        }
+    }
+    if request.ref_images_base64.len() > MAX_REF_IMAGES {
+        return Err(format!(
+            "At most {MAX_REF_IMAGES} reference images can be used at once"
+        ));
+    }
+    for image in &request.ref_images_base64 {
+        if image.trim().is_empty() {
+            return Err("A reference image is empty".to_string());
+        }
+        if image.len() > MAX_INIT_IMAGE_BYTES {
+            return Err("Reference image exceeds its size limit".to_string());
+        }
+    }
+    for (label, strength) in [
+        ("Control strength", request.control_strength),
+        ("Reference strength", request.ip_adapter_strength),
+    ] {
+        if let Some(strength) = strength {
+            if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+                return Err(format!("{label} must be between 0 and 1"));
+            }
+        }
+    }
+
     if request.loras.len() > MAX_LORAS {
         return Err(format!("At most {MAX_LORAS} LoRAs can be applied at once"));
     }
@@ -908,6 +1169,10 @@ pub fn validate_request(
         if fps > MAX_FPS {
             return Err(format!("Frame rate may not exceed {MAX_FPS}"));
         }
+        // A clip is one artifact per run: the engine's batch field counts
+        // images, and asking a video job for eight of them would multiply the
+        // longest run in the app by eight without the UI ever offering it.
+        normalized.batch_count = 1;
         normalized.fps = fps;
         normalized.video_frames = normalize_video_frames(
             spec.defaults.frame_grid,
@@ -987,12 +1252,45 @@ pub fn request_body(spec: &GenerationModelSpec, request: &GenerationRequest) -> 
     if let Some(image) = &request.init_image_base64 {
         body["init_image"] = json!(image);
     }
+    if let Some(mask) = &request.mask_image_base64 {
+        body["mask_image"] = json!(mask);
+    }
+    if let Some(prompt) = &request.ad_prompt {
+        body["ad_prompt"] = json!(prompt);
+    }
+    if let Some(prompt) = &request.ad_negative_prompt {
+        body["ad_negative_prompt"] = json!(prompt);
+    }
+    if let Some(control) = &request.control_image_base64 {
+        body["control_image"] = json!(control);
+    }
+    if let Some(strength) = request.control_strength {
+        body["control_strength"] = json!(strength);
+    }
+    if let Some(reference) = &request.ip_adapter_image_base64 {
+        body["ip_adapter_image"] = json!(reference);
+    }
+    if let Some(strength) = request.ip_adapter_strength {
+        body["ip_adapter_strength"] = json!(strength);
+    }
+    if !request.ref_images_base64.is_empty() {
+        body["ref_images"] = json!(request.ref_images_base64);
+        // Only sent alongside the images it describes: on its own it would ask
+        // an engine build that predates the field for something new on every
+        // ordinary run.
+        body["increase_ref_index"] = json!(request.increase_ref_index);
+    }
     if request.task.is_video() {
         body["video_frames"] = json!(request.video_frames);
         body["fps"] = json!(request.fps);
         body["output_format"] = json!("webm");
     } else {
         body["output_format"] = json!("png");
+        // Sent only when it is more than the default, so an engine build that
+        // predates the field is asked nothing new for the ordinary run.
+        if request.batch_count > 1 {
+            body["batch_count"] = json!(request.batch_count);
+        }
     }
     body
 }
@@ -1010,8 +1308,12 @@ pub struct GeneratedMedia {
 /// the UI can distinguish "waiting behind another job" from "sampling".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobProgress {
-    Running { queue_position: u32 },
-    Completed(Box<GeneratedMedia>),
+    Running {
+        queue_position: u32,
+    },
+    /// Every artifact the job produced, in the engine's own order. One for a
+    /// clip or a single image; `batch_count` of them for a batch.
+    Completed(Vec<GeneratedMedia>),
     Failed(String),
     Cancelled,
 }
@@ -1050,7 +1352,9 @@ pub fn decode_job_status(value: &Value) -> Result<JobProgress, String> {
         }),
         "cancelled" => Ok(JobProgress::Cancelled),
         "failed" => Ok(JobProgress::Failed(
-            engine_error_text(value).unwrap_or("Generation failed").to_string(),
+            engine_error_text(value)
+                .unwrap_or("Generation failed")
+                .to_string(),
         )),
         "completed" => {
             let result = value
@@ -1061,41 +1365,69 @@ pub fn decode_job_status(value: &Value) -> Result<JobProgress, String> {
             // for the batch; `vid_gen` yields one encoded container inline with
             // its own `mime_type`. Read whichever is present rather than
             // assuming a mode from the caller.
-            let encoded = result
-                .pointer("/images/0/b64_json")
-                .or_else(|| result.get("b64_json"))
+            //
+            // The list is read whole. A batch of four comes back as four
+            // entries in it, and taking only the first would spend the whole
+            // run and then throw three quarters of it away.
+            let media_type = result
+                .get("mime_type")
                 .and_then(Value::as_str)
-                .ok_or("Generation result carried no payload")?;
-            // Reject before decoding: base64 is 4/3 the size of its payload, so
-            // this bounds the allocation rather than discovering it afterwards.
-            if encoded.len() / 4 * 3 > MAX_MEDIA_BYTES {
-                return Err("Generated media exceeds its size limit".to_string());
-            }
-            let bytes = STANDARD
-                .decode(encoded)
-                .map_err(|_| "Generation result is not valid base64".to_string())?;
-            if bytes.is_empty() {
-                return Err("Generated media is empty".to_string());
-            }
-            Ok(JobProgress::Completed(Box::new(GeneratedMedia {
-                media_type: result
-                    .get("mime_type")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| {
-                        result
-                            .get("output_format")
+                .map(str::to_string)
+                .or_else(|| {
+                    result
+                        .get("output_format")
+                        .and_then(Value::as_str)
+                        .map(media_type_for_format)
+                })
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let frame_count = result
+                .get("frame_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(1) as u32;
+            let fps = result.get("fps").and_then(Value::as_u64).unwrap_or(1) as u32;
+
+            let encoded: Vec<&str> = match result.get("images").and_then(Value::as_array) {
+                Some(images) => images
+                    .iter()
+                    .map(|image| {
+                        image
+                            .get("b64_json")
                             .and_then(Value::as_str)
-                            .map(media_type_for_format)
+                            .ok_or("A generated image carried no payload")
                     })
-                    .unwrap_or_else(|| "application/octet-stream".to_string()),
-                frame_count: result
-                    .get("frame_count")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1) as u32,
-                fps: result.get("fps").and_then(Value::as_u64).unwrap_or(1) as u32,
-                bytes,
-            })))
+                    .collect::<Result<_, _>>()?,
+                None => vec![result
+                    .get("b64_json")
+                    .and_then(Value::as_str)
+                    .ok_or("Generation result carried no payload")?],
+            };
+            if encoded.is_empty() {
+                return Err("Generation result carried no payload".to_string());
+            }
+            let media = encoded
+                .into_iter()
+                .map(|encoded| {
+                    // Reject before decoding: base64 is 4/3 the size of its
+                    // payload, so this bounds the allocation rather than
+                    // discovering it afterwards.
+                    if encoded.len() / 4 * 3 > MAX_MEDIA_BYTES {
+                        return Err("Generated media exceeds its size limit".to_string());
+                    }
+                    let bytes = STANDARD
+                        .decode(encoded)
+                        .map_err(|_| "Generation result is not valid base64".to_string())?;
+                    if bytes.is_empty() {
+                        return Err("Generated media is empty".to_string());
+                    }
+                    Ok(GeneratedMedia {
+                        media_type: media_type.clone(),
+                        frame_count,
+                        fps,
+                        bytes,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(JobProgress::Completed(media))
         }
         other => Err(format!("Unknown generation job status {other}")),
     }
@@ -1207,13 +1539,17 @@ fn drain_engine_output(
             let text = String::from_utf8_lossy(line).to_string();
             line.clear();
             if let Some(progress) = parse_sampling_progress(&text) {
-                let Ok(mut cell) = sampling.lock() else { return false };
+                let Ok(mut cell) = sampling.lock() else {
+                    return false;
+                };
                 *cell = Some(progress);
                 // A redrawn bar is noise in a failure message; the tail is for
                 // the lines a person reads.
                 return true;
             }
-            let Ok(mut buffer) = tail.lock() else { return false };
+            let Ok(mut buffer) = tail.lock() else {
+                return false;
+            };
             buffer.push_str(text.trim_end());
             buffer.push('\n');
             if buffer.len() > MAX_STDERR_TAIL {
@@ -1265,6 +1601,12 @@ struct EngineProcess {
     /// The command line it was launched with, port aside. Reuse is keyed on
     /// this, so an edited model gets a fresh engine.
     signature: Option<Vec<String>>,
+    /// Whether this instance has answered once, so it is serving rather than
+    /// still loading weights. Anything that only *reads* from the engine has to
+    /// wait for this: a probe abandoned mid-load leaves its handler thread
+    /// blocked, which is what `ensure_ready` waits out its whole deadline on one
+    /// request to avoid.
+    ready: bool,
     /// Tail of the engine's stderr, drained by a reader thread so the pipe can
     /// never fill and block the child.
     stderr_tail: Option<Arc<Mutex<String>>>,
@@ -1274,7 +1616,10 @@ struct EngineProcess {
 
 impl GenerationEngineState {
     pub fn loaded_model(&self) -> Option<String> {
-        self.inner.lock().ok().and_then(|state| state.model_id.clone())
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|state| state.model_id.clone())
     }
 
     /// Where the running instance is listening, if one is.
@@ -1282,6 +1627,21 @@ impl GenerationEngineState {
         self.inner
             .lock()
             .ok()
+            .and_then(|state| state.port)
+            .map(|port| format!("http://127.0.0.1:{port}"))
+    }
+
+    /// [`base_url`](Self::base_url), but only once the engine has answered.
+    ///
+    /// For callers that merely ask the engine something rather than driving a
+    /// run: an instance that is still loading a 20 GB model accepts the
+    /// connection and holds it, so probing it with a short deadline burns a
+    /// worker thread for nothing.
+    pub fn ready_base_url(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .ok()
+            .filter(|state| state.ready)
             .and_then(|state| state.port)
             .map(|port| format!("http://127.0.0.1:{port}"))
     }
@@ -1319,6 +1679,7 @@ impl GenerationEngineState {
         state.model_id = None;
         state.signature = None;
         state.port = None;
+        state.ready = false;
         // Keep the tail: `ensure_ready` stops a failed launch before reporting,
         // and dropping it here would throw away the only useful diagnosis.
         Ok(())
@@ -1344,7 +1705,11 @@ impl GenerationEngineState {
         let detail = state
             .stderr_tail
             .as_ref()
-            .and_then(|tail| tail.lock().ok().map(|value| engine_failure_detail(value.trim())))
+            .and_then(|tail| {
+                tail.lock()
+                    .ok()
+                    .map(|value| engine_failure_detail(value.trim()))
+            })
             .filter(|value| !value.is_empty());
         Ok(Some(match detail {
             Some(detail) => format!("{outcome}:\n{detail}"),
@@ -1432,11 +1797,18 @@ impl GenerationEngineState {
                 self.stop()?;
                 return Err(failure);
             }
-            if let Ok(response) = client
-                .get(&capabilities)
-                .timeout(Duration::from_secs(2))
-                .send()
-                .await
+            // Wait out the whole deadline on one probe rather than abandoning a
+            // short one every half second. `sd-server` answers `/capabilities`
+            // from its worker pool, and a big model warms up for a minute or
+            // more before the first answer comes back — every probe we give up
+            // on leaves its handler thread blocked, so a 2s timeout drains the
+            // pool in seconds and the engine can never answer at all. A dead
+            // child drops the connection, so this still fails fast.
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_secs(1));
+            if let Ok(response) =
+                crate::egress::send(client.get(&capabilities).timeout(remaining)).await
             {
                 // A foreign service could answer on this port while our child
                 // is losing the bind. Prove the child is still alive after the
@@ -1459,6 +1831,11 @@ impl GenerationEngineState {
                     if let Some(failure) = self.child_exited()? {
                         self.stop()?;
                         return Err(failure);
+                    }
+                    // It has answered once, so everything else may now ask it
+                    // things without waiting out a load it cannot see.
+                    if let Ok(mut state) = self.inner.lock() {
+                        state.ready = true;
                     }
                     return Ok(base_url);
                 }
@@ -1498,12 +1875,13 @@ pub async fn submit_job(
     spec: &GenerationModelSpec,
     request: &GenerationRequest,
 ) -> Result<String, String> {
-    let response = client
-        .post(format!("{base_url}{}", request.task.endpoint()))
-        .json(&request_body(spec, request))
-        .send()
-        .await
-        .map_err(|error| format!("Submit generation job: {error}"))?;
+    let response = crate::egress::send(
+        client
+            .post(format!("{base_url}{}", request.task.endpoint()))
+            .json(&request_body(spec, request)),
+    )
+    .await
+    .map_err(|error| format!("Submit generation job: {error}"))?;
     let status = response.status();
     let body: Value = response
         .json()
@@ -1526,9 +1904,7 @@ pub async fn poll_job(
     base_url: &str,
     job_id: &str,
 ) -> Result<JobProgress, String> {
-    let response = client
-        .get(format!("{base_url}/sdcpp/v1/jobs/{job_id}"))
-        .send()
+    let response = crate::egress::send(client.get(format!("{base_url}/sdcpp/v1/jobs/{job_id}")))
         .await
         .map_err(|error| format!("Poll generation job: {error}"))?;
     if !response.status().is_success() {
@@ -1545,12 +1921,377 @@ pub async fn poll_job(
 }
 
 pub async fn cancel_job(client: &reqwest::Client, base_url: &str, job_id: &str) -> bool {
-    client
-        .post(format!("{base_url}/sdcpp/v1/jobs/{job_id}/cancel"))
-        .send()
+    crate::egress::send(client.post(format!("{base_url}/sdcpp/v1/jobs/{job_id}/cancel")))
         .await
         .map(|response| response.status().is_success())
         .unwrap_or(false)
+}
+
+/// What the engine that is running right now says it can do.
+///
+/// Every field here used to be a list compiled into the frontend, which meant a
+/// new stable-diffusion.cpp release was unusable until somebody edited an array
+/// by hand. The engine builds all of them from its own enums —
+/// `sd_sample_method_name` over `SAMPLE_METHOD_COUNT`, `sd_scheduler_name` over
+/// `SCHEDULER_COUNT`, the upscaler directory rescanned per call — so asking it
+/// is the only way to be right about the build that is actually loaded.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EngineCapabilities {
+    pub samplers: Vec<String>,
+    /// Includes the `normal` alias the engine reports beside `discrete`.
+    pub schedulers: Vec<String>,
+    /// Built-ins plus whatever models were found in `--hires-upscalers-dir`.
+    pub upscalers: Vec<String>,
+    /// The feature flags for the mode this engine is in, verbatim:
+    /// `init_image`, `mask_image`, `control_image`, `ip_adapter_image`,
+    /// `ref_images`, `lora`, `vae_tiling`, `hires`, `cache`, `cancel_queued`,
+    /// `cancel_generating`. Not an enum, because a build newer than this one
+    /// naming a flag we have never heard of should still reach the UI.
+    pub features: BTreeMap<String, bool>,
+}
+
+/// Reads `[{"name": ...}, ...]`, which is how the engine reports its upscalers
+/// and LoRAs — unlike samplers and schedulers, which are bare strings.
+fn named_entries(body: &Value, key: &str) -> Vec<String> {
+    body.get(key)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn string_entries(body: &Value, key: &str) -> Vec<String> {
+    body.get(key)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn decode_capabilities(body: &Value) -> EngineCapabilities {
+    EngineCapabilities {
+        samplers: string_entries(body, "samplers"),
+        schedulers: string_entries(body, "schedulers"),
+        upscalers: named_entries(body, "upscalers"),
+        features: body
+            .get("features")
+            .and_then(Value::as_object)
+            .map(|flags| {
+                flags
+                    .iter()
+                    .filter_map(|(name, value)| value.as_bool().map(|flag| (name.clone(), flag)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Asks the running engine what it supports.
+///
+/// The same endpoint `ensure_ready` polls to decide the engine is up, so a
+/// successful answer here means the server is serving and holding weights.
+pub async fn fetch_capabilities(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<EngineCapabilities, String> {
+    let response = crate::egress::send(client.get(format!("{base_url}/sdcpp/v1/capabilities")))
+        .await
+        .map_err(|error| format!("Read engine capabilities: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Generation engine returned {} for its capabilities",
+            response.status()
+        ));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("Generation engine returned unreadable capabilities: {error}"))?;
+    Ok(decode_capabilities(&body))
+}
+
+// ---------------------------------------------------------------------------
+// Remote backends
+// ---------------------------------------------------------------------------
+//
+// The managed `sd-server` above runs weight files the app itself downloaded and
+// verified, which is why every model there is a set of component slots. Two
+// other engines generate images without any of that machinery, and neither can
+// be bundled: ComfyUI is a Python process the user installs and GPL-3.0, and a
+// hosted OpenAI-compatible endpoint has no local weights at all. Both are
+// reached over HTTP at arm's length — nothing is linked and nothing is shipped,
+// so this app's MIT license is unaffected.
+//
+// A remote backend is deliberately *not* a [`GenerationModelSpec`]: it has no
+// components to validate, nothing to download, and no launch line. It is a
+// destination plus the model names that destination serves.
+
+/// How a remote backend is spoken to. The two protocols share nothing beyond
+/// "POST a prompt, get an image back".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteBackendKind {
+    /// A ComfyUI server. Generation is a workflow graph the user supplies;
+    /// the app substitutes prompt and canvas into it and never authors nodes.
+    ComfyUi,
+    /// `POST /images/generations` with the key already in the OS keychain.
+    OpenAiCompatible,
+}
+
+/// The `model_id` prefix that routes a run away from the managed engine.
+///
+/// Remote entries share the model picker with library models, so they share the
+/// id space too. A prefix keeps one field doing one job — a request either
+/// names a library model or names a backend and one of its models — instead of
+/// adding a mode flag that every other field then has to be read against.
+pub const REMOTE_MODEL_PREFIX: &str = "remote:";
+
+/// Builds the picker id for one model on one backend.
+pub fn remote_model_id(backend_id: &str, model: &str) -> String {
+    format!("{REMOTE_MODEL_PREFIX}{backend_id}:{model}")
+}
+
+/// Splits a [`remote_model_id`] back into its parts.
+///
+/// The model name is the remainder after the *first* separator, not up to the
+/// last one: hosted model names contain colons (`black-forest-labs/flux:1.1`),
+/// and splitting from the right would silently address a different model.
+pub fn parse_remote_model_id(model_id: &str) -> Option<(&str, &str)> {
+    let rest = model_id.strip_prefix(REMOTE_MODEL_PREFIX)?;
+    let (backend_id, model) = rest.split_once(':')?;
+    if backend_id.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some((backend_id, model))
+}
+
+/// One user-registered remote generation endpoint.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteBackend {
+    pub id: String,
+    pub label: String,
+    pub kind: RemoteBackendKind,
+    /// Base URL of the ComfyUI server, or of the OpenAI-compatible API. Empty
+    /// on an OpenAI-compatible backend falls back to the provider's own base.
+    pub base_url: String,
+    /// Which saved provider key to authenticate with. OpenAI-compatible only.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// The ComfyUI API-format workflow, with `{{prompt}}`-style placeholders.
+    #[serde(default)]
+    pub workflow_template: Option<Value>,
+    /// Whether this endpoint accepts an init image on `/images/edits`.
+    #[serde(default)]
+    pub supports_editing: bool,
+    /// Model names to offer in the picker. A ComfyUI workflow names its own
+    /// checkpoint, so one placeholder entry is enough there.
+    pub models: Vec<String>,
+}
+
+impl RemoteBackend {
+    /// The tasks this backend can be asked for.
+    ///
+    /// Video and speech are absent on purpose: a ComfyUI graph *can* produce
+    /// video, but which node does and how to read it back is workflow-specific
+    /// and cannot be inferred from a template the app did not author.
+    pub fn tasks(&self) -> Vec<GenerationTask> {
+        match self.kind {
+            RemoteBackendKind::ComfyUi => vec![GenerationTask::TextToImage],
+            RemoteBackendKind::OpenAiCompatible if self.supports_editing => {
+                vec![GenerationTask::TextToImage, GenerationTask::ImageToImage]
+            }
+            RemoteBackendKind::OpenAiCompatible => vec![GenerationTask::TextToImage],
+        }
+    }
+}
+
+pub fn validate_remote_backend(backend: &RemoteBackend) -> Result<(), String> {
+    if backend.id.trim().is_empty() || backend.id.len() > 64 {
+        return Err("A backend needs an id of at most 64 characters".to_string());
+    }
+    // The id is half of a `remote:<id>:<model>` picker id, so a colon in it
+    // would make that id parse back to a different backend than it names.
+    if backend
+        .id
+        .contains(|c: char| c == ':' || c == '/' || c.is_whitespace())
+    {
+        return Err("A backend id may not contain colons, slashes or spaces".to_string());
+    }
+    if backend.label.trim().is_empty() || backend.label.len() > 120 {
+        return Err("A backend needs a label of at most 120 characters".to_string());
+    }
+    if backend.models.is_empty() {
+        return Err("List at least one model this backend serves".to_string());
+    }
+    if backend.models.len() > 64 {
+        return Err("At most 64 models can be listed for one backend".to_string());
+    }
+    for model in &backend.models {
+        if model.trim().is_empty() || model.len() > 200 {
+            return Err("Each model name must be 1 to 200 characters".to_string());
+        }
+    }
+    match backend.kind {
+        RemoteBackendKind::ComfyUi => {
+            if backend.workflow_template.is_none() {
+                return Err("A ComfyUI backend needs an API-format workflow".to_string());
+            }
+            if backend.base_url.trim().is_empty() {
+                return Err("A ComfyUI backend needs a base URL".to_string());
+            }
+        }
+        RemoteBackendKind::OpenAiCompatible => {
+            if backend
+                .provider_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+            {
+                return Err(
+                    "An OpenAI-compatible backend needs the provider whose key it uses".to_string(),
+                );
+            }
+        }
+    }
+    if !backend.base_url.trim().is_empty() {
+        let url = backend.base_url.trim();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err("A backend base URL must start with http:// or https://".to_string());
+        }
+        if url.len() > 400 {
+            return Err("Backend base URL is too long".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// The remote counterpart of [`validate_request`].
+///
+/// It cannot reuse that function: every bound there is read off a
+/// [`GenerationModelSpec`] — supported tasks, default sampler, frame grid — and
+/// a remote backend has none of those. What is shared is the part that protects
+/// the *caller* rather than the engine, so those bounds are repeated here
+/// rather than relaxed.
+pub fn validate_remote_request(
+    backend: &RemoteBackend,
+    request: &GenerationRequest,
+) -> Result<GenerationRequest, String> {
+    if !backend.tasks().contains(&request.task) {
+        return Err(format!("{} does not support this task", backend.label));
+    }
+    if request.prompt.trim().is_empty() {
+        return Err("A prompt is required".to_string());
+    }
+    if request.prompt.len() > MAX_PROMPT_BYTES || request.negative_prompt.len() > MAX_PROMPT_BYTES {
+        return Err("Prompt exceeds its size limit".to_string());
+    }
+    if request.steps == 0 || request.steps > MAX_STEPS {
+        return Err(format!("Steps must be between 1 and {MAX_STEPS}"));
+    }
+    if !request.cfg_scale.is_finite() || !(0.0..=100.0).contains(&request.cfg_scale) {
+        return Err("Guidance scale is out of range".to_string());
+    }
+    if request.width > MAX_DIMENSION || request.height > MAX_DIMENSION {
+        return Err(format!("Canvas may not exceed {MAX_DIMENSION} px"));
+    }
+    match (request.task.needs_init_image(), &request.init_image_base64) {
+        (true, None) => return Err("This task requires a source image".to_string()),
+        (_, Some(encoded)) if encoded.len() > MAX_INIT_IMAGE_BYTES => {
+            return Err("Source image exceeds its size limit".to_string())
+        }
+        _ => {}
+    }
+
+    let mut normalized = request.clone();
+    normalized.width = normalize_dimension(request.width);
+    normalized.height = normalize_dimension(request.height);
+    normalized.fps = 1;
+    normalized.video_frames = 1;
+    // Nothing below reaches a remote engine: LoRAs are local files, component
+    // overrides name local weight slots, hires is an `sd-server` pass, and the
+    // conditioning images are `sd-server` request fields that neither the
+    // ComfyUI workflow encoder nor the OpenAI-compatible one emits. They are
+    // dropped rather than rejected so switching the picker from a library model
+    // to a backend does not invalidate the controls already set — but they are
+    // dropped *here*, so a run can never appear to be conditioned by an image
+    // the backend was never sent.
+    normalized.loras.clear();
+    normalized.component_overrides.clear();
+    normalized.hires = None;
+    normalized.mask_image_base64 = None;
+    normalized.ad_prompt = None;
+    normalized.ad_negative_prompt = None;
+    normalized.control_image_base64 = None;
+    normalized.control_strength = None;
+    normalized.ip_adapter_image_base64 = None;
+    normalized.ip_adapter_strength = None;
+    normalized.ref_images_base64.clear();
+    normalized.increase_ref_index = false;
+    Ok(normalized)
+}
+
+/// Substitutes generation parameters into a ComfyUI workflow template.
+///
+/// Every string leaf is scanned, so a placeholder works wherever the user put
+/// it — the app has no idea which node in *their* graph is the sampler.
+///
+/// A leaf that is *only* a placeholder is replaced by a typed value, not by
+/// text: ComfyUI validates `steps` and `width` as numbers and rejects the graph
+/// outright if they arrive quoted. A placeholder embedded in a longer string
+/// (`"masterpiece, {{prompt}}"`) can only be text, so it is spliced instead.
+pub fn replace_workflow_placeholders(value: &mut Value, request: &GenerationRequest, model: &str) {
+    match value {
+        Value::String(text) => {
+            *value = match text.as_str() {
+                "{{prompt}}" => Value::String(request.prompt.clone()),
+                "{{negative_prompt}}" => Value::String(request.negative_prompt.clone()),
+                "{{model}}" => Value::String(model.to_string()),
+                "{{width}}" => Value::from(request.width),
+                "{{height}}" => Value::from(request.height),
+                "{{steps}}" => Value::from(request.steps),
+                "{{cfg_scale}}" => Value::from(request.cfg_scale),
+                "{{seed}}" => Value::from(request.seed),
+                _ => {
+                    if !text.contains("{{") {
+                        return;
+                    }
+                    Value::String(
+                        text.replace("{{prompt}}", &request.prompt)
+                            .replace("{{negative_prompt}}", &request.negative_prompt)
+                            .replace("{{model}}", model)
+                            .replace("{{width}}", &request.width.to_string())
+                            .replace("{{height}}", &request.height.to_string())
+                            .replace("{{steps}}", &request.steps.to_string())
+                            .replace("{{cfg_scale}}", &request.cfg_scale.to_string())
+                            .replace("{{seed}}", &request.seed.to_string()),
+                    )
+                }
+            };
+        }
+        Value::Array(items) => {
+            for item in items {
+                replace_workflow_placeholders(item, request, model);
+            }
+        }
+        Value::Object(entries) => {
+            for entry in entries.values_mut() {
+                replace_workflow_placeholders(entry, request, model);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -1622,6 +2363,8 @@ mod tests {
             task,
             prompt: "a lovely cat".to_string(),
             negative_prompt: String::new(),
+            ad_prompt: None,
+            ad_negative_prompt: None,
             width: 704,
             height: 1280,
             steps: 20,
@@ -1633,11 +2376,19 @@ mod tests {
             strength: None,
             hires: None,
             seed: -1,
+            batch_count: 1,
             video_frames: 34,
             fps: 24,
             speaker_file: None,
             language: None,
             init_image_base64: None,
+            mask_image_base64: None,
+            control_image_base64: None,
+            control_strength: None,
+            ip_adapter_image_base64: None,
+            ip_adapter_strength: None,
+            ref_images_base64: Vec::new(),
+            increase_ref_index: false,
             loras: Vec::new(),
             component_overrides: Vec::new(),
         }
@@ -1774,9 +2525,15 @@ mod tests {
             ("--audio-vae", "audio.safetensors"),
         ] {
             let at = args.iter().position(|arg| arg == flag).expect(flag);
-            assert_eq!(args[at + 1], under("/models", &["wan-mine", file]), "{flag}");
+            assert_eq!(
+                args[at + 1],
+                under("/models", &["wan-mine", file]),
+                "{flag}"
+            );
         }
-        assert!(args.windows(2).any(|pair| pair == ["--listen-port", "8092"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--listen-port", "8092"]));
         assert!(args.contains(&"--diffusion-fa".to_string()));
     }
 
@@ -1795,15 +2552,16 @@ mod tests {
             1,
         )];
         let before = launch_signature(&spec, root);
-        spec.components
-            .push(ModelComponent::huggingface(ComponentSlot::Vae, "r", "vae.safetensors", 1));
+        spec.components.push(ModelComponent::huggingface(
+            ComponentSlot::Vae,
+            "r",
+            "vae.safetensors",
+            1,
+        ));
         assert_ne!(before, launch_signature(&spec, root));
         // The port is the one thing that legitimately differs between two
         // launches of the same file set, so it must not be in the key.
-        assert_eq!(
-            launch_signature(&spec, root),
-            launch_args(&spec, root, 0),
-        );
+        assert_eq!(launch_signature(&spec, root), launch_args(&spec, root, 0),);
     }
 
     /// A checkpoint that needs a separate VAE does not name one, so the common
@@ -1846,9 +2604,15 @@ mod tests {
         // Swapped, not duplicated.
         assert_eq!(args.iter().filter(|arg| *arg == "--vae").count(), 1);
         // The model had no text encoder at all; choosing one adds it.
-        let t5 = args.iter().position(|arg| arg == "--t5xxl").expect("--t5xxl");
+        let t5 = args
+            .iter()
+            .position(|arg| arg == "--t5xxl")
+            .expect("--t5xxl");
         assert_eq!(args[t5 + 1], parts[1].path);
-        let unet = args.iter().position(|arg| arg == "--diffusion-model").unwrap();
+        let unet = args
+            .iter()
+            .position(|arg| arg == "--diffusion-model")
+            .unwrap();
         assert_eq!(args[unet + 1], under("/models", &["wan-mine", "unet.gguf"]));
 
         // A path the library does not hold is not loadable, whatever the UI says.
@@ -1910,7 +2674,10 @@ mod tests {
         assert_eq!(normalize_video_frames(DownTo4nPlus1, 34), 33);
         assert_eq!(normalize_video_frames(DownTo4nPlus1, 32), 29);
         assert_eq!(normalize_video_frames(DownTo4nPlus1, 4), 1);
-        assert_eq!(normalize_video_frames(DownTo4nPlus1, u32::MAX), MAX_VIDEO_FRAMES);
+        assert_eq!(
+            normalize_video_frames(DownTo4nPlus1, u32::MAX),
+            MAX_VIDEO_FRAMES
+        );
 
         assert_eq!(normalize_video_frames(UpTo17kPlus5, 56), 56);
         assert_eq!(normalize_video_frames(UpTo17kPlus5, 45), 56);
@@ -1938,7 +2705,11 @@ mod tests {
         assert_eq!(normalized.fps, 24);
 
         // The same 34 becomes 39 on an upward 17k+5 grid, not 33.
-        let h3 = model("h3-mine", vec![GenerationTask::TextToVideo], FrameGrid::UpTo17kPlus5);
+        let h3 = model(
+            "h3-mine",
+            vec![GenerationTask::TextToVideo],
+            FrameGrid::UpTo17kPlus5,
+        );
         let mut on_h3 = video_request(GenerationTask::TextToVideo);
         on_h3.model_id = h3.id.clone();
         assert_eq!(validate_request(&h3, &on_h3).unwrap().video_frames, 39);
@@ -1947,7 +2718,11 @@ mod tests {
         assert!(validate_request(&wan, &video_request(GenerationTask::ImageToVideo)).is_err());
 
         // A model that does not declare video must refuse a video task.
-        let stills = model("sd-mine", vec![GenerationTask::TextToImage], FrameGrid::DownTo4nPlus1);
+        let stills = model(
+            "sd-mine",
+            vec![GenerationTask::TextToImage],
+            FrameGrid::DownTo4nPlus1,
+        );
         assert!(validate_request(&stills, &video_request(GenerationTask::TextToVideo)).is_err());
 
         let mut blank = video_request(GenerationTask::TextToVideo);
@@ -1973,7 +2748,11 @@ mod tests {
         assert_eq!(body["sample_params"]["guidance"]["txt_cfg"], json!(6.0));
         assert!(body.get("init_image").is_none());
 
-        let mut stills = model("sd-mine", vec![GenerationTask::TextToImage], FrameGrid::DownTo4nPlus1);
+        let mut stills = model(
+            "sd-mine",
+            vec![GenerationTask::TextToImage],
+            FrameGrid::DownTo4nPlus1,
+        );
         stills.defaults.flow_shift = None;
         let mut image = video_request(GenerationTask::TextToImage);
         image.model_id = stills.id.clone();
@@ -1983,6 +2762,268 @@ mod tests {
         // A model that declares no flow shift must leave the field absent
         // rather than pinning a value the backend would otherwise choose.
         assert!(body["sample_params"].get("flow_shift").is_none());
+    }
+
+    fn image_model() -> GenerationModelSpec {
+        let mut spec = model(
+            "sdxl-mine",
+            vec![GenerationTask::TextToImage, GenerationTask::ImageToImage],
+            FrameGrid::DownTo4nPlus1,
+        );
+        spec.components[0].slot = ComponentSlot::Checkpoint;
+        spec
+    }
+
+    fn image_request(task: GenerationTask) -> GenerationRequest {
+        let mut request = video_request(task);
+        request.model_id = "sdxl-mine".to_string();
+        request.width = 1024;
+        request.height = 1024;
+        request
+    }
+
+    fn local_component(slot: ComponentSlot, name: &str) -> ModelComponent {
+        ModelComponent {
+            slot,
+            source: ComponentSource::LocalFile {
+                path: absolute(&["weights", name]),
+            },
+            size_bytes: 1,
+        }
+    }
+
+    /// Inpainting, ControlNet and the reference-image conditioners all reach
+    /// the engine as extra fields on the ordinary request, so the check is that
+    /// each one is carried verbatim and that none of them appears when it was
+    /// not asked for — an engine build predating a field must not be sent it on
+    /// every ordinary run.
+    #[test]
+    fn conditioning_images_reach_the_request_body_only_when_supplied() {
+        let sdxl = image_model();
+        let mut request = image_request(GenerationTask::ImageToImage);
+        request.init_image_base64 = Some("aW5pdA==".to_string());
+        request.mask_image_base64 = Some("bWFzaw==".to_string());
+        request.control_image_base64 = Some("Y29udHJvbA==".to_string());
+        request.control_strength = Some(0.65);
+        request.ip_adapter_image_base64 = Some("cmVm".to_string());
+        request.ip_adapter_strength = Some(0.4);
+        request.ref_images_base64 = vec!["b25l".to_string(), "dHdv".to_string()];
+        request.increase_ref_index = true;
+
+        let normalized = validate_request(&sdxl, &request).unwrap();
+        let body = request_body(&sdxl, &normalized);
+        assert_eq!(body["mask_image"], json!("bWFzaw=="));
+        assert_eq!(body["control_image"], json!("Y29udHJvbA=="));
+        assert_eq!(body["control_strength"], json!(0.65));
+        assert_eq!(body["ip_adapter_image"], json!("cmVm"));
+        assert_eq!(body["ip_adapter_strength"], json!(0.4));
+        assert_eq!(body["ref_images"], json!(["b25l", "dHdv"]));
+        assert_eq!(body["increase_ref_index"], json!(true));
+
+        let plain = request_body(&sdxl, &image_request(GenerationTask::TextToImage));
+        for absent in [
+            "mask_image",
+            "control_image",
+            "control_strength",
+            "ip_adapter_image",
+            "ip_adapter_strength",
+            "ref_images",
+            "increase_ref_index",
+        ] {
+            assert!(plain.get(absent).is_none(), "{absent} was sent unasked");
+        }
+    }
+
+    #[test]
+    fn conditioning_inputs_are_bounded_and_a_mask_needs_something_to_mask() {
+        let sdxl = image_model();
+
+        // The engine takes the pair and ignores the mask, so this has to be
+        // caught here or inpainting silently degrades to plain img2img.
+        let mut orphan_mask = image_request(GenerationTask::TextToImage);
+        orphan_mask.mask_image_base64 = Some("bWFzaw==".to_string());
+        assert!(validate_request(&sdxl, &orphan_mask).is_err());
+
+        let mut wild_strength = image_request(GenerationTask::TextToImage);
+        wild_strength.control_strength = Some(1.5);
+        assert!(validate_request(&sdxl, &wild_strength).is_err());
+        wild_strength.control_strength = Some(f64::NAN);
+        assert!(validate_request(&sdxl, &wild_strength).is_err());
+
+        let mut too_many_refs = image_request(GenerationTask::TextToImage);
+        too_many_refs.ref_images_base64 = vec!["b25l".to_string(); MAX_REF_IMAGES + 1];
+        assert!(validate_request(&sdxl, &too_many_refs).is_err());
+
+        let mut huge = image_request(GenerationTask::TextToImage);
+        huge.control_image_base64 = Some("A".repeat(MAX_INIT_IMAGE_BYTES + 1));
+        assert!(validate_request(&sdxl, &huge).is_err());
+    }
+
+    /// `sd-server` accepts `control_image` with no `--control-net` loaded and
+    /// quietly ignores it, so the only symptom would be a three-minute render
+    /// that followed none of the structure it was given.
+    #[test]
+    fn a_conditioning_image_is_refused_when_its_weights_are_not_loaded() {
+        let plain = image_model();
+        let mut request = image_request(GenerationTask::TextToImage);
+        request.control_image_base64 = Some("Y29udHJvbA==".to_string());
+        assert!(validate_conditioning(&plain, &request).is_err());
+
+        let mut with_control_net = plain.clone();
+        with_control_net.components.push(local_component(
+            ComponentSlot::ControlNet,
+            "canny.safetensors",
+        ));
+        assert!(validate_conditioning(&with_control_net, &request).is_ok());
+
+        // A ControlNet does not stand in for an IP-Adapter: the three fields
+        // are read by three different sets of weights.
+        let mut reference = image_request(GenerationTask::TextToImage);
+        reference.ip_adapter_image_base64 = Some("cmVm".to_string());
+        assert!(validate_conditioning(&with_control_net, &reference).is_err());
+
+        let mut identities = image_request(GenerationTask::TextToImage);
+        identities.ref_images_base64 = vec!["b25l".to_string()];
+        assert!(validate_conditioning(&with_control_net, &identities).is_err());
+        let mut with_photo_maker = plain.clone();
+        with_photo_maker.components.push(local_component(
+            ComponentSlot::PhotoMaker,
+            "photomaker.safetensors",
+        ));
+        assert!(validate_conditioning(&with_photo_maker, &identities).is_ok());
+
+        // Nothing sent, nothing to refuse, whatever is loaded.
+        assert!(validate_conditioning(&plain, &image_request(GenerationTask::TextToImage)).is_ok());
+    }
+
+    /// An ADetailer prompt without a detector is the same silent failure as a
+    /// conditioning image without its weights: `ad_model_path` is the one
+    /// ADetailer field the server does not read from the request body, so an
+    /// engine launched without `--ad-model` accepts the prompt and re-details
+    /// nothing.
+    #[test]
+    fn an_adetailer_prompt_is_refused_without_a_detector() {
+        let plain = image_model();
+        let mut request = image_request(GenerationTask::TextToImage);
+        request.ad_prompt = Some("a sharp face".to_string());
+        assert!(validate_conditioning(&plain, &request).is_err());
+
+        let mut with_detector = plain.clone();
+        with_detector
+            .components
+            .push(local_component(ComponentSlot::AdModel, "face_yolov8n.gguf"));
+        assert!(validate_conditioning(&with_detector, &request).is_ok());
+
+        // The negative prompt reaches the detector through the same flag, so it
+        // is refused on its own too rather than only alongside a positive one.
+        let mut negative_only = image_request(GenerationTask::TextToImage);
+        negative_only.ad_negative_prompt = Some("blurry".to_string());
+        assert!(validate_conditioning(&plain, &negative_only).is_err());
+        assert!(validate_conditioning(&with_detector, &negative_only).is_ok());
+    }
+
+    /// `--ip-adapter` reads its reference through a CLIP vision tower and
+    /// `sd-server` fails at load without one, so the model is rejected while it
+    /// is being added rather than the first time it is run.
+    #[test]
+    fn an_ip_adapter_model_must_also_carry_a_clip_vision_encoder() {
+        let mut spec = image_model();
+        spec.components.push(local_component(
+            ComponentSlot::IpAdapter,
+            "ip-adapter.safetensors",
+        ));
+        assert!(validate_model_spec(&spec).is_err());
+
+        spec.components.push(local_component(
+            ComponentSlot::ClipVision,
+            "clip-vision.safetensors",
+        ));
+        assert!(validate_model_spec(&spec).is_ok());
+    }
+
+    /// A remote backend is sent a workflow or an OpenAI-compatible body, and
+    /// neither encoder emits any of these fields. Dropping them here is what
+    /// keeps a run from looking conditioned by an image the backend never saw.
+    #[test]
+    fn conditioning_never_survives_the_hop_to_a_remote_backend() {
+        let backend = RemoteBackend {
+            id: "comfy".to_string(),
+            label: "My ComfyUI".to_string(),
+            kind: RemoteBackendKind::ComfyUi,
+            base_url: "http://127.0.0.1:8188".to_string(),
+            provider_id: None,
+            workflow_template: None,
+            supports_editing: false,
+            models: vec!["sd_xl_base_1.0.safetensors".to_string()],
+        };
+        let mut request = image_request(GenerationTask::TextToImage);
+        request.mask_image_base64 = Some("bWFzaw==".to_string());
+        request.control_image_base64 = Some("Y29udHJvbA==".to_string());
+        request.control_strength = Some(0.5);
+        request.ip_adapter_image_base64 = Some("cmVm".to_string());
+        request.ip_adapter_strength = Some(0.5);
+        request.ref_images_base64 = vec!["b25l".to_string()];
+        request.increase_ref_index = true;
+
+        let normalized = validate_remote_request(&backend, &request).unwrap();
+        assert!(normalized.mask_image_base64.is_none());
+        assert!(normalized.control_image_base64.is_none());
+        assert!(normalized.control_strength.is_none());
+        assert!(normalized.ip_adapter_image_base64.is_none());
+        assert!(normalized.ip_adapter_strength.is_none());
+        assert!(normalized.ref_images_base64.is_empty());
+        assert!(!normalized.increase_ref_index);
+    }
+
+    /// Every new slot is a flag `sd-server` actually accepts; a typo here is an
+    /// engine that refuses to launch, which is why the mapping is asserted
+    /// rather than trusted.
+    #[test]
+    fn the_conditioning_and_exotic_slots_map_to_real_engine_flags() {
+        for (slot, flag) in [
+            (ComponentSlot::ControlNet, "--control-net"),
+            (ComponentSlot::IpAdapter, "--ip-adapter"),
+            (ComponentSlot::PhotoMaker, "--photo-maker"),
+            (ComponentSlot::PulidWeights, "--pulid-weights"),
+            (ComponentSlot::LlmVision, "--llm_vision"),
+            (
+                ComponentSlot::UncondDiffusionModel,
+                "--uncond-diffusion-model",
+            ),
+            (
+                ComponentSlot::EmbeddingsConnectors,
+                "--embeddings-connectors",
+            ),
+            (ComponentSlot::MotionModule, "--motion-module"),
+        ] {
+            assert_eq!(slot.flag(), flag);
+            // None of them belongs to `llama-tts`, so all of them reach the
+            // `sd-server` command line rather than being skipped.
+            assert!(
+                !slot.is_speech_only(),
+                "{slot:?} was skipped as speech-only"
+            );
+        }
+
+        // Only the three that unlock a per-run image say so.
+        assert_eq!(
+            ComponentSlot::ControlNet.conditioning_image(),
+            Some(ConditioningImage::Control)
+        );
+        assert_eq!(
+            ComponentSlot::IpAdapter.conditioning_image(),
+            Some(ConditioningImage::IpAdapter)
+        );
+        assert_eq!(
+            ComponentSlot::PhotoMaker.conditioning_image(),
+            Some(ConditioningImage::Reference)
+        );
+        assert_eq!(
+            ComponentSlot::PulidWeights.conditioning_image(),
+            Some(ConditioningImage::Reference)
+        );
+        assert_eq!(ComponentSlot::Vae.conditioning_image(), None);
+        assert_eq!(ComponentSlot::MotionModule.conditioning_image(), None);
     }
 
     /// The engine ignores prompt-embedded `<lora:...>` tags on purpose, so the
@@ -2008,7 +3049,10 @@ mod tests {
         let body = request_body(&wan, &normalized);
         let loras = body["lora"].as_array().expect("lora array");
         assert_eq!(loras.len(), 2);
-        assert_eq!(loras[0]["path"], json!(absolute(&["loras", "style.safetensors"])));
+        assert_eq!(
+            loras[0]["path"],
+            json!(absolute(&["loras", "style.safetensors"]))
+        );
         // Negative strengths are meaningful — they subtract a style.
         assert_eq!(loras[1]["multiplier"], json!(-0.4));
         assert_eq!(loras[1]["is_high_noise"], json!(true));
@@ -2089,9 +3133,10 @@ mod tests {
         let JobProgress::Completed(media) = completed else {
             panic!("expected a completed job");
         };
-        assert_eq!(media.bytes, b"webm-bytes");
-        assert_eq!(media.media_type, "video/webm");
-        assert_eq!(media.frame_count, 33);
+        assert_eq!(media.len(), 1, "a clip is one artifact");
+        assert_eq!(media[0].bytes, b"webm-bytes");
+        assert_eq!(media[0].media_type, "video/webm");
+        assert_eq!(media[0].frame_count, 33);
 
         // img_gen: a list of encoded images and no media type at all — the
         // format is stated once for the batch. Verified against a real
@@ -2107,9 +3152,35 @@ mod tests {
         let JobProgress::Completed(media) = completed else {
             panic!("expected a completed job");
         };
-        assert_eq!(media.bytes, b"png-bytes");
-        assert_eq!(media.media_type, "image/png");
-        assert_eq!(media.frame_count, 1);
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].bytes, b"png-bytes");
+        assert_eq!(media[0].media_type, "image/png");
+        assert_eq!(media[0].frame_count, 1);
+
+        // A batch comes back as several entries in that same list. Reading
+        // only the first is the bug this asserts against: the run has already
+        // been paid for by the time the response arrives, so a dropped entry
+        // is sampling time thrown away.
+        let completed = decode_job_status(&json!({
+            "status": "completed",
+            "result": {
+                "output_format": "png",
+                "images": [
+                    {"index": 0, "b64_json": STANDARD.encode(b"first")},
+                    {"index": 1, "b64_json": STANDARD.encode(b"second")},
+                    {"index": 2, "b64_json": STANDARD.encode(b"third")},
+                ],
+            }
+        }))
+        .unwrap();
+        let JobProgress::Completed(media) = completed else {
+            panic!("expected a completed job");
+        };
+        assert_eq!(media.len(), 3, "every image in the batch is kept");
+        assert_eq!(media[0].bytes, b"first");
+        assert_eq!(media[2].bytes, b"third");
+        // The format is stated once for the batch, so every image carries it.
+        assert!(media.iter().all(|item| item.media_type == "image/png"));
 
         // A completed job with no payload is a protocol error, not empty media.
         assert!(decode_job_status(&json!({"status": "completed", "result": {}})).is_err());
@@ -2119,6 +3190,62 @@ mod tests {
         }))
         .is_err());
         assert!(decode_job_status(&json!({"status": "invented"})).is_err());
+    }
+
+    /// A batch is an image-only idea, and only travels when it is asked for.
+    ///
+    /// The engine samples a batch serially, so `batch_count` on a video job
+    /// would multiply the app's longest run by eight; and an engine build that
+    /// predates the field should still see exactly the body it saw before, so
+    /// the ordinary single-image run must not carry it at all.
+    #[test]
+    fn a_batch_is_images_only_and_only_sent_when_asked_for() {
+        let mut spec = model(
+            "sdxl-mine",
+            vec![GenerationTask::TextToImage],
+            FrameGrid::default(),
+        );
+        spec.defaults.width = 512;
+        spec.defaults.height = 512;
+
+        let mut request = video_request(GenerationTask::TextToImage);
+        request.model_id = spec.id.clone();
+        let single = validate_request(&spec, &request).unwrap();
+        assert!(request_body(&spec, &single).get("batch_count").is_none());
+
+        request.batch_count = 4;
+        let batched = validate_request(&spec, &request).unwrap();
+        assert_eq!(request_body(&spec, &batched)["batch_count"], json!(4));
+
+        // Out of range is refused rather than clamped: silently returning one
+        // image for a request that asked for fifty is worse than saying no.
+        request.batch_count = MAX_BATCH_COUNT + 1;
+        assert!(validate_request(&spec, &request).is_err());
+        request.batch_count = 0;
+        assert!(validate_request(&spec, &request).is_err());
+
+        // Video and speech normalize back to one whatever the caller sent.
+        let wan = video_model();
+        let mut clip = video_request(GenerationTask::TextToVideo);
+        clip.batch_count = 4;
+        let clip = validate_request(&wan, &clip).unwrap();
+        assert_eq!(clip.batch_count, 1);
+        assert!(request_body(&wan, &clip).get("batch_count").is_none());
+
+        let mut voice = model(
+            "voice",
+            vec![GenerationTask::TextToSpeech],
+            FrameGrid::default(),
+        );
+        voice.components = vec![ModelComponent::huggingface(
+            ComponentSlot::Checkpoint,
+            "r",
+            "backbone.gguf",
+            1,
+        )];
+        let mut utterance = video_request(GenerationTask::TextToSpeech);
+        utterance.batch_count = 4;
+        assert_eq!(validate_request(&voice, &utterance).unwrap().batch_count, 1);
     }
 
     /// The canvas and sampling controls belong to the run, not the library
@@ -2177,9 +3304,11 @@ mod tests {
         let mut text_only = request.clone();
         text_only.task = GenerationTask::TextToVideo;
         text_only.init_image_base64 = None;
-        assert!(request_body(&wan, &validate_request(&wan, &text_only).unwrap())
-            .get("strength")
-            .is_none());
+        assert!(
+            request_body(&wan, &validate_request(&wan, &text_only).unwrap())
+                .get("strength")
+                .is_none()
+        );
 
         for spoil in [
             (|r: &mut GenerationRequest| r.clip_skip = MAX_CLIP_SKIP + 1) as fn(&mut _),
@@ -2216,7 +3345,10 @@ mod tests {
             parse_sampling_progress("  |####      | 212/686 - 647.34MB/s"),
             None
         );
-        assert_eq!(parse_sampling_progress("[INFO ] main.cpp:148 - listening"), None);
+        assert_eq!(
+            parse_sampling_progress("[INFO ] main.cpp:148 - listening"),
+            None
+        );
         assert_eq!(parse_sampling_progress("  |==| 4/0 - 1.0s/it"), None);
     }
 
@@ -2273,7 +3405,11 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
     /// flag, and one wav written straight to disk.
     #[test]
     fn speech_builds_its_own_command_line_and_skips_the_diffusion_bounds() {
-        let mut spec = model("voice", vec![GenerationTask::TextToSpeech], FrameGrid::default());
+        let mut spec = model(
+            "voice",
+            vec![GenerationTask::TextToSpeech],
+            FrameGrid::default(),
+        );
         spec.components = vec![
             ModelComponent::huggingface(ComponentSlot::Checkpoint, "r", "backbone.gguf", 1),
             ModelComponent::huggingface(ComponentSlot::Mmproj, "r", "mmproj.gguf", 1),
@@ -2293,7 +3429,10 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
             ("--model", under("/m", &["voice", "backbone.gguf"])),
             ("--mmproj", under("/m", &["voice", "mmproj.gguf"])),
             ("--prompt", "a lovely cat".to_string()),
-            ("--output", Path::new("/out.wav").to_string_lossy().to_string()),
+            (
+                "--output",
+                Path::new("/out.wav").to_string_lossy().to_string(),
+            ),
             ("--tts-speaker-file", absolute(&["reference.wav"])),
             ("--tts-lang", "en".to_string()),
         ] {
@@ -2301,6 +3440,19 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
             assert_eq!(args[at + 1], value, "{flag}");
         }
         assert!(args.contains(&"--tts-use-guide-tokens".to_string()));
+
+        // Speech asks for the GPU by default. Without this the pinned macOS
+        // arm64 build — which ships libggml-metal.dylib — synthesizes on the
+        // CPU of a machine whose GPU is sitting idle.
+        let ngl = args.iter().position(|arg| arg == "-ngl").expect("-ngl");
+        assert_eq!(args[ngl + 1], SPEECH_GPU_LAYERS.to_string());
+        // ...and the model's own arguments come after it, so llama.cpp's
+        // last-one-wins parsing leaves the escape hatch open.
+        let mut cpu_only = spec.clone();
+        cpu_only.extra_launch_args = vec!["-ngl".to_string(), "0".to_string()];
+        let args =
+            speech_args(&cpu_only, Path::new("/m"), &normalized, Path::new("/o.wav")).unwrap();
+        assert_eq!(args.last().unwrap(), "0");
 
         // The projector is llama-tts's flag; sd-server would reject it outright.
         assert!(!launch_args(&spec, Path::new("/m"), 1).contains(&"--mmproj".to_string()));
@@ -2344,8 +3496,7 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
             let mut request = video_request(GenerationTask::TextToSpeech);
             request.model_id = spec.id.clone();
             request.prompt = "Little Monkey now speaks.".to_string();
-            request.speaker_file =
-                reference.map(|path| path.to_string_lossy().to_string());
+            request.speaker_file = reference.map(|path| path.to_string_lossy().to_string());
             let request = validate_request(&spec, &request).unwrap();
             let args = speech_args(&spec, Path::new("/unused"), &request, output).unwrap();
             let status = Command::new(&binary).args(&args).output().unwrap();
@@ -2371,16 +3522,24 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
     }
 
     fn model_spec_for_speech(backbone: &str, mmproj: &str) -> GenerationModelSpec {
-        let mut spec = model("voice", vec![GenerationTask::TextToSpeech], FrameGrid::default());
+        let mut spec = model(
+            "voice",
+            vec![GenerationTask::TextToSpeech],
+            FrameGrid::default(),
+        );
         spec.components = vec![
             ModelComponent {
                 slot: ComponentSlot::Checkpoint,
-                source: ComponentSource::LocalFile { path: backbone.to_string() },
+                source: ComponentSource::LocalFile {
+                    path: backbone.to_string(),
+                },
                 size_bytes: 0,
             },
             ModelComponent {
                 slot: ComponentSlot::Mmproj,
-                source: ComponentSource::LocalFile { path: mmproj.to_string() },
+                source: ComponentSource::LocalFile {
+                    path: mmproj.to_string(),
+                },
                 size_bytes: 0,
             },
         ];
@@ -2401,13 +3560,16 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
     #[test]
     #[ignore = "needs a local sd-server binary and checkpoint"]
     fn a_real_engine_reports_its_model_and_its_step_count() {
-        let (Ok(binary), Ok(checkpoint)) = (
-            std::env::var("SD_SERVER"),
-            std::env::var("SD_CHECKPOINT"),
-        ) else {
+        let (Ok(binary), Ok(checkpoint)) =
+            (std::env::var("SD_SERVER"), std::env::var("SD_CHECKPOINT"))
+        else {
             panic!("set SD_SERVER and SD_CHECKPOINT");
         };
-        let mut spec = model("live", vec![GenerationTask::TextToImage], FrameGrid::default());
+        let mut spec = model(
+            "live",
+            vec![GenerationTask::TextToImage],
+            FrameGrid::default(),
+        );
         spec.components = vec![ModelComponent {
             slot: ComponentSlot::Checkpoint,
             source: ComponentSource::LocalFile { path: checkpoint },
@@ -2449,7 +3611,10 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
                     JobProgress::Running { .. } => {
                         saw_progress = saw_progress.or_else(|| engine.progress());
                     }
-                    JobProgress::Completed(media) => break media,
+                    JobProgress::Completed(mut media) => {
+                        assert_eq!(media.len(), 1, "one image was asked for");
+                        break media.remove(0);
+                    }
                     other => panic!("{other:?}"),
                 }
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2461,7 +3626,8 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
             assert!(media.bytes.starts_with(b"\x89PNG"));
             // IHDR carries the real canvas: a 2× hires pass on 256 px has to
             // come back at 512, or the second pass never ran.
-            let dimension = |at: usize| u32::from_be_bytes(media.bytes[at..at + 4].try_into().unwrap());
+            let dimension =
+                |at: usize| u32::from_be_bytes(media.bytes[at..at + 4].try_into().unwrap());
             assert_eq!((dimension(16), dimension(20)), (512, 512));
             engine.stop().unwrap();
         });
@@ -2478,5 +3644,70 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
         // sd-server-shaped is reached for.
         assert!(GenerationTask::TextToSpeech.is_speech());
         assert!(!GenerationTask::TextToVideo.is_speech());
+    }
+
+    /// The shape `/sdcpp/v1/capabilities` really answers with, trimmed to the
+    /// parts the app reads: samplers and schedulers are bare strings, upscalers
+    /// are objects, and the two are not interchangeable.
+    #[test]
+    fn capabilities_are_read_off_the_engines_own_lists() {
+        let body = json!({
+            "current_mode": "img_gen",
+            "samplers": ["euler", "euler_a", "brand_new_sampler"],
+            "schedulers": ["discrete", "normal", "karras"],
+            "upscalers": [{"name": "None"}, {"name": "Lanczos"}, {"name": "RealESRGAN_x4plus"}],
+            "loras": [{"name": "detail", "path": "/loras/detail.safetensors"}],
+            "features": {"mask_image": true, "control_image": false, "cancel_generating": false},
+        });
+        let capabilities = decode_capabilities(&body);
+        assert_eq!(
+            capabilities.samplers,
+            ["euler", "euler_a", "brand_new_sampler"]
+        );
+        assert_eq!(capabilities.schedulers, ["discrete", "normal", "karras"]);
+        // A model dropped in --hires-upscalers-dir arrives beside the built-ins.
+        assert_eq!(
+            capabilities.upscalers,
+            ["None", "Lanczos", "RealESRGAN_x4plus"]
+        );
+        assert_eq!(capabilities.features.get("mask_image"), Some(&true));
+        assert_eq!(capabilities.features.get("control_image"), Some(&false));
+        assert_eq!(capabilities.features.get("ip_adapter_image"), None);
+    }
+
+    /// An engine that is up but still loading has an address and must not be
+    /// asked anything at it: the read would sit on one of its worker threads
+    /// for the whole load, which is the drain `ensure_ready` goes out of its way
+    /// to avoid. Only the run path, which waits, gets the address before then.
+    #[test]
+    fn an_engine_that_has_not_answered_yet_is_not_offered_to_readers() {
+        let engine = GenerationEngineState {
+            inner: Mutex::new(EngineProcess {
+                port: Some(51_234),
+                ..EngineProcess::default()
+            }),
+        };
+        assert_eq!(engine.base_url().as_deref(), Some("http://127.0.0.1:51234"));
+        assert!(engine.ready_base_url().is_none());
+
+        engine.inner.lock().unwrap().ready = true;
+        assert_eq!(
+            engine.ready_base_url().as_deref(),
+            Some("http://127.0.0.1:51234")
+        );
+
+        // Stopping takes the address back from both.
+        engine.stop().unwrap();
+        assert!(engine.base_url().is_none());
+        assert!(engine.ready_base_url().is_none());
+    }
+
+    /// An engine too old to report any of this must read as "said nothing",
+    /// not as "supports nothing" — the frontend falls back to its own lists on
+    /// an empty answer, and cannot tell the two apart itself.
+    #[test]
+    fn missing_capability_fields_decode_to_empty_rather_than_failing() {
+        let capabilities = decode_capabilities(&json!({"model": {"path": "/m.safetensors"}}));
+        assert_eq!(capabilities, EngineCapabilities::default());
     }
 }

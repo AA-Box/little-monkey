@@ -110,6 +110,7 @@ pub async fn spawn_if_configured(
     paths: DaemonPaths,
     desktop: Arc<DesktopControlRuntime>,
     mobile_chat: Arc<dyn super::api::MobileChatQueue>,
+    placement: Arc<dyn super::api::PlacementQueue>,
 ) -> Result<bool, String> {
     let Some(config) = load_host_config(&paths)? else {
         return Ok(false);
@@ -119,7 +120,7 @@ pub async fn spawn_if_configured(
     }
     let listener = bind(&config).await?;
     let acceptor = acceptor(&config)?;
-    let api = RemoteApi::production(paths, config.clone(), desktop, mobile_chat)?;
+    let api = RemoteApi::production(paths, config.clone(), desktop, mobile_chat, placement)?;
     tokio::spawn(async move {
         if let Err(error) = serve_bound(listener, acceptor, api).await {
             eprintln!("remote runner listener stopped: {error}");
@@ -132,6 +133,7 @@ pub async fn serve(
     paths: DaemonPaths,
     desktop: Arc<DesktopControlRuntime>,
     mobile_chat: Arc<dyn super::api::MobileChatQueue>,
+    placement: Arc<dyn super::api::PlacementQueue>,
 ) -> Result<(), String> {
     let config =
         load_host_config(&paths)?.ok_or_else(|| "Remote host is not configured".to_string())?;
@@ -140,7 +142,7 @@ pub async fn serve(
     }
     let listener = bind(&config).await?;
     let acceptor = acceptor(&config)?;
-    let api = RemoteApi::production(paths, config, desktop, mobile_chat)?;
+    let api = RemoteApi::production(paths, config, desktop, mobile_chat, placement)?;
     serve_bound(listener, acceptor, api).await
 }
 

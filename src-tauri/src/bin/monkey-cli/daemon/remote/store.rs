@@ -10,6 +10,12 @@ use super::protocol::{
     RotationBundle, REMOTE_PROTOCOL_VERSION,
 };
 
+/// Profile-scoped (K23): the default profile keeps this exact service name,
+/// so credentials stored before profiles existed still resolve, and any other
+/// profile's secrets are a different keychain item entirely.
+static REMOTE_KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| little_monkey_lib::profiles::keychain_service("com.littlemonkey.remote"));
+
 const REMOTE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS pairing_invitations (
     pairing_id TEXT PRIMARY KEY,
@@ -119,6 +125,65 @@ CREATE TABLE IF NOT EXISTS remote_mobile_workflow_runs (
 
 CREATE INDEX IF NOT EXISTS remote_mobile_workflow_device_idx
     ON remote_mobile_workflow_runs(device_id,created_at_ms DESC);
+
+-- Roadmap K17. Two tables for the two directions, deliberately not one:
+-- `remote_placed_runs` is work THIS machine accepted from somewhere else, and
+-- `remote_nodes` / `remote_placements` are what this machine knows about the
+-- machines it places work ON. The same daemon is usually both, and folding the
+-- two into one table would make every query have to say which role it meant.
+
+-- Answering side: a run another owned machine placed here.
+CREATE TABLE IF NOT EXISTS remote_placed_runs (
+    -- The SUBMITTER's run id, which is the correlation key across the wire.
+    -- The node's own run id is a separate column because the node mints its
+    -- own: adopting a foreign id would let a submitter pick a local identity.
+    submitted_run_id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL REFERENCES remote_devices(device_id) ON DELETE RESTRICT,
+    node_run_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    residency TEXT NOT NULL,
+    -- Digest of the exact frozen spec bytes this node accepted. What the node
+    -- enforced is auditable against what the submitter says it sent.
+    spec_sha256 TEXT NOT NULL CHECK(length(spec_sha256)=64),
+    created_at_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS remote_placed_runs_device_idx
+    ON remote_placed_runs(device_id,created_at_ms DESC);
+
+-- Asking side: a node this machine may place work on, and the last description
+-- it gave of itself.
+CREATE TABLE IF NOT EXISTS remote_nodes (
+    alias TEXT PRIMARY KEY REFERENCES remote_controllers(alias) ON DELETE CASCADE,
+    runner_id TEXT NOT NULL,
+    residency TEXT NOT NULL,
+    descriptor_json BLOB NOT NULL,
+    -- When the node last ANSWERED, not when we last asked. `liveness` reads
+    -- this, and a failed probe must not look like a fresh one.
+    last_seen_at_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+) STRICT;
+
+-- Asking side: one run this machine put on a node.
+CREATE TABLE IF NOT EXISTS remote_placements (
+    submitted_run_id TEXT PRIMARY KEY,
+    alias TEXT NOT NULL,
+    runner_id TEXT NOT NULL,
+    node_run_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    -- 1 for the original placement; incremented each time a vanished node
+    -- forces a re-placement (see `node_placement::reconcile_placement`).
+    attempt INTEGER NOT NULL CHECK(attempt > 0),
+    residency TEXT NOT NULL,
+    deciding_key TEXT NOT NULL,
+    last_error TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS remote_placements_alias_idx
+    ON remote_placements(alias,updated_at_ms DESC);
 "#;
 
 pub trait RemoteSecretStore: Send + Sync {
@@ -143,7 +208,7 @@ pub struct KeyringRemoteSecrets;
 
 impl KeyringRemoteSecrets {
     fn entry(slot: &str) -> Result<keyring::Entry, String> {
-        keyring::Entry::new("com.littlemonkey.remote", slot).map_err(|error| error.to_string())
+        keyring::Entry::new(&REMOTE_KEYCHAIN_SERVICE, slot).map_err(|error| error.to_string())
     }
 }
 
@@ -252,6 +317,37 @@ pub struct MobileWorkflowRunRecord {
     pub created_at_ms: u64,
 }
 
+/// One run another owned machine placed on this node (roadmap K17 S2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedRunRecord {
+    pub submitted_run_id: String,
+    pub device_id: String,
+    pub node_run_id: String,
+    pub job_id: String,
+    pub residency: String,
+    pub spec_sha256: String,
+    pub created_at_ms: u64,
+}
+
+/// One run this machine placed on a node (roadmap K17 S2/S4/S5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementRecord {
+    pub submitted_run_id: String,
+    pub alias: String,
+    pub runner_id: String,
+    pub node_run_id: String,
+    pub job_id: String,
+    pub state: String,
+    pub attempt: u32,
+    pub residency: String,
+    /// Which of `node_placement::select_node`'s keys chose this node, so the
+    /// record says *why* rather than only *where*.
+    pub deciding_key: String,
+    pub last_error: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandReservation {
     New,
@@ -298,12 +394,7 @@ impl RemoteStore {
         expires_at_ms: u64,
     ) -> Result<InvitationRecord, String> {
         let capabilities = legacy_capabilities(scopes);
-        self.create_invitation_with_capabilities(
-            scopes,
-            &capabilities,
-            now_ms,
-            expires_at_ms,
-        )
+        self.create_invitation_with_capabilities(scopes, &capabilities, now_ms, expires_at_ms)
     }
 
     pub fn create_invitation_with_capabilities(
@@ -1034,6 +1125,252 @@ impl RemoteStore {
             })
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<std::collections::HashMap<_, _>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Every paired controller alias on this machine — the set of nodes it
+    /// could place work on, before any of them has been described.
+    pub fn controller_aliases(&self) -> Result<Vec<String>, String> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT alias FROM remote_controllers ORDER BY alias")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    // --- Roadmap K17: the answering side ---------------------------------
+
+    /// Records a run this node accepted from another owned machine.
+    ///
+    /// `INSERT ... ON CONFLICT DO NOTHING` keyed on the submitter's run id, so a
+    /// resubmission of a spec this node already owns is the *same* placement
+    /// rather than a second one. The signed-request replay guard already
+    /// deduplicates an identical retried request; this deduplicates a *new*
+    /// request carrying a spec that was already placed, which the replay guard
+    /// cannot see.
+    pub fn insert_placed_run(&mut self, record: &PlacedRunRecord) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT INTO remote_placed_runs(
+                    submitted_run_id,device_id,node_run_id,job_id,residency,spec_sha256,created_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(submitted_run_id) DO NOTHING",
+                params![
+                    record.submitted_run_id,
+                    record.device_id,
+                    record.node_run_id,
+                    record.job_id,
+                    record.residency,
+                    record.spec_sha256,
+                    to_i64(record.created_at_ms)?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn placed_run(&self, submitted_run_id: &str) -> Result<Option<PlacedRunRecord>, String> {
+        self.connection
+            .query_row(
+                "SELECT submitted_run_id,device_id,node_run_id,job_id,residency,spec_sha256,created_at_ms
+                 FROM remote_placed_runs WHERE submitted_run_id=?1",
+                params![submitted_run_id],
+                |row| {
+                    Ok(PlacedRunRecord {
+                        submitted_run_id: row.get(0)?,
+                        device_id: row.get(1)?,
+                        node_run_id: row.get(2)?,
+                        job_id: row.get(3)?,
+                        residency: row.get(4)?,
+                        spec_sha256: row.get(5)?,
+                        created_at_ms: from_i64(row.get(6)?)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// How many placed runs this node currently holds, for the health route's
+    /// `placed_active`. Counted from the placement table rather than the job
+    /// table because a placement outlives the job row's retention.
+    pub fn placed_run_count(&self) -> Result<u32, String> {
+        self.connection
+            .query_row("SELECT COUNT(*) FROM remote_placed_runs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|error| error.to_string())
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    // --- Roadmap K17: the asking side ------------------------------------
+
+    /// Stores (or refreshes) what a paired node last said about itself.
+    ///
+    /// `last_seen_at_ms` is only ever advanced by this call, which is the point:
+    /// it records that the node *answered*, so a failed probe leaves the old
+    /// value alone and `node_placement::liveness` sees the silence grow.
+    pub fn save_node(
+        &mut self,
+        alias: &str,
+        descriptor: &little_monkey_lib::node_placement::NodeDescriptor,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        descriptor.validate()?;
+        let stored = serde_json::to_vec(descriptor).map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "INSERT INTO remote_nodes(alias,runner_id,residency,descriptor_json,last_seen_at_ms,updated_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,?5)
+                 ON CONFLICT(alias) DO UPDATE SET runner_id=excluded.runner_id,
+                    residency=excluded.residency,
+                    descriptor_json=excluded.descriptor_json,
+                    last_seen_at_ms=excluded.last_seen_at_ms,
+                    updated_at_ms=excluded.updated_at_ms",
+                params![
+                    alias,
+                    descriptor.runner_id,
+                    descriptor.residency,
+                    stored,
+                    to_i64(now_ms)?
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Every known node with its stored descriptor and the moment it last
+    /// answered.
+    pub fn nodes(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            little_monkey_lib::node_placement::NodeDescriptor,
+            Option<u64>,
+        )>,
+        String,
+    > {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT alias,descriptor_json,last_seen_at_ms FROM remote_nodes ORDER BY alias",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                let alias: String = row.get(0)?;
+                let stored: Vec<u8> = row.get(1)?;
+                let last_seen: Option<i64> = row.get(2)?;
+                Ok((alias, stored, last_seen))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (alias, stored, last_seen) = row.map_err(|error| error.to_string())?;
+            // A descriptor written by a newer node build that this build cannot
+            // parse is skipped rather than failing the whole listing: one
+            // unreadable node must not make the others unplaceable.
+            let Ok(descriptor) = serde_json::from_slice::<
+                little_monkey_lib::node_placement::NodeDescriptor,
+            >(&stored) else {
+                continue;
+            };
+            let last_seen = last_seen
+                .map(|value| from_i64(value).map_err(|error| error.to_string()))
+                .transpose()?;
+            out.push((alias, descriptor, last_seen));
+        }
+        Ok(out)
+    }
+
+    /// Records a placement this machine made, or replaces it in place when a
+    /// vanished node forced a re-placement onto a different node.
+    pub fn save_placement(&mut self, record: &PlacementRecord) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT INTO remote_placements(
+                    submitted_run_id,alias,runner_id,node_run_id,job_id,state,attempt,
+                    residency,deciding_key,last_error,created_at_ms,updated_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)
+                 ON CONFLICT(submitted_run_id) DO UPDATE SET alias=excluded.alias,
+                    runner_id=excluded.runner_id,
+                    node_run_id=excluded.node_run_id,
+                    job_id=excluded.job_id,
+                    state=excluded.state,
+                    attempt=excluded.attempt,
+                    residency=excluded.residency,
+                    deciding_key=excluded.deciding_key,
+                    last_error=excluded.last_error,
+                    updated_at_ms=excluded.updated_at_ms",
+                params![
+                    record.submitted_run_id,
+                    record.alias,
+                    record.runner_id,
+                    record.node_run_id,
+                    record.job_id,
+                    record.state,
+                    record.attempt,
+                    record.residency,
+                    record.deciding_key,
+                    record.last_error,
+                    to_i64(record.created_at_ms)?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn set_placement_state(
+        &mut self,
+        submitted_run_id: &str,
+        state: &str,
+        last_error: Option<&str>,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "UPDATE remote_placements
+                 SET state=?2, last_error=COALESCE(?3,last_error), updated_at_ms=?4
+                 WHERE submitted_run_id=?1",
+                params![submitted_run_id, state, last_error, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn placements(&self) -> Result<Vec<PlacementRecord>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT submitted_run_id,alias,runner_id,node_run_id,job_id,state,attempt,
+                        residency,deciding_key,last_error,created_at_ms,updated_at_ms
+                 FROM remote_placements ORDER BY updated_at_ms DESC, submitted_run_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(PlacementRecord {
+                    submitted_run_id: row.get(0)?,
+                    alias: row.get(1)?,
+                    runner_id: row.get(2)?,
+                    node_run_id: row.get(3)?,
+                    job_id: row.get(4)?,
+                    state: row.get(5)?,
+                    attempt: row.get(6)?,
+                    residency: row.get(7)?,
+                    deciding_key: row.get(8)?,
+                    last_error: row.get(9)?,
+                    created_at_ms: from_i64(row.get(10)?)?,
+                    updated_at_ms: from_i64(row.get(11)?)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())
     }
 

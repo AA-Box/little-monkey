@@ -52,6 +52,13 @@ subscribeToSystemTheme(() => {
 // actually lives here in main.tsx (pre-render, not an App.tsx effect), so
 // `hydratePrompts()` follows suit for the same "no user action can race
 // hydration" reason.
+// The webview's native right-click menu ("Inspect Element", "AutoFill", ...)
+// is a browser affordance, not an app one — suppress it everywhere in release
+// builds. Kept in dev so the inspector stays one right-click away.
+if (!import.meta.env.DEV) {
+  document.addEventListener("contextmenu", (event) => event.preventDefault());
+}
+
 const isCompanionOverlay = new URLSearchParams(window.location.search).get("overlay") === "1";
 const localeReady = loadLocaleTranslations(useLocaleStore.getState().locale);
 

@@ -390,7 +390,7 @@ describe("cross-window comparison merge", () => {
 
     const merged = useSessionStore.getState();
     expect(merged.sessions.find((session) => session.id === runningId)?.messages).toEqual([
-      { role: "assistant", content: "local partial stream" },
+      { role: "assistant", content: "local partial stream", at: expect.any(Number) },
     ]);
     expect(merged.sessions.find((session) => session.id === runningId)?.comparisonBranch?.status).toBe("running");
     expect(merged.groups.some((group) => group.id === groupId && group.kind === "comparison")).toBe(true);

@@ -1,17 +1,77 @@
 import { useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
+import { FolderOpen, Trash2 } from "lucide-react";
 
-import { Button } from "../ui";
+import { Button, IconButton } from "../ui";
 import { ModelFiles } from "./ModelFiles";
 import { useT } from "../../lib/i18n";
 import { describeWeightFile } from "../../lib/weightFileHints";
 import {
   ALL_TASKS,
   emptyModelSpec,
+  formatLaunchArgs,
+  hasLaunchFlag,
+  launchArgValue,
+  parseLaunchArgs,
+  setLaunchArg,
+  setLaunchFlag,
   studioClient,
   type GenerationModelSpec,
   type GenerationTask,
   type ModelComponent,
 } from "../../lib/studioClient";
+
+/** Engine flags that name a *directory* of extra weights rather than one file.
+ *  The engine rescans these per run, so pointing at a folder is enough — the
+ *  upscaler picker fills itself from whatever is found. */
+export const DIRECTORY_FLAGS = [
+  {
+    flag: "--hires-upscalers-dir",
+    labelKey: "Studio.add.upscalersDir",
+    hintKey: "Studio.add.upscalersDirHint",
+  },
+  {
+    flag: "--embd-dir",
+    labelKey: "Studio.add.embeddingsDir",
+    hintKey: "Studio.add.embeddingsDirHint",
+  },
+] as const;
+
+/**
+ * Launch-time switches worth a control of their own.
+ *
+ * Every one is verified present in the pinned engine's own `--help`, and every
+ * one is a *launch* flag — so it belongs to the model entry rather than to a
+ * run. That is a real limitation for `--circular`, which is a creative choice
+ * someone would reasonably want per image; it is here because the engine takes
+ * it at startup, not because that is the better place for it.
+ *
+ * Deliberately short. The engine has 136 flags and most are either already sent
+ * per run (samplers, steps, guidance, schedulers) or so specialised that a
+ * checkbox would be noise beside the args field that already reaches them.
+ */
+export const ENGINE_TOGGLES = [
+  {
+    flag: "--vae-tiling",
+    labelKey: "Studio.add.vaeTiling",
+    hintKey: "Studio.add.vaeTilingHint",
+  },
+  {
+    flag: "--offload-to-cpu",
+    labelKey: "Studio.add.offloadToCpu",
+    hintKey: "Studio.add.offloadToCpuHint",
+  },
+  {
+    flag: "--diffusion-fa",
+    labelKey: "Studio.add.flashAttention",
+    hintKey: "Studio.add.flashAttentionHint",
+  },
+  {
+    flag: "--circular",
+    labelKey: "Studio.add.seamless",
+    hintKey: "Studio.add.seamlessHint",
+  },
+] as const;
 
 /** A slug the backend will accept as a directory name. */
 function slugify(value: string): string {
@@ -188,18 +248,87 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
         </label>
       </div>
 
+      {/* Both of these are directories, not weight files, which is why neither is
+          a component slot: a slot resolves to one file. They write into the
+          engine-args field below rather than carrying their own state, so a path
+          typed there by hand and one picked here can never disagree about what
+          actually launches. */}
+      {DIRECTORY_FLAGS.map(({ flag, labelKey, hintKey }) => {
+        const current = launchArgValue(spec.extraLaunchArgs, flag);
+        return (
+          <label key={flag} className="grid gap-1 text-[11px] text-muted">
+            {t(labelKey)}
+            <span className="flex items-center gap-2">
+              <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-foreground">
+                {current ?? <span className="text-faint">{t("Studio.add.noFolder")}</span>}
+              </span>
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={async () => {
+                  const picked = await open({ directory: true, multiple: false });
+                  if (typeof picked === "string") {
+                    patch({ extraLaunchArgs: setLaunchArg(spec.extraLaunchArgs, flag, picked) });
+                  }
+                }}
+              >
+                <FolderOpen size={13} />
+                {t("Studio.add.chooseFolder")}
+              </Button>
+              {current && (
+                <IconButton
+                  size="sm"
+                  aria-label={t("Studio.add.clearFolder")}
+                  onClick={() => patch({ extraLaunchArgs: setLaunchArg(spec.extraLaunchArgs, flag, null) })}
+                >
+                  <Trash2 size={12} />
+                </IconButton>
+              )}
+            </span>
+            <span className="text-faint">{t(hintKey)}</span>
+          </label>
+        );
+      })}
+
+      {/* Launch-time switches. Reachable by typing them into the field below
+          since the quote-aware parser landed, so this is discoverability rather
+          than new capability — which is exactly why they are toggles over the
+          same `extraLaunchArgs` and not a second place to store settings. */}
+      <div className="grid gap-1.5">
+        <span className="text-[11px] text-muted">{t("Studio.add.engineOptions")}</span>
+        {ENGINE_TOGGLES.map(({ flag, labelKey, hintKey }) => (
+          <label key={flag} className="flex items-start gap-2 text-[11px]">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={hasLaunchFlag(spec.extraLaunchArgs, flag)}
+              onChange={(event) =>
+                patch({
+                  extraLaunchArgs: setLaunchFlag(
+                    spec.extraLaunchArgs,
+                    flag,
+                    event.target.checked,
+                  ),
+                })
+              }
+            />
+            <span className="grid gap-0.5">
+              <span className="text-foreground">{t(labelKey)}</span>
+              <span className="text-faint">{t(hintKey)}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+
       <label className="grid gap-1 text-[11px] text-muted">
         {t("Studio.add.engineArgs")}
         <input
           className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
-          value={spec.extraLaunchArgs.join(" ")}
+          value={formatLaunchArgs(spec.extraLaunchArgs)}
           placeholder={t("Studio.add.engineArgsPlaceholder")}
-          onChange={(event) =>
-            patch({
-              extraLaunchArgs: event.target.value.split(/\s+/).filter(Boolean),
-            })
-          }
+          onChange={(event) => patch({ extraLaunchArgs: parseLaunchArgs(event.target.value) })}
         />
+        <span className="text-faint">{t("Studio.add.engineArgsHint")}</span>
       </label>
 
       <Button

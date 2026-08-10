@@ -3112,6 +3112,198 @@ pub struct HybridIndex {
     embedding_spec: EmbeddingSpec,
 }
 
+/// Test-only tally of [`HybridIndex::open`] calls per index path. `open`
+/// revalidates every stored chunk (see [`digest_stored_index`]), so a caller
+/// that opens the same index twice to serve one query doubles the cost of that
+/// query — which is exactly what `open_active_index` used to do on top of
+/// [`GenerationStore::active`]. Keyed by path rather than a single global
+/// counter so a test can assert on its own temporary index while the rest of
+/// the suite opens theirs in parallel.
+#[cfg(test)]
+static INDEX_OPENS: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
+
+#[cfg(not(test))]
+fn record_index_open(_path: &Path) {}
+
+#[cfg(test)]
+fn record_index_open(path: &Path) {
+    *INDEX_OPENS
+        .lock()
+        .expect("index-open tally")
+        .get_or_insert_with(HashMap::new)
+        .entry(path.to_path_buf())
+        .or_insert(0) += 1;
+}
+
+#[cfg(test)]
+fn index_opens(path: &Path) -> usize {
+    let opens = INDEX_OPENS.lock().expect("index-open tally");
+    opens
+        .as_ref()
+        .and_then(|counts| counts.get(path).copied())
+        .unwrap_or(0)
+}
+
+/// What makes one *version* of an index file distinct from another.
+///
+/// Device and inode rather than the path, plus size and mtime: a generation is
+/// immutable and a new one is a new file, so a match on all four means the bytes
+/// on disk are the ones that were validated. A path alone would be wrong — a
+/// prune can replace `index.sqlite3` under a stable path — and a digest alone
+/// would be wrong for the opposite reason: the digest is read *out of the file*,
+/// so it is the claim being checked, not evidence about it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_ns: u128,
+}
+
+impl FileIdentity {
+    fn of(path: &Path, metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let (device, inode) = {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        };
+        // Windows has no stable cheap inode from `symlink_metadata`, so the path
+        // stands in. It is weaker — two different files cannot share a path at
+        // one instant, but a replaced file can reuse one — which is exactly what
+        // size and mtime below are here to catch.
+        #[cfg(not(unix))]
+        let (device, inode) = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            path.hash(&mut hasher);
+            (0_u64, hasher.finish())
+        };
+        let _ = path;
+        FileIdentity {
+            device,
+            inode,
+            size: metadata.len(),
+            modified_ns: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// Index files whose contents this process has already validated.
+///
+/// # The regression this fixes
+///
+/// `HybridIndex::open` runs on **every query**, and it re-derived the content
+/// digest from every stored chunk and re-ran the FTS mirror check each time. A
+/// warm query therefore did three deserialization passes over the whole index
+/// where v1 did none — the one performance debt v1's removal left behind.
+///
+/// # What the cache claims, and what it does not
+///
+/// It claims: *these exact bytes, at this size and mtime, on this inode, were
+/// validated and their stored digest was `X`.* Corruption detection stays where
+/// it belongs — at write and at import, where the bytes are produced — and the
+/// first open of any file version still pays the full check.
+///
+/// It does **not** claim that a file is uncorruptible. A rewrite that preserved
+/// device, inode, size and mtime to the nanosecond would be skipped, and that is
+/// an accepted limit rather than an oversight: an actor able to do that can also
+/// rewrite the `index_digest` metadata the check compares against, so the check
+/// was never the defence against them. What it does defend is the ordinary case
+/// — a truncated write, a bit-rotted page, a partially copied file — every one of
+/// which changes size or mtime and so re-validates.
+///
+/// Bounded, because a long-lived process refreshing a stack repeatedly would
+/// otherwise accumulate one entry per generation forever. The bound is generous
+/// relative to how many indexes exist at once and the eviction is arbitrary:
+/// evicting the wrong entry costs one full validation, not correctness.
+const MAX_VALIDATED_INDEXES: usize = 64;
+
+static VALIDATED_INDEXES: Mutex<Option<HashMap<FileIdentity, String>>> = Mutex::new(None);
+
+/// Test-only tally of *full* validations — the O(all chunks) work the cache
+/// exists to skip. Counting opens is not enough to prove the fix: an open that
+/// hits the cache and one that does not look identical from the outside.
+///
+/// Per path, like [`INDEX_OPENS`], because these tests run in parallel with
+/// every other test that opens an index and a single global counter would read
+/// their work as its own.
+#[cfg(test)]
+static FULL_VALIDATIONS: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
+
+#[cfg(not(test))]
+fn record_full_validation(_path: &Path) {}
+
+#[cfg(test)]
+fn record_full_validation(path: &Path) {
+    if let Ok(mut counts) = FULL_VALIDATIONS
+        .lock()
+        .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
+    {
+        *counts
+            .get_or_insert_with(HashMap::new)
+            .entry(path.to_path_buf())
+            .or_insert(0) += 1;
+    }
+}
+
+#[cfg(test)]
+fn full_validations(path: &Path) -> usize {
+    let counts = FULL_VALIDATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    counts
+        .as_ref()
+        .and_then(|counts| counts.get(path).copied())
+        .unwrap_or(0)
+}
+
+fn validation_is_cached(identity: &FileIdentity, index_digest: &str) -> bool {
+    let Ok(guard) = VALIDATED_INDEXES
+        .lock()
+        .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
+    else {
+        return false;
+    };
+    guard
+        .as_ref()
+        .and_then(|cache| cache.get(identity))
+        .is_some_and(|cached| cached == index_digest)
+}
+
+fn remember_validated(identity: FileIdentity, index_digest: String) {
+    let Ok(mut guard) = VALIDATED_INDEXES
+        .lock()
+        .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
+    else {
+        return;
+    };
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if cache.len() >= MAX_VALIDATED_INDEXES && !cache.contains_key(&identity) {
+        if let Some(victim) = cache.keys().next().cloned() {
+            cache.remove(&victim);
+        }
+    }
+    cache.insert(identity, index_digest);
+}
+
+/// Drops every cached verdict. Test-only: the cache is keyed on file identity,
+/// so production has no reason to invalidate it by hand — a changed file is a
+/// different key.
+#[cfg(test)]
+fn forget_validated_indexes() {
+    if let Ok(mut guard) = VALIDATED_INDEXES
+        .lock()
+        .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
+    {
+        *guard = None;
+    }
+}
+
 impl HybridIndex {
     pub fn create(
         path: &Path,
@@ -3239,12 +3431,14 @@ impl HybridIndex {
     }
 
     pub fn open(path: &Path) -> PipelineResult<Self> {
+        record_index_open(path);
         let metadata = fs::symlink_metadata(path)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(PipelineError::InvalidIndex(
                 "index must be a regular file".to_string(),
             ));
         }
+        let identity = FileIdentity::of(path, &metadata);
         let connection = Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -3266,13 +3460,23 @@ impl HybridIndex {
         let embedding_spec: EmbeddingSpec =
             serde_json::from_str(&metadata_value(&connection, "embedding_spec")?)?;
         embedding_spec.validate()?;
-        let computed_digest = digest_stored_index(&connection, &generation_id, &embedding_spec)?;
-        if computed_digest != index_digest {
-            return Err(PipelineError::InvalidIndex(
-                "index content digest does not match immutable metadata".to_string(),
-            ));
+
+        // The two O(all chunks) passes — re-deriving the content digest from
+        // every stored chunk, and the FTS mirror set-difference — run once per
+        // *file version* rather than once per open. See [`VALIDATED_INDEXES`]
+        // for why that is safe and what it deliberately does not claim.
+        if !validation_is_cached(&identity, &index_digest) {
+            record_full_validation(path);
+            let computed_digest =
+                digest_stored_index(&connection, &generation_id, &embedding_spec)?;
+            if computed_digest != index_digest {
+                return Err(PipelineError::InvalidIndex(
+                    "index content digest does not match immutable metadata".to_string(),
+                ));
+            }
+            verify_fts_mirror(&connection)?;
+            remember_validated(identity, index_digest.clone());
         }
-        verify_fts_mirror(&connection)?;
         Ok(Self {
             path: path.to_path_buf(),
             generation_id,
@@ -3842,11 +4046,28 @@ fn verify_fts_mirror(connection: &Connection) -> PipelineResult<()> {
             "FTS mirror count differs from the chunk table".to_string(),
         ));
     }
+    // Set difference, not a join. `chunks_fts` is an FTS5 virtual table with no
+    // index on `chunk_id`, so `chunks LEFT JOIN chunks_fts ON chunk_id` — the
+    // shape this check used to have — rescans the whole FTS table once per chunk
+    // row: 31s to open an 11k-chunk index, dwarfing everything else `open` does
+    // (the per-chunk digest recompute over the same rows is ~120ms). `EXCEPT`
+    // sorts each side once instead, and with the count equality above it carries
+    // exactly the same guarantee: every stored chunk's searchable text and
+    // heading appear in the mirror, and the mirror holds nothing else.
+    //
+    // That equivalence leans on `chunks.chunk_id` being a PRIMARY KEY, so state it
+    // rather than leave it implicit. `EXCEPT` deduplicates, so on its own it only
+    // proves `distinct(chunks) ⊆ distinct(mirror)`. Uniqueness on the chunks side
+    // makes that set as large as the row count, and an extra mirror row would then
+    // push the mirror's row count above it — which the count check above already
+    // refused. Drop the primary key and this check silently weakens to "the mirror
+    // contains at least the distinct chunk rows", so the two belong together.
     let mismatches = connection.query_row(
-        "SELECT COUNT(*)
-         FROM chunks AS c
-         LEFT JOIN chunks_fts AS f ON f.chunk_id = c.chunk_id
-         WHERE f.chunk_id IS NULL OR f.text != c.text OR f.heading != c.heading",
+        "SELECT COUNT(*) FROM (
+             SELECT chunk_id, text, heading FROM chunks
+             EXCEPT
+             SELECT chunk_id, text, heading FROM chunks_fts
+         )",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -4328,6 +4549,58 @@ impl GenerationStore {
     }
 
     pub fn active(&self, stack_id: &str) -> PipelineResult<Option<ActiveGeneration>> {
+        Ok(self
+            .active_with_index(stack_id)?
+            .map(|(generation, _)| generation))
+    }
+
+    /// The verified active generation **and** the [`HybridIndex`] resolving it
+    /// already opened. Callers that need both (a refresh reading the previous
+    /// generation's chunks, a prune rewriting it) must use this rather than
+    /// `active()` followed by `open_active_index()`: `HybridIndex::open`
+    /// revalidates every stored chunk, so the second call re-pays an
+    /// O(all chunks) cost for a file that cannot have changed in between —
+    /// generations are immutable.
+    pub fn active_with_index(
+        &self,
+        stack_id: &str,
+    ) -> PipelineResult<Option<(ActiveGeneration, HybridIndex)>> {
+        Ok(self
+            .resolve_active(stack_id, true)?
+            .map(|(generation, index)| {
+                (
+                    generation,
+                    index.expect(
+                        "a verified active generation carries the index it was verified with",
+                    ),
+                )
+            }))
+    }
+
+    /// The active generation's manifest **without** opening its index — every
+    /// cheap check `active` makes (active-state parse, manifest hash, manifest
+    /// validation, stack/generation identity) minus the one expensive one
+    /// (`HybridIndex::open`, which revalidates every stored chunk). For callers
+    /// that only read manifest fields and never touch chunks; a read-only
+    /// staleness badge fanned out across every stack must not pay a full index
+    /// revalidation per stack to answer a hint.
+    ///
+    /// The cost is precision, not safety: a generation whose index file is
+    /// missing or corrupt is still reported here, where `active` would skip it
+    /// and fall back to an older active-state entry. Nothing is *served* from
+    /// this — the query path goes through `open_active_index` and still fails
+    /// hard on a corrupt index.
+    pub fn active_manifest(&self, stack_id: &str) -> PipelineResult<Option<ActiveGeneration>> {
+        Ok(self
+            .resolve_active(stack_id, false)?
+            .map(|(generation, _)| generation))
+    }
+
+    fn resolve_active(
+        &self,
+        stack_id: &str,
+        verify_index: bool,
+    ) -> PipelineResult<Option<(ActiveGeneration, Option<HybridIndex>)>> {
         validate_stable_id("stack_id", stack_id)?;
         let directory = self.active_stack_dir(stack_id);
         if !directory.exists() {
@@ -4394,25 +4667,38 @@ impl GenerationStore {
             {
                 continue;
             }
-            let Ok(index) = HybridIndex::open(&generation_dir.join(INDEX_FILE)) else {
-                continue;
+            // Two digest checks, neither redundant with the other. `open`
+            // recomputes the index's content digest and compares it to the
+            // digest stored *inside the same file* — that catches corruption or
+            // tampering of the index itself. The comparison after it checks that
+            // claim against the manifest, which is what catches an index file
+            // that is internally consistent but belongs to another (or a
+            // stale) generation than the active pointer names.
+            let index = if verify_index {
+                let Ok(index) = HybridIndex::open(&generation_dir.join(INDEX_FILE)) else {
+                    continue;
+                };
+                if index.index_digest() != manifest.index_digest {
+                    continue;
+                }
+                Some(index)
+            } else {
+                None
             };
-            if index.index_digest() != manifest.index_digest {
-                continue;
-            }
-            return Ok(Some(ActiveGeneration {
-                sequence: state.sequence,
-                manifest,
-                directory: generation_dir,
-            }));
+            return Ok(Some((
+                ActiveGeneration {
+                    sequence: state.sequence,
+                    manifest,
+                    directory: generation_dir,
+                },
+                index,
+            )));
         }
         Ok(None)
     }
 
     pub fn open_active_index(&self, stack_id: &str) -> PipelineResult<Option<HybridIndex>> {
-        self.active(stack_id)?
-            .map(|generation| HybridIndex::open(&generation.directory.join(INDEX_FILE)))
-            .transpose()
+        Ok(self.active_with_index(stack_id)?.map(|(_, index)| index))
     }
 
     fn active_stack_dir(&self, stack_id: &str) -> PathBuf {
@@ -5850,6 +6136,241 @@ mod tests {
         assert_eq!(active.manifest.generation_id, first_id);
         assert_eq!(active.sequence, 1);
         assert!(store.root().join(GENERATIONS_DIR).join(second_id).is_dir());
+    }
+
+    /// Serving a query must revalidate the active index once. `open_active_index`
+    /// used to call `active` (which opens the index to cross-check its digest
+    /// against the manifest) and then open the very same file again, so every
+    /// search paid `digest_stored_index`'s per-chunk revalidation twice.
+    #[test]
+    fn serving_the_active_index_opens_it_once_per_call() {
+        let directory = TestDirectory::new("generation-open-count");
+        let store = GenerationStore::new(directory.path()).expect("store");
+        let generation_id = Uuid::new_v4().to_string();
+        let chunk = chunks_for("generation-open-count", "the only generation").remove(0);
+        let build = generation_build(generation_id.clone(), None, chunk, vec![1.0, 0.0]);
+        let staged = store
+            .stage(&build, &test_limits(), &CancellationToken::new())
+            .expect("stage");
+        store
+            .activate(staged, &CancellationToken::new())
+            .expect("activate");
+        let index_path = store
+            .root()
+            .join(GENERATIONS_DIR)
+            .join(&generation_id)
+            .join(INDEX_FILE);
+
+        let before = index_opens(&index_path);
+        let index = store
+            .open_active_index("stack:test")
+            .expect("open active index")
+            .expect("active index");
+        assert_eq!(index.path(), index_path);
+        assert_eq!(index_opens(&index_path) - before, 1);
+
+        let before = index_opens(&index_path);
+        let (active, index) = store
+            .active_with_index("stack:test")
+            .expect("load active")
+            .expect("active generation");
+        assert_eq!(active.manifest.generation_id, generation_id);
+        assert_eq!(index.index_digest(), active.manifest.index_digest);
+        assert_eq!(index_opens(&index_path) - before, 1);
+    }
+
+    /// Serializes the tests that read [`full_validations`] or depend on the
+    /// validation cache being empty for a path.
+    ///
+    /// Both are process-wide by construction — the whole point is that a verdict
+    /// outlives one `open` call — so parallel tests would otherwise read each
+    /// other's counts. Poisoning is absorbed so one failing test reports its own
+    /// assertion rather than turning every sibling into a second failure.
+    static VALIDATION_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn validation_cache_lock() -> std::sync::MutexGuard<'static, ()> {
+        let guard = VALIDATION_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        forget_validated_indexes();
+        guard
+    }
+
+    /// The D2 regression, pinned: `open` runs on every query and used to
+    /// re-derive the content digest from every stored chunk each time.
+    ///
+    /// Counting *opens* would not prove this — a cached open and a full one look
+    /// identical from outside — so this counts the O(all chunks) validation
+    /// itself.
+    #[test]
+    fn a_second_open_of_an_unchanged_index_does_not_revalidate_every_chunk() {
+        let _serial = validation_cache_lock();
+        let directory = TestDirectory::new("validate-once");
+        let path = directory.path().join("index.sqlite3");
+        let chunk = chunks_for("validate-once", "some indexed text").remove(0);
+        HybridIndex::create(
+            &path,
+            &Uuid::new_v4().to_string(),
+            std::slice::from_ref(&chunk),
+            &[vec![1.0, 0.0]],
+            &embedding_spec(),
+            &CancellationToken::new(),
+        )
+        .expect("create");
+
+        let before = full_validations(&path);
+        HybridIndex::open(&path).expect("the first open validates");
+        assert_eq!(
+            full_validations(&path) - before,
+            1,
+            "the first open of a file version must pay the full check"
+        );
+
+        for _ in 0..5 {
+            HybridIndex::open(&path).expect("a warm open still opens");
+        }
+        assert_eq!(
+            full_validations(&path) - before,
+            1,
+            "every later query re-paid an O(all chunks) revalidation — the D2 debt"
+        );
+    }
+
+    /// The half that makes the cache safe to have: a corrupted chunk is still
+    /// refused, *after* a successful open has already cached a verdict for that
+    /// path.
+    ///
+    /// The cache is keyed on the file's identity — device, inode, size, mtime —
+    /// so writing to it produces a different key and the full check runs again.
+    /// A cache keyed on the path alone would silently serve a corrupt index here,
+    /// which is precisely the failure worth a test.
+    #[test]
+    fn a_corrupted_chunk_is_still_refused_after_a_cached_open() {
+        let _serial = validation_cache_lock();
+        let directory = TestDirectory::new("corrupt-after-cache");
+        let path = directory.path().join("index.sqlite3");
+        let chunk = chunks_for("corrupt-after-cache", "the original chunk text").remove(0);
+        HybridIndex::create(
+            &path,
+            &Uuid::new_v4().to_string(),
+            std::slice::from_ref(&chunk),
+            &[vec![1.0, 0.0]],
+            &embedding_spec(),
+            &CancellationToken::new(),
+        )
+        .expect("create");
+
+        // Open twice: the second is the one that would be served from the cache.
+        HybridIndex::open(&path).expect("the untampered index opens");
+        HybridIndex::open(&path).expect("and opens again from the cache");
+
+        // Now corrupt a chunk's payload. The digest stored in the file still
+        // claims the original contents, which is what the check catches.
+        let connection = Connection::open(&path).expect("open writable");
+        connection
+            .execute(
+                "UPDATE chunks SET chunk_json = replace(chunk_json, 'original', 'tampered')",
+                [],
+            )
+            .expect("tamper chunk");
+        drop(connection);
+
+        assert!(
+            matches!(
+                HybridIndex::open(&path),
+                Err(PipelineError::InvalidIndex(_))
+            ),
+            "a corrupted chunk must be refused even though this path had a cached verdict"
+        );
+
+        // And it stays refused — a failed validation must not be cached as a
+        // pass, and must not be skipped on the next attempt either.
+        assert!(matches!(
+            HybridIndex::open(&path),
+            Err(PipelineError::InvalidIndex(_))
+        ));
+    }
+
+    /// A second, *different* index does not inherit the first one's verdict.
+    #[test]
+    fn a_cached_verdict_belongs_to_one_file_and_not_to_the_next() {
+        let _serial = validation_cache_lock();
+        let directory = TestDirectory::new("per-file-verdict");
+        let embedding = embedding_spec();
+
+        let first = directory.path().join("first.sqlite3");
+        HybridIndex::create(
+            &first,
+            &Uuid::new_v4().to_string(),
+            &chunks_for("first", "first index text"),
+            &[vec![1.0, 0.0]],
+            &embedding,
+            &CancellationToken::new(),
+        )
+        .expect("create first");
+
+        let second = directory.path().join("second.sqlite3");
+        HybridIndex::create(
+            &second,
+            &Uuid::new_v4().to_string(),
+            &chunks_for("second", "second index text"),
+            &[vec![0.0, 1.0]],
+            &embedding,
+            &CancellationToken::new(),
+        )
+        .expect("create second");
+
+        let before = full_validations(&first) + full_validations(&second);
+        HybridIndex::open(&first).expect("first opens");
+        HybridIndex::open(&second).expect("second opens");
+        assert_eq!(
+            full_validations(&first) + full_validations(&second) - before,
+            2,
+            "each file pays its own first validation"
+        );
+    }
+
+    /// The lexical half of every hybrid query is served from `chunks_fts`, and
+    /// the content digest covers only the `chunks` table — so the mirror check is
+    /// the sole thing standing between an edited FTS row and a search that
+    /// silently returns text no chunk contains. Pinned here because that check
+    /// was rewritten (`LEFT JOIN` to `EXCEPT`) for speed.
+    #[test]
+    fn a_tampered_fts_mirror_is_rejected() {
+        let directory = TestDirectory::new("fts-mirror");
+        let path = directory.path().join("index.sqlite3");
+        let chunk = chunks_for("fts-mirror", "mirrored chunk text").remove(0);
+        HybridIndex::create(
+            &path,
+            &Uuid::new_v4().to_string(),
+            std::slice::from_ref(&chunk),
+            &[vec![1.0, 0.0]],
+            &embedding_spec(),
+            &CancellationToken::new(),
+        )
+        .expect("create");
+        HybridIndex::open(&path).expect("the untampered index opens");
+
+        let connection = Connection::open(&path).expect("open writable");
+        connection
+            .execute("UPDATE chunks_fts SET text = 'tampered'", [])
+            .expect("tamper mirror");
+        drop(connection);
+        assert!(matches!(
+            HybridIndex::open(&path),
+            Err(PipelineError::InvalidIndex(_))
+        ));
+
+        // And a mirror row that is simply gone (counts disagree), not edited.
+        let connection = Connection::open(&path).expect("open writable");
+        connection
+            .execute("DELETE FROM chunks_fts", [])
+            .expect("empty mirror");
+        drop(connection);
+        assert!(matches!(
+            HybridIndex::open(&path),
+            Err(PipelineError::InvalidIndex(_))
+        ));
     }
 
     #[test]

@@ -155,7 +155,11 @@ struct RawSkillManifest {
     /// all-whitespace CSV — both are normalized to "unrestricted" by
     /// `normalize_manifest` regardless, so the distinction never leaks past
     /// that function.
-    #[serde(default, rename = "allowed-tools", deserialize_with = "deserialize_allowed_tools")]
+    #[serde(
+        default,
+        rename = "allowed-tools",
+        deserialize_with = "deserialize_allowed_tools"
+    )]
     allowed_tools: Option<Vec<String>>,
 }
 
@@ -653,9 +657,8 @@ impl NativeSkillManager {
         let command = validate_command(command)?;
         let candidate_roots = [
             Some(self.global_root.clone()),
-            primary_workspace.and_then(|workspace| {
-                workspace_skill_root(workspace, false).ok().flatten()
-            }),
+            primary_workspace
+                .and_then(|workspace| workspace_skill_root(workspace, false).ok().flatten()),
         ];
         let skill_dir = candidate_roots
             .into_iter()
@@ -1364,11 +1367,7 @@ impl NativeSkillManager {
         let output = git_checked(
             &self.git_binary,
             None,
-            [
-                "ls-remote",
-                request.repository_url.as_str(),
-                pattern,
-            ],
+            ["ls-remote", request.repository_url.as_str(), pattern],
             &self.acquisition_root,
         )?;
         let listing = String::from_utf8(output.stdout)
@@ -2036,7 +2035,11 @@ fn normalize_manifest(raw: RawSkillManifest) -> Result<SkillManifest, SkillError
             "frontmatter requirement lists exceed their bounded sizes".to_string(),
         ));
     }
-    if raw.allowed_tools.as_ref().is_some_and(|values| values.len() > 64) {
+    if raw
+        .allowed_tools
+        .as_ref()
+        .is_some_and(|values| values.len() > 64)
+    {
         return Err(SkillError::Invalid(
             "allowed-tools exceeds 64 entries".to_string(),
         ));
@@ -2952,7 +2955,10 @@ mod tests {
             "---\nname: X\ndescription: X\ncommand: x\nversion: 1.0.0\nunknown: true\n---\nDo x.\n",
         )
         .unwrap();
-        assert_eq!(scan_skill_folder(&skill).unwrap().parsed.manifest.command, "x");
+        assert_eq!(
+            scan_skill_folder(&skill).unwrap().parsed.manifest.command,
+            "x"
+        );
 
         // ...but unknown keys nested under `requires` still fail closed.
         fs::write(
@@ -3162,7 +3168,15 @@ mod tests {
             assert!(validate_git_request(&request).is_err());
         }
         // Option-injection and traversal shapes are rejected as references.
-        for commit in ["-evil", "a..b", "a//b", "/main", ".hidden", "main/", "ref with space"] {
+        for commit in [
+            "-evil",
+            "a..b",
+            "a//b",
+            "/main",
+            ".hidden",
+            "main/",
+            "ref with space",
+        ] {
             assert!(
                 validate_git_request(&GitSkillRequest {
                     repository_url: "https://example.com/skill.git".to_string(),
@@ -3214,11 +3228,10 @@ mod tests {
             select_ls_remote_commit(listing, &GitCommitSpec::Reference("v1".to_string())).unwrap(),
             "5555555555555555555555555555555555555555"
         );
-        assert!(select_ls_remote_commit(
-            listing,
-            &GitCommitSpec::Reference("missing".to_string())
-        )
-        .is_err());
+        assert!(
+            select_ls_remote_commit(listing, &GitCommitSpec::Reference("missing".to_string()))
+                .is_err()
+        );
         assert!(select_ls_remote_commit("", &GitCommitSpec::DefaultHead).is_err());
     }
 
@@ -3659,11 +3672,13 @@ esac
             .set_enabled_many(SkillScope::Global, None, &mixed, false)
             .is_err());
         let after_partial = manager.discover(None, &[]).unwrap();
-        assert!(!after_partial
-            .iter()
-            .find(|skill| skill.command == commands[0])
-            .unwrap()
-            .enabled);
+        assert!(
+            !after_partial
+                .iter()
+                .find(|skill| skill.command == commands[0])
+                .unwrap()
+                .enabled
+        );
     }
 
     #[cfg(unix)]
@@ -3703,7 +3718,10 @@ esac
             "allowed-tools: [read_file, grep]\n",
         );
         let manifest = scan_skill_folder(&skill).unwrap().parsed.manifest;
-        assert_eq!(manifest.allowed_tools, vec!["grep".to_string(), "read_file".to_string()]);
+        assert_eq!(
+            manifest.allowed_tools,
+            vec!["grep".to_string(), "read_file".to_string()]
+        );
     }
 
     #[test]
@@ -3717,7 +3735,10 @@ esac
         );
         // CSV entries are trimmed and returned sorted, same as the list form.
         let manifest = scan_skill_folder(&skill).unwrap().parsed.manifest;
-        assert_eq!(manifest.allowed_tools, vec!["grep".to_string(), "read_file".to_string()]);
+        assert_eq!(
+            manifest.allowed_tools,
+            vec!["grep".to_string(), "read_file".to_string()]
+        );
     }
 
     #[test]
@@ -3748,7 +3769,10 @@ esac
     #[test]
     fn allowed_tools_rejects_too_many_entries() {
         let root = TestDirectory::new("allowed-tools-overflow");
-        let entries = (0..65).map(|index| format!("tool_{index}")).collect::<Vec<_>>().join(", ");
+        let entries = (0..65)
+            .map(|index| format!("tool_{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let skill = write_skill(
             root.path(),
             "review",
@@ -3767,9 +3791,17 @@ esac
         let app_data = root.path().join("app-data");
         let source = write_skill(root.path(), "summarize", "1.0.0", "");
         let manager = NativeSkillManager::new(&app_data).unwrap();
-        let preview = manager.preview_local(&source, SkillScope::Global, None).unwrap();
+        let preview = manager
+            .preview_local(&source, SkillScope::Global, None)
+            .unwrap();
         manager
-            .install_local(&source, SkillScope::Global, None, &preview.approval_digest, true)
+            .install_local(
+                &source,
+                SkillScope::Global,
+                None,
+                &preview.approval_digest,
+                true,
+            )
             .unwrap();
         let contents = manager
             .read_resource("summarize", "references/info.md", None)
@@ -3783,9 +3815,17 @@ esac
         let app_data = root.path().join("app-data");
         let source = write_skill(root.path(), "summarize", "1.0.0", "");
         let manager = NativeSkillManager::new(&app_data).unwrap();
-        let preview = manager.preview_local(&source, SkillScope::Global, None).unwrap();
+        let preview = manager
+            .preview_local(&source, SkillScope::Global, None)
+            .unwrap();
         manager
-            .install_local(&source, SkillScope::Global, None, &preview.approval_digest, true)
+            .install_local(
+                &source,
+                SkillScope::Global,
+                None,
+                &preview.approval_digest,
+                true,
+            )
             .unwrap();
         assert!(manager
             .read_resource("summarize", "../outside.txt", None)
@@ -3802,9 +3842,17 @@ esac
         let source = write_skill(root.path(), "summarize", "1.0.0", "");
         fs::write(source.join("references/binary.bin"), [0xFFu8, 0xFE, 0x00]).unwrap();
         let manager = NativeSkillManager::new(&app_data).unwrap();
-        let preview = manager.preview_local(&source, SkillScope::Global, None).unwrap();
+        let preview = manager
+            .preview_local(&source, SkillScope::Global, None)
+            .unwrap();
         manager
-            .install_local(&source, SkillScope::Global, None, &preview.approval_digest, true)
+            .install_local(
+                &source,
+                SkillScope::Global,
+                None,
+                &preview.approval_digest,
+                true,
+            )
             .unwrap();
         assert!(matches!(
             manager.read_resource("summarize", "references/binary.bin", None),

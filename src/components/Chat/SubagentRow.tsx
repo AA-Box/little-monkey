@@ -5,7 +5,9 @@ import { textContent, type ChatMessage } from "../../lib/llamaClient";
 import { CANCELLED_TOOL_RESULT } from "../../lib/turnEngine";
 import { unwrapUntrustedContent } from "../../lib/untrustedContent";
 import { useSubagentStore, type SubagentStatus } from "../../store/subagentStore";
-import { useSessionStore } from "../../store/sessionStore";
+import { useSessionStore, type SubagentWorktreeInfo } from "../../store/sessionStore";
+import { agentWorktreeClient } from "../../lib/agentWorktree";
+import { errorMessage } from "../../lib/errors";
 import { formatCompactTokens, formatElapsed } from "../../lib/taskFormat";
 import { useT } from "../../lib/i18n";
 import {
@@ -38,7 +40,8 @@ export interface SubagentRowProps {
 
 export interface ParsedTaskArgs {
   description: string;
-  profile: "explore" | "code";
+  /** Built-in profile or a custom agent name (`customAgents.ts`). */
+  profile: string;
 }
 
 /** Exported for `SubagentRow.test.ts` — this codebase's test setup runs
@@ -55,13 +58,23 @@ export function parseTaskArgs(args: string): ParsedTaskArgs {
       const candidate = parsed as Partial<ParsedTaskArgs>;
       return {
         description: typeof candidate.description === "string" && candidate.description.trim().length > 0 ? candidate.description : "Subagent task",
-        profile: candidate.profile === "code" ? "code" : "explore",
+        profile: typeof candidate.profile === "string" && candidate.profile.trim().length > 0 ? candidate.profile.trim() : "explore",
       };
     }
   } catch {
     // fall through to the default below
   }
   return { description: "Subagent task", profile: "explore" };
+}
+
+/** What the header's agent badge shows: the translated built-in profile
+ * label, or a custom agent's own name verbatim (a user-authored identifier,
+ * not translatable copy). Exported for `SubagentRow.test.ts`, same
+ * logic-not-JSX convention as `parseTaskArgs`. */
+export function profileBadge(profile: string): { i18nKey: string } | { raw: string } {
+  if (profile === "explore") return { i18nKey: "SubagentRow.profileExplore" };
+  if (profile === "code") return { i18nKey: "SubagentRow.profileCode" };
+  return { raw: profile };
 }
 
 export interface ChildToolCallRow {
@@ -229,6 +242,75 @@ const ChildToolGroupRow = memo(function ChildToolGroupRow({ group }: { group: Ch
  * is empty but the run itself already finished and was persisted by
  * `runSubagentTask`'s `finish` helper.
  */
+/**
+ * "Changes in worktree" footer for a run that kept its isolated worktree —
+ * the diffstat plus the two terminal actions: Apply (git-apply the diff onto
+ * the workspace via the path-validating Rust command, then remove the
+ * worktree) and Discard (force-remove it). A conflict on Apply errors and
+ * leaves the worktree in place, exactly as the Rust side promises.
+ */
+function WorktreeFooter({ sessionId, taskId, worktree }: { sessionId: string; taskId: string; worktree: SubagentWorktreeInfo }) {
+  const { t } = useT();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const run = async (action: "applied" | "discarded") => {
+    setBusy(true);
+    setError(null);
+    try {
+      if (action === "applied") {
+        await agentWorktreeClient.apply(worktree.path);
+        // The diff now lives in the workspace; the worktree itself is spent.
+        await agentWorktreeClient.remove(worktree.path, true);
+      } else {
+        await agentWorktreeClient.remove(worktree.path, true);
+      }
+      useSessionStore.getState().setSubagentWorktreeStatus(sessionId, taskId, action);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mt-2 rounded-md border border-border bg-surface-2 px-3 py-2">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-medium text-foreground">{t("SubagentRow.worktreeChanges")}</span>
+        <span className="min-w-0 truncate font-mono text-[10px] text-faint">{worktree.path}</span>
+        {worktree.status === "kept" ? (
+          <span className="ml-auto flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void run("applied")}
+              className="cursor-pointer text-xs font-medium text-accent hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {t("SubagentRow.worktreeApply")}
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void run("discarded")}
+              className="cursor-pointer text-xs text-faint hover:text-danger disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {t("SubagentRow.worktreeDiscard")}
+            </button>
+          </span>
+        ) : (
+          <span className="ml-auto shrink-0 text-xs text-muted">
+            {worktree.status === "applied" ? t("SubagentRow.worktreeApplied") : t("SubagentRow.worktreeDiscarded")}
+          </span>
+        )}
+      </div>
+      {worktree.diffstat && (
+        <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-all font-mono text-[10px] text-muted">{worktree.diffstat}</pre>
+      )}
+      {error && <p className="mt-1 text-xs text-danger">{error}</p>}
+    </div>
+  );
+}
+
 const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result }: SubagentRowProps) {
   const { t } = useT();
   const [open, setOpen] = useState(false);
@@ -239,7 +321,10 @@ const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result 
   // transient store is gone (post-restart), see ChatSession.subagentRunMeta.
   const persistedMeta = useSessionStore((state) => state.sessions.find((s) => s.id === sessionId)?.subagentRunMeta?.[taskId]);
 
-  const { description } = parseTaskArgs(args);
+  const { description, profile } = parseTaskArgs(args);
+  // The live/persisted run knows the ACTUAL profile it ran under (a custom
+  // name survives there even when the transcript args were minified away).
+  const badge = profileBadge(live?.profile ?? persistedMeta?.profile ?? profile);
   const status: SubagentStatus = resolveSubagentStatus(live?.status, result);
   const running = status === "running";
   const transcript = live?.liveMessages ?? persisted ?? [];
@@ -281,6 +366,9 @@ const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result 
           className="flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-[13px] text-muted transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent motion-reduce:transition-none"
         >
           <span className="min-w-0 truncate">{headerTitle}</span>
+          <span className="shrink-0 rounded-full border border-border px-1.5 text-[10px] font-medium text-faint">
+            {"i18nKey" in badge ? t(badge.i18nKey) : badge.raw}
+          </span>
           {running && (
             <span className="flex shrink-0 items-center gap-1" aria-hidden>
               <span className="h-1 w-1 animate-bounce rounded-full bg-faint [animation-delay:-0.3s]" />
@@ -314,6 +402,9 @@ const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result 
                 <div className="mb-1 text-faint">{t("SubagentRow.reportLabel")}</div>
                 <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all">{result}</pre>
               </div>
+            )}
+            {persistedMeta?.worktree && (
+              <WorktreeFooter sessionId={sessionId} taskId={taskId} worktree={persistedMeta.worktree} />
             )}
           </div>
         )}

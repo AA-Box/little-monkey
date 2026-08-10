@@ -58,3 +58,9 @@ src-tauri/resources/managed-runtime/*
 extensions/little-monkey-jetbrains/.gradle
 extensions/little-monkey-jetbrains/.intellijPlatform
 extensions/little-monkey-jetbrains/build
+
+# Built MLX service package (interpreter + mlx-lm; produced by pnpm mlx:package)
+packaging/mlx/dist
+packaging/mlx/mlx-runtime-*.tar.gz
+packaging/mlx/mlx-catalog.json
+packaging/mlx/service/__pycache__
