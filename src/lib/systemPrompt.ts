@@ -346,6 +346,11 @@ export function buildSystemPrompt(
           '',
           '## Plan Mode',
           "You are in Plan Mode: read_file, glob, grep, and list_dir work normally, but every other tool call — including write_file, edit_file, run_shell, remember, web_fetch, and web_search — is blocked and will return an error if you try. Investigate using only the read-only filesystem tools first, then call present_plan exactly once with your proposed plan (a short title, the plan itself as Markdown, and any open_questions worth asking) — then stop and wait for the user to approve it.",
+          ...(subagentGuidanceAvailable
+            ? [
+                'Delegating read-only research with the task/workflow tools still works in Plan Mode, but only with profile "explore" (or a read-only custom agent) — a "code"-profile agent is refused without running.',
+              ]
+            : []),
         ]
       : [];
 

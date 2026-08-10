@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
@@ -20,6 +20,7 @@ import {
   attemptStream,
   CANCELLED_TOOL_RESULT,
   executeToolCall,
+  isBlockedInPlanMode,
   isToolCallAllowed,
   PRESENT_PLAN_RESULT,
   stringifyToolError,
@@ -42,6 +43,7 @@ import { useWorkspaceStore } from "../store/workspaceStore";
 import { useSessionStore } from "../store/sessionStore";
 import { providerModelTargetKey } from "./modelTargets";
 import { useUserHooksStore } from "../store/userHooksStore";
+import { usePermissionStore } from "../store/permissionStore";
 
 const emptyMcpRegistry: McpToolRegistry = new Map();
 
@@ -1219,5 +1221,55 @@ describe("executeToolCall / user hooks", () => {
     await executeToolCall(call("read_file", { path: "a.txt" }), null, "turn-1", emptyMcpRegistry);
 
     expect(invokeMock.mock.calls.some(([name]) => name === "hook_exec")).toBe(false);
+  });
+});
+
+describe("executeToolCall / Plan Mode dispatch backstop", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    usePermissionStore.setState({ mode: "plan" });
+  });
+
+  afterEach(() => {
+    usePermissionStore.setState({ mode: "manual" });
+  });
+
+  it.each(["write_file", "edit_file", "run_shell", "shell_kill", "remember", "web_fetch", "web_search"])(
+    "refuses %s without dispatching to Rust",
+    async (name) => {
+      const result = await executeToolCall(call(name, { path: "a.ts" }), null, "turn-1", emptyMcpRegistry);
+      expect(JSON.parse(result).error).toContain("Plan Mode");
+      expect(invokeMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("refuses an mcp__ tool without resolving or dispatching it", async () => {
+    const result = await executeToolCall(call("mcp__srv__write_row"), null, "turn-1", emptyMcpRegistry);
+    expect(JSON.parse(result).error).toContain("Plan Mode");
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("still dispatches read-only tools in plan mode", async () => {
+    invokeMock.mockResolvedValue("file contents");
+    const result = await executeToolCall(call("read_file", { path: "a.ts" }), null, "turn-1", emptyMcpRegistry);
+    expect(result).toBe("file contents");
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("dispatches the same mutating call normally once the mode is no longer plan — approval re-enables acting", async () => {
+    usePermissionStore.setState({ mode: "acceptEdits" });
+    invokeMock.mockResolvedValue("ok");
+    const result = await executeToolCall(call("write_file", { path: "a.ts", content: "x" }), null, "turn-1", emptyMcpRegistry);
+    expect(result).toBe("ok");
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("isBlockedInPlanMode: pins the exact blocked-name predicate", () => {
+    for (const name of ["write_file", "edit_file", "run_shell", "shell_kill", "remember", "web_fetch", "web_search", "mcp__x__y"]) {
+      expect(isBlockedInPlanMode(name), name).toBe(true);
+    }
+    for (const name of ["read_file", "list_dir", "glob", "grep", "shell_output", "task", "workflow", "skill", "present_plan", "spawn_task"]) {
+      expect(isBlockedInPlanMode(name), name).toBe(false);
+    }
   });
 });

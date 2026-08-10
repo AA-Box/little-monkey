@@ -40,6 +40,7 @@ import { gatePrivacyWireMessages, type PrivacyWireCache } from './privacyWire';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { useSessionStore } from '../store/sessionStore';
+import { usePermissionStore } from '../store/permissionStore';
 import { runSubagentTask } from './subagent';
 import { resolveWorkflowSpec, runWorkflow } from './workflow';
 import { protocolToolCallId } from './durableRun';
@@ -246,6 +247,25 @@ const MUTATING_TOOLS = RISK_ELIGIBLE_TOOLS;
  * Rust can scope a permission prompt (and, for run_shell/web_fetch, Stop-button
  * cancellation) to the right in-flight turn. */
 const PERMISSION_GATED_TOOLS = new Set([...MUTATING_TOOLS, 'remember', 'web_fetch', 'web_search']);
+
+/**
+ * Whether Plan Mode refuses `name` outright: every permission-gated tool
+ * (the exact set Rust's `mode_short_circuit` would refuse anyway — this
+ * predicate is the fail-closed frontend mirror, used both to EXCLUDE these
+ * names from the offered list (`toolsForMode`, agentLoop.ts) and as
+ * `executeToolCall`'s dispatch backstop), plus:
+ * - `shell_kill`: not permission-gated in Rust (a prompt per kill would make
+ *   the Stop affordance useless), so the frontend layers here are its only
+ *   Plan-Mode guard — it mutates process state, which planning never needs.
+ * - every `mcp__` name: MCP tools carry no reliable read-only marking, so
+ *   Plan Mode excludes them wholesale rather than guessing which ones only
+ *   read (they are all permission-gated in Rust too, so this tightens the
+ *   offer to match what dispatch would do anyway).
+ * Exported for `toolsForMode` and the logic tests.
+ */
+export function isBlockedInPlanMode(name: string): boolean {
+  return PERMISSION_GATED_TOOLS.has(name) || name === 'shell_kill' || name.startsWith('mcp__');
+}
 
 function isPermissionGatedTool(name: string): boolean {
   return PERMISSION_GATED_TOOLS.has(name) || name.startsWith('mcp__');
@@ -574,6 +594,24 @@ async function executeToolCallInner(
 ): Promise<string> {
   useUsageHistoryStore.getState().recordToolCall();
   const { name, arguments: rawArguments } = toolCall.function;
+
+  // Plan Mode backstop — the frontend half of the double layer whose other
+  // half is Rust's `mode_short_circuit` (permissions.rs): the offered tool
+  // list already excludes these names in Plan Mode (`toolsForMode`,
+  // agentLoop.ts), but a model that emits one anyway (or a child loop whose
+  // caller composed its own list) must still be refused HERE, before any
+  // dispatch. This is also the ONLY enforcement point for the names Rust
+  // doesn't permission-gate (`shell_kill`), and it covers every subagent's
+  // calls too, since `runSubagentTask` routes through this function.
+  // Checked before the frontend-only branches below purely because none of
+  // those names are blocked — the message mirrors Rust's own wording.
+  if (isBlockedInPlanMode(name) && usePermissionStore.getState().mode === 'plan') {
+    return stringifyToolError(
+      new Error(
+        `Blocked: Little Monkey is in Plan Mode. Describe your plan instead of using ${name} - call the present_plan tool with your proposed plan, then ask the user to approve it and switch out of Plan Mode before making changes.`
+      )
+    );
+  }
 
   let args: Record<string, unknown> = {};
   if (rawArguments && rawArguments.trim().length > 0) {

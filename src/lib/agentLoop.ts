@@ -36,6 +36,7 @@ import {
   CANCELLED_TOOL_RESULT,
   describeUsageTarget,
   executeToolCall,
+  isBlockedInPlanMode,
   isToolCallAllowed,
   PRESENT_PLAN_RESULT,
   stringifyToolError,
@@ -429,7 +430,14 @@ export function toolCallPlanArgs(toolCall: ToolCall): { title: string; plan: str
  * function's output feeds into, alongside `toolsForSettings`).
  */
 export function toolsForMode(tools: ToolDef[], mode: PermissionMode): ToolDef[] {
-  return mode === 'plan' ? [...tools, PRESENT_PLAN_TOOL] : tools;
+  if (mode !== 'plan') return tools;
+  // Fail closed at the OFFER level too, not just at Rust's mode gate: a tool
+  // Plan Mode would refuse anyway (see `isBlockedInPlanMode` — mutating and
+  // permission-gated names, `shell_kill`, and every un-marked `mcp__` tool)
+  // is not even shown to the model, so a well-behaved model never wastes a
+  // round trip on a doomed call. `executeToolCall`'s own check remains the
+  // dispatch backstop for a model that emits one regardless.
+  return [...tools.filter((tool) => !isBlockedInPlanMode(tool.function.name)), PRESENT_PLAN_TOOL];
 }
 
 /** Prefix identifying a synthetic notice inserted right after a successful

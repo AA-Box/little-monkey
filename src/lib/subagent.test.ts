@@ -47,6 +47,11 @@ vi.mock("./turnEngine", () => ({
   // always says "allowed".
   isToolCallAllowed: (toolCall: { function: { name: string } }, toolsForTurn: { function: { name: string } }[]) =>
     toolsForTurn.some((tool) => tool.function.name === toolCall.function.name),
+  // Same real-implementation-not-spy reasoning as `isToolCallAllowed` just
+  // above: the Plan-Mode suite needs the actual predicate semantics.
+  isBlockedInPlanMode: (name: string) =>
+    ["write_file", "edit_file", "run_shell", "shell_kill", "remember", "web_fetch", "web_search"].includes(name) ||
+    name.startsWith("mcp__"),
   CANCELLED_TOOL_RESULT: JSON.stringify({ error: "Cancelled by the user" }),
   stringifyToolError: (err: unknown) => JSON.stringify({ error: errorMessage(err) }),
   describeUsageTarget: (target: ResolvedTarget) =>
@@ -61,6 +66,7 @@ import { selectSubagentRun, useSubagentStore } from "../store/subagentStore";
 import { useSessionStore, type ChatSession } from "../store/sessionStore";
 import { useSettingsStore } from "../store/settingsStore";
 import { useCustomAgentStore } from "../store/customAgentStore";
+import { usePermissionStore } from "../store/permissionStore";
 
 const fakeTarget: ResolvedTarget = { kind: "local", baseUrl: "http://localhost:8090" };
 
@@ -1073,5 +1079,67 @@ describe("runSubagentTask / custom agent profiles", () => {
     const wire = attemptStreamMock.mock.calls[1][1] as ChatMessage[];
     const rejection = wire.find((m) => m.role === "tool");
     expect(rejection && JSON.parse(rejection.content as string).error).toContain('"write_file"');
+  });
+});
+
+describe("runSubagentTask / Plan Mode", () => {
+  const webAgentDef = {
+    name: "researcher",
+    description: "Researches with web tools",
+    tools: ["read_file", "grep", "web_search"],
+    addendum: "",
+    sourcePath: ".monkey/agents/researcher.md",
+  };
+  const fixerAgentDef = {
+    name: "fixer",
+    description: "Fixes bugs",
+    tools: ["read_file", "write_file"],
+    addendum: "",
+    sourcePath: ".monkey/agents/fixer.md",
+  };
+
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    useSettingsStore.setState({ subagentProfileModels: {} });
+    usePermissionStore.setState({ mode: "plan" });
+    useCustomAgentStore.setState({ defs: { researcher: webAgentDef, fixer: fixerAgentDef }, errors: [], loadedAt: Date.now() });
+  });
+
+  afterEach(() => {
+    usePermissionStore.setState({ mode: "manual" });
+    useCustomAgentStore.setState({ defs: {}, errors: [], loadedAt: null });
+  });
+
+  it("refuses a code-profile dispatch outright, without streaming", async () => {
+    const result = await runSubagentTask(baseParams({ profile: "code", toolCallId: "call-plan-code" }));
+    expect(JSON.parse(result).error).toContain("Plan Mode");
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+    expect(useSubagentStore.getState().runs["call-plan-code"]?.status).toBe("error");
+  });
+
+  it("refuses a mutating custom agent by its own name", async () => {
+    const result = await runSubagentTask(baseParams({ profile: "fixer" }));
+    expect(JSON.parse(result).error).toContain('"fixer"');
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+  });
+
+  it("still dispatches an explore child, with Plan-Mode-blocked names dropped from its offer", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "researcher" }));
+
+    const tools = attemptStreamMock.mock.calls[0][2] as { function: { name: string } }[];
+    // web_search is in the def, but Plan Mode refuses it — so it is not even
+    // offered to the child, same double layer as the parent's toolsForMode.
+    expect(tools.map((t) => t.function.name).sort()).toEqual(["grep", "read_file"]);
+  });
+
+  it("dispatches code normally again once the mode is no longer plan", async () => {
+    usePermissionStore.setState({ mode: "acceptEdits" });
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    const result = await runSubagentTask(baseParams({ profile: "code" }));
+    expect(result).toBe("done");
   });
 });

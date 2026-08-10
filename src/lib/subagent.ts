@@ -19,6 +19,7 @@ import {
   attemptStream,
   describeUsageTarget,
   executeToolCall,
+  isBlockedInPlanMode,
   isToolCallAllowed,
   CANCELLED_TOOL_RESULT,
   stringifyToolError,
@@ -40,6 +41,7 @@ import { protectToolResult } from './untrustedContent';
 import { mutationToolFailureReason } from './workspaceMutation';
 import { customAgentBaseProfile, toolsForCustomAgent, type CustomAgentDef } from './customAgents';
 import { useCustomAgentStore } from '../store/customAgentStore';
+import { usePermissionStore } from '../store/permissionStore';
 
 /** Hard cap on model/tool round trips for a single subagent run — smaller
  * than the parent's own `MAX_ITERATIONS` (25, agentLoop.ts) since a
@@ -500,6 +502,24 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
       );
     }
     const baseProfile = resolvedProfile.kind === 'custom' ? resolvedProfile.base : resolvedProfile.profile;
+    // Plan Mode refusal, at DISPATCH rather than per child tool call: a
+    // `code`-class agent exists to make changes, and every change it tried
+    // would be refused anyway (`executeToolCall`'s Plan-Mode backstop + the
+    // Rust mode gate) — refusing the whole dispatch with one actionable
+    // error beats burning a child loop on doomed calls. Snapshotted once,
+    // like every other per-run resolution here: the user approving the plan
+    // mid-run must not retroactively rewire an already-running child.
+    const planMode = usePermissionStore.getState().mode === 'plan';
+    if (planMode && baseProfile === 'code') {
+      return finish(
+        'error',
+        stringifyToolError(
+          new Error(
+            `Blocked: Little Monkey is in Plan Mode, and the "${profile}" agent profile can make changes. Use profile "explore" (or a read-only custom agent) to investigate, or ask the user to approve the plan first.`
+          )
+        )
+      );
+    }
     const roots: PromptWorkspaceRoot[] = useWorkspaceStore.getState().roots;
     const osLabel = detectOsLabel(typeof navigator !== 'undefined' ? navigator.platform : '');
     const systemPrompt = buildSubagentSystemPrompt(
@@ -513,8 +533,13 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
     // `toolsForCustomAgent` (defense in depth on top of load-time
     // validation); `isToolCallAllowed` below then enforces exactly this list
     // per call, so a granted-but-hallucinated name never dispatches either.
-    const tools: ToolDef[] =
+    const profileTools: ToolDef[] =
       resolvedProfile.kind === 'custom' ? toolsForCustomAgent(resolvedProfile.def) : toolsForProfile(resolvedProfile.profile);
+    // In Plan Mode an `explore`-class agent still dispatches, but any name
+    // Plan Mode refuses (a read-only custom agent may hold web tools, which
+    // are permission-gated) is dropped from the child's OFFER too — same
+    // fail-closed double layer the parent's own `toolsForMode` applies.
+    const tools: ToolDef[] = planMode ? profileTools.filter((tool) => !isBlockedInPlanMode(tool.function.name)) : profileTools;
     // The def's own effort wins over the inherited turn effort — that's what
     // declaring `effort` in the definition file is FOR; a caller has no way
     // to signal "explicitly override the def" separately from "inherited".
