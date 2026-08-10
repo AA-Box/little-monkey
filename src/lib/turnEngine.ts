@@ -35,12 +35,13 @@ import {
   providerModelTargetKey,
 } from './modelTargets';
 import { riskCacheKey, type RiskClassification } from './riskJudge';
+import { evaluatePreToolUseHooks, fireObservedHooks, hooksForEvent } from './userHooks';
 import { gatePrivacyWireMessages, type PrivacyWireCache } from './privacyWire';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { useSessionStore } from '../store/sessionStore';
 import { runSubagentTask } from './subagent';
-import { parseWorkflowSpec, runWorkflow } from './workflow';
+import { resolveWorkflowSpec, runWorkflow } from './workflow';
 import { protocolToolCallId } from './durableRun';
 import { formatSkillToolResult, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
@@ -466,8 +467,77 @@ export interface SkillToolContext {
  * to cancel everything cancellable (`tools_cancel_running` kills any running
  * shell child and denies any pending permission prompt) and a cancelled
  * result is returned immediately rather than waiting the command out.
+ *
+ * User hooks wrap the whole dispatch (see `userHooks.ts`): a PreToolUse
+ * hook that explicitly denies blocks the call BEFORE any dispatch and its
+ * reason becomes the tool error; PostToolUse hooks observe the result and
+ * can change nothing. A hook that crashes or times out is a console WARN
+ * and the call proceeds — the deny path fails closed only on an explicit
+ * deny, never on hook infrastructure failure. Every caller (parent turns,
+ * subagents, workflow agents, crew) passes through here, so the hook
+ * boundary is a single place by construction.
  */
 export async function executeToolCall(
+  toolCall: ToolCall,
+  checkpointId: string | null,
+  turnId: string,
+  mcpRegistry: McpToolRegistry,
+  signal?: AbortSignal,
+  risk?: RiskAnnotationContext,
+  attachedStackNames?: string[],
+  subagent?: SubagentContext,
+  agentLabel?: string,
+  skill?: SkillToolContext,
+  chatSessionId?: string
+): Promise<string> {
+  const name = toolCall.function.name;
+  const sessionId = chatSessionId ?? subagent?.sessionId;
+  // Hook payloads carry the model's own args — parsed leniently here (the
+  // strict parse with its error result stays in the inner dispatch).
+  const argsForHooks = (): Record<string, unknown> => {
+    try {
+      const parsed: unknown = JSON.parse(toolCall.function.arguments || '{}');
+      return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  };
+
+  if (hooksForEvent('PreToolUse', name).length > 0) {
+    try {
+      const denial = await evaluatePreToolUseHooks(name, argsForHooks(), sessionId);
+      if (denial !== null) {
+        return stringifyToolError(new Error(`Blocked by a PreToolUse hook: ${denial.reason}`));
+      }
+    } catch (err) {
+      // The evaluator itself already proceeds past individual hook failures;
+      // this catch is defense in depth so a hook-layer bug can never leave a
+      // tool_calls entry without a result.
+      console.warn('PreToolUse hook evaluation failed — proceeding:', err);
+    }
+  }
+
+  const result = await executeToolCallInner(
+    toolCall,
+    checkpointId,
+    turnId,
+    mcpRegistry,
+    signal,
+    risk,
+    attachedStackNames,
+    subagent,
+    agentLabel,
+    skill,
+    chatSessionId,
+  );
+
+  if (hooksForEvent('PostToolUse', name).length > 0) {
+    fireObservedHooks('PostToolUse', { tool_name: name, args: argsForHooks(), session_id: sessionId, result });
+  }
+  return result;
+}
+
+async function executeToolCallInner(
   toolCall: ToolCall,
   checkpointId: string | null,
   turnId: string,
@@ -675,7 +745,7 @@ export async function executeToolCall(
       if (!subagent) {
         return stringifyToolError(new Error('The workflow tool has no subagent execution context configured for this turn.'));
       }
-      const spec = parseWorkflowSpec(args);
+      const spec = resolveWorkflowSpec(args);
       return await runWorkflow({
         sessionId: subagent.sessionId,
         runId: subagent.runId,
@@ -683,6 +753,7 @@ export async function executeToolCall(
         parentSignal: signal,
         toolCallId: toolCall.id,
         spec,
+        resume: typeof args.resume === 'string' && args.resume.trim().length > 0 ? args.resume.trim() : undefined,
         target: subagent.target,
         effort: subagent.effort,
         risk: subagent.risk,
