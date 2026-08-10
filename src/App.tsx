@@ -21,6 +21,8 @@ import {
   useSideTaskStore,
 } from "./store/sideTaskStore";
 import { selectRunningShellTaskCount, useBackgroundShellStore } from "./store/backgroundShellStore";
+import { useUserHooksStore } from "./store/userHooksStore";
+import { fireObservedHooks } from "./lib/userHooks";
 import { useSubagentStore, selectRunningSubagentCount } from "./store/subagentStore";
 import { SessionGrantBanner } from "./components/Workspace/SessionGrantBanner";
 import { IconButton, Button } from "./components/ui";
@@ -405,6 +407,15 @@ function App() {
   // Background Tasks panel happened to be mounted.
   useEffect(() => {
     void useBackgroundShellStore.getState().initialize();
+  }, []);
+
+  // User hooks load once at boot, then SessionStart fires — after the load,
+  // or a hook configured on this very event would never see the first boot.
+  useEffect(() => {
+    void useUserHooksStore
+      .getState()
+      .initialize()
+      .then(() => fireObservedHooks("SessionStart"));
   }, []);
 
   /** The right sidebar hosts real TABS: several panels open at once, one

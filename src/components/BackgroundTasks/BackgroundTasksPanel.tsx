@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { ChevronRight, Loader2, Square, TerminalSquare, X } from "lucide-react";
+import { ChevronRight, CornerDownLeft, Loader2, Square, TerminalSquare, Trash2, X } from "lucide-react";
 
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
 import {
@@ -20,12 +20,14 @@ import {
 } from "../../store/subagentStore";
 import { useSessionStore } from "../../store/sessionStore";
 import { useT } from "../../lib/i18n";
-import { cancelSubagentRun } from "../../lib/subagent";
+import { cancelSubagentRun, steerSubagentRun } from "../../lib/subagent";
 import { formatCompactTokens, formatElapsed } from "../../lib/taskFormat";
 import { textContent, type ChatMessage } from "../../lib/llamaClient";
 import { ToolCallRow } from "../Chat/MessageList";
 import { dotClass, resolveGroupStatus } from "../Chat/SubagentGroupCard";
 import { selectWorkflowRunList, useWorkflowStore, type WorkflowPhase, type WorkflowStatus } from "../../store/workflowStore";
+import { selectSavedWorkflowList, useSavedWorkflowStore, type SavedWorkflow } from "../../store/savedWorkflowStore";
+import type { WorkflowSpec } from "../../lib/workflow";
 
 /**
  * Background tasks: work the APP is doing on its own behalf while the user
@@ -239,6 +241,45 @@ function TranscriptRowsView({ rows }: { rows: TranscriptRow[] }) {
   );
 }
 
+/** One-line mid-run composer for a live subagent run — queues a user message
+ * the child model sees at the top of its next loop iteration (see
+ * `steerSubagentRun` in subagent.ts). Rendered only while the run is
+ * `'running'`; additionally disabled when `cancelId` is empty (a restored
+ * run from a previous app session, which cannot be steered). */
+function SteerInput({ run }: { run: SubagentRun }) {
+  const { t } = useT();
+  const [text, setText] = useState("");
+  const disabled = run.cancelId === "";
+  const send = () => {
+    const trimmed = text.trim();
+    if (!trimmed || disabled) return;
+    if (steerSubagentRun(run.cancelId, trimmed)) setText("");
+  };
+  return (
+    <div className="mt-2 flex items-center gap-1.5">
+      <input
+        type="text"
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") send();
+        }}
+        placeholder={t("BackgroundTasksPanel.steerPlaceholder")}
+        disabled={disabled}
+        className="min-w-0 flex-1 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground placeholder:text-faint focus:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
+      />
+      <IconButton
+        size="sm"
+        aria-label={t("BackgroundTasksPanel.steerSendAriaLabel", { name: run.description })}
+        onClick={send}
+        disabled={disabled || text.trim().length === 0}
+      >
+        <CornerDownLeft size={12} />
+      </IconButton>
+    </div>
+  );
+}
+
 /**
  * One `task`-tool subagent run — the model's own delegated work. Same card
  * shape as `ShellTaskCard` above so the two kinds read as one list: title,
@@ -291,6 +332,7 @@ function AgentTaskCard({ run }: { run: SubagentRun }) {
         )}
       </div>
       {running && run.lastActivity && <div className="mt-1 truncate font-mono text-[11px] text-faint">{run.lastActivity}</div>}
+      {running && <SteerInput run={run} />}
       {showTranscript && (
         <div className="mt-2 space-y-1.5 border-t border-border pt-2">
           <TranscriptRowsView rows={transcriptRows} />
@@ -378,6 +420,7 @@ function AgentTable({ runs }: { runs: SubagentRun[] }) {
                       <div className="space-y-1.5 border-t border-border pt-2">
                         <TranscriptRowsView rows={buildTranscriptRows(run.liveMessages)} />
                       </div>
+                      {run.status === "running" && <SteerInput run={run} />}
                     </td>
                   </tr>
                 )}
@@ -401,6 +444,9 @@ export interface WorkflowRunView {
   phases: WorkflowPhase[];
   /** Defined only for a live, running entry. */
   activePhaseIndex?: number;
+  /** The full spec (prompts included) — live entries only (see
+   * `WorkflowRun.spec`); what the card's "Save workflow" button saves. */
+  spec?: WorkflowSpec;
 }
 
 /**
@@ -415,6 +461,12 @@ function WorkflowRunCard({ view, agentsByTaskId }: { view: WorkflowRunView; agen
   const { t } = useT();
   const running = view.status === "running";
   useLiveTick(running);
+  // Save is offered only when the full spec is at hand (live entries) and
+  // this name isn't saved yet — a fully-successful run auto-saves itself
+  // (see `runWorkflow`), so this button mostly serves failed/cancelled runs
+  // the user still wants to keep.
+  const alreadySaved = useSavedWorkflowStore((state) => Boolean(state.workflows[view.name]));
+  const savableSpec = view.spec;
 
   const memberRuns = view.phases.flatMap((phase) => phase.agents.map((agent) => agentsByTaskId.get(agent.taskId)).filter(Boolean) as SubagentRun[]);
   const totalTokens = memberRuns.reduce((sum, run) => sum + (run.usage?.totalTokens ?? 0), 0);
@@ -446,6 +498,15 @@ function WorkflowRunCard({ view, agentsByTaskId }: { view: WorkflowRunView; agen
         <span className="text-faint">{elapsed}</span>
         <span className="text-faint">{t("BackgroundTasksPanel.tokenUsage", { count: formatCompactTokens(totalTokens) })}</span>
         {running && <Loader2 size={11} className="shrink-0 animate-spin text-warning" />}
+        {savableSpec && !alreadySaved && (
+          <button
+            type="button"
+            onClick={() => useSavedWorkflowStore.getState().upsert(savableSpec)}
+            className="cursor-pointer text-accent hover:underline"
+          >
+            {t("BackgroundTasksPanel.saveWorkflowButton")}
+          </button>
+        )}
       </div>
       <div className="mt-2 space-y-2">
         {view.phases.map((phase, phaseIndex) => {
@@ -538,6 +599,51 @@ function AgentGroupCard({ runs }: { runs: SubagentRun[] }) {
   );
 }
 
+/** The drawer's "Saved workflows" section — the manage surface for
+ * `savedWorkflowStore`: name, description, shape, last run, delete. Runs are
+ * model-invoked only in this slice (the `workflow` tool's `saved` argument);
+ * there is no Run button because a workflow needs a live parent turn's
+ * `SubagentContext` to execute under. Hidden entirely while nothing is
+ * saved. */
+function SavedWorkflowsSection() {
+  const { t } = useT();
+  const saved = useSavedWorkflowStore(useShallow(selectSavedWorkflowList));
+  if (saved.length === 0) return null;
+  return (
+    <div>
+      <div className="text-[11px] font-medium uppercase tracking-wider text-faint">{t("BackgroundTasksPanel.savedWorkflowsHeading")}</div>
+      <div className="mt-1 space-y-1.5">
+        {saved.map((entry: SavedWorkflow) => {
+          const agents = entry.spec.phases.reduce((sum, phase) => sum + phase.agents.length, 0);
+          return (
+            <div key={entry.spec.name} className="rounded-xl border border-border bg-surface-2 p-3">
+              <div className="flex items-start gap-2">
+                <span className="min-w-0 flex-1 truncate text-sm font-medium leading-snug text-foreground">{entry.spec.name}</span>
+                <IconButton
+                  size="sm"
+                  aria-label={t("BackgroundTasksPanel.savedWorkflowDeleteAriaLabel", { name: entry.spec.name })}
+                  onClick={() => useSavedWorkflowStore.getState().remove(entry.spec.name)}
+                >
+                  <Trash2 size={12} />
+                </IconButton>
+              </div>
+              {entry.spec.description.length > 0 && <p className="mt-0.5 truncate text-xs text-faint">{entry.spec.description}</p>}
+              <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-faint">
+                <span>{t("BackgroundTasksPanel.savedWorkflowShape", { phases: entry.spec.phases.length, agents })}</span>
+                <span>
+                  {entry.lastRunAt !== undefined
+                    ? t("BackgroundTasksPanel.savedWorkflowLastRun", { when: new Date(entry.lastRunAt).toLocaleString() })
+                    : t("BackgroundTasksPanel.savedWorkflowNeverRun")}
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export interface BackgroundTasksPanelProps {
   /** The chat session whose persisted subagent-run stats are restored into
    * the Finished section after a restart (see `ChatSession.subagentRunMeta`). */
@@ -625,6 +731,7 @@ export function BackgroundTasksPanel({ sessionId, onClose }: BackgroundTasksPane
       finishedAt: run.finishedAt,
       phases: run.phases,
       activePhaseIndex: run.status === "running" ? run.activePhaseIndex : undefined,
+      spec: run.spec,
     }));
     return [...live, ...restored];
   }, [liveWorkflowRuns, persistedWorkflowMeta]);
@@ -708,6 +815,8 @@ export function BackgroundTasksPanel({ sessionId, onClose }: BackgroundTasksPane
         {shellError && (
           <p className="rounded-md border border-danger bg-danger-soft p-2 text-xs text-danger">{shellError}</p>
         )}
+
+        <SavedWorkflowsSection />
 
         {!hasAnyTask && (
           <div className="flex flex-1 flex-col items-center justify-center py-12 text-center">

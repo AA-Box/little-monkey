@@ -41,6 +41,7 @@ import { usePrivacyFirewallStore } from "../store/privacyFirewallStore";
 import { useWorkspaceStore } from "../store/workspaceStore";
 import { useSessionStore } from "../store/sessionStore";
 import { providerModelTargetKey } from "./modelTargets";
+import { useUserHooksStore } from "../store/userHooksStore";
 
 const emptyMcpRegistry: McpToolRegistry = new Map();
 
@@ -1137,5 +1138,86 @@ describe("attemptStream / privacy firewall choke point", () => {
     await attemptStream(localTarget, [{ role: "user", content: "sk-secret stays local" }], [], undefined, undefined, "session-privacy").catch(() => undefined);
 
     expect(invokeMock).not.toHaveBeenCalledWith("privacy_firewall_preview", expect.anything());
+  });
+});
+
+// User hooks wrap `executeToolCall`'s whole dispatch (see `userHooks.ts`):
+// an explicit PreToolUse deny must block the call BEFORE any `invoke`
+// dispatch and become the tool error; hook infrastructure failure must
+// proceed. Store-seeded directly — the store's own load/save is
+// `userHooks.test.ts`'s subject.
+describe("executeToolCall / user hooks", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    useUserHooksStore.setState({ hooks: [], loaded: true });
+  });
+
+  it("blocks the tool call and returns the hook's reason as the tool error on an explicit deny", async () => {
+    useUserHooksStore.setState({
+      hooks: [{ id: "h1", event: "PreToolUse", command: "guard.sh", matcher: "write_file" }],
+      loaded: true,
+    });
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "hook_exec") return { exit_code: 2, stdout: "", stderr: "protected file", timed_out: false };
+      throw new Error(`unexpected invoke: ${command}`);
+    });
+
+    const result = await executeToolCall(call("write_file", { path: "a.txt", content: "x" }), null, "turn-1", emptyMcpRegistry);
+
+    const parsed = JSON.parse(result) as { error: string };
+    expect(parsed.error).toContain("protected file");
+    // The gate held: nothing but the hook itself was ever invoked.
+    expect(invokeMock.mock.calls.every(([name]) => name === "hook_exec")).toBe(true);
+  });
+
+  it("proceeds to the normal dispatch when the hook times out", async () => {
+    useUserHooksStore.setState({
+      hooks: [{ id: "h1", event: "PreToolUse", command: "guard.sh" }],
+      loaded: true,
+    });
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "hook_exec") return { exit_code: null, stdout: "", stderr: "", timed_out: true };
+      if (command === "tool_read_file") return "file contents";
+      throw new Error(`unexpected invoke: ${command}`);
+    });
+
+    const result = await executeToolCall(call("read_file", { path: "a.txt" }), null, "turn-1", emptyMcpRegistry);
+
+    expect(result).toContain("file contents");
+  });
+
+  it("fires PostToolUse hooks with the result after a successful dispatch", async () => {
+    useUserHooksStore.setState({
+      hooks: [{ id: "h2", event: "PostToolUse", command: "log.sh" }],
+      loaded: true,
+    });
+    const hookPayloads: string[] = [];
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "hook_exec") {
+        hookPayloads.push((args as { payload: string }).payload);
+        return { exit_code: 0, stdout: "", stderr: "", timed_out: false };
+      }
+      if (command === "tool_read_file") return "file contents";
+      throw new Error(`unexpected invoke: ${command}`);
+    });
+
+    await executeToolCall(call("read_file", { path: "a.txt" }), null, "turn-1", emptyMcpRegistry);
+
+    await vi.waitFor(() => expect(hookPayloads.length).toBe(1));
+    const payload = JSON.parse(hookPayloads[0]) as Record<string, unknown>;
+    expect(payload.event).toBe("PostToolUse");
+    expect(payload.tool_name).toBe("read_file");
+    expect(typeof payload.result).toBe("string");
+  });
+
+  it("never consults hooks when none are configured", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_read_file") return "file contents";
+      throw new Error(`unexpected invoke: ${command}`);
+    });
+
+    await executeToolCall(call("read_file", { path: "a.txt" }), null, "turn-1", emptyMcpRegistry);
+
+    expect(invokeMock.mock.calls.some(([name]) => name === "hook_exec")).toBe(false);
   });
 });
