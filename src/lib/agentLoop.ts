@@ -78,6 +78,7 @@ import { admitProcess, exitProcess, exitStatusFor, linkProcessRun, markProcessRu
 import { honourPause, forgetPause, isPauseRequested } from './pauseRegistry';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import {
+  describeRedactions,
   gatePrivacyWireMessages,
   type PrivacyWireCache,
 } from './privacyWire';
@@ -1111,10 +1112,10 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
           });
         } else {
           summaryMessages = gated.messages;
-          if (gated.newlyRedactedFindings > 0) {
+          if (gated.newlyRedacted.length > 0) {
             useSessionStore.getState().addMessage(sessionId, {
               role: 'system',
-              content: `${PRIVACY_NOTE_PREFIX} Redacted ${gated.newlyRedactedFindings} sensitive item(s) before cloud summarization.`,
+              content: `${PRIVACY_NOTE_PREFIX} Redacted ${gated.newlyRedacted.length} sensitive item(s) before cloud summarization: ${describeRedactions(gated.newlyRedacted)}.`,
             });
           }
         }
@@ -1808,10 +1809,10 @@ async function runDaemonAgentTurn(
           privacyOutcome.messages[historyLength + index]?.content ?? '',
         ),
       }));
-      if (privacyOutcome.newlyRedactedFindings > 0) {
+      if (privacyOutcome.newlyRedacted.length > 0) {
         store.addMessage(sessionId, {
           role: 'system',
-          content: `${PRIVACY_NOTE_PREFIX} Redacted ${privacyOutcome.newlyRedactedFindings} sensitive item(s) from the resident turn snapshot before cloud submission.`,
+          content: `${PRIVACY_NOTE_PREFIX} Redacted ${privacyOutcome.newlyRedacted.length} sensitive item(s) from the resident turn snapshot before cloud submission: ${describeRedactions(privacyOutcome.newlyRedacted)}.`,
         });
       }
     }
@@ -2276,12 +2277,12 @@ async function runAgentTurnBody(
       // the same approval twice.
       privacyWireCache.set(composedText, { content: gate.content });
       if (gate.content !== composedText) {
-        const redactedCount = gate.report.findings.filter(
+        const redacted = gate.report.findings.filter(
           (finding) => finding.action !== 'allow' && !finding.exempted,
-        ).length;
+        );
         addMessage({
           role: 'system',
-          content: `${PRIVACY_NOTE_PREFIX} Redacted ${redactedCount} sensitive item(s) before sending to ${targetLabel(primaryTarget)}.`,
+          content: `${PRIVACY_NOTE_PREFIX} Redacted ${redacted.length} sensitive item(s) before sending to ${targetLabel(primaryTarget)}: ${describeRedactions(redacted)}.`,
         });
         wireContent = toMessageContent(gate.content, images);
       }
@@ -2491,10 +2492,10 @@ async function runAgentTurnBody(
       const local = await switchTurnToLocalForPrivacy(candidate);
       return local ? { target: local, messages } : null;
     }
-    if (outcome.newlyRedactedFindings > 0) {
+    if (outcome.newlyRedacted.length > 0) {
       addMessage({
         role: 'system',
-        content: `${PRIVACY_NOTE_PREFIX} Redacted ${outcome.newlyRedactedFindings} sensitive item(s) from protected context before sending to ${targetLabel(candidate)}.`,
+        content: `${PRIVACY_NOTE_PREFIX} Redacted ${outcome.newlyRedacted.length} sensitive item(s) from protected context before sending to ${targetLabel(candidate)}: ${describeRedactions(outcome.newlyRedacted)}.`,
       });
     }
     surfaceRateLimitWarnings(candidate);

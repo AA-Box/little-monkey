@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { ChatMessage } from "./llamaClient";
 import {
+  describeRedactions,
   gatePrivacyWireMessages,
   type PrivacyWireCache,
 } from "./privacyWire";
@@ -73,7 +74,7 @@ describe("gatePrivacyWireMessages", () => {
 
     expect(outcome).toMatchObject({
       action: "send",
-      newlyRedactedFindings: 1,
+      newlyRedacted: [expect.objectContaining({ kind: "api_credential" })],
     });
     if (outcome.action !== "send") throw new Error("expected send");
     expect(outcome.messages[1]).toEqual({
@@ -153,9 +154,38 @@ describe("gatePrivacyWireMessages", () => {
     const second = await gatePrivacyWireMessages(messages, gate, cache);
 
     expect(gate).toHaveBeenCalledTimes(1);
-    expect(first).toMatchObject({ action: "send", newlyRedactedFindings: 1 });
-    expect(second).toMatchObject({ action: "send", newlyRedactedFindings: 0 });
+    expect(first).toMatchObject({ action: "send", newlyRedacted: [{ kind: "api_credential" }] });
+    expect(second).toMatchObject({ action: "send", newlyRedacted: [] });
     if (second.action !== "send") throw new Error("expected send");
     expect(second.messages[0].content).toBe("[REDACTED]");
+  });
+});
+
+describe("describeRedactions", () => {
+  it("names each finding's kind, masked preview, and line", () => {
+    expect(
+      describeRedactions([
+        {
+          kind: "credit_card",
+          byteStart: 0,
+          byteEnd: 16,
+          line: 7,
+          column: 3,
+          maskedPreview: "4242…4242",
+          action: "redact",
+          exempted: false,
+        },
+        {
+          kind: "email",
+          byteStart: 20,
+          byteEnd: 36,
+          line: 9,
+          column: 1,
+          maskedPreview: "m…@example.com",
+          action: "redact",
+          exempted: false,
+        },
+      ]),
+    ).toBe("credit_card 4242…4242 (line 7), email m…@example.com (line 9)");
   });
 });
