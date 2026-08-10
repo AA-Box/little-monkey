@@ -14,6 +14,7 @@ import {
   extractChildToolCalls,
   groupChildToolCalls,
   parseTaskArgs,
+  profileBadge,
   resolveSubagentStatus,
   statusLabelKey,
 } from "./SubagentRow";
@@ -36,9 +37,12 @@ describe("parseTaskArgs", () => {
     });
   });
 
-  it("defaults profile to 'explore' for any value other than the literal 'code'", () => {
-    expect(parseTaskArgs(JSON.stringify({ description: "x", profile: "something-else" })).profile).toBe("explore");
+  it("passes a custom agent name through, defaulting to 'explore' only when missing or blank", () => {
+    // Custom agent names are valid profiles now (customAgents.ts) — the row
+    // must show what was actually requested, not coerce it to a built-in.
+    expect(parseTaskArgs(JSON.stringify({ description: "x", profile: "docs-writer" })).profile).toBe("docs-writer");
     expect(parseTaskArgs(JSON.stringify({ description: "x" })).profile).toBe("explore");
+    expect(parseTaskArgs(JSON.stringify({ description: "x", profile: "  " })).profile).toBe("explore");
   });
 
   it("falls back to a default description for malformed JSON, empty string, or a missing/blank field", () => {
@@ -203,5 +207,16 @@ describe("groupChildToolCalls", () => {
 
   it("ignores rounds with no tool calls at all", () => {
     expect(groupChildToolCalls([{ role: "assistant", content: "Found 3 callers of X." }])).toEqual([]);
+  });
+});
+
+describe("profileBadge", () => {
+  it("maps the built-in profiles to their i18n keys", () => {
+    expect(profileBadge("explore")).toEqual({ i18nKey: "SubagentRow.profileExplore" });
+    expect(profileBadge("code")).toEqual({ i18nKey: "SubagentRow.profileCode" });
+  });
+
+  it("shows a custom agent name verbatim — a user-authored identifier, not translatable copy", () => {
+    expect(profileBadge("docs-writer")).toEqual({ raw: "docs-writer" });
   });
 });
