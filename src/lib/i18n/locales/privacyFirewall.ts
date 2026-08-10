@@ -24,7 +24,7 @@ export const privacyFirewallLocale: Record<string, string> = {
   "PrivacyFirewallPanel.kindEmail": "Email addresses",
   "PrivacyFirewallPanel.kindEmailDescription": "Email addresses in standard local@domain form.",
   "PrivacyFirewallPanel.kindCreditCard": "Credit card numbers",
-  "PrivacyFirewallPanel.kindCreditCardDescription": "Digit sequences that pass a Luhn checksum, the same validation the scanner uses.",
+  "PrivacyFirewallPanel.kindCreditCardDescription": "Digit sequences carrying a card-network prefix and an issued length that also pass a Luhn checksum, the same validation the scanner uses.",
   "PrivacyFirewallPanel.kindPhone": "Phone numbers",
   "PrivacyFirewallPanel.kindPhoneDescription": "Phone numbers in common international or local formats.",
   "PrivacyFirewallPanel.kindIpAddress": "IP addresses",
