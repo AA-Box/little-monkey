@@ -2565,7 +2565,7 @@ mod tests {
                 timeout_secs: Some(30),
             }],
         };
-        crate::mcp::save_config_impl(&directory.0.join("mcp_servers.json"), &config).unwrap();
+        crate::mcp::save_config_impl(&directory.0.join("mcp_servers.json"), &config, None).unwrap();
         let catalog = production_workflow_capabilities(&directory.0).unwrap();
         assert_eq!(
             catalog.mcp_tools.get("fixture:lookup"),

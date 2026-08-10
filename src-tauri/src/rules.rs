@@ -27,8 +27,34 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::config_revisions::{self, RecordRequest};
 use crate::profiles::ProfileScopedPaths;
 use crate::{workspace, AppState};
+
+/// Revision kind for a rules/memory file (roadmap K24).
+///
+/// Its own kind rather than sharing `prompt-library`'s, because "restore this"
+/// means writing a different file for each and the history panel is keyed on the
+/// pair: a shared kind would put a workspace's MONKEY.md into the same list as a
+/// persona.
+pub const RULES_REVISION_KIND: &str = "rules";
+
+/// The revision entity a rules file is filed under.
+///
+/// The *path* rather than a label, and that is load-bearing: two attached roots
+/// can both be called `src`, and a label-keyed history would merge their files
+/// into one log where a restore would put the wrong content in the wrong repo.
+/// `config_revisions::slug` already hashes the id, so a path with separators in
+/// it is a safe single filename.
+pub fn rules_entity_id(scope: &str, target: &Path) -> String {
+    match scope {
+        // One global file per profile, and its path already carries the profile
+        // data root — so two profiles keep separate histories for free, which is
+        // the same boundary every other profile-scoped store draws.
+        "global" => format!("global:{}", target.display()),
+        _ => format!("project:{}", target.display()),
+    }
+}
 
 /// Filename looked for at the global app-data dir and at the top of every
 /// attached workspace root.
@@ -152,11 +178,13 @@ pub fn rules_read(
 /// caller can never write outside an attached root.
 fn write_rules_impl(
     state: &AppState,
+    revision_root: &Path,
     global_path: &Path,
     scope: &str,
     root_path: Option<&str>,
     content: &str,
-) -> Result<(), String> {
+    base_revision_id: Option<String>,
+) -> Result<String, String> {
     let target = match scope {
         "global" => global_path.to_path_buf(),
         "project" => {
@@ -199,8 +227,56 @@ fn write_rules_impl(
             )
         })?;
     }
+    // Revision first, exactly as `prompts::prompts_save` orders it, and for the
+    // same reason: recording is the only step that can *reject* the write, and
+    // rejecting after the file is already overwritten would defeat the point of
+    // detecting the conflict at all.
+    //
+    // A rules file was the last-write-wins case this item named. Two windows —
+    // or the desktop and the CLI — editing the same MONKEY.md silently kept
+    // whichever saved second, with no record that the other edit had existed.
+    let revision = config_revisions::record(
+        revision_root,
+        RULES_REVISION_KIND,
+        &rules_entity_id(scope, &target),
+        RecordRequest {
+            branch: None,
+            base_revision_id,
+            label: "Saved".to_string(),
+            content: content.to_string(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
     std::fs::write(&target, content)
-        .map_err(|e| format!("Failed to write '{}': {}", target.display(), e))
+        .map_err(|e| format!("Failed to write '{}': {}", target.display(), e))?;
+    Ok(revision.revision_id)
+}
+
+/// The rules file a scope resolves to, without writing anything.
+///
+/// Shared by [`rules_write`] and [`rules_current_revision`] so a caller reading
+/// its base revision and a caller saving against that base agree on which entity
+/// they are talking about — deriving the id twice from two different resolutions
+/// is exactly how a conflict check ends up silently checking the wrong log.
+fn rules_target(
+    state: &AppState,
+    global_path: &Path,
+    scope: &str,
+    root_path: Option<&str>,
+) -> Result<PathBuf, String> {
+    match scope {
+        "global" => Ok(global_path.to_path_buf()),
+        "project" => {
+            let root_path = root_path
+                .ok_or_else(|| "root_path is required when scope is \"project\"".to_string())?;
+            let (resolved, _root_canon) = workspace::resolve_path_and_root(state, root_path)?;
+            Ok(resolved)
+        }
+        other => Err(format!(
+            "Unknown rules scope '{}' (expected \"global\" or \"project\")",
+            other
+        )),
+    }
 }
 
 /// Save a MONKEY.md file from the Settings "Rules" editor. A direct,
@@ -208,6 +284,15 @@ fn write_rules_impl(
 /// intentionally NOT routed through `permissions::request_permission`; the
 /// user is editing their own instructions file by hand, not asking the agent
 /// to write it.
+/// `base_revision_id` is the revision the caller last saw. Supplying it opts into
+/// the concurrent-edit check: if another window (or the CLI) saved this same
+/// rules file since, the write is REFUSED with a `conflict:`-prefixed error and
+/// the file on disk is left untouched, instead of the last writer silently
+/// winning. `None` keeps the old unconditional behaviour, which is what a first
+/// save, an import, and a restore want.
+///
+/// Returns the new revision id, which the caller holds as its base for the next
+/// save.
 #[tauri::command]
 pub fn rules_write(
     app: tauri::AppHandle,
@@ -215,24 +300,100 @@ pub fn rules_write(
     scope: String,
     root_path: Option<String>,
     content: String,
-) -> Result<(), String> {
+    base_revision_id: Option<String>,
+) -> Result<String, String> {
     let global_dir = app
         .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
     let global_path = global_dir.join(RULE_FILE_NAME);
+    let revision_root = config_revisions::revision_root(&global_dir);
     write_rules_impl(
         state.inner(),
+        &revision_root,
         &global_path,
         &scope,
         root_path.as_deref(),
         &content,
+        base_revision_id,
     )
+}
+
+/// The current revision id of one rules file, so a window that just hydrated
+/// from disk knows what base to save against.
+///
+/// `None` when nothing has been recorded yet — a file edited before this existed,
+/// or one that has never been saved through the app.
+#[tauri::command]
+pub fn rules_current_revision(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    scope: String,
+    root_path: Option<String>,
+) -> Result<Option<String>, String> {
+    let global_dir = app
+        .profile_data_dir()
+        .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
+    let global_path = global_dir.join(RULE_FILE_NAME);
+    let target = rules_target(state.inner(), &global_path, &scope, root_path.as_deref())?;
+    let root = config_revisions::revision_root(&global_dir);
+    config_revisions::head(
+        &root,
+        RULES_REVISION_KIND,
+        &rules_entity_id(&scope, &target),
+        None,
+    )
+    .map(|head| head.map(|revision| revision.revision_id))
+    .map_err(|e| e.to_string())
+}
+
+/// The revision entity id for one rules file, so the history panel can ask for
+/// the right log without re-deriving the path rule in TypeScript.
+#[tauri::command]
+pub fn rules_revision_entity(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    scope: String,
+    root_path: Option<String>,
+) -> Result<String, String> {
+    let global_dir = app
+        .profile_data_dir()
+        .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
+    let global_path = global_dir.join(RULE_FILE_NAME);
+    let target = rules_target(state.inner(), &global_path, &scope, root_path.as_deref())?;
+    Ok(rules_entity_id(&scope, &target))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// [`write_rules_impl`] with a throwaway revision root and no base revision.
+    ///
+    /// Every case below is about *where the file lands*, and threading a
+    /// revision root plus a `None` base through each of them would bury the
+    /// cases that are genuinely about versioning — which call the real function.
+    fn write_rules(
+        state: &AppState,
+        global_path: &Path,
+        scope: &str,
+        root_path: Option<&str>,
+        content: &str,
+    ) -> Result<String, String> {
+        let revision_root = global_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("config-revisions-test");
+        write_rules_impl(
+            state,
+            &revision_root,
+            global_path,
+            scope,
+            root_path,
+            content,
+            None,
+        )
+    }
 
     struct TempDir {
         path: PathBuf,
@@ -370,7 +531,7 @@ mod tests {
         let global_path = dir.path.join("nested").join("MONKEY.md");
         let state = AppState::default();
 
-        write_rules_impl(&state, &global_path, "global", None, "Global rules.").unwrap();
+        write_rules(&state, &global_path, "global", None, "Global rules.").unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&global_path).unwrap(),
@@ -384,7 +545,7 @@ mod tests {
         let ws = TempDir::new();
         let state = state_with_roots(&ws.path, &[]);
 
-        write_rules_impl(
+        write_rules(
             &state,
             &global_path,
             "project",
@@ -408,7 +569,7 @@ mod tests {
         let state = state_with_roots(&primary.path, &[(&secondary.path, "libs")]);
 
         let root_path = format!("libs/{}", RULE_FILE_NAME);
-        write_rules_impl(
+        write_rules(
             &state,
             &global_path,
             "project",
@@ -430,7 +591,7 @@ mod tests {
         let ws = TempDir::new();
         let state = state_with_roots(&ws.path, &[]);
 
-        let err = write_rules_impl(&state, &global_path, "project", None, "content").unwrap_err();
+        let err = write_rules(&state, &global_path, "project", None, "content").unwrap_err();
         assert!(
             err.contains("root_path"),
             "expected a root_path error, got: {err}"
@@ -443,7 +604,7 @@ mod tests {
         let ws = TempDir::new();
         let state = state_with_roots(&ws.path, &[]);
 
-        let err = write_rules_impl(
+        let err = write_rules(
             &state,
             &global_path,
             "project",
@@ -465,8 +626,8 @@ mod tests {
         std::fs::write(&victim, "{\"original\": true}").unwrap();
         let state = state_with_roots(&ws.path, &[]);
 
-        let err = write_rules_impl(&state, &global_path, "project", Some("package.json"), "{}")
-            .unwrap_err();
+        let err =
+            write_rules(&state, &global_path, "project", Some("package.json"), "{}").unwrap_err();
         assert!(
             err.contains("Refusing to write") && err.contains("MONKEY.md"),
             "expected a refusal mentioning MONKEY.md, got: {err}"
@@ -485,7 +646,7 @@ mod tests {
         let secondary = TempDir::new();
         let state = state_with_roots(&primary.path, &[(&secondary.path, "libs")]);
 
-        let err = write_rules_impl(
+        let err = write_rules(
             &state,
             &global_path,
             "project",
@@ -547,10 +708,197 @@ mod tests {
         let global_path = TempDir::new().path.join("MONKEY.md");
         let state = AppState::default();
 
-        let err = write_rules_impl(&state, &global_path, "bogus", None, "content").unwrap_err();
+        let err = write_rules(&state, &global_path, "bogus", None, "content").unwrap_err();
         assert!(
             err.contains("Unknown rules scope"),
             "expected an unknown-scope error, got: {err}"
         );
+    }
+
+    /// The gap K24 named: rules files saved last-write-wins. They now go through
+    /// the same append-only log every persona and workflow does.
+    #[test]
+    fn a_rules_save_records_a_revision_and_dedupes_an_unchanged_one() {
+        let dir = TempDir::new();
+        let global_path = dir.path.join("MONKEY.md");
+        let revisions = dir.path.join("config-revisions");
+        let state = AppState::default();
+
+        let first = write_rules_impl(
+            &state,
+            &revisions,
+            &global_path,
+            "global",
+            None,
+            "Always write tests.",
+            None,
+        )
+        .unwrap();
+
+        let entity = rules_entity_id("global", &global_path);
+        let history =
+            crate::config_revisions::history(&revisions, RULES_REVISION_KIND, &entity, None)
+                .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].revision_id, first);
+
+        // An unchanged save is not a revision. An editor that saves on a
+        // debounce must not fill the history with copies of the same text.
+        let same = write_rules_impl(
+            &state,
+            &revisions,
+            &global_path,
+            "global",
+            None,
+            "Always write tests.",
+            Some(first.clone()),
+        )
+        .unwrap();
+        assert_eq!(same, first, "an identical save returns the existing head");
+        assert_eq!(
+            crate::config_revisions::history(&revisions, RULES_REVISION_KIND, &entity, None)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let second = write_rules_impl(
+            &state,
+            &revisions,
+            &global_path,
+            "global",
+            None,
+            "Always write tests, and run them.",
+            Some(first.clone()),
+        )
+        .unwrap();
+        assert_ne!(second, first);
+        assert_eq!(
+            crate::config_revisions::history(&revisions, RULES_REVISION_KIND, &entity, None)
+                .unwrap()
+                .len(),
+            2
+        );
+        // The snapshot is restorable: it is the content, not a diff.
+        let restored =
+            crate::config_revisions::get(&revisions, RULES_REVISION_KIND, &entity, &first).unwrap();
+        assert_eq!(restored.content, "Always write tests.");
+    }
+
+    /// A stale base is refused, **and the file on disk is left untouched** —
+    /// which is the half that makes the refusal worth anything. Rejecting after
+    /// the write would report a conflict for an edit that had already landed.
+    #[test]
+    fn a_save_against_a_stale_base_is_refused_and_changes_nothing_on_disk() {
+        let dir = TempDir::new();
+        let global_path = dir.path.join("MONKEY.md");
+        let revisions = dir.path.join("config-revisions");
+        let state = AppState::default();
+
+        let first = write_rules_impl(
+            &state,
+            &revisions,
+            &global_path,
+            "global",
+            None,
+            "one",
+            None,
+        )
+        .unwrap();
+        // Another window saves.
+        write_rules_impl(
+            &state,
+            &revisions,
+            &global_path,
+            "global",
+            None,
+            "two",
+            Some(first.clone()),
+        )
+        .unwrap();
+
+        // This one still believes `first` is current.
+        let error = write_rules_impl(
+            &state,
+            &revisions,
+            &global_path,
+            "global",
+            None,
+            "three",
+            Some(first),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_lowercase().contains("conflict:"),
+            "the UI matches on this prefix to tell a concurrent edit from a disk \
+             error, got {error:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&global_path).unwrap(),
+            "two",
+            "a refused save must not have already overwritten the file"
+        );
+    }
+
+    /// Two roots can both be labelled `src`. Keying the history on the label
+    /// would merge their files into one log, where a restore would put one
+    /// repo's instructions into the other.
+    #[test]
+    fn two_workspace_roots_keep_separate_histories() {
+        let global_path = TempDir::new().path.join("MONKEY.md");
+        let primary = TempDir::new();
+        let secondary = TempDir::new();
+        let revisions = TempDir::new();
+        let state = state_with_roots(&primary.path, &[(&secondary.path, "libs")]);
+
+        write_rules_impl(
+            &state,
+            &revisions.path,
+            &global_path,
+            "project",
+            Some(RULE_FILE_NAME),
+            "primary rules",
+            None,
+        )
+        .unwrap();
+        write_rules_impl(
+            &state,
+            &revisions.path,
+            &global_path,
+            "project",
+            Some(&format!("libs/{RULE_FILE_NAME}")),
+            "secondary rules",
+            None,
+        )
+        .unwrap();
+
+        let primary_entity = rules_entity_id(
+            "project",
+            &primary.path.canonicalize().unwrap().join(RULE_FILE_NAME),
+        );
+        let secondary_entity = rules_entity_id(
+            "project",
+            &secondary.path.canonicalize().unwrap().join(RULE_FILE_NAME),
+        );
+        assert_ne!(primary_entity, secondary_entity);
+
+        for (entity, expected) in [
+            (&primary_entity, "primary rules"),
+            (&secondary_entity, "secondary rules"),
+        ] {
+            let history = crate::config_revisions::history(
+                &revisions.path,
+                RULES_REVISION_KIND,
+                entity,
+                None,
+            )
+            .unwrap();
+            assert_eq!(history.len(), 1, "each root gets exactly its own log");
+            let head =
+                crate::config_revisions::head(&revisions.path, RULES_REVISION_KIND, entity, None)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(head.content, expected);
+        }
     }
 }

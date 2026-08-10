@@ -500,10 +500,29 @@ migration over users' existing embedded vectors**:
   One claim in this section stands unchanged and was not what forced the staging: **v1's
   query cache was never worth porting** — the test-search box fires on Enter, not per
   keystroke, and `LoadedStack` was an unbounded `HashMap` holding every parsed chunk and
-  vector. The real v2 regression is still open and still worth fixing on its own terms:
-  `HybridIndex::open` re-digests and re-validates every chunk on **every query**, so a warm
-  v1 query did zero deserialization passes where v2 does three. That is a fix to the open
-  path, not a cache, and it is now the only performance debt v1's removal leaves behind.
+  vector.
+
+  **The v2 regression this named is closed.** `HybridIndex::open` re-digested and
+  re-validated every chunk on *every query*, so a warm v1 query did zero deserialization
+  passes where v2 did three. The two O(all chunks) passes — re-deriving the content
+  digest, and the FTS mirror set-difference — now run once per *file version*.
+
+  The cache is keyed on the file's identity: device, inode, size and mtime, together
+  with the digest stored inside it. A path alone would be wrong (a prune replaces
+  `index.sqlite3` under a stable path) and the digest alone would be wrong for the
+  opposite reason — it is read *out of* the file, so it is the claim being checked
+  rather than evidence about it. A generation is immutable, so a match on all four
+  means the bytes are the ones that were validated.
+
+  **What it deliberately does not claim.** Corruption detection stays where it belongs,
+  at write and at import, and the first open of any file version still pays the full
+  check. A rewrite preserving device, inode, size and mtime to the nanosecond would be
+  skipped — an accepted limit, because an actor able to do that can also rewrite the
+  `index_digest` this check compares against, so the check was never the defence against
+  them. What it does defend is the ordinary case: a truncated write, a bit-rotted page, a
+  partially copied file, each of which changes size or mtime and re-validates. A test
+  corrupts a chunk *after* a successful open has already cached a verdict and asserts the
+  refusal, which is the case a path-keyed cache would have served happily.
 
 **Blocks:** nothing now. K11's precondition was that two systems stopped producing
 context by different rules; one index is one rule.
@@ -5300,12 +5319,52 @@ digest-verified manifests that never trust a corrupt local copy for reuse. CI
 runs dependency review plus Rust/npm advisory audits and publishes a CycloneDX
 SBOM, attached to each release as an asset.
 
+**Shipped since — the three CI-shaped gaps.**
+
+- **An accessibility audit in CI** (`src/lib/a11yAudit.ts`), over the built
+  shell and over rendered screens, in the existing frontend job. It is a
+  **named rule set, not a WCAG audit, and says so**: eleven rules, each
+  decidable from the DOM alone and each a defect this codebase can actually
+  introduce — an icon-only button one `aria-label` away from being unusable is
+  the one it exists for. Contrast, focus order, live-region timing and reading
+  order are *not* covered and are stated as not covered. axe-core is the better
+  tool; it needs a browser in CI, which is a larger change than the check
+  itself, and the upgrade path is to swap `auditDom`'s body for `axe.run` with
+  the call sites and the job unchanged.
+- **A clean-machine install/upgrade smoke test** in release CI, between the
+  build matrix and publish, so a release that cannot be installed is never
+  published. It unpacks the real `.deb`/`.dmg`/NSIS payload into a scratch
+  prefix, asserts the binaries a user would get are there, runs the installed
+  CLI and compares its version to the release, then installs over the previous
+  release and asserts a file under the data directory survived. **Every leg
+  reports PASS, FAIL, or SKIPPED with its reason** — a hosted runner cannot
+  exercise an MSI without elevation, and the first release ever has nothing to
+  upgrade from, so "not covered here" is often the honest answer and is written
+  to the job summary rather than left as silence. Only a real failure is fatal.
+  What extraction does *not* cover — post-install scripts, registry and desktop
+  entries — is named in the runner rather than implied to be tested.
+- **The locale key sets are equal, and now enforced.** The gap was not ~650: it
+  had grown to **1,468 keys per locale across ten locales** while `keyLint`'s
+  warning printed on every run, because a warning is not a gate. Each locale now
+  spreads `en` as its base, so the sets are identical *by construction* rather
+  than by a batch pass that would drift again by the next feature. No
+  user-visible text changes — `useT()` already fell back to English for a
+  missing key — and there is no bundle cost, because `index.ts` imports `en`
+  unconditionally as that fallback. `localeSync.test.ts` then holds three
+  properties as a **failing** check: identical key sets, identical
+  `{{placeholder}}` sets per key (a dropped brace renders as literal text and is
+  invisible to everyone who does not read that language), and no empty values.
+  Completing the sets did not hide the real gap: each locale exports the keys it
+  genuinely translates, so coverage is an exact number rather than one inferred
+  from "the string differs from English" — which plenty of real translations do
+  not.
+
 **Still open:** signing beyond macOS (Windows needs a code-signing certificate
 this project does not have; Linux has no OS-level binary signature to verify,
 which is why the integrity check reports the runtime digests as the whole of
-the evidence there), clean-machine install/upgrade tests, an accessibility
-audit in CI, a release penetration test, and the ~650 keys each of ten locales
-is missing.
+the evidence there), a release penetration test, and the translation of those
+1,468 keys per locale — the key sets are complete and enforced, the *words* are
+still English, and the coverage number says so.
 
 **Acceptance:** ROADMAP #8 in full, plus a startup self-integrity check that
 verifies the app's own binary signature and the digests of every managed
@@ -5438,9 +5497,37 @@ workflows the same refusal comes from the definition store's own version rule.
 Both the desktop and the CLI/daemon write the same history, because the store
 sits below the Tauri layer.
 
-**Remaining:** rules/memory files and MCP server definitions still save
-last-write-wins; the history is per-entity, so there is no cross-entity view of
-what a given change touched.
+**Shipped — rules/memory files and MCP server definitions now go through the
+same log.** Both were the last last-write-wins stores: two windows (or the
+desktop and the CLI) editing one `MONKEY.md` or one MCP server silently kept
+whichever saved second, with nothing recording that the other edit existed.
+
+- **Rules.** `write_rules_impl` records before it writes, in `prompts_save`'s
+  order and for its reason: recording is the only step that can *reject* the
+  write, and rejecting after the file is replaced would defeat the point of
+  detecting the conflict. The entity is keyed on the file's **resolved path**,
+  not its label — two attached roots can both be called `src`, and a
+  label-keyed history would merge them into one log where a restore puts one
+  repo's instructions into the other. `rules_current_revision` gives an editor
+  its base; a stale one is refused with `conflict:` and the file on disk is
+  untouched.
+- **MCP.** The record happens inside `save_config_impl`, which *every* mutation
+  — add, update, remove, enable — already goes through, so a fifth mutation
+  cannot skip versioning by forgetting a line. Two kinds are written: the whole
+  document (what a restore puts back, since restoring one server into a file
+  that has since gained and lost others would produce a state that never
+  existed) and one per server (what answers "what changed about *this* server").
+  An unchanged server dedupes on its digest, so a save touching one server
+  appends one entry revision rather than one per server.
+- **Restore is the owning store's job**, per `RevisionHistoryPanel`'s rule.
+  `mcp_restore_config` parses and validates the snapshot before writing anything
+  — a hand-edited revision is refused rather than installed and discovered at
+  the next connect — and then goes through the ordinary save, so the restore is
+  itself a revision. The rules editor loads a snapshot into the textarea rather
+  than writing it, so the user's own Save records it.
+
+**Remaining:** the history is per-entity, so there is still no cross-entity view
+of what a given change touched.
 
 *Maps to: ROADMAP #3.*
 
