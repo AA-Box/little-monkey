@@ -24,6 +24,7 @@ import { runSubagentTask, type RunSubagentTaskParams } from './subagent';
 import { useWorkflowStore, type WorkflowPhase } from '../store/workflowStore';
 import { useSessionStore } from '../store/sessionStore';
 import { useSettingsStore } from '../store/settingsStore';
+import { useSavedWorkflowStore, type SavedWorkflow } from '../store/savedWorkflowStore';
 import { unwrapUntrustedContent } from './untrustedContent';
 
 export interface WorkflowAgentSpec {
@@ -92,6 +93,51 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
     throw new Error(`workflow allows at most ${MAX_WORKFLOW_AGENTS} agents in total.`);
   }
   return { name, description, phases };
+}
+
+/**
+ * Resolves the raw `workflow` tool arguments to a spec: a `saved` name (with
+ * `phases` omitted) looks up the previously saved spec by name — an unknown
+ * name throws a message listing what IS saved, so the model can recover —
+ * and anything else falls through to `parseWorkflowSpec` unchanged. The
+ * `executeToolCall` `workflow` branch calls this instead of
+ * `parseWorkflowSpec` directly. Exported for the logic tests.
+ */
+export function resolveWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
+  const saved = typeof args.saved === 'string' ? args.saved.trim() : '';
+  if (saved && !Array.isArray(args.phases)) {
+    const entry = useSavedWorkflowStore.getState().workflows[saved];
+    if (!entry) {
+      const names = Object.keys(useSavedWorkflowStore.getState().workflows).sort();
+      throw new Error(
+        names.length > 0
+          ? `No saved workflow named "${saved}". Saved workflows: ${names.join(', ')}.`
+          : `No saved workflow named "${saved}" — nothing has been saved yet.`,
+      );
+    }
+    return entry.spec;
+  }
+  return parseWorkflowSpec(args);
+}
+
+/**
+ * Renders the saved-workflow catalog for the system prompt — the `workflow`
+ * counterpart of `skills.ts`'s `composeSkillCatalog`, and appended by
+ * `agentLoop.ts` under the same `subagentsEnabled` gate that offers
+ * `WORKFLOW_TOOL` itself. Empty string when nothing is saved, so the
+ * `.filter(Boolean)` section join drops it entirely.
+ */
+export function composeSavedWorkflowCatalog(saved: SavedWorkflow[]): string {
+  if (saved.length === 0) return '';
+  return [
+    '## Saved workflows',
+    'Call the `workflow` tool with `{"saved": "<name>"}` (omitting "phases") to re-run one of these previously saved workflows:',
+    ...saved.map((entry) => {
+      const agents = entry.spec.phases.reduce((sum, phase) => sum + phase.agents.length, 0);
+      const description = entry.spec.description.length > 0 ? entry.spec.description : 'no description';
+      return `- ${entry.spec.name} — ${description} (${entry.spec.phases.length} phases, ${agents} agents)`;
+    }),
+  ].join('\n');
 }
 
 /** The `subagentStore` key for one workflow agent — deterministic from the
@@ -190,7 +236,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
       description: agent.description,
     })),
   }));
-  useWorkflowStore.getState().start({ sessionId, runId: toolCallId, name: spec.name, description: spec.description, phases });
+  useWorkflowStore.getState().start({ sessionId, runId: toolCallId, name: spec.name, description: spec.description, phases, spec });
 
   /** Single exit point — mirrors `runSubagentTask`'s own `finish` helper:
    * marks the run terminal in the live store and snapshots the shape into
@@ -263,6 +309,10 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
     }
 
     const anyFailure = phaseSummaries.some((phase) => phase.agents.some((agent) => agent.status !== 'done'));
+    // Every fully-successful run saves its spec under its name (last-run-wins)
+    // — what makes `resolveWorkflowSpec`'s `saved` lookup and the drawer's
+    // Saved-workflows list work without the user ever pressing Save.
+    if (!anyFailure) useSavedWorkflowStore.getState().upsert(spec, Date.now());
     return finish(
       anyFailure ? 'error' : 'done',
       stringifyToolResult({ workflow: spec.name, status: anyFailure ? 'completed_with_failures' : 'completed', phases: phaseSummaries }),

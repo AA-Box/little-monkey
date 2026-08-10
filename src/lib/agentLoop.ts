@@ -54,6 +54,8 @@ import {
 } from './mentions';
 import { currentSystemPrompt, ULTRACODE_SYSTEM_SECTION, type AttachedStackPromptInfo } from './systemPrompt';
 import { composeSkillCatalog, composeSkillSystemPrompt, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
+import { composeSavedWorkflowCatalog } from './workflow';
+import { selectSavedWorkflowList, useSavedWorkflowStore } from '../store/savedWorkflowStore';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { isBtwNotice } from './slashCommands';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
@@ -2783,6 +2785,11 @@ async function runAgentTurnBody(
         ),
         ...(ultracode ? [ULTRACODE_SYSTEM_SECTION] : []),
         ...(settings.skillAutoInvokeEnabled ? [composeSkillCatalog(availableSkills, invokedSkillCommands)] : []),
+        // Saved workflows are only actionable when WORKFLOW_TOOL is offered,
+        // so the catalog rides the same `subagentsEnabled` gate.
+        ...(settings.subagentsEnabled
+          ? [composeSavedWorkflowCatalog(selectSavedWorkflowList(useSavedWorkflowStore.getState()))]
+          : []),
       ]
         .filter(Boolean)
         .join('\n\n'),

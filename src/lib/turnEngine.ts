@@ -40,7 +40,7 @@ import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { useSessionStore } from '../store/sessionStore';
 import { runSubagentTask } from './subagent';
-import { parseWorkflowSpec, runWorkflow } from './workflow';
+import { resolveWorkflowSpec, runWorkflow } from './workflow';
 import { protocolToolCallId } from './durableRun';
 import { formatSkillToolResult, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
@@ -675,7 +675,7 @@ export async function executeToolCall(
       if (!subagent) {
         return stringifyToolError(new Error('The workflow tool has no subagent execution context configured for this turn.'));
       }
-      const spec = parseWorkflowSpec(args);
+      const spec = resolveWorkflowSpec(args);
       return await runWorkflow({
         sessionId: subagent.sessionId,
         runId: subagent.runId,

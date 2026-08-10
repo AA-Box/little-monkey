@@ -502,10 +502,14 @@ export const WORKFLOW_TOOL: ToolDef = {
   function: {
     name: 'workflow',
     description:
-      'Run a named, multi-phase orchestration of subagents. Phases run in order; the agents inside one phase run in parallel. Each later phase automatically receives the earlier phases\' reports appended to its prompts. Use this instead of plain task calls when the work has distinct stages (e.g. survey then verify, or explore then implement then review). Each agent is isolated: give every prompt full, self-contained context. Limits: at most 6 phases, 6 agents per phase, 16 agents total.',
+      'Run a named, multi-phase orchestration of subagents. Phases run in order; the agents inside one phase run in parallel. Each later phase automatically receives the earlier phases\' reports appended to its prompts. Use this instead of plain task calls when the work has distinct stages (e.g. survey then verify, or explore then implement then review). Each agent is isolated: give every prompt full, self-contained context. Limits: at most 6 phases, 6 agents per phase, 16 agents total. To re-run a previously saved workflow, pass only {"saved": "<name>"} (see the "Saved workflows" section of the system prompt) and omit every other field.',
     parameters: {
       type: 'object',
       properties: {
+        saved: {
+          type: 'string',
+          description: 'Name of a previously saved workflow to re-run. When set, omit "name"/"description"/"phases" — the saved spec is used as-is.',
+        },
         name: {
           type: 'string',
           description: 'A short kebab-case name for the whole workflow (e.g. "roadmap-audit"), shown to the user.',
@@ -548,7 +552,12 @@ export const WORKFLOW_TOOL: ToolDef = {
           },
         },
       },
-      required: ['name', 'description', 'phases'],
+      // Nothing hard-required at the schema level: a saved-workflow call is
+      // just {"saved": "<name>"}, while an inline call needs name/description/
+      // phases — `resolveWorkflowSpec`/`parseWorkflowSpec` enforce whichever
+      // shape applies and return an actionable error for anything else, same
+      // frontend-validation posture as every other tool argument.
+      required: [],
       additionalProperties: false,
     },
   },

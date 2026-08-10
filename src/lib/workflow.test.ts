@@ -17,12 +17,15 @@ import { CANCELLED_TOOL_RESULT } from "./turnEngine";
 import {
   MAX_WORKFLOW_PHASES,
   buildPriorReportsBlock,
+  composeSavedWorkflowCatalog,
   parseWorkflowSpec,
+  resolveWorkflowSpec,
   runWorkflow,
   workflowAgentTaskId,
   type WorkflowSpec,
 } from "./workflow";
 import { useWorkflowStore } from "../store/workflowStore";
+import { selectSavedWorkflowList, useSavedWorkflowStore } from "../store/savedWorkflowStore";
 
 const TARGET = {} as never;
 
@@ -183,5 +186,105 @@ describe("runWorkflow", () => {
     const dispatched = runSubagentTaskMock.mock.calls.map((call) => (call[0] as { toolCallId: string }).toolCallId);
     expect(dispatched).toEqual(["call_wf#p0a0", "call_wf#p0a1"]);
     expect(useWorkflowStore.getState().runs["call_wf"].status).toBe("cancelled");
+  });
+});
+
+// Saved, named workflows: `resolveWorkflowSpec` resolves the `workflow`
+// tool's `saved` argument against `savedWorkflowStore`; every fully
+// successful `runWorkflow` upserts its spec (last-run-wins); and
+// `composeSavedWorkflowCatalog` renders the system-prompt catalog that
+// tells the model what names exist.
+describe("resolveWorkflowSpec", () => {
+  beforeEach(() => {
+    useSavedWorkflowStore.setState({ workflows: {} });
+  });
+
+  it("returns the saved spec for a known name when phases are omitted", () => {
+    useSavedWorkflowStore.getState().upsert(spec());
+    const resolved = resolveWorkflowSpec({ saved: "roadmap-audit" });
+    expect(resolved).toEqual(spec());
+  });
+
+  it("throws for an unknown name, listing what IS saved", () => {
+    useSavedWorkflowStore.getState().upsert(spec());
+    useSavedWorkflowStore.getState().upsert(spec({ name: "release-check" }));
+    expect(() => resolveWorkflowSpec({ saved: "nope" })).toThrow(/release-check, roadmap-audit/);
+  });
+
+  it("throws a nothing-saved-yet message when the store is empty", () => {
+    expect(() => resolveWorkflowSpec({ saved: "nope" })).toThrow(/nothing has been saved/);
+  });
+
+  it("falls through to parseWorkflowSpec when phases are supplied, even alongside saved", () => {
+    useSavedWorkflowStore.getState().upsert(spec());
+    const inline = spec({ name: "inline-run" });
+    const resolved = resolveWorkflowSpec({ saved: "roadmap-audit", name: inline.name, description: inline.description, phases: inline.phases });
+    expect(resolved.name).toBe("inline-run");
+  });
+
+  it("validates a plain inline call exactly like parseWorkflowSpec", () => {
+    expect(() => resolveWorkflowSpec({ phases: [] })).toThrow(/name/);
+  });
+});
+
+describe("runWorkflow / saved-workflow upsert", () => {
+  beforeEach(() => {
+    useSavedWorkflowStore.setState({ workflows: {} });
+  });
+
+  it("upserts the spec under its name after a fully successful run, stamping lastRunAt", async () => {
+    await runWorkflow({ sessionId: "s", parentCheckpointId: null, toolCallId: "call_wf_save", spec: spec(), target: TARGET });
+
+    const saved = useSavedWorkflowStore.getState().workflows["roadmap-audit"];
+    expect(saved).toBeDefined();
+    expect(saved.spec).toEqual(spec());
+    expect(typeof saved.lastRunAt).toBe("number");
+  });
+
+  it("last-run-wins: a later successful run replaces the saved spec of the same name", async () => {
+    useSavedWorkflowStore.getState().upsert(spec({ description: "old version" }));
+
+    await runWorkflow({ sessionId: "s", parentCheckpointId: null, toolCallId: "call_wf_save2", spec: spec({ description: "new version" }), target: TARGET });
+
+    expect(useSavedWorkflowStore.getState().workflows["roadmap-audit"].spec.description).toBe("new version");
+  });
+
+  it("does not upsert when any agent fails", async () => {
+    runSubagentTaskMock.mockResolvedValue(JSON.stringify({ error: "boom" }));
+
+    await runWorkflow({ sessionId: "s", parentCheckpointId: null, toolCallId: "call_wf_fail", spec: spec(), target: TARGET });
+
+    expect(useSavedWorkflowStore.getState().workflows["roadmap-audit"]).toBeUndefined();
+  });
+
+  it("does not upsert a cancelled run", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    await runWorkflow({ sessionId: "s", parentCheckpointId: null, parentSignal: controller.signal, toolCallId: "call_wf_cancel", spec: spec(), target: TARGET });
+
+    expect(useSavedWorkflowStore.getState().workflows["roadmap-audit"]).toBeUndefined();
+  });
+});
+
+describe("composeSavedWorkflowCatalog", () => {
+  beforeEach(() => {
+    useSavedWorkflowStore.setState({ workflows: {} });
+  });
+
+  it("returns an empty string when nothing is saved", () => {
+    expect(composeSavedWorkflowCatalog(selectSavedWorkflowList(useSavedWorkflowStore.getState()))).toBe("");
+  });
+
+  it("lists each saved workflow with its description and shape", () => {
+    useSavedWorkflowStore.getState().upsert(spec());
+    useSavedWorkflowStore.getState().upsert(spec({ name: "release-check", description: "" }));
+
+    const catalog = composeSavedWorkflowCatalog(selectSavedWorkflowList(useSavedWorkflowStore.getState()));
+
+    expect(catalog).toContain("## Saved workflows");
+    expect(catalog).toContain('{"saved": "<name>"}');
+    expect(catalog).toContain("- roadmap-audit — Verify roadmap claims (2 phases, 3 agents)");
+    expect(catalog).toContain("- release-check — no description (2 phases, 3 agents)");
   });
 });
