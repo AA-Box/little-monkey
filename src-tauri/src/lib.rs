@@ -384,16 +384,19 @@ pub mod privacy_firewall;
 // action. Reuses `run_protocol`/`run_ledger` for run modeling exactly like
 // every other execution surface above.
 pub mod sandbox;
+// The agent shell's live-workspace policy, layered on the same Seatbelt,
+// Landlock/seccomp and AppContainer/job primitives as disposable sandboxes.
+// Public only for monkey-cli's AppHandle-free run_shell path.
+pub mod workspace_shell;
 // The Linux half of `sandbox`'s OS boundary (ROADMAP.md item K3): a Landlock
 // filesystem ruleset plus a seccomp-BPF network filter, installed in `pre_exec`
 // alongside `os_limits`. Linux-only because the crates behind it are, and
 // because a stub would just be a second place to claim confinement from.
 #[cfg(target_os = "linux")]
 pub mod sandbox_linux;
-// The Windows half, and a narrower promise than the other two: a job object
-// bounds the run's process tree, committed memory and window-station reach, but
-// no filesystem boundary exists here that does not require this crate owning its
-// own `CreateProcess`. Reported as `ProcessContained`, never `OsSandboxed`.
+// The Windows half: AppContainer filesystem/network confinement plus a job
+// object for the process tree, memory and window-station reach. It owns the raw
+// CreateProcess path needed to apply both at spawn.
 #[cfg(target_os = "windows")]
 pub mod sandbox_windows;
 // Local, single-machine "Team, Family, and Organization Mode" (ROADMAP.md
