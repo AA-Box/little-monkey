@@ -492,6 +492,11 @@ mod tests {
         git(&repo, &["init", "-q"]);
         git(&repo, &["config", "user.email", "t@example.com"]);
         git(&repo, &["config", "user.name", "t"]);
+        // Windows CI's system git ships core.autocrlf=true, which rewrites
+        // the fixture's \n to \r\n during apply and fails byte-equality
+        // asserts. The tests assert exact bytes, so pin conversion off —
+        // worktrees share the repo's config, so this covers them too.
+        git(&repo, &["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "init"]);
