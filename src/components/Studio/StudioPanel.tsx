@@ -1664,11 +1664,11 @@ export function StudioPanel({ mode, railSlot }: Props) {
                 step={1}
                 value={seconds}
                 onChange={(event) => setSeconds(Number(event.target.value))}
-                className="flex-1"
+                className="min-w-0 flex-1"
               />
               {/* The backend snaps length to its 4n+1 grid, so show the frame
                   count the clip will really have, not the slider's ask. */}
-              <span className="w-28 shrink-0 text-right font-mono text-[11px] text-faint">
+              <span className="shrink-0 whitespace-nowrap text-right font-mono text-[11px] text-faint">
                 {t("Studio.frames", {
                   frames: String(effectiveFrames),
                   fps: String(selected.defaults.fps),
