@@ -1128,9 +1128,19 @@ function App() {
           }
         >
           <Suspense fallback={<LazyPanelFallback />}>
-            {section === "studio" ? (
+            {/* Studio stays mounted while Chat is shown. The RUN survives a
+                switch on its own now (`studioRunStore.ts` owns it), but the
+                composer around it does not: prompt, init image, painted mask
+                and outpaint history are this panel's state, and unmounting
+                would throw all of it away mid-edit. */}
+            <div
+              className={
+                section === "studio" ? "flex min-h-0 flex-1 flex-col" : "hidden"
+              }
+            >
               <StudioPanel mode={studioMode} railSlot={studioRail} />
-            ) : globalSearchOpen ? (
+            </div>
+            {section === "studio" ? null : globalSearchOpen ? (
               <GlobalSearch
                 onClose={() => closeFeaturePanel("global-search")}
                 onOpenRun={(runId) => {
@@ -1277,6 +1287,7 @@ function App() {
                 headerActionsSlot={chatHeaderActionsEl}
                 onOpenBackgroundTasks={openBackgroundTasksPanel}
                 onOpenPmCopilot={() => openFeaturePanel("pm-copilot")}
+                onOpenStudio={() => setSection("studio")}
               />
             )}
           </Suspense>
@@ -1314,6 +1325,7 @@ function App() {
                   onOpenSettingsTab={openSettingsTab}
                   onOpenBackgroundTasks={openBackgroundTasksPanel}
                   onOpenPmCopilot={() => openFeaturePanel("pm-copilot")}
+                  onOpenStudio={() => setSection("studio")}
                 />
               )}
             </Suspense>

@@ -332,9 +332,12 @@ interface ChatWindowProps {
    * the feature-panel region still runs the command, it just can't reveal the
    * panel. */
   onOpenPmCopilot?: () => void;
+  /** Switches the app to the Studio section — where a running generation the
+   * chip is counting actually lives. Optional like the two above. */
+  onOpenStudio?: () => void;
 }
 
-export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot }: ChatWindowProps) {
+export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot, onOpenStudio }: ChatWindowProps) {
   const messages = useSessionStore(selectSessionMessages(sessionId));
   const persistError = useSessionStore((state) => state.persistError);
   const roots = useWorkspaceStore((state) => state.roots);
@@ -1455,7 +1458,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
 
       <TaskSuggestionChips sessionId={sessionId} />
 
-      <RunningTasksChip onClick={onOpenBackgroundTasks} />
+      <RunningTasksChip onClick={onOpenBackgroundTasks} onOpenStudio={onOpenStudio} />
 
       <div className="relative shrink-0 bg-background px-4 py-3">
         <SideChatPanel sessionId={sessionId} />
