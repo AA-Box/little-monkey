@@ -162,8 +162,11 @@ pub struct ManualClientRegistration {
 }
 
 fn manual_client_entry(server_id: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(&KEYCHAIN_SERVICE, &manual_client_keychain_account(server_id))
-        .map_err(|e| format!("Failed to access keychain: {e}"))
+    keyring::Entry::new(
+        &KEYCHAIN_SERVICE,
+        &manual_client_keychain_account(server_id),
+    )
+    .map_err(|e| format!("Failed to access keychain: {e}"))
 }
 
 /// Reads server `id`'s saved OAuth client registration, if any. Absence is

@@ -4,9 +4,11 @@ import { Button, StatusPill } from "../ui";
 import {
   MAX_CHECKPOINT_RETENTION,
   MAX_MAX_CONCURRENT_SUBAGENTS,
+  MAX_PROCESS_WALL_BUDGET_HOURS,
   MAX_VERIFY_MAX_ROUNDS,
   MIN_CHECKPOINT_RETENTION,
   MIN_MAX_CONCURRENT_SUBAGENTS,
+  MIN_PROCESS_WALL_BUDGET_HOURS,
   MIN_VERIFY_MAX_ROUNDS,
   useSettingsStore,
   type ContextTrimStrategy,
@@ -853,6 +855,10 @@ export function AutomationPanel() {
   const setContextTrimStrategy = useSettingsStore((s) => s.setContextTrimStrategy);
   const checkpointRetention = useSettingsStore((s) => s.checkpointRetention);
   const setCheckpointRetention = useSettingsStore((s) => s.setCheckpointRetention);
+  const processWallBudgetEnabled = useSettingsStore((s) => s.processWallBudgetEnabled);
+  const setProcessWallBudgetEnabled = useSettingsStore((s) => s.setProcessWallBudgetEnabled);
+  const processWallBudgetHours = useSettingsStore((s) => s.processWallBudgetHours);
+  const setProcessWallBudgetHours = useSettingsStore((s) => s.setProcessWallBudgetHours);
   const rateLimitWarningsEnabled = useSettingsStore((s) => s.rateLimitWarningsEnabled);
   const setRateLimitWarningsEnabled = useSettingsStore((s) => s.setRateLimitWarningsEnabled);
   const providerRateLimits = useSettingsStore((s) => s.providerRateLimits);
@@ -1122,6 +1128,37 @@ export function AutomationPanel() {
                 className="h-8 w-16 rounded-md border border-border bg-surface px-2 text-right text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
               />
               <span className="text-muted">{t("AutomationPanel.checkpointRetentionUnit")}</span>
+            </span>
+          </label>
+        </div>
+      </section>
+
+      <section>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.processWallBudgetHeading")}</h3>
+        <p className="mb-2 text-xs text-muted">{t("AutomationPanel.processWallBudgetIntro")}</p>
+        <div className="divide-y divide-border rounded-lg border border-border bg-background px-3">
+          <Toggle
+            checked={processWallBudgetEnabled}
+            onChange={setProcessWallBudgetEnabled}
+            label={t("AutomationPanel.processWallBudgetEnabledLabel")}
+            description={t("AutomationPanel.processWallBudgetEnabledDescription")}
+          />
+          <label className="flex items-center justify-between gap-3 py-2.5 text-sm">
+            <span className="flex flex-col">
+              <span className="text-foreground">{t("AutomationPanel.processWallBudgetHoursLabel")}</span>
+              <span className="text-xs text-muted">{t("AutomationPanel.processWallBudgetHoursDescription")}</span>
+            </span>
+            <span className="flex shrink-0 items-center gap-1.5">
+              <input
+                type="number"
+                min={MIN_PROCESS_WALL_BUDGET_HOURS}
+                max={MAX_PROCESS_WALL_BUDGET_HOURS}
+                value={processWallBudgetHours}
+                disabled={!processWallBudgetEnabled}
+                onChange={(event) => setProcessWallBudgetHours(Number(event.target.value))}
+                className="h-8 w-16 rounded-md border border-border bg-surface px-2 text-right text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent disabled:opacity-50"
+              />
+              <span className="text-muted">{t("AutomationPanel.processWallBudgetHoursUnit")}</span>
             </span>
           </label>
         </div>

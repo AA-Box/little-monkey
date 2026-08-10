@@ -34,7 +34,12 @@ import {
   wallBudgetStopReason,
   wallBudgetVerdict,
 } from "./processWallBudget";
+import { admitProcess } from "./processTable";
 import type { ProcessKind, ProcessRecord } from "./processTable";
+import {
+  DEFAULT_PROCESS_WALL_BUDGET_HOURS,
+  useSettingsStore,
+} from "../store/settingsStore";
 
 const MAIN = { ownsGlobalKinds: true };
 const SECONDARY = { ownsGlobalKinds: false };
@@ -317,5 +322,100 @@ describe("the sweep", () => {
     invokeMock.mockRejectedValue(new Error("no ledger"));
     await expect(enforceWallBudgets(MAIN, PAST)).resolves.toEqual([]);
     warn.mockRestore();
+  });
+});
+
+/**
+ * The mechanism shipped enforced and *unset*: `ProcessKind::default_limits`
+ * returned `None` for all four kinds and `process_admit` built its limit set
+ * from the arguments alone, so every WebView row was declared unbounded and the
+ * sweep above had nothing to fire on. These assert the two halves that changed —
+ * that a row now arrives carrying a budget, and that the budget it arrives with
+ * is the one the user's setting names.
+ */
+describe("the budget a WebView process is admitted with", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({
+      processWallBudgetEnabled: true,
+      processWallBudgetHours: DEFAULT_PROCESS_WALL_BUDGET_HOURS,
+    });
+  });
+
+  function admittedArgs(): Record<string, unknown> {
+    const call = invokeMock.mock.calls.find(([command]) => command === "process_admit");
+    expect(call, "process_admit was never invoked").toBeDefined();
+    return (call![1] as { args: Record<string, unknown> }).args;
+  }
+
+  it("carries the default budget for every kind the sweep enforces", async () => {
+    for (const kind of WALL_BUDGET_KINDS) {
+      invokeMock.mockReset();
+      invokeMock.mockResolvedValue({ processId: "p-1" });
+      await admitProcess({ kind, externalId: `ext-${kind}` });
+      expect(admittedArgs().maxWallMs).toBe(
+        DEFAULT_PROCESS_WALL_BUDGET_HOURS * 60 * 60 * 1000,
+      );
+      expect(admittedArgs().unboundedWall).toBeUndefined();
+    }
+  });
+
+  it("leaves a kind bounded by somebody else alone", async () => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue({ processId: "p-1" });
+    // A background shell is spawned with no timeout on purpose so it can
+    // outlive its turn; a global slider must not quietly bound it.
+    await admitProcess({ kind: "background_shell", externalId: "sh-1" });
+    expect(admittedArgs().maxWallMs).toBeUndefined();
+    expect(admittedArgs().unboundedWall).toBeUndefined();
+  });
+
+  it("asks for no budget at all when the setting is off, rather than one nothing enforces", async () => {
+    useSettingsStore.setState({ processWallBudgetEnabled: false });
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue({ processId: "p-1" });
+    await admitProcess({ kind: "chat_turn", externalId: "ext-off" });
+    expect(admittedArgs().unboundedWall).toBe(true);
+    expect(admittedArgs().maxWallMs).toBeUndefined();
+  });
+
+  it("uses the configured hours rather than the default once one is set", async () => {
+    useSettingsStore.setState({ processWallBudgetHours: 2 });
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue({ processId: "p-1" });
+    await admitProcess({ kind: "subagent", externalId: "ext-2h" });
+    expect(admittedArgs().maxWallMs).toBe(2 * 60 * 60 * 1000);
+  });
+
+  it("never overrides a budget the caller stated for itself", async () => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue({ processId: "p-1" });
+    await admitProcess({ kind: "chat_turn", externalId: "ext-explicit", maxWallMs: 5_000 });
+    expect(admittedArgs().maxWallMs).toBe(5_000);
+  });
+
+  /**
+   * End to end over the two halves: a row admitted with the shipped default is
+   * inside its budget for hours and then latches a stop — which is the claim
+   * "the budget actually fires", rather than "a hand-written row would fire".
+   */
+  it("fires on a row admitted with the shipped default, and not before", async () => {
+    const budgetMs = DEFAULT_PROCESS_WALL_BUDGET_HOURS * 60 * 60 * 1000;
+    const admitted = record({ limits: { maxWallMs: budgetMs } });
+
+    expect(wallBudgetVerdict(admitted, STARTED + budgetMs - 1)).toBe("within-budget");
+    expect(wallBudgetVerdict(admitted, STARTED + budgetMs)).toBe("exceeded");
+
+    invokeMock.mockReset();
+    invokeMock.mockImplementation((command: string) =>
+      command === "process_list" ? Promise.resolve([admitted]) : Promise.resolve(true),
+    );
+    await expect(enforceWallBudgets(MAIN, STARTED + budgetMs)).resolves.toEqual(["exceeded"]);
+
+    const signal = invokeMock.mock.calls.find(([command]) => command === "process_signal");
+    expect(signal).toBeDefined();
+    const payload = signal![1] as { signal: string; reason: string };
+    expect(payload.signal).toBe("stop");
+    expect(payload.reason.startsWith(WALL_BUDGET_STOP_REASON_PREFIX)).toBe(true);
+    expect(isWallBudgetKill({ ...admitted, signalReason: payload.reason })).toBe(true);
   });
 });

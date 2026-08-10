@@ -1038,6 +1038,16 @@ export const en: Record<string, string> = {
   "AutomationPanel.checkpointRetentionLabel": "Keep last",
   "AutomationPanel.checkpointRetentionDescription": "How many recent checkpoints to keep on disk before the oldest are pruned. Applies the next time a checkpoint is created.",
   "AutomationPanel.checkpointRetentionUnit": "checkpoints",
+  "AutomationPanel.processWallBudgetHeading": "Runaway protection",
+  "AutomationPanel.processWallBudgetIntro":
+    "A chat turn, subagent, crew member or side task runs an unbounded number of individually bounded tool calls, so nothing stops a loop that never finishes. This bounds how long one keeps starting new work.",
+  "AutomationPanel.processWallBudgetEnabledLabel": "Stop long-running work",
+  "AutomationPanel.processWallBudgetEnabledDescription":
+    "Ask a turn, subagent, crew member or side task to wind down once it has been running longer than the budget below. It stops at its next safe point, so a tool call already in flight finishes first.",
+  "AutomationPanel.processWallBudgetHoursLabel": "Budget",
+  "AutomationPanel.processWallBudgetHoursDescription":
+    "Applies to work started from now on. Long by design: work waiting on a permission prompt is still counted as running.",
+  "AutomationPanel.processWallBudgetHoursUnit": "hours",
   "ProviderCard.connected": "Connected",
   "ProviderCard.custom": "Custom",
   "ProviderCard.remove": "Remove",
@@ -1331,6 +1341,7 @@ export const en: Record<string, string> = {
   "RulesMemoryPanel.charCount": "{{count}} / {{max}} characters",
   "RulesMemoryPanel.truncatedWarning": "This file is longer than the 16,000-character limit — the part beyond it is not sent to the model.",
   "RulesMemoryPanel.saveButton": "Save",
+  "RulesMemoryPanel.historyButton": "History",
   "RulesMemoryPanel.createButton": "Create MONKEY.md",
   "RulesMemoryPanel.savingButton": "Saving…",
   "RulesMemoryPanel.savedStatus": "Saved",
@@ -1401,6 +1412,10 @@ export const en: Record<string, string> = {
   "McpPanel.sideEffectsNotice": "MCP tool calls are not checkpointed — reverting to an earlier checkpoint won't undo anything an MCP server's tool did (same as Run Shell).",
   "McpPanel.toolCountWarning": "{{count}} tools are currently offered to the model across connected servers — consider narrowing servers' tool allowlists to keep prompts lean.",
   "McpPanel.emptyState": "No MCP servers configured yet. Add one below.",
+  "McpPanel.historyHeading": "Server history",
+  "McpPanel.historyDescription":
+    "Every change to your MCP servers is recorded. Compare two versions, or put an earlier one back.",
+  "McpPanel.historyButton": "History",
   "McpPanel.status_connecting": "Connecting…",
   "McpPanel.status_connected": "Connected",
   "McpPanel.status_error": "Error",
