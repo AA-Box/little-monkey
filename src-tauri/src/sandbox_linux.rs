@@ -551,15 +551,9 @@ mod tests {
         assert_eq!(flags & libc::FD_CLOEXEC, 0, "test fd was not inheritable");
         let script = format!("printf inherited >&{}", inherited.0);
 
-        let mut baseline = Command::new("/bin/sh");
-        baseline
-            .args(["-c", &script])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        install(&mut baseline, None, None, false);
-        let baseline = baseline.status().expect("baseline shell");
         assert!(
-            baseline.success(),
+            crate::workspace_shell::posix_spawn_inheriting_shell_for_test(&script)
+                .expect("baseline shell"),
             "baseline shell did not inherit the test fd"
         );
 

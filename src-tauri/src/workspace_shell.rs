@@ -751,6 +751,48 @@ pub async fn run_to_output(
     }
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn posix_spawn_inheriting_shell_for_test(shell_command: &str) -> io::Result<bool> {
+    use std::ffi::CString;
+
+    let path = CString::new("/bin/sh").expect("static shell path has no NUL");
+    let arg0 = CString::new("sh").expect("static argv has no NUL");
+    let arg1 = CString::new("-c").expect("static argv has no NUL");
+    let arg2 = CString::new(shell_command)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "shell command contains NUL"))?;
+    let mut argv = [
+        arg0.as_ptr().cast_mut(),
+        arg1.as_ptr().cast_mut(),
+        arg2.as_ptr().cast_mut(),
+        std::ptr::null_mut(),
+    ];
+    let mut envp = [std::ptr::null_mut()];
+    let mut pid = 0;
+    let spawned = unsafe {
+        libc::posix_spawn(
+            &mut pid,
+            path.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            argv.as_mut_ptr(),
+            envp.as_mut_ptr(),
+        )
+    };
+    if spawned != 0 {
+        return Err(io::Error::from_raw_os_error(spawned));
+    }
+    let mut status = 0;
+    loop {
+        if unsafe { libc::waitpid(pid, &mut status, 0) } == pid {
+            return Ok(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,7 +1052,6 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     async fn live_shell_does_not_inherit_an_ambient_outside_file_descriptor() {
         use std::os::fd::AsRawFd;
-        use std::os::unix::process::CommandExt;
 
         struct RestoreFdFlags {
             fd: libc::c_int,
@@ -1051,19 +1092,9 @@ mod tests {
             flags: original_flags,
         };
         assert_ne!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, -1);
-        let mut control = std::process::Command::new("/bin/sh");
-        control
-            .args(["-c", &format!("/bin/cat <&{fd} >/dev/null")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        unsafe {
-            control.pre_exec(|| Ok(()));
-        }
         assert!(
-            control
-                .status()
-                .expect("run inherited-fd control")
-                .success(),
+            posix_spawn_inheriting_shell_for_test(&format!("/bin/cat <&{fd} >/dev/null"))
+                .expect("run inherited-fd control"),
             "the control must inherit and read the descriptor"
         );
 
