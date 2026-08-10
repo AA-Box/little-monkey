@@ -2441,7 +2441,10 @@ impl SensitiveDataScanner {
                 .bytes()
                 .filter(u8::is_ascii_digit)
                 .collect::<Vec<_>>();
-            if (13..=19).contains(&digits.len()) && luhn_valid(&digits) {
+            if (13..=19).contains(&digits.len())
+                && card_network_prefix(&digits)
+                && luhn_valid(&digits)
+            {
                 spans.push((
                     SensitiveDataKind::CreditCard,
                     capture.start(),
@@ -2533,6 +2536,44 @@ fn push_regex_spans(
             .find_iter(text)
             .map(|capture| (kind, capture.start(), capture.end(), confidence_micros)),
     );
+}
+
+/// Luhn alone accepts roughly one in ten arbitrary digit runs, so a bare
+/// 13-digit epoch-millisecond timestamp, order number, or numeric id used to
+/// be reported as a credit card. Requiring an issuer-identification prefix
+/// with a length that network actually issues removes that whole class of
+/// false positive; a real card always satisfies both.
+fn card_network_prefix(digits: &[u8]) -> bool {
+    let len = digits.len();
+    let prefix = |count: usize| -> u32 {
+        digits[..count]
+            .iter()
+            .fold(0, |value, byte| value * 10 + u32::from(byte - b'0'))
+    };
+    let two = prefix(2);
+    let three = prefix(3);
+    let four = prefix(4);
+    match digits[0] {
+        // Visa
+        b'4' => matches!(len, 13 | 16 | 19),
+        // Mastercard (51-55 and the 2221-2720 range)
+        b'5' => (51..=55).contains(&two) && len == 16,
+        b'2' => (2221..=2720).contains(&four) && len == 16,
+        // Amex (34/37), Diners (300-305, 3095, 36, 38-39), JCB (3528-3589)
+        b'3' => match two {
+            34 | 37 => len == 15,
+            36 | 38 | 39 => (14..=19).contains(&len),
+            30 => ((300..=305).contains(&three) || four == 3095) && (14..=19).contains(&len),
+            35 => (3528..=3589).contains(&four) && (16..=19).contains(&len),
+            _ => false,
+        },
+        // Discover (6011, 644-649, 65) and UnionPay (62)
+        b'6' => {
+            (four == 6011 || (644..=649).contains(&three) || two == 65 || two == 62)
+                && (16..=19).contains(&len)
+        }
+        _ => false,
+    }
 }
 
 fn luhn_valid(digits: &[u8]) -> bool {
@@ -5824,6 +5865,27 @@ mod tests {
             scanner.apply_policy(&text, SensitiveDataMode::RejectSecrets),
             Err(PipelineError::SensitiveData(_))
         ));
+    }
+
+    #[test]
+    fn luhn_valid_non_card_digit_runs_are_not_credit_cards() {
+        let scanner = SensitiveDataScanner::new().expect("scanner");
+        // A 13-digit epoch-millisecond timestamp that happens to satisfy Luhn
+        // (roughly one in ten do) — no issuer prefix, so not a card.
+        let findings = scanner.scan("captured at 1786099200001 by the recorder");
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.kind == SensitiveDataKind::CreditCard));
+        // Real cards still match, formatted or not.
+        for card in ["4242 4242 4242 4242", "378282246310005", "6011111111111117"] {
+            assert!(
+                scanner
+                    .scan(card)
+                    .iter()
+                    .any(|finding| finding.kind == SensitiveDataKind::CreditCard),
+                "expected {card} to scan as a credit card"
+            );
+        }
     }
 
     #[test]
