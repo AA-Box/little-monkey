@@ -753,6 +753,7 @@ async function executeToolCallInner(
         parentSignal: signal,
         toolCallId: toolCall.id,
         spec,
+        resume: typeof args.resume === 'string' && args.resume.trim().length > 0 ? args.resume.trim() : undefined,
         target: subagent.target,
         effort: subagent.effort,
         risk: subagent.risk,

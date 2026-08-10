@@ -20,9 +20,10 @@
  * configures.
  */
 import { stringifyToolError, stringifyToolResult, CANCELLED_TOOL_RESULT } from './turnEngine';
-import { runSubagentTask, type RunSubagentTaskParams } from './subagent';
+import { MAX_REPORT_CHARS, runSubagentTask, type RunSubagentTaskParams } from './subagent';
 import { useWorkflowStore, type WorkflowPhase } from '../store/workflowStore';
-import { useSessionStore } from '../store/sessionStore';
+import { useSubagentStore } from '../store/subagentStore';
+import { useSessionStore, type WorkflowAgentResult } from '../store/sessionStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useSavedWorkflowStore, type SavedWorkflow } from '../store/savedWorkflowStore';
 import { unwrapUntrustedContent } from './untrustedContent';
@@ -31,6 +32,15 @@ export interface WorkflowAgentSpec {
   description: string;
   prompt: string;
   profile: 'explore' | 'code';
+  /** Optional per-agent reasoning-effort override, threaded straight to
+   * `runSubagentTask`'s existing `effort` param — absent means "inherit the
+   * parent turn's effort", exactly like v1 behaved. Model overrides were
+   * deliberately NOT added: `SubagentContext.target` is resolved once per
+   * turn and passed down so a mid-turn switch can never split parent and
+   * child across targets (see its doc comment), and per-profile pinning +
+   * dispatch policies already cover per-agent model choice inside
+   * `resolveSubagentTarget`. */
+  effort?: 'low' | 'medium' | 'high';
 }
 
 export interface WorkflowSpec {
@@ -84,7 +94,10 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
       const prompt = typeof agent.prompt === 'string' && agent.prompt.trim().length > 0 ? agent.prompt : null;
       if (!prompt) throw new Error(`workflow agent "${agentDescription}" requires a non-empty "prompt".`);
       const profile: 'explore' | 'code' = agent.profile === 'code' ? 'code' : 'explore';
-      return { description: agentDescription, prompt, profile };
+      const rawEffort = agent.effort;
+      const effort: 'low' | 'medium' | 'high' | undefined =
+        rawEffort === 'low' || rawEffort === 'medium' || rawEffort === 'high' ? rawEffort : undefined;
+      return { description: agentDescription, prompt, profile, effort };
     });
     totalAgents += agents.length;
     return { title, agents };
@@ -149,6 +162,21 @@ export function workflowAgentTaskId(runId: string, phaseIndex: number, agentInde
   return `${runId}#p${phaseIndex}a${agentIndex}`;
 }
 
+/** Stable, dependency-free hash of one agent's FULL composed prompt (spec
+ * prompt + injected prior-phase context) — the per-agent "spec still
+ * matches" test `resume` relies on. FNV-1a 32-bit: not cryptographic on
+ * purpose (nothing adversarial hashes here — a collision merely replays a
+ * stale report), chosen because it is synchronous and four lines. Exported
+ * for the logic tests. */
+export function promptHash(prompt: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < prompt.length; i++) {
+    hash ^= prompt.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
 /** One finished agent's contribution to later phases' prompts. */
 interface PhaseReport {
   phaseTitle: string;
@@ -211,6 +239,12 @@ export interface RunWorkflowParams {
    * `RunSubagentTaskParams.toolCallId`. */
   toolCallId: string;
   spec: WorkflowSpec;
+  /** An earlier `workflow` call's own runId (toolCallId) to resume from —
+   * `done` agents whose journaled `promptHash` still matches replay their
+   * report instantly; failed/cancelled/missing ones re-dispatch. Best-effort:
+   * an unknown id, or one whose run fully succeeded, simply runs everything
+   * fresh rather than erroring — resume is an optimization, not a gate. */
+  resume?: string;
   target: RunSubagentTaskParams['target'];
   effort?: string;
   risk?: RunSubagentTaskParams['risk'];
@@ -226,8 +260,24 @@ export interface RunWorkflowParams {
  * cancellation — comes back as a result payload the parent model can read.
  */
 export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
-  const { sessionId, runId, parentCheckpointId, parentSignal, toolCallId, spec, target, effort, risk, onRoutingDecision, onMutatedPath, onMutationFailure } =
+  const { sessionId, runId, parentCheckpointId, parentSignal, toolCallId, spec, resume, target, effort, risk, onRoutingDecision, onMutatedPath, onMutationFailure } =
     params;
+
+  // The journal of the run being resumed — only a TERMINAL-WITH-FAILURES
+  // run's entries are consulted (a fully-'done' run has nothing to resume,
+  // and re-running it fresh is the least surprising reading of the call).
+  const resumeJournal: Record<string, WorkflowAgentResult> | undefined = (() => {
+    if (!resume) return undefined;
+    const meta = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.workflowRunMeta?.[resume];
+    if (!meta || meta.status === 'done') return undefined;
+    return meta.agentResults;
+  })();
+
+  // This run's own journal, keyed by the NEW run's deterministic taskIds and
+  // snapshotted with the terminal meta in `finish` — which is what makes a
+  // chain of partial resumes work: each resume writes a fresh, complete
+  // journal of its own.
+  const agentResults: Record<string, WorkflowAgentResult> = {};
 
   const phases: WorkflowPhase[] = spec.phases.map((phase, phaseIndex) => ({
     title: phase.title,
@@ -253,13 +303,43 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
       startedAt: live?.startedAt ?? Date.now(),
       finishedAt: Date.now(),
       phases,
+      agentResults,
     });
     return result;
   };
 
+  /** Registers a replayed (journal-hit) agent in the live store AND the
+   * persisted per-agent transcript, so the drawer's workflow card shows a
+   * truthful 'done' row with the reused report — not a forever-"Queued" dot
+   * for an agent that will never dispatch. `cancelId: ""` — nothing to stop
+   * or steer, same convention as restored runs. */
+  const replayJournaledAgent = (taskId: string, agent: WorkflowAgentSpec, prompt: string, report: string): void => {
+    const now = Date.now();
+    useSubagentStore.getState().start({ sessionId, taskId, cancelId: '', workflowRunId: toolCallId, description: agent.description, profile: agent.profile });
+    useSubagentStore.getState().appendMessage(taskId, { role: 'assistant', content: report });
+    useSubagentStore.getState().finish(taskId, 'done');
+    useSessionStore.getState().setSubagentRun(
+      sessionId,
+      taskId,
+      [
+        { role: 'user', content: prompt },
+        { role: 'assistant', content: report },
+      ],
+      {
+        status: 'done',
+        workflowRunId: toolCallId,
+        description: agent.description,
+        profile: agent.profile,
+        startedAt: now,
+        finishedAt: now,
+        toolCallCount: 0,
+      },
+    );
+  };
+
   try {
     const priorReports: PhaseReport[] = [];
-    const phaseSummaries: { title: string; agents: { description: string; status: string; report: string }[] }[] = [];
+    const phaseSummaries: { title: string; agents: { description: string; status: string; report: string; reused?: boolean }[] }[] = [];
 
     for (let phaseIndex = 0; phaseIndex < spec.phases.length; phaseIndex++) {
       if (parentSignal?.aborted) return finish('cancelled', CANCELLED_TOOL_RESULT);
@@ -269,26 +349,50 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
 
       const limit = useSettingsStore.getState().maxConcurrentSubagents;
       const results = await runBounded(
-        phase.agents.map((agent, agentIndex) => () =>
-          runSubagentTask({
+        phase.agents.map((agent, agentIndex) => async () => {
+          const agentTaskId = workflowAgentTaskId(toolCallId, phaseIndex, agentIndex);
+          const prompt = `${agent.prompt}${contextBlock}`;
+          const hash = promptHash(prompt);
+
+          // Resume hit: the same position in the resumed run completed with
+          // the exact same composed prompt — replay its report instantly. A
+          // later phase whose context CHANGED (because a re-run agent now
+          // contributes a report the original run lacked) hashes differently
+          // and correctly re-dispatches.
+          const journaled = resume ? resumeJournal?.[workflowAgentTaskId(resume, phaseIndex, agentIndex)] : undefined;
+          if (journaled && journaled.status === 'done' && journaled.promptHash === hash) {
+            replayJournaledAgent(agentTaskId, agent, prompt, journaled.report);
+            agentResults[agentTaskId] = { promptHash: hash, status: 'done', report: journaled.report, reused: true };
+            return journaled.report;
+          }
+
+          const raw = await runSubagentTask({
             sessionId,
             runId,
             parentCheckpointId,
             parentSignal,
             taskId: crypto.randomUUID(),
-            toolCallId: workflowAgentTaskId(toolCallId, phaseIndex, agentIndex),
+            toolCallId: agentTaskId,
             workflowRunId: toolCallId,
             description: agent.description,
-            prompt: `${agent.prompt}${contextBlock}`,
+            prompt,
             profile: agent.profile,
             target,
-            effort,
+            effort: agent.effort ?? effort,
             risk,
             onRoutingDecision,
             onMutatedPath,
             onMutationFailure,
-          }),
-        ),
+          });
+          const cancelled = unwrapUntrustedContent(raw) === CANCELLED_TOOL_RESULT;
+          const failed = !cancelled && resultIsError(raw);
+          agentResults[agentTaskId] = {
+            promptHash: hash,
+            status: cancelled ? 'cancelled' : failed ? 'error' : 'done',
+            report: raw.slice(0, MAX_REPORT_CHARS),
+          };
+          return raw;
+        }),
         limit,
       );
 
@@ -299,7 +403,13 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
         if (!cancelled && !failed) {
           priorReports.push({ phaseTitle: phase.title, agentDescription: agent.description, report: raw });
         }
-        return { description: agent.description, status: cancelled ? 'cancelled' : failed ? 'error' : 'done', report: raw };
+        const reused = agentResults[workflowAgentTaskId(toolCallId, phaseIndex, agentIndex)]?.reused === true;
+        return {
+          description: agent.description,
+          status: cancelled ? 'cancelled' : failed ? 'error' : 'done',
+          report: raw,
+          ...(reused ? { reused: true } : {}),
+        };
       });
       phaseSummaries.push({ title: phase.title, agents });
 

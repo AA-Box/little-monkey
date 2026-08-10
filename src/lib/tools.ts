@@ -510,6 +510,11 @@ export const WORKFLOW_TOOL: ToolDef = {
           type: 'string',
           description: 'Name of a previously saved workflow to re-run. When set, omit "name"/"description"/"phases" — the saved spec is used as-is.',
         },
+        resume: {
+          type: 'string',
+          description:
+            "An earlier workflow tool call's own id to resume from, when that run ended with failures. Agents that already completed with an unchanged prompt return their journaled reports instantly; only failed or changed agents re-run. Best-effort: an unknown id just runs everything fresh.",
+        },
         name: {
           type: 'string',
           description: 'A short kebab-case name for the whole workflow (e.g. "roadmap-audit"), shown to the user.',
@@ -540,6 +545,11 @@ export const WORKFLOW_TOOL: ToolDef = {
                       type: 'string',
                       enum: ['explore', 'code'],
                       description: "Tool access profile — same meaning as the task tool's profile.",
+                    },
+                    effort: {
+                      type: 'string',
+                      enum: ['low', 'medium', 'high'],
+                      description: 'Optional reasoning-effort override for this one agent — omit to inherit the turn\'s effort. Use "low" for cheap mechanical work, "high" only for the hardest verify/judge agents.',
                     },
                   },
                   required: ['description', 'prompt', 'profile'],
