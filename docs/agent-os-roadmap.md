@@ -1453,29 +1453,35 @@ It gains no new filesystem or network reach, but authority can last past the cal
 macOS process-tree leg K4's deferred-platform section must continue to name, not evidence this entry
 has a cross-platform resource/lifetime mechanism it does not have.
 
-**Blocks:** K3's live filesystem/egress boundary no longer blocks the name cut line. K4 still owns
-the macOS process-tree lifetime gap, and K21 still owes the Windows disposable-run shared parity
-body before its conformance suite can certify that separate Sandbox-panel feature.
+**Blocks:** K3's live filesystem/egress boundary no longer blocks the name cut line. K4 records
+the macOS process-tree lifetime gap as an explicitly deferred platform capability, and K21 still
+owes the Windows disposable-run shared parity body before its conformance suite can certify that
+separate Sandbox-panel feature.
 
-## K4. Enforced per-process resource limits *(userspace built; platform legs deferred)*
+## K4. Enforced per-process resource limits *(userspace enforcement built; declaration and platform legs open)*
 
-**Where this stands.** Every bound this app can enforce without a platform
-mechanism is built, and the entries below are the record of each slice. What
-remains is two per-platform mechanisms, and auditing them established that
-**neither should be built as this item's acceptance describes** — see *Deferred,
-with reasons* at the end. So K4 is not "half done"; its userspace half is
-finished and its platform half has been re-scoped rather than skipped.
+**Where this stands.** The original acceptance was a portable quota checklist
+whose named mechanisms cannot provide three of its six resources and whose
+failure semantics do not match those mechanisms. The historical wording and the
+corrections it forced remain below. Every userspace mechanism named in the shipped
+slices is built, but that does not make the platform legs portable or turn
+`ProcessLimits` into proof of enforcement: explicit admission overrides can still
+record fields an owner does not enforce. Stronger mechanisms remain documented
+under *Deferred, with reasons*, and K4 stays open rather than moving those gaps
+outside the cut line by wording alone.
 
-What is enforced today: kernel-held `setrlimit` bounds on all four app-side spawn
-sites, process-group termination on every timeout, a sampling watchdog over daemon
-jobs that measures memory across the whole process group, a per-kind declared limit
+What is enforced today: kernel-held `setrlimit` bounds on Unix app-side spawn
+sites, process-group termination on Unix timeouts, Windows job ownership for
+disposable and live shell trees, a sampling watchdog over daemon jobs that measures
+the Unix process group or walks Windows parent/descendant links, a per-kind declared limit
 set, a bounded *read* of the shell output that reaches a model — the cap holds the
 app's own heap, not just the returned string — a browser-session
-watchdog plus a recorded process group that survives the app that spawned it, and a
+watchdog plus, on Unix, a recorded process group that survives the app that spawned it, and a
 wall-clock budget for the four WebView kinds that is now set as well as enforced.
 A limit kill
-records as `limit_exceeded` rather than as an indistinguishable cancel, on every
-host.
+records as `limit_exceeded` rather than as an indistinguishable cancel for daemon
+and WebView budget owners on every host; browser-session rows retain the named
+quota reason on their cancelled exit.
 
 **Two earlier drafts of this section were wrong in opposite directions**, which is
 worth keeping as a caution about how this file gets written. The first claimed
@@ -1678,14 +1684,14 @@ the process's class, not hardcoded", using the same per-kind-policy shape as
   from the generic ledger onto one subsystem, which is the lesser evil: a second
   copy could drift from the code that enforces it, and a declaration that
   disagrees with its enforcement is worse than an untidy dependency.
-- **`None` is the finding, not an unfinished cell.** Exactly one kind carries a
-  class-level bound, and a test asserts that *shape* — so gaining or losing one
-  forces the field docs and this entry to move with it. The desktop kinds have
-  per-*tool* timeouts (`SHELL_TIMEOUT`, `DEFAULT_VERIFY_TIMEOUT_SECS`) and no
-  budget on the process that issues them, so a turn is unbounded however many
-  tools it runs. No wall-clock or memory number was invented per kind: that would
-  be a guess presented as policy, and `os_limits` above is where this slice
-  learned that choosing one is a judgement about what the process is *for*.
+- **`None` was the finding at this slice, not an unfinished cell.** Exactly one
+  kind then carried a class-level bound, and a test asserted that *shape* — so
+  gaining or losing one forced the field docs and this entry to move with it.
+  The desktop kinds had per-*tool* timeouts (`SHELL_TIMEOUT`,
+  `DEFAULT_VERIFY_TIMEOUT_SECS`) and no budget on the process that issued them,
+  so a turn was unbounded however many tools it ran. Later slices below added
+  class limits for `browser_session` and the four WebView kinds rather than
+  rewriting this historical finding.
 - **The daemon stays unbounded *by class*** and keeps writing its own per-job
   values, which are truer because they came from the job's recipe. A class default
   would be overwritten on the next projection and would only mislead a reader in
@@ -1835,11 +1841,12 @@ and no new delivery path: the existing 2-second sweep reads the live rows of tho
 kinds, and a row past its budget gets the existing durable stop latch, delivered the
 same tick by the existing fan-out.
 
-- **Shipped enforced but *unset*, and that is the honest state rather than an
-  unfinished one.** `ProcessState` has no state for "parked on an unanswered
-  permission prompt" — such a turn reads as `Running` — so any default budget would
-  kill a turn for the user's own slowness. The mechanism is live and fires for
-  nobody; the number is a settings decision this work does not make.
+- **This slice shipped enforced but *unset*; the later slice below set the
+  configurable six-hour default.** `ProcessState` has no state for "parked on an
+  unanswered permission prompt" — such a turn reads as `Running` — so a tight
+  default would kill a turn for the user's own slowness. At this point the
+  mechanism was live and fired for nobody; the later settings work made that
+  policy choice without rewriting this historical result.
 - **`workflow_node` is excluded by an allow-list, not by omission.**
   `deliverProcessSignal` answers `"no-primitive"` for it and `signal_support` refuses
   suspend/resume on the documented grounds that a node has no independent pause
@@ -1865,11 +1872,12 @@ same tick by the existing fan-out.
   `started_at_ms` deliberately survives resume and there is no accumulated-suspended
   column — a long-parked turn trips the moment it resumes.
 
-### Deferred, with reasons — the two platform legs
+### Deferred, with reasons — stronger non-portable platform legs
 
-Both are named in the acceptance below. Auditing them established that neither is
-"the remaining coding work", so they are recorded here rather than left implying a
-sprint's worth of effort.
+These are stronger capabilities than the revised acceptance below, not portable
+promises hidden behind one platform's implementation. Auditing them established
+that none is "the remaining coding work", so they are recorded here rather than
+left implying a sprint's worth of effort.
 
 **Linux cgroups v2 — likely unobtainable in the target environment, not merely
 unbuilt.** An unprivileged desktop app cannot count on a writable, controller-enabled
@@ -1886,25 +1894,52 @@ about whether the app can obtain a cgroup; a probe-and-skip test would be green 
 asserting nothing, which reads as coverage. **If wanted, file the transient-scope
 route as its own item with an `Unavailable(reason)` surfaced to the user.**
 
-**Windows job objects — now built for one owner, and still deferred for the rest, which
-is the distinction this entry was written to protect.** K3's Windows sandbox
-(`sandbox_windows.rs`) puts every *sandboxed* run in a job object with
-`JOB_OBJECT_LIMIT_ACTIVE_PROCESS`, `JOB_OBJECT_LIMIT_JOB_MEMORY` and
-`KILL_ON_JOB_CLOSE`, and the committed-memory bound there is strictly better than the
-per-process `setrlimit` unix gets: a tree of small processes cannot add up to an unbounded
-total. That is one caller, chosen because a sandboxed run is exactly the case whose tree
-*should* die with its guard.
+K3's Landlock and seccomp cut did not change this answer: those rules restrict the
+child after the parent has prepared them; they do not delegate a controller-enabled
+cgroup subtree to the desktop process. Wrapping the child in `systemd-run --user`
+would also collide with the live shell's deliberate AF_UNIX denial. A parent-side
+transient scope therefore remains a new D-Bus authority and lifecycle design with
+no representative `systemd --user` CI fixture, not a missing `pre_exec` call.
 
-**The hazard this entry named is why it stops there.** `KILL_ON_JOB_CLOSE` makes a dropped
-guard tear down the whole tree on Windows while being a silent no-op on macOS: invisible on
-the machine the code is written on, fatal on the platform that cannot be typechecked there
-(Homebrew rustc, `aarch64-apple-darwin` only). `background_shell.rs` is the wrong-owner
-case — its child is *meant* to outlive the spawning call — and it still has no job object,
-deliberately: a misplaced guard would kill every Windows background shell instantly. The
-signature problem is unchanged too, since a job handle is an owned resource whose lifetime
-must span the child. **Extending job objects to the process table's other kinds is still
-not the fill-in-the-no-op the acceptance wording implies**, and the sandbox leg is evidence
-for that rather than against it — it took owning `CreateProcessW` to get there.
+**Correction to the CI claim above:** “no honest CI story” was too absolute. A
+workflow could provision a user manager and exercise the transient-scope path as an
+available leg. That would honestly test the mechanism, but not whether an ordinary
+desktop launch receives delegation on the distributions, containers and non-systemd
+hosts this app supports. The current matrix has no naturally representative fixture;
+the deferral rests on the new parent-side authority, cleanup and `Unavailable(reason)`
+contract, not on CI being impossible.
+
+**Windows job objects — the earlier one-owner account became stale when the live
+tool boundary landed; per-class job budgets remain deferred.** `sandbox_windows.rs`
+still owns `CreateProcessW`, creates the child suspended, assigns it before its first
+instruction and holds `KILL_ON_JOB_CLOSE`, `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` and
+`JOB_OBJECT_LIMIT_JOB_MEMORY`. `workspace_shell.rs` now reuses that owner for the
+desktop foreground shell, the long-lived background shell and monkey-cli. Its
+`ConfinedChild` holds the job, process, AppContainer and scoped grants together, so
+the background handle lives past the spawning tool call instead of killing the work
+on return. The old statement that `background_shell.rs` had no job object was true
+when written and is corrected here rather than deleted.
+
+Those job values are fixed containment guardrails — 512 live processes and 4 GiB
+committed across the tree — not limits derived from `ProcessLimits`. Windows verify
+commands, hooks, Chromium and daemon jobs still use ordinary `Command::spawn`
+owners and hold no job. Assigning one after spawn would leave a first-instruction and descendant
+escape race; doing it correctly needs a generic suspended launcher, class-derived
+job limits, an owned handle stored for each owner's full lifetime, and native tests
+that make the configured threshold fire. Routing those owners through
+`workspace_shell` would silently change their filesystem, network, environment and
+stdio contracts. **That broader Windows leg remains correctly deferred rather than
+being half-built from a post-spawn assignment.**
+
+**macOS process-tree ownership — explicitly deferred, not hidden behind a process
+group.** `workspace_shell.rs` owns a process group and its native regression proves
+a child can move to another group and outlive cleanup. That test directly proves the
+escaped child still cannot read or write outside the Seatbelt filesystem grant; the
+profile itself remains inherited, so changing groups grants no broader network rule.
+Darwin has no cgroup or job object equivalent available to this desktop app;
+recursively enumerating descendants would be a userspace, PID-racy reaper rather than
+a kernel-owned tree. This is the macOS lifetime capability K3 handed to K4, and it
+remains deferred with its actual security boundary stated.
 
 ### Still genuinely missing, after the corrections above narrowed the list
 
@@ -1986,6 +2021,14 @@ for that rather than against it — it took owning `CreateProcessW` to get there
   with an *enforced* class wall bound, declaring the `max_session_ms` the
   browser watchdog already sweeps on rather than inventing a second ceiling.
 
+  **Platform correction:** that pid and crash-reclaim claim is Unix-only.
+  `OwnedBrowser::pgid` is deliberately `None` on Windows, so a Windows
+  `browser_session` row has no `native_pid`; startup reclaim can close the row but
+  cannot recover the Chromium tree. Giving that owner a suspended job and holding
+  its handle belongs to the deferred Windows leg above. Recording only Chromium's
+  direct pid would not create a tree handle and would make the row look stronger
+  without fixing teardown.
+
 - **Two acceptance resources are unachievable as written** and the criteria should
   be amended rather than left standing: "open files" has no Windows job-object
   equivalent, so it is permanently unix-only; and "disk written" cannot come from
@@ -1994,7 +2037,7 @@ for that rather than against it — it took owning `CreateProcessW` to get there
   process, so that leg would not deliver "terminates with a distinguishable exit
   status" even once built.
 
-**Acceptance:** a limit set attached to every process record — CPU time, RSS,
+**Original acceptance (historical, corrected below):** a limit set attached to every process record — CPU time, RSS,
 open files, disk written, wall clock, and process count — enforced by cgroups
 v2 on Linux, job objects on Windows, and `rlimit` plus a supervising watchdog
 on macOS. Exceeding a limit terminates the process with a distinguishable exit
@@ -2022,8 +2065,31 @@ criteria should say is that CPU time, wall clock and captured output are bounded
 that memory is bounded by a sampling watchdog rather than by the kernel, and that
 process count and disk written need a mechanism this app does not have.
 
-**Blocks:** K7, K8 — admission control that cannot bound what it admits is a
-guess.
+**A further correction to that proposed amendment:** both of its conclusions were
+too broad. CPU time is deliberately not bounded — the `RLIMIT_CPU` analysis above
+explains why — and `ProcessLimits` has no CPU, descriptor or disk-written fields.
+The distinguishable-exit claim is true for daemon, workflow and WebView budget
+owners, not for every mechanism: a browser quota exit remains `cancelled` with a
+named reason, and a Windows job-memory breach makes allocation fail. Saying the
+whole half is met would repeat the original checklist under different words.
+
+**Revised acceptance after audit (not yet met):** `ProcessLimits` is a declaration
+record, not proof by itself. A positive value may be recorded only when its owner
+enforces it or reports that specific limit as unavailable; `None` stays distinct
+from zero. A configured breach must retain a named cause in the owning record, and
+the platform tree primitive that actually contains it must be stated rather than
+inferred. Class defaults satisfy the first rule today, but generic admission still
+accepts memory, output and child-process overrides for kinds that do not enforce
+them. Linux per-class cgroups, `ProcessLimits`-backed Windows jobs and a macOS
+kernel-owned process tree also remain deferred above. K4 closes only when those
+declarations and platform capabilities are either enforced or surfaced as
+`Unavailable(reason)`; fixed Unix rlimits and Windows shell-job guardrails do not
+stand in for that contract.
+
+**Blocks (historical correction):** this originally blocked implementation of K7
+and K8 on the theory that admission without a universal quota was a guess. Both are
+now built against measured reservations, so K4 no longer blocks their mechanics;
+their existence does not close K4's declaration and platform-enforcement gaps.
 
 ## K5. Per-run egress policy *(renamed from per-process — see the acceptance correction)*
 
@@ -5734,7 +5800,7 @@ that measured something — and the README's whole voice is that a reader who
 looks will find what was promised.
 
 **Three of those four now survive that reader.** There is a process table with a
-parent/child tree, nine kinds, a validated transition table and three reapers (K1,
+parent/child tree, ten kinds, a validated transition table and three reapers (K1,
 K2). There is a scheduler that arbitrates by documented classes, preempts by
 suspend-and-resume, states a starvation bound as a formula with a test behind it,
 and shares fairly on CPU milliseconds it measured itself (K6–K8). Resource
@@ -5764,10 +5830,11 @@ the grant, linked-worktree Git metadata outside it is not, obsolete Windows prof
 need a cleanup ledger, and macOS group escape can extend a child's already-confined lifetime. Linux
 denies signal syscalls wholesale rather than let a same-user shell target its host, so signal-based
 child supervision is unavailable until a PID namespace or broker can scope it. The macOS lifetime
-gap is K4's process-tree debt, not a process-tree claim smuggled into K3. The optional Sandbox panel
+gap is K4's explicitly deferred platform debt, not a process-tree claim smuggled into K3. The optional Sandbox panel
 is still optional; it is no longer the evidence for how agent shell tools execute.
 
 So the name still does not change. The former isolation blocker is closed, but the cut line is
 Phase 0–3, not one marquee mechanism. Copy-on-write, freeze/restore and transactional effects are
-built; Phase 3 still owes K12's remaining cross-store audit joins and allowed-egress evidence.
+still built; Phase 1 owes K4's declaration/platform enforcement contract, and Phase 3 owes K12's
+remaining cross-store audit joins and allowed-egress evidence.
 "Agent runtime and control plane" remains the honest README name until those entries close.
