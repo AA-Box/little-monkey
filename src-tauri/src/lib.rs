@@ -771,6 +771,10 @@ pub fn run() {
     // launchd's `PATH`, so every shell tool would miss the user's own binaries
     // (`~/.local/bin`, Homebrew, version-manager shims) until this runs.
     login_path::hydrate();
+    // User-authored agent/CLI configuration has a stable, portable home of
+    // its own. Managed state below remains in the OS app-data directory.
+    app_paths::ensure_agent_config_dir()
+        .expect("failed to initialize the Little Monkey agent home");
     let app_data_dir = app_paths::data_dir()
         .expect("the operating system must provide an application data directory");
     // Installed before anything that can refuse an outbound request, and the only

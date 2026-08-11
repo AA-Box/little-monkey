@@ -2,7 +2,7 @@
 //! USER wired to agent lifecycle events (PreToolUse / PostToolUse /
 //! SessionStart / UserPromptSubmit). The frontend owns which hooks exist and
 //! when they fire (`src/lib/userHooks.ts`); this module owns exactly two
-//! things — the per-profile `hooks.json` config file, and one bounded
+//! things — the per-profile agent-home `hooks.json` config file, and one bounded
 //! executor.
 //!
 //! Deliberately NOT `tools::tool_run_shell`: that command is the MODEL's
@@ -46,20 +46,18 @@ pub struct HookExecOutcome {
     pub timed_out: bool,
 }
 
-/// The per-profile hooks config file — resolved through [`app_paths::data_dir`],
-/// the same profile chokepoint every other per-profile store uses (K23), so
-/// hooks never leak across profiles.
-fn hooks_file() -> Result<PathBuf, String> {
-    Ok(app_paths::data_dir()
-        .ok_or_else(|| "Could not resolve the app data directory.".to_string())?
-        .join("hooks.json"))
+/// The per-profile hooks config file. A home copy wins; an existing legacy
+/// profile-data copy remains in use until the user creates the home copy.
+fn hooks_file(roots: &app_paths::AgentConfigRoots) -> Result<PathBuf, String> {
+    roots.effective_path("hooks.json")
 }
 
 /// Returns the raw `hooks.json` content, or an empty string when no hooks
 /// were ever saved — the frontend treats both the same way.
 #[tauri::command(rename_all = "snake_case")]
 pub fn hooks_load() -> Result<String, String> {
-    let path = hooks_file()?;
+    let roots = app_paths::agent_config_roots()?;
+    let path = hooks_file(&roots)?;
     match std::fs::read_to_string(&path) {
         Ok(content) => Ok(content),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
@@ -74,7 +72,8 @@ pub fn hooks_load() -> Result<String, String> {
 pub fn hooks_save(content: String) -> Result<(), String> {
     serde_json::from_str::<serde_json::Value>(&content)
         .map_err(|error| format!("Hooks config is not valid JSON: {}", error))?;
-    let path = hooks_file()?;
+    let roots = app_paths::ensure_agent_config_roots()?;
+    let path = hooks_file(&roots)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Could not create {}: {}", parent.display(), error))?;
@@ -191,5 +190,39 @@ pub async fn hook_exec(
             }
             Ok(HookExecOutcome { exit_code: None, stdout: String::new(), stderr: String::new(), timed_out: true })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn hooks_use_authored_config_with_legacy_fallback() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "little_monkey_hooks_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let roots = app_paths::AgentConfigRoots {
+            profile_id: "work".to_string(),
+            registry_active_id: "work".to_string(),
+            agent_home: root.join("authored-home"),
+            authored: root.join("authored"),
+            legacy: root.join("legacy"),
+        };
+        std::fs::create_dir_all(&roots.legacy).unwrap();
+        std::fs::write(roots.legacy.join("hooks.json"), "{}").unwrap();
+        assert_eq!(hooks_file(&roots).unwrap(), roots.legacy.join("hooks.json"));
+
+        std::fs::create_dir_all(&roots.authored).unwrap();
+        std::fs::write(roots.authored.join("hooks.json"), "{}").unwrap();
+        assert_eq!(
+            hooks_file(&roots).unwrap(),
+            roots.authored.join("hooks.json")
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

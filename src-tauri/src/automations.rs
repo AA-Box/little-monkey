@@ -160,6 +160,20 @@ fn simple_calendar_fields(expr: &str) -> Option<Vec<(&'static str, u32)>> {
     Some(fields)
 }
 
+fn xml_escape(value: &str) -> Result<String, String> {
+    if value.chars().any(|ch| {
+        !matches!(ch, '\u{9}' | '\u{a}' | '\u{d}' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
+    }) {
+        return Err("launchd values cannot contain XML 1.0 control characters".to_string());
+    }
+    Ok(value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;"))
+}
+
 /// Formats a ready-to-install launchd plist for `expr`, or `None` when
 /// `expr` uses cron syntax launchd can't express directly (see
 /// [`simple_calendar_fields`]).
@@ -168,8 +182,12 @@ pub fn format_launchd_plist(
     program: &str,
     args: &[String],
     expr: &str,
-) -> Option<String> {
-    let fields = simple_calendar_fields(expr)?;
+) -> Result<Option<String>, String> {
+    let Some(fields) = simple_calendar_fields(expr) else {
+        return Ok(None);
+    };
+    let label = xml_escape(label)?;
+    let program = xml_escape(program)?;
     let calendar_entries: String = fields
         .iter()
         .map(|(key, value)| {
@@ -178,9 +196,9 @@ pub fn format_launchd_plist(
         .collect();
     let arg_entries: String = args
         .iter()
-        .map(|a| format!("        <string>{a}</string>\n"))
-        .collect();
-    Some(format!(
+        .map(|arg| xml_escape(arg).map(|arg| format!("        <string>{arg}</string>\n")))
+        .collect::<Result<_, String>>()?;
+    Ok(Some(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
 <plist version=\"1.0\">\n\
@@ -202,14 +220,42 @@ pub fn format_launchd_plist(
     <string>/tmp/{label}.log</string>\n\
 </dict>\n\
 </plist>\n"
-    ))
+    )))
 }
 
 /// Formats a crontab line for `expr` — works for any valid cron expression,
 /// no conversion needed, unlike launchd's calendar-interval format.
-pub fn format_crontab_line(expr: &str, program: &str, args: &[String]) -> String {
-    let quoted_args: Vec<String> = args.iter().map(|a| format!("'{a}'")).collect();
-    format!("{expr} '{program}' {}", quoted_args.join(" "))
+pub fn format_crontab_line(expr: &str, program: &str, args: &[String]) -> Result<String, String> {
+    if std::iter::once(expr)
+        .chain(std::iter::once(program))
+        .chain(args.iter().map(String::as_str))
+        .any(|value| value.contains(['\r', '\n']))
+    {
+        return Err("crontab fields cannot contain line breaks".to_string());
+    }
+    let command = std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(posix_single_quote)
+        .map(|value| cron_escape_command_layer(&value))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(format!("{expr} {command}"))
+}
+
+fn posix_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn cron_escape_command_layer(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '%' => escaped.push_str("\\%"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -327,6 +373,7 @@ mod tests {
             ],
             "0 3 * * *",
         )
+        .expect("valid XML values")
         .expect("a fixed-value daily schedule must convert");
 
         assert!(plist.contains("<key>Label</key>"));
@@ -345,16 +392,45 @@ mod tests {
     fn format_launchd_plist_converts_a_weekly_schedule() {
         let plist =
             format_launchd_plist("label", "monkey-cli", &["task".to_string()], "30 9 * * 1")
+                .unwrap()
                 .unwrap();
         assert!(plist.contains("<key>Weekday</key>\n        <integer>1</integer>"));
         assert!(!plist.contains("<key>Day</key>"));
     }
 
     #[test]
+    fn format_launchd_plist_escapes_xml_in_label_program_and_args() {
+        let plist = format_launchd_plist(
+            "label<&>\"'",
+            "/Applications/Monkey <&>\"'",
+            &["recipe <&>\"'".to_string()],
+            "0 3 * * *",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(plist.contains("<string>label&lt;&amp;&gt;&quot;&apos;</string>"));
+        assert!(plist.contains("<string>/Applications/Monkey &lt;&amp;&gt;&quot;&apos;</string>"));
+        assert!(plist.contains("<string>recipe &lt;&amp;&gt;&quot;&apos;</string>"));
+        assert!(plist.contains("<string>/tmp/label&lt;&amp;&gt;&quot;&apos;.log</string>"));
+    }
+
+    #[test]
     fn format_launchd_plist_returns_none_for_a_range_or_step_expression() {
-        assert!(format_launchd_plist("l", "p", &[], "*/15 * * * *").is_none());
-        assert!(format_launchd_plist("l", "p", &[], "0 9-17 * * *").is_none());
-        assert!(format_launchd_plist("l", "p", &[], "0 3 * * 1,3,5").is_none());
+        assert!(format_launchd_plist("l", "p", &[], "*/15 * * * *")
+            .unwrap()
+            .is_none());
+        assert!(format_launchd_plist("l", "p", &[], "0 9-17 * * *")
+            .unwrap()
+            .is_none());
+        assert!(format_launchd_plist("l", "p", &[], "0 3 * * 1,3,5")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn format_launchd_plist_rejects_xml_control_characters() {
+        assert!(format_launchd_plist("label", "/tmp/monkey\u{1}", &[], "0 3 * * *").is_err());
     }
 
     #[test]
@@ -367,7 +443,8 @@ mod tests {
                 "run".to_string(),
                 "/ws/r.yml".to_string(),
             ],
-        );
+        )
+        .unwrap();
         assert_eq!(
             line,
             "0 3 * * * '/usr/local/bin/monkey-cli' 'task' 'run' '/ws/r.yml'"
@@ -377,7 +454,56 @@ mod tests {
     #[test]
     fn format_crontab_line_works_for_expressions_launchd_cannot_express() {
         // No conversion needed — crontab syntax IS cron syntax.
-        let line = format_crontab_line("*/15 9-17 * * 1-5", "monkey-cli", &["task".to_string()]);
+        let line =
+            format_crontab_line("*/15 9-17 * * 1-5", "monkey-cli", &["task".to_string()]).unwrap();
         assert!(line.starts_with("*/15 9-17 * * 1-5 "));
+    }
+
+    #[test]
+    fn format_crontab_line_escapes_single_quotes_and_empty_args() {
+        let line = format_crontab_line(
+            "0 3 * * *",
+            "/opt/Monkey's/bin/monkey",
+            &["O'Brien's audit".to_string(), String::new()],
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            "0 3 * * * '/opt/Monkey'\\\\''s/bin/monkey' 'O'\\\\''Brien'\\\\''s audit' ''"
+        );
+    }
+
+    #[test]
+    fn format_crontab_line_escapes_cron_percent_metacharacters() {
+        let line = format_crontab_line(
+            "0 3 * * *",
+            "/opt/monkey%portable/bin/monkey",
+            &["--agent-home=/home/test/100%local".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            "0 3 * * * '/opt/monkey\\%portable/bin/monkey' '--agent-home=/home/test/100\\%local'"
+        );
+    }
+
+    #[test]
+    fn format_crontab_line_preserves_backslashes_around_percent() {
+        let args = [
+            r"a\%b".to_string(),
+            r"c\\%d".to_string(),
+            r"tail\\".to_string(),
+        ];
+        let line = format_crontab_line("0 3 * * *", "monkey", &args).unwrap();
+
+        assert!(line.contains(r"'a\\\%b'"));
+        assert!(line.contains(r"'c\\\\\%d'"));
+        assert!(line.contains(r"'tail\\\\'"));
+    }
+
+    #[test]
+    fn format_crontab_line_rejects_physical_line_breaks() {
+        assert!(format_crontab_line("0 3 * * *", "monkey\nnext", &[]).is_err());
+        assert!(format_crontab_line("0 3 * * *", "monkey", &["arg\rnext".into()]).is_err());
     }
 }
