@@ -58,26 +58,31 @@ graph LR
 Not features. Each one means a kernel change has to be made twice, or can be
 made once and silently not take effect.
 
-## D1. One HTTP server *(partially built)*
+## D1. One HTTP server *(built)*
 
-**Today:** `server.rs` (~4.6k lines, legacy proxy) and `m3_http_server.rs`
-(~2.1k) both still serve live requests.
+**Today:** one production accept/Hyper connection path in `server.rs`, shared by
+the desktop and `monkey-cli api-serve`; `m3_http_server.rs` can bind only in its
+test harness. The earlier claim that both files still served live requests was
+true when this entry began and was retired in the two cuts recorded below.
 
-**Shipped:** `http_policy.rs`, the shared module both listeners now draw from — and
-`tests/legacy_route_compatibility.rs`, the byte-level harness this item's own "Remaining"
-section calls "the one thing that would make the rest of the merge safe to attempt". Eight
-tests pin what `server.rs` does today: wildcard CORS on every response including failures,
+**First cut (historical):** `http_policy.rs`, the shared module the two then-live
+listeners drew from — and `tests/legacy_route_compatibility.rs`, the byte-level harness
+this item's own "Remaining" section calls "the one thing that would make the rest of the
+merge safe to attempt". Ten tests pin what `server.rs` does today: wildcard CORS on every
+response including failures,
 `/health` byte-for-byte, the OpenAI error envelope's exact nesting and each failure's own
 message bytes, `owned_by` values, raw SSE passthrough, and `OPTIONS /v1/*` → 204 scoped to
-`/v1/*`. Scaffolding for the merge rather than the merge: both servers are still live
-(`server.rs` 5.5k lines, `m3_http_server.rs` 2.1k).
+`/v1/*`. At that cut this was scaffolding for the merge rather than the merge: both
+servers were still live (`server.rs` 5.5k lines, `m3_http_server.rs` 2.1k).
 
-- **Admission control covers every serving path, and now actually bounds it.**
-  `AdmissionGuard` / `RequestAdmission` own the concurrency permit and the
-  in-flight and total counters; `m3_http_server.rs`'s `RequestGuard` is a thin
-  wrapper over the same guard, so the bookkeeping has one implementation rather
-  than two. `serve_with_admission` is the single implementation of the rule, and
-  both legacy accept loops call it.
+- **The admission cut covered every then-live serving path and actually bounded it.**
+  `AdmissionGuard` / `RequestAdmission` owned the concurrency permit and the
+  in-flight and total counters; at that cut `m3_http_server.rs`'s `RequestGuard`
+  was a thin wrapper over the same guard, and `serve_with_admission` was the rule
+  both legacy accept loops called. The final transport cut below retired
+  `RequestGuard`, made `serve_with_admission` a test-only default-envelope wrapper,
+  and put production admission in `serve_with_admission_response` on the one
+  connection path.
 
   **An earlier version of this bullet claimed all of that was already true, and
   three parts of it were not.** Recorded because the corrections are the
@@ -88,20 +93,22 @@ message bytes, `owned_by` values, raw SSE passthrough, and `OPTIONS /v1/*` → 2
     permit and no counters, serving the *identical* route set through the same
     `serve_one_request`. So "a route on either listener can no longer bypass
     admission control" was false in the plainest way: every legacy route stayed
-    reachable with the quota bypassed, by running one command. It now admits
-    through the same helper, and a source-level test pins that a *fourth* path
-    cannot be added silently — a behavioural test cannot cover it, since the
-    defect was precisely a second path that looked fine in isolation.
+    reachable with the quota bypassed, by running one command. The first cut made
+    it admit through the same helper and pinned that a *fourth* path could not be
+    added silently. The final cut removed its private serving path entirely; the
+    structural test now pins one production `listener.accept`, `service_fn` and
+    `serve_connection` authority. A behavioural test cannot cover that invariant,
+    since the defect was precisely a second path that looked fine in isolation.
   - **The permit was released before the request did any work.** The loop dropped
     its guard as soon as `serve_one_request` returned a `Response`, which for a
     streaming route is when upstream *headers* arrive — the `StreamBody` wrapping
     reqwest's `bytes_stream` has not produced a byte. The bound therefore measured
     time-to-first-header, and concurrent SSE streams were not bounded at all. The
-    guard now lives in the response body (`hold_permit_until_body_ends`), so it is
-    released when the body ends *or* when hyper drops it because the client went
-    away — both are tested, the second because leaking a permit per abandoned
-    stream would wedge the listener at its quota with nothing running, which is
-    strictly worse than the unbounded behaviour it replaced.
+    guard now lives in the response body (`hold_admission_until_response_ends`),
+    so it is released when the body ends *or* when hyper drops it because the
+    client went away — both are tested, the second because leaking a permit per
+    abandoned stream would wedge the listener at its quota with nothing running,
+    which is strictly worse than the unbounded behaviour it replaced.
   - **Cancellation was claimed, then found unwired, and is now actually wired** —
     in that order, and the middle step is why the third one describes a different
     defect than the first one did. The guard carried a token that
@@ -110,14 +117,16 @@ message bytes, `owned_by` values, raw SSE passthrough, and `OPTIONS /v1/*` → 2
     Wiring it turned up that **the claimed motivation was wrong**. "A client that
     went away leaves work running" is already handled by drop: hyper drops the
     service future and the in-flight `reqwest` future with it. The real hole was
-    **stopping the server** — `stop_server_core` awaits only the accept loop's
-    task, and every connection is a separate `tokio::spawn` that nothing joins, so
-    requests already accepted kept streaming from upstream after the UI said
-    "stopped".
+    **stopping the server** — at that cut `stop_server_core` awaited only the accept
+    loop's task, and every connection was a separate `tokio::spawn` that nothing
+    joined, so requests already accepted kept streaming from upstream after the UI
+    said "stopped". The final cut made `run_unified_endpoint` own and drain that
+    connection `JoinSet`, so the task awaited by stop now covers the whole tree.
 
     The token now rides on `ServerDeps`, so no handler signature had to learn that
-    cancellation exists, and it is supplied by `serve_with_admission`'s closure
-    parameter — deps cannot be constructed without one. Both upstream `send`s and
+    cancellation exists, and it is now supplied by
+    `serve_with_admission_response`'s closure parameter — deps cannot be constructed
+    without one. Both upstream `send`s and
     both body reads race it; `reqwest` has no cancel method, so cancellation is a
     race whose loser is dropped. A cut stream ends in an **error**, never a clean
     close: a truncated SSE stream that closes successfully is indistinguishable to
@@ -142,15 +151,18 @@ message bytes, `owned_by` values, raw SSE passthrough, and `OPTIONS /v1/*` → 2
   Also corrected: the 503 refusal body is now byte-asserted. It was the one
   response on this listener with no test at all, and an SDK client branches on
   its shape.
-- **The port collision is diagnosable.** Both default to 1234, both bind
-  loopback, and both autostart independently from `setup` with no ordering and
-  no cross-check, so a user with `autostart` on *and* a persisted LAN policy has
-  two tasks racing for one socket. A bind failure on that port now names the other
-  listener and the panel that fixes it; on a custom port, or any non-`AddrInUse`
-  error, it reports what the OS said rather than guessing.
+- **The former port collision became diagnosable before it was removed.** Both
+  defaulted to 1234, bound loopback, and autostarted independently from `setup`
+  with no ordering or cross-check, so a user with `autostart` on *and* a persisted
+  LAN policy had two tasks racing for one socket. A bind failure on that port
+  learned to name the other listener and the panel that fixed it; on a custom
+  port, or any non-`AddrInUse` error, it reported what the OS said rather than
+  guessing. The unified reconciler below removed the production race by owning
+  the single bind; the diagnostic remains useful for collisions with an older
+  concurrently running build.
 
-  The shared `DEFAULT_HTTP_PORT` was also claimed to state the overlap, and until
-  now it did not: both listeners kept their own `1234` literal and nothing outside
+  The shared `DEFAULT_HTTP_PORT` was also claimed to state the overlap, and at the
+  time it did not: both listeners kept their own `1234` literal and nothing outside
   `http_policy.rs` referenced the constant, so it was a third copy of the number
   with a comment about the other two. Both defaults now derive from it — which
   matters beyond tidiness, because the bind-error message branches on
@@ -225,7 +237,7 @@ wait was unnecessary, and what actually remains is a capability that has to be b
   **What *was* duplication, and is now fixed.** `constant_time_eq` existed twice, in
   `server.rs` and `compatibility_hub.rs`, byte-identical — a security primitive with two
   copies, which is one copy that can be corrected while the other keeps the defect. It now
-  lives once in `http_policy.rs`, the module both listeners already share, and its two tests
+  lives once in `http_policy.rs`, the module both route families already share, and its two tests
   moved with it: they had been sitting beside one copy, which is precisely the arrangement
   that lets the second go untested. `server.rs` also carried the bearer→token scan twice
   (`authenticate_credential` and `authenticate_local_app_token`), each with its own expiry
@@ -310,23 +322,41 @@ wait was unnecessary, and what actually remains is a capability that has to be b
   the other three, against a fixture written to be wrong in three ways a
   re-serializer would silently fix.
 
-Also still open: `monkey-cli api-serve` is deliberately `AppHandle`-free while
-the merged server needs an `M3RuntimeHub` that today only exists under Tauri.
-The five host routes (`/v1/knowledge/query`, `/v1/local-apps/{id}/run`,
-`/v1/artifacts/{id}`, `/v1/workflows/runs/{id}`, `/local-apps/{id}`) are done —
-they are in the typed registry, loopback-scoped, with the prefix tier landed and
-the invariant `route_allowlist_never_exposes_agent_or_workspace_tools` now an
-actual test rather than a name in this file.
+**The last transport fork is now gone.** An earlier revision said
+`monkey-cli api-serve` could not join the listener because it is deliberately
+`AppHandle`-free and the real `M3RuntimeHub` existed only under Tauri. That had
+already become stale: `run_cli_server` builds the same production hub through
+`build_m3_command_state` and injects it into the headless server. What remained
+was the CLI's private `listener.accept` / `service_fn` / `serve_connection`
+loop, duplicating connection limits, admission lifetime, shutdown and future
+TLS changes even though both paths called the same router.
 
-**Blocks:** K7 still.
+`server.rs` now expresses the host-only differences as `EndpointHost` and
+`CliServerRuntime`; both hosts run every connection through
+`serve_endpoint_connection` and the sole production accept implementation,
+`run_unified_endpoint`. The CLI keeps its per-request config/provider reload,
+token-use writeback, audit and request log, while the desktop keeps its status
+projection. `endpoint_request_surface` preserves legacy auth/body/preflight
+ordering for unmatched primary `/v1/*` requests before the shared admission
+path. `tests/legacy_route_compatibility.rs` was not changed: all ten byte-level
+tests pass against the merged path. `m3_http_server.rs` retains its real listener
+only as the existing test harness; it is not a second production server.
+
+The five host routes (`/v1/knowledge/query`, `/v1/local-apps/{id}/run`,
+`/v1/artifacts/{id}`, `/v1/workflows/runs/{id}`, `/local-apps/{id}`) remain in
+the typed registry, loopback-scoped, with the prefix tier landed and the
+invariant `route_allowlist_never_exposes_agent_or_workspace_tools` an actual
+test rather than a name in this file.
+
+**Blocks:** nothing now. K7 shipped on top of the unified serving path.
 
 The claim that "K4 and K5 are unblocked by the admission work above" was wrong in
 kind, not just in degree, so it is withdrawn rather than adjusted. Per-HTTP-request
 admission bounds how many requests one listener serves at once. K4 is per-*process*
 resource enforcement (wall clock, memory, child count) and K5 is per-*process*
 egress policy; neither is expressible in terms of a request permit, and no part of
-`http_policy.rs` touches either. What D1 genuinely blocks is having *one* place to
-attach a policy later — useful, and not the same as unblocking.
+`http_policy.rs` touches either. What D1 genuinely supplied was *one* place to
+attach a policy later — useful, and not the same as unblocking either item.
 
 *Maps to: ROADMAP #9.*
 
@@ -3507,16 +3537,18 @@ test fed it verbatim CLI JSON: the nested block needs a split
 camelCase every sibling struct uses loses exactly the fields whose absence still
 lets `state` work.
 
-The two HTTP listeners honor nothing, **with evidence rather than by omission**:
+The two HTTP route families honor nothing, **with evidence rather than by omission**:
 `m3_http_server.rs` contains no reference to the daemon at all, and every
 `server.rs` route is inference proxy, model lifecycle, cancellation, or read-only
 state — `POST /v1/local-apps/{id}/run` emits an event and returns 202 without
 touching the queue. Gating inference would mean spawning a status subprocess on the
 hot path of every chat completion to refuse work that never enters the queue being
 measured. A test trips if an enqueueing route is ever added. Note also that
-scheduler backpressure and the per-listener `RequestAdmission` bound are different
-things and stay distinguishable: `503`/`server_busy` means requests in flight,
-`429` + `Retry-After` means the work queue behind them.
+scheduler backpressure and the shared `RequestAdmission` bound are different
+things and stay distinguishable: a desktop generation shares one admission
+authority across its reconciled endpoints, while the headless CLI enters the
+same connection path with its own instance. `503`/`server_busy` means requests
+in flight; `429` + `Retry-After` means the work queue behind them.
 
 **Shipped — cascade preemption, and the reason it was deferred did not survive
 being written down.** `preemption_victim` returned at most one job and required
@@ -5151,7 +5183,7 @@ exactly one definition of each tool.
   route's grant, changing a protocol version, or shortening the support window
   are `Breaking`; additions and relaxations are `Additive`; wording is `Patch`.
   A reviewer never has to decide which one an edit was.
-- **`GET /v1/contract` answers before authentication, on both listeners**, for
+- **`GET /v1/contract` answers before authentication, for both route families**, for
   the reason `/health` does: a client negotiating an ABI has not necessarily got
   a credential of the right shape yet, and one whose shape changed must still be
   able to find out. The body is a pure function of the built binary — no
