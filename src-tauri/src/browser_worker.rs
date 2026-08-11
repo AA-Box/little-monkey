@@ -973,7 +973,8 @@ impl OwnedBrowser {
         Ok(browser)
     }
 
-    /// Writes this session's row, including the pid that names its process group.
+    /// Writes this session's row, including the Unix pid that names its process
+    /// group. Windows leaves it absent rather than presenting one pid as a tree.
     ///
     /// Fail-soft by construction — the result is logged and dropped. A browser
     /// action must not fail because a bookkeeping row could not be written, which
@@ -986,9 +987,9 @@ impl OwnedBrowser {
 
         let mut projection =
             ProcessProjection::new(ProcessKind::BrowserSession, self.session_id.clone(), state)
-                // The pid is the point of the row: it is the only durable handle on this
-                // Chromium's process group, and the only thing that lets a *later* app
-                // session kill a tree this one launched.
+                // On Unix the pid is the only durable handle on this Chromium's
+                // process group, and the only thing that lets a later app session
+                // kill a tree this one launched. It is None on Windows.
                 .with_native_pid(self.pgid.map(i64::from));
         projection.limits.max_wall_ms = Some(self.limits.max_session_ms);
         projection.exit = exit.map(|exit| match exit {
@@ -2539,7 +2540,8 @@ fn kill_browser_process_group(pgid: u32) {
     }
 }
 
-/// Kills and closes out browser sessions a previous app process left running.
+/// Kills and closes out browser sessions a previous app process left running on
+/// platforms where the row carries a process-group id.
 ///
 /// This is the crash path, and the reason [`ProcessKind::BrowserSession`] and its
 /// `native_pid` exist at all. Chromium is spawned by this app but is not its
@@ -2549,9 +2551,11 @@ fn kill_browser_process_group(pgid: u32) {
 /// existing startup sweep could delete the profile — it could not kill the
 /// processes holding it, because nothing recorded what they were.
 ///
-/// Now something does. For every live `browser_session` row this reads the
-/// recorded group id and terminates it, then hands the rows to the ordinary
-/// startup reap, which closes them as [`ExitStatus::Lost`].
+/// On Unix the row does: this reads the recorded group id and terminates it,
+/// then hands the rows to the ordinary startup reap, which closes them as
+/// [`ExitStatus::Lost`]. Windows records no `native_pid` because its direct pid
+/// is not a tree handle; crash-safe reclaim there needs the owned job object
+/// tracked in K4 rather than a stronger claim attached to one pid.
 ///
 /// # Pid reuse
 ///
