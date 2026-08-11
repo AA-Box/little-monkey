@@ -5865,8 +5865,42 @@ whichever saved second, with nothing recording that the other edit existed.
   itself a revision. The rules editor loads a snapshot into the textarea rather
   than writing it, so the user's own Save records it.
 
-**Remaining:** the history is per-entity, so there is still no cross-entity view
-of what a given change touched.
+~~**Remaining:** the history is per-entity, so there is still no cross-entity view
+of what a given change touched.~~
+
+**Shipped — the change is recorded as a fact, not inferred from the clock.**
+
+`Revision` gains `change_id`, and every `record` call one save makes passes the
+same one. `config_revisions::changes` groups by it across entities *and across
+kinds* — the read neither `history` (one entity) nor `entities` (one kind) could
+do — reachable as `config_revisions_changes`, `listChanges` in
+`configRevisionStore.ts`, and `monkey revisions changes`.
+
+- **Timestamps were the obvious mechanism and the wrong one.** Grouping
+  revisions written within a second of each other would report two unrelated
+  saves as one change that never happened. This entry's own multi-entity write is
+  the case that makes it concrete: an MCP save records the whole document *and*
+  one revision per changed server, and those genuinely are one change — but so
+  are the two windows saving different personas at the same moment, under a clock
+  heuristic. An id says which; a timestamp guesses.
+- **Old revisions stay uncorrelated, and that is the answer rather than a gap.**
+  `#[serde(default)]` keeps every log already on disk parsing, and each such
+  revision comes back as its own single-entry set with `change_id: None`. This is
+  the same discipline `run_scope`'s two arms, `permission_decisions.attribution`
+  and `tool_call_origin`'s `unknown` default already follow: absence with a
+  stated reason beats a plausible-looking value. Pinned by a test that feeds the
+  reader two real pre-change-id records a second apart and requires two sets, not
+  one.
+- **A one-entity save still gets an id.** "This change touched only `MONKEY.md`"
+  is an answer; an absent id means something else entirely, and collapsing the
+  two would make the field unreadable exactly where it is most often read.
+- **`branch_from` mints its own** rather than inheriting the source revision's:
+  forking a branch happens later than the change it forks from, and reusing that
+  id would enlarge a past change with something that was not part of it.
+- **Full scan, no index, deliberately.** The store is tens of small JSONL files —
+  one per persona, rules file and MCP server. An index here would be a second
+  thing to keep correct in exchange for nothing measurable, and the code says so
+  at the scan.
 
 *Maps to: ROADMAP #3.*
 

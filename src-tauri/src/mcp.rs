@@ -295,6 +295,10 @@ pub fn save_config_impl(
         .map_err(|e| format!("Failed to serialize mcp_servers.json: {}", e))?;
 
     let root = revision_root_for(path);
+    // One id for the whole save, so the document revision and each changed
+    // server's revision are readable afterwards as the one change they were
+    // (`config_revisions::changes`) rather than as neighbours in time.
+    let change_id = config_revisions::new_change_id();
     let revision = config_revisions::record(
         &root,
         MCP_CONFIG_REVISION_KIND,
@@ -304,6 +308,7 @@ pub fn save_config_impl(
             base_revision_id,
             label: "Saved".to_string(),
             content: payload.clone(),
+            change_id: Some(change_id.clone()),
         },
     )
     .map_err(|e| e.to_string())?;
@@ -330,6 +335,7 @@ pub fn save_config_impl(
                 base_revision_id: None,
                 label,
                 content: server_snapshot(entry),
+                change_id: Some(change_id.clone()),
             },
         );
     }

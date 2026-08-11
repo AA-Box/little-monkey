@@ -28,6 +28,7 @@ mod processes_cli;
 mod profiles_cli;
 mod providers_cli;
 mod repl;
+mod revisions_cli;
 mod security_cli;
 mod skills_cli;
 mod sse;
@@ -374,6 +375,17 @@ enum Cmd {
         /// System prompt overriding the model's default
         #[arg(long)]
         system: Option<String>,
+    },
+    /// Show what recent configuration changes touched, across personas,
+    /// rules/memory files, MCP servers and workflow definitions — the
+    /// cross-entity view of the per-entity revision history.
+    Revisions {
+        /// Show only this change id (from an earlier listing).
+        #[arg(long)]
+        change: Option<String>,
+        /// How many recent changes to list.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     /// Revert a checkpoint's file changes (defaults to the most recent one
     /// from this CLI). Prints the restored-file count.
@@ -1427,6 +1439,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             .await;
             return;
         }
+        Cmd::Revisions { change, limit } => revisions_cli::list(change.as_deref(), *limit),
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
             Ok(count) => {
                 println!("Restored {count} file(s).");

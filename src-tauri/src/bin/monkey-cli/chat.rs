@@ -845,7 +845,10 @@ mod tests {
         // exactly the "fixed literal port" bug class, just with a temp file
         // instead of a socket. `uuid`-suffix it per run, same as
         // `daemon::remote::api::tests::fixture`'s `root`.
-        let dir = std::env::temp_dir().join(format!("monkey_cli_chat_test_format-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "monkey_cli_chat_test_format-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("schema.json");
         std::fs::write(&file, r#"{"type":"object"}"#).unwrap();
@@ -877,7 +880,10 @@ mod tests {
         // Uuid-suffixed for the same reason as `parse_format_flag_forms`
         // above — a fixed directory name races any other concurrently
         // running copy of this test binary.
-        let dir = std::env::temp_dir().join(format!("monkey_cli_chat_test_images-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "monkey_cli_chat_test_images-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let img = dir.join("cat.png");
         std::fs::write(&img, [0x89u8, b'P', b'N', b'G']).unwrap();
