@@ -1157,21 +1157,24 @@ only a stop. What K8 still needs from elsewhere is the reservation question
 above — a suspended process holds its resident model slot, worktree lease and
 workspace root — which is a K7/K8 decision, not a signals one.
 
-## K3. Isolation parity across platforms *(built on all three; parity test owed on Windows)*
+## K3. Isolation parity across platforms *(built on all three; disposable-run parity test owed on Windows)*
 
-**Today:** real Seatbelt (`sandbox-exec`) confinement on macOS, with an
-integration test asserting a sandboxed command cannot read or write the real
-workspace with or without network (`sandbox.rs`). On Windows and Linux the
-same call falls back to a restricted cwd and scrubbed environment — that is
-app-level policy, not kernel-enforced isolation.
+**Historical baseline, superseded by the shipped entries below:** at that point,
+`execute_in_sandbox` had real Seatbelt (`sandbox-exec`) confinement on macOS,
+with an integration test asserting a sandboxed command could not read or write
+the real workspace with or without network (`sandbox.rs`). On Windows and Linux
+the same call fell back to a restricted cwd and scrubbed environment — app-level
+policy, not kernel-enforced isolation.
 
-**Scope correction, because the sentence above invites a bigger reading than it
-should.** `execute_in_sandbox` has exactly one non-test caller — `sandbox_run`,
-behind the Sandbox panel and `probeGeneratedMcpArtifact`. It is an opt-in feature,
-*not* the app's execution boundary: the agent's own shell tool spawns `sh -c` /
-`cmd /C` with the workspace as cwd and does not even `env_clear()`, on every
-platform including macOS. So "Seatbelt confinement on macOS" describes one
-feature, and no reader should take it as a statement about how agent tools run.
+**Historical scope correction, now superseded by the live tool boundary below,
+because the sentence above invited a bigger reading than it should.**
+`execute_in_sandbox` has exactly one non-test caller — `sandbox_run`, behind the
+Sandbox panel and `probeGeneratedMcpArtifact`. It was an opt-in feature, *not* the
+app's execution boundary: the agent's own shell tool spawned `sh -c` / `cmd /C`
+with the workspace as cwd and did not even `env_clear()`, on every platform
+including macOS. So "Seatbelt confinement on macOS" described one feature, and
+no reader should take that historical sentence as a statement about how agent
+tools run now.
 
 **Shipped — enforcement is reported before it is relied on, and the one
 enforcement claim that had no test now has one.**
@@ -1333,35 +1336,96 @@ container and CI environments, so seccomp on socket creation was taken instead. 
 that filter covers what the acceptance asks of the Linux leg; namespaces would add a stronger
 network boundary and a mount view, and the latter is K10's business rather than this item's.
 
-**The two caveats that outlived the platform work, and are now the whole of this item.**
-Both were true when the sandbox was macOS-only and are unchanged by having three legs:
+**Shipped — the live tool boundary, superseding both caveats above.**
+`workspace_shell.rs` is the one policy and spawn surface for the desktop foreground shell
+(`tools.rs`), the long-lived background shell (`background_shell.rs`), and monkey-cli
+(`bin/monkey-cli/tools_cli.rs`). The selected workspace is writable; a fresh process-private
+HOME/TMP root is writable; filtered system, PATH and rustup roots are read/execute only; and
+everything else is outside the filesystem grant. Every command starts from `env_clear()` and
+receives only PATH, `SystemRoot` where Windows needs it, the private HOME/TMP variables, and a
+computed read-only `RUSTUP_HOME`. Background worktree shells now receive the same registered
+worktree override as foreground shells instead of silently falling back to the shared checkout.
 
-- **The sandbox is still opt-in, with exactly one non-test caller.** `execute_in_sandbox` is
-  reached only from `sandbox_run`, behind the Sandbox panel and `probeGeneratedMcpArtifact`.
-  Kernel-enforced confinement on every desktop platform describes one *feature*, not how
-  agent tools run.
-- **The agent's own shell tool is not routed through it on any platform**, and has no
-  `env_clear()` — it spawns `sh -c` / `cmd /C` with the workspace as cwd, inheriting whatever
-  launched the app. The tempting framing is "it leaks secrets", and that overstates it: there
-  is no production `std::env::set_var` anywhere in the crate and no provider key is injected
-  into any child's environment, so what a tool call inherits is close to nothing from Finder
-  and a developer's own exports from a terminal.
+PATH is executable authority, so it is not trusted wholesale. `sandbox.rs` retains only the
+workspace's own entries, fixed system locations, and named user tool layouts; the resulting roots,
+not the parent's arbitrary PATH directories, become read grants. The regression test puts a secret
+directory on ambient PATH and proves it is removed. A linked worktree's `.git` file is not followed
+to the shared checkout's config, hooks, refs and object store: shell Git commands which need those
+may fail, while the host-owned `agent_worktrees` status/apply/remove path remains available. This is
+a path-tree boundary. A hard link, FIFO or other object deliberately named inside that tree is
+workspace content; scanning and rejecting every Cargo target or pnpm store link before every shell
+would both change that namespace contract and make the tool unusable.
 
-  This is not a one-line fix because the obvious fix is wrong. A blanket `env_clear()` would
-  strip `PATH`, `HOME`, toolchain and proxy variables from every tool call, and an allowlist
-  narrow enough to be safe breaks the same commands — `sandbox.rs`'s `allowlisted_env` can be
-  that strict only because it serves a disposable probe, not the user's real workspace. Nor
-  is pointing the shell tool at `execute_in_sandbox` the answer: the sandbox denies the real
-  workspace by design and the agent's job is to edit it. What tool calls should be allowed to
-  reach is a policy question, and it belongs with K5.
+This reuses the three platform legs rather than creating a fourth confinement path. On macOS,
+`build_seatbelt_profile_for_roots` extends the Seatbelt builder to the live workspace and private
+runtime root, omits ambient Mach lookup, enumerates `/dev/fd` in the already-forked child and marks
+every non-stdio descriptor close-on-exec, and clears the inherited launchd bootstrap port before
+`sandbox-exec` starts. The directory handle and buffer are allocated in the parent; the hook calls
+Darwin's raw `__getdirentries64` wrapper and `fcntl`, so another app thread cannot add a descriptor
+to the child after the enumeration point. The last two controls matter: a profile rule alone does
+not revoke a port or file the parent already opened, and both observed escapes have live regression
+tests, including a descriptor opened after runtime setup.
 
-**Blocks:** no longer the platform half of the claim — isolation is kernel-enforced on
-macOS, Linux and Windows. What it still blocks is narrower and stated above: the sandbox is
-opt-in and the agent's shell tool does not go through it, so "enforced by the platform" is
-true of a feature rather than of how agent tools run. K21 concretely: its conformance suite
-must cover the isolation guarantees, and Windows has the mechanism but not yet the shared
-assertion body, so a suite written today could certify two platforms by test and the third
-by argument.
+On Linux, `sandbox_linux.rs` installs the rules on both Tokio and standard-library children and
+requires Landlock ABI 3 for the live path; older kernels fail the shell rather than leave
+`truncate(2)` outside the workspace unconfined. Its strict seccomp leg denies every socket domain,
+same-user process-memory and descriptor inspection, session-keyring syscalls, and process-group
+escape. It also denies all cross-process signal syscalls: classic seccomp cannot distinguish a
+descendant from the known host parent, so allowing `kill(2)` would let a command stop or kill the
+desktop. That secure default means `timeout`, process supervisors and signal-based child control
+do not work inside a Linux agent shell; restoring scoped signals needs a PID namespace or broker,
+not a syscall allowlist. `close_range(..., CLOSE_RANGE_CLOEXEC)` removes inherited descriptors. The optional
+disposable-copy Sandbox keeps its older ABI-degrading and AF_UNIX-compatible behavior; that
+correction is local to live tools rather than a retrospective claim about the separate feature.
+
+On Windows, `sandbox_windows.rs` owns the `CreateProcessW` path needed to attach an AppContainer,
+an explicit three-handle inheritance list, and a job before the child is resumed. The stable
+container identity is a digest of the canonical workspace, ordered readable roots and policy
+version, so removing a PATH root selects a new SID rather than retaining yesterday's authority.
+Workspace write and tool-root read/execute ACEs persist for that exact identity; the per-command
+runtime grant is removed after the job has killed every descendant. AppContainer package storage
+is another private root owned by that identity, even though HOME/TMP are rebound to the disposable
+runtime root. Profiles and obsolete SID ACEs do not yet have a ledger-backed cleanup path and
+managed worktrees can accumulate them; protected-DACL descendants may instead stay inaccessible.
+Those are maintenance and compatibility debts, not hidden grants to the current identity.
+
+The live tool path fails closed when Seatbelt, Landlock or AppContainer cannot provide the
+filesystem boundary; the Sandbox panel keeps its older, explicitly reported degradation because it
+is a separate disposable-copy feature. Opening host- or network-reachable socket endpoints from
+shell commands is always denied:
+Seatbelt's network rule, Linux seccomp, and the absence of Windows AppContainer network capabilities
+are the only enforceable answer. Turning them on for a run with a non-empty K5
+allowlist would reduce host/port/protocol policy to a boolean and bypass DNS pins, denial records,
+destination/byte accounting and background-process lifetime. Network-capable built-in tools stay
+host-mediated. Linux still permits local `socketpair(2)` IPC, which creates no host or network
+endpoint. This costs real shell behavior: package downloads, loopback clients/listeners, dev
+servers and socket-based local databases do not work through foreground, background or CLI shell
+tools. They must use a host-mediated tool to receive K5 policy; there is no transparent
+cross-platform broker in this change.
+
+`workspace_shell::tests::agent_shell_cannot_read_or_write_outside_selected_workspace` is one
+shared assertion body compiled on macOS, Linux and Windows and drives the actual shell spawn
+primitive: workspace read/write must succeed, an absolute sibling read and write must fail, and
+the host confirms the sibling bytes did not change. Linux additionally proves AF_UNIX is refused;
+macOS proves the launchd bootstrap port and an ambient outside-file descriptor are gone; Windows
+proves the job is attached before user code and a descendant cannot outlive it. The descriptor test
+constructs the runtime first and opens the inheritable outside file afterward, pinning the macOS
+fork-time sweep rather than a parent-side snapshot. Linux also proves its shell cannot signal the
+host parent. This is independent
+of the older owed Windows parity test for the **disposable** `execute_in_sandbox` path; widening
+that test's cfg without running its positive/network assertions remains dishonest for the reason
+recorded above.
+
+One process-lifetime correction stays explicit. Windows owns a real tree through its job and Linux
+denies `setsid`/`setpgid`; macOS owns a process group, not a kernel process tree. A child which moves
+itself into another group can outlive foreground cleanup, still carrying the same Seatbelt policy.
+It gains no new filesystem or network reach, but authority can last past the call. That is the
+macOS process-tree leg K4's deferred-platform section must continue to name, not evidence this entry
+has a cross-platform resource/lifetime mechanism it does not have.
+
+**Blocks:** K3's live filesystem/egress boundary no longer blocks the name cut line. K4 still owns
+the macOS process-tree lifetime gap, and K21 still owes the Windows disposable-run shared parity
+body before its conformance suite can certify that separate Sandbox-panel feature.
 
 ## K4. Enforced per-process resource limits *(userspace built; platform legs deferred)*
 
@@ -2494,9 +2558,9 @@ there: a chain starting from `hardened()` instead of `Client::builder()` escapes
 substring cannot distinguish.
 
 **Shipped — and the premise "a total deadline is fine when the body is small and
-buffered" turned out to be too simple.** Auditing all 15 sites (10 verifiers, each
-verdict then adversarially challenged by a second reader instructed to refute it) turned
-up **three** distinct failure modes, not one:
+buffered" turned out to be too simple.** Auditing all 18 total-deadline chains across
+11 files — each initial verdict adversarially challenged by a second reader instructed
+to refute it — turned up **three** distinct failure modes, not one:
 
 - **(A) A large download.** The truncation the rule is named for. Two sites, both
   converted rather than allow-listed. `bin/monkey-cli/daemon/remote/client.rs`'s
@@ -3052,6 +3116,22 @@ would make every reader join twice to ask it.
   check — wrote no destinations at all, which is the gap itself. Fail-soft with
   return-on-failure like every other drain here, and a returned drain past the cap
   becomes overflow rather than breaching it.
+
+**Shipped — built-in tool egress now meets the live shell boundary.**
+`workspace_shell.rs` denies host/network socket endpoints for foreground, background and CLI
+shell children on all three platforms, because K5's host/port/protocol declaration cannot be
+enforced by changing the sandbox backends' network decision to a single allow bit. `web.rs` now
+resolves the injected turn with the same attribution rule used by its permission decision and enters
+that `RunScope` around `web_fetch`/`web_search`. AppHandle-free helpers preserve an ambient CLI or
+durable-task scope and synthesize `Unattributed::UserAction` only when there is no scope to keep, so
+the public helper no longer erases its caller's attribution. Fetch checks K5 before DNS for both
+the initial URL and every redirect, composes the SSRF resolver with K5's pinned answers, and charges
+each allowed redirect destination. The requests cross `egress::send`, so a durable run receives
+its frozen allowlist, denial record and byte accounting rather than being relabelled as a user
+action. This is intentionally stricter than "shell network follows the allowlist": no
+child-created host or network socket endpoint is allowed, including loopback or one a background
+process opens after its originating turn ends. The resulting shell incompatibilities are recorded
+under K3 and in README rather than hidden behind the word "egress".
 
 **Blocks:** K17 — placing a run on a remote node is only safe if the run's
 egress travels with it.
@@ -5608,28 +5688,33 @@ and shares fairly on CPU milliseconds it measured itself (K6–K8). Resource
 arbitration is real: admission consults live hardware and the offload plan, holds
 what does not fit, and rejects at enqueue what can never fit.
 
-**Isolation (K3) is the clause that decided the name, and the platform half of it is
-now met on all three.** Seatbelt on macOS, Landlock plus seccomp on Linux, AppContainer
-plus a job object on Windows — so "enforced by the platform, not requested politely by the
-program", the definition this file opens with, is true wherever this app runs. Two of those
-three are exercised against a real kernel in CI by a shared assertion body; Windows has the
-mechanism and its own enforcement test but has not joined that body, and K3 states why
-widening the `cfg` would not be honest (a hosted runner's account is an administrator, so
-CI is the privileged case).
+**Isolation (K3) was the clause that decided the name, and its live tool boundary now lands on
+all three platforms.** Seatbelt on macOS, Landlock plus seccomp on Linux, and AppContainer plus
+a job object on Windows now confine the agent's foreground shell, background shell and CLI shell
+to the selected writable workspace namespace, private runtime state and named read-only tool roots,
+with a scrubbed environment and platform-specific inherited-handle narrowing. The shared tool-runner
+test proves an absolute sibling read and write fail on each CI platform; macOS also proves its
+inherited launchd port and one descriptor opened after runtime setup are revoked, while Linux
+requires the ABI which can deny outside `truncate(2)`. This does not erase the older Windows test
+debt: the optional disposable-copy Sandbox-panel path still has not
+joined its own macOS/Linux shared positive/filesystem/network assertion body. The earlier privilege
+wording was also backwards: AppContainer checks the container SID, so the hosted runner's
+administrator account does not weaken that denial.
 
-**What still decides the name is no longer a platform, and that is a sharper problem
-rather than a smaller one.** The sandbox is **opt-in**, with exactly one non-test caller,
-and **the agent's own shell tool is not routed through it on any platform** — it spawns
-`sh -c` / `cmd /C` with the workspace as cwd. So the honest sentence has changed from
-"advisory on Windows" to something less comfortable: confinement is real and available on
-every platform, and the agent does not use it. That is not fixed by pointing the shell tool
-at `execute_in_sandbox`, because the sandbox denies the real workspace by design and the
-agent's job is to edit it; what tool calls should be allowed to reach is a policy question,
-and it belongs with K5.
+The K3/K5 boundary is deliberately narrower than ambient shell networking. A child-created host or
+network socket endpoint is denied on every platform, even when a run declares an egress allowlist,
+because enabling the backend's boolean network switch would bypass K5's host, port, protocol, DNS,
+denial and accounting rules. Built-in network tools remain in the host, preserve the calling run's K5 scope, and check
+initial and redirect destinations before DNS. This also means shell package downloads, loopback
+clients and servers do not work. Pre-existing hard links/FIFOs named in the workspace are part of
+the grant, linked-worktree Git metadata outside it is not, obsolete Windows profiles/ACEs still
+need a cleanup ledger, and macOS group escape can extend a child's already-confined lifetime. Linux
+denies signal syscalls wholesale rather than let a same-user shell target its host, so signal-based
+child supervision is unavailable until a PID namespace or broker can scope it. The macOS lifetime
+gap is K4's process-tree debt, not a process-tree claim smuggled into K3. The optional Sandbox panel
+is still optional; it is no longer the evidence for how agent shell tools execute.
 
-So the name does not change yet, and the reasons have moved rather than shrunk: the
-sandbox is opt-in and unused by the agent's own tools, and Phase 3 (copy-on-write namespace
-— now started on macOS under K10 — tamper-evident log chaining, freeze/restore,
-transactional effects) is still largely ahead. Platform isolation is no longer one of them,
-which means the next honest step is a policy decision about what tool calls may reach, not
-another platform leg.
+So the name still does not change. The former isolation blocker is closed, but the cut line is
+Phase 0–3, not one marquee mechanism, and Phase 3 still owes its remaining copy-on-write,
+tamper-evident, freeze/restore and transactional-effect work. "Agent runtime and control plane"
+remains the honest README name until those entries close.

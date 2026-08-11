@@ -25,8 +25,8 @@
 //! takes a *synchronous* closure, so there's no way to `.await` inside it) is
 //! only ever a fast-reject pre-check, not the actual security boundary for
 //! the connection: `fetch_impl` installs [`SsrfGuardedResolver`] as the
-//! `reqwest::Client`'s DNS resolver, so hostname resolution for the real TCP
-//! connect happens exactly once, filtered through the same blocklist, with no
+//! `reqwest::Client`'s DNS resolver. It delegates to K5's per-run pinned
+//! resolver, then filters the pinned answers through the same blocklist, with no
 //! separate later lookup for a DNS-rebinding attacker (TTL=0 / a rebinding
 //! service answering the check-time and connect-time queries differently) to
 //! race against.
@@ -771,8 +771,18 @@ fn build_redirect_policy(allow_local_network: bool) -> reqwest::redirect::Policy
                 format!("refusing to follow more than {MAX_REDIRECT_HOPS} redirects"),
             )));
         }
+        // K5 must run before the SSRF pre-check below: hostname validation
+        // resolves DNS, so doing it first would leak a disallowed name to the
+        // resolver before the run's frozen policy had refused it. `send` checks
+        // the initial URL; automatic redirects never pass through `send` again.
+        if let Err(denial) = crate::egress::check_run_allowlist(attempt.url()) {
+            return attempt.error(refused(denial));
+        }
         match validate_fetch_url(attempt.url(), allow_local_network) {
-            Ok(()) => attempt.follow(),
+            Ok(()) => {
+                crate::egress::note_allowed_redirect_destination(attempt.url());
+                attempt.follow()
+            }
             // The hop's own rule, not a rule about redirects: a hop refused for
             // pointing at loopback should say `egress.loopback`, so the reason is
             // the same whether the address arrived in the request or in a `302`.
@@ -800,10 +810,10 @@ fn refused(denial: EgressDenial) -> std::io::Error {
 /// a rebinding service) can answer those two lookups differently, passing the
 /// check with a public address while the real connection lands on a private
 /// one. Installed via `ClientBuilder::dns_resolver` in [`fetch_impl`], this
-/// resolver is the *only* resolution that ever happens for a hostname target:
-/// it resolves once (async, via `tokio::net::lookup_host`, so no blocking-DNS
-/// call lands on the async runtime thread the way `validate_fetch_url`'s
-/// pre-check does) and filters the result through the exact same
+/// resolver is the *only* connect-time resolution for a hostname target: it
+/// resolves through K5's per-run pin (async, so no blocking-DNS call lands on
+/// the async runtime thread the way `validate_fetch_url`'s pre-check does) and
+/// filters the pinned result through the exact same
 /// [`blocked_reason_ip`] classifier `validate_fetch_url` uses, handing `reqwest`
 /// only addresses that already passed the filter. Since the addresses handed
 /// back are exactly what `reqwest` connects to — not a hint checked against a
@@ -819,20 +829,14 @@ impl reqwest::dns::Resolve for SsrfGuardedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let allow_local_network = self.allow_local_network;
         let host = name.as_str().to_string();
+        // Taken while this task's RunScope is active. K5 returns the run's
+        // existing pin or resolves and records the first answer set.
+        let pinned = crate::egress::resolve_pinned(name);
         Box::pin(async move {
-            // Port `0` here is intentional and harmless: `reqwest` overrides
-            // it with whatever port the request URL itself specifies (or the
-            // scheme's conventional port) — see `Resolve::resolve`'s own doc
-            // comment. Formatted as an owned `"{host}:0"` string (rather than
-            // a `(&str, u16)` tuple) purely so the future `lookup_host`
-            // returns doesn't borrow from `host` across the `.await` — it
-            // owns its own copy instead.
-            let resolved = tokio::net::lookup_host(format!("{host}:0"))
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let resolved = pinned.await?;
 
             if allow_local_network {
-                return Ok(Box::new(resolved) as reqwest::dns::Addrs);
+                return Ok(resolved);
             }
 
             // Classified rather than merely filtered, so the refusal below can
@@ -900,38 +904,32 @@ async fn read_body_capped(mut response: reqwest::Response, max: usize) -> reqwes
 /// settings-driven version `tool_web_fetch` (and monkey-cli, phase 4) call with
 /// whatever `web_settings.json` currently holds.
 ///
-/// # Why the run scope is entered here and not at the command
-///
-/// This tool has no run and will not acquire one. A `web_fetch` is a tool call
-/// inside a chat turn: the run id in this app is a `run_ledger` entity, the
-/// frontend agent loop only forwards one to `provider_chat`, and both of this
-/// function's callers — [`tool_web_fetch`] and `monkey-cli`'s agent — are a person
-/// asking for a turn. So the honest answer is a *reason*, and it is the same
-/// reason `providers.rs` gives an ordinary non-run chat stream:
-/// [`crate::run_scope::Unattributed::UserAction`], i.e. work the user asked for
-/// outside any run.
-///
-/// Entered here rather than in [`tool_web_fetch`] because this is the boundary both
-/// callers share — a scope at the command would leave `monkey-cli`'s fetches
-/// recording a blank — and because this is the one of the two that a test can drive,
-/// so the label is pinned rather than asserted in prose.
-///
-/// The consequence to know about: this is a `scoped` and therefore *shadows* an outer
-/// scope. If a durable run ever drives a fetch, this must become a
-/// [`crate::run_scope::RunScope`] parameter, exactly as `m4_runtime`'s
-/// `run_async_worker` did for the same reason — silently relabelling a run's egress
-/// as a user action would be worse than the blank this replaces.
+/// AppHandle-free callers preserve an ambient run scope when one exists (the
+/// durable monkey-cli task path supplies one); otherwise this public core labels
+/// their traffic as a user action. [`tool_web_fetch`] enters the injected turn's
+/// scope around [`fetch_within_scope`] directly.
 pub async fn fetch_impl(
     settings: &WebSettings,
     url: String,
     max_chars: Option<usize>,
     start_index: Option<usize>,
 ) -> Result<FetchResult, String> {
-    crate::run_scope::scoped(
-        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
-        fetch_within_scope(settings, url, max_chars, start_index),
-    )
-    .await
+    user_action_when_unscoped(fetch_within_scope(settings, url, max_chars, start_index)).await
+}
+
+async fn user_action_when_unscoped<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    if crate::run_scope::current().is_some() {
+        future.await
+    } else {
+        crate::run_scope::scoped(
+            crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+            future,
+        )
+        .await
+    }
 }
 
 /// [`fetch_impl`]'s body, with the scope already established.
@@ -952,18 +950,14 @@ async fn fetch_within_scope(
     let start_index = start_index.unwrap_or(0);
 
     let parsed = Url::parse(&url).map_err(|e| format!("Invalid URL '{}': {}", url, e))?;
+    // `validate_fetch_url` resolves hostname targets. Enforce the run's frozen
+    // host/port/protocol policy first so a denied hostname is not leaked to DNS.
+    crate::egress::check_run_allowlist(&parsed)
+        .map_err(|denial| fetch_refusal(&parsed, &denial))?;
     validate_fetch_url(&parsed, settings.allow_local_network)
         .map_err(|denial| fetch_refusal(&parsed, &denial))?;
 
-    let client = reqwest::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .redirect(build_redirect_policy(settings.allow_local_network))
-        .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver {
-            allow_local_network: settings.allow_local_network,
-        }))
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let client = fetch_client(settings)?;
 
     let response = crate::egress::send(client.get(parsed.clone()))
         .await
@@ -994,6 +988,43 @@ async fn fetch_within_scope(
         total_chars,
         truncated,
     })
+}
+
+fn fetch_client(settings: &WebSettings) -> Result<reqwest::Client, String> {
+    crate::egress::hardened()
+        .timeout(FETCH_TIMEOUT)
+        .redirect(build_redirect_policy(settings.allow_local_network))
+        .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver {
+            allow_local_network: settings.allow_local_network,
+        }))
+        .user_agent(USER_AGENT)
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))
+}
+
+fn tool_egress_scope<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    turn_id: Option<&str>,
+) -> Result<crate::run_scope::RunScope, String> {
+    let (run_id, attribution) = permissions::permission_attribution(app, state, turn_id)?;
+    egress_scope_for_attribution(run_id, attribution)
+}
+
+fn egress_scope_for_attribution(
+    run_id: Option<String>,
+    attribution: crate::run_ledger::PermissionAttribution,
+) -> Result<crate::run_scope::RunScope, String> {
+    use crate::run_ledger::PermissionAttribution;
+    use crate::run_scope::{RunScope, Unattributed};
+
+    match attribution {
+        PermissionAttribution::LedgerRun | PermissionAttribution::UnregisteredRun => run_id
+            .map(RunScope::run)
+            .ok_or_else(|| "Network tool attribution named a run without its id".to_string()),
+        PermissionAttribution::Unattributed(reason) => Ok(RunScope::Unattributed(reason)),
+        PermissionAttribution::Unknown => Ok(RunScope::Unattributed(Unattributed::UserAction)),
+    }
 }
 
 /// Fetch a URL and return its content as Markdown (HTML) or as-is (plain
@@ -1045,6 +1076,7 @@ pub async fn tool_web_fetch(
     )?;
 
     let settings = load_settings_impl(&settings_file_path(&app)?)?;
+    let egress_scope = tool_egress_scope(&app, state.inner(), turn_id.as_deref())?;
 
     // Same per-turn cancellation channel `tool_run_shell` uses — see
     // `AppState::tool_cancel`'s doc comment. Callers that don't thread a turn
@@ -1059,7 +1091,12 @@ pub async fn tool_web_fetch(
         .clone();
 
     let outcome = tokio::select! {
-        result = fetch_impl(&settings, url, max_chars, start_index) => result,
+        result = crate::run_commands::scoped_with_egress(
+            &app,
+            state.inner(),
+            egress_scope,
+            fetch_within_scope(&settings, url, max_chars, start_index),
+        ) => result,
         _ = cancel.notified() => Err("Fetch cancelled by the user".to_string()),
     };
 
@@ -1502,6 +1539,15 @@ pub async fn search_impl(
     query: String,
     count: Option<usize>,
 ) -> Result<Vec<SearchResult>, String> {
+    user_action_when_unscoped(search_within_scope(settings, brave_key, query, count)).await
+}
+
+async fn search_within_scope(
+    settings: &WebSettings,
+    brave_key: Option<String>,
+    query: String,
+    count: Option<usize>,
+) -> Result<Vec<SearchResult>, String> {
     let count = count
         .unwrap_or(DEFAULT_SEARCH_COUNT)
         .clamp(1, DEFAULT_SEARCH_COUNT);
@@ -1586,6 +1632,7 @@ pub async fn tool_web_search(
     } else {
         None
     };
+    let egress_scope = tool_egress_scope(&app, state.inner(), turn_id.as_deref())?;
 
     // Same per-turn cancellation channel `tool_web_fetch`/`tool_run_shell`
     // use — see `AppState::tool_cancel`'s doc comment. Callers that don't
@@ -1600,7 +1647,12 @@ pub async fn tool_web_search(
         .clone();
 
     let outcome = tokio::select! {
-        result = search_impl(&settings, brave_key, query, count) => result,
+        result = crate::run_commands::scoped_with_egress(
+            &app,
+            state.inner(),
+            egress_scope,
+            search_within_scope(&settings, brave_key, query, count),
+        ) => result,
         _ = cancel.notified() => Err("Search cancelled by the user".to_string()),
     };
 
@@ -1640,6 +1692,223 @@ mod tests {
 
     fn url(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn network_tools_keep_registered_and_unregistered_turn_ids_for_k5() {
+        use crate::run_ledger::PermissionAttribution;
+
+        for attribution in [
+            PermissionAttribution::LedgerRun,
+            PermissionAttribution::UnregisteredRun,
+        ] {
+            let scope = egress_scope_for_attribution(Some("turn:web".to_string()), attribution)
+                .expect("turn scope");
+            assert_eq!(scope.run_id(), Some("turn:web"));
+        }
+        let scope = egress_scope_for_attribution(None, PermissionAttribution::Unknown)
+            .expect("user action scope");
+        assert_eq!(
+            scope.unattributed(),
+            Some(crate::run_scope::Unattributed::UserAction)
+        );
+    }
+
+    struct RunPolicyReset;
+
+    impl Drop for RunPolicyReset {
+        fn drop(&mut self) {
+            crate::egress::clear_run_policy_source();
+        }
+    }
+
+    fn install_test_run_policy(
+        run_id: &str,
+        hosts: &[&str],
+        ports: &[u16],
+        protocols: &[&str],
+    ) -> RunPolicyReset {
+        let run_id = run_id.to_string();
+        let allowlist = crate::run_protocol::EgressAllowlist {
+            hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+            ports: ports.to_vec(),
+            protocols: protocols
+                .iter()
+                .map(|protocol| (*protocol).to_string())
+                .collect(),
+        };
+        allowlist.validate().expect("valid test allowlist");
+        crate::egress::install_run_policy_source(move |asked| {
+            if asked == run_id {
+                crate::egress::RunEgressPolicy::Declared(std::sync::Arc::new(allowlist.clone()))
+            } else {
+                crate::egress::RunEgressPolicy::Unknown
+            }
+        });
+        RunPolicyReset
+    }
+
+    #[tokio::test]
+    async fn fetch_checks_the_run_allowlist_before_resolving_the_initial_host() {
+        let _serialized = crate::denial_sink::test_lock();
+        let _policy =
+            install_test_run_policy("run:web-initial", &["allowed.example"], &[443], &["https"]);
+
+        let error = crate::run_scope::scoped(
+            crate::run_scope::RunScope::run("run:web-initial"),
+            fetch_within_scope(
+                &WebSettings::default(),
+                "https://must-not-resolve.invalid/".to_string(),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect_err("the undeclared host must be refused");
+
+        assert!(
+            error.contains(EgressRule::RunHostNotAllowlisted.code()),
+            "unexpected refusal: {error}"
+        );
+        assert!(
+            !error.contains(EgressRule::DnsResolutionFailed.code()),
+            "the refused hostname must not reach DNS: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_handle_free_fetch_preserves_an_ambient_run_for_k5() {
+        let _serialized = crate::denial_sink::test_lock();
+        let _policy =
+            install_test_run_policy("run:cli-fetch", &["allowed.example"], &[443], &["https"]);
+
+        let error = crate::run_scope::scoped(
+            crate::run_scope::RunScope::run("run:cli-fetch"),
+            fetch_impl(
+                &WebSettings::default(),
+                "https://must-not-resolve.invalid/".to_string(),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect_err("the CLI helper must retain the run allowlist");
+
+        assert!(
+            error.contains(EgressRule::RunHostNotAllowlisted.code()),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_handle_free_search_preserves_an_ambient_run_for_k5() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory =
+            std::env::temp_dir().join(format!("lm-web-cli-search-sink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("creates the sink directory");
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+        let _policy =
+            install_test_run_policy("run:cli-search", &["allowed.example"], &[443], &["https"]);
+        let mut settings = WebSettings::default();
+        settings.search_provider = SearchProvider::Searxng;
+        settings.searxng_base_url = Some("https://must-not-resolve.invalid".to_string());
+
+        crate::run_scope::scoped(
+            crate::run_scope::RunScope::run("run:cli-search"),
+            search_impl(&settings, None, "query".to_string(), Some(1)),
+        )
+        .await
+        .expect_err("the CLI helper must retain the run allowlist");
+
+        let reader = crate::denial_sink::DenialSink::open(&path).expect("reopens for reading");
+        let mine: Vec<_> = reader
+            .recent(64)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.run_id.as_deref() == Some("run:cli-search"))
+            .collect();
+        assert_eq!(mine.len(), 1, "exactly one denial belongs to this run");
+        assert_eq!(mine[0].rule_code, EgressRule::RunHostNotAllowlisted.code());
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn fetch_rechecks_the_run_allowlist_before_resolving_a_redirect_host() {
+        let _serialized = crate::denial_sink::test_lock();
+        let _policy =
+            install_test_run_policy("run:web-redirect", &["allowed.example"], &[443], &["https"]);
+        let origin =
+            spawn_redirecting_server("https://must-not-resolve.invalid/steal".to_string(), "");
+        let mut settings = WebSettings::default();
+        settings.allow_local_network = true;
+
+        let error =
+            crate::run_scope::scoped(crate::run_scope::RunScope::run("run:web-redirect"), async {
+                let client = fetch_client(&settings).expect("build fetch client");
+                crate::egress::send(client.get(origin))
+                    .await
+                    .expect_err("the redirect to an undeclared host must be refused")
+            })
+            .await;
+
+        assert_eq!(
+            denied_rule(&error),
+            Some(EgressRule::RunHostNotAllowlisted),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_accounts_each_allowed_redirect_destination() {
+        let _serialized = crate::denial_sink::test_lock();
+        crate::egress::clear_run_policy_source();
+        let (target, seen) = spawn_recording_server();
+        let origin = spawn_redirecting_server(format!("{target}/landed"), "");
+        let expected_ports: std::collections::BTreeSet<u16> = [&origin, &target]
+            .into_iter()
+            .map(|url| {
+                Url::parse(url)
+                    .expect("fixture url parses")
+                    .port_or_known_default()
+                    .expect("fixture url has a port")
+            })
+            .collect();
+        let mut settings = WebSettings::default();
+        settings.allow_local_network = true;
+        let process = crate::run_scope::ProcessScope::new("p-web-redirect-accounting");
+
+        let response = crate::run_scope::scoped_with_process(
+            crate::run_scope::RunScope::run("run:web-redirect-accounting"),
+            process.clone(),
+            async {
+                let client = fetch_client(&settings).expect("build fetch client");
+                crate::egress::send(client.get(origin))
+                    .await
+                    .expect("the allowed redirect must be followed")
+            },
+        )
+        .await;
+        assert!(response.status().is_success());
+        assert!(
+            seen.lock().unwrap().is_some(),
+            "the redirect target must be contacted"
+        );
+
+        let destinations = process.take_destinations();
+        let actual_ports: std::collections::BTreeSet<u16> = destinations
+            .seen
+            .iter()
+            .map(|(destination, requests)| {
+                assert_eq!(*requests, 1, "each hop is one request");
+                destination.port
+            })
+            .collect();
+        assert_eq!(actual_ports, expected_ports);
+        assert_eq!(destinations.overflowed, 0);
     }
 
     /// `::127.0.0.1` walked past this guard entirely: not `::1`, not unspecified,

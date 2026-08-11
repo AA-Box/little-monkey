@@ -20,9 +20,11 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
+use std::process::{Command, Stdio};
 
 use serde::Serialize;
 use tauri::{Emitter, Manager};
@@ -92,7 +94,7 @@ pub struct BackgroundShellView {
 
 struct BackgroundProcess {
     view: Mutex<BackgroundShellView>,
-    child: Mutex<Child>,
+    child: Mutex<crate::workspace_shell::BackgroundShellChild>,
     /// Byte offset into `view.output` already returned by
     /// `background_shell_output` in draining mode — the "only new output"
     /// cursor the model's polling tool reads through. Kept out of the view so
@@ -563,6 +565,7 @@ pub async fn tool_run_shell_background(
     risk_level: Option<String>,
     risk_reason: Option<String>,
     agent_label: Option<String>,
+    workspace_root_override: Option<String>,
 ) -> Result<BackgroundShellView, String> {
     let risk = permissions::compute_risk(None, risk_level, risk_reason);
     permissions::request_permission(
@@ -587,53 +590,31 @@ pub async fn tool_run_shell_background(
         ));
     }
 
-    let cwd_path = match cwd {
-        Some(ref value) => workspace::resolve_path_and_root(state.inner(), value)?.0,
-        None => workspace::primary_root_canon(state.inner())?,
+    let (cwd_path, workspace_root) = match cwd {
+        Some(ref value) => crate::agent_worktrees::resolve_with_override(
+            state.inner(),
+            value,
+            workspace_root_override.as_deref(),
+        )?,
+        None => match workspace_root_override.as_deref() {
+            Some(root) => {
+                crate::agent_worktrees::resolve_with_override(state.inner(), ".", Some(root))?
+            }
+            None => {
+                let root = workspace::primary_root_canon(state.inner())?;
+                (root.clone(), root)
+            }
+        },
     };
 
-    #[cfg(target_os = "windows")]
-    let (shell, shell_flag) = ("cmd", "/C");
-    #[cfg(not(target_os = "windows"))]
-    let (shell, shell_flag) = ("sh", "-c");
-
-    let mut command_builder = Command::new(shell);
-    command_builder
-        .arg(shell_flag)
-        .arg(&command)
-        .current_dir(&cwd_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Its own process group, so a later suspend/resume/kill-by-group
-    // (`os_signal::suspend_process_group` et al.) targets exactly this
-    // command's tree rather than whatever group this app itself runs in —
-    // mirrors the daemon's own job spawn (`daemon/engine.rs`).
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command_builder.process_group(0);
-    }
-    // Core dumps refused and nothing else, installed between `fork` and `exec`
-    // like the other three spawn sites — `apply_std` because this builder is
-    // `std::process::Command`, not tokio's. No file-size or descriptor ceiling
-    // here on purpose: this child is *meant* to outlive the call that spawned it,
-    // so a number for either would be a judgement about what a command nobody
-    // has classified is for, which is the process class K4 still lacks. Refusing
-    // core dumps carries no such judgement — a dev server that segfaults should
-    // not drop gigabytes into the workspace it was started in, and unlike the
-    // foreground tool there is no timeout here to end it.
-    crate::os_limits::apply_std(
-        crate::os_limits::ChildLimits::baseline(),
-        &mut command_builder,
-    );
-    let mut child = command_builder
-        .spawn()
+    let spawned = crate::workspace_shell::spawn_background(&workspace_root, &cwd_path, &command)
         .map_err(|error| format!("Failed to spawn shell: {error}"))?;
-    let native_pid = i64::try_from(child.id()).ok();
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let native_pid = i64::try_from(spawned.child.id()).ok();
+    let crate::workspace_shell::BackgroundSpawn {
+        child,
+        stdout,
+        stderr,
+    } = spawned;
 
     let view = BackgroundShellView {
         id: uuid::Uuid::new_v4().to_string(),
@@ -911,7 +892,11 @@ mod tests {
                 shell_id.clone(),
                 Arc::new(BackgroundProcess {
                     view: Mutex::new(view),
-                    child: Mutex::new(child),
+                    child: Mutex::new(
+                        crate::workspace_shell::BackgroundShellChild::unconfined_for_lifecycle_test(
+                            child,
+                        ),
+                    ),
                     read_cursor: Mutex::new(0),
                 }),
             )
