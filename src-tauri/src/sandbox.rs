@@ -13,8 +13,9 @@
 //! directory, and denies network access unless it was explicitly enabled. On
 //! Linux the equivalent boundary is a Landlock filesystem ruleset plus a
 //! seccomp-BPF network filter installed in `pre_exec` (see
-//! `crate::sandbox_linux`); Windows gets the restricted-cwd/env isolation
-//! only. Every run reports which of the two actually applied (see
+//! `crate::sandbox_linux`); Windows uses an AppContainer filesystem/network
+//! boundary plus a job object for the process tree and resource bounds. Every
+//! run reports which level actually applied (see
 //! [`Isolation`]) — never more than what was really enforced.
 //!
 //! Nothing the sandboxed command writes ever reaches the real workspace
@@ -83,7 +84,7 @@ const MAX_PROMOTE_FILES: usize = 500;
 /// goes.
 ///
 /// A no-op on macOS and Linux, where canonical paths have no such prefix.
-fn plain_canonical(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn plain_canonical(path: &Path) -> io::Result<PathBuf> {
     let canonical = fs::canonicalize(path)?;
     #[cfg(not(target_os = "windows"))]
     {
@@ -245,16 +246,14 @@ struct PendingPromote {
 pub enum Isolation {
     /// A kernel-enforced filesystem boundary applied in addition to the
     /// restricted cwd/env: a generated macOS Seatbelt profile (`sandbox-exec`),
-    /// or a Landlock ruleset on Linux.
+    /// a Landlock ruleset on Linux, or an AppContainer on Windows.
     OsSandboxed,
     /// The kernel bounded the process *tree* but not its filesystem: a Windows
     /// job object confined the run's process count, committed memory and
     /// window-station reach, and killed the whole tree on exit.
     ///
-    /// Deliberately not [`Isolation::OsSandboxed`], because the real workspace is
-    /// still reachable by absolute path. Windows has no filesystem boundary this
-    /// app can reach without owning its own `CreateProcess` — see
-    /// `crate::sandbox_windows`.
+    /// Deliberately not [`Isolation::OsSandboxed`]: this is the Windows
+    /// degradation when AppContainer creation failed and only the job landed.
     ProcessContained,
     /// Only the restricted cwd + allowlisted env applied — either no OS-level
     /// sandbox exists for this platform, or this kernel could not enforce one.
@@ -270,10 +269,9 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// [`Isolation`] reports what a run got, which is honest but arrives too late to
 /// inform the decision to start one. The Sandbox panel offers the same button on
 /// every platform, and `probeGeneratedMcpArtifact` sends **model-authored MCP
-/// server code** through it — so on Windows, and on a Linux kernel without
-/// Landlock, that code runs with a restricted cwd and a scrubbed environment and
-/// no kernel boundary, free to read or write the real workspace by absolute
-/// path. That is worth knowing first.
+/// server code** through it — so on any machine where the platform mechanism is
+/// unavailable, that code may run with a restricted cwd and scrubbed environment
+/// but no filesystem boundary. That is worth knowing first.
 ///
 /// `Unavailable` is a third state, not a pessimistic reading of `ProcessOnly`: on
 /// macOS `execute_in_sandbox` spawns `sandbox-exec` unconditionally, so if the
@@ -289,13 +287,12 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxEnforcement {
-    /// A kernel-enforced boundary applies: macOS Seatbelt via `sandbox-exec`, or
-    /// Landlock on Linux.
+    /// A kernel-enforced filesystem boundary applies: macOS Seatbelt, Linux
+    /// Landlock, or Windows AppContainer.
     OsEnforced,
-    /// A Windows job object will bound the run's process tree, committed memory
-    /// and window-station reach, and kill the tree when the run ends — but no
-    /// filesystem or network boundary applies, so the real workspace stays
-    /// reachable by absolute path.
+    /// A Windows job object bounds the run's process tree, committed memory and
+    /// window-station reach, but AppContainer creation failed, so no filesystem
+    /// or network boundary applies.
     ///
     /// Between [`SandboxEnforcement::OsEnforced`] and
     /// [`SandboxEnforcement::ProcessOnly`] on purpose, and closer to the latter
@@ -851,17 +848,183 @@ fn readable_roots(
     roots.into_iter().collect()
 }
 
-/// Gated because only the macOS branch sets `RUSTUP_HOME`. The Linux branch
-/// still picks up `~/.rustup/toolchains` as a read root through
-/// [`readable_roots`], but it does not point a sandboxed Cargo at it.
-#[cfg(target_os = "macos")]
-fn macos_path_uses_rustup(path_env: Option<&OsStr>, real_home: &Path) -> bool {
+fn path_uses_rustup(path_env: Option<&OsStr>, real_home: &Path) -> bool {
     let cargo_bin = real_home.join(".cargo/bin");
     path_env
         .map(std::env::split_paths)
         .into_iter()
         .flatten()
         .any(|entry| entry.is_absolute() && entry.starts_with(&cargo_bin))
+}
+
+fn trusted_home_tool_path(path: &Path, real_home: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(real_home) else {
+        return false;
+    };
+    let Some(relative) = relative.to_str() else {
+        return false;
+    };
+    #[cfg(target_os = "windows")]
+    let relative = relative.replace('\\', "/").to_ascii_lowercase();
+    #[cfg(not(target_os = "windows"))]
+    let relative = relative.replace('\\', "/");
+
+    matches!(
+        relative.as_str(),
+        ".cargo/bin"
+            | ".local/bin"
+            | ".bun/bin"
+            | ".deno/bin"
+            | ".volta/bin"
+            | ".npm-global/bin"
+            | ".pyenv/bin"
+            | ".pyenv/shims"
+            | ".local/share/pnpm"
+            | "Library/pnpm"
+            | "library/pnpm"
+            | "AppData/Roaming/npm"
+            | "appdata/roaming/npm"
+    ) || (relative.starts_with(".nvm/versions/") && relative.ends_with("/bin"))
+        || (relative.starts_with(".local/share/fnm/") && relative.ends_with("/bin"))
+}
+
+fn trusted_global_tool_path(path: &Path) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        const EXACT: &[&str] = &[
+            "/bin",
+            "/sbin",
+            "/usr/bin",
+            "/usr/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/snap/bin",
+        ];
+        if EXACT.iter().any(|candidate| path == Path::new(candidate)) {
+            return true;
+        }
+        return (path.starts_with("/Applications/Xcode.app/Contents/Developer")
+            || path.starts_with("/Library/Developer/CommandLineTools")
+            || path.starts_with("/Library/Developer/Toolchains"))
+            && path.file_name() == Some(OsStr::new("bin"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let under = |key: &str, allow_base: bool| {
+            std::env::var_os(key)
+                .and_then(|value| plain_canonical(Path::new(&value)).ok())
+                .is_some_and(|base| path.starts_with(&base) && (allow_base || path != base))
+        };
+        return under("SystemRoot", true)
+            || under("ProgramFiles", false)
+            || under("ProgramFiles(x86)", false)
+            || under("ProgramW6432", false)
+            || std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .map(|base| base.join("Programs"))
+                .and_then(|base| plain_canonical(&base).ok())
+                .is_some_and(|base| path.starts_with(&base));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// PATH is executable authority, not ambient read authority. Keep entries
+/// inside the selected workspace plus a small set of system and user-tool
+/// locations; an arbitrary absolute entry must not turn its whole subtree into
+/// an exception to the live shell's filesystem boundary.
+fn trusted_shell_path_entries(
+    path_env: Option<&OsStr>,
+    real_home: Option<&Path>,
+    workspace_root: &Path,
+) -> Vec<PathBuf> {
+    let workspace_root =
+        plain_canonical(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let mut entries = Vec::new();
+    for entry in path_env
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.is_absolute())
+    {
+        let Ok(entry) = plain_canonical(&entry) else {
+            continue;
+        };
+        let trusted = entry.starts_with(&workspace_root)
+            || trusted_global_tool_path(&entry)
+            || real_home.is_some_and(|home| trusted_home_tool_path(&entry, home));
+        if trusted && !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
+/// Scrubbed environment and read-only executable/toolchain roots for a shell
+/// that is allowed to mutate one live workspace. Writable roots are passed
+/// separately to each platform's kernel enforcement primitive.
+pub(crate) struct WorkspaceShellPolicy {
+    pub env: Vec<(String, String)>,
+    pub readable_roots: Vec<PathBuf>,
+}
+
+pub(crate) fn workspace_shell_policy(
+    workspace_root: &Path,
+    private_home: &Path,
+    private_tmp: &Path,
+) -> WorkspaceShellPolicy {
+    let mut env = allowlisted_env(private_home, private_tmp, &[]);
+    let real_home = dirs::home_dir().and_then(|path| plain_canonical(&path).ok());
+    let inherited_path = env
+        .iter()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| OsStr::new(value));
+    let trusted_path = trusted_shell_path_entries(inherited_path, real_home.as_deref(), workspace_root);
+    let trusted_path = std::env::join_paths(&trusted_path).unwrap_or_default();
+    set_env_value(&mut env, "PATH", trusted_path.to_string_lossy().into_owned());
+    let path_env = env
+        .iter()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| OsStr::new(value));
+    if let Some(home) = real_home.as_deref() {
+        let rustup_home = home.join(".rustup");
+        if path_uses_rustup(path_env, home) && rustup_home.is_dir() {
+            // Toolchains are read-only; Cargo config, credentials and caches
+            // still resolve below the private HOME.
+            set_env_value(
+                &mut env,
+                "RUSTUP_HOME",
+                rustup_home.to_string_lossy().into_owned(),
+            );
+        }
+    }
+    let path_env = env
+        .iter()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| OsStr::new(value));
+
+    #[cfg(target_os = "macos")]
+    let system_roots = MACOS_SYSTEM_READ_ROOTS;
+    #[cfg(target_os = "linux")]
+    let system_roots = LINUX_SYSTEM_READ_ROOTS;
+    // AppContainer already grants packaged apps their system roots. PATH and
+    // rustup locations still need explicit read/execute ACLs.
+    #[cfg(target_os = "windows")]
+    let system_roots: &[&str] = &[];
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let system_roots: &[&str] = &[];
+
+    let readable_roots =
+        readable_roots(system_roots, path_env, real_home.as_deref(), workspace_root);
+    WorkspaceShellPolicy {
+        env,
+        readable_roots,
+    }
 }
 
 fn seatbelt_escape(path: &Path) -> String {
@@ -904,8 +1067,34 @@ pub fn build_seatbelt_profile(
     readable_roots: &[PathBuf],
     allow_network: bool,
 ) -> String {
+    build_seatbelt_profile_inner(
+        &[sandbox_root.to_path_buf()],
+        readable_roots,
+        allow_network,
+        true,
+    )
+}
+
+/// Seatbelt policy with multiple writable roots. Live shell tools use two:
+/// the selected workspace and one private runtime root holding HOME/TMP. Mach
+/// service lookup is omitted here: unlike the disposable compatibility path,
+/// a live shell must not use launchd/XPC to reach authority outside those roots.
+pub(crate) fn build_seatbelt_profile_for_roots(
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    allow_network: bool,
+) -> String {
+    build_seatbelt_profile_inner(writable_roots, readable_roots, allow_network, false)
+}
+
+fn build_seatbelt_profile_inner(
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    allow_network: bool,
+    allow_mach_lookup: bool,
+) -> String {
     let mut read_roots = BTreeSet::new();
-    read_roots.insert(sandbox_root.to_path_buf());
+    read_roots.extend(writable_roots.iter().cloned());
     read_roots.extend(
         readable_roots
             .iter()
@@ -920,11 +1109,30 @@ pub fn build_seatbelt_profile(
     let ancestors = traversal_ancestors(&read_roots);
     let read_filters = seatbelt_filters(&read_roots, "subpath");
     let ancestor_filters = seatbelt_filters(&ancestors, "literal");
-    let sandbox_root = seatbelt_escape(sandbox_root);
+    let writable_roots: BTreeSet<_> = writable_roots
+        .iter()
+        .filter(|path| path.has_root() && path.as_path() != Path::new("/"))
+        .cloned()
+        .collect();
+    let write_rules: String = writable_roots
+        .iter()
+        .map(|path| {
+            let path = seatbelt_escape(path);
+            format!(
+                "         (allow file-write* (subpath \"{path}\"))\n\
+                 (allow file-ioctl (subpath \"{path}\"))\n"
+            )
+        })
+        .collect();
     let network_clause = if allow_network {
         "(allow network*)"
     } else {
         "(deny network*)"
+    };
+    let mach_clause = if allow_mach_lookup {
+        "(allow mach-lookup)\n"
+    } else {
+        ""
     };
     format!(
         "(version 1)\n\
@@ -937,10 +1145,11 @@ pub fn build_seatbelt_profile(
          {read_filters})\n\
          (allow file-read-metadata\n\
          {ancestor_filters})\n\
-         (allow file-write* (subpath \"{sandbox_root}\"))\n\
-         (allow file-ioctl (subpath \"{sandbox_root}\"))\n\
+         {write_rules}\
+         (allow file-write* (literal \"/dev/null\"))\n\
+         (allow file-ioctl (literal \"/dev/null\"))\n\
          (allow sysctl-read)\n\
-         (allow mach-lookup)\n\
+         {mach_clause}\
          (allow signal (target self))\n\
          {network_clause}\n"
     )
@@ -1030,7 +1239,7 @@ pub async fn execute_in_sandbox(
             .find(|(key, _)| key == "PATH")
             .map(|(_, value)| OsStr::new(value));
         let rustup_home = home.join(".rustup");
-        if macos_path_uses_rustup(path_env, home) && rustup_home.is_dir() {
+        if path_uses_rustup(path_env, home) && rustup_home.is_dir() {
             // This is a computed, read-only toolchain location, not inherited
             // user configuration. CARGO_HOME remains under sandbox HOME, so
             // Cargo credentials/config/registries are never exposed.
@@ -2475,13 +2684,14 @@ mod tests {
             "whole user home must not be readable"
         );
         assert!(profile.contains("(allow file-write* (subpath \"/tmp/example-sandbox-dir\"))"));
+        assert!(profile.contains("(allow file-write* (literal \"/dev/null\"))"));
         assert_eq!(
             profile
                 .lines()
                 .filter(|line| line.contains("(allow file-write*"))
                 .count(),
-            1,
-            "only the sandbox write grant is allowed"
+            2,
+            "only the sandbox and write-only null-device grants are allowed"
         );
         assert!(profile.contains("(deny network*)"));
         assert!(!profile.contains("(allow network*)"));
@@ -2742,6 +2952,33 @@ mod tests {
         );
         assert!(roots.contains(&canonical_cargo));
         assert!(roots.contains(&canonical_external));
+        let _ = fs::remove_dir_all(&fixture);
+    }
+
+    #[test]
+    fn live_shell_path_does_not_grant_an_arbitrary_ambient_directory() {
+        let fixture = temp_dir("live-shell-path");
+        let home = fixture.join("user-home");
+        let workspace = home.join("Documents/project");
+        let workspace_bin = workspace.join("node_modules/.bin");
+        let cargo_bin = home.join(".cargo/bin");
+        let ambient_secret = fixture.join("ambient-secret/bin");
+        for path in [&workspace_bin, &cargo_bin, &ambient_secret] {
+            fs::create_dir_all(path).expect("create PATH fixture");
+        }
+        let joined = std::env::join_paths([
+            workspace_bin.as_path(),
+            cargo_bin.as_path(),
+            ambient_secret.as_path(),
+        ])
+        .expect("join PATH");
+
+        let canonical_home = plain_canonical(&home).unwrap();
+        let entries =
+            trusted_shell_path_entries(Some(&joined), Some(&canonical_home), &workspace);
+        assert!(entries.contains(&plain_canonical(&workspace_bin).unwrap()));
+        assert!(entries.contains(&plain_canonical(&cargo_bin).unwrap()));
+        assert!(!entries.contains(&plain_canonical(&ambient_secret).unwrap()));
         let _ = fs::remove_dir_all(&fixture);
     }
 
@@ -3183,12 +3420,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_network_denial_filter_compiles_for_this_architecture() {
-        let program =
-            crate::sandbox_linux::network_denial_filter().expect("filter compiles for this arch");
-        assert!(
-            !program.is_empty(),
-            "an empty BPF program is rejected by `apply_filter`, so it would fail the spawn"
-        );
+        for program in [
+            crate::sandbox_linux::network_denial_filter()
+                .expect("disposable filter compiles for this arch"),
+            crate::sandbox_linux::strict_network_denial_filter()
+                .expect("live-shell filter compiles for this arch"),
+        ] {
+            assert!(
+                !program.is_empty(),
+                "an empty BPF program is rejected by `apply_filter`, so it would fail the spawn"
+            );
+        }
     }
 
     // --- promote digest / confirmation -----------------------------------

@@ -11,7 +11,6 @@
 //! [`permissions::request_permission`] and refuses to run if the user (or an
 //! existing "allow for session" grant) doesn't approve it.
 
-use std::process::Stdio;
 use std::time::Duration;
 
 use globset::GlobBuilder;
@@ -881,68 +880,29 @@ pub async fn tool_run_shell(
     // Under a worktree override the DEFAULT cwd is the worktree itself, and
     // an explicit `cwd` is sandboxed inside it — a worktree-isolated agent's
     // commands must never silently run in the shared checkout.
-    let cwd_path = match cwd {
-        Some(ref c) => {
-            crate::agent_worktrees::resolve_with_override(state.inner(), c, workspace_root_override.as_deref())?.0
-        }
+    let (cwd_path, workspace_root) = match cwd {
+        Some(ref c) => crate::agent_worktrees::resolve_with_override(
+            state.inner(),
+            c,
+            workspace_root_override.as_deref(),
+        )?,
         None => match workspace_root_override.as_deref() {
             Some(root) => {
-                crate::agent_worktrees::resolve_with_override(state.inner(), ".", Some(root))?.0
+                crate::agent_worktrees::resolve_with_override(state.inner(), ".", Some(root))?
             }
-            None => workspace::primary_root_canon(state.inner())?,
+            None => {
+                let root = workspace::primary_root_canon(state.inner())?;
+                (root.clone(), root)
+            }
         },
     };
-
-    // `sh` does not exist on Windows (and the app bundles for all targets) —
-    // use the platform's own command interpreter there.
-    #[cfg(target_os = "windows")]
-    let (shell, shell_flag) = ("cmd", "/C");
-    #[cfg(not(target_os = "windows"))]
-    let (shell, shell_flag) = ("sh", "-c");
-
-    let mut command_builder = tokio::process::Command::new(shell);
-    command_builder
-        .arg(shell_flag)
-        .arg(&command)
-        .current_dir(&cwd_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Both the timeout and cancellation branches below work by DROPPING
-        // the in-flight `wait_with_output` future (and the child with it) —
-        // without this, the spawned process would keep running orphaned
-        // after a timeout or a Stop-button cancellation.
-        .kill_on_drop(true);
-    // Its own process group, so suspending this turn SIGSTOPs exactly this
-    // command's process tree and nothing else. Without it the child inherits
-    // the app's group and `kill -STOP -<pid>` would target the whole app —
-    // mirrors `background_shell.rs`'s own spawn.
-    // (`tokio::process::Command` exposes this natively on unix — no
-    // `std::os::unix::process::CommandExt` import needed.)
-    #[cfg(unix)]
-    command_builder.process_group(0);
-    // Kernel-held bounds, in contrast to everything else here: the timeout above
-    // and the group termination below both need this app alive to enforce them.
-    // Not under `cfg(unix)` — `apply` is a documented no-op on Windows, whose
-    // equivalent is a job object and is not built.
-    //
-    // Only the baseline. A file-size or descriptor ceiling would be a guess about
-    // what an agent shell is for — this is the site that legitimately downloads a
-    // 40 GB model — and `os_limits` explains why the tempting resources
-    // (`RLIMIT_CPU`, `NPROC`, `RSS`, `AS`) are the wrong tool. Real per-kind
-    // values need the process class K4 still lacks.
-    crate::os_limits::apply(
-        crate::os_limits::ChildLimits::baseline(),
-        &mut command_builder,
-    );
 
     // Decided before the spawn, because it is now the *read* that is bounded
     // rather than the returned string: the drain below needs to know its ceiling
     // before the first byte arrives.
     let cap = stream_cap(full_output);
 
-    let mut child = command_builder
-        .spawn()
+    let mut child = crate::workspace_shell::spawn_foreground(&workspace_root, &cwd_path, &command)
         .map_err(|e| format!("Failed to spawn shell: {}", e))?;
     // Captured before the capture future borrows the child. With
     // `process_group(0)` above, the child's own pid is also its group id.
@@ -952,12 +912,10 @@ pub async fn tool_run_shell(
     // the `ok_or` is a refusal rather than an `expect` because a panic inside a
     // Tauri command aborts the whole IPC task.
     let stdout_pipe = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| "Shell child had no stdout pipe".to_string())?;
     let stderr_pipe = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| "Shell child had no stderr pipe".to_string())?;
 
     // Each turn gets its own cancellation channel so Stop in one pane never
@@ -982,7 +940,7 @@ pub async fn tool_run_shell(
     });
 
     let outcome = tokio::select! {
-        result = capture_bounded(&mut child, stdout_pipe, stderr_pipe, cap) => {
+        result = capture_bounded(child.wait(), stdout_pipe, stderr_pipe, cap) => {
             result.map_err(|e| format!("Failed to run command: {}", e))
         }
         _ = cancel.notified() => {
@@ -1004,13 +962,7 @@ pub async fn tool_run_shell(
     // was already known here and used for suspend/resume; it simply was not used
     // for the kill. TERM first, so a build can flush and clean up its temp files.
     if outcome.is_err() {
-        if let Some(pgid) = registered_pgid {
-            if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
-                // Swallowed: `kill_on_drop` still reaps the direct child below, so
-                // the worst case is the orphan this used to leave every time.
-                eprintln!("run_shell: could not terminate process group {pgid}: {error}");
-            }
-        }
+        child.terminate_tree();
     }
 
     if let Some(pgid) = registered_pgid {
@@ -1207,14 +1159,19 @@ where
 /// (closing the read ends) and stops the wait. The child itself is killed by the
 /// caller's process-group terminate, with `kill_on_drop` as the backstop — the
 /// same two mechanisms as before this change.
-async fn capture_bounded(
-    child: &mut tokio::process::Child,
-    stdout_pipe: tokio::process::ChildStdout,
-    stderr_pipe: tokio::process::ChildStderr,
+async fn capture_bounded<W, O, E>(
+    wait: W,
+    stdout_pipe: O,
+    stderr_pipe: E,
     cap: Option<usize>,
-) -> std::io::Result<ShellCapture> {
+) -> std::io::Result<ShellCapture>
+where
+    W: std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
+    O: tokio::io::AsyncRead + Unpin,
+    E: tokio::io::AsyncRead + Unpin,
+{
     let (status, stdout, stderr) = tokio::try_join!(
-        child.wait(),
+        wait,
         drain_capped(stdout_pipe, cap),
         drain_capped(stderr_pipe, cap),
     )?;
@@ -1514,9 +1471,9 @@ mod shell_suspend_tests {
             let mut command = Command::new("sleep");
             command
                 .arg("30")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
             command.process_group(0);
             let child = command.spawn().expect("sleep spawns");
             let pgid = child.id();
@@ -1797,7 +1754,7 @@ mod tests {
 
         let captured = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            super::capture_bounded(&mut child, stdout_pipe, stderr_pipe, Some(CAP)),
+            super::capture_bounded(child.wait(), stdout_pipe, stderr_pipe, Some(CAP)),
         )
         .await
         .expect("draining both pipes concurrently must not deadlock")
@@ -1837,7 +1794,7 @@ mod tests {
         let stdout_pipe = child.stdout.take().expect("stdout pipe");
         let stderr_pipe = child.stderr.take().expect("stderr pipe");
 
-        let captured = super::capture_bounded(&mut child, stdout_pipe, stderr_pipe, None)
+        let captured = super::capture_bounded(child.wait(), stdout_pipe, stderr_pipe, None)
             .await
             .expect("the child ran");
         let (stdout, truncated) = captured.stdout.into_string();
