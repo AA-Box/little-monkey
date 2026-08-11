@@ -3418,6 +3418,79 @@ mod tests {
         format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn assert_workspace_boundary_outcome(
+        label: &str,
+        allow_network: bool,
+        outcome: &SandboxExecOutcome,
+        expected_home: &Path,
+        expected_tmp: &Path,
+        forbidden_file: &Path,
+        home_probe: &Path,
+        tmp_probe: &Path,
+    ) {
+        assert_eq!(
+            outcome.isolation,
+            Isolation::OsSandboxed,
+            "{label} launched without its OS sandbox (network={allow_network})"
+        );
+        let stdout = String::from_utf8_lossy(&outcome.stdout);
+        let stderr = String::from_utf8_lossy(&outcome.stderr);
+        let ran = format!(
+            "{label} boundary (network={allow_network}) exit={:?} stdout={stdout:?} stderr={stderr:?}",
+            outcome.exit_code
+        );
+        assert!(
+            stdout.contains("LM-BEGIN") && stdout.contains("LM-END"),
+            "the confined child did not run every boundary probe: {ran}"
+        );
+        assert!(!outcome.timed_out, "the boundary probe timed out: {ran}");
+        for step in [
+            "S1-read-own",
+            "S2-write-home",
+            "S3-write-tmp",
+            "S6-read-real",
+            "S7-write-real",
+        ] {
+            assert!(
+                stdout.contains(step),
+                "the confined child skipped boundary probe {step}: {ran}"
+            );
+        }
+        assert!(
+            stdout.contains(&format!("home={}", expected_home.display()))
+                && stdout.contains(&format!("TMP={}", expected_tmp.display())),
+            "the child did not receive its sandbox-owned HOME and TMP: {ran}"
+        );
+        assert!(
+            stdout.contains("sandbox-visible"),
+            "the child could not read its workspace copy: {ran}"
+        );
+        assert!(
+            !stdout.contains("must-stay-secret"),
+            "the child read a file outside the sandbox: {ran}"
+        );
+        assert_eq!(
+            fs::read_to_string(forbidden_file).expect("read real file after run"),
+            "must-stay-secret",
+            "the child overwrote a file outside the sandbox: {ran}"
+        );
+        assert_eq!(
+            fs::read_to_string(home_probe)
+                .expect("read HOME probe after run")
+                .trim(),
+            "home-ok",
+            "the child did not write its sandbox-owned HOME: {ran}"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp_probe)
+                .expect("read TMP probe after run")
+                .trim(),
+            "tmp-ok",
+            "the child did not write its sandbox-owned TMP: {ran}"
+        );
+    }
+
     /// The workspace boundary, exercised for real: one command that reads its own
     /// copy, fails to read the real workspace, fails to overwrite it, and writes
     /// to the sandbox-owned HOME and TMP — run once with network and once without,
@@ -3450,28 +3523,28 @@ mod tests {
             plain_canonical(&forbidden_file).expect("canonical forbidden file");
         let expected_home = canonical_sandbox.join(SANDBOX_HOME_DIR);
         let expected_tmp = canonical_sandbox.join(SANDBOX_TMP_DIR);
-        let command = format!(
-            "set -eu\n\
-             test \"$HOME\" = {}\n\
-             test \"$TMPDIR\" = {}\n\
-             /bin/cat {} > \"$TMPDIR/allowed-copy\"\n\
-             if /bin/cat {} > \"$TMPDIR/forbidden-copy\"; then exit 71; fi\n\
-             if printf overwritten > {}; then exit 72; fi\n\
-             printf home-ok > \"$HOME/probe\"\n\
-             printf tmp-ok > \"$TMPDIR/probe\"",
-            sh_quote(&expected_home),
-            sh_quote(&expected_tmp),
-            sh_quote(&canonical_workspace.join("allowed.txt")),
-            sh_quote(&canonical_forbidden),
-            sh_quote(&canonical_forbidden),
-        );
 
         for allow_network in [false, true] {
-            let profile_path = sandbox_root.join(if allow_network {
-                "boundary-network.sb"
-            } else {
-                "boundary-offline.sb"
-            });
+            let mode = if allow_network { "network" } else { "offline" };
+            let profile_path = sandbox_root.join(format!("boundary-{mode}.sb"));
+            let home_probe = expected_home.join(format!("probe-{mode}"));
+            let tmp_probe = expected_tmp.join(format!("probe-{mode}"));
+            let command = format!(
+                "printf 'LM-BEGIN\\n'; \
+                 printf 'home=%s\\n' \"$HOME\"; \
+                 printf 'TMP=%s\\n' \"$TMPDIR\"; \
+                 printf 'S1-read-own\\n'; /bin/cat {} 2>&1; \
+                 printf 'S2-write-home\\n'; printf home-ok > {} 2>&1; \
+                 printf 'S3-write-tmp\\n'; printf tmp-ok > {} 2>&1; \
+                 printf 'S6-read-real\\n'; /bin/cat {} 2>&1; \
+                 printf 'S7-write-real\\n'; printf overwritten > {} 2>&1; \
+                 printf 'LM-END\\n'",
+                sh_quote(&canonical_workspace.join("allowed.txt")),
+                sh_quote(&home_probe),
+                sh_quote(&tmp_probe),
+                sh_quote(&canonical_forbidden),
+                sh_quote(&canonical_forbidden),
+            );
             let outcome = execute_in_sandbox(
                 &sandbox_root,
                 &workspace_dir,
@@ -3484,19 +3557,17 @@ mod tests {
             )
             .await
             .expect("the sandbox launches");
-            assert_eq!(
-                outcome.exit_code,
-                Some(0),
-                "{label} boundary failed (network={allow_network}); stderr={}",
-                String::from_utf8_lossy(&outcome.stderr)
-            );
-            assert_eq!(
-                fs::read_to_string(&forbidden_file).expect("read real file after run"),
-                "must-stay-secret"
+            assert_workspace_boundary_outcome(
+                label,
+                allow_network,
+                &outcome,
+                &expected_home,
+                &expected_tmp,
+                &forbidden_file,
+                &home_probe,
+                &tmp_probe,
             );
         }
-        assert!(expected_home.join("probe").is_file());
-        assert!(expected_tmp.join("probe").is_file());
 
         let _ = fs::remove_dir_all(&sandbox_root);
         let _ = fs::remove_dir_all(&real_workspace);
@@ -3534,7 +3605,7 @@ mod tests {
     /// boundary — so on CI the absence of the mechanism is a failure. A runner
     /// image that stops shipping Landlock must turn this red rather than silently
     /// stop enforcing it.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn skip_locally_but_fail_in_ci(mechanism: &str, reason: &str) {
         assert!(
             std::env::var_os("CI").is_none(),
@@ -3561,22 +3632,16 @@ mod tests {
     /// The Windows arm of the same boundary, and the third platform finally
     /// joins the assertion rather than being argued about.
     ///
-    /// # It is a sibling, not a copy
+    /// # Shared verdict, platform-specific reporter
     ///
-    /// macOS and Linux share `assert_real_workspace_stays_out_of_reach`
-    /// verbatim because both run the same `sh` script. Windows cannot: `cmd /C`
+    /// macOS and Linux share one `sh` script. Windows cannot: `cmd /C`
     /// takes one line, has no `set -eu`, and reads `%USERPROFILE%`/`%TMP%` where
-    /// the others read `$HOME`/`$TMPDIR`. The deeper split is where the
-    /// assertions live. The `sh` version can hold its own, because `set -eu` plus
-    /// a distinct `exit` per step makes the exit code a verdict; a `cmd`
-    /// one-liner cannot, so this version's script only *reports* and every
-    /// assertion is made in Rust against its stdout. See the comment on the
-    /// command for the two ways the other arrangement lied. What is shared is
-    /// the *claim* — read
-    /// your own copy, fail to read the real workspace, fail to overwrite it,
-    /// write to the sandbox-owned home and tmp, with and without network — and
-    /// the claim is what the acceptance is about. Forcing one string across
-    /// three shells would have meant a weaker assertion on all three.
+    /// the others read `$HOME`/`$TMPDIR`. Each shell therefore reports the same
+    /// labelled observations in its native syntax, then all three enter
+    /// `assert_workspace_boundary_outcome` for the verdict: own-copy read,
+    /// outside read/write denial, sandbox HOME/TMP writes, both network-policy
+    /// states, and real OS isolation. Forcing one string across three shells
+    /// would weaken that shared assertion rather than strengthen it.
     ///
     /// # CI is the privileged case, and for a *deny* assertion that is the
     /// stronger one
@@ -3600,14 +3665,10 @@ mod tests {
     #[tokio::test]
     async fn app_container_cannot_read_or_write_real_workspace_with_or_without_network() {
         if !crate::sandbox_windows::app_containers_are_enforceable() {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "AppContainers are unavailable on this CI runner, so the filesystem \
-                 boundary they enforce went untested"
-            );
-            eprintln!(
-                "skipping AppContainer integration test: this machine cannot create a \
-                 container profile (group policy, or a locked-down registry hive)"
+            skip_locally_but_fail_in_ci(
+                "AppContainer",
+                "this machine cannot create a container profile (group policy, or a \
+                 locked-down registry hive)",
             );
             return;
         }
@@ -3650,16 +3711,15 @@ mod tests {
         // this script's own `exit /b 70`, which is the branch *taken*; fixing the
         // paths is what made the run silent.
         //
-        // So the exit code stops being the verdict, and `dir /b` and `type` stop
-        // being decoration. The one-liner's whole job is to say what the container
+        // So the exit code stops being the verdict. The one-liner's whole job is
+        // to say what the container
         // saw, on stdout, where the host can read it:
         //
         // * `LM-BEGIN` and `LM-END` bracket the run, so "the script stopped early"
         //   is a distinguishable outcome rather than an empty string.
         // * `home=` and `set TMP` replace the two `exit /b 70` guards.
         // * `type "{allowed}"` replaces 73: its content on stdout *is* the read.
-        // * the two `dir /b` replace 74/75 — what the container sees of its own
-        //   writes, which the host listing in the assertions below cannot show.
+        // * HOME/TMP writes are read back by the host in the shared verdict.
         // * `type "{forbidden}"` replaces 71: the secret must not appear.
         // * the `echo` into `{forbidden}` replaces 72, and the host reads that
         //   file afterwards to check it did not land.
@@ -3672,8 +3732,8 @@ mod tests {
         // the container's package temp, the value the `set` exists to replace.
         // `set TMP` has no such problem: it prints what the environment holds when
         // it runs. It also prints `TMPDIR`, which the allowlist sets to the same
-        // path; harmless, and `TMP=` is not a substring of `TMPDIR=`. The two
-        // writes and the listing use `{tmp}`, written out in full.
+        // path; harmless, and `TMP=` is not a substring of `TMPDIR=`. The TMP
+        // write uses `{tmp}`, written out in full.
         //
         // The deny probes come last on purpose. They are the two steps expected to
         // fail, and a failed step is the one that might take the rest of the line
@@ -3682,39 +3742,27 @@ mod tests {
         //
         // Each step is labelled and sends its stderr to stdout, `2>&1` before any
         // `>` so the diagnostic goes to the pipe and not into the file being
-        // written. stdout is one ordered stream, so every "Access is denied."
-        // arrives under the label of the step that earned it. Without that the two
-        // streams cannot be lined up: a run that printed four denials against six
-        // steps that could each produce one is not enough to say which four, and
-        // every consistent guess contradicted another part of the same output.
-        let command = format!(
-            "echo LM-BEGIN \
-             & echo home=%USERPROFILE% \
-             & set TMP \
-             & echo S1-read-own & type \"{allowed}\" 2>&1 \
-             & echo S2-write-home & echo home-ok 2>&1> \"%USERPROFILE%\\probe\" \
-             & echo S3-write-tmp & echo tmp-ok 2>&1> \"{tmp}\\probe\" \
-             & echo S4-list-home & dir /b \"%USERPROFILE%\" 2>&1 \
-             & echo S5-list-tmp & dir /b \"{tmp}\" 2>&1 \
-             & echo S6-read-real & type \"{forbidden}\" 2>&1 \
-             & echo S7-write-real & echo overwritten 2>&1> \"{forbidden}\" \
-             & echo LM-END",
-            allowed = canonical_workspace.join("allowed.txt").display(),
-            tmp = expected_tmp.display(),
-            forbidden = canonical_forbidden.display(),
-        );
-
-        // What the container reported about its own filesystem, kept past the
-        // loop: a failed write says "Access is denied." on stderr, and the
-        // trailing `dir /b` says what the container could see. Without these the
-        // probe assertions below can only report the host's half.
-        let mut container_view = String::new();
+        // written. stdout is one ordered stream, so each denial remains attached
+        // to the labelled probe that earned it.
         for allow_network in [false, true] {
-            let profile_path = sandbox_root.join(if allow_network {
-                "boundary-network.sb"
-            } else {
-                "boundary-offline.sb"
-            });
+            let mode = if allow_network { "network" } else { "offline" };
+            let profile_path = sandbox_root.join(format!("boundary-{mode}.sb"));
+            let home_probe = expected_home.join(format!("probe-{mode}"));
+            let tmp_probe = expected_tmp.join(format!("probe-{mode}"));
+            let command = format!(
+                "echo LM-BEGIN \
+                 & echo home=%USERPROFILE% \
+                 & set TMP \
+                 & echo S1-read-own & type \"{allowed}\" 2>&1 \
+                 & echo S2-write-home & echo home-ok 2>&1> \"%USERPROFILE%\\probe-{mode}\" \
+                 & echo S3-write-tmp & echo tmp-ok 2>&1> \"{tmp}\\probe-{mode}\" \
+                 & echo S6-read-real & type \"{forbidden}\" 2>&1 \
+                 & echo S7-write-real & echo overwritten 2>&1> \"{forbidden}\" \
+                 & echo LM-END",
+                allowed = canonical_workspace.join("allowed.txt").display(),
+                tmp = expected_tmp.display(),
+                forbidden = canonical_forbidden.display(),
+            );
             let outcome = execute_in_sandbox(
                 &sandbox_root,
                 &workspace_dir,
@@ -3727,117 +3775,17 @@ mod tests {
             )
             .await
             .expect("the sandbox launches");
-            assert_eq!(
-                outcome.isolation,
-                Isolation::OsSandboxed,
-                "the container was created, so the run must report the boundary it got"
+            assert_workspace_boundary_outcome(
+                "AppContainer",
+                allow_network,
+                &outcome,
+                &expected_home,
+                &expected_tmp,
+                &forbidden_file,
+                &home_probe,
+                &tmp_probe,
             );
-            let stdout = String::from_utf8_lossy(&outcome.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&outcome.stderr).into_owned();
-            // Everything below reads this run's own report, so first establish
-            // there is one. Asserted before anything else, including the exit
-            // code: a script that never ran exits 0 too, and that is precisely how
-            // this test used to pass its way into a misleading failure.
-            let ran = format!(
-                "(network={allow_network}) exit={:?} stdout={stdout:?} stderr={stderr:?}",
-                outcome.exit_code
-            );
-            assert!(
-                stdout.contains("LM-BEGIN") && stdout.contains("LM-END"),
-                "the confined child did not run its script from start to finish, so \
-                 nothing below is a statement about the boundary — an absent \
-                 LM-BEGIN means it ran nothing at all, an absent LM-END means a \
-                 step took the rest of the line with it: {ran}"
-            );
-            // The two `exit /b 70` guards, moved out of `cmd`. A wrong
-            // `%USERPROFILE%` would make every path below name somewhere other
-            // than the directory the host checks afterwards; a wrong `TMP` would
-            // leave the run's temporary files outside the sandbox tree, in a
-            // container profile that is deleted with the container.
-            assert!(
-                stdout.contains(&format!("home={}", expected_home.display()))
-                    && stdout.contains(&format!("TMP={}", expected_tmp.display())),
-                "the child's sandbox-owned environment is not what this test \
-                 expects, so its writes did not go where the assertions look: \
-                 wanted home={} tmp={}; {ran}",
-                expected_home.display(),
-                expected_tmp.display()
-            );
-            // The allow half: its own copy of the workspace is readable, and its
-            // own home and tmp are writable. The write is asserted after the loop,
-            // from the host, which is the stronger half of the claim anyway — the
-            // file being there is the write having landed, and landing where the
-            // sandbox says.
-            //
-            // The two `dir /b` are not asserted on. Labelling every step settled
-            // what four denials against six candidates could not: `S2-write-home`
-            // and `S3-write-tmp` are silent, which is a write that worked, and the
-            // denials land under `S4-list-home` and `S5-list-tmp`.
-            //
-            // Those two denials are not this boundary. The container enumerates
-            // its own directories perfectly well through `FindFirstFile` and
-            // through `System.IO`; `dir` is a `cmd` builtin that reads the volume
-            // first, and the volume root is granted to nothing here, so it is
-            // refused on every path — including ones this app has no ACL on. See
-            // `sandbox_windows::AppContainer::grant_tree_access` for the evidence
-            // and `a_confined_run_can_enumerate_the_tree_it_was_granted` for the
-            // assertions. Leaving them unasserted here is therefore right for a
-            // second reason: they would be measuring `cmd`, not the sandbox. This
-            // test is about the *real* workspace, and making it fail on the
-            // listing means asserting a proxy for the write in place of the write,
-            // which the host checks directly after the loop. The labels and their
-            // output stay in `ran`, so the fact is in the failure message of every
-            // assertion below rather than lost with the assertion.
-            assert!(
-                stdout.contains("sandbox-visible"),
-                "the container could not read its own workspace copy, so this run \
-                 proves nothing about what it cannot read: {ran}"
-            );
-            // The deny half. `type` printing the secret is the read succeeding,
-            // which is the boundary gone — and the file's content on the host is
-            // the write half, checked here so a clobber is reported against the
-            // run that did it.
-            assert!(
-                !stdout.contains("must-stay-secret"),
-                "the container read a file outside the sandbox: {ran}"
-            );
-            assert_eq!(
-                fs::read_to_string(&forbidden_file).expect("read real file after run"),
-                "must-stay-secret",
-                "the container overwrote a file outside the sandbox: {ran}"
-            );
-            container_view = ran;
         }
-        // The write half, and the only place it is asserted: the host sees both
-        // probes after the container is gone. That is what "the container writes
-        // into its own home and tmp" has to mean — a file the container alone can
-        // see is a file the run has lost. When it fails, say what is on disk
-        // rather than only that something is not.
-        let listing = |dir: &Path| match fs::read_dir(dir) {
-            Ok(entries) => entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join(", "),
-            Err(error) => format!("<unreadable: {error}>"),
-        };
-        assert!(
-            expected_home.join("probe").is_file(),
-            "the container wrote a probe under {} and exited 0, but the host cannot \
-             see it afterwards; home contains [{}], tmp contains [{}]; the \
-             container reported {}",
-            expected_home.display(),
-            listing(&expected_home),
-            listing(&expected_tmp),
-            container_view
-        );
-        assert!(
-            expected_tmp.join("probe").is_file(),
-            "the container wrote a probe under {} and exited 0, but the host cannot \
-             see it afterwards; tmp contains [{}]",
-            expected_tmp.display(),
-            listing(&expected_tmp)
-        );
 
         let _ = fs::remove_dir_all(&sandbox_root);
         let _ = fs::remove_dir_all(&real_workspace);
