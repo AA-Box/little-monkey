@@ -63,11 +63,18 @@ impl ConversationSource {
         }
     }
 
-    /// Whether turns from this source are attributable to a party outside the
-    /// operator's own machine. Used to decide untrusted-text wrapping and to
-    /// keep external turns out of any elevated permission mode.
-    pub fn is_external(self) -> bool {
-        !matches!(self, ConversationSource::Desktop)
+    /// Whether the text from this source was authored by the operator.
+    ///
+    /// The distinction is authentication, not network distance. A paired phone
+    /// and the Talk microphone are the operator speaking, and their words are
+    /// instructions — wrapping them as untrusted data would make Little Monkey
+    /// refuse its own owner. A Telegram sender, a caller, and a peer node are
+    /// someone else, and their words are evidence.
+    pub fn author_is_operator(self) -> bool {
+        matches!(
+            self,
+            ConversationSource::Desktop | ConversationSource::Mobile | ConversationSource::Voice
+        )
     }
 }
 
@@ -228,6 +235,12 @@ impl ConversationIngress {
         format!("ingress-{}", &digest[..32])
     }
 
+    /// Whether this turn's text must be wrapped as untrusted data before it can
+    /// become model input. True for everyone who is not the operator.
+    pub fn needs_untrusted_wrapping(&self) -> bool {
+        !self.source.author_is_operator()
+    }
+
     /// Whether this turn carries anything worth running.
     pub fn has_content(&self) -> bool {
         !self.text.is_blank() || !self.attachments.is_empty()
@@ -283,11 +296,26 @@ mod tests {
     }
 
     #[test]
-    fn only_the_desktop_is_not_external() {
-        assert!(!ConversationSource::Desktop.is_external());
-        assert!(ConversationSource::Mobile.is_external());
-        assert!(ConversationSource::MessagingChannel.is_external());
-        assert!(ConversationSource::Telephone.is_external());
+    fn the_operators_own_surfaces_are_not_wrapped_as_untrusted() {
+        assert!(ConversationSource::Desktop.author_is_operator());
+        assert!(ConversationSource::Mobile.author_is_operator());
+        assert!(ConversationSource::Voice.author_is_operator());
+
+        assert!(!ConversationSource::MessagingChannel.author_is_operator());
+        assert!(!ConversationSource::Telephone.author_is_operator());
+        assert!(!ConversationSource::Peer.author_is_operator());
+
+        assert!(ConversationIngress::from_channel(&envelope(), &route()).needs_untrusted_wrapping());
+        assert!(!ConversationIngress::direct(
+            ConversationSource::Mobile,
+            "device-1",
+            "mm-1",
+            "mobile:s-1",
+            "ship it",
+            RouteTarget::new("mobile-chat"),
+            1,
+        )
+        .needs_untrusted_wrapping());
     }
 
     #[test]

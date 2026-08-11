@@ -358,10 +358,25 @@ fn run_params(
         );
         params.push(format!(
             "{MESSAGE_PARAM}={}",
-            crate::agent::wrap_untrusted_content(&source, ingress.text.as_untrusted_str())
+            message_param(ingress, &source)
         ));
     }
     params
+}
+
+/// The message text as a run parameter, wrapped when its author is not the
+/// operator.
+///
+/// Shared with the mobile path, which is the case that shows why the decision
+/// belongs to the source rather than to the call site: a paired phone is the
+/// operator, and wrapping their words as untrusted data would tell the model to
+/// ignore its own owner.
+pub(super) fn message_param(ingress: &ConversationIngress, source: &str) -> String {
+    if ingress.needs_untrusted_wrapping() {
+        crate::agent::wrap_untrusted_content(source, ingress.text.as_untrusted_str())
+    } else {
+        ingress.text.as_untrusted_str().to_string()
+    }
 }
 
 /// Turn an accepted plan into the daemon's queue options.

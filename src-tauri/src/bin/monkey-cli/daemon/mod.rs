@@ -738,12 +738,28 @@ fn mobile_chat_job_id(client_key: &str) -> String {
 /// same conservative posture as `queue_client_recipe`.
 pub(crate) fn queue_mobile_chat_recipe(
     paths: &DaemonPaths,
+    session_id: &str,
     client_key: &str,
     prompt: &str,
 ) -> Result<QueuedRun, String> {
     if client_key.is_empty() || client_key.len() > 256 {
         return Err("Mobile chat queue key is invalid".to_string());
     }
+    // The same durable description every other external turn is built as. The
+    // queue options below are unchanged — a mobile turn keeps its own job id,
+    // its own frozen recipe contract and its own runtime budget — but the text
+    // now travels as a `ConversationIngress`, which is what decides that a
+    // paired phone's words are the operator's instructions rather than
+    // untrusted data. See `ConversationSource::author_is_operator`.
+    let ingress = little_monkey_lib::channels::ingress::ConversationIngress::direct(
+        little_monkey_lib::channels::ingress::ConversationSource::Mobile,
+        session_id,
+        client_key,
+        format!("mobile:{session_id}"),
+        prompt,
+        little_monkey_lib::channels::routing::RouteTarget::new(MOBILE_CHAT_RECIPE),
+        i64::try_from(now_ms()?).unwrap_or(i64::MAX),
+    );
     let config = DaemonConfig::load(paths).map_err(|error| {
         format!(
             "The Little Monkey background runner is not configured. Install it from the app or run `monkey daemon install`: {error}"
@@ -756,7 +772,10 @@ pub(crate) fn queue_mobile_chat_recipe(
     let mut shared = SharedLedger::open(&paths.ledger_db)?;
     let options = QueueOptions {
         recipe: MOBILE_CHAT_RECIPE.to_string(),
-        params: vec![format!("prompt={prompt}")],
+        params: vec![format!(
+            "prompt={}",
+            channel_ingress::message_param(&ingress, "a paired mobile device")
+        )],
         origin: QueueOrigin::Remote {
             request_id: client_key.to_string(),
         },
@@ -803,8 +822,14 @@ impl DaemonMobileChatQueue {
 }
 
 impl remote::api::MobileChatQueue for DaemonMobileChatQueue {
-    fn queue_chat(&self, client_key: &str, prompt: &str) -> Result<String, String> {
-        queue_mobile_chat_recipe(&self.paths, client_key, prompt).map(|queued| queued.run_id)
+    fn queue_chat(
+        &self,
+        session_id: &str,
+        client_key: &str,
+        prompt: &str,
+    ) -> Result<String, String> {
+        queue_mobile_chat_recipe(&self.paths, session_id, client_key, prompt)
+            .map(|queued| queued.run_id)
     }
 
     fn chat_run_id(&self, client_key: &str) -> Result<Option<String>, String> {
