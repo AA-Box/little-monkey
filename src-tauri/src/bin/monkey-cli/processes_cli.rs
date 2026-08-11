@@ -16,7 +16,7 @@ use std::path::Path;
 
 use clap::Subcommand;
 use little_monkey_lib::process_table::{
-    ProcessFilter, ProcessKind, ProcessRecord, ProcessSignal, DEFAULT_LIST_LIMIT,
+    ProcessFilter, ProcessKind, ProcessLimitKind, ProcessRecord, ProcessSignal, DEFAULT_LIST_LIMIT,
 };
 use little_monkey_lib::run_ledger::RunLedger;
 
@@ -76,6 +76,19 @@ pub enum ProcessesCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Print who enforces each declared limit, and why nobody does for the rest.
+    ///
+    /// The counterpart to `signals`, for the other half of what a process row
+    /// claims. A `ProcessLimits` field is a declaration, and this says whether
+    /// anything reads it: `enforced` means the owner reads this row's field and
+    /// a caller-supplied value takes effect, `owner-sourced` means a real bound
+    /// exists but its number comes from a recipe, a workflow definition or the
+    /// owner's own settings, and `unavailable` names the mechanism that is
+    /// missing.
+    Limits {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(action: &ProcessesCmd, data_dir: &Path) -> Result<(), String> {
@@ -83,6 +96,9 @@ pub fn run(action: &ProcessesCmd, data_dir: &Path) -> Result<(), String> {
     // machine where the app has never run.
     if let ProcessesCmd::Signals { json } = action {
         return print_signal_matrix(*json);
+    }
+    if let ProcessesCmd::Limits { json } = action {
+        return print_limit_matrix(*json);
     }
 
     let path = data_dir.join(LEDGER_FILE);
@@ -150,7 +166,9 @@ pub fn run(action: &ProcessesCmd, data_dir: &Path) -> Result<(), String> {
             }
             Ok(())
         }
-        ProcessesCmd::Signals { .. } => unreachable!("handled before the ledger is opened"),
+        ProcessesCmd::Signals { .. } | ProcessesCmd::Limits { .. } => {
+            unreachable!("handled before the ledger is opened")
+        }
         ProcessesCmd::Signal {
             process_id,
             signal,
@@ -204,6 +222,57 @@ pub fn run(action: &ProcessesCmd, data_dir: &Path) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// Prints who enforces each declared limit for each kind, and why nobody does
+/// for the rest.
+///
+/// The `unavailable` rows are the useful half, the same way refusals are in the
+/// signal matrix: they say which mechanism is missing rather than leaving a
+/// reader to infer that an absent number means an absent bound.
+fn print_limit_matrix(json: bool) -> Result<(), String> {
+    if json {
+        let rows: Vec<serde_json::Value> = ProcessKind::ALL
+            .iter()
+            .flat_map(|kind| {
+                ProcessLimitKind::ALL.iter().map(move |limit| {
+                    let support = kind.limit_support(*limit);
+                    serde_json::json!({
+                        "kind": kind.as_str(),
+                        "limit": limit.as_str(),
+                        "status": support.status(),
+                        "honoursCallerValue": support.honours_caller_value(),
+                        "detail": support.detail(),
+                    })
+                })
+            })
+            .collect();
+        return print_json(&rows);
+    }
+
+    println!(
+        "{:<18} {:<20} {:<14} {}",
+        "KIND", "LIMIT", "STATUS", "DETAIL"
+    );
+    for kind in ProcessKind::ALL {
+        for limit in ProcessLimitKind::ALL {
+            let support = kind.limit_support(*limit);
+            println!(
+                "{:<18} {:<20} {:<14} {}",
+                kind.as_str(),
+                limit.as_str(),
+                support.status(),
+                support.detail()
+            );
+        }
+    }
+    println!();
+    println!(
+        "enforced      = the owner reads this row's field; a value you set takes effect\n\
+         owner-sourced = a real bound, but its number comes from the owner, not from you\n\
+         unavailable   = nothing enforces it for this kind; the detail names what is missing"
+    );
+    Ok(())
 }
 
 /// Prints which signals each kind honours, and the reason for each refusal.
