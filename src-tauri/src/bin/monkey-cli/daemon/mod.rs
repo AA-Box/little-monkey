@@ -395,7 +395,8 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
     match action {
         DaemonCmd::Install(args) => install(args),
         DaemonCmd::Start => {
-            ServiceManager::<service::RealCommandRunner>::real()?.start(&DaemonPaths::resolve()?)
+            let (paths, manager) = service_context()?;
+            manager.start(&paths)
         }
         DaemonCmd::Status { json } => status(*json),
         DaemonCmd::Decisions { limit, json } => decisions(*limit, *json),
@@ -427,8 +428,15 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
     }
 }
 
+fn service_context() -> Result<(DaemonPaths, ServiceManager<service::RealCommandRunner>), String> {
+    let roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    let paths = DaemonPaths::under(&roots.legacy);
+    let manager = ServiceManager::<service::RealCommandRunner>::real(roots)?;
+    Ok((paths, manager))
+}
+
 fn install(args: &DaemonInstallArgs) -> Result<(), String> {
-    let paths = DaemonPaths::resolve()?;
+    let (paths, manager) = service_context()?;
     let config = DaemonConfig {
         concurrency: args.concurrency,
         max_queue: args.max_queue,
@@ -439,7 +447,6 @@ fn install(args: &DaemonInstallArgs) -> Result<(), String> {
     };
     let mut store = DaemonStore::open(&paths)?;
     store.set_meta("stop_requested", "0")?;
-    let manager = ServiceManager::<service::RealCommandRunner>::real()?;
     let manifest = manager.install(&paths, &config)?;
     println!(
         "Installed {} user service at {}",
@@ -450,9 +457,8 @@ fn install(args: &DaemonInstallArgs) -> Result<(), String> {
 }
 
 fn status(json: bool) -> Result<(), String> {
-    let paths = DaemonPaths::resolve()?;
-    let manager = ServiceManager::<service::RealCommandRunner>::real()?;
-    let installed = paths.config.is_file() && manager.manifest_path(&paths).is_file();
+    let (paths, manager) = service_context()?;
+    let installed = paths.config.is_file() && manager.is_installed(&paths)?;
     let mut queued = 0;
     let mut active = 0;
     let mut waiting_approval = 0;
@@ -583,7 +589,7 @@ fn decisions(limit: u32, json: bool) -> Result<(), String> {
 }
 
 async fn stop() -> Result<(), String> {
-    let paths = DaemonPaths::resolve()?;
+    let (paths, manager) = service_context()?;
     if paths.state_db.is_file() {
         let mut store = DaemonStore::open(&paths)?;
         store.set_meta("stop_requested", "1")?;
@@ -595,8 +601,7 @@ async fn stop() -> Result<(), String> {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
-    let manager = ServiceManager::<service::RealCommandRunner>::real()?;
-    if manager.manifest_path(&paths).is_file() {
+    if manager.is_installed(&paths)? {
         manager.stop(&paths)?;
     }
     println!("Daemon stopped.");
@@ -604,8 +609,7 @@ async fn stop() -> Result<(), String> {
 }
 
 fn uninstall(purge_state: bool) -> Result<(), String> {
-    let paths = DaemonPaths::resolve()?;
-    let manager = ServiceManager::<service::RealCommandRunner>::real()?;
+    let (paths, manager) = service_context()?;
     manager.uninstall(&paths)?;
     if purge_state && paths.root.exists() {
         let store = DaemonStore::open(&paths)?;
@@ -625,7 +629,9 @@ fn uninstall(purge_state: bool) -> Result<(), String> {
 }
 
 fn queue_command(cli: &crate::Cli, args: &DaemonRunArgs) -> Result<(), String> {
-    let paths = DaemonPaths::resolve()?;
+    let config_roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    let paths = DaemonPaths::under(&config_roots.legacy);
+    let global_config_roots = config_roots.ordered();
     let config = DaemonConfig::load(&paths)?;
     let mut store = DaemonStore::open(&paths)?;
     if store.kill_switch()? {
@@ -633,7 +639,15 @@ fn queue_command(cli: &crate::Cli, args: &DaemonRunArgs) -> Result<(), String> {
     }
     let mut shared = SharedLedger::open(&paths.ledger_db)?;
     let options = QueueOptions::from_run_args(args);
-    let queued = enqueue(Some(cli), &paths, &config, &mut store, &mut shared, options)?;
+    let queued = enqueue(
+        Some(cli),
+        &paths,
+        &global_config_roots,
+        &config,
+        &mut store,
+        &mut shared,
+        options,
+    )?;
     if args.json {
         println!("{}", serde_json::to_string(&queued).unwrap_or_default());
     } else {
@@ -654,7 +668,9 @@ pub(crate) fn queue_client_recipe(
     if client_key.is_empty() || client_key.len() > 4_096 || client_key.contains('\0') {
         return Err("Protocol client run key is invalid".to_string());
     }
-    let paths = DaemonPaths::resolve()?;
+    let config_roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    let paths = DaemonPaths::under(&config_roots.legacy);
+    let global_config_roots = config_roots.ordered();
     let config = DaemonConfig::load(&paths).map_err(|error| {
         format!(
             "The Little Monkey background runner is not configured. Install it from the app or run `monkey daemon install`: {error}"
@@ -690,7 +706,15 @@ pub(crate) fn queue_client_recipe(
         parent_run_id: None,
         snapshot_is_frozen: false,
     };
-    enqueue(Some(cli), &paths, &config, &mut store, &mut shared, options)
+    enqueue(
+        Some(cli),
+        &paths,
+        &global_config_roots,
+        &config,
+        &mut store,
+        &mut shared,
+        options,
+    )
 }
 
 /// Recipe name the mobile chat route executes. The node operator authors it
@@ -753,7 +777,16 @@ pub(crate) fn queue_mobile_chat_recipe(
         // process's cwd.
         snapshot_is_frozen: true,
     };
-    enqueue(None, paths, &config, &mut store, &mut shared, options)
+    let global_config_roots = global_config_roots_for_paths(paths)?;
+    enqueue(
+        None,
+        paths,
+        &global_config_roots,
+        &config,
+        &mut store,
+        &mut shared,
+        options,
+    )
 }
 
 /// Production implementation of the remote API's mobile chat seam.
@@ -1031,7 +1064,16 @@ impl remote::api::PlacementQueue for DaemonPlacementQueue {
             parent_run_id: None,
             snapshot_is_frozen: true,
         };
-        let queued = enqueue(None, &self.paths, &config, &mut store, &mut shared, options)?;
+        let global_config_roots = global_config_roots_for_paths(&self.paths)?;
+        let queued = enqueue(
+            None,
+            &self.paths,
+            &global_config_roots,
+            &config,
+            &mut store,
+            &mut shared,
+            options,
+        )?;
         Ok(remote::api::PlacedJob {
             node_run_id: queued.run_id,
             job_id: queued.job_id,
@@ -1237,6 +1279,7 @@ fn enqueue(
     // rules/facts into a NON-frozen recipe's system prompt.
     cli: Option<&crate::Cli>,
     paths: &DaemonPaths,
+    global_config_roots: &[PathBuf],
     config: &DaemonConfig,
     store: &mut DaemonStore,
     shared: &mut SharedLedger,
@@ -1276,10 +1319,12 @@ fn enqueue(
             state: existing.state,
         });
     }
-    let app_data = crate::app_data_dir().ok_or("Could not resolve app data directory")?;
     let workspace_root = std::env::current_dir().ok();
-    let (recipe, recipe_path) =
-        recipes::resolve_recipe_with_path(&options.recipe, workspace_root.as_deref(), &app_data)?;
+    let (recipe, recipe_path) = recipes::resolve_recipe_with_path(
+        &options.recipe,
+        workspace_root.as_deref(),
+        global_config_roots,
+    )?;
     let overrides = parse_params(&options.params)?;
     let rendered = recipes::render_recipe(&recipe, &overrides)?;
     let original_workspace = resolve_recipe_workspace(&recipe, &recipe_path)?;
@@ -1405,6 +1450,21 @@ fn enqueue(
         run_id,
         state: JobState::Queued,
     })
+}
+
+fn global_config_roots_for_paths(paths: &DaemonPaths) -> Result<Vec<PathBuf>, String> {
+    let roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    if !daemon_paths_match_profile(paths, &roots.legacy) {
+        return Err(
+            "The active profile changed while resolving daemon paths; retry the command"
+                .to_string(),
+        );
+    }
+    Ok(roots.ordered())
+}
+
+fn daemon_paths_match_profile(paths: &DaemonPaths, profile_root: &Path) -> bool {
+    paths.root == profile_root.join("daemon")
 }
 
 fn submit_queued_snapshot(
@@ -1600,7 +1660,9 @@ fn append_cancellation(paths: &DaemonPaths, run_id: &str, reason: &str) -> Resul
 }
 
 fn retry(cli: &crate::Cli, run_id: &str, acknowledge: bool) -> Result<(), String> {
-    let paths = DaemonPaths::resolve()?;
+    let config_roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    let paths = DaemonPaths::under(&config_roots.legacy);
+    let global_config_roots = config_roots.ordered();
     let config = DaemonConfig::load(&paths)?;
     let mut store = DaemonStore::open(&paths)?;
     let mut shared = SharedLedger::open(&paths.ledger_db)?;
@@ -1647,7 +1709,15 @@ fn retry(cli: &crate::Cli, run_id: &str, acknowledge: bool) -> Result<(), String
         parent_run_id: prior.run_id,
         snapshot_is_frozen: true,
     };
-    let queued = enqueue(Some(cli), &paths, &config, &mut store, &mut shared, options)?;
+    let queued = enqueue(
+        Some(cli),
+        &paths,
+        &global_config_roots,
+        &config,
+        &mut store,
+        &mut shared,
+        options,
+    )?;
     let _ = std::fs::remove_file(retry_source);
     println!("Queued retry {} as {}", queued.job_id, queued.run_id);
     Ok(())
@@ -1968,9 +2038,9 @@ fn validate_trigger_recipe(config: &TriggerConfig) -> Result<(), String> {
     let Some((recipe_name, params, payload_param)) = config.recipe_target() else {
         return Ok(());
     };
-    let app_data = crate::app_data_dir().ok_or("Could not resolve app data directory")?;
+    let global_config_roots = recipes::global_config_roots()?;
     let cwd = std::env::current_dir().ok();
-    let recipe = recipes::resolve_recipe(recipe_name, cwd.as_deref(), &app_data)?;
+    let recipe = recipes::resolve_recipe(recipe_name, cwd.as_deref(), &global_config_roots)?;
     for key in params.keys() {
         if !recipe.params.contains_key(key) {
             return Err(format!(
@@ -2111,11 +2181,13 @@ fn reap_dead_workflow_hosts(shared: &SharedLedger) {
 }
 
 async fn serve(cli: &crate::Cli) -> Result<(), String> {
-    let paths = DaemonPaths::resolve()?;
+    let roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    let paths = DaemonPaths::under(&roots.legacy);
     let config = DaemonConfig::load(&paths)?;
     paths.ensure()?;
     let _lock = DaemonLock::acquire(&paths.lock)?;
     let mut store = DaemonStore::open(&paths)?;
+    store.set_meta("profile_id", &roots.profile_id)?;
     store.set_meta("stop_requested", "0")?;
     // A stale escape-hatch flag from a prior run must not instantly kill the
     // first session of this run.
@@ -2435,7 +2507,16 @@ fn process_one_pending_delivery(
         options.allow_create_pull_request = *allow_create_pull_request;
         options.allow_review_comment = *allow_review_comment;
     }
-    let queued = enqueue(Some(cli), paths, config, store, shared, options)?;
+    let global_config_roots = global_config_roots_for_paths(paths)?;
+    let queued = enqueue(
+        Some(cli),
+        paths,
+        &global_config_roots,
+        config,
+        store,
+        shared,
+        options,
+    )?;
     shared.mark_delivery_submitted(
         &pending.trigger_id,
         &pending.delivery_id,
@@ -2541,6 +2622,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use little_monkey_lib::workflow_core::{workflow_core_fixtures, WorkflowRunStatus};
+
+    #[test]
+    fn daemon_and_authored_roots_must_come_from_the_same_profile_snapshot() {
+        let first = Path::new("/tmp/little-monkey/profiles/first");
+        let second = Path::new("/tmp/little-monkey/profiles/second");
+        let paths = DaemonPaths::under(first);
+
+        assert!(daemon_paths_match_profile(&paths, first));
+        assert!(!daemon_paths_match_profile(&paths, second));
+    }
 
     #[test]
     fn a_remote_request_is_lineage_and_is_never_left_claiming_to_run() {

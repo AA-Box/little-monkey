@@ -1,8 +1,11 @@
 //! Read-only access to `MONKEY.md` project-instruction files: a global file
-//! at `<app_data>/MONKEY.md` (applies to every workspace) plus one optional
+//! at `<agent-home>/MONKEY.md` (applies to every workspace) plus one optional
 //! file at the top of each attached workspace root (primary and every
 //! secondary), mirroring how CLAUDE.md works for this app's multi-root
 //! workspace model.
+//!
+//! Existing `<profile-data>/MONKEY.md` files remain authoritative until a
+//! home copy exists, so upgrades never strand a user's standing instructions.
 //!
 //! Each scope also falls back to `AGENTS.md` when no `MONKEY.md` is present
 //! there, so third-party tooling that ships instructions as an `AGENTS.md`
@@ -27,8 +30,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::app_paths;
 use crate::config_revisions::{self, RecordRequest};
-use crate::profiles::ProfileScopedPaths;
 use crate::{workspace, AppState};
 
 /// Revision kind for a rules/memory file (roadmap K24).
@@ -64,6 +67,16 @@ const RULE_FILE_NAME: &str = "MONKEY.md";
 /// absent — the de facto standard instructions filename used by other agent
 /// tooling (Codex, Cursor's AGENTS.md support, the ponytail plugin, etc).
 const AGENTS_FILE_NAME: &str = "AGENTS.md";
+
+/// Resolves the global rules scope as one unit so a legacy `AGENTS.md`
+/// fallback is not hidden merely because the new home lacks `MONKEY.md`.
+pub fn global_rules_path() -> Result<PathBuf, String> {
+    global_rules_path_for(&app_paths::agent_config_roots()?)
+}
+
+fn global_rules_path_for(roots: &app_paths::AgentConfigRoots) -> Result<PathBuf, String> {
+    roots.effective_path_with_sibling(RULE_FILE_NAME, AGENTS_FILE_NAME)
+}
 
 /// Per-file character cap enforced on read — see module docs.
 const MAX_RULE_CHARS: usize = 16_000;
@@ -155,13 +168,10 @@ pub fn read_rules_impl(global_path: &Path, roots: &[(PathBuf, String, bool)]) ->
 /// entries (the global file, if any, still applies).
 #[tauri::command]
 pub fn rules_read(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<RuleFile>, String> {
-    let global_dir = app
-        .profile_data_dir()
-        .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
-    let global_path = global_dir.join(RULE_FILE_NAME);
+    let global_path = global_rules_path()?;
     let roots = workspace::all_roots(state.inner()).unwrap_or_default();
     Ok(read_rules_impl(&global_path, &roots))
 }
@@ -170,7 +180,8 @@ pub fn rules_read(
 /// global path (no `AppHandle`) so it's directly unit-testable, mirroring
 /// the `*_impl` split used throughout `checkpoints.rs`/`workspace.rs`.
 ///
-/// `scope: "global"` writes `global_path` (`<app_data>/MONKEY.md`),
+/// `scope: "global"` writes `global_path` (`<agent-home>/MONKEY.md`, or the
+/// existing legacy profile-data file when one is still in use),
 /// ignoring `root_path`. `scope: "project"` requires `root_path` — the same
 /// resolvable path a tool call would use (e.g. `"MONKEY.md"` for the
 /// primary root, or `"<label>/MONKEY.md"` for an attached secondary root's
@@ -299,18 +310,16 @@ fn rules_target(
 /// save.
 #[tauri::command]
 pub fn rules_write(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     scope: String,
     root_path: Option<String>,
     content: String,
     base_revision_id: Option<String>,
 ) -> Result<String, String> {
-    let global_dir = app
-        .profile_data_dir()
-        .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
-    let global_path = global_dir.join(RULE_FILE_NAME);
-    let revision_root = config_revisions::revision_root(&global_dir);
+    let roots = app_paths::ensure_agent_config_roots()?;
+    let global_path = global_rules_path_for(&roots)?;
+    let revision_root = config_revisions::revision_root(&roots.legacy);
     write_rules_impl(
         state.inner(),
         &revision_root,
@@ -329,17 +338,15 @@ pub fn rules_write(
 /// or one that has never been saved through the app.
 #[tauri::command]
 pub fn rules_current_revision(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     scope: String,
     root_path: Option<String>,
 ) -> Result<Option<String>, String> {
-    let global_dir = app
-        .profile_data_dir()
-        .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
-    let global_path = global_dir.join(RULE_FILE_NAME);
+    let roots = app_paths::agent_config_roots()?;
+    let global_path = global_rules_path_for(&roots)?;
     let target = rules_target(state.inner(), &global_path, &scope, root_path.as_deref())?;
-    let root = config_revisions::revision_root(&global_dir);
+    let root = config_revisions::revision_root(&roots.legacy);
     config_revisions::head(
         &root,
         RULES_REVISION_KIND,
@@ -354,15 +361,12 @@ pub fn rules_current_revision(
 /// the right log without re-deriving the path rule in TypeScript.
 #[tauri::command]
 pub fn rules_revision_entity(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     scope: String,
     root_path: Option<String>,
 ) -> Result<String, String> {
-    let global_dir = app
-        .profile_data_dir()
-        .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
-    let global_path = global_dir.join(RULE_FILE_NAME);
+    let global_path = global_rules_path()?;
     let target = rules_target(state.inner(), &global_path, &scope, root_path.as_deref())?;
     Ok(rules_entity_id(&scope, &target))
 }

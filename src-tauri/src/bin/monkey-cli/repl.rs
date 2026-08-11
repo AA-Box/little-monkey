@@ -1,5 +1,5 @@
 //! The interactive REPL — an `ollama run`-style chat prompt: rustyline line
-//! editing with persistent history in `~/.monkey_cli_history`, a `>>> ` prompt,
+//! editing with persistent history in `~/.littlemonkey/history`, a `>>> ` prompt,
 //! `"""` multi-line messages, and slash commands (`/set`, `/show`, `/save`,
 //! `/load`, `/revert`, `/clear`, `/bye`, `/?`) that mutate the live session. When stdin
 //! is not a TTY the whole thing falls back to a plain `read_line` loop with
@@ -41,7 +41,12 @@ impl Reader {
     fn new() -> Self {
         if std::io::stdin().is_terminal() {
             if let Ok(mut editor) = rustyline::DefaultEditor::new() {
-                let path = dirs::home_dir().map(|h| h.join(".monkey_cli_history"));
+                let roots = little_monkey_lib::app_paths::agent_config_roots().ok();
+                let preferred = roots.as_ref().map(|roots| roots.authored.join("history"));
+                let legacy = roots
+                    .as_ref()
+                    .and_then(|roots| legacy_history_path(&roots.profile_id, dirs::home_dir()));
+                let path = preferred_history_path(preferred, legacy);
                 if let Some(path) = &path {
                     let _ = editor.load_history(path);
                 }
@@ -88,6 +93,29 @@ impl Reader {
             }
         }
     }
+}
+
+fn preferred_history_path(preferred: Option<PathBuf>, legacy: Option<PathBuf>) -> Option<PathBuf> {
+    match preferred {
+        Some(path) => {
+            if path.try_exists().unwrap_or(true)
+                || !legacy
+                    .as_ref()
+                    .is_some_and(|old| old.try_exists().unwrap_or(false))
+            {
+                Some(path)
+            } else {
+                legacy
+            }
+        }
+        None => legacy,
+    }
+}
+
+fn legacy_history_path(profile_id: &str, home: Option<PathBuf>) -> Option<PathBuf> {
+    (profile_id == little_monkey_lib::profiles::DEFAULT_PROFILE_ID)
+        .then(|| home.map(|path| path.join(".monkey_cli_history")))
+        .flatten()
 }
 
 /// The session header an interactive REPL opens with: what's answering,
@@ -887,7 +915,7 @@ fn print_shortcuts() {
   Ctrl + l         Clear the screen
   Ctrl + c         Cancel the current input
   Ctrl + d         Exit (on an empty line)
-  Up / Down        Walk the input history (~/.monkey_cli_history)"
+  Up / Down        Walk the input history (~/.littlemonkey/history)"
     );
 }
 
@@ -930,6 +958,51 @@ fn print_show_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_uses_home_path_with_legacy_fallback() {
+        let suffix = format!(
+            "{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let preferred = std::env::temp_dir().join(format!("littlemonkey-history-{suffix}"));
+        let legacy = std::env::temp_dir().join(format!("monkey-cli-history-{suffix}"));
+
+        assert_eq!(
+            preferred_history_path(Some(preferred.clone()), Some(legacy.clone())),
+            Some(preferred.clone())
+        );
+        std::fs::write(&legacy, "legacy").unwrap();
+        assert_eq!(
+            preferred_history_path(Some(preferred.clone()), Some(legacy.clone())),
+            Some(legacy.clone())
+        );
+        std::fs::write(&preferred, "new").unwrap();
+        assert_eq!(
+            preferred_history_path(Some(preferred.clone()), Some(legacy.clone())),
+            Some(preferred.clone())
+        );
+
+        let _ = std::fs::remove_file(preferred);
+        let _ = std::fs::remove_file(legacy);
+    }
+
+    #[test]
+    fn named_profiles_do_not_inherit_default_cli_history() {
+        let home = Some(PathBuf::from("/home/example"));
+        assert_eq!(
+            legacy_history_path(
+                little_monkey_lib::profiles::DEFAULT_PROFILE_ID,
+                home.clone(),
+            ),
+            Some(PathBuf::from("/home/example/.monkey_cli_history"))
+        );
+        assert_eq!(legacy_history_path("work", home), None);
+    }
 
     #[test]
     fn split_first_word_cases() {

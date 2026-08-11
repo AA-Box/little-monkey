@@ -395,9 +395,9 @@ fn resolve_workspace_dir(recipe: &Recipe, recipe_path: &Path) -> PathBuf {
 /// line, with a `Warning:` for any file that failed to parse instead of
 /// silently omitting it.
 pub fn list() -> Result<(), String> {
-    let app_data_dir = crate::app_data_dir().ok_or("Could not resolve the app data directory")?;
+    let global_config_roots = recipes::global_config_roots()?;
     let workspace_root = std::env::current_dir().ok();
-    let found = recipes::discover_recipes(workspace_root.as_deref(), &app_data_dir);
+    let found = recipes::discover_recipes(workspace_root.as_deref(), &global_config_roots);
     if found.is_empty() {
         println!(
             "No recipes found (checked ./.littlemonkey/recipes/ and the global recipes directory)."
@@ -487,6 +487,36 @@ pub fn conformance(path: &str) -> Result<(), String> {
     }
 }
 
+fn schedule_command_args(
+    agent_home: &Path,
+    binary_path: &Path,
+    profile_id: &str,
+    recipe_path: &Path,
+) -> Result<Vec<String>, String> {
+    let agent_home = agent_home
+        .to_str()
+        .ok_or_else(|| "The Little Monkey agent home is not valid UTF-8".to_string())?;
+    let binary_path = binary_path
+        .to_str()
+        .ok_or_else(|| "The monkey executable path is not valid UTF-8".to_string())?;
+    let recipe_path = recipe_path
+        .to_str()
+        .ok_or_else(|| "The recipe path is not valid UTF-8".to_string())?;
+    Ok(vec![
+        format!(
+            "{}={agent_home}",
+            little_monkey_lib::app_paths::AGENT_HOME_ENV
+        ),
+        binary_path.to_string(),
+        "--profile".to_string(),
+        profile_id.to_string(),
+        "task".to_string(),
+        "run".to_string(),
+        recipe_path.to_string(),
+        "--json".to_string(),
+    ])
+}
+
 /// `task schedule <name_or_path> --cron '...'` — emits a ready-to-install
 /// launchd plist (macOS) or crontab line for running this recipe on a
 /// schedule via the OS's own scheduler, rather than the app daemonizing
@@ -497,10 +527,14 @@ pub fn conformance(path: &str) -> Result<(), String> {
 pub fn schedule(name_or_path: &str, cron: &str) -> Result<(), String> {
     little_monkey_lib::automations::validate_cron_impl(cron)?;
 
-    let app_data_dir = crate::app_data_dir().ok_or("Could not resolve the app data directory")?;
+    let config_roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    let global_config_roots = config_roots.ordered();
     let workspace_root = std::env::current_dir().ok();
-    let (recipe, recipe_path) =
-        recipes::resolve_recipe_with_path(name_or_path, workspace_root.as_deref(), &app_data_dir)?;
+    let (recipe, recipe_path) = recipes::resolve_recipe_with_path(
+        name_or_path,
+        workspace_root.as_deref(),
+        &global_config_roots,
+    )?;
     let recipe_abs_path = recipe_path.canonicalize().map_err(|e| {
         format!(
             "Failed to resolve absolute path to '{}': {e}",
@@ -509,25 +543,22 @@ pub fn schedule(name_or_path: &str, cron: &str) -> Result<(), String> {
     })?;
 
     let binary_path = std::env::current_exe()
-        .map_err(|e| format!("Failed to resolve monkey's own binary path: {e}"))?
-        .to_string_lossy()
-        .to_string();
-    let recipe_path_str = recipe_abs_path.to_string_lossy().to_string();
-    let args = vec![
-        "task".to_string(),
-        "run".to_string(),
-        recipe_path_str,
-        "--json".to_string(),
-    ];
+        .map_err(|e| format!("Failed to resolve monkey's own binary path: {e}"))?;
+    let args = schedule_command_args(
+        &config_roots.agent_home,
+        &binary_path,
+        &config_roots.profile_id,
+        &recipe_abs_path,
+    )?;
     let label = format!("com.littlemonkey.task.{}", recipe.name);
 
     if cfg!(target_os = "macos") {
         match little_monkey_lib::automations::format_launchd_plist(
             &label,
-            &binary_path,
+            "/usr/bin/env",
             &args,
             cron,
-        ) {
+        )? {
             Some(plist) => {
                 println!("{plist}");
                 eprintln!(
@@ -540,14 +571,18 @@ pub fn schedule(name_or_path: &str, cron: &str) -> Result<(), String> {
                 );
                 println!(
                     "{}",
-                    little_monkey_lib::automations::format_crontab_line(cron, &binary_path, &args)
+                    little_monkey_lib::automations::format_crontab_line(
+                        cron,
+                        "/usr/bin/env",
+                        &args,
+                    )?
                 );
             }
         }
     } else {
         println!(
             "{}",
-            little_monkey_lib::automations::format_crontab_line(cron, &binary_path, &args)
+            little_monkey_lib::automations::format_crontab_line(cron, "/usr/bin/env", &args)?
         );
         eprintln!("\n# Add the above line via `crontab -e`.");
     }
@@ -937,10 +972,15 @@ async fn run_inner(
     run_key: Option<&str>,
     json_output: bool,
 ) -> Result<(i32, RunResult), String> {
-    let app_data_dir = crate::app_data_dir().ok_or("Could not resolve the app data directory")?;
+    let config_roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    let app_data_dir = config_roots.legacy.clone();
+    let global_config_roots = config_roots.ordered();
     let workspace_root = std::env::current_dir().ok();
-    let (recipe, recipe_path) =
-        recipes::resolve_recipe_with_path(name_or_path, workspace_root.as_deref(), &app_data_dir)?;
+    let (recipe, recipe_path) = recipes::resolve_recipe_with_path(
+        name_or_path,
+        workspace_root.as_deref(),
+        &global_config_roots,
+    )?;
 
     let overrides = parse_param_flags(param_flags)?;
     let rendered = recipes::render_recipe(&recipe, &overrides)?;
@@ -1613,6 +1653,41 @@ mod tests {
     fn parse_param_flags_allows_a_value_containing_an_equals_sign() {
         let map = parse_param_flags(&["url=http://x?a=b".to_string()]).unwrap();
         assert_eq!(map.get("url"), Some(&"http://x?a=b".to_string()));
+    }
+
+    #[test]
+    fn schedule_command_pins_agent_home_as_environment_and_profile_as_an_argument() {
+        let agent_home = Path::new("/home/test/Agent Home");
+        let binary_path = Path::new("/opt/little monkey/bin/monkey");
+        let recipe_path = Path::new("/repo/recipes/nightly audit.yml");
+        assert_eq!(
+            schedule_command_args(agent_home, binary_path, "work", recipe_path),
+            Ok(vec![
+                "LITTLE_MONKEY_HOME=/home/test/Agent Home".to_string(),
+                "/opt/little monkey/bin/monkey".to_string(),
+                "--profile".to_string(),
+                "work".to_string(),
+                "task".to_string(),
+                "run".to_string(),
+                recipe_path.to_string_lossy().into_owned(),
+                "--json".to_string(),
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schedule_rejects_non_utf8_paths_instead_of_changing_them() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'/', b't', b'm', b'p', 0xff,
+        ]));
+        let binary = Path::new("/tmp/monkey");
+        let recipe = Path::new("/tmp/recipe.yml");
+        assert!(schedule_command_args(&invalid, binary, "work", recipe).is_err());
+        assert!(schedule_command_args(Path::new("/tmp/home"), &invalid, "work", recipe).is_err());
+        assert!(schedule_command_args(Path::new("/tmp/home"), binary, "work", &invalid).is_err());
     }
 
     #[test]
