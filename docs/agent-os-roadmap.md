@@ -1470,7 +1470,7 @@ has a cross-platform resource/lifetime mechanism it does not have.
 process-tree lifetime gap as an explicitly deferred platform capability; K21's
 disposable-isolation evidence prerequisite is now satisfied.
 
-## K4. Enforced per-process resource limits *(userspace enforcement built; declaration and platform legs open)*
+## K4. Enforced per-process resource limits *(built)*
 
 **Where this stands.** The original acceptance was a portable quota checklist
 whose named mechanisms cannot provide three of its six resources and whose
@@ -1479,8 +1479,10 @@ corrections it forced remain below. Every userspace mechanism named in the shipp
 slices is built, but that does not make the platform legs portable or turn
 `ProcessLimits` into proof of enforcement: explicit admission overrides can still
 record fields an owner does not enforce. Stronger mechanisms remain documented
-under *Deferred, with reasons*, and K4 stays open rather than moving those gaps
-outside the cut line by wording alone.
+under *Deferred, with reasons*. ~~K4 stays open rather than moving those gaps
+outside the cut line by wording alone.~~ **Closed by the final slice below — not
+by wording: the declaration contract is enforced at admission, and each deferred
+leg answers `Unavailable(reason)` as a value a caller receives.**
 
 What is enforced today: kernel-held `setrlimit` bounds on Unix app-side spawn
 sites, process-group termination on Unix timeouts, Windows job ownership for
@@ -2085,7 +2087,7 @@ owners, not for every mechanism: a browser quota exit remains `cancelled` with a
 named reason, and a Windows job-memory breach makes allocation fail. Saying the
 whole half is met would repeat the original checklist under different words.
 
-**Revised acceptance after audit (not yet met):** `ProcessLimits` is a declaration
+**Revised acceptance after audit (met — see the closing slice below):** `ProcessLimits` is a declaration
 record, not proof by itself. A positive value may be recorded only when its owner
 enforces it or reports that specific limit as unavailable; `None` stays distinct
 from zero. A configured breach must retain a named cause in the owning record, and
@@ -2098,10 +2100,61 @@ declarations and platform capabilities are either enforced or surfaced as
 `Unavailable(reason)`; fixed Unix rlimits and Windows shell-job guardrails do not
 stand in for that contract.
 
+**Shipped — the declaration contract is enforced at the boundary that leaked it,
+and every platform gap now answers for itself.**
+
+The acceptance asked for one of two things per limit, per kind: the owner
+enforces it, or that specific limit reports itself unavailable. Neither existed
+as a value — the facts were spread across field docs, a deferred-legs subsection
+here, and the reader's willingness to believe both. `ProcessKind::limit_support`
+is that answer as code, exhaustive over kind × field, so the roadmap no longer
+holds knowledge the program lacks.
+
+- **Three answers, not two, because two collapse a real distinction.**
+  `Enforced` means the owner reads *this row's field*, so a caller's value takes
+  effect. `OwnerSourced` means a real bound exists but its number comes from a
+  recipe, a workflow definition, or the owner's own settings — the daemon's
+  memory watchdog is genuinely enforcing, and a caller value would still be
+  overwritten at the next projection. `Unavailable` names the missing mechanism.
+  Calling the middle case "enforced" is what made the old field docs read as
+  stronger than the code; calling it "unavailable" would have been false in the
+  other direction.
+- **`process_admit` no longer records a bound nobody reads.** It `or`-ed every
+  stated field over the class default, so an IPC caller could put a 512 MiB
+  ceiling and a four-process ceiling on a chat turn. Nothing on any platform
+  consults either, and the row advertised containment to the run dashboard,
+  `monkey processes show`, and anyone auditing what this app promised. A caller
+  value now survives only where the matrix says the owner reads that field;
+  class defaults are untouched, because the code that writes them is the code
+  that enforces them. `unbounded_wall` still works for every kind: turning a
+  budget *off* declares less, so it cannot manufacture a bound nobody holds.
+- **The deferred platform legs are surfaced rather than quietly deferred.** The
+  memory and child-process reasons name the mechanism — delegated cgroups v2 or
+  a class-derived job object; the `pids` controller or a job object — at the
+  point a caller meets them, not only in the subsection above. `RLIMIT_RSS` is a
+  no-op on Darwin and advisory on Linux, `RLIMIT_AS` bounds address space rather
+  than residency, and `RLIMIT_NPROC` counts per real uid rather than per tree.
+  That is why those legs stay deferred, and it is now the program's own answer.
+- **Reachable as `monkey processes limits`**, the counterpart to `processes
+  signals`, printing all fifty pairs with a status and a reason. Static, so it
+  answers on a machine where the app has never run.
+- **Two tests hold the contract against drift.** One requires every pair to
+  answer with a reason over twenty characters that never says "unsupported" — a
+  catch-all arm cannot creep back in. The other refuses any class default that
+  declares a limit the matrix calls unavailable, so `default_limits` and
+  `limit_support` cannot disagree about the same row.
+
+What this does *not* claim: no cgroup was delegated, no job object was derived
+per class, and no macOS process tree became kernel-owned. Those remain deferred
+with their reasons, which is exactly what the acceptance permits — it asks for
+enforcement *or* an honest `Unavailable(reason)`, and the second is now a value
+a caller receives rather than a paragraph a reader has to find.
+
 **Blocks (historical correction):** this originally blocked implementation of K7
 and K8 on the theory that admission without a universal quota was a guess. Both are
 now built against measured reservations, so K4 no longer blocks their mechanics;
-their existence does not close K4's declaration and platform-enforcement gaps.
+~~their existence does not close K4's declaration and platform-enforcement gaps.~~
+**Those gaps are closed by the slice above.**
 
 ## K5. Per-run egress policy *(renamed from per-process — see the acceptance correction)*
 
@@ -6008,11 +6061,15 @@ child supervision is unavailable until a PID namespace or broker can scope it. T
 gap is K4's explicitly deferred platform debt, not a process-tree claim smuggled into K3. The optional Sandbox panel
 is still optional; it is no longer the evidence for how agent shell tools execute.
 
-So the name still does not change. The former isolation blocker is closed, but the cut line is
-Phase 0–3, not one marquee mechanism. Copy-on-write, freeze/restore and transactional effects are
-still built; Phase 1 owes K4's declaration/platform enforcement contract. Phase 3's K12 debt is
+The cut line is Phase 0–3, not one marquee mechanism. Copy-on-write, freeze/restore and transactional effects are
+still built. Phase 1's K4 debt is closed: the declaration contract is enforced where
+`process_admit` used to leak it, and the deferred platform legs answer
+`Unavailable(reason)` through `ProcessKind::limit_support` and `monkey processes
+limits`. Phase 3's K12 debt is
 closed: the allowed-egress rows turned out to have shipped with K5's per-run policy, and what was
 actually missing — a surface that reads the allowed half and the refused half together, and one
 that produces the run behind an admission decision — is `monkey security egress-evidence` and
 `monkey security admission-trail`, both joins rather than migrations.
-"Agent runtime and control plane" remains the honest README name until K4 closes.
+With that, every entry Phase 0-3 names is closed. The README name is no longer blocked
+by an open item; changing it is now a decision rather than a claim ahead of the code, and
+this file records that the gate opened rather than making the change on the reader's behalf.
