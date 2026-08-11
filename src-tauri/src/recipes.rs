@@ -14,8 +14,10 @@
 //! Recipe discovery deliberately checks TWO locations, local shadowing
 //! global by `name` (not filename): workspace-local
 //! `.littlemonkey/recipes/*.{yml,yaml,json}` (checked into the repo,
-//! shareable with a team) and the global `<app_data>/recipes/` directory
-//! (the desktop app's Settings > Tasks panel writes here). `permission_mode`
+//! shareable with a team) and the global `<agent-home>/recipes/` directory
+//! (plus automatic discovery of an existing legacy app-data directory).
+//! New recipes use the home; edits to legacy recipes stay at their original
+//! path so relative workspaces keep the same meaning. `permission_mode`
 //! is a required field with NO default — a lesson from Goose Recipes and
 //! Cline's headless mode (see the design doc's "Competitor reference"):
 //! nothing should run unattended without an explicit policy choice.
@@ -27,7 +29,7 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use tauri::Emitter;
 
-use crate::profiles::ProfileScopedPaths;
+use crate::app_paths;
 use crate::run_protocol::{
     ModelTargetSnapshot, PermissionMode as RunPermissionMode, PermissionPolicySnapshot,
     WorkspaceContext,
@@ -896,8 +898,17 @@ fn scan_recipe_dir(dir: &Path, source: RecipeSource) -> Vec<DiscoveredRecipe> {
         {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                out.push(DiscoveredRecipe {
+                    path,
+                    source: source.clone(),
+                    recipe: None,
+                    error: Some(format!("Failed to read recipe: {error}")),
+                });
+                continue;
+            }
         };
         match parse_recipe(&content, ext) {
             Ok(recipe) => out.push(DiscoveredRecipe {
@@ -914,18 +925,46 @@ fn scan_recipe_dir(dir: &Path, source: RecipeSource) -> Vec<DiscoveredRecipe> {
             }),
         }
     }
+    out.sort_by(|left, right| left.path.cmp(&right.path));
     out
+}
+
+fn recipe_shadow_keys(discovered: &DiscoveredRecipe) -> Vec<String> {
+    if let Some(recipe) = &discovered.recipe {
+        return vec![recipe.name.clone()];
+    }
+    discovered
+        .path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| vec![stem.to_string()])
+        .unwrap_or_default()
+}
+
+fn extend_unshadowed(
+    visible: &mut Vec<DiscoveredRecipe>,
+    seen_keys: &mut std::collections::HashSet<String>,
+    discovered: Vec<DiscoveredRecipe>,
+) {
+    for item in discovered {
+        let keys = recipe_shadow_keys(&item);
+        let shadowed = keys.iter().any(|key| seen_keys.contains(key));
+        seen_keys.extend(keys);
+        if !shadowed {
+            visible.push(item);
+        }
+    }
 }
 
 /// Discovers every recipe visible right now: workspace-local
 /// `.littlemonkey/recipes/` (skipped entirely when `workspace_root` is
-/// `None` — no workspace open) plus the global `<app_data>/recipes/`
+/// `None` — no workspace open) plus the global `<agent-home>/recipes/`
 /// directory, with a workspace recipe shadowing a global one of the same
 /// `name` (never both — the workspace copy wins, matching "local shadows
 /// global" from the design doc).
 pub fn discover_recipes(
     workspace_root: Option<&Path>,
-    app_data_dir: &Path,
+    global_config_roots: &[PathBuf],
 ) -> Vec<DiscoveredRecipe> {
     let mut local = workspace_root
         .map(|root| {
@@ -935,18 +974,23 @@ pub fn discover_recipes(
             )
         })
         .unwrap_or_default();
-    let global = scan_recipe_dir(&app_data_dir.join("recipes"), RecipeSource::Global);
+    let mut global = Vec::new();
+    let mut global_keys = std::collections::HashSet::new();
+    for root in global_config_roots {
+        extend_unshadowed(
+            &mut global,
+            &mut global_keys,
+            scan_recipe_dir(&root.join("recipes"), RecipeSource::Global),
+        );
+    }
 
-    let local_names: std::collections::HashSet<String> = local
-        .iter()
-        .filter_map(|d| d.recipe.as_ref().map(|r| r.name.clone()))
-        .collect();
+    let local_keys: std::collections::HashSet<String> =
+        local.iter().flat_map(recipe_shadow_keys).collect();
 
-    local.extend(global.into_iter().filter(|d| {
-        d.recipe
-            .as_ref()
-            .map(|r| !local_names.contains(&r.name))
-            .unwrap_or(true)
+    local.extend(global.into_iter().filter(|discovered| {
+        recipe_shadow_keys(discovered)
+            .iter()
+            .all(|key| !local_keys.contains(key))
     }));
     local
 }
@@ -959,9 +1003,9 @@ pub fn discover_recipes(
 pub fn resolve_recipe(
     name_or_path: &str,
     workspace_root: Option<&Path>,
-    app_data_dir: &Path,
+    global_config_roots: &[PathBuf],
 ) -> Result<Recipe, String> {
-    resolve_recipe_with_path(name_or_path, workspace_root, app_data_dir)
+    resolve_recipe_with_path(name_or_path, workspace_root, global_config_roots)
         .map(|(recipe, _path)| recipe)
 }
 
@@ -970,7 +1014,7 @@ pub fn resolve_recipe(
 pub fn resolve_recipe_with_path(
     name_or_path: &str,
     workspace_root: Option<&Path>,
-    app_data_dir: &Path,
+    global_config_roots: &[PathBuf],
 ) -> Result<(Recipe, PathBuf), String> {
     let direct_path = Path::new(name_or_path);
     if direct_path.is_file() {
@@ -982,15 +1026,29 @@ pub fn resolve_recipe_with_path(
             .map_err(|e| format!("Failed to read '{name_or_path}': {e}"))?;
         return Ok((parse_recipe(&content, ext)?, direct_path.to_path_buf()));
     }
-    discover_recipes(workspace_root, app_data_dir)
-        .into_iter()
-        .filter_map(|d| d.recipe.map(|r| (r, d.path)))
-        .find(|(r, _path)| r.name == name_or_path)
-        .ok_or_else(|| {
-            format!(
-                "No recipe named '{name_or_path}' found (checked workspace .littlemonkey/recipes/ and the global recipes directory)"
-            )
-        })
+    let discovered = discover_recipes(workspace_root, global_config_roots);
+    if let Some((recipe, path)) = discovered.iter().find_map(|item| {
+        item.recipe
+            .as_ref()
+            .filter(|recipe| recipe.name == name_or_path)
+            .cloned()
+            .map(|recipe| (recipe, item.path.clone()))
+    }) {
+        return Ok((recipe, path));
+    }
+    if let Some(broken) = discovered.iter().find(|item| {
+        item.recipe.is_none()
+            && item.path.file_stem().and_then(|stem| stem.to_str()) == Some(name_or_path)
+    }) {
+        return Err(format!(
+            "Recipe '{}' failed to parse: {}",
+            broken.path.display(),
+            broken.error.as_deref().unwrap_or("unknown error")
+        ));
+    }
+    Err(format!(
+        "No recipe named '{name_or_path}' found (checked workspace .littlemonkey/recipes/ and the global recipes directory)"
+    ))
 }
 
 fn validate_recipe_id(name: &str) -> Result<(), String> {
@@ -1000,40 +1058,119 @@ fn validate_recipe_id(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Saves `yaml_content` as `<app_data>/recipes/<name>.yml`, atomically
+/// Saves `yaml_content` as `<global-config-root>/recipes/<name>.yml`, atomically
 /// (temp file + rename, same pattern as `sessions.rs::save_to`) — always
 /// into the GLOBAL directory: the desktop app's recipe library (design doc
 /// slice 2) has no concept of "which workspace" a saved recipe belongs to,
 /// unlike a hand-authored `.littlemonkey/recipes/` file committed to a repo.
 pub fn save_recipe_impl(
-    app_data_dir: &Path,
+    global_config_root: &Path,
     name: &str,
     yaml_content: &str,
 ) -> Result<Recipe, String> {
+    let path = global_config_root
+        .join("recipes")
+        .join(format!("{name}.yml"));
+    save_recipe_at_path(&path, name, yaml_content)
+}
+
+fn save_recipe_at_path(path: &Path, name: &str, content: &str) -> Result<Recipe, String> {
     validate_recipe_id(name)?;
-    let recipe = parse_recipe(yaml_content, "yml")?;
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            format!(
+                "Recipe path '{}' has no supported extension",
+                path.display()
+            )
+        })?;
+    let recipe = parse_recipe(content, extension)?;
     if recipe.name != name {
         return Err(format!(
             "recipe content's name '{}' does not match the target '{name}'",
             recipe.name
         ));
     }
-    let dir = app_data_dir.join("recipes");
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("Recipe path '{}' has no parent", path.display()))?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create recipes directory: {e}"))?;
-    let path = dir.join(format!("{name}.yml"));
-    let tmp = path.with_extension("yml.tmp");
-    std::fs::write(&tmp, yaml_content).map_err(|e| format!("Failed to write recipe: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to finalize recipe: {e}"))?;
+    let tmp = dir.join(format!(".{name}-{}.tmp", uuid::Uuid::new_v4().simple()));
+    if let Err(error) = std::fs::write(&tmp, content) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Failed to write recipe: {error}"));
+    }
+    replace_recipe_file(&tmp, path)?;
     Ok(recipe)
 }
 
-/// Deletes `<app_data>/recipes/<name>.yml` — a no-op success (not an error)
+fn replace_recipe_file(temporary: &Path, destination: &Path) -> Result<(), String> {
+    match std::fs::rename(temporary, destination) {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            let metadata = match std::fs::symlink_metadata(destination) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let _ = std::fs::remove_file(temporary);
+                    return Err(format!("Failed to finalize recipe: {first_error}"));
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(temporary);
+                    return Err(format!(
+                        "Failed to inspect recipe destination after {first_error}: {error}"
+                    ));
+                }
+            };
+            if metadata.is_dir() {
+                let _ = std::fs::remove_file(temporary);
+                return Err(format!(
+                    "Recipe destination '{}' is a directory",
+                    destination.display()
+                ));
+            }
+            let parent = destination
+                .parent()
+                .ok_or_else(|| format!("Recipe path '{}' has no parent", destination.display()))?;
+            let backup = parent.join(format!(".recipe-{}.bak", uuid::Uuid::new_v4().simple()));
+            std::fs::rename(destination, &backup).map_err(|error| {
+                let _ = std::fs::remove_file(temporary);
+                format!("Failed to prepare recipe replacement after {first_error}: {error}")
+            })?;
+            if let Err(error) = std::fs::rename(temporary, destination) {
+                let restore_error = std::fs::rename(&backup, destination).err();
+                let _ = std::fs::remove_file(temporary);
+                return Err(match restore_error {
+                    Some(restore) => format!(
+                        "Failed to finalize recipe: {error}; restoring the previous file also failed: {restore}"
+                    ),
+                    None => format!("Failed to finalize recipe: {error}"),
+                });
+            }
+            cleanup_committed_recipe_backup(&backup, |path| std::fs::remove_file(path));
+            Ok(())
+        }
+    }
+}
+
+fn cleanup_committed_recipe_backup(
+    backup: &Path,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) {
+    // The destination already contains the new recipe. A leftover backup is
+    // preferable to reporting a failure for a save that visibly succeeded.
+    let _ = remove(backup);
+}
+
+/// Deletes `<global-config-root>/recipes/<name>.yml` — a no-op success (not an error)
 /// when it's already gone, same "delete is idempotent" convention as every
 /// other per-item store in this codebase.
-pub fn delete_recipe_impl(app_data_dir: &Path, name: &str) -> Result<(), String> {
+pub fn delete_recipe_impl(global_config_root: &Path, name: &str) -> Result<(), String> {
     validate_recipe_id(name)?;
-    let path = app_data_dir.join("recipes").join(format!("{name}.yml"));
+    let path = global_config_root
+        .join("recipes")
+        .join(format!("{name}.yml"));
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1041,31 +1178,100 @@ pub fn delete_recipe_impl(app_data_dir: &Path, name: &str) -> Result<(), String>
     }
 }
 
+/// Deletes every global file whose parsed recipe declares `name`, across all
+/// compatibility roots and supported extensions. Workspace recipes are never
+/// touched by a global Settings deletion.
+pub fn delete_global_recipe_impl(
+    global_config_roots: &[PathBuf],
+    name: &str,
+) -> Result<(), String> {
+    delete_global_recipe_with(global_config_roots, name, |path| std::fs::remove_file(path))
+}
+
+fn delete_global_recipe_with(
+    global_config_roots: &[PathBuf],
+    name: &str,
+    mut remove: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    validate_recipe_id(name)?;
+    for root in global_config_roots.iter().rev() {
+        for discovered in scan_recipe_dir(&root.join("recipes"), RecipeSource::Global)
+            .into_iter()
+            .rev()
+        {
+            if discovered
+                .recipe
+                .as_ref()
+                .map(|recipe| recipe.name.as_str())
+                == Some(name)
+            {
+                match remove(&discovered.path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "Failed to delete recipe '{}': {error}",
+                            discovered.path.display()
+                        ))
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands — thin wrappers resolving `AppHandle`/`AppState` down to the
 // plain paths every `*_impl`/free function above actually needs.
 // ---------------------------------------------------------------------------
 
-fn app_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.profile_data_dir()
-        .map_err(|e| format!("Failed to resolve app data dir: {e}"))
+pub fn global_config_roots() -> Result<Vec<PathBuf>, String> {
+    Ok(app_paths::agent_config_roots()?.ordered())
+}
+
+fn select_global_config_write_path(roots: &[PathBuf], name: &str) -> Result<PathBuf, String> {
+    let preferred = roots
+        .first()
+        .cloned()
+        .ok_or_else(|| "Could not resolve the global recipes directory".to_string())?;
+    if let Some(discovered) = discover_recipes(None, roots)
+        .into_iter()
+        .find(|discovered| {
+            discovered
+                .recipe
+                .as_ref()
+                .map(|recipe| recipe.name.as_str())
+                == Some(name)
+                || (discovered.recipe.is_none()
+                    && discovered.path.file_stem().and_then(|stem| stem.to_str()) == Some(name))
+        })
+    {
+        return Ok(discovered.path);
+    }
+    Ok(preferred.join("recipes").join(format!("{name}.yml")))
+}
+
+fn save_global_recipe_impl(roots: &[PathBuf], name: &str, content: &str) -> Result<Recipe, String> {
+    let path = select_global_config_write_path(roots, name)?;
+    save_recipe_at_path(&path, name, content)
 }
 
 #[tauri::command]
 pub fn recipes_list(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Vec<DiscoveredRecipe>, String> {
     let workspace_root = crate::workspace::primary_root_canon(state.inner()).ok();
     Ok(discover_recipes(
         workspace_root.as_deref(),
-        &app_data_dir(&app)?,
+        &global_config_roots()?,
     ))
 }
 
 #[tauri::command]
 pub fn recipes_read(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     name_or_path: String,
 ) -> Result<Recipe, String> {
@@ -1073,7 +1279,7 @@ pub fn recipes_read(
     resolve_recipe(
         &name_or_path,
         workspace_root.as_deref(),
-        &app_data_dir(&app)?,
+        &global_config_roots()?,
     )
 }
 
@@ -1081,11 +1287,11 @@ pub fn recipes_read(
 /// editor's "Edit" action needs the original YAML text to edit, not the
 /// parsed `Recipe` `recipes_read` returns. Resolution is otherwise
 /// identical to `recipes_read`; `tool_read_file` can't be reused here since
-/// it's sandboxed to workspace roots and a global recipe lives in the
-/// app-data directory, outside all of them.
+/// it's sandboxed to workspace roots and a global recipe lives in an
+/// agent-home or compatible legacy directory, outside all of them.
 #[tauri::command]
 pub fn recipes_read_raw(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     name_or_path: String,
 ) -> Result<String, String> {
@@ -1093,7 +1299,7 @@ pub fn recipes_read_raw(
     let (_recipe, path) = resolve_recipe_with_path(
         &name_or_path,
         workspace_root.as_deref(),
-        &app_data_dir(&app)?,
+        &global_config_roots()?,
     )?;
     std::fs::read_to_string(&path).map_err(|e| format!("Failed to read '{}': {e}", path.display()))
 }
@@ -1104,7 +1310,7 @@ pub fn recipes_read_raw(
 /// with `monkey-cli task run`, not two independently maintained ones.
 #[tauri::command]
 pub fn recipes_render(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     name_or_path: String,
     overrides: HashMap<String, String>,
@@ -1113,7 +1319,7 @@ pub fn recipes_render(
     let recipe = resolve_recipe(
         &name_or_path,
         workspace_root.as_deref(),
-        &app_data_dir(&app)?,
+        &global_config_roots()?,
     )?;
     render_recipe(&recipe, &overrides)
 }
@@ -1132,7 +1338,8 @@ pub fn recipes_save(
     name: String,
     content: String,
 ) -> Result<Recipe, String> {
-    let recipe = save_recipe_impl(&app_data_dir(&app)?, &name, &content)?;
+    let roots = app_paths::ensure_agent_config_roots()?.ordered();
+    let recipe = save_global_recipe_impl(&roots, &name, &content)?;
     let _ = app.emit(RECIPES_CHANGED_EVENT, window.label());
     Ok(recipe)
 }
@@ -1143,7 +1350,8 @@ pub fn recipes_delete(
     window: tauri::Window,
     name: String,
 ) -> Result<(), String> {
-    delete_recipe_impl(&app_data_dir(&app)?, &name)?;
+    let roots = app_paths::ensure_agent_config_roots()?.ordered();
+    delete_global_recipe_impl(&roots, &name)?;
     let _ = app.emit(RECIPES_CHANGED_EVENT, window.label());
     Ok(())
 }
@@ -1827,7 +2035,7 @@ params:
         );
         write_recipe_file(&app_data.join("recipes"), "global.yml", "global-recipe");
 
-        let found = discover_recipes(Some(&workspace), &app_data);
+        let found = discover_recipes(Some(&workspace), std::slice::from_ref(&app_data));
         let names: Vec<&str> = found
             .iter()
             .filter_map(|d| d.recipe.as_ref().map(|r| r.name.as_str()))
@@ -1847,7 +2055,7 @@ params:
         );
         write_recipe_file(&app_data.join("recipes"), "r.yml", "shared-name");
 
-        let found = discover_recipes(Some(&workspace), &app_data);
+        let found = discover_recipes(Some(&workspace), std::slice::from_ref(&app_data));
         let matches: Vec<&DiscoveredRecipe> = found
             .iter()
             .filter(|d| {
@@ -1866,10 +2074,136 @@ params:
     }
 
     #[test]
+    fn authored_global_recipes_shadow_legacy_without_hiding_other_legacy_recipes() {
+        let authored = temp_dir("authored-global");
+        let legacy = temp_dir("legacy-global");
+        write_recipe_file(&authored.join("recipes"), "shared.yml", "shared-name");
+        write_recipe_file(&legacy.join("recipes"), "shared.yml", "shared-name");
+        write_recipe_file(&legacy.join("recipes"), "legacy.yml", "legacy-only");
+
+        let found = discover_recipes(None, &[authored.clone(), legacy]);
+        let shared = found
+            .iter()
+            .filter(|discovered| {
+                discovered
+                    .recipe
+                    .as_ref()
+                    .map(|recipe| recipe.name.as_str())
+                    == Some("shared-name")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shared.len(), 1);
+        assert!(shared[0].path.starts_with(&authored));
+        assert!(found.iter().any(|discovered| {
+            discovered
+                .recipe
+                .as_ref()
+                .map(|recipe| recipe.name.as_str())
+                == Some("legacy-only")
+        }));
+    }
+
+    #[test]
+    fn a_valid_recipe_shadows_by_declared_name_not_filename() {
+        let authored = temp_dir("mismatched-name-authored");
+        let legacy = temp_dir("mismatched-name-legacy");
+        write_recipe_file(&authored.join("recipes"), "old-name.yml", "new-name");
+        write_recipe_file(&legacy.join("recipes"), "legacy.yml", "old-name");
+
+        let found = discover_recipes(None, &[authored.clone(), legacy.clone()]);
+        let names = found
+            .iter()
+            .filter_map(|item| item.recipe.as_ref().map(|recipe| recipe.name.as_str()))
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"new-name"));
+        assert!(names.contains(&"old-name"));
+        let (recipe, path) =
+            resolve_recipe_with_path("old-name", None, &[authored, legacy.clone()]).unwrap();
+        assert_eq!(recipe.name, "old-name");
+        assert!(path.starts_with(legacy));
+    }
+
+    #[test]
+    fn malformed_authored_recipe_blocks_and_reports_a_stale_legacy_fallback() {
+        let authored = temp_dir("malformed-authored");
+        let legacy = temp_dir("malformed-legacy");
+        std::fs::create_dir_all(authored.join("recipes")).unwrap();
+        std::fs::write(authored.join("recipes/nightly.yml"), "not: [valid").unwrap();
+        write_recipe_file(&legacy.join("recipes"), "old-name.yml", "nightly");
+
+        let found = discover_recipes(None, &[authored.clone(), legacy.clone()]);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, authored.join("recipes/nightly.yml"));
+        assert!(found[0].recipe.is_none());
+        let error = resolve_recipe("nightly", None, &[authored, legacy]).unwrap_err();
+        assert!(error.contains("failed to parse"));
+        assert!(error.contains("nightly.yml"));
+    }
+
+    #[test]
+    fn saving_a_malformed_authored_recipe_repairs_it_instead_of_editing_legacy() {
+        let authored = temp_dir("repair-malformed-authored");
+        let legacy = temp_dir("repair-malformed-legacy");
+        let authored_path = authored.join("recipes/nightly.yml");
+        let legacy_path = legacy.join("recipes/old-name.yml");
+        std::fs::create_dir_all(authored.join("recipes")).unwrap();
+        std::fs::write(&authored_path, "not: [valid").unwrap();
+        write_recipe_file(&legacy.join("recipes"), "old-name.yml", "nightly");
+        let replacement = "version: 1\nname: nightly\ntarget:\n  ollama: q\npermission_mode: manual\nprompt: repaired\n";
+
+        save_global_recipe_impl(&[authored.clone(), legacy.clone()], "nightly", replacement)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&authored_path).unwrap(),
+            replacement
+        );
+        assert!(std::fs::read_to_string(&legacy_path)
+            .unwrap()
+            .contains("prompt: do the thing"));
+        let (_, path) = resolve_recipe_with_path("nightly", None, &[authored, legacy]).unwrap();
+        assert_eq!(path, authored_path);
+    }
+
+    #[test]
+    fn existing_recipe_edits_stay_at_their_origin_and_new_recipes_use_home() {
+        let authored = temp_dir("write-authored");
+        let legacy = temp_dir("write-legacy");
+        write_recipe_file(&legacy.join("recipes"), "old.yml", "existing");
+        let roots = [authored.clone(), legacy.clone()];
+
+        assert_eq!(
+            select_global_config_write_path(&roots, "existing").unwrap(),
+            legacy.join("recipes/old.yml")
+        );
+        assert_eq!(
+            select_global_config_write_path(&roots, "new-recipe").unwrap(),
+            authored.join("recipes/new-recipe.yml")
+        );
+    }
+
+    #[test]
+    fn existing_recipe_save_updates_its_exact_file_without_a_duplicate() {
+        let authored = temp_dir("save-existing-authored");
+        let legacy = temp_dir("save-existing-legacy");
+        let existing = legacy.join("recipes/custom-name.yaml");
+        write_recipe_file(&legacy.join("recipes"), "custom-name.yaml", "existing");
+        let updated = "version: 1\nname: existing\ntarget:\n  ollama: q2\npermission_mode: manual\nprompt: updated\n";
+
+        save_global_recipe_impl(&[authored.clone(), legacy.clone()], "existing", updated).unwrap();
+
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), updated);
+        assert!(!authored.join("recipes/existing.yml").exists());
+        assert!(!legacy.join("recipes/existing.yml").exists());
+    }
+
+    #[test]
     fn discover_recipes_tolerates_no_workspace_open() {
         let app_data = temp_dir("app-no-ws");
         write_recipe_file(&app_data.join("recipes"), "g.yml", "global-only");
-        let found = discover_recipes(None, &app_data);
+        let found = discover_recipes(None, std::slice::from_ref(&app_data));
         assert_eq!(found.len(), 1);
     }
 
@@ -1880,7 +2214,7 @@ params:
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("broken.yml"), "not: [valid").unwrap();
 
-        let found = discover_recipes(None, &app_data);
+        let found = discover_recipes(None, std::slice::from_ref(&app_data));
         assert_eq!(found.len(), 1);
         assert!(found[0].recipe.is_none());
         assert!(found[0].error.is_some());
@@ -1890,7 +2224,7 @@ params:
     fn resolve_recipe_finds_a_recipe_by_bare_name() {
         let app_data = temp_dir("app-resolve-name");
         write_recipe_file(&app_data.join("recipes"), "g.yml", "findable");
-        let recipe = resolve_recipe("findable", None, &app_data).unwrap();
+        let recipe = resolve_recipe("findable", None, std::slice::from_ref(&app_data)).unwrap();
         assert_eq!(recipe.name, "findable");
     }
 
@@ -1899,15 +2233,20 @@ params:
         let app_data = temp_dir("app-resolve-path");
         let dir = app_data.join("somewhere-else");
         write_recipe_file(&dir, "custom.yml", "path-recipe");
-        let recipe =
-            resolve_recipe(dir.join("custom.yml").to_str().unwrap(), None, &app_data).unwrap();
+        let recipe = resolve_recipe(
+            dir.join("custom.yml").to_str().unwrap(),
+            None,
+            std::slice::from_ref(&app_data),
+        )
+        .unwrap();
         assert_eq!(recipe.name, "path-recipe");
     }
 
     #[test]
     fn resolve_recipe_errors_with_a_clear_message_when_nothing_matches() {
         let app_data = temp_dir("app-resolve-missing");
-        let err = resolve_recipe("does-not-exist", None, &app_data).unwrap_err();
+        let err =
+            resolve_recipe("does-not-exist", None, std::slice::from_ref(&app_data)).unwrap_err();
         assert!(err.contains("does-not-exist"));
     }
 
@@ -1922,8 +2261,40 @@ params:
             .join("saved-recipe.yml.tmp")
             .exists());
 
-        let reread = resolve_recipe("saved-recipe", None, &app_data).unwrap();
+        let reread = resolve_recipe("saved-recipe", None, std::slice::from_ref(&app_data)).unwrap();
         assert_eq!(reread.name, "saved-recipe");
+    }
+
+    #[test]
+    fn post_commit_backup_cleanup_failure_does_not_turn_save_into_failure() {
+        let backup = Path::new("old-recipe.bak");
+        let mut attempted = false;
+
+        cleanup_committed_recipe_backup(backup, |path| {
+            attempted = true;
+            assert_eq!(path, backup);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "backup is locked",
+            ))
+        });
+
+        assert!(attempted);
+    }
+
+    #[test]
+    fn recipe_save_never_relocates_a_directory_at_the_destination() {
+        let root = temp_dir("save-directory-destination");
+        let destination = root.join("recipes/directory-recipe.yml");
+        std::fs::create_dir_all(&destination).unwrap();
+        let sentinel = destination.join("keep.txt");
+        std::fs::write(&sentinel, "keep").unwrap();
+        let yaml = "version: 1\nname: directory-recipe\ntarget:\n  ollama: q\npermission_mode: manual\nprompt: x\n";
+
+        let error = save_recipe_impl(&root, "directory-recipe", yaml).unwrap_err();
+
+        assert!(error.contains("is a directory"));
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "keep");
     }
 
     #[test]
@@ -1946,6 +2317,91 @@ params:
 
         // Deleting again must not error.
         delete_recipe_impl(&app_data, "to-delete").unwrap();
+    }
+
+    #[test]
+    fn global_delete_removes_declared_name_across_roots_and_extensions() {
+        let authored = temp_dir("delete-authored");
+        let legacy = temp_dir("delete-legacy");
+        write_recipe_file(
+            &authored.join("recipes"),
+            "different-file.yaml",
+            "to-delete",
+        );
+        std::fs::create_dir_all(legacy.join("recipes")).unwrap();
+        std::fs::write(
+            legacy.join("recipes/another-name.json"),
+            r#"{"version":1,"name":"to-delete","target":{"ollama":"q"},"permission_mode":"manual","prompt":"x"}"#,
+        )
+        .unwrap();
+        write_recipe_file(&legacy.join("recipes"), "keep.yml", "keep-me");
+        write_recipe_file(&legacy.join("recipes"), "to-delete.yml", "different-recipe");
+
+        delete_global_recipe_impl(&[authored.clone(), legacy.clone()], "to-delete").unwrap();
+
+        assert!(!authored.join("recipes/different-file.yaml").exists());
+        assert!(!legacy.join("recipes/another-name.json").exists());
+        assert!(legacy.join("recipes/keep.yml").exists());
+        assert!(legacy.join("recipes/to-delete.yml").exists());
+    }
+
+    #[test]
+    fn global_delete_keeps_preferred_recipe_when_fallback_deletion_fails() {
+        let authored = temp_dir("delete-failure-authored");
+        let legacy = temp_dir("delete-failure-legacy");
+        let authored_path = authored.join("recipes/preferred.yml");
+        let legacy_path = legacy.join("recipes/fallback.yml");
+        write_recipe_file(&authored.join("recipes"), "preferred.yml", "to-delete");
+        write_recipe_file(&legacy.join("recipes"), "fallback.yml", "to-delete");
+        let mut attempted = Vec::new();
+
+        let error =
+            delete_global_recipe_with(&[authored.clone(), legacy.clone()], "to-delete", |path| {
+                attempted.push(path.to_path_buf());
+                if path == legacy_path {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "locked legacy recipe",
+                    ))
+                } else {
+                    std::fs::remove_file(path)
+                }
+            })
+            .unwrap_err();
+
+        assert!(error.contains("locked legacy recipe"));
+        assert_eq!(attempted, vec![legacy_path.clone()]);
+        assert!(legacy_path.exists());
+        assert!(authored_path.exists());
+    }
+
+    #[test]
+    fn global_delete_keeps_the_visible_same_root_recipe_when_hidden_deletion_fails() {
+        let authored = temp_dir("delete-duplicate-failure");
+        let visible_path = authored.join("recipes/a.yml");
+        let hidden_path = authored.join("recipes/b.yml");
+        write_recipe_file(&authored.join("recipes"), "a.yml", "to-delete");
+        write_recipe_file(&authored.join("recipes"), "b.yml", "to-delete");
+        let mut attempted = Vec::new();
+
+        let error =
+            delete_global_recipe_with(std::slice::from_ref(&authored), "to-delete", |path| {
+                attempted.push(path.to_path_buf());
+                if path == hidden_path {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "locked hidden recipe",
+                    ))
+                } else {
+                    std::fs::remove_file(path)
+                }
+            })
+            .unwrap_err();
+
+        assert!(error.contains("locked hidden recipe"));
+        assert_eq!(attempted, vec![hidden_path.clone()]);
+        assert!(hidden_path.exists());
+        assert!(visible_path.exists());
     }
 
     #[test]
