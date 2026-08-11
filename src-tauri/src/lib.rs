@@ -153,6 +153,7 @@ pub mod mlx_runtime;
 // authenticated LAN policy shared by the API server and user-owned runners.
 mod artifact_commands;
 pub mod chat_template_lab;
+pub mod channels;
 pub mod checkpoints;
 pub mod compatibility_hub;
 pub mod conformance;
