@@ -177,6 +177,13 @@ rustls = "0.23.41"
 # Pinned to the rustls backend already resolved above rather than pulling a
 # second TLS stack in behind it.
 tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+# daemon/adapters/irc.rs: `tokio_rustls` (above) verifies a TLS certificate
+# against whatever root store it is handed, but ships with none itself — the
+# IRC adapter opens a raw client TLS socket outside of `reqwest`/tungstenite,
+# so it needs its own root store rather than borrowing theirs. Pinned to
+# 0.26.11, the exact version already resolved by `tokio-tungstenite`'s own
+# `rustls-tls-webpki-roots` feature above, so this adds no new resolution.
+webpki-roots = "0.26"
 # knowledge_adapters.rs: bounded, inert Office Open XML extraction. These are
 # already locked transitively in this workspace; making them direct lets the
 # app decode ZIP/Deflate containers and stream XML without executing macros,
