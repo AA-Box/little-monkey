@@ -3773,9 +3773,10 @@ mod tests {
         }
     }
 
-    /// Ratchet: pins every remaining bare `Client::new()` in the tree, so a new
-    /// one cannot be added without either routing it through [`hardened`] or
-    /// writing down here why it does not need to be.
+    /// Ratchet: pins every client this tree constructs outside [`hardened`] —
+    /// both spellings, `Client::new()` and `Client::builder()` — so a new one
+    /// cannot be added without either routing it through [`hardened`] or writing
+    /// down here why it does not need to be.
     ///
     /// # Why a source scan
     ///
@@ -3795,14 +3796,32 @@ mod tests {
     /// `clippy.toml`, no `[lints]`, and CI never runs it, so a lint would
     /// enforce nothing.)
     ///
-    /// # What it does not catch
+    /// # Why both spellings
     ///
-    /// A hand-rolled `Client::builder()` that happens to set no timeout. Counting
-    /// those too would flag the dozen sites that legitimately build their own
-    /// client with their own budget (`m7_companion`'s 30- and 60-minute totals,
-    /// `web.rs`'s SSRF-guarded resolver), so this pins the one spelling that is
-    /// *never* right on a credentialed path instead of trying to police every
-    /// builder.
+    /// This scan used to look for `Client::new()` alone, and pinned **5** bare
+    /// production sites in four files while **30** `Client::builder()` chains
+    /// stood next to them unseen. (`docs/agent-os-roadmap.md` said "8", which
+    /// matched neither the table below it nor the tree — a third wrong count in
+    /// an entry whose subject is wrong counts.) Both are the same defect class —
+    /// a client built somewhere
+    /// other than [`hardened`], with whatever budget and redirect policy its
+    /// author happened to think of — so the count that matters is the sum, and a
+    /// scanner that reads one spelling only reports a reassuring number rather
+    /// than a true one.
+    ///
+    /// Counting builders does **not** mean every builder is wrong. Most are
+    /// deliberate and several are stricter than [`hardened`] (a pinned runner
+    /// certificate, `redirect::Policy::none()`). Listing them here pins the set
+    /// rather than blessing it: the point is that a new one has to be argued for
+    /// in this table instead of arriving silently.
+    ///
+    /// # What it still does not catch
+    ///
+    /// Whether a builder chain's budget is *proportionate*. That is a separate
+    /// question with a separate ratchet —
+    /// `no_new_total_request_deadline_can_be_added_unnoticed`, below — and the
+    /// two deliberately do not share a verdict: a site can be legitimately
+    /// hand-built and still carry the wrong kind of deadline.
     mod ratchet {
         /// Deliberately written without the `reqwest::` prefix so the
         /// `use reqwest::Client;` spelling cannot dodge the ratchet. The cost is
@@ -3811,40 +3830,155 @@ mod tests {
         /// is, which is a fair price for closing the alias hole.
         const BARE_CLIENT: &str = "Client::new()";
 
-        /// Production bare-client sites that are staying, and why.
+        /// The other construction spelling, and the one this scan was blind to
+        /// until now. Written without the `reqwest::` prefix for the same reason
+        /// as [`BARE_CLIENT`], and it also matches this module's own
+        /// [`hardened`](super::super::hardened) root, which is why `egress.rs`
+        /// appears in [`ALLOWED`] rather than being special-cased out.
+        const HAND_BUILT_CLIENT: &str = "Client::builder()";
+
+        /// Production client-construction sites that are staying, and why.
         ///
-        /// Paths are relative to `src/`. Every one of these is a **loopback-only**
-        /// peer — this machine's own `llama-server`, `ollama`, or an LM-Studio-
-        /// style runtime. They are not egress targets: there is no credential to
-        /// forward and no third party to forward it to, and the counts are
-        /// pinned here rather than converted so that a *new* site has to be
-        /// justified.
-        const ALLOWED: &[(&str, usize)] = &[
+        /// Each entry is `(path relative to src/, bare `Client::new()` count,
+        /// `Client::builder()` count)`, in that order.
+        ///
+        /// Being in this table is a **pin, not an endorsement**. The bare-client
+        /// entries are all loopback-only peers — this machine's own
+        /// `llama-server`, `ollama`, or an LM-Studio-style runtime — with no
+        /// credential to forward and no third party to forward it to. The builder
+        /// entries are a mixed set, and the note on each says which it is:
+        /// stricter than [`hardened`] on purpose, loopback-only, bounded at the
+        /// application layer instead of at the client, or unable to adopt
+        /// [`hardened`] without losing the feature.
+        const ALLOWED: &[(&str, usize, usize)] = &[
+            // The daemon's client for a remote runner: `tls_certs_only` pins the
+            // runner's certificate, plus `https_only`, a connect timeout and a
+            // silence budget. Stricter than `hardened()`, which has no way to pin
+            // a self-signed peer.
+            ("bin/monkey-cli/daemon/remote/client.rs", 0, 1),
             // The CLI's local embedding endpoint.
-            ("bin/monkey-cli/embed_cli.rs", 1),
+            ("bin/monkey-cli/embed_cli.rs", 1, 0),
+            // Favicon fetches for the user's own browsing pane. Its total deadline
+            // is the one audited in `TOTAL_TIMEOUT_ALLOWED` below.
+            ("browser_pane.rs", 0, 1),
+            // Connector verification, `redirect::Policy::none()` and a total
+            // deadline against a 64 KiB cap; audited below.
+            ("connectors.rs", 0, 1),
+            // Loopback `/health` probe; audited below.
+            ("diagnostics.rs", 0, 1),
+            // This module's own two: the `hardened()` root that every other site
+            // is asked to start from, and `refusal_error`'s client, whose resolver
+            // answers every name with an error — it exists to mint a
+            // `reqwest::Error` and never opens a socket.
+            ("egress.rs", 0, 2),
             // The readiness probe against Studio's own `sd-server` child, on a
             // loopback port this process reserved and handed it on its command
             // line. Loopback by construction, and not deadline-free: the probe
             // carries a 2s per-request timeout and the whole wait is bounded by
             // `READY_TIMEOUT`.
-            ("generation.rs", 1),
+            ("generation.rs", 1, 0),
+            // Studio's loopback `sd-server` job/cancel/capabilities clients plus
+            // the tool-sidecar client, all to children this process spawned on
+            // ports it reserved; deadlines audited below.
+            ("generation_commands.rs", 0, 4),
+            // The hosted image API (total deadline, audited below) and its ComfyUI
+            // sibling, which bounds silence with `read_timeout` because its
+            // `/history` poll and result download stream.
+            ("generation_remote.rs", 0, 2),
             // Local stack runtimes. Lived in `stacks.rs` until the v1 registry and
             // embedding core were extracted for the D2 collapse; the client itself is
             // unchanged and still talks only to the loopback embedding runtime.
-            ("knowledge_core.rs", 1),
+            ("knowledge_core.rs", 1, 0),
             // Bundled `llama-server` health/completion probes.
-            ("llama.rs", 2),
+            ("llama.rs", 2, 0),
+            // Both talk to `OLLAMA_ENDPOINT`/`LLAMA_ENDPOINT`, which are literals
+            // on `127.0.0.1`. No client-level deadline: every call is wrapped in
+            // `tokio::time::timeout(context.timeout_ms)` instead, which is the
+            // bound the component-hub contract actually specifies.
+            ("m3_production.rs", 0, 2),
+            // Catalog search and model download against an endpoint that
+            // `validate_https_url` allows to be remote. `redirect::Policy::none()`
+            // — stricter than `hardened()`'s same-origin rule — and every request
+            // runs inside `run_bounded`, so the deadline lives one layer up.
+            ("m3_runtime_hub.rs", 0, 2),
+            // OAuth token/revocation and the workflow client; deadlines audited
+            // below.
+            ("m4_runtime.rs", 0, 2),
+            // One loopback Ollama review; audited below.
+            ("m5_delivery/reviewer.rs", 0, 1),
+            // Two audited totals below (image edit, transcription) plus the
+            // ComfyUI download, which bounds silence rather than elapsed time.
+            ("m7_companion.rs", 0, 3),
+            // The model-download client, and the one site that **cannot** adopt
+            // `hardened()`: `same_origin_redirect_policy` would refuse every
+            // Hugging Face and Ollama-registry CDN redirect, which are cross-host
+            // by construction. Its integrity guarantee is a SHA-256 check rather
+            // than an origin pin, and reqwest strips `Authorization` cross-host
+            // anyway. It sets a connect timeout, `egress::READ_TIMEOUT`, a hop cap
+            // and its own per-hop SSRF check. `docs/agent-os-roadmap.md` carries
+            // the long form.
+            ("model_sources.rs", 0, 1),
+            // `download_to_file`, the same shape and the same reason, likewise on
+            // `egress::READ_TIMEOUT`.
+            ("models.rs", 0, 1),
+            // The loopback Ollama daemon: `/api/version`, `/api/ps`, `/api/embed`;
+            // deadlines audited below.
+            ("ollama.rs", 0, 3),
+            // `EndpointPolicy` gates this between `LoopbackOnly` and
+            // `AllowRemoteHttps`. `redirect::Policy::none()`, and each operation is
+            // bounded by `tokio::time::timeout` from `RuntimeOperationLimits`.
+            ("runtime_adapter.rs", 0, 1),
+            // Paged pull-request reads; audited below.
+            ("runtime_pr_watcher.rs", 0, 1),
+            // `bounded_loopback_client`: `no_proxy`, a connect timeout, a 30-minute
+            // silence budget and no redirects. This is the loopback-inference half
+            // of the forwarding client the roadmap records splitting — the cloud
+            // half went to `hardened()`.
+            ("server.rs", 0, 1),
         ];
 
-        /// Everything after the first `#[cfg(test)]` is test code, and a test is
-        /// free to use a bare client — it is talking to a listener it started
-        /// itself. Verified at the time of writing that every file in the tree
-        /// containing a bare client has at most one such attribute and no
-        /// production code after it, so a single split is sound.
-        fn production_half(source: &str) -> &str {
-            source
-                .split_once("\n#[cfg(test)]")
-                .map_or(source, |(before, _)| before)
+        /// Drops test code, which is free to build any client it likes — it is
+        /// talking to a listener it started itself.
+        ///
+        /// This used to split at the first `\n#[cfg(test)]` and treat the rest of
+        /// the file as tests, on the stated grounds that no file had production
+        /// code after its test module. That was false **in this very file**: `egress.rs` has two `#[cfg(test)]`
+        /// modules with production code between and after them, so splitting at
+        /// the first one hid 3,200 lines from the scan — including
+        /// `refusal_error`'s own client, and, in `server.rs`,
+        /// `bounded_loopback_client`. Two production sites, invisible, in the two
+        /// files most concerned with egress. It cost nothing only because neither
+        /// spelled the bare constructor.
+        ///
+        /// So each `#[cfg(test)]` block is dropped individually now. A block is
+        /// recognised only when the attribute sits at column zero and the line
+        /// after it opens a brace, which rustfmt guarantees for `mod tests {`.
+        /// `#[cfg(test)] use …;`, test-only `static`s and multi-line test fn
+        /// signatures are therefore left in — deliberately, because that
+        /// over-counts rather than under-counts. An over-count fails loudly and
+        /// gets a note in [`ALLOWED`]; an under-count is the exact defect this
+        /// module exists to prevent.
+        fn production_half(source: &str) -> String {
+            let lines: Vec<&str> = source.lines().collect();
+            let mut kept: Vec<&str> = Vec::new();
+            let mut index = 0;
+            while index < lines.len() {
+                let opens_test_block = lines[index] == "#[cfg(test)]"
+                    && lines
+                        .get(index + 1)
+                        .is_some_and(|next| next.trim_end().ends_with('{'));
+                if opens_test_block {
+                    index += 2;
+                    while index < lines.len() && lines[index] != "}" {
+                        index += 1;
+                    }
+                    index += 1;
+                    continue;
+                }
+                kept.push(lines[index]);
+                index += 1;
+            }
+            kept.join("\n")
         }
 
         /// Drops comment-only lines, so prose about a spelling is not counted as a
@@ -4023,7 +4157,7 @@ mod tests {
                     continue;
                 }
                 let source = std::fs::read_to_string(entry.path()).expect("source file reads");
-                let scannable = code_only(production_half(&source));
+                let scannable = code_only(&production_half(&source));
                 let lines: Vec<&str> = scannable.lines().collect();
                 let count = lines
                     .iter()
@@ -4071,9 +4205,9 @@ mod tests {
         }
 
         #[test]
-        fn no_new_bare_reqwest_client_can_be_added_unnoticed() {
+        fn no_new_unpinned_client_construction_can_be_added_unnoticed() {
             let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-            let mut found: Vec<(String, usize)> = Vec::new();
+            let mut found: Vec<(String, usize, usize)> = Vec::new();
 
             for entry in walkdir::WalkDir::new(&src)
                 .into_iter()
@@ -4083,36 +4217,51 @@ mod tests {
                     continue;
                 }
                 let source = std::fs::read_to_string(entry.path()).expect("source file reads");
-                let count = code_only(production_half(&source))
-                    .matches(BARE_CLIENT)
-                    .count();
-                if count > 0 {
+                let scannable = code_only(&production_half(&source));
+                let bare = scannable.matches(BARE_CLIENT).count();
+                let hand_built = scannable.matches(HAND_BUILT_CLIENT).count();
+                if bare > 0 || hand_built > 0 {
                     let relative = entry
                         .path()
                         .strip_prefix(&src)
                         .expect("walked path is under src/")
                         .to_string_lossy()
                         .replace('\\', "/");
-                    found.push((relative, count));
+                    found.push((relative, bare, hand_built));
                 }
             }
             found.sort();
 
-            let expected: Vec<(String, usize)> = ALLOWED
+            let expected: Vec<(String, usize, usize)> = ALLOWED
                 .iter()
-                .map(|(file, count)| ((*file).to_string(), *count))
+                .map(|(file, bare, hand_built)| ((*file).to_string(), *bare, *hand_built))
                 .collect();
+
+            // Name the files that moved, so the failure does not make the reader
+            // diff two twenty-two-line vectors by eye to find the one that grew.
+            let changed: std::collections::BTreeSet<&str> = found
+                .iter()
+                .filter(|entry| !expected.contains(entry))
+                .chain(expected.iter().filter(|entry| !found.contains(entry)))
+                .map(|(file, _, _)| file.as_str())
+                .collect();
+            let changed = changed.into_iter().collect::<Vec<_>>().join(", ");
 
             assert_eq!(
                 found, expected,
-                "the set of bare `{BARE_CLIENT}` sites in production code changed.\n\
-                 A new credentialed remote call must start from \
-                 `egress::hardened()`, which supplies a connect timeout, a read \
-                 timeout, and a redirect policy that will not carry an \
-                 `x-api-key` to a host the response picked. If the new site is \
-                 loopback-only (a local llama-server/ollama/LM Studio runtime), \
-                 add it to `ALLOWED` with a comment saying which peer it talks \
-                 to. If a site disappeared, drop its entry."
+                "client construction outside `egress::hardened()` changed in: \
+                 {changed}.\n\
+                 Each entry is (file, bare `{BARE_CLIENT}` count, hand-built \
+                 `{HAND_BUILT_CLIENT}` count). A new credentialed remote call must \
+                 start from `egress::hardened()`, which supplies a connect \
+                 timeout, a read timeout, and a redirect policy that will not \
+                 carry an `x-api-key` to a host the response picked. If the new \
+                 site cannot use it — loopback-only (a local \
+                 llama-server/ollama/LM Studio runtime), a pinned peer \
+                 certificate, or a cross-host download whose integrity comes from \
+                 a checksum rather than an origin pin — add it to `ALLOWED` with a \
+                 comment saying which of those it is and what bounds it instead. \
+                 If a site disappeared, drop its entry."
             );
         }
     }
