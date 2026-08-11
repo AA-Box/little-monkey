@@ -94,12 +94,7 @@ impl Reader {
 /// where it can write, and what the permission gate is set to — the three
 /// facts that decide what the next `>>>` will actually do. Box-drawn and
 /// sized to its own longest line, so it needs no terminal-width math.
-fn print_banner(
-    target: &Target,
-    state: &AppState,
-    mode: PermissionMode,
-    mcp_servers: usize,
-) {
+fn print_banner(target: &Target, state: &AppState, mode: PermissionMode, mcp_servers: usize) {
     let model = match target {
         Target::Local { model, .. } => model.clone().unwrap_or_else(|| "default".to_string()),
         Target::Provider { model, .. } => model.clone(),
@@ -107,9 +102,14 @@ fn print_banner(
     let root = little_monkey_lib::workspace::primary_root_canon(state).ok();
     let folder = root
         .as_ref()
-        .map(|path| match (dirs::home_dir(), path.strip_prefix(dirs::home_dir().unwrap_or_default())) {
-            (Some(_), Ok(relative)) => format!("~/{}", relative.display()),
-            _ => path.display().to_string(),
+        .map(|path| {
+            match (
+                dirs::home_dir(),
+                path.strip_prefix(dirs::home_dir().unwrap_or_default()),
+            ) {
+                (Some(_), Ok(relative)) => format!("~/{}", relative.display()),
+                _ => path.display().to_string(),
+            }
         })
         .unwrap_or_else(|| "no folder open".to_string());
     let branch = root.as_ref().and_then(|path| git_branch(path));

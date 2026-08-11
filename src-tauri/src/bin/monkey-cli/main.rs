@@ -28,6 +28,7 @@ mod processes_cli;
 mod profiles_cli;
 mod providers_cli;
 mod repl;
+mod revisions_cli;
 mod security_cli;
 mod skills_cli;
 mod sse;
@@ -53,7 +54,9 @@ use permission::{PermissionMode, TerminalPermissions};
 
 #[derive(Parser, Debug)]
 #[command(name = "monkey", bin_name = "monkey", version, about)]
-#[command(after_help = "Prompts need no quoting — `monkey MODEL summarize this repo` works as-is on sh, PowerShell and cmd. Use double quotes (the one form all three share) when exact spacing or shell metacharacters matter.\n\nRun `monkey` with no arguments for the interactive launcher.")]
+#[command(
+    after_help = "Prompts need no quoting — `monkey MODEL summarize this repo` works as-is on sh, PowerShell and cmd. Use double quotes (the one form all three share) when exact spacing or shell metacharacters matter.\n\nRun `monkey` with no arguments for the interactive launcher."
+)]
 struct Cli {
     /// Ollama-style model management subcommand. Note: a bare first argument
     /// matching a subcommand name (e.g. `monkey list`) parses as that
@@ -366,6 +369,17 @@ enum Cmd {
         /// System prompt overriding the model's default
         #[arg(long)]
         system: Option<String>,
+    },
+    /// Show what recent configuration changes touched, across personas,
+    /// rules/memory files, MCP servers and workflow definitions — the
+    /// cross-entity view of the per-entity revision history.
+    Revisions {
+        /// Show only this change id (from an earlier listing).
+        #[arg(long)]
+        change: Option<String>,
+        /// How many recent changes to list.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     /// Revert a checkpoint's file changes (defaults to the most recent one
     /// from this CLI). Prints the restored-file count.
@@ -915,7 +929,8 @@ fn compose_system_prompt_impl(
     let root = workspace::primary_root_canon(state)
         .ok()
         .map(|root| root.to_string_lossy().to_string());
-    let facts = memory::list_impl(&data_dir.join("memories.json"), root.as_deref()).unwrap_or_default();
+    let facts =
+        memory::list_impl(&data_dir.join("memories.json"), root.as_deref()).unwrap_or_default();
 
     let mut sections: Vec<String> = Vec::new();
     if !rule_files.is_empty() {
@@ -1267,8 +1282,12 @@ async fn run_model(
                 Ok(installed) => installed,
                 Err(error) => fail(&error),
             };
-            let session = match managed_model_cli::start_server(client, &installed.local_path, context_tokens)
-                .await
+            let session = match managed_model_cli::start_server(
+                client,
+                &installed.local_path,
+                context_tokens,
+            )
+            .await
             {
                 Ok(session) => session,
                 Err(error) => fail(&error),
@@ -1383,6 +1402,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             .await;
             return;
         }
+        Cmd::Revisions { change, limit } => revisions_cli::list(change.as_deref(), *limit),
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
             Ok(count) => {
                 println!("Restored {count} file(s).");
@@ -1925,8 +1945,14 @@ mod tests {
         let state = state_with_primary_root(&ws.path);
         let memories_path = data_dir.path.join("memories.json");
 
-        memory::add_fact_impl(&memories_path, &ws_canon.to_string_lossy(), "keep me", "agent", None)
-            .unwrap();
+        memory::add_fact_impl(
+            &memories_path,
+            &ws_canon.to_string_lossy(),
+            "keep me",
+            "agent",
+            None,
+        )
+        .unwrap();
         let disabled = memory::add_fact_impl(
             &memories_path,
             &ws_canon.to_string_lossy(),
@@ -1935,8 +1961,13 @@ mod tests {
             None,
         )
         .unwrap();
-        memory::set_enabled_impl(&memories_path, &ws_canon.to_string_lossy(), &disabled.id, false)
-            .unwrap();
+        memory::set_enabled_impl(
+            &memories_path,
+            &ws_canon.to_string_lossy(),
+            &disabled.id,
+            false,
+        )
+        .unwrap();
 
         let prompt = compose_system_prompt_impl(&data_dir.path, &state, None).unwrap();
         assert!(prompt.contains("- keep me"));

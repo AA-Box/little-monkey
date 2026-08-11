@@ -72,7 +72,11 @@ pub async fn tool_read_file(
     path: String,
     workspace_root_override: Option<String>,
 ) -> Result<String, String> {
-    let (resolved, _) = crate::agent_worktrees::resolve_with_override(state.inner(), &path, workspace_root_override.as_deref())?;
+    let (resolved, _) = crate::agent_worktrees::resolve_with_override(
+        state.inner(),
+        &path,
+        workspace_root_override.as_deref(),
+    )?;
 
     if !resolved.is_file() {
         return Err(format!("'{}' is not a file", path));
@@ -88,7 +92,11 @@ pub async fn tool_list_dir(
     path: String,
     workspace_root_override: Option<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let (resolved, _) = crate::agent_worktrees::resolve_with_override(state.inner(), &path, workspace_root_override.as_deref())?;
+    let (resolved, _) = crate::agent_worktrees::resolve_with_override(
+        state.inner(),
+        &path,
+        workspace_root_override.as_deref(),
+    )?;
 
     if !resolved.is_dir() {
         return Err(format!("'{}' is not a directory", path));
@@ -133,8 +141,11 @@ pub async fn tool_grep(
 ) -> Result<Vec<serde_json::Value>, String> {
     let regex = Regex::new(&pattern).map_err(|e| format!("Invalid regex '{}': {}", pattern, e))?;
 
-    let (search_root, display_root) =
-        crate::agent_worktrees::resolve_with_override(state.inner(), path.as_deref().unwrap_or("."), workspace_root_override.as_deref())?;
+    let (search_root, display_root) = crate::agent_worktrees::resolve_with_override(
+        state.inner(),
+        path.as_deref().unwrap_or("."),
+        workspace_root_override.as_deref(),
+    )?;
     let label_prefix = workspace::secondary_label_for(state.inner(), &display_root)?
         .map(|label| format!("{}/", label))
         .unwrap_or_default();
@@ -207,8 +218,11 @@ pub async fn tool_glob(
     path: Option<String>,
     workspace_root_override: Option<String>,
 ) -> Result<Vec<String>, String> {
-    let (search_root, display_root) =
-        crate::agent_worktrees::resolve_with_override(state.inner(), path.as_deref().unwrap_or("."), workspace_root_override.as_deref())?;
+    let (search_root, display_root) = crate::agent_worktrees::resolve_with_override(
+        state.inner(),
+        path.as_deref().unwrap_or("."),
+        workspace_root_override.as_deref(),
+    )?;
     let label_prefix = workspace::secondary_label_for(state.inner(), &display_root)?
         .map(|label| format!("{}/", label))
         .unwrap_or_default();
@@ -341,8 +355,11 @@ pub async fn tool_write_file(
     // worktree override (validated against the managed registry inside
     // `resolve_with_override`) is applied at this same point for the same
     // reason: the floor and the prompt must describe the real target.
-    let (resolved, root) =
-        crate::agent_worktrees::resolve_with_override(state.inner(), &path, workspace_root_override.as_deref())?;
+    let (resolved, root) = crate::agent_worktrees::resolve_with_override(
+        state.inner(),
+        &path,
+        workspace_root_override.as_deref(),
+    )?;
     let risk = permissions::compute_risk(Some((&resolved, &root)), risk_level, risk_reason);
 
     let detail = format!("Write {} bytes to {}", content.len(), path);
@@ -633,8 +650,11 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
 
     // Same before-the-prompt override point as `tool_write_file` — see its
     // comment.
-    let (resolved, root) =
-        crate::agent_worktrees::resolve_with_override(state.inner(), &path, workspace_root_override.as_deref())?;
+    let (resolved, root) = crate::agent_worktrees::resolve_with_override(
+        state.inner(),
+        &path,
+        workspace_root_override.as_deref(),
+    )?;
 
     if !resolved.is_file() {
         return Err(format!("'{}' is not a file", path));

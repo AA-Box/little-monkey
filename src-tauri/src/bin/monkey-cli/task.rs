@@ -99,66 +99,64 @@ fn desktop_execution_target(
     snapshot: &DesktopTurnSnapshot,
 ) -> Result<Target, String> {
     match (&snapshot.target, &snapshot.execution_base_url) {
-            (
-                ModelTargetSnapshot::Provider {
-                    provider_id,
-                    endpoint,
-                    model,
-                    ..
-                },
-                None,
-            ) => {
-                let recipe_provider = target
-                    .provider
-                    .as_deref()
-                    .ok_or("desktop provider snapshot requires a provider recipe target")?;
-                let recipe_model = target
-                    .model
-                    .as_deref()
-                    .ok_or("desktop provider snapshot requires a model")?;
-                if recipe_provider != provider_id || recipe_model != model {
-                    return Err(
-                        "desktop provider execution target differs from its frozen target"
-                            .to_string(),
-                    );
-                }
-                let custom = crate::providers_cli::load_custom_providers();
-                let current =
-                    little_monkey_lib::providers::resolve_base_url(recipe_provider, &custom)?
-                        .trim_end_matches('/')
-                        .to_string();
-                if current != endpoint.trim_end_matches('/') {
-                    return Err("desktop provider endpoint changed after the turn was queued; refusing target drift".to_string());
-                }
-                Ok(Target::Provider {
-                    provider_id: recipe_provider.to_string(),
-                    model: recipe_model.to_string(),
-                })
+        (
+            ModelTargetSnapshot::Provider {
+                provider_id,
+                endpoint,
+                model,
+                ..
+            },
+            None,
+        ) => {
+            let recipe_provider = target
+                .provider
+                .as_deref()
+                .ok_or("desktop provider snapshot requires a provider recipe target")?;
+            let recipe_model = target
+                .model
+                .as_deref()
+                .ok_or("desktop provider snapshot requires a model")?;
+            if recipe_provider != provider_id || recipe_model != model {
+                return Err(
+                    "desktop provider execution target differs from its frozen target".to_string(),
+                );
             }
-            (ModelTargetSnapshot::Ollama { model, .. }, Some(base_url)) => {
-                if target.ollama.as_deref() != Some(model.as_str()) {
-                    return Err(
-                        "desktop Ollama execution model differs from its frozen target".to_string(),
-                    );
-                }
-                Ok(Target::Local {
-                    base_url: base_url.trim_end_matches('/').to_string(),
-                    model: Some(model.clone()),
-                    native_ollama: true,
-                })
+            let custom = crate::providers_cli::load_custom_providers();
+            let current = little_monkey_lib::providers::resolve_base_url(recipe_provider, &custom)?
+                .trim_end_matches('/')
+                .to_string();
+            if current != endpoint.trim_end_matches('/') {
+                return Err("desktop provider endpoint changed after the turn was queued; refusing target drift".to_string());
             }
-            (ModelTargetSnapshot::ManagedLlama { model_id, .. }, Some(base_url)) => {
-                if target.local_url.as_deref() != Some(base_url.as_str()) {
-                    return Err(
-                        "desktop managed runtime origin differs from its frozen recipe".to_string(),
-                    );
-                }
-                Ok(Target::Local {
-                    base_url: base_url.trim_end_matches('/').to_string(),
-                    model: target.model.clone().or_else(|| Some(model_id.clone())),
-                    native_ollama: false,
-                })
+            Ok(Target::Provider {
+                provider_id: recipe_provider.to_string(),
+                model: recipe_model.to_string(),
+            })
+        }
+        (ModelTargetSnapshot::Ollama { model, .. }, Some(base_url)) => {
+            if target.ollama.as_deref() != Some(model.as_str()) {
+                return Err(
+                    "desktop Ollama execution model differs from its frozen target".to_string(),
+                );
             }
+            Ok(Target::Local {
+                base_url: base_url.trim_end_matches('/').to_string(),
+                model: Some(model.clone()),
+                native_ollama: true,
+            })
+        }
+        (ModelTargetSnapshot::ManagedLlama { model_id, .. }, Some(base_url)) => {
+            if target.local_url.as_deref() != Some(base_url.as_str()) {
+                return Err(
+                    "desktop managed runtime origin differs from its frozen recipe".to_string(),
+                );
+            }
+            Ok(Target::Local {
+                base_url: base_url.trim_end_matches('/').to_string(),
+                model: target.model.clone().or_else(|| Some(model_id.clone())),
+                native_ollama: false,
+            })
+        }
         _ => Err("desktop execution target is incomplete".to_string()),
     }
 }
@@ -728,12 +726,15 @@ fn snapshot_target(target: &recipes::RecipeTarget) -> Result<ModelTargetSnapshot
             model_id: model_id.clone(),
             model_path: artifact.to_string_lossy().to_string(),
             capabilities,
-            estimated_memory_bytes: match little_monkey_lib::m3_runtime_hub::installed_model_footprint(&app_data, model_id) {
-                little_monkey_lib::m3_runtime_hub::M3ModelFootprint::Known { memory, .. } => {
-                    Some(memory.ram_bytes)
-                }
-                little_monkey_lib::m3_runtime_hub::M3ModelFootprint::Unknown => None,
-            },
+            estimated_memory_bytes:
+                match little_monkey_lib::m3_runtime_hub::installed_model_footprint(
+                    &app_data, model_id,
+                ) {
+                    little_monkey_lib::m3_runtime_hub::M3ModelFootprint::Known {
+                        memory, ..
+                    } => Some(memory.ram_bytes),
+                    little_monkey_lib::m3_runtime_hub::M3ModelFootprint::Unknown => None,
+                },
         });
     }
     Err(

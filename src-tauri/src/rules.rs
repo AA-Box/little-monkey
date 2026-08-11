@@ -244,6 +244,10 @@ fn write_rules_impl(
             base_revision_id,
             label: "Saved".to_string(),
             content: content.to_string(),
+            // A rules save touches one file, but it still gets an id: "this
+            // change touched only MONKEY.md" is an answer, and an absent id
+            // means something else entirely (written before ids existed).
+            change_id: Some(config_revisions::new_change_id()),
         },
     )
     .map_err(|e| e.to_string())?;

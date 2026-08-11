@@ -847,15 +847,13 @@ fn placed_recipe_target(
             local_url: None,
             managed_model: None,
         }),
-        ModelTargetSnapshot::Ollama { model, .. } => {
-            Ok(little_monkey_lib::recipes::RecipeTarget {
-                provider: None,
-                model: None,
-                ollama: Some(model.clone()),
-                local_url: None,
-                managed_model: None,
-            })
-        }
+        ModelTargetSnapshot::Ollama { model, .. } => Ok(little_monkey_lib::recipes::RecipeTarget {
+            provider: None,
+            model: None,
+            ollama: Some(model.clone()),
+            local_url: None,
+            managed_model: None,
+        }),
         ModelTargetSnapshot::ManagedLlama { model_id, .. } => {
             if little_monkey_lib::m3_runtime_hub::installed_model_artifact(app_data, model_id)
                 .is_none()
