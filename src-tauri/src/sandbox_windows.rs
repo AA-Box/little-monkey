@@ -1721,7 +1721,7 @@ pub fn app_containers_are_enforceable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::Security::{GetAce, ACCESS_ALLOWED_ACE, ACE_HEADER, INHERITED_ACE};
+    use windows_sys::Win32::Security::Authorization::GetEffectiveRightsFromAclW;
 
     fn sid_access_entries(path: &Path, sid: PSID) -> io::Result<Vec<(u32, u32)>> {
         let _mutation = acquire_dacl_mutation_lock()?;
@@ -1786,7 +1786,7 @@ mod tests {
             .collect())
     }
 
-    fn sid_raw_access_entries(path: &Path, sid: PSID) -> io::Result<Vec<(u32, u8)>> {
+    fn sid_effective_permissions(path: &Path, sid: PSID) -> io::Result<u32> {
         let _mutation = acquire_dacl_mutation_lock()?;
         let object = wide_path(path);
         let mut dacl: *mut ACL = std::ptr::null_mut();
@@ -1811,26 +1811,20 @@ mod tests {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "NULL DACL"));
         }
 
-        let mut access = Vec::new();
-        for index in 0..unsafe { (*dacl).AceCount } {
-            let mut raw: *mut c_void = std::ptr::null_mut();
-            if unsafe { GetAce(dacl, u32::from(index), &mut raw) } == 0 {
-                let error = io::Error::last_os_error();
-                unsafe { LocalFree(descriptor.cast()) };
-                return Err(error);
-            }
-            let header = unsafe { &*raw.cast::<ACE_HEADER>() };
-            // ACCESS_ALLOWED_ACE_TYPE is zero. Object-specific ACEs are not
-            // emitted by this module and have a different layout.
-            if header.AceType == 0 {
-                let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
-                if unsafe { EqualSid((&raw const ace.SidStart).cast_mut().cast(), sid) } != 0 {
-                    access.push((ace.Mask, ace.Header.AceFlags));
-                }
-            }
-        }
+        let trustee = TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: sid.cast(),
+        };
+        let mut access = 0;
+        let resolved = unsafe { GetEffectiveRightsFromAclW(dacl, &trustee, &mut access) };
         unsafe { LocalFree(descriptor.cast()) };
-        Ok(access)
+        match resolved {
+            ERROR_SUCCESS => Ok(access),
+            error => Err(io::Error::from_raw_os_error(error as i32)),
+        }
     }
 
     #[test]
@@ -1851,6 +1845,12 @@ mod tests {
 
         assert!(sid_permissions(&root, container.sid).unwrap().is_empty());
         assert!(sid_permissions(&child, container.sid).unwrap().is_empty());
+        let child_baseline = sid_effective_permissions(&child, container.sid).unwrap();
+        assert_ne!(
+            child_baseline & WORKSPACE_TREE_ACCESS,
+            WORKSPACE_TREE_ACCESS,
+            "the baseline already grants every right this test must observe arriving"
+        );
         {
             let _grant = container
                 .grant_tree_access_scoped(&root)
@@ -1859,20 +1859,19 @@ mod tests {
                 sid_permissions(&root, container.sid).unwrap(),
                 [WORKSPACE_TREE_ACCESS]
             );
-            let child_permissions = sid_raw_access_entries(&child, container.sid).unwrap();
-            assert!(
-                !child_permissions.is_empty()
-                    && child_permissions
-                        .iter()
-                        .all(|(mask, flags)| *mask == WORKSPACE_TREE_ACCESS
-                            && u32::from(*flags) & INHERITED_ACE != 0),
-                "unexpected inherited masks: {child_permissions:?}"
+            let child_permissions = sid_effective_permissions(&child, container.sid).unwrap();
+            assert_eq!(
+                child_permissions & WORKSPACE_TREE_ACCESS,
+                WORKSPACE_TREE_ACCESS,
+                "the existing child did not inherit the scoped grant"
             );
         }
         assert!(sid_permissions(&root, container.sid).unwrap().is_empty());
-        assert!(sid_raw_access_entries(&child, container.sid)
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            sid_effective_permissions(&child, container.sid).unwrap(),
+            child_baseline,
+            "revoking the root grant did not restore the child's effective rights"
+        );
 
         {
             let _grant = container
