@@ -1187,7 +1187,7 @@ only a stop. What K8 still needs from elsewhere is the reservation question
 above — a suspended process holds its resident model slot, worktree lease and
 workspace root — which is a K7/K8 decision, not a signals one.
 
-## K3. Isolation parity across platforms *(built on all three; disposable-run parity test owed on Windows)*
+## K3. Isolation parity across platforms *(built and parity-tested on all three)*
 
 **Historical baseline, superseded by the shipped entries below:** at that point,
 `execute_in_sandbox` had real Seatbelt (`sandbox-exec`) confinement on macOS,
@@ -1328,8 +1328,8 @@ writing. So a network-allowed run on Windows reaches a public address but not `1
 where macOS and Linux reach both — stricter than those, never looser, so it cannot turn a
 denied run into an allowed one, and it is documented at the module rather than discovered.
 
-**Shipped — a real Windows bug the parity work found, and the parity test itself
-pulled back out.**
+**Historical parity attempt, superseded below — a real Windows bug the work
+found before its test was pulled back out.**
 
 The assertion was written, run on CI, and found something before it could pass:
 `execute_in_sandbox` canonicalizes every path it resolves, and on Windows
@@ -1344,13 +1344,13 @@ makes the `starts_with(&sandbox_root)` containment checks sound — and leaving 
 true UNC share alone rather than turning it into a relative path that names
 nothing.
 
-**The parity test is not in this change, and the reason is worth recording.** It
+**The parity test was not in that change, and the reason is worth recording.** It
 took four CI rounds to get that far, because there is no Windows toolchain on the
 machine it was written on — not even a cross-compile check — so every iteration
 costs a full remote run and it was blocking two unrelated, verified items from
 landing. It is a good test: it earned its keep twice over on the run that found
-the bug above. It needs a machine that can run it, and it will land when it has
-one.
+the bug above. It needed a machine that could run it; the shipped entry below is
+the later completion of that work.
 
 **The privilege warning this entry left, resolved.** It said a hosted runner's
 account is an administrator, so CI is the privileged case. That is right for a
@@ -1359,6 +1359,19 @@ is against the container SID's ACE, not the user's group membership, so a
 process holding an administrator token *inside* a container still cannot read a
 directory that grants the container nothing. "Denied while running as an
 administrator" implies denied for a standard user, not the reverse.
+
+**Shipped — the disposable Windows leg now enters the shared assertion body.**
+`sandbox.rs` keeps separate `sh` and `cmd /C` reporters because sharing shell
+control flow was the bug above, then sends both through
+`assert_workspace_boundary_outcome`. That Rust verdict requires real OS
+isolation, a complete begin/end transcript, own-copy reads, sandbox HOME/TMP
+writes, denied outside reads and writes, unchanged host bytes, and both network
+policy states on macOS, Linux, and Windows. AppContainer availability still
+fails rather than skips on CI, and `windows-latest` runs the real container.
+The public-network contrast remains separate: AppContainer deliberately blocks
+loopback even with network capability, so this test proves the filesystem
+boundary is invariant across both policy states rather than inventing loopback
+parity Windows does not provide.
 
 Also unbuilt on Linux: user namespaces. `unshare(CLONE_NEWNET)` needs `CLONE_NEWUSER` first
 for an unprivileged process, which changes uid semantics and is disabled outright in many
@@ -1442,9 +1455,9 @@ proves the job is attached before user code and a descendant cannot outlive it. 
 constructs the runtime first and opens the inheritable outside file afterward, pinning the macOS
 fork-time sweep rather than a parent-side snapshot. Linux also proves its shell cannot signal the
 host parent. This is independent
-of the older owed Windows parity test for the **disposable** `execute_in_sandbox` path; widening
-that test's cfg without running its positive/network assertions remains dishonest for the reason
-recorded above.
+of the **disposable** `execute_in_sandbox` path, which now has its own all-three
+shared Rust verdict. The launch policies stay separate; the observable
+filesystem assertions no longer do.
 
 One process-lifetime correction stays explicit. Windows owns a real tree through its job and Linux
 denies `setsid`/`setpgid`; macOS owns a process group, not a kernel process tree. A child which moves
@@ -1453,10 +1466,9 @@ It gains no new filesystem or network reach, but authority can last past the cal
 macOS process-tree leg K4's deferred-platform section must continue to name, not evidence this entry
 has a cross-platform resource/lifetime mechanism it does not have.
 
-**Blocks:** K3's live filesystem/egress boundary no longer blocks the name cut line. K4 records
-the macOS process-tree lifetime gap as an explicitly deferred platform capability, and K21 still
-owes the Windows disposable-run shared parity body before its conformance suite can certify that
-separate Sandbox-panel feature.
+**Blocks:** no K3 isolation or parity gap remains. K4 records the macOS
+process-tree lifetime gap as an explicitly deferred platform capability; K21's
+disposable-isolation evidence prerequisite is now satisfied.
 
 ## K4. Enforced per-process resource limits *(userspace enforcement built; declaration and platform legs open)*
 
@@ -5814,11 +5826,12 @@ to the selected writable workspace namespace, private runtime state and named re
 with a scrubbed environment and platform-specific inherited-handle narrowing. The shared tool-runner
 test proves an absolute sibling read and write fail on each CI platform; macOS also proves its
 inherited launchd port and one descriptor opened after runtime setup are revoked, while Linux
-requires the ABI which can deny outside `truncate(2)`. This does not erase the older Windows test
-debt: the optional disposable-copy Sandbox-panel path still has not
-joined its own macOS/Linux shared positive/filesystem/network assertion body. The earlier privilege
-wording was also backwards: AppContainer checks the container SID, so the hosted runner's
-administrator account does not weaken that denial.
+requires the ABI which can deny outside `truncate(2)`. The separate optional
+disposable-copy Sandbox-panel path now also runs one shared Rust verdict on all
+three platforms while retaining platform-native shell reporters. AppContainer
+checks the container SID, so the hosted runner's administrator account strengthens
+rather than weakens that denial proof; Windows loopback remains intentionally
+outside the cross-platform claim.
 
 The K3/K5 boundary is deliberately narrower than ambient shell networking. A child-created host or
 network socket endpoint is denied on every platform, even when a run declares an egress allowlist,
