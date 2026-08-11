@@ -678,11 +678,10 @@ fn scheduler_now_ms() -> Result<u64, String> {
 }
 
 fn visible_recipes(state: &crate::AppState) -> Result<HashMap<String, VisibleRecipe>, String> {
-    let app_data = crate::app_paths::data_dir()
-        .ok_or_else(|| "Could not resolve application data directory".to_string())?;
+    let global_config_roots = crate::recipes::global_config_roots()?;
     let workspace = crate::workspace::primary_root_canon(state).ok();
     let mut visible = HashMap::new();
-    for discovered in crate::recipes::discover_recipes(workspace.as_deref(), &app_data) {
+    for discovered in crate::recipes::discover_recipes(workspace.as_deref(), &global_config_roots) {
         let Some(recipe) = discovered.recipe else {
             continue;
         };

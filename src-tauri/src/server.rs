@@ -729,6 +729,10 @@ pub fn config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
         .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
+    config_file_path_for_data_dir(&base)
+}
+
+pub(crate) fn config_file_path_for_data_dir(base: &Path) -> Result<PathBuf, String> {
     if !base.exists() {
         std::fs::create_dir_all(&base).map_err(|e| {
             format!(
@@ -2077,16 +2081,18 @@ async fn handle_local_app_run(
     {
         return not_found_response();
     }
-    let Ok(app_data_dir) = app.profile_data_dir() else {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to resolve the app data directory",
-            "internal_error",
-        );
+    let config_roots = match crate::app_paths::agent_config_roots() {
+        Ok(roots) => roots,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e, "internal_error"),
     };
-    let config = match crate::local_apps::config_file_path(app)
-        .and_then(|path| crate::local_apps::load_config_impl(&path))
-    {
+    let local_apps_config_path =
+        match crate::local_apps::config_file_path_for_data_dir(&config_roots.legacy) {
+            Ok(path) => path,
+            Err(e) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e, "internal_error");
+            }
+        };
+    let config = match crate::local_apps::load_config_impl(&local_apps_config_path) {
         Ok(config) => config,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e, "internal_error"),
     };
@@ -2103,10 +2109,11 @@ async fn handle_local_app_run(
 
     let state = app.state::<AppState>();
     let workspace_root = crate::workspace::primary_root_canon(state.inner()).ok();
+    let global_config_roots = config_roots.ordered();
     let recipe = match crate::recipes::resolve_recipe_with_path(
         &def.recipe_name,
         workspace_root.as_deref(),
-        &app_data_dir,
+        &global_config_roots,
     ) {
         Ok((recipe, _path)) => recipe,
         Err(e) => {
