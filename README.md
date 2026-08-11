@@ -162,7 +162,7 @@ Each workbench is a real model-driven flow. Where its scope is narrower than its
 - Stop or suspend anything from anywhere, including a terminal. `monkey processes signal <id> stop|suspend|resume|kill` (with `monkey processes signals` for the support matrix) records durable intent on the process row rather than in a live handle, which is what lets it reach work this app is not running and survive a restart. A kind that cannot honour a signal refuses it with the reason instead of appearing to succeed. Delivery is per-owner: the daemon reads the latch once per tick, the desktop reads it through the `processes://changed` event plus a 2-second catch-up query, and each hands it to the primitive that kind already had.
 - `stop` and `kill` are separate latches, not one bit with two names. A kill is a stop with a stronger delivery promise — immediate `SIGKILL` to the process group where the app owns one, against stop's TERM-grace-KILL wind-down — escalation is one-way, and a kill recorded without a stop is refused by a SQL trigger. The operator kill switch takes the immediate path; on Windows `taskkill /F` makes the two coincide, and the matrix says so.
 - Pause and resume reach the loops that can honour them: chat turns, subagents, Crew members, workflow runs, background shells, daemon jobs, and side tasks each park at a safe point and only then report `suspended`. A workflow node refuses suspend with its reason — pausing operates at the owning run's level boundary, which the headless executor observes — and that same latch makes a daemon-hosted workflow run cancellable from anywhere that can write it. A paired controller gets pause and resume as its own scoped remote action (`monkey remote pause|resume`, `POST /v1/remote/runs/{id}/pause`), strictly weaker than cancel, so trust to suspend is not trust to destroy. Restart policy is declared per kind: exactly one kind, the daemon job, is restartable, because only it has both a supervisor outliving the process and a durable description of what to run.
-- Attribute every recorded egress refusal. A blocked outbound request carries either the id of the run that caused it or one of five coded reasons why it has no run — user action, scheduled work, inbound request, startup, or shared transport — never a blank. Each site was scoped individually, because a `tokio::spawn` or `spawn_blocking` between the scope and the record voids the attribution.
+- Attribute every recorded egress refusal. A blocked outbound request carries either the id of the run that caused it or one of five coded reasons why it has no run — user action, scheduled work, inbound request, startup, or shared transport — never a blank. Each site was scoped individually, because a `tokio::spawn` or `spawn_blocking` between the scope and the record voids the attribution. Allowed egress is recorded too, per destination in the run ledger, and `monkey security egress-evidence` reads the two halves together; it exits non-zero when a per-attribution destination cap means the list it printed is truncated rather than complete.
 - Approve, inspect, and replay from one place: the Agent Inbox and Run Dashboard put approvals from desktop, daemon, and remote controller on one screen with a per-run event timeline.
 - Export a Run Capsule — a redacted, replayable record of a run — and replay it by class.
 - Track token usage and cost in **Settings → Usage**: per-request cost against rates you enter, daily and monthly budgets, and a `warn` or `pause` enforcement mode checked before every provider request. Rates are yours; the app never claims to read a provider invoice.
@@ -358,6 +358,14 @@ monkey skills enable|disable|rollback|uninstall <command>
 monkey plugins list [--json]
 monkey plugins health [--json]
 monkey security audit [--deep] [--fix] [--json]
+monkey security verify-run-chain <run-id> [--json]
+monkey security permission-trail <tool-call-id> [--json]
+monkey security permission-gaps <run-id> [--json]
+monkey security subsystem-events [--subsystem <name>] [--limit <n>] [--json]
+monkey security egress-evidence [--limit <n>] [--json]
+monkey security admission-trail [--limit <n>] [--json]
+
+monkey revisions [--change <change-id>] [--limit <n>]
 
 monkey daemon install | status [--json]
 monkey daemon run <recipe> [--owned-worktree] [--json]
