@@ -4353,8 +4353,10 @@ a broken chain so a scripted check cannot pass by printing bad news.
   daemon through `run_events`, and HTTP, MCP, browser, ACP and the remote node
   through `subsystem_events`. Separate stores still hold gating-relevant records
   with no join to either stream: `daemon_scheduler_decisions` and `remote_audit` in their own database
-  files, and `egress_denials`, which records denials only — **an allowed egress
-  produces no row anywhere** — and ring-buffers itself on every insert.
+  files, and `egress_denials`, which records denials only — ~~**an allowed egress
+  produces no row anywhere**~~ **stale by the time it was written: `egress_destinations`
+  (V14, relaxed by V19) has been counting allowed egress per destination since
+  K5's per-run policy landed** — and ring-buffers itself on every insert.
 - **A schema bump was a one-way door, and that is why the audit is scattered
   across three databases.** `denial_sink.rs` says it outright: the ledger's
   forward-only guard refused any database whose `MAX(version)` exceeded the
@@ -4396,9 +4398,45 @@ a broken chain so a scripted check cannot pass by printing bad news.
   bounds them is a poor neighbour for a hash-chained, strictly append-only stream
   that must never drop a row. Moving those rows in would mean either giving the
   stream an eviction policy or letting a remote party grow it without limit.
-  What *does* belong in the ledger is the half that is still missing entirely —
+  ~~What *does* belong in the ledger is the half that is still missing entirely —
   an **allowed** egress produces no row anywhere — because its volume is the
-  app's own.
+  app's own.~~
+
+  **That half was already built, and this entry was reading its own file rather
+  than the schema.** `egress_destinations` (V14; V19 rebuilds it to relax
+  `process_id`) records allowed egress in the run ledger, keyed per destination
+  with a `last_seen_ms` and a count, plus an unattributed bucket for traffic no
+  run made — the app's own volume, exactly as this paragraph argued it should be.
+  The gap was never the rows. It was that **nothing read the two halves
+  together**: an allowed destination in one file and its refusal in another are
+  the same question asked twice, and no surface asked it once.
+
+  `monkey security egress-evidence` is that read, and it is a join rather than a
+  migration — nothing moves between the files, so the ring buffer keeps
+  ring-buffering and the chain keeps its no-drop guarantee. It exits non-zero on
+  the one condition that makes the report lie about itself: `MAX_DESTINATIONS`
+  caps how many distinct destinations one attribution names and counts the
+  excess as `dropped`, so a nonzero total means the evidence is **truncated, not
+  complete**, and a truncated list that does not say so reads as a full one.
+
+  **`daemon_scheduler_decisions` gets the same treatment, for the same reason.**
+  It was the last gating record with no join to either stream, and it decides
+  whether a job runs at all. It stays in the daemon's own database — the
+  scheduler rewrites its verdict every tick and the table is bounded to 512 rows,
+  which is the same poor-neighbour argument `egress_denials` already won — so
+  `monkey security admission-trail` joins it through `daemon_jobs.run_id`. It
+  exits non-zero when a decision names a run the ledger cannot produce, which is
+  this command's form of the acceptance's bug: work the daemon admitted that the
+  log cannot account for. A decision naming *no* run is the scheduler's most
+  ordinary outcome and is deliberately not counted — a check that reports every
+  healthy daemon as broken is a check somebody switches off.
+
+  `remote_audit` is not joined here and does not need to be: K12 already
+  records every `RemoteApi` request in `subsystem_events` through the `handle`
+  wrapper, including the unauthenticated ones that never reach a route, so the
+  stream already answers "what did the remote node do". `remote_audit` holds the
+  protocol-level denial detail beside it, which is the division this entry
+  settled above.
 - ~~**Per-event process identity does not exist.**~~ **Done** — migration V10 adds
   `run_events.process_id`, populated from the ambient `ProcessScope` (the D3
   `tokio::task_local!`) inside `append_event`. That is the single place all 46
@@ -4904,7 +4942,7 @@ against independently.
 
 *Maps to: ROADMAP #7.*
 
-## K16. Driver coverage completion *(built; harness route owed)*
+## K16. Driver coverage completion *(built)*
 
 **Today:** real detection of Metal, CUDA, ROCm, Vulkan, and best-effort
 DirectML, with per-backend `available` / `not_detected` / `driver_too_old` /
@@ -4955,13 +4993,60 @@ than inferred", which is a fact about the *probe*. Neither is a fact about
   two report builders cannot drift — which is not hypothetical: the existing
   cross-builder test caught the second list when only the first had grown.
 
-**Remaining: the acceptance's parenthetical, "with a passing
+~~**Remaining: the acceptance's parenthetical, "with a passing
 compatibility-harness route".** The harness mocks at the runtime-driver boundary
 and never spawns a process, and its `ApiBackend` is an API family
 (`ManagedLocal`/`Ollama`/`Mlx`/`CloudProvider`) rather than a hardware
-accelerator — there is no accelerator-keyed route anywhere. Proving execution
-*per backend* means running real work on real hardware, which is a per-machine
-claim this repo's CI cannot make for any backend but its own.
+accelerator — there is no accelerator-keyed route anywhere.~~ **Shipped, and the
+first time a route ran real work it failed — on a bug ten green mocked routes had
+been hiding.**
+
+`m3_compatibility_harness.rs` gains two things. `harness_route(AcceleratorKind)`
+is exhaustive over the enum and pairs with `execution_support`: an `Executes`
+answer must name a route, a `DetectionOnly` answer must not have one, and
+`every_accelerator_backend_has_a_harness_route_or_a_stated_reason` fails if the
+two ever disagree. That runs in ordinary CI — it reads two tables and touches no
+hardware, so the acceptance's "either/or" is now enforced rather than described.
+
+The route itself, `real_ollama_completion_lands_on_a_detected_accelerator`, is
+`#[ignore]`d and gated a second time on `LITTLE_MONKEY_HARNESS_OLLAMA_MODEL`: it
+drives a real `ollama serve` on loopback through the real `m3_http_server`
+listener, on a machine whose own `SystemM3HardwareProbe` reports Metal or CUDA,
+and reads `RunningModel::vram_bytes` back through the hub's adapter status view —
+the only evidence available that the work did not fall to the CPU.
+
+- **The production bug it found.** The listener's `REQUEST_TIMEOUT_MS` is 30
+  minutes; `runtime_adapter.rs`'s `ABSOLUTE_MAX_TIMEOUT_MS` is 15. Four sites
+  built `RuntimeOperationLimits` by hand from a caller's deadline, and the one
+  that validated what it built — the hub's `runtime_context` — refused every
+  adapter-backed operation, which `M3RuntimeCatalogSource::list_models` turned
+  into `SourceUnavailable`. A real Ollama runtime registered in the hub therefore
+  answered `/v1/models` with an empty list and `/v1/chat/completions` with a 502,
+  against a daemon that returned its inventory in five milliseconds. The other
+  three sites did not validate and ran past the cap instead. Both are the same
+  mistake, so the clamp went into one constructor,
+  `RuntimeOperationLimits::with_timeout_ms`, rather than into four call sites: a
+  caller asking for longer means "no longer than this", never "fail the call".
+  `a_listener_sized_deadline_survives_the_trip_into_an_adapter` pins it in CI,
+  with the listener's number spelled out so raising either constant has to come
+  past the test.
+- **This is exactly what the parenthetical was for.** Ten harness routes were
+  green the whole time. Their mock drivers never build these limits, so the one
+  thing they could not prove was the one thing that was broken — a runtime path
+  that actually executes.
+- **What the route proves, and what it cannot.** It proves *an* accelerator ran
+  the completion: detection says the machine has one, and a CPU-resident model
+  reports `vram_bytes` of zero. It does not prove *which*, and no assertion here
+  implies otherwise — nothing in Ollama's HTTP surface names a device, the same
+  limit K15 hit when a per-device split had to answer `UnsupportedCapability`. A
+  genuinely per-backend claim needs a runtime whose API names the card.
+- **Verified by running it**, not by writing it: passed on Apple Silicon against
+  `ollama serve` on `127.0.0.1:11434` with a 9 GB model, in 10.2s. Proving
+  execution *per backend* still means running real work on real hardware, which
+  is a per-machine claim this repo's hosted CI cannot make for any backend but
+  its own — so the route names its requirements (a Metal or CUDA device, a
+  running daemon, a pulled model) rather than pretending a hosted runner has a
+  GPU.
 
 ## K17. Remote node as a scheduled device *(built)*
 
@@ -5925,6 +6010,9 @@ is still optional; it is no longer the evidence for how agent shell tools execut
 
 So the name still does not change. The former isolation blocker is closed, but the cut line is
 Phase 0–3, not one marquee mechanism. Copy-on-write, freeze/restore and transactional effects are
-still built; Phase 1 owes K4's declaration/platform enforcement contract, and Phase 3 owes K12's
-remaining cross-store audit joins and allowed-egress evidence.
-"Agent runtime and control plane" remains the honest README name until those entries close.
+still built; Phase 1 owes K4's declaration/platform enforcement contract. Phase 3's K12 debt is
+closed: the allowed-egress rows turned out to have shipped with K5's per-run policy, and what was
+actually missing — a surface that reads the allowed half and the refused half together, and one
+that produces the run behind an admission decision — is `monkey security egress-evidence` and
+`monkey security admission-trail`, both joins rather than migrations.
+"Agent runtime and control plane" remains the honest README name until K4 closes.

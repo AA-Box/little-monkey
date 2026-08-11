@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use clap::Subcommand;
+use little_monkey_lib::denial_sink::{DenialRecord, DenialSink, SINK_FILE};
 use little_monkey_lib::native_skills::{NativeSkillManager, SkillSource};
+use little_monkey_lib::process_table::{ProcessEgressDestinations, ProcessFilter};
 use little_monkey_lib::run_ledger::{
     ChainVerification, PermissionGap, RunLedger, StoredPermissionDecision, StoredSubsystemEvent,
     Subsystem, ToolCallOrigin,
@@ -82,6 +85,86 @@ pub enum SecurityCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Show the egress the app was allowed beside the egress that was refused.
+    ///
+    /// The two halves deliberately live in two files. Allowed egress is in the
+    /// run ledger (`egress_destinations`, migrations V14 and V19) as a counter
+    /// per destination, because its volume is the app's own; refusals are in
+    /// `egress-denials-v1.sqlite3`, because *their* volume is
+    /// attacker-influenced and ring-buffered. This is the read-side join, and
+    /// nothing moves between the files to produce it.
+    ///
+    /// Exits non-zero when the ledger says it could not name where an allowed
+    /// request went: a truncated evidence list that does not say it is
+    /// truncated reads as a complete one.
+    EgressEvidence {
+        /// How many processes to read destinations for, and how many refusals
+        /// to show.
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Print the versioned machine-readable evidence.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Produce the run behind each of the daemon's admission decisions.
+    ///
+    /// `daemon_scheduler_decisions` is the last gating record with no join to
+    /// either ledger stream: it decides whether a job runs at all, and it lives
+    /// in the daemon's own database. It stays there — the scheduler rewrites its
+    /// verdict on every tick and the table ring-buffers itself, which is a poor
+    /// neighbour for an append-only chain — so the join is made here, through
+    /// `daemon_jobs.run_id`.
+    ///
+    /// Exits non-zero when a decision names a run the ledger cannot produce,
+    /// which is this command's version of the acceptance's bug: work the daemon
+    /// admitted and the log cannot account for.
+    AdmissionTrail {
+        /// How many of the most recent decisions to join.
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Print the versioned machine-readable trail.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// One admission decision beside the run the ledger can (or cannot) produce for
+/// it.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdmissionJoin {
+    pub decided_at_ms: u64,
+    pub job_id: String,
+    pub outcome: String,
+    /// The run `daemon_jobs` says this job became, if it ever became one.
+    pub run_id: Option<String>,
+    /// Whether the ledger holds that run.
+    pub run_in_ledger: bool,
+}
+
+impl AdmissionJoin {
+    /// A decision that claims a run the ledger does not hold.
+    ///
+    /// `run_id: None` is **not** this: a rejected or still-queued job never
+    /// reached `mark_queued`, so there is no run to produce and nothing is
+    /// missing. Counting that as a gap would report the scheduler's most
+    /// ordinary outcome as a bug.
+    #[must_use]
+    pub fn is_unproduceable(&self) -> bool {
+        self.run_id.is_some() && !self.run_in_ledger
+    }
+}
+
+/// Allowed requests the ledger counted but could not name a destination for.
+///
+/// `run_scope::MAX_DESTINATIONS` caps how many distinct destinations one
+/// attribution names, and the excess is counted rather than dropped precisely so
+/// this number exists. It is the one figure in this report that makes the report
+/// itself incomplete, so it is what the exit status is built on.
+fn unnamed_allowed_requests<'a>(
+    groups: impl Iterator<Item = &'a ProcessEgressDestinations>,
+) -> u64 {
+    groups.map(|group| group.dropped).sum()
 }
 
 pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> Result<(), String> {
@@ -234,6 +317,123 @@ pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> R
                 }
             }
         }
+        SecurityCmd::EgressEvidence { limit, json } => {
+            let ledger = open_existing_ledger(data_dir)?;
+            let table = ledger.process_table();
+            // Read through the process list rather than the destination table
+            // directly: a destination row is `ON DELETE CASCADE` on its process,
+            // so the process is the thing that exists, and this reuses the same
+            // page `monkey processes list` shows instead of inventing a second
+            // ordering for the same rows.
+            let processes = table
+                .list(&ProcessFilter {
+                    kinds: Vec::new(),
+                    live_only: false,
+                    parent_process_id: None,
+                    workspace: None,
+                    limit: Some(*limit),
+                })
+                .map_err(|error| error.to_string())?;
+            let runs: BTreeMap<String, Option<String>> = processes
+                .iter()
+                .map(|process| (process.process_id.clone(), process.run_id.clone()))
+                .collect();
+            let ids: Vec<String> = runs.keys().cloned().collect();
+            let attributed = table
+                .egress_destinations_for(&ids)
+                .map_err(|error| error.to_string())?;
+            let unattributed = table
+                .unattributed_egress_destinations()
+                .map_err(|error| error.to_string())?;
+
+            // Opened only if it is already there. A read-only question must not
+            // create the sink as a side effect, the same rule
+            // `open_existing_ledger` follows.
+            let sink_path = data_dir.join(SINK_FILE);
+            let denials = if sink_path.exists() {
+                DenialSink::open(&sink_path)
+                    .and_then(|sink| sink.recent(*limit as usize))
+                    .map_err(|error| error.to_string())?
+            } else {
+                Vec::new()
+            };
+
+            let unnamed = unnamed_allowed_requests(attributed.values())
+                + unnamed_allowed_requests(unattributed.values());
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "allowedByProcess": attributed,
+                        "allowedOutsideARun": unattributed,
+                        "denials": denials.iter().map(denial_json).collect::<Vec<_>>(),
+                        "denialSink": sink_path.exists().then(|| sink_path.display().to_string()),
+                        "unnamedAllowedRequests": unnamed,
+                    }))
+                    .map_err(|error| error.to_string())?
+                );
+            } else {
+                print_egress_evidence(&attributed, &runs, &unattributed, &denials, &sink_path);
+            }
+            if unnamed > 0 {
+                return Err(format!(
+                    "{unnamed} allowed request(s) went to destinations this ledger cannot name — \
+                     the evidence is truncated, not complete"
+                ));
+            }
+            Ok(())
+        }
+        SecurityCmd::AdmissionTrail { limit, json } => {
+            let ledger = open_existing_ledger(data_dir)?;
+            let paths = crate::daemon::store::DaemonPaths::under(data_dir);
+            let mut joined: Vec<AdmissionJoin> = Vec::new();
+            // Absent daemon state is "this machine never ran a daemon", not an
+            // error — and opening the store would create it, which a read must
+            // not do.
+            if paths.state_db.exists() {
+                let store = crate::daemon::store::DaemonStore::open(&paths)?;
+                for decision in store.recent_decisions(*limit)? {
+                    let run_id = store.get_job(&decision.job_id)?.and_then(|job| job.run_id);
+                    let run_in_ledger = match &run_id {
+                        Some(id) => ledger
+                            .load_run(id)
+                            .map_err(|error| error.to_string())?
+                            .is_some(),
+                        None => false,
+                    };
+                    joined.push(AdmissionJoin {
+                        decided_at_ms: decision.decided_at_ms,
+                        job_id: decision.job_id,
+                        outcome: decision.outcome,
+                        run_id,
+                        run_in_ledger,
+                    });
+                }
+            }
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "decisions": joined,
+                        "daemonState": paths.state_db.exists()
+                            .then(|| paths.state_db.display().to_string()),
+                    }))
+                    .map_err(|error| error.to_string())?
+                );
+            } else {
+                print_admission_trail(&joined, paths.state_db.exists());
+            }
+            let unproduceable = joined
+                .iter()
+                .filter(|entry| entry.is_unproduceable())
+                .count();
+            if unproduceable > 0 {
+                return Err(format!(
+                    "{unproduceable} admission decision(s) name a run the ledger cannot produce"
+                ));
+            }
+            Ok(())
+        }
         SecurityCmd::VerifyRunChain { run_id, json } => {
             let ledger = open_existing_ledger(data_dir)?;
             let verdict = ledger
@@ -270,6 +470,118 @@ fn open_existing_ledger(data_dir: &Path) -> Result<RunLedger, String> {
         ));
     }
     RunLedger::open(&path).map_err(|error| error.to_string())
+}
+
+/// A denial as JSON. Hand-built because [`DenialRecord`] is a storage struct
+/// rather than a wire type, and giving it a `Serialize` here would make this
+/// report's field names the sink's public shape.
+fn denial_json(record: &DenialRecord) -> serde_json::Value {
+    serde_json::json!({
+        "recordedAtMs": record.recorded_at_ms,
+        "ruleCode": record.rule_code,
+        "guard": record.guard,
+        // Already bounded to 160 characters and already free of query strings
+        // when it was written — this only reads it back.
+        "detail": record.detail,
+        "runId": record.run_id,
+        "unattributedReason": record.unattributed_reason,
+    })
+}
+
+fn print_egress_evidence(
+    attributed: &BTreeMap<String, ProcessEgressDestinations>,
+    runs: &BTreeMap<String, Option<String>>,
+    unattributed: &BTreeMap<String, ProcessEgressDestinations>,
+    denials: &[DenialRecord],
+    sink_path: &Path,
+) {
+    println!(
+        "Allowed egress, from the run ledger — a counter per destination, not a row per request:"
+    );
+    if attributed.is_empty() && unattributed.is_empty() {
+        println!("  nothing recorded yet");
+    }
+    for (process_id, group) in attributed {
+        match runs.get(process_id).and_then(Option::as_deref) {
+            Some(run_id) => println!("  process {process_id} (run {run_id})"),
+            None => println!("  process {process_id} (no ledger run)"),
+        }
+        print_destinations(group);
+    }
+    for (reason, group) in unattributed {
+        // The reason is `run_scope::Unattributed`'s own persisted code, so this
+        // says which kind of run-less work reached the host rather than "none".
+        println!("  outside any run — {reason}");
+        print_destinations(group);
+    }
+
+    println!(
+        "\nRefused egress, from {} — its own file, deliberately:",
+        sink_path.display()
+    );
+    if !sink_path.exists() {
+        println!("  no denial sink here yet — nothing has been refused on this machine");
+        return;
+    }
+    if denials.is_empty() {
+        println!("  the sink exists and holds no refusals");
+    }
+    for denial in denials {
+        println!(
+            "  [{}] {} — {}",
+            denial.rule_code,
+            denial.guard,
+            denial.detail.as_deref().unwrap_or("(no detail recorded)")
+        );
+        match (&denial.run_id, &denial.unattributed_reason) {
+            (Some(run_id), _) => println!("    run {run_id}"),
+            (None, Some(reason)) => println!("    outside any run — {reason}"),
+            (None, None) => println!("    scoped to nothing — this call site is not instrumented"),
+        }
+    }
+    println!(
+        "\n  note: this sink ring-buffers itself, so it is the newest refusals rather than all of \
+         them. The allowed half above does not — it is a bounded counter."
+    );
+}
+
+fn print_destinations(group: &ProcessEgressDestinations) {
+    for destination in &group.destinations {
+        println!(
+            "    {}://{}:{} — {} request(s)",
+            destination.scheme, destination.host, destination.port, destination.requests
+        );
+    }
+    if group.dropped > 0 {
+        println!(
+            "    {} request(s) went past the destination cap and were counted but NOT named",
+            group.dropped
+        );
+    }
+}
+
+fn print_admission_trail(joined: &[AdmissionJoin], has_daemon_state: bool) {
+    if !has_daemon_state {
+        println!("No daemon state on this machine — nothing has ever been admitted or refused.");
+        return;
+    }
+    if joined.is_empty() {
+        println!("The daemon has recorded no admission decisions yet.");
+        return;
+    }
+    println!("{} admission decision(s), newest first:", joined.len());
+    for entry in joined {
+        // Three states, like `permission-gaps`: produced, never became a run, and
+        // claims a run nobody can produce. The middle one is not a gap.
+        let verdict = match (&entry.run_id, entry.run_in_ledger) {
+            (Some(run_id), true) => format!("run {run_id} — in the ledger"),
+            (Some(run_id), false) => {
+                format!("run {run_id} — NOT IN THE LEDGER, which the log cannot account for")
+            }
+            (None, _) => "never queued, so there is no run to produce".to_string(),
+        };
+        println!("  [{}] job {} — {verdict}", entry.outcome, entry.job_id);
+    }
 }
 
 fn print_permission_gaps(run_id: &str, gaps: &[PermissionGap]) {
@@ -469,6 +781,46 @@ fn print_human(report: &little_monkey_lib::security_doctor::SecurityAuditReport)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both new commands exit non-zero on one condition each, and both
+    /// conditions are a *silence* rather than a failure — the shape that reads
+    /// as "nothing to report" if the predicate is wrong by one case.
+    #[test]
+    fn an_admission_decision_is_unproduceable_only_when_it_named_a_run() {
+        let join = |run_id: Option<&str>, run_in_ledger: bool| AdmissionJoin {
+            decided_at_ms: 0,
+            job_id: "job".to_string(),
+            outcome: "admitted".to_string(),
+            run_id: run_id.map(str::to_string),
+            run_in_ledger,
+        };
+
+        // The bug: the daemon admitted work against a run the ledger cannot
+        // produce.
+        assert!(join(Some("run-1"), false).is_unproduceable());
+        // Produced. Not a bug.
+        assert!(!join(Some("run-1"), true).is_unproduceable());
+        // The scheduler's most ordinary outcome — a decision that names no run
+        // at all. Counting this would report every healthy daemon as broken,
+        // which is how a check gets switched off.
+        assert!(!join(None, false).is_unproduceable());
+    }
+
+    #[test]
+    fn unnamed_allowed_requests_counts_only_what_the_ledger_could_not_name() {
+        let group = |dropped| ProcessEgressDestinations {
+            destinations: Vec::new(),
+            dropped,
+        };
+
+        assert_eq!(unnamed_allowed_requests([].iter()), 0);
+        // A complete list is not a truncated one, however long it is.
+        assert_eq!(unnamed_allowed_requests([group(0), group(0)].iter()), 0);
+        // Both halves of the report contribute: attributed processes and the
+        // unattributed bucket are summed by the caller, so this must add rather
+        // than take a maximum.
+        assert_eq!(unnamed_allowed_requests([group(2), group(3)].iter()), 5);
+    }
 
     #[test]
     fn security_command_shape_supports_requested_flags() {
