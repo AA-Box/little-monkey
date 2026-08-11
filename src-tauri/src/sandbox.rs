@@ -46,6 +46,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::fs::{File, OpenOptions};
+#[cfg(target_os = "windows")]
+use std::io::{Read, Seek, SeekFrom};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -375,6 +380,10 @@ pub struct CopyStats {
     /// than byte copies. Zero on a filesystem or platform that cannot clone —
     /// see [`clone_file`].
     pub files_cloned: u64,
+    /// Logical bytes backed by copy-on-write extents. This can be smaller than
+    /// [`Self::bytes_copied`] on Windows, where ReFS requires an unaligned tail
+    /// to be copied normally.
+    pub bytes_cloned: u64,
 }
 
 impl CopyStats {
@@ -387,8 +396,10 @@ impl CopyStats {
     pub fn placement_mode(&self) -> &'static str {
         match (self.files_copied, self.files_cloned) {
             (0, _) => "no files",
-            (total, cloned) if cloned == total => "copy-on-write",
             (_, 0) => "full copy",
+            (total, cloned) if cloned == total && self.bytes_cloned == self.bytes_copied => {
+                "copy-on-write"
+            }
             _ => "copy-on-write where the filesystem allowed it",
         }
     }
@@ -409,44 +420,236 @@ impl CopyStats {
 /// unchanged by construction, which is what makes "byte-for-byte identical to
 /// the copy implementation" true rather than tested-and-hoped.
 ///
-/// # Failure is never an error
+/// # Refusal falls back
 ///
-/// Returns `false` for every refusal — a filesystem without copy-on-write, a
+/// Returns `None` for every refusal — a filesystem without copy-on-write, a
 /// cross-device destination, a destination that already exists — because each
 /// one means "copy it the ordinary way", not "fail the run". The caller falls
-/// back to `fs::copy`, so the only thing lost is the saving.
+/// back to `fs::copy`, so the only thing lost is the saving. Failure to remove
+/// a partial destination remains an error: copying over an ambiguous result is
+/// not a safe fallback.
 #[cfg(target_os = "macos")]
-fn clone_file(src: &Path, dest: &Path) -> bool {
+fn clone_file(src: &Path, dest: &Path) -> io::Result<Option<u64>> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
+    let metadata = match fs::metadata(src) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    if dest.exists() {
+        return Ok(None);
+    }
     let (Ok(source), Ok(destination)) = (
         CString::new(src.as_os_str().as_bytes()),
         CString::new(dest.as_os_str().as_bytes()),
     ) else {
         // An interior NUL, which no path this walk produced can contain.
-        return false;
+        return Ok(None);
     };
     // SAFETY: both pointers are NUL-terminated C strings that outlive the call,
     // and `clonefile` neither retains them nor writes through them.
-    unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) == 0 }
+    if unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
+        Ok(Some(metadata.len()))
+    } else {
+        remove_partial_clone(dest)
+    }
 }
 
-/// Every other platform copies, and says so rather than pretending.
-///
-/// Linux reflink (`FICLONE`, on btrfs and XFS) and Windows ReFS block cloning
-/// are both real and both deliberately absent: neither can be exercised on this
-/// project's machines, and an untested ioctl that silently degrades to a copy
-/// would look identical to this in every test while being harder to read.
-/// Overlayfs, which the roadmap names for Linux, needs mount privileges a
-/// desktop application does not have.
-///
-/// Hard-linking a staging tree is not a substitute on any platform and is not a
-/// deferral: a write through a hard link mutates the workspace file itself,
-/// which is the one thing an ephemeral sandbox exists to prevent.
-#[cfg(not(target_os = "macos"))]
-fn clone_file(_src: &Path, _dest: &Path) -> bool {
-    false
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn remove_partial_clone(dest: &Path) -> io::Result<Option<u64>> {
+    match fs::remove_file(dest) {
+        Ok(()) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Linux's per-file reflink. Any kernel/filesystem refusal is an optimization
+/// miss; the caller's ordinary copy remains the authoritative operation.
+#[cfg(target_os = "linux")]
+fn clone_file(src: &Path, dest: &Path) -> io::Result<Option<u64>> {
+    use std::os::fd::AsRawFd;
+
+    let source = match File::open(src) {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
+    let metadata = match source.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    let destination = match OpenOptions::new().write(true).create_new(true).open(dest) {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
+
+    // SAFETY: both descriptors remain open for the call; FICLONE reads the
+    // source descriptor and installs shared copy-on-write extents in dest.
+    if unsafe {
+        libc::ioctl(
+            destination.as_raw_fd(),
+            libc::FICLONE as _,
+            source.as_raw_fd(),
+        )
+    } != 0
+    {
+        drop(destination);
+        return remove_partial_clone(dest);
+    }
+
+    if fs::set_permissions(dest, metadata.permissions()).is_err() {
+        drop(destination);
+        return remove_partial_clone(dest);
+    }
+    Ok(Some(metadata.len()))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cluster_size(dest: &Path) -> Option<u64> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceW, GetVolumePathNameW};
+
+    let parent = plain_canonical(dest.parent()?).ok()?;
+    let path: Vec<u16> = parent
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect();
+    let mut volume = vec![0_u16; 32_768];
+    // SAFETY: both buffers are writable/readable for their declared lengths
+    // and remain alive for each synchronous call.
+    if unsafe {
+        GetVolumePathNameW(
+            path.as_ptr(),
+            volume.as_mut_ptr(),
+            u32::try_from(volume.len()).ok()?,
+        )
+    } == 0
+    {
+        return None;
+    }
+
+    let (mut sectors_per_cluster, mut bytes_per_sector) = (0_u32, 0_u32);
+    let (mut free_clusters, mut total_clusters) = (0_u32, 0_u32);
+    if unsafe {
+        GetDiskFreeSpaceW(
+            volume.as_ptr(),
+            &mut sectors_per_cluster,
+            &mut bytes_per_sector,
+            &mut free_clusters,
+            &mut total_clusters,
+        )
+    } == 0
+    {
+        return None;
+    }
+    u64::from(sectors_per_cluster).checked_mul(u64::from(bytes_per_sector))
+}
+
+/// ReFS block cloning is range-based, so clone the cluster-aligned prefix and
+/// copy the final partial cluster. A file with no aligned extent simply takes
+/// the ordinary-copy path. Hard links are intentionally never used: writes
+/// through one would mutate the workspace.
+#[cfg(target_os = "windows")]
+fn clone_file(src: &Path, dest: &Path) -> io::Result<Option<u64>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Ioctl::{
+        DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const MAX_CLONE_CHUNK: u64 = 1 << 30;
+
+    let cluster_size = match windows_cluster_size(dest) {
+        Some(size) if size > 0 => size,
+        _ => return Ok(None),
+    };
+    let mut source = match File::open(src) {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
+    let metadata = match source.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    let aligned_len = metadata.len() / cluster_size * cluster_size;
+    if aligned_len == 0 || i64::try_from(metadata.len()).is_err() {
+        return Ok(None);
+    }
+    let mut destination = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(dest)
+    {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
+    if destination.set_len(metadata.len()).is_err() {
+        drop(destination);
+        return remove_partial_clone(dest);
+    }
+
+    let chunk_limit = MAX_CLONE_CHUNK / cluster_size * cluster_size;
+    if chunk_limit == 0 {
+        drop(destination);
+        return remove_partial_clone(dest);
+    }
+    let source_handle = source.as_raw_handle() as _;
+    let mut offset = 0_u64;
+    while offset < aligned_len {
+        let byte_count = (aligned_len - offset).min(chunk_limit);
+        let data = DUPLICATE_EXTENTS_DATA {
+            FileHandle: source_handle,
+            SourceFileOffset: offset as i64,
+            TargetFileOffset: offset as i64,
+            ByteCount: byte_count as i64,
+        };
+        let mut bytes_returned = 0_u32;
+        // SAFETY: the destination handle and input structure remain valid for
+        // this synchronous ioctl; no output or OVERLAPPED buffer is requested.
+        if unsafe {
+            DeviceIoControl(
+                destination.as_raw_handle() as _,
+                FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+                (&data as *const DUPLICATE_EXTENTS_DATA).cast(),
+                std::mem::size_of::<DUPLICATE_EXTENTS_DATA>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            drop(destination);
+            return remove_partial_clone(dest);
+        }
+        offset += byte_count;
+    }
+
+    let tail_len = metadata.len() - aligned_len;
+    if tail_len > 0 {
+        let tail_result = source
+            .seek(SeekFrom::Start(aligned_len))
+            .and_then(|_| destination.seek(SeekFrom::Start(aligned_len)))
+            .and_then(|_| io::copy(&mut source.take(tail_len), &mut destination));
+        if !matches!(tail_result, Ok(bytes) if bytes == tail_len) {
+            drop(destination);
+            return remove_partial_clone(dest);
+        }
+    }
+    if fs::set_permissions(dest, metadata.permissions()).is_err() {
+        drop(destination);
+        return remove_partial_clone(dest);
+    }
+    Ok(Some(aligned_len))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn clone_file(_src: &Path, _dest: &Path) -> io::Result<Option<u64>> {
+    Ok(None)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -457,7 +660,7 @@ pub struct PromoteFileEntry {
     pub size_bytes: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxPromotePreview {
     pub run_id: String,
@@ -474,7 +677,7 @@ pub struct SandboxPromoteResult {
     pub promoted_files: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxDiffEntry {
     pub path: String,
@@ -616,6 +819,17 @@ fn secret_shaped(path: &Path, root: &Path) -> bool {
 /// (never followed, so a symlink pointing outside `root` can never smuggle
 /// unrelated files into the copy).
 pub fn copy_workspace_into_sandbox(root: &Path, dest: &Path) -> io::Result<CopyStats> {
+    copy_workspace_into_sandbox_with(root, dest, clone_file)
+}
+
+fn copy_workspace_into_sandbox_with<F>(
+    root: &Path,
+    dest: &Path,
+    clone_strategy: F,
+) -> io::Result<CopyStats>
+where
+    F: Fn(&Path, &Path) -> io::Result<Option<u64>>,
+{
     fs::create_dir_all(dest)?;
     let mut stats = CopyStats::default();
 
@@ -655,11 +869,14 @@ pub fn copy_workspace_into_sandbox(root: &Path, dest: &Path) -> io::Result<CopyS
         // of the tree, not the number of bytes the disk actually wrote, because
         // it is read as "how big is this sandbox" and a clone does not make the
         // sandbox smaller.
-        let bytes = if clone_file(path, &dest_path) {
-            stats.files_cloned += 1;
-            entry.metadata().map_err(io::Error::other)?.len()
-        } else {
-            fs::copy(path, &dest_path)?
+        let metadata = entry.metadata().map_err(io::Error::other)?;
+        let bytes = match clone_strategy(path, &dest_path)? {
+            Some(cloned_bytes) => {
+                stats.files_cloned += 1;
+                stats.bytes_cloned += cloned_bytes;
+                metadata.len()
+            }
+            None => fs::copy(path, &dest_path)?,
         };
         stats.files_copied += 1;
         stats.bytes_copied += bytes;
@@ -1818,6 +2035,36 @@ pub fn diff_sandbox_against_workspace(
     Ok(entries)
 }
 
+fn sandbox_copy_checkpoint_label(stats: &CopyStats) -> String {
+    bounded(
+        &format!(
+            "Ephemeral copy: {} file(s), {} byte(s), {} ({} cloned byte(s) across {} file(s))",
+            stats.files_copied,
+            stats.bytes_copied,
+            stats.placement_mode(),
+            stats.bytes_cloned,
+            stats.files_cloned
+        ),
+        1_024,
+    )
+}
+
+fn discard_sandbox_dir(dir: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn discard_sandbox_dir_then<F>(dir: &Path, record_cancelled: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    discard_sandbox_dir(dir).map_err(|error| format!("Failed to discard sandbox run: {error}"))?;
+    record_cancelled()
+}
+
 async fn run_sandboxed_body(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -1843,16 +2090,7 @@ async fn run_sandboxed_body(
             // The placement mode is part of the record, not decoration: two runs
             // with the same file and byte counts can have cost wildly different
             // amounts of disk, and the ledger is where that is answerable later.
-            label: bounded(
-                &format!(
-                    "Ephemeral copy: {} file(s), {} byte(s), {} ({} cloned)",
-                    stats.files_copied,
-                    stats.bytes_copied,
-                    stats.placement_mode(),
-                    stats.files_cloned
-                ),
-                1_024,
-            ),
+            label: sandbox_copy_checkpoint_label(&stats),
             content_sha256: None,
         },
         engine.clone(),
@@ -2256,14 +2494,6 @@ pub fn sandbox_discard(
     reason: Option<String>,
 ) -> Result<(), String> {
     require_sandboxed_run(&app, state.inner(), &run_id)?;
-    crate::run_commands::append_host_event(
-        &app,
-        &window,
-        state.inner(),
-        run_id.clone(),
-        None,
-        RunEvent::Cancelled { reason },
-    )?;
 
     {
         let mut guard = state
@@ -2276,10 +2506,17 @@ pub fn sandbox_discard(
     }
 
     let dir = sandbox_run_dir(&app, &run_id)?;
-    if dir.exists() {
-        let _ = fs::remove_dir_all(&dir);
-    }
-    Ok(())
+    discard_sandbox_dir_then(&dir, || {
+        crate::run_commands::append_host_event(
+            &app,
+            &window,
+            state.inner(),
+            run_id,
+            None,
+            RunEvent::Cancelled { reason },
+        )
+        .map(|_| ())
+    })
 }
 
 #[cfg(test)]
@@ -2294,16 +2531,44 @@ mod tests {
             .as_millis() as u64
     }
 
-    fn temp_dir(label: &str) -> PathBuf {
+    fn temp_dir_under(base: &Path, label: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = base.join(format!(
             "little-monkey-sandbox-test-{label}-{}-{counter}-{}",
             std::process::id(),
             now_ms()
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        temp_dir_under(&std::env::temp_dir(), label)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cow_test_dir(label: &str) -> Option<PathBuf> {
+        Some(temp_dir(label))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn cow_test_dir(label: &str) -> Option<PathBuf> {
+        let Some(root) = std::env::var_os("LITTLE_MONKEY_COW_TEST_ROOT") else {
+            assert!(
+                std::env::var_os("LITTLE_MONKEY_REQUIRE_COW_TESTS").is_none(),
+                "this test run requires LITTLE_MONKEY_COW_TEST_ROOT"
+            );
+            return None;
+        };
+        let root = PathBuf::from(root);
+        fs::create_dir_all(&root).expect("create native COW test root");
+        Some(temp_dir_under(&root, label))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    fn cow_test_dir(_label: &str) -> Option<PathBuf> {
+        None
     }
 
     fn write(path: &Path, content: &str) {
@@ -2315,115 +2580,235 @@ mod tests {
 
     // --- copy_workspace_into_sandbox -----------------------------------
 
-    /// The acceptance clause this whole change has to earn: a cloned sandbox is
-    /// byte-for-byte the tree the copy implementation produced.
-    ///
-    /// Asserted against a copy made from the *same* fixture rather than against
-    /// a written-down expectation, so the two implementations are compared to
-    /// each other and not to somebody's idea of what they do. On a filesystem
-    /// that cannot clone, the two are the same code path and the test still
-    /// holds — it just stops proving anything new, which is why the clone count
-    /// is reported rather than asserted.
+    #[cfg(unix)]
+    fn permission_bits(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    }
+
+    #[cfg(not(unix))]
+    fn permission_bits(path: &Path) -> u32 {
+        u32::from(
+            fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .readonly(),
+        )
+    }
+
+    fn tree_listing(base: &Path) -> Vec<(String, Vec<u8>, u32)> {
+        let mut found: Vec<_> = walkdir::WalkDir::new(base)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| {
+                (
+                    entry
+                        .path()
+                        .strip_prefix(base)
+                        .expect("under the base")
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    fs::read(entry.path()).expect("the file reads"),
+                    permission_bits(entry.path()),
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
     #[test]
-    fn a_cloned_sandbox_is_byte_for_byte_the_tree_a_copy_produces() {
-        let root = temp_dir("clone-src");
-        let cloned = temp_dir("clone-dest");
-
-        write(&root.join("src/main.rs"), "fn main() { println!(\"hi\"); }");
-        write(&root.join("src/nested/deep/file.txt"), "deep content");
-        write(&root.join("package.json"), "{\"name\":\"fixture\"}");
-        write(&root.join(".env"), "API_KEY=super-secret");
-        write(
-            &root.join("node_modules/pkg/index.js"),
-            "module.exports = {};",
-        );
-        // An empty file and a large-ish one: clonefile's edge is zero-length
-        // extents, and a multi-block file is the case a clone actually saves on.
-        write(&root.join("empty"), "");
-        write(&root.join("big.bin"), &"x".repeat(1_000_000));
-
-        let stats = copy_workspace_into_sandbox(&root, &cloned).expect("the sandbox is created");
-
-        // The same fixture through `fs::copy` alone, for comparison.
-        let copied = temp_dir("clone-reference");
-        for relative in [
-            "src/main.rs",
-            "src/nested/deep/file.txt",
-            "package.json",
-            "empty",
-            "big.bin",
-        ] {
-            let destination = copied.join(relative);
-            fs::create_dir_all(destination.parent().expect("a parent")).expect("create parent");
-            fs::copy(root.join(relative), &destination).expect("reference copy");
-        }
-
-        let listing = |base: &Path| {
-            let mut found: Vec<(String, Vec<u8>)> = walkdir::WalkDir::new(base)
-                .min_depth(1)
-                .into_iter()
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_type().is_file())
-                .map(|entry| {
-                    (
-                        entry
-                            .path()
-                            .strip_prefix(base)
-                            .expect("under the base")
-                            .to_string_lossy()
-                            .into_owned(),
-                        fs::read(entry.path()).expect("the file reads"),
-                    )
-                })
-                .collect();
-            found.sort();
-            found
+    fn native_copy_on_write_file_is_independent() {
+        let Some(root) = cow_test_dir("native-cow-src") else {
+            return;
         };
+        let dest = cow_test_dir("native-cow-dest").expect("same native COW volume");
+        let original = vec![b'x'; 1024 * 1024];
+        fs::write(root.join("big.bin"), &original).expect("write aligned fixture");
 
-        assert_eq!(
-            listing(&cloned),
-            listing(&copied),
-            "a cloned sandbox must contain exactly the files a copy would, with exactly the same bytes"
-        );
-        assert_eq!(stats.files_copied, 5, "every non-skipped file is placed");
-        assert!(stats.files_cloned <= stats.files_copied);
-        // On macOS this is the assertion that the clone path is reached at all:
-        // every temp directory this test uses is on the APFS data volume, so a
-        // zero here means `clone_file` stopped working, not that the filesystem
-        // declined. Left as an inequality elsewhere, where copying is the only
-        // implemented path and asserting otherwise would fail honestly-written
-        // code.
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            stats.files_cloned, stats.files_copied,
-            "APFS clones every file, so a copy here means the clone path was skipped"
-        );
+        let stats = copy_workspace_into_sandbox(&root, &dest).expect("native clone succeeds");
+        assert_eq!(stats.files_cloned, 1, "the platform fast path must run");
+        assert_eq!(stats.bytes_cloned, original.len() as u64);
+        assert_eq!(stats.placement_mode(), "copy-on-write");
+
+        fs::write(dest.join("big.bin"), b"sandbox").expect("write sandbox clone");
+        assert_eq!(fs::read(root.join("big.bin")).unwrap(), original);
+        fs::write(root.join("big.bin"), b"workspace").expect("write workspace source");
+        assert_eq!(fs::read(dest.join("big.bin")).unwrap(), b"sandbox");
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(dest);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn refs_copies_an_unaligned_tail_and_records_only_cloned_extents() {
+        let Some(root) = cow_test_dir("refs-tail-src") else {
+            return;
+        };
+        let dest = cow_test_dir("refs-tail-dest").expect("same ReFS volume");
+        let bytes = vec![b't'; 1024 * 1024 + 17];
+        fs::write(root.join("tail.bin"), &bytes).expect("write unaligned fixture");
+
+        let stats = copy_workspace_into_sandbox(&root, &dest).expect("partial ReFS clone");
+        assert_eq!(stats.files_cloned, 1);
+        assert_eq!(stats.bytes_cloned, (1024 * 1024) as u64);
+        assert_eq!(stats.bytes_copied, bytes.len() as u64);
         assert_eq!(
             stats.placement_mode(),
-            if stats.files_cloned == stats.files_copied {
-                "copy-on-write"
-            } else if stats.files_cloned == 0 {
-                "full copy"
-            } else {
-                "copy-on-write where the filesystem allowed it"
-            },
-            "the ledger label must describe what actually happened"
+            "copy-on-write where the filesystem allowed it"
         );
+        assert_eq!(fs::read(dest.join("tail.bin")).unwrap(), bytes);
+        fs::write(dest.join("tail.bin"), b"sandbox").expect("mutate partial clone");
+        assert_eq!(fs::read(root.join("tail.bin")).unwrap(), bytes);
+        fs::write(root.join("tail.bin"), b"workspace").expect("mutate source");
+        assert_eq!(fs::read(dest.join("tail.bin")).unwrap(), b"sandbox");
 
-        // The saving is real only if the clone is independent: writing through
-        // the sandbox copy must not reach back into the workspace. This is the
-        // property a hard-linked staging tree would fail.
-        fs::write(cloned.join("src/main.rs"), "fn main() {}")
-            .expect("the sandbox file is writable");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(dest);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn cross_volume_clone_refusal_falls_back_to_full_copy() {
+        let Some(dest) = cow_test_dir("native-cow-fallback-dest") else {
+            return;
+        };
+        let root = temp_dir("native-cow-fallback-src");
+        let bytes = vec![b'f'; 1024 * 1024];
+        fs::write(root.join("big.bin"), &bytes).expect("write fallback fixture");
+
+        let stats = copy_workspace_into_sandbox(&root, &dest).expect("fallback copy succeeds");
+        assert_eq!(stats.files_cloned, 0);
+        assert_eq!(stats.bytes_cloned, 0);
+        assert_eq!(stats.placement_mode(), "full copy");
+        assert_eq!(fs::read(dest.join("big.bin")).unwrap(), bytes);
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(dest);
+    }
+
+    /// Clone and forced-copy trees must stay equivalent through the whole
+    /// namespace lifecycle, not only immediately after placement.
+    #[test]
+    fn cow_and_full_copy_have_identical_copy_diff_promote_and_discard_outcomes() {
+        let native_root = cow_test_dir("cow-parity-src");
+        let root = native_root
+            .clone()
+            .unwrap_or_else(|| temp_dir("cow-parity-src"));
+        let cloned =
+            cow_test_dir("cow-parity-cloned").unwrap_or_else(|| temp_dir("cow-parity-cloned"));
+        let copied =
+            cow_test_dir("cow-parity-copied").unwrap_or_else(|| temp_dir("cow-parity-copied"));
+
+        write(&root.join("src/main.rs"), "fn main() { println!(\"hi\"); }");
+        write(&root.join("script.sh"), "#!/bin/sh\nexit 0\n");
+        write(&root.join("empty"), "");
+        fs::write(root.join("big.bin"), vec![b'x'; 1024 * 1024]).expect("write large fixture");
+        write(&root.join(".env"), "API_KEY=super-secret");
+        write(&root.join("node_modules/pkg/index.js"), "ignored");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root.join("script.sh"), fs::Permissions::from_mode(0o755))
+                .expect("make fixture executable");
+        }
+
+        let original = tree_listing(&root);
+        let clone_stats =
+            copy_workspace_into_sandbox(&root, &cloned).expect("production placement succeeds");
+        let copy_stats = copy_workspace_into_sandbox_with(&root, &copied, |_, _| Ok(None))
+            .expect("forced full copy succeeds");
+        assert_eq!(tree_listing(&cloned), tree_listing(&copied));
+        assert_eq!(copy_stats.files_cloned, 0);
+        if native_root.is_some() {
+            assert!(
+                clone_stats.files_cloned > 0,
+                "native fast path must contribute"
+            );
+        }
+
+        let real_cloned = cow_test_dir("cow-parity-real-cloned")
+            .unwrap_or_else(|| temp_dir("cow-parity-real-cloned"));
+        let real_copied = cow_test_dir("cow-parity-real-copied")
+            .unwrap_or_else(|| temp_dir("cow-parity-real-copied"));
+        copy_workspace_into_sandbox_with(&root, &real_cloned, |_, _| Ok(None))
+            .expect("make cloned-path workspace");
+        copy_workspace_into_sandbox_with(&root, &real_copied, |_, _| Ok(None))
+            .expect("make copied-path workspace");
+
+        for staging in [&cloned, &copied] {
+            write(&staging.join("src/main.rs"), "fn main() {}");
+            write(&staging.join("added.txt"), "new file");
+        }
+        let clone_diff = diff_sandbox_against_workspace(&cloned, &real_cloned).unwrap();
+        let copy_diff = diff_sandbox_against_workspace(&copied, &real_copied).unwrap();
+        assert_eq!(clone_diff, copy_diff);
+
+        let files = vec!["added.txt".to_string(), "src/main.rs".to_string()];
+        let clone_preview =
+            build_promote_preview("parity-run", &cloned, &files, 10, 1_000).expect("clone preview");
+        let copy_preview =
+            build_promote_preview("parity-run", &copied, &files, 10, 1_000).expect("copy preview");
+        assert_eq!(clone_preview, copy_preview);
         assert_eq!(
-            fs::read_to_string(root.join("src/main.rs")).expect("the original reads"),
-            "fn main() { println!(\"hi\"); }",
-            "a write inside the sandbox must never mutate the workspace"
+            promote_files(&cloned, &real_cloned, &clone_preview.files).unwrap(),
+            promote_files(&copied, &real_copied, &copy_preview.files).unwrap()
         );
+        assert_eq!(tree_listing(&real_cloned), tree_listing(&real_copied));
 
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&cloned);
-        let _ = fs::remove_dir_all(&copied);
+        let promoted = tree_listing(&real_cloned);
+        discard_sandbox_dir(&cloned).expect("discard cloned staging tree");
+        discard_sandbox_dir(&copied).expect("discard copied staging tree");
+        assert!(!cloned.exists() && !copied.exists());
+        assert_eq!(
+            tree_listing(&root),
+            original,
+            "staging never mutates source"
+        );
+        assert_eq!(tree_listing(&real_cloned), promoted);
+        assert_eq!(tree_listing(&real_copied), promoted);
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(real_cloned);
+        let _ = fs::remove_dir_all(real_copied);
+    }
+
+    #[test]
+    fn discard_deletes_before_terminal_event_and_remains_retryable() {
+        let parent = temp_dir("discard-order");
+        let run_dir = parent.join("run");
+        write(&run_dir, "not a directory");
+        let recorded = std::cell::Cell::new(0_u32);
+
+        let deletion_error = discard_sandbox_dir_then(&run_dir, || {
+            recorded.set(recorded.get() + 1);
+            Ok(())
+        });
+        assert!(deletion_error.is_err());
+        assert_eq!(recorded.get(), 0, "failed deletion must not terminalize");
+
+        fs::remove_file(&run_dir).expect("clear failed-delete fixture");
+        fs::create_dir(&run_dir).expect("restore disposable run directory");
+        write(&run_dir.join("artifact"), "bytes");
+        let ledger_error = discard_sandbox_dir_then(&run_dir, || {
+            assert!(!run_dir.exists(), "delete must precede the terminal event");
+            recorded.set(recorded.get() + 1);
+            Err("ledger unavailable".to_string())
+        });
+        assert!(ledger_error.is_err());
+        assert_eq!(recorded.get(), 1);
+
+        discard_sandbox_dir_then(&run_dir, || {
+            recorded.set(recorded.get() + 1);
+            Ok(())
+        })
+        .expect("retry records cancellation after idempotent deletion");
+        assert_eq!(recorded.get(), 2);
+
+        let _ = fs::remove_dir_all(parent);
     }
 
     /// An empty workspace must not read as a filesystem that refused to clone.
@@ -2433,6 +2818,7 @@ mod tests {
         assert_eq!(
             CopyStats {
                 files_copied: 3,
+                bytes_copied: 10,
                 files_cloned: 0,
                 ..CopyStats::default()
             }
@@ -2442,7 +2828,9 @@ mod tests {
         assert_eq!(
             CopyStats {
                 files_copied: 3,
+                bytes_copied: 10,
                 files_cloned: 3,
+                bytes_cloned: 10,
                 ..CopyStats::default()
             }
             .placement_mode(),
@@ -2451,12 +2839,55 @@ mod tests {
         assert_eq!(
             CopyStats {
                 files_copied: 3,
+                bytes_copied: 10,
                 files_cloned: 1,
+                bytes_cloned: 8,
                 ..CopyStats::default()
             }
             .placement_mode(),
             "copy-on-write where the filesystem allowed it"
         );
+    }
+
+    #[test]
+    fn checkpoint_label_records_exact_copy_on_write_mode_and_extent_counts() {
+        let cases = [
+            (
+                CopyStats::default(),
+                "Ephemeral copy: 0 file(s), 0 byte(s), no files (0 cloned byte(s) across 0 file(s))",
+            ),
+            (
+                CopyStats {
+                    files_copied: 3,
+                    bytes_copied: 10,
+                    ..CopyStats::default()
+                },
+                "Ephemeral copy: 3 file(s), 10 byte(s), full copy (0 cloned byte(s) across 0 file(s))",
+            ),
+            (
+                CopyStats {
+                    files_copied: 3,
+                    bytes_copied: 10,
+                    files_cloned: 3,
+                    bytes_cloned: 10,
+                    skipped: 0,
+                },
+                "Ephemeral copy: 3 file(s), 10 byte(s), copy-on-write (10 cloned byte(s) across 3 file(s))",
+            ),
+            (
+                CopyStats {
+                    files_copied: 3,
+                    bytes_copied: 10,
+                    files_cloned: 1,
+                    bytes_cloned: 8,
+                    skipped: 0,
+                },
+                "Ephemeral copy: 3 file(s), 10 byte(s), copy-on-write where the filesystem allowed it (8 cloned byte(s) across 1 file(s))",
+            ),
+        ];
+        for (stats, expected) in cases {
+            assert_eq!(sandbox_copy_checkpoint_label(&stats), expected);
+        }
     }
 
     #[test]
