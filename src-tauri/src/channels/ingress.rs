@@ -313,7 +313,10 @@ mod tests {
         let mut collapsing = route();
         collapsing.target.session_scope = SessionScope::Conversation;
         let per_conversation = ConversationIngress::from_channel(&threaded, &collapsing);
-        assert_eq!(per_conversation.session_key, "channel:telegram:acct-1:chat-7");
+        assert_eq!(
+            per_conversation.session_key,
+            "channel:telegram:acct-1:chat-7"
+        );
     }
 
     #[test]

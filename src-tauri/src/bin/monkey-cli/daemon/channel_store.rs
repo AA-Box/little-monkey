@@ -935,6 +935,25 @@ impl DaemonStore {
             .map_err(|error| error.to_string())
     }
 
+    /// The payload of a message we sent, looked up by the id the provider gave
+    /// it. Used by the inbound path to tell a reply to our own message from a
+    /// fresh one, which is how an automated exchange gets a depth at all.
+    pub fn sent_outbox_payload(
+        &self,
+        account_id: &str,
+        provider_message_id: &str,
+    ) -> Result<Option<String>, String> {
+        self.connection
+            .query_row(
+                "SELECT payload_json FROM channel_outbox
+                 WHERE account_id=?1 AND provider_message_id=?2 AND state='sent'",
+                params![account_id, provider_message_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
     // -- Cursors -------------------------------------------------------------
 
     pub fn channel_cursor(&self, account_id: &str, key: &str) -> Result<Option<String>, String> {

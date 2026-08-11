@@ -72,7 +72,10 @@ fn neutralize_model_control_tokens(value: &str) -> String {
         .into_owned()
 }
 
-fn wrap_untrusted_content(source: &str, content: &str) -> String {
+/// Visible to the rest of the binary because every path that turns externally
+/// supplied text into model input has to use this one — the channel ingress path
+/// wraps a stranger's message with it before it can become a run parameter.
+pub(crate) fn wrap_untrusted_content(source: &str, content: &str) -> String {
     let safe_source: String = neutralize_model_control_tokens(source)
         .replace('\r', " ")
         .replace('\n', " ")
