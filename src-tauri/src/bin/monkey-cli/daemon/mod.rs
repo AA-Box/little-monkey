@@ -4,7 +4,7 @@ mod ledger;
 mod remote;
 mod scheduler;
 mod service;
-mod store;
+pub(crate) mod store;
 mod trigger;
 mod webhook;
 mod workflow_trigger;
