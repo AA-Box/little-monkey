@@ -28,28 +28,25 @@ Every surface shares one set of contracts — workspace, permission, run, model,
 ## How it fits together
 
 ```mermaid
-flowchart TB
+flowchart LR
     subgraph S["Surfaces"]
-        direction LR
-        D["Desktop app<br/><i>Tauri 2 · React</i>"]
-        C["monkey CLI<br/><i>chat · REPL · ACP</i>"]
-        B["Background daemon<br/><i>recipes · triggers</i>"]
-        R["Remote and mobile<br/><i>paired, scoped</i>"]
+        D["Desktop app"]
+        C["monkey CLI"]
+        B["Background daemon"]
+        R["Remote and mobile"]
     end
 
-    subgraph K["Shared contracts — one implementation each"]
-        direction LR
-        P["Permission gate<br/><i>six modes · risk floor</i>"]
-        L["Run ledger and process table<br/><i>ten kinds · hash-chained</i>"]
-        E["Egress policy<br/><i>per run · named rules</i>"]
-        W["Workspace boundary<br/><i>kernel-confined shells</i>"]
+    subgraph K["Shared contracts"]
+        P["Permission gate"]
+        L["Run ledger and process table"]
+        E["Per-run egress policy"]
+        W["Workspace boundary"]
     end
 
     subgraph X["Execution"]
-        direction LR
-        M["Managed llama.cpp<br/>Ollama · MLX"]
-        G["sd-server · llama-tts<br/><i>image · video · speech</i>"]
-        V["Cloud / BYOK<br/><i>OpenAI-compatible</i>"]
+        M["llama.cpp · Ollama · MLX"]
+        G["sd-server · llama-tts"]
+        V["Cloud / BYOK providers"]
     end
 
     S --> K --> X
