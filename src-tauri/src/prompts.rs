@@ -132,6 +132,10 @@ fn record_revisions(
     payload: &str,
     base_revision_id: Option<String>,
 ) -> Result<String, String> {
+    // One id for the whole save — the library revision and every changed
+    // entry's revision are one change, and `config_revisions::changes` can only
+    // say so if they were written saying so.
+    let change_id = config_revisions::new_change_id();
     let library = config_revisions::record(
         root,
         LIBRARY_REVISION_KIND,
@@ -141,6 +145,7 @@ fn record_revisions(
             base_revision_id,
             label: "Saved".to_string(),
             content: payload.to_string(),
+            change_id: Some(change_id.clone()),
         },
     )
     .map_err(|e| e.to_string())?;
@@ -165,6 +170,7 @@ fn record_revisions(
                 base_revision_id: None,
                 label,
                 content: entry_snapshot(&entry),
+                change_id: Some(change_id.clone()),
             },
         );
     }

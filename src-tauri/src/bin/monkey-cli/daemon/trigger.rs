@@ -16,8 +16,9 @@ use super::store::DaemonStore;
 /// Profile-scoped (K23): the default profile keeps this exact service name,
 /// so credentials stored before profiles existed still resolve, and any other
 /// profile's secrets are a different keychain item entirely.
-static WEBHOOK_KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| little_monkey_lib::profiles::keychain_service("com.littlemonkey.daemon-webhooks"));
+static WEBHOOK_KEYCHAIN_SERVICE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    little_monkey_lib::profiles::keychain_service("com.littlemonkey.daemon-webhooks")
+});
 
 pub const MAX_WEBHOOK_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_SIGNATURE_SKEW_MS: u64 = 5 * 60 * 1_000;

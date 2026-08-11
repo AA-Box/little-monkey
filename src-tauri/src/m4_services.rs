@@ -2661,6 +2661,7 @@ impl WorkflowService {
                 base_revision_id: None,
                 label: format!("Saved v{}", definition.workflow_version),
                 content,
+                change_id: Some(crate::config_revisions::new_change_id()),
             },
         );
     }

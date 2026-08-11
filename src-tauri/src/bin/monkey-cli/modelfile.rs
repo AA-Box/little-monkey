@@ -174,8 +174,7 @@ mod tests {
              MESSAGE user hi\nMESSAGE assistant hello\n",
         )
         .unwrap();
-        let request =
-            to_create_request(parsed, "my-model", Some("q4_K_M".to_string())).unwrap();
+        let request = to_create_request(parsed, "my-model", Some("q4_K_M".to_string())).unwrap();
 
         assert_eq!(request.quantize.as_deref(), Some("q4_K_M"));
         assert_eq!(request.messages.unwrap().len(), 2);

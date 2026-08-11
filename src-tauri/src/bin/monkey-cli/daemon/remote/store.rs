@@ -13,8 +13,9 @@ use super::protocol::{
 /// Profile-scoped (K23): the default profile keeps this exact service name,
 /// so credentials stored before profiles existed still resolve, and any other
 /// profile's secrets are a different keychain item entirely.
-static REMOTE_KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| little_monkey_lib::profiles::keychain_service("com.littlemonkey.remote"));
+static REMOTE_KEYCHAIN_SERVICE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    little_monkey_lib::profiles::keychain_service("com.littlemonkey.remote")
+});
 
 const REMOTE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS pairing_invitations (

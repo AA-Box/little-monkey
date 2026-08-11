@@ -1201,9 +1201,14 @@ pub(crate) fn workspace_shell_policy(
         .iter()
         .find(|(key, _)| key == "PATH")
         .map(|(_, value)| OsStr::new(value));
-    let trusted_path = trusted_shell_path_entries(inherited_path, real_home.as_deref(), workspace_root);
+    let trusted_path =
+        trusted_shell_path_entries(inherited_path, real_home.as_deref(), workspace_root);
     let trusted_path = std::env::join_paths(&trusted_path).unwrap_or_default();
-    set_env_value(&mut env, "PATH", trusted_path.to_string_lossy().into_owned());
+    set_env_value(
+        &mut env,
+        "PATH",
+        trusted_path.to_string_lossy().into_owned(),
+    );
     let path_env = env
         .iter()
         .find(|(key, _)| key == "PATH")
@@ -3405,8 +3410,7 @@ mod tests {
         .expect("join PATH");
 
         let canonical_home = plain_canonical(&home).unwrap();
-        let entries =
-            trusted_shell_path_entries(Some(&joined), Some(&canonical_home), &workspace);
+        let entries = trusted_shell_path_entries(Some(&joined), Some(&canonical_home), &workspace);
         assert!(entries.contains(&plain_canonical(&workspace_bin).unwrap()));
         assert!(entries.contains(&plain_canonical(&cargo_bin).unwrap()));
         assert!(!entries.contains(&plain_canonical(&ambient_secret).unwrap()));
