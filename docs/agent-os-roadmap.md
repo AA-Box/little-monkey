@@ -2191,9 +2191,10 @@ deny-by-default and nothing here is keyed to a run.
   strings, so a refusal must not log the whole URL.
 - **A ratcheting source-scan test** pins the remaining bare `Client::new()` sites
   per file, so a new one fails `cargo test` with a message naming
-  `egress::hardened()`. Bare production sites went from 13 to 8. Not clippy: this
-  repo has no `clippy.toml`, no `[lints]`, and CI never invokes clippy, so a lint
-  would have enforced nothing.
+  `egress::hardened()`. ~~Bare production sites went from 13 to 8.~~ **That
+  number was wrong and so was the scan under it — see the correction below.** Not
+  clippy: this repo has no `clippy.toml`, no `[lints]`, and CI never invokes
+  clippy, so a lint would have enforced nothing.
 - **The ~12 loopback-only clients were deliberately left alone.** They are not
   egress targets, and custom providers at `http://127.0.0.1:1234/v1` (LM Studio,
   vLLM, LiteLLM) are a supported configuration — any public-only or cleartext-refusing
@@ -2570,11 +2571,12 @@ rename:
   produces. Changing it changes which chains this app accepts in exchange for nothing —
   the definition of churn. Recorded as deliberate divergence, like the four blocklists.
 
-  **The one real residue is the ratchet blind spot**, and it is a property of the
+  ~~**The one real residue is the ratchet blind spot**, and it is a property of the
   scanner rather than of this file: `Client::builder()` is not the string the
   bare-client scan looks for. That is worth fixing in the *scan* if it is worth fixing
   at all — a file that sets `connect_timeout`, `read_timeout`, a hop cap and a per-hop
-  SSRF check is not the risk the ratchet was built to catch.
+  SSRF check is not the risk the ratchet was built to catch.~~ **Fixed, and the
+  blind spot was twice the size that paragraph thought — see below.**
 
 **Shipped — the two unbounded download clients no longer hang on a silent peer.**
 Both set a silence budget now. `model_sources.rs`'s was the worst outbound site in
@@ -3240,6 +3242,47 @@ action. This is intentionally stricter than "shell network follows the allowlist
 child-created host or network socket endpoint is allowed, including loopback or one a background
 process opens after its originating turn ends. The resulting shell incompatibilities are recorded
 under K3 and in README rather than hidden behind the word "egress".
+
+**Shipped — the ratchet now counts both spellings, and correcting it found a
+second hole underneath the first.**
+
+The scan looked for the literal `Client::new()`. `Client::builder()` — the other
+way this tree constructs a client, and the more common one — was invisible to it.
+The entry above said the blind spot was worth fixing "if it is worth fixing at
+all"; it was, because the number it was protecting was fiction three times over.
+
+- **The counts were wrong in the prose and in the table, differently.** The bullet
+  above says "13 to 8"; the test's own `ALLOWED` table pinned **5**, in four
+  files. The tree holds **35** construction sites across 22 files: 5 bare and
+  **30** hand-built. An entry whose subject is wrong counts carried a wrong count
+  for the thing doing the counting.
+- **`production_half` was the second hole, and it was in `egress.rs` itself.** It
+  split each file at the *first* `\n#[cfg(test)]` and discarded everything after,
+  on the recorded grounds that no file had production code past its test module.
+  This file has two test modules with production code between and after them, so
+  the scan never read its own last 3,200 lines — including `refusal_error`'s
+  client — and in `server.rs` it never read `bounded_loopback_client`. Two
+  production sites invisible, in the two files most about egress. It cost nothing
+  only because neither spelled the bare constructor. Each `#[cfg(test)]` block is
+  now dropped individually, and the recogniser deliberately over-counts (a
+  `#[cfg(test)] use` stays in): an over-count fails loudly and earns a note, an
+  under-count is the defect the module exists to prevent.
+- **Pinning a builder is not blessing it.** Most of the 30 are deliberate and
+  several are *stricter* than `hardened()` — the daemon's remote-runner client
+  pins the peer certificate, `m3_runtime_hub.rs` and `connectors.rs` take
+  `redirect::Policy::none()`. Several are bounded a layer up instead of at the
+  client (`run_bounded`, `RuntimeOperationLimits`, the component hub's
+  `timeout_ms`), and `model_sources.rs`/`models.rs` are the cross-host download
+  case argued above. Each entry carries which of those it is, so a new one has to
+  be argued for in the table rather than arriving silently.
+- **The failure names the file that moved.** The old message asked a reader to
+  diff two 22-line vectors by eye. Verified by adding a builder to `verify.rs`:
+  `client construction outside egress::hardened() changed in: verify.rs`.
+
+Still not caught, and stated rather than glossed: whether a hand-built chain's
+budget is *proportionate*. That is `no_new_total_request_deadline_can_be_added_unnoticed`'s
+question, and the two ratchets deliberately keep separate verdicts — a site can be
+legitimately hand-built and still carry the wrong kind of deadline.
 
 **Blocks:** K17 — placing a run on a remote node is only safe if the run's
 egress travels with it.
