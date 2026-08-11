@@ -1946,10 +1946,7 @@ impl RuntimeAdapterM3Driver {
         context: &M3OperationContext,
     ) -> M3HubResult<RuntimeOperationContext> {
         context.preflight("runtime operation")?;
-        let limits = RuntimeOperationLimits {
-            timeout_ms: context.timeout_ms,
-            ..RuntimeOperationLimits::default()
-        };
+        let limits = RuntimeOperationLimits::with_timeout_ms(context.timeout_ms);
         limits.validate().map_err(runtime_error)?;
         Ok(RuntimeOperationContext::new(
             limits,

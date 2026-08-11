@@ -1791,10 +1791,7 @@ impl CapabilityCheckedInferenceEngine {
         request: &CanonicalInferenceRequest,
         context: &M3OperationContext,
     ) -> M3HubResult<()> {
-        let limits = RuntimeOperationLimits {
-            timeout_ms: context.timeout_ms,
-            ..RuntimeOperationLimits::default()
-        };
+        let limits = RuntimeOperationLimits::with_timeout_ms(context.timeout_ms);
         let runtime_context = RuntimeOperationContext::new(limits, context.cancellation.clone());
         let inventory = self
             .adapter
@@ -1845,10 +1842,7 @@ impl CapabilityCheckedInferenceEngine {
         request: &CanonicalEmbeddingRequest,
         context: &M3OperationContext,
     ) -> M3HubResult<()> {
-        let limits = RuntimeOperationLimits {
-            timeout_ms: context.timeout_ms,
-            ..RuntimeOperationLimits::default()
-        };
+        let limits = RuntimeOperationLimits::with_timeout_ms(context.timeout_ms);
         let runtime_context = RuntimeOperationContext::new(limits, context.cancellation.clone());
         let inventory = self
             .adapter
@@ -3248,10 +3242,7 @@ impl ProductionMlxServiceController {
     }
 
     fn runtime_context(context: &MlxOperationContext) -> RuntimeOperationContext {
-        let limits = RuntimeOperationLimits {
-            timeout_ms: context.timeout_ms,
-            ..RuntimeOperationLimits::default()
-        };
+        let limits = RuntimeOperationLimits::with_timeout_ms(context.timeout_ms);
         RuntimeOperationContext::new(limits, context.cancellation.clone())
     }
 

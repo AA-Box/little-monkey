@@ -279,6 +279,27 @@ impl Default for RuntimeOperationLimits {
 }
 
 impl RuntimeOperationLimits {
+    /// Default limits carrying a caller's deadline, clamped into this module's
+    /// own hard caps.
+    ///
+    /// Every caller derives `timeout_ms` from a request deadline set for a
+    /// different purpose — the compatibility listener's `REQUEST_TIMEOUT_MS` is
+    /// 30 minutes, sized for a streaming completion, against an
+    /// `ABSOLUTE_MAX_TIMEOUT_MS` of 15. Building the limits by hand let that
+    /// difference decide the call: the one site that validated turned every
+    /// adapter-backed runtime into `SourceUnavailable`, and the three that did
+    /// not silently ran past the cap. Both are the same mistake, which is why
+    /// the clamp lives here rather than at four call sites.
+    ///
+    /// A caller asking for longer means "no longer than this", never "fail the
+    /// call", so the cap is applied rather than reported.
+    pub fn with_timeout_ms(timeout_ms: u64) -> Self {
+        Self {
+            timeout_ms: timeout_ms.clamp(1, ABSOLUTE_MAX_TIMEOUT_MS),
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> RuntimeAdapterResult<()> {
         let valid = self.timeout_ms > 0
             && self.timeout_ms <= ABSOLUTE_MAX_TIMEOUT_MS
@@ -4307,6 +4328,50 @@ fn validate_offload_plan_input(input: &OffloadPlanInput) -> RuntimeAdapterResult
 
 #[cfg(test)]
 mod tests {
+    /// The compatibility listener's own request deadline must survive the trip
+    /// into an adapter, because it is twice this module's hard cap.
+    ///
+    /// It did not. `REQUEST_TIMEOUT_MS` is 30 minutes and
+    /// `ABSOLUTE_MAX_TIMEOUT_MS` is 15, so the hub's `runtime_context` — the
+    /// one of four sites that validated what it built — refused every
+    /// adapter-backed operation, and `M3RuntimeCatalogSource::list_models`
+    /// turned that refusal into `SourceUnavailable`. A real Ollama or MLX
+    /// runtime registered in the hub answered `/v1/models` with an empty list
+    /// and `/v1/chat/completions` with a 502, on a daemon that returned its
+    /// inventory in five milliseconds. Ten harness routes stayed green
+    /// throughout: their mock drivers never build these limits.
+    ///
+    /// The number is spelled out rather than imported so that raising either
+    /// constant has to come past this test.
+    #[test]
+    fn a_listener_sized_deadline_survives_the_trip_into_an_adapter() {
+        const LISTENER_REQUEST_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
+        assert!(
+            LISTENER_REQUEST_TIMEOUT_MS > ABSOLUTE_MAX_TIMEOUT_MS,
+            "this test is pointless unless the listener asks for longer than the cap"
+        );
+
+        let limits = RuntimeOperationLimits::with_timeout_ms(LISTENER_REQUEST_TIMEOUT_MS);
+        assert_eq!(limits.timeout_ms, ABSOLUTE_MAX_TIMEOUT_MS);
+        limits
+            .validate()
+            .expect("a clamped deadline is within the caps by construction");
+
+        // Zero is the other end, and it is the shape that fails validation
+        // rather than merely exceeding it — a caller with no time left must not
+        // become a call with an unbounded one.
+        let floored = RuntimeOperationLimits::with_timeout_ms(0);
+        assert_eq!(floored.timeout_ms, 1);
+        floored
+            .validate()
+            .expect("a floored deadline is still valid");
+
+        // A deadline already inside the caps is carried through untouched.
+        let ordinary = RuntimeOperationLimits::with_timeout_ms(DEFAULT_OPERATION_TIMEOUT_MS);
+        assert_eq!(ordinary.timeout_ms, DEFAULT_OPERATION_TIMEOUT_MS);
+        ordinary.validate().expect("the default is within the caps");
+    }
+
     fn cuda_pair() -> AcceleratorCapability {
         AcceleratorCapability {
             kind: AcceleratorKind::Cuda,
