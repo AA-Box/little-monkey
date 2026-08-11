@@ -216,12 +216,12 @@ pub fn apply_std(limits: ChildLimits, command: &mut std::process::Command) {
 
 /// No-op on Windows, which has no `setrlimit`.
 ///
-/// The Windows equivalent is a **job object** (`SetInformationJobObject` with
-/// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`), which bounds committed memory, CPU
-/// time and process count for a whole tree and would cover more of K4 than
-/// `setrlimit` does on unix. It is not built. This is a deliberate no-op rather
-/// than an error so the call sites read the same on every platform, and the gap
-/// is recorded in the roadmap instead of being hidden behind a silent success.
+/// The Windows equivalent is a job object. Live and disposable shell paths use
+/// one through `sandbox_windows`, whose suspended `CreateProcessW` path assigns
+/// the child before its first instruction and owns the handle for the child's
+/// lifetime. This generic `Command` adapter cannot provide that atomic spawn or
+/// return the owned job handle, so verify and hook callers remain without a job
+/// rather than receiving a post-spawn assignment with a descendant escape race.
 #[cfg(windows)]
 pub fn apply(_limits: ChildLimits, _command: &mut tokio::process::Command) {}
 

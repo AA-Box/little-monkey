@@ -212,9 +212,10 @@ const WORKSPACE_PROFILE_POLICY_VERSION: &[u8] = b"workspace-shell-authority-v2";
 /// An owned job object. Dropping it kills every process still inside.
 ///
 /// The kill-on-close flag makes the handle's lifetime the containment's
-/// lifetime, so this must be held for as long as the child may run — see
-/// `execute_in_sandbox`, which binds it beside the child and lets both fall at
-/// the end of the same scope.
+/// lifetime, so this must be held for as long as the child may run. Disposable
+/// sandbox execution holds it beside the awaited child; live foreground,
+/// background, and CLI shells transfer it into [`ConfinedChild`], which owns it
+/// until that child's actual lifecycle ends.
 #[derive(Debug)]
 pub struct JobConfinement {
     handle: HANDLE,
@@ -222,7 +223,7 @@ pub struct JobConfinement {
 
 // The handle is owned outright and only ever passed to job-object syscalls,
 // which take it by value and are themselves thread-safe. Needed because the
-// value is held across an `await` in `execute_in_sandbox`.
+// value is held across awaits and by long-lived background shell owners.
 unsafe impl Send for JobConfinement {}
 unsafe impl Sync for JobConfinement {}
 
