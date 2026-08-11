@@ -90,6 +90,9 @@ jobs:
       # Keep target/ small enough for the 14 GB hosted-runner disk
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
+      # Linux and Windows must run the native clone path, not silently exercise
+      # only its ordinary-copy fallback.
+      LITTLE_MONKEY_REQUIRE_COW_TESTS: 1
 
     steps:
       - uses: actions/checkout@v4
@@ -104,7 +107,7 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential dbus-x11 gnome-keyring
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential dbus-x11 gnome-keyring btrfs-progs
 
       - name: Start a D-Bus Secret Service for keychain-backed tests
         if: startsWith(matrix.os, 'ubuntu')
@@ -133,6 +136,49 @@ jobs:
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
+
+      - name: Provision Linux reflink test volume
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          image="$RUNNER_TEMP/little-monkey-btrfs.img"
+          root="$RUNNER_TEMP/little-monkey-btrfs"
+          truncate -s 512M "$image"
+          sudo modprobe btrfs
+          mkfs.btrfs -q "$image"
+          mkdir -p "$root"
+          sudo mount -o loop "$image" "$root"
+          sudo chown "$USER:$(id -gn)" "$root"
+          echo "LITTLE_MONKEY_COW_TEST_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: Provision Windows ReFS test volume
+        if: startsWith(matrix.os, 'windows')
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Test-Path "R:\") {
+            throw "R: is already in use"
+          }
+          $image = Join-Path $env:RUNNER_TEMP "little-monkey-refs.vhdx"
+          $diskpartScript = Join-Path $env:RUNNER_TEMP "little-monkey-refs.txt"
+          @"
+          create vdisk file="$image" maximum=2048 type=expandable
+          select vdisk file="$image"
+          attach vdisk
+          create partition primary
+          format fs=refs quick label=LITTLEMONKEY
+          assign letter=R
+          "@ | Set-Content -Path $diskpartScript -Encoding ascii
+          & diskpart /s $diskpartScript
+          if ($LASTEXITCODE -ne 0) {
+            throw "diskpart failed with exit code $LASTEXITCODE"
+          }
+          $root = "R:\little-monkey-cow-tests"
+          $volume = Get-Volume -DriveLetter R -ErrorAction Stop
+          if ($volume.FileSystem -ne "ReFS") {
+            throw "R: is $($volume.FileSystem), not ReFS"
+          }
+          New-Item -ItemType Directory -Force $root | Out-Null
+          "LITTLE_MONKEY_COW_TEST_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Rust tests
         run: pnpm test:rust
