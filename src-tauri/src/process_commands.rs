@@ -198,10 +198,32 @@ pub struct ProcessAdmitArgs {
 ///
 /// Split out of the command so it can be asserted without an `AppHandle`, the
 /// same reason `verify.rs` tests `run_command_impl` rather than its wrapper.
+/// Drop a caller's value for a field this kind's owner will not read.
+///
+/// K4's contract: a positive value may be recorded only when its owner enforces
+/// it or that limit is reported unavailable. `merged_limits` used to `or` the
+/// caller's value over the class default for every field, so an IPC caller could
+/// put a memory ceiling on a chat turn or a child-process ceiling on anything,
+/// and the row would carry a bound nothing consults. The class default is kept
+/// either way — it is written by the same code that enforces it — but a caller
+/// value survives only where [`ProcessKind::limit_support`] says the owner reads
+/// this row's field.
+fn caller_value<T>(
+    kind: ProcessKind,
+    limit: crate::process_table::ProcessLimitKind,
+    stated: Option<T>,
+) -> Option<T> {
+    match kind.limit_support(limit).honours_caller_value() {
+        true => stated,
+        false => None,
+    }
+}
+
 fn merged_limits(
     kind: ProcessKind,
     args: &ProcessAdmitArgs,
 ) -> crate::process_table::ProcessLimits {
+    use crate::process_table::ProcessLimitKind as L;
     let class = kind.default_limits();
     crate::process_table::ProcessLimits {
         // The one field with an explicit opt-out, because it is the one with a
@@ -209,15 +231,22 @@ fn merged_limits(
         // `max_wall_ms` too: a caller that says both has contradicted itself, and
         // "no budget" is the safer of the two readings — it declares less rather
         // than enforcing something nobody asked for.
+        // `unbounded_wall` is honoured for every kind, unlike a stated value:
+        // turning a budget *off* declares less rather than more, so it cannot
+        // manufacture a bound nobody enforces.
         max_wall_ms: if args.unbounded_wall.unwrap_or(false) {
             None
         } else {
-            args.max_wall_ms.or(class.max_wall_ms)
+            caller_value(kind, L::Wall, args.max_wall_ms).or(class.max_wall_ms)
         },
-        max_memory_bytes: args.max_memory_bytes.or(class.max_memory_bytes),
-        max_output_bytes: args.max_output_bytes.or(class.max_output_bytes),
-        max_child_processes: args.max_child_processes.or(class.max_child_processes),
-        max_context_tokens: args.max_context_tokens.or(class.max_context_tokens),
+        max_memory_bytes: caller_value(kind, L::Memory, args.max_memory_bytes)
+            .or(class.max_memory_bytes),
+        max_output_bytes: caller_value(kind, L::Output, args.max_output_bytes)
+            .or(class.max_output_bytes),
+        max_child_processes: caller_value(kind, L::ChildProcesses, args.max_child_processes)
+            .or(class.max_child_processes),
+        max_context_tokens: caller_value(kind, L::ContextTokens, args.max_context_tokens)
+            .or(class.max_context_tokens),
     }
 }
 
@@ -893,6 +922,51 @@ mod tests {
                 &args(ProcessKind::BackgroundShell.as_str())
             ),
             ProcessKind::BackgroundShell.default_limits()
+        );
+    }
+
+    /// K4's contract at the boundary that used to leak it: a caller may not
+    /// record a bound this kind's owner will not read.
+    ///
+    /// Before this, `process_admit` `or`-ed every stated field over the class
+    /// default, so an IPC caller could put a 512 MiB ceiling and a 4-process
+    /// ceiling on a chat turn. Nothing on any platform consults either, so the
+    /// row advertised containment that did not exist — to the run dashboard, to
+    /// `monkey processes show`, and to anyone auditing what this app promised.
+    #[test]
+    fn a_caller_cannot_record_a_bound_whose_owner_will_not_read_it() {
+        let mut overreaching = args("chat_turn");
+        overreaching.max_memory_bytes = Some(512 * 1024 * 1024);
+        overreaching.max_child_processes = Some(4);
+        overreaching.max_output_bytes = Some(1_024);
+
+        let merged = merged_limits(ProcessKind::ChatTurn, &overreaching);
+        assert_eq!(merged.max_memory_bytes, None, "no memory mechanism exists");
+        assert_eq!(merged.max_child_processes, None, "no pids mechanism exists");
+        assert_eq!(
+            merged.max_output_bytes, None,
+            "a chat turn captures no output stream of its own"
+        );
+        // The field its owner *does* read is untouched by the same call.
+        assert_eq!(merged.max_wall_ms, Some(WEBVIEW_WALL_BUDGET_MS));
+
+        // A real bound whose number belongs to the owner is refused too: the
+        // daemon enforces memory from the job's own recipe, and a caller value
+        // would be replaced on the next projection rather than honoured.
+        let mut daemon = args("daemon_job");
+        daemon.max_memory_bytes = Some(1_024);
+        assert_eq!(
+            merged_limits(ProcessKind::DaemonJob, &daemon).max_memory_bytes,
+            None
+        );
+
+        // And the one desktop kind that reads a caller value for output keeps
+        // it, so this is a contract rather than a blanket refusal.
+        let mut shell = args("background_shell");
+        shell.max_output_bytes = Some(4_096);
+        assert_eq!(
+            merged_limits(ProcessKind::BackgroundShell, &shell).max_output_bytes,
+            Some(4_096)
         );
     }
 
