@@ -1,6 +1,9 @@
 mod admission;
+pub(crate) mod adapters;
+pub(crate) mod channel_adapter;
 pub(crate) mod channel_ingress;
 pub(crate) mod channel_store;
+pub(crate) mod channel_worker;
 mod engine;
 mod ledger;
 mod remote;
@@ -808,6 +811,50 @@ pub(crate) fn queue_mobile_chat_recipe(
         &mut shared,
         options,
     )
+}
+
+/// Production implementation of the channel worker's run seam.
+///
+/// Opens its own handles per submission rather than holding them, because the
+/// inbound loop can sit idle for hours between messages and a long-lived
+/// connection to the ledger buys nothing over that interval.
+pub(crate) struct DaemonChannelQueue {
+    paths: DaemonPaths,
+}
+
+impl DaemonChannelQueue {
+    pub(crate) fn new(paths: DaemonPaths) -> Self {
+        Self { paths }
+    }
+}
+
+impl channel_worker::RunQueue for DaemonChannelQueue {
+    fn submit(
+        &self,
+        ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
+        params: Vec<String>,
+    ) -> Result<String, String> {
+        let config = DaemonConfig::load(&self.paths).map_err(|error| {
+            format!("The Little Monkey background runner is not configured: {error}")
+        })?;
+        let mut store = DaemonStore::open(&self.paths)?;
+        if store.kill_switch()? {
+            return Err("Global kill switch is engaged; the message was not run".to_string());
+        }
+        let mut shared = SharedLedger::open(&self.paths.ledger_db)?;
+        let options = channel_ingress::queue_options_for(ingress, params);
+        let global_config_roots = global_config_roots_for_paths(&self.paths)?;
+        enqueue(
+            None,
+            &self.paths,
+            &global_config_roots,
+            &config,
+            &mut store,
+            &mut shared,
+            options,
+        )
+        .map(|queued| queued.job_id)
+    }
 }
 
 /// Production implementation of the remote API's mobile chat seam.

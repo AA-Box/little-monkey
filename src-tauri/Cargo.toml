@@ -172,6 +172,11 @@ ring = "0.17.14"
 # reqwest, so this only makes the server-side API available to the binary.
 tokio-rustls = "0.26.4"
 rustls = "0.23.41"
+# daemon/adapters: Discord's gateway, Slack's Socket Mode and Mattermost's event
+# socket are all plain WebSocket over TLS, so one client covers three providers.
+# Pinned to the rustls backend already resolved above rather than pulling a
+# second TLS stack in behind it.
+tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 # knowledge_adapters.rs: bounded, inert Office Open XML extraction. These are
 # already locked transitively in this workspace; making them direct lets the
 # app decode ZIP/Deflate containers and stream XML without executing macros,

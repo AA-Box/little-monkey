@@ -237,9 +237,7 @@ pub(crate) fn plan_channel_ingress_with(
 }
 
 /// Production entry point: the same planner with a real CSPRNG behind the
-/// pairing code. The provider adapters are its callers; until the first of them
-/// lands, only the deterministic form above has one.
-#[allow(dead_code)]
+/// pairing code.
 pub(crate) fn plan_channel_ingress(
     store: &mut DaemonStore,
     envelope: &ChannelEnvelope,
@@ -390,13 +388,20 @@ pub(super) fn queue_options_for(
     params: Vec<String>,
 ) -> super::QueueOptions {
     super::QueueOptions {
-        origin: QueueOrigin::Local,
+        // An external message is a request from off this machine, the same way
+        // a mobile turn is, so it is projected as one: the request and the job
+        // it queued stay distinguishable in the process listing.
+        origin: QueueOrigin::Remote {
+            request_id: ingress.dedupe_key(),
+        },
         recipe: ingress.target.recipe.clone(),
         params,
         deterministic_job_id: Some(ingress.deterministic_job_id()),
         priority: ingress.target.priority,
         max_attempts: 1,
-        max_runtime_ms: 7 * 24 * 60 * 60 * 1_000,
+        // Half an hour, matching the mobile turn. A conversation nobody is
+        // watching should not be able to hold a slot for a week.
+        max_runtime_ms: 30 * 60 * 1_000,
         max_memory_bytes: None,
         owned_worktree: false,
         repository: ingress.target.repository.as_ref().map(PathBuf::from),
@@ -407,7 +412,11 @@ pub(super) fn queue_options_for(
         allow_create_pull_request: false,
         allow_review_comment: false,
         parent_run_id: None,
-        snapshot_is_frozen: false,
+        // The route's recipe is the contract, used verbatim: its own system
+        // prompt and permission mode are what the operator configured for
+        // strangers, never merged with whatever rules sit in the daemon
+        // process's working directory.
+        snapshot_is_frozen: true,
     }
 }
 
