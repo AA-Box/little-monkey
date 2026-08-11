@@ -276,8 +276,9 @@ winreg = "0.56"
 # `Win32_Security_Isolation` is the AppContainer itself, `Win32_Security_Authorization`
 # the one ACE that grants it the sandbox root, and `Win32_System_Pipes` the
 # stdout/stderr pipes `run_confined` has to create by hand now that it calls
-# `CreateProcessW` directly.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+# `CreateProcessW` directly. `Win32_System_IO` and `Win32_System_Ioctl` expose
+# the ReFS block-clone request used by the per-run workspace staging tree.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [features]
 default = ["pdf-extraction"]

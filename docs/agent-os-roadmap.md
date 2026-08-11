@@ -3735,25 +3735,30 @@ the arbitration gap.
 
 # Phase 3 — Memory, namespace, and state
 
-## K10. Copy-on-write run namespace
+## K10. Copy-on-write run namespace *(built)*
 
-**Today:** `copy_workspace_into_sandbox` copies the workspace into the
-sandbox directory per run, and `diff_sandbox_against_workspace` diffs it back
-with an explicit prepare/execute promote path. Correct, reviewable, and
-linear in workspace size — which makes many concurrent runs on a large
-workspace expensive in both time and disk.
+**Today:** `copy_workspace_into_sandbox` builds a filtered disposable workspace
+per run with native copy-on-write extents where the source and sandbox share a
+capable volume, and a per-file full-copy fallback everywhere else.
+`diff_sandbox_against_workspace` diffs it back through the same explicit
+prepare/execute promote path; discard removes only the disposable tree.
 
-**Acceptance:** a run gets a copy-on-write view — overlayfs on Linux, APFS
-clone on macOS, a cloned or hard-linked staging tree on Windows — with a disk
-quota (K4) and the same promote/diff/discard semantics as today, byte-for-byte
+**Acceptance:** a run gets a copy-on-write view — reflink on Linux, APFS clone
+on macOS, and a ReFS block-cloned staging tree on Windows — with a disk quota
+(K4) and the same promote/diff/discard semantics as today, byte-for-byte
 identical outcomes verified against the copy implementation. Full copy remains
 the fallback when the filesystem cannot clone, and the mode used is recorded
-in the ledger.
+in the ledger. This corrects the earlier acceptance text's Windows hard-link
+option: a live hard link is not copy-on-write and a sandbox write through it
+would write the workspace.
 
-**Shipped — the macOS leg, copy-on-write per file, with the mode in the ledger.**
-`copy_workspace_into_sandbox` now clones each file through APFS `clonefile`
-where the filesystem allows it and copies it where it does not, so a sandbox on
-a large workspace costs metadata rather than bytes.
+**Shipped — per-file copy-on-write on macOS, Linux and Windows, with native CI
+proof and the exact mode in the ledger.** `sandbox.rs` keeps the existing
+workspace walk and selects one platform primitive per file: APFS `clonefile`,
+Linux `FICLONE`, or ReFS `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. `Cargo.toml` exposes
+only the two Windows API feature modules that ReFS needs, and `ci.yml` provisions
+a loop-backed btrfs volume on Linux and a disposable ReFS VHDX on Windows so
+those cfg-gated fast paths execute rather than merely compile.
 
 - **Per file, not per tree, and that is the correctness argument rather than a
   performance one.** `clonefile` can clone a whole directory in one call. It
@@ -3767,31 +3772,47 @@ a large workspace costs metadata rather than bytes.
   outcomes verified against the copy implementation" true rather than
   tested-and-hoped. It is also tested: one test builds the same fixture both
   ways and compares every path and every byte.
-- **A refusal is never an error.** No copy-on-write on this filesystem, a
-  cross-device destination, a destination that already exists — each means "copy
-  it the ordinary way", so full copy is the fallback at the granularity of a
-  single file rather than of the whole run.
-- **The mode is in the ledger**, on the `CheckpointLinked` event the sandbox
-  already appends, with the clone count beside the file and byte counts. Three
-  states and not two: an empty workspace reads as "no files", never as a
-  filesystem that refused to clone.
+- **A primitive refusal is a full-copy fallback, per file.** No copy-on-write on
+  this filesystem, a cross-volume destination, an uncloneable short ReFS file,
+  or any kernel refusal means "copy it the ordinary way." A partial destination
+  is closed and removed first; failure to remove it aborts placement rather than
+  copy over an ambiguous result. Linux and Windows CI also put source and
+  destination on different volumes and require that fallback to produce the
+  same bytes with zero cloned extents.
+- **ReFS's alignment rule is recorded rather than rounded away.** Windows clones
+  only the cluster-aligned prefix, in bounded ranges below the API limit, and
+  copies the final partial cluster. `CopyStats` therefore records cloned bytes
+  as well as cloned files: a partially cloned file is honestly "copy-on-write
+  where the filesystem allowed it," never a fully cloned file by convenient
+  arithmetic.
+- **The exact mode is in the ledger**, on the `CheckpointLinked` event the
+  sandbox already appends, with cloned byte and file counts beside the logical
+  file and byte counts. The factored label test pins all four answers: no files,
+  full copy, copy-on-write, and mixed placement.
 - **A clone is independent, and the test says so.** Writing through the sandbox
   copy must not reach back into the workspace. This is the property that rules
-  out the acceptance's own suggestion of a hard-linked staging tree on Windows:
-  a write through a hard link mutates the workspace file itself, which is the
-  one thing an ephemeral sandbox exists to prevent. It is not a deferral — it is
-  wrong for this use.
+  out the acceptance's former suggestion of a hard-linked staging tree on
+  Windows: a write through a hard link mutates the workspace file itself, which
+  is the one thing an ephemeral sandbox exists to prevent. It is not a deferral
+  — it is wrong for this use.
+- **Parity covers the lifecycle, not just initial placement.**
+  `cow_and_full_copy_have_identical_copy_diff_promote_and_discard_outcomes`
+  runs one fixture through the production clone strategy and a forced
+  `fs::copy` strategy, compares paths, bytes and permissions, then requires
+  identical sorted diffs, promote previews and digests, promoted file lists and
+  roots, and fallible discard outcomes. The native-platform test separately
+  requires real shared extents and bidirectional write isolation.
 
-**Remaining, and deliberately not guessed at.** Linux reflink (`FICLONE`, on
-btrfs and XFS) and Windows ReFS block cloning are both real and both absent:
-neither can be exercised on this project's machines, and an untested ioctl that
-silently degrades to a copy would look identical to the current code in every
-test while being harder to read. Overlayfs, which this acceptance names for
-Linux, needs mount privileges a desktop application does not have. The disk
-quota clause is K4's and is untouched here.
+**Correction to the former remaining note.** Linux reflink and Windows ReFS
+block cloning are no longer absent or unexercised. Overlayfs remains the wrong
+desktop primitive because constructing the mount requires privileges the app
+does not have; per-file `FICLONE` preserves the skip walk without them. The disk
+quota clause was always K4's and remains there rather than being half-built into
+this item.
 
-**Blocks:** K8 in practice — preempting and resuming runs is only affordable
-if their namespaces are cheap.
+**Blocks:** nothing now. The earlier K8 dependency was practical, and K8 is
+already built; cheap namespaces now satisfy that prerequisite where the
+workspace and sandbox storage share a clone-capable volume.
 
 ## K11. Context memory manager *(built)*
 
@@ -5747,6 +5768,6 @@ gap is K4's process-tree debt, not a process-tree claim smuggled into K3. The op
 is still optional; it is no longer the evidence for how agent shell tools execute.
 
 So the name still does not change. The former isolation blocker is closed, but the cut line is
-Phase 0–3, not one marquee mechanism, and Phase 3 still owes its remaining copy-on-write,
-tamper-evident, freeze/restore and transactional-effect work. "Agent runtime and control plane"
-remains the honest README name until those entries close.
+Phase 0–3, not one marquee mechanism. Copy-on-write, freeze/restore and transactional effects are
+built; Phase 3 still owes K12's remaining cross-store audit joins and allowed-egress evidence.
+"Agent runtime and control plane" remains the honest README name until those entries close.
