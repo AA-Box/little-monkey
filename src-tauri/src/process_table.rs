@@ -384,16 +384,15 @@ impl ProcessKind {
     ///
     /// A `None` here means this app genuinely does not bound that resource for
     /// that kind, and the row should say so rather than carry a number nothing
-    /// enforces. That is most of this table, and it is the honest state of K4:
-    /// the desktop-owned kinds have per-*tool* timeouts (`SHELL_TIMEOUT`,
-    /// `DEFAULT_VERIFY_TIMEOUT_SECS`) but no budget on the process that issues
-    /// them, so the turn itself is unbounded however many tools it runs.
+    /// enforces. Most fields remain absent. The four WebView kinds do carry the
+    /// configurable wall budget below, while their tools also have independent
+    /// call timeouts (`SHELL_TIMEOUT`, `DEFAULT_VERIFY_TIMEOUT_SECS`).
     ///
-    /// Deliberately not invented here: a wall-clock or memory number per kind
-    /// would be a guess presented as policy. Kernel enforcement now exists for
-    /// tool children ([`crate::os_limits`]), and what it taught is that choosing
-    /// a value is a judgement about what the process is *for* — see that module
-    /// for why `RLIMIT_CPU`, `NPROC`, `RSS` and `AS` are the wrong instruments.
+    /// Deliberately not invented here: a memory number per kind would be a guess
+    /// presented as policy. Kernel enforcement now exists for Unix tool children
+    /// ([`crate::os_limits`]) and as fixed Windows shell-job guardrails, but
+    /// neither supplies portable `ProcessLimits` semantics — see that module for
+    /// why `RLIMIT_CPU`, `NPROC`, `RSS` and `AS` are the wrong instruments.
     pub fn default_limits(self) -> ProcessLimits {
         match self {
             // The one desktop kind with a real, enforced ceiling: a backgrounded
@@ -631,10 +630,10 @@ fn upgrade_a_budget_kill(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessLimits {
-    /// Wall-clock budget. Enforced only for `daemon_job`, whose watchdog kills on
-    /// its own `max_runtime_ms`. No other kind bounds its own wall time — the
-    /// desktop kinds have per-*tool* timeouts, not a budget on the process that
-    /// issues the tools.
+    /// Wall-clock budget. Enforced by the daemon watchdog for `daemon_job`, the
+    /// WebView process sweep for chat/subagent/Crew/side-task loops, and the
+    /// browser-session watchdog. Other kinds leave it absent or use subsystem
+    /// budgets that are not represented by this field.
     pub max_wall_ms: Option<u64>,
     /// Resident memory ceiling. Enforced only for `daemon_job`, by a sampling
     /// watchdog that measures the whole process group.
@@ -642,8 +641,10 @@ pub struct ProcessLimits {
     /// Deliberately *not* enforced by `setrlimit`, which does exist now for tool
     /// children ([`crate::os_limits`]): `RLIMIT_RSS` is a no-op on Darwin and
     /// advisory on Linux, and `RLIMIT_AS` bounds virtual address space rather than
-    /// resident memory. Bounding this per process needs cgroups v2 or a Windows
-    /// job object, neither of which is built.
+    /// resident memory. `ProcessLimits`-backed enforcement would need delegated
+    /// cgroups v2 or class-derived Windows jobs. Windows shell jobs do exist, but
+    /// their fixed containment ceiling is deliberately not recorded as this
+    /// field or advertised as portable per-process policy.
     pub max_memory_bytes: Option<u64>,
     /// Captured output ceiling. Enforced for `daemon_job` (log-file size) and for
     /// `background_shell`, whose in-memory tail is front-truncated at this many
@@ -653,8 +654,9 @@ pub struct ProcessLimits {
     ///
     /// `RLIMIT_NPROC` cannot deliver this: it counts processes per real uid rather
     /// than per tree, so a value low enough to matter fails whenever the user's
-    /// own session is busy. This needs the cgroup `pids` controller or a job
-    /// object.
+    /// own session is busy. Portable field-backed enforcement needs the cgroup
+    /// `pids` controller or a class-derived job object; the fixed Windows shell
+    /// job ceiling is a narrower containment guardrail, not this declaration.
     pub max_child_processes: Option<u32>,
     /// Prompt-token ceiling for one request (roadmap K11). **Enforced**, for
     /// runtimes that can count exactly — today that is llama.cpp, via
@@ -670,11 +672,11 @@ pub struct ProcessLimits {
     /// # It ships enforced and unset
     ///
     /// Nothing picks a number: `default_limits` returns `None` for every kind and
-    /// no admit call site passes one, exactly as `processWallBudget.ts` describes
-    /// for the wall budget. The mechanism is live and fires for nobody until a
-    /// budget is configured, because a default here is a judgement about what a
-    /// conversation is *for* — too low silently ends long sessions that were
-    /// working fine — and that belongs to settings, not to a constant.
+    /// no admit call site passes one. Unlike the WebView wall budget, which now
+    /// has a configurable six-hour default, this mechanism is live and fires for
+    /// nobody until a context budget is configured. Choosing one is a judgement
+    /// about what a conversation is *for* — too low silently ends long sessions
+    /// that were working fine — and belongs to settings, not to a constant.
     pub max_context_tokens: Option<u64>,
 }
 
