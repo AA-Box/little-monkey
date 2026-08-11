@@ -1,4 +1,5 @@
 mod admission;
+pub(crate) mod channel_store;
 mod engine;
 mod ledger;
 mod remote;
