@@ -1,8 +1,9 @@
-mod admission;
 pub(crate) mod adapters;
+mod admission;
 pub(crate) mod channel_adapter;
 pub(crate) mod channel_ingress;
 pub(crate) mod channel_store;
+pub(crate) mod channel_tool;
 pub(crate) mod channel_worker;
 mod engine;
 mod ledger;

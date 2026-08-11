@@ -862,6 +862,35 @@ async fn execute_tool_call(
     // "only offered while mode==='plan'" boundary the GUI enforces via
     // `isToolCallAllowed`, just checked here at dispatch time instead of a
     // separate offered-tools allowlist.
+    // `send_message` answers the conversation this run came from. Checked here,
+    // before the `tool_<name>` dispatch, for the same reason `present_plan` is:
+    // it is not a Tauri command, and the guard belongs at dispatch time rather
+    // than in an offered-tools list a hallucinated name could slip past.
+    //
+    // Two gates, both refusing rather than asking:
+    // - the run's own permission snapshot must allow external mutation. A reply
+    //   leaves the machine and is not undoable, so a run that was not granted
+    //   that authority cannot acquire it by being asked nicely;
+    // - the destination comes from the durable event that produced this job, so
+    //   there is no argument for the model to redirect.
+    if name == "send_message" {
+        if !perms.allow_external_mutations() {
+            return serde_json::json!({
+                "error": "This run's permission snapshot does not allow sending messages outside this machine."
+            })
+            .to_string();
+        }
+        let text = args["text"].as_str().unwrap_or_default().to_string();
+        let preview: String = text.chars().take(120).collect();
+        return match perms.request("send_message", &preview).await {
+            Ok(()) => match crate::daemon::channel_tool::send_message(&text) {
+                Ok(value) => value.to_string(),
+                Err(error) => serde_json::json!({ "error": error }).to_string(),
+            },
+            Err(error) => serde_json::json!({ "error": error }).to_string(),
+        };
+    }
+
     if name == "present_plan" {
         return if perms.mode() != PermissionMode::Plan {
             serde_json::json!({ "error": "present_plan is only available in Plan Mode." })
@@ -1400,6 +1429,15 @@ async fn run_tool_loop(
     // turn rather than disappearing out from under an in-flight model reply.
     if perms.mode() == PermissionMode::Plan {
         tools_vec.push(tools_def::present_plan_tool_def());
+    }
+    // `send_message` is offered only on a run that arrived from a messaging
+    // conversation and was granted the authority to answer it. A run with no
+    // origin has nowhere to send anything, and one without the grant would only
+    // be offered a tool that refuses.
+    if perms.allow_external_mutations()
+        && crate::daemon::channel_tool::current_channel_origin().is_some()
+    {
+        tools_vec.push(tools_def::send_message_tool_def());
     }
     // `search_docs` is offered only when at least one `--stack` was given —
     // mirrors the desktop app's `buildTools(attachedStackNames)`, which only

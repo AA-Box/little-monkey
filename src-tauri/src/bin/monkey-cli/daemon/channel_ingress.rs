@@ -276,7 +276,10 @@ fn sender_authorization(stored: &StoredSenderAuthorization) -> SenderAuthorizati
 /// replies to something we sent, the chain continues at that message's depth
 /// plus one. Without reply metadata the answer is zero, which is the honest
 /// answer rather than a guess.
-fn inherited_reply_depth(store: &DaemonStore, envelope: &ChannelEnvelope) -> Result<u32, String> {
+pub(super) fn inherited_reply_depth(
+    store: &DaemonStore,
+    envelope: &ChannelEnvelope,
+) -> Result<u32, String> {
     let Some(reply_to) = envelope.reply_to_provider_id.as_deref() else {
         return Ok(0);
     };

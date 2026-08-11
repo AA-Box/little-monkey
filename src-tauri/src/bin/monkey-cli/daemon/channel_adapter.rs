@@ -143,7 +143,9 @@ impl ChannelSecrets for KeyringChannelSecrets {
     fn delete(&self, credential_ref: &str) -> Result<(), String> {
         match Self::entry(credential_ref)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(format!("Failed to delete the messaging credential: {error}")),
+            Err(error) => Err(format!(
+                "Failed to delete the messaging credential: {error}"
+            )),
         }
     }
 }

@@ -24,9 +24,7 @@ use little_monkey_lib::channels::ingress::ConversationIngress;
 use little_monkey_lib::channels::types::{ChannelEnvelope, SendOutcome};
 
 use super::channel_adapter::ChannelAdapter;
-use super::channel_ingress::{
-    self, IngressPlan, OutboxPayload, PlannedDecision,
-};
+use super::channel_ingress::{self, IngressPlan, OutboxPayload, PlannedDecision};
 use super::channel_store::{EventDirection, EventDisposition, NewChannelEvent};
 use super::store::DaemonStore;
 
@@ -189,7 +187,8 @@ pub(crate) async fn drain_outbox_once(
                 // provider echo against.
                 let _ = store.record_channel_event(&NewChannelEvent {
                     account_id: row.account_id.clone(),
-                    source: little_monkey_lib::channels::ingress::ConversationSource::MessagingChannel,
+                    source:
+                        little_monkey_lib::channels::ingress::ConversationSource::MessagingChannel,
                     direction: EventDirection::Outbound,
                     provider_event_id: provider_message_id
                         .clone()
@@ -392,7 +391,10 @@ mod tests {
             cursor: Some("42".to_string()),
         });
 
-        assert_eq!(store.channel_cursor("acct-1", POLL_CURSOR_KEY).unwrap(), None);
+        assert_eq!(
+            store.channel_cursor("acct-1", POLL_CURSOR_KEY).unwrap(),
+            None
+        );
         let report = poll_account_once(&mut store, &queue, "acct-1", &adapter, NOW)
             .await
             .expect("poll");
@@ -523,7 +525,10 @@ mod tests {
             .await
             .expect("drain");
         assert_eq!(report.retrying, 1);
-        assert!(store.claim_outbox_batch(NOW + 1_000, 10).unwrap().is_empty());
+        assert!(store
+            .claim_outbox_batch(NOW + 1_000, 10)
+            .unwrap()
+            .is_empty());
 
         let report = drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 6_000)
             .await

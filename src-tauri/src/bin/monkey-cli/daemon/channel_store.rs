@@ -193,6 +193,17 @@ pub struct StoredOutboxMessage {
     pub sent_at_ms: Option<i64>,
 }
 
+/// The conversation a run must reply into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelOrigin {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub thread_id: Option<String>,
+    /// The inbound message being answered, so the reply threads correctly on
+    /// providers that support it.
+    pub provider_event_id: String,
+}
+
 /// Outcome of [`DaemonStore::enqueue_channel_message`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboxEnqueue {
@@ -932,6 +943,62 @@ impl DaemonStore {
                 [now_ms],
             )
             .map(|changed| u32::try_from(changed).unwrap_or(u32::MAX))
+            .map_err(|error| error.to_string())
+    }
+
+    /// Where a run's reply belongs: the conversation whose accepted inbound
+    /// event produced this job.
+    ///
+    /// This is the whole reason `send_message` needs no destination
+    /// parameter. The answer comes from the durable event log, so a model that
+    /// is told "reply to my other account instead" by the very message it is
+    /// reading has nothing to act on.
+    pub fn channel_origin_for_job(&self, job_id: &str) -> Result<Option<ChannelOrigin>, String> {
+        self.connection
+            .query_row(
+                "SELECT account_id, conversation_id, thread_id, provider_event_id
+                 FROM channel_events
+                 WHERE job_id=?1 AND direction='inbound'
+                 ORDER BY received_at_ms DESC LIMIT 1",
+                [job_id],
+                |row| {
+                    Ok(ChannelOrigin {
+                        account_id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        thread_id: row.get(2)?,
+                        provider_event_id: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// The inbound envelope that produced this job, as stored.
+    pub fn inbound_envelope_for_job(&self, job_id: &str) -> Result<Option<String>, String> {
+        self.connection
+            .query_row(
+                "SELECT envelope_json FROM channel_events
+                 WHERE job_id=?1 AND direction='inbound'
+                 ORDER BY received_at_ms DESC LIMIT 1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// How many outbound rows this job already queued. The reply tool uses it
+    /// to build a stable idempotency key per call, so a retried run does not
+    /// send the same reply twice.
+    pub fn outbox_count_for_job(&self, job_id: &str) -> Result<u32, String> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM channel_outbox WHERE job_id=?1",
+                [job_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
             .map_err(|error| error.to_string())
     }
 
