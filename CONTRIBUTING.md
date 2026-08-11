@@ -17,7 +17,7 @@ requests.
 
 1. Fork the repo and create your branch from `develop` — not `main`. `main` is
    the release branch; pushing to it triggers the signed release build.
-2. Add tests if you changed behaviour (see [Testing](#testing) below).
+2. Add tests if you changed behaviour (see [Test your code modification](#test-your-code-modification) below).
 3. Update the docs if you changed something a user or operator would notice —
    `README.md` for shipped behaviour, [ROADMAP.md](ROADMAP.md) for work that
    isn't built yet, `docs/` for design notes.
@@ -87,8 +87,8 @@ choosing, routing, or rendering it badly.
 ## Set up a development environment
 
 You need Node.js, `pnpm`, Rust, Cargo, and the Tauri 2 prerequisites for your
-platform. Full list in the README's
-[Prerequisites](README.md#prerequisites).
+platform. Full list in
+[Setup and development](docs/setup.md#prerequisites).
 
 ```sh
 pnpm install
