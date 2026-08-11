@@ -278,10 +278,7 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<(), String> {
 
 fn print_table(records: &[ProcessRecord], live_only: bool, limit: u32) {
     if records.is_empty() {
-        println!(
-            "no {}agent processes",
-            if live_only { "live " } else { "" }
-        );
+        println!("no {}agent processes", if live_only { "live " } else { "" });
         return;
     }
     println!(
@@ -307,9 +304,7 @@ fn print_table(records: &[ProcessRecord], live_only: bool, limit: u32) {
         );
     }
     if records.len() as u32 >= limit {
-        println!(
-            "\n(showing {limit} rows — pass --limit to widen; listings are always bounded)"
-        );
+        println!("\n(showing {limit} rows — pass --limit to widen; listings are always bounded)");
     }
 }
 

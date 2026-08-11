@@ -1277,6 +1277,7 @@ pub fn run() {
             config_revisions::config_revisions_branch,
             config_revisions::config_revisions_branches,
             config_revisions::config_revisions_entities,
+            config_revisions::config_revisions_changes,
             checkpoints::checkpoint_begin,
             checkpoints::checkpoint_end,
             checkpoints::checkpoint_revert,

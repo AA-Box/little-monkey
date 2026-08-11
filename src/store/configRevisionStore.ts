@@ -34,6 +34,8 @@ export interface Revision {
   label: string;
   contentSha256: string;
   entityId: string;
+  /** See {@link RevisionMeta.changeId}. */
+  changeId: string | null;
   content: string;
 }
 
@@ -47,6 +49,28 @@ export interface RevisionMeta {
   label: string;
   contentSha256: string;
   bytes: number;
+  /**
+   * The write this revision came from, shared with every other revision the
+   * same save produced — across entities and kinds. `null` on revisions written
+   * before change ids existed: those are uncorrelated, and must be shown as
+   * such rather than grouped with whatever was saved around the same second.
+   */
+  changeId: string | null;
+}
+
+/** One entity's part in a change (`config_revisions::ChangeEntry`). */
+export interface ChangeEntry {
+  kind: string;
+  entityId: string;
+  revision: RevisionMeta;
+}
+
+/** Everything one write touched, across entities and kinds. */
+export interface ChangeSet {
+  /** `null` for a revision that predates change ids — see {@link RevisionMeta.changeId}. */
+  changeId: string | null;
+  createdAt: number;
+  entries: ChangeEntry[];
 }
 
 export interface BranchSummary {
@@ -110,6 +134,20 @@ export async function listBranches(kind: string, entityId: string): Promise<Bran
 export async function listVersionedEntities(kind: string): Promise<string[]> {
   if (unavailable()) return [];
   return await invoke<string[]>("config_revisions_entities", { kind });
+}
+
+/**
+ * What one change touched, across kinds — the read the per-entity history
+ * cannot do. Pass a `changeId` for one change; omit it for the most recent
+ * ones. A revision with no change id comes back as its own single-entry set
+ * with `changeId: null`, never folded into a neighbouring group.
+ */
+export async function listChanges(changeId?: string | null, limit?: number): Promise<ChangeSet[]> {
+  if (unavailable()) return [];
+  return await invoke<ChangeSet[]>("config_revisions_changes", {
+    changeId: changeId ?? null,
+    limit: limit ?? null,
+  });
 }
 
 /**
