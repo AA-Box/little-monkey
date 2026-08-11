@@ -24,6 +24,7 @@
 //! properties (pairing, mention gating, loop bounds, route determinism) testable
 //! without a provider.
 
+pub mod ingress;
 pub mod policy;
 pub mod routing;
 pub mod types;
