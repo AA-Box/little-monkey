@@ -289,6 +289,136 @@ impl ProcessKind {
     /// Each refusal names the mechanism that is missing, or the correct target
     /// to signal instead, rather than saying "unsupported" — because the
     /// caller's next question is always "why not".
+    /// Who enforces each [`ProcessLimits`] field for this kind, or why nobody
+    /// does.
+    ///
+    /// This is K4's declaration contract made answerable. `ProcessLimits` is a
+    /// declaration record, and a positive value in it used to mean nothing in
+    /// particular: `process_admit` accepted any override for any kind, so a row
+    /// could carry a memory ceiling on a kind with no memory watchdog and a
+    /// child-process ceiling that no platform primitive here can hold. A limit
+    /// nobody reads is worse than an absent one, because it reads as a bound to
+    /// everything downstream — the run dashboard, `monkey processes show`, and
+    /// anyone auditing what this app promised to contain.
+    ///
+    /// Exhaustive over both enums on purpose: a new kind or a new field cannot
+    /// be added without answering this question for it, and
+    /// `every_kind_and_limit_pair_is_answered` fails if an arm is ever left to a
+    /// catch-all.
+    ///
+    /// The three `Unavailable` reasons that repeat are the deferred platform
+    /// legs, and they are stated here rather than only in the roadmap so the
+    /// answer travels with the code: memory needs delegated cgroups v2 or a
+    /// class-derived job object (`RLIMIT_RSS` is a no-op on Darwin and advisory
+    /// on Linux, `RLIMIT_AS` bounds address space rather than residency), and a
+    /// child-process ceiling needs the cgroup `pids` controller or a job object
+    /// (`RLIMIT_NPROC` counts per real uid, not per tree, so a value low enough
+    /// to matter fires whenever the user's own session is busy).
+    pub fn limit_support(self, limit: ProcessLimitKind) -> LimitEnforcement {
+        use LimitEnforcement as E;
+        use ProcessKind as K;
+        use ProcessLimitKind as L;
+
+        const NO_MEMORY_MECHANISM: &str =
+            "no per-class memory mechanism on any host: needs delegated cgroups v2 or a \
+             class-derived Windows job object";
+        const NO_PIDS_MECHANISM: &str =
+            "no per-tree process-count mechanism: needs the cgroup `pids` controller or a \
+             class-derived Windows job object";
+        const NO_MODEL_REQUEST: &str = "this kind issues no model request of its own";
+        const NO_CAPTURED_OUTPUT: &str = "this kind captures no output stream of its own";
+
+        match (self, limit) {
+            // --- Wall ------------------------------------------------------
+            // The four WebView kinds are the only ones whose wall bound is read
+            // off the row: `processWallBudget.ts` sweeps `max_wall_ms` against
+            // `started_at_ms`, and the six-hour class default plus the Settings
+            // override both arrive through this field.
+            (K::ChatTurn | K::Subagent | K::CrewMember | K::SideTask, L::Wall) => {
+                E::Enforced("swept by the WebView wall-budget sweep against `started_at_ms`")
+            }
+            // Real bounds whose number comes from the owner, not the caller.
+            (K::DaemonJob, L::Wall) => E::OwnerSourced(
+                "the daemon watchdog enforces the job recipe's own `max_runtime_ms`",
+            ),
+            (K::WorkflowRun, L::Wall) => E::OwnerSourced(
+                "the executor enforces the definition's `budgets.maximum_wall_time_ms`",
+            ),
+            (K::BrowserSession, L::Wall) => {
+                E::OwnerSourced("the browser watchdog enforces its session's own `max_session_ms`")
+            }
+            (K::BackgroundShell, L::Wall) => E::Unavailable(
+                "a background shell is spawned to outlive its turn, with neither a timeout \
+                 nor `kill_on_drop`",
+            ),
+            (K::WorkflowNode, L::Wall) => E::OwnerSourced(
+                "a node is bounded by its own `timeout_ms`, which the definition validates \
+                 against the run's wall budget",
+            ),
+            (K::RemoteRun, L::Wall) => E::Unavailable(
+                "the row is terminal from birth — it records that a controller asked for \
+                 work; bound the daemon job it queued instead",
+            ),
+
+            // --- Memory ----------------------------------------------------
+            (K::DaemonJob, L::Memory) => E::OwnerSourced(
+                "the daemon's sampling watchdog measures the job's whole process group \
+                 against the recipe's own `max_memory_bytes`",
+            ),
+            (_, L::Memory) => E::Unavailable(NO_MEMORY_MECHANISM),
+
+            // --- Output ----------------------------------------------------
+            // The one field a desktop kind genuinely reads off its class default.
+            (K::BackgroundShell, L::Output) => E::Enforced(
+                "the in-memory tail is front-truncated at this many bytes by \
+                 `background_shell`",
+            ),
+            (K::DaemonJob, L::Output) => E::OwnerSourced(
+                "the daemon watchdog enforces the recipe's own `max_log_bytes` against the \
+                 job's log file",
+            ),
+            (
+                K::ChatTurn
+                | K::Subagent
+                | K::CrewMember
+                | K::SideTask
+                | K::WorkflowRun
+                | K::WorkflowNode
+                | K::RemoteRun
+                | K::BrowserSession,
+                L::Output,
+            ) => E::Unavailable(NO_CAPTURED_OUTPUT),
+
+            // --- Child processes -------------------------------------------
+            // Nothing, anywhere. The Windows shell job's fixed 512-process
+            // ceiling is a containment guardrail on one spawn site, not a
+            // per-class policy this field could express.
+            (_, L::ChildProcesses) => E::Unavailable(NO_PIDS_MECHANISM),
+
+            // --- Context tokens --------------------------------------------
+            // Enforced pre-flight for a runtime that can count exactly. The
+            // qualification is the runtime, not the kind: a budget set on a
+            // process running Ollama or MLX is reported unenforceable rather
+            // than silently ignored, which is why this stays `Enforced` here and
+            // the runtime check lives at the request.
+            (K::ChatTurn | K::Subagent | K::CrewMember | K::SideTask, L::ContextTokens) => {
+                E::Enforced(
+                    "checked before the request by `m3_production` for runtimes that count \
+                     exactly; a runtime without a tokenizer reports it unenforceable",
+                )
+            }
+            (
+                K::DaemonJob
+                | K::WorkflowRun
+                | K::WorkflowNode
+                | K::RemoteRun
+                | K::BackgroundShell
+                | K::BrowserSession,
+                L::ContextTokens,
+            ) => E::Unavailable(NO_MODEL_REQUEST),
+        }
+    }
+
     pub fn signal_support(self, signal: ProcessSignal) -> SignalSupport {
         use ProcessKind as K;
         use ProcessSignal as S;
@@ -1048,6 +1178,87 @@ impl SignalSupport {
         match self {
             SignalSupport::Honoured => None,
             SignalSupport::Refused(reason) => Some(reason),
+        }
+    }
+}
+
+/// One field of [`ProcessLimits`], as a value, so the enforcement matrix can be
+/// iterated and asserted exhaustively rather than described in prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessLimitKind {
+    Wall,
+    Memory,
+    Output,
+    ChildProcesses,
+    ContextTokens,
+}
+
+impl ProcessLimitKind {
+    pub const ALL: &'static [ProcessLimitKind] = &[
+        ProcessLimitKind::Wall,
+        ProcessLimitKind::Memory,
+        ProcessLimitKind::Output,
+        ProcessLimitKind::ChildProcesses,
+        ProcessLimitKind::ContextTokens,
+    ];
+
+    /// The `ProcessLimits` field name, so a message names the thing a caller set.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProcessLimitKind::Wall => "max_wall_ms",
+            ProcessLimitKind::Memory => "max_memory_bytes",
+            ProcessLimitKind::Output => "max_output_bytes",
+            ProcessLimitKind::ChildProcesses => "max_child_processes",
+            ProcessLimitKind::ContextTokens => "max_context_tokens",
+        }
+    }
+}
+
+/// What happens to a positive value in one [`ProcessLimits`] field, for one kind.
+///
+/// K4's acceptance is that a positive value may be recorded only when its owner
+/// enforces it or that specific limit is reported unavailable. Three answers are
+/// needed rather than two, because "the owner enforces a bound" and "the owner
+/// reads *this field*" are different facts, and collapsing them is what let
+/// generic admission record ceilings nobody consults:
+///
+/// - [`Enforced`](Self::Enforced) — the owner reads this row's field. A caller's
+///   override takes effect.
+/// - [`OwnerSourced`](Self::OwnerSourced) — the owner enforces a real bound but
+///   supplies the number itself, from a recipe, a workflow definition, or its own
+///   settings, and writes it onto the row. A caller's override would be silently
+///   replaced, so it is refused at admission instead.
+/// - [`Unavailable`](Self::Unavailable) — nothing enforces it for this kind. The
+///   reason names the missing mechanism, never the word "unsupported", because
+///   the caller's next question is always "why not".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "detail")]
+pub enum LimitEnforcement {
+    Enforced(&'static str),
+    OwnerSourced(&'static str),
+    Unavailable(&'static str),
+}
+
+impl LimitEnforcement {
+    /// Whether a caller-supplied value for this field would actually be obeyed.
+    pub fn honours_caller_value(self) -> bool {
+        matches!(self, LimitEnforcement::Enforced(_))
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            LimitEnforcement::Enforced(d)
+            | LimitEnforcement::OwnerSourced(d)
+            | LimitEnforcement::Unavailable(d) => d,
+        }
+    }
+
+    pub fn status(self) -> &'static str {
+        match self {
+            LimitEnforcement::Enforced(_) => "enforced",
+            LimitEnforcement::OwnerSourced(_) => "owner-sourced",
+            LimitEnforcement::Unavailable(_) => "unavailable",
         }
     }
 }
@@ -6061,6 +6272,100 @@ mod tests {
             "lm-signal-source-test-{label}-{}",
             uuid::Uuid::new_v4()
         ))
+    }
+
+    /// Every (kind, limit) pair answers, and every answer says something.
+    ///
+    /// The matrix is the whole of K4's declaration contract, so an arm added by
+    /// a catch-all — or a reason left empty — would silently reintroduce the
+    /// defect: a field recorded with nobody behind it.
+    #[test]
+    fn every_kind_and_limit_pair_is_answered() {
+        for kind in ProcessKind::ALL {
+            for limit in ProcessLimitKind::ALL {
+                let support = kind.limit_support(*limit);
+                assert!(
+                    support.detail().len() > 20,
+                    "{}/{} answers without saying who or why: {support:?}",
+                    kind.as_str(),
+                    limit.as_str()
+                );
+                assert!(
+                    !support.detail().contains("unsupported"),
+                    "{}/{} says \"unsupported\" instead of naming the missing mechanism",
+                    kind.as_str(),
+                    limit.as_str()
+                );
+            }
+        }
+    }
+
+    /// A class default may not set a limit the matrix says nobody enforces.
+    ///
+    /// This is the contradiction that would make the matrix a comment rather
+    /// than a contract: `default_limits` writes the row, `limit_support`
+    /// describes it, and the two disagreeing means one of them is lying to a
+    /// reader who cannot tell which.
+    #[test]
+    fn no_class_default_declares_a_limit_nobody_enforces() {
+        for kind in ProcessKind::ALL {
+            let class = kind.default_limits();
+            let declared: [(ProcessLimitKind, bool); 5] = [
+                (ProcessLimitKind::Wall, class.max_wall_ms.is_some()),
+                (ProcessLimitKind::Memory, class.max_memory_bytes.is_some()),
+                (ProcessLimitKind::Output, class.max_output_bytes.is_some()),
+                (
+                    ProcessLimitKind::ChildProcesses,
+                    class.max_child_processes.is_some(),
+                ),
+                (
+                    ProcessLimitKind::ContextTokens,
+                    class.max_context_tokens.is_some(),
+                ),
+            ];
+            for (limit, is_set) in declared {
+                if !is_set {
+                    continue;
+                }
+                assert!(
+                    !matches!(kind.limit_support(limit), LimitEnforcement::Unavailable(_)),
+                    "{} declares {} by class default while the matrix says nobody enforces it",
+                    kind.as_str(),
+                    limit.as_str()
+                );
+            }
+        }
+    }
+
+    /// The one field a caller may still set on a desktop kind, and the one that
+    /// made the old behaviour wrong.
+    #[test]
+    fn only_a_field_its_owner_reads_honours_a_caller_value() {
+        // The WebView wall budget: swept off the row, so Settings can raise it.
+        assert!(ProcessKind::ChatTurn
+            .limit_support(ProcessLimitKind::Wall)
+            .honours_caller_value());
+        // A memory ceiling on a chat turn was accepted before this and consulted
+        // by nothing on any platform.
+        assert!(!ProcessKind::ChatTurn
+            .limit_support(ProcessLimitKind::Memory)
+            .honours_caller_value());
+        // The daemon enforces memory for real — but from the job's own recipe,
+        // so a caller value would be overwritten on the next projection.
+        assert!(!ProcessKind::DaemonJob
+            .limit_support(ProcessLimitKind::Memory)
+            .honours_caller_value());
+        // Nothing, anywhere, holds a per-tree process count.
+        for kind in ProcessKind::ALL {
+            assert!(
+                matches!(
+                    kind.limit_support(ProcessLimitKind::ChildProcesses),
+                    LimitEnforcement::Unavailable(_)
+                ),
+                "{} claims a child-process ceiling",
+                kind.as_str()
+            );
+        }
     }
 
     #[test]

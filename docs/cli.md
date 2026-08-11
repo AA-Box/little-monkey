@@ -60,6 +60,8 @@ monkey api-serve [--port <port>]
 monkey processes [--kind <kind>] [--all] [--json]
 monkey processes show <id>
 monkey processes signal <id> stop|suspend|resume|kill
+monkey processes signals [--json]
+monkey processes limits [--json]
 
 monkey profiles list [--json]
 monkey profiles create <name>
