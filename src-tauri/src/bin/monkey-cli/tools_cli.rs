@@ -6,7 +6,6 @@
 //! `permission.rs` — since there's no window here to emit a
 //! `permission://request` event to.
 
-use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
 use globset::GlobBuilder;
@@ -322,50 +321,36 @@ pub async fn run_shell(
     perms.request("run_shell", command).await?;
     checkpoints::record_shell(state, checkpoint_id)?;
 
-    let cwd_path = match cwd {
-        Some(c) => workspace::resolve_path_and_root(state, c)?.0,
-        None => workspace::primary_root_canon(state)?,
-    };
-
-    // `sh` does not exist on Windows — use the platform's own command
-    // interpreter there. Same rule as the GUI's tool_run_shell.
-    #[cfg(target_os = "windows")]
-    let (shell, shell_flag) = ("cmd", "/C");
-    #[cfg(not(target_os = "windows"))]
-    let (shell, shell_flag) = ("sh", "-c");
-
-    let mut command_builder = tokio::process::Command::new(shell);
-    command_builder
-        .arg(shell_flag)
-        .arg(command)
-        .current_dir(&cwd_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // The timeout below works by DROPPING the in-flight
-        // `wait_with_output` future (and the child with it) — without this,
-        // the spawned process would keep running orphaned after a timeout.
-        .kill_on_drop(true);
-
-    let child = command_builder
-        .spawn()
-        .map_err(|e| format!("Failed to spawn shell: {e}"))?;
-
-    let output = match tokio::time::timeout(SHELL_TIMEOUT, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => return Err(format!("Failed to run command: {e}")),
-        Err(_) => {
-            return Err(format!(
-                "Command timed out after {} seconds",
-                SHELL_TIMEOUT.as_secs()
-            ))
+    let (cwd_path, workspace_root) = match cwd {
+        Some(c) => workspace::resolve_path_and_root(state, c)?,
+        None => {
+            let root = workspace::primary_root_canon(state)?;
+            (root.clone(), root)
         }
     };
+
+    let output = little_monkey_lib::workspace_shell::run_to_output(
+        &workspace_root,
+        &cwd_path,
+        command,
+        SHELL_TIMEOUT,
+    )
+    .await
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            format!(
+                "Command timed out after {} seconds",
+                SHELL_TIMEOUT.as_secs()
+            )
+        } else {
+            format!("Failed to run command: {error}")
+        }
+    })?;
 
     Ok(serde_json::json!({
         "stdout": String::from_utf8_lossy(&output.stdout),
         "stderr": String::from_utf8_lossy(&output.stderr),
-        "code": output.status.code(),
+        "code": output.exit_code,
     }))
 }
 

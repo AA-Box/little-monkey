@@ -696,6 +696,7 @@ fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
             return attempt.error(refused(denial));
         }
         if may_follow(previous, attempt.url()) {
+            note_allowed_redirect_destination(attempt.url());
             return attempt.follow();
         }
         let refusal = EgressDenial::about(
@@ -1182,8 +1183,9 @@ fn system_lookup(
 /// connected to need not be the same place. Pinning removes the second lookup: the
 /// addresses handed back here are exactly what reqwest connects to, not a hint
 /// compared against a later answer, so there is no second resolution left to race.
-/// `web.rs`'s `SsrfGuardedResolver` closes the same gap for its own guard, and
-/// `browser_worker.rs` does it per Chromium launch with `--host-resolver-rules`.
+/// `web.rs`'s `SsrfGuardedResolver` composes this pin with its own address-class
+/// guard, and `browser_worker.rs` does the equivalent per Chromium launch with
+/// `--host-resolver-rules`.
 ///
 /// # What it costs, which is real
 ///
@@ -1244,6 +1246,22 @@ impl reqwest::dns::Resolve for PinnedResolver {
             Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
         })
     }
+}
+
+/// Resolve through K5's per-run DNS pin without replacing the caller's own
+/// address-class policy.
+///
+/// Most callers install [`PinnedResolver`] indirectly through [`hardened`].
+/// `web_fetch` also has to remove private/loopback answers before reqwest sees
+/// them, so its SSRF resolver composes with the same pin here instead of
+/// replacing it with a second system lookup or maintaining a second cache.
+pub(crate) fn resolve_pinned(name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+    use reqwest::dns::Resolve;
+
+    PinnedResolver {
+        lookup: system_lookup,
+    }
+    .resolve(name)
 }
 
 /// Bytes counted for work with no process row to charge, one tally per reason.
@@ -1383,6 +1401,17 @@ impl Charge {
             }
         }
     }
+}
+
+/// Records one redirect hop after the caller's redirect policy has accepted it.
+///
+/// [`send`] records the initial request before handing it to reqwest, but reqwest
+/// follows redirects inside `Client::execute`, where `send` cannot see the later
+/// URLs. Redirect policies call this only after every policy guard succeeds, so a
+/// refused hop remains a denial record and never appears among allowed
+/// destinations.
+pub(crate) fn note_allowed_redirect_destination(url: &Url) {
+    Charge::resolve().note_destination(url);
 }
 
 /// Where egress that belongs to no run went, by the reason it had none.
@@ -1613,10 +1642,10 @@ where
 /// ordinary one, with its url, status, headers and extensions intact.
 ///
 /// ponytail: an in-memory body replayed across a redirect is counted once, not
-/// once per hop. Counting the replay would mean wrapping a reusable body, which
-/// makes it unreusable (`reqwest::Body::try_clone` returns `None` for a streaming
-/// body) and would break the same-origin redirect this module deliberately
-/// follows. Upgrade path is counting in the redirect policy, which sees each hop.
+/// once per hop. The redirect policies do record every allowed hop's destination,
+/// but counting a replay would mean wrapping a reusable body, which makes it
+/// unreusable (`reqwest::Body::try_clone` returns `None` for a streaming body) and
+/// would break the same-origin redirect this module deliberately follows.
 pub async fn send(request: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
     let charge = Charge::resolve();
     let (client, built) = request.build_split();
@@ -2562,15 +2591,24 @@ mod tests {
             let host = FakeHost::start(vec![redirect_to("/landed"), ok_body("landed")]);
 
             let client = hardened().build().expect("client builds");
-            let response = client
-                .get(&host.origin)
-                .send()
-                .await
-                .expect("a same-origin redirect must be followed");
+            let process = run_scope::ProcessScope::new("p-redirect-destinations");
+            let response = run_scope::scoped_with_process(
+                RunScope::run("run:redirect-destinations"),
+                process.clone(),
+                send(client.get(&host.origin)),
+            )
+            .await
+            .expect("a same-origin redirect must be followed");
 
             assert!(response.url().path().ends_with("/landed"));
             assert_eq!(response.text().await.expect("body reads"), "landed");
             assert_eq!(host.accepted(), 2, "one connection per hop");
+            let destinations = process.take_destinations();
+            assert_eq!(destinations.seen.len(), 1);
+            assert_eq!(
+                destinations.seen[0].1, 2,
+                "the initial request and followed hop must both be accounted"
+            );
         }
 
         /// The count, against a peer that says exactly how many bytes it wrote.
@@ -3843,21 +3881,28 @@ mod tests {
 
         /// A `ClientBuilder` chain's own total-request deadline.
         ///
-        /// Matched as the builder spelling only. `.timeout(..)` on a
+        /// Matched from either reqwest's builder spelling or this module's standard
+        /// hardened builder. `.timeout(..)` on a
         /// *`RequestBuilder`* is a different thing and usually correct — a
         /// per-request deadline on one small buffered call, which `llama.rs` and
         /// `stacks.rs` use exactly right — and there is no way to tell the two
-        /// apart from the substring alone. So the scan finds `Client::builder()`
-        /// first and only looks inside the chain that follows it.
+        /// apart from the substring alone. So the scan finds a client-builder root
+        /// first and only looks inside the chain that follows it. The separately
+        /// tuned `hardened_with_read_budget` root remains outside this narrow
+        /// ratchet; the roadmap records that deferred widening.
         const BUILDER_TOTAL_TIMEOUT: &str = ".timeout(";
 
-        /// How far past a `Client::builder()` to keep looking for its own
+        fn starts_client_builder(line: &str) -> bool {
+            line.contains("Client::builder()") || line.contains("crate::egress::hardened()")
+        }
+
+        /// How far past a client-builder root to keep looking for its own
         /// `.timeout(`. Every builder chain in this tree is far shorter than this;
         /// the window exists so the scan cannot run off into an unrelated
         /// function and count its per-request deadline.
         const CHAIN_WINDOW_LINES: usize = 14;
 
-        /// Production `Client::builder()` chains that set a total deadline, and
+        /// Production client-builder chains that set a total deadline, and
         /// why each is allowed to.
         ///
         /// Paths are relative to `src/`. A total deadline covers the body, so it is
@@ -3956,10 +4001,9 @@ mod tests {
             // deliberately: it is a product ceiling as much as a safety net, since
             // a `web_fetch` the model is waiting on is useless once it is slower
             // than this — which is why the fetch path keeps one and the download
-            // paths do not. Two caveats in the roadmap: the chain sets no
-            // `connect_timeout`, so those 30s also cover DNS, TLS and up to
-            // `MAX_REDIRECT_HOPS` hops; and `search_client`'s own 15s total is
-            // **not** counted here, because it starts from
+            // paths do not. The chain now inherits K5's connect and read budgets;
+            // the remaining caveat is that `search_client`'s own 15s total is
+            // **not** counted here because it starts from
             // `hardened_with_read_budget` rather than the builder this scan looks
             // for. That is the documented hole, and it is the one that will let a
             // future total deadline through.
@@ -3985,12 +4029,12 @@ mod tests {
                     .iter()
                     .enumerate()
                     .filter(|(index, line)| {
-                        line.contains("Client::builder()")
+                        starts_client_builder(line)
                             && lines
                                 .iter()
                                 .skip(index + 1)
                                 .take(CHAIN_WINDOW_LINES)
-                                .take_while(|following| !following.contains("Client::builder()"))
+                                .take_while(|following| !starts_client_builder(following))
                                 .any(|following| following.contains(BUILDER_TOTAL_TIMEOUT))
                     })
                     .count();
@@ -4013,7 +4057,7 @@ mod tests {
 
             assert_eq!(
                 found, expected,
-                "the set of `Client::builder()` chains setting their own total \
+                "the set of client-builder chains setting their own total \
                  request deadline changed.\n\
                  `ClientBuilder::timeout` covers the response body, so on any path \
                  that streams (`bytes_stream()`, a `chunk()` loop) it truncates a \
