@@ -280,8 +280,13 @@ pub fn verify_media_stream_token(
 }
 
 /// One carrier.
+///
+/// Every carrier is also a [`MediaFrameCodec`], because a carrier that cannot
+/// say how its own audio frames are spelled cannot carry a conversation — and
+/// a default implementation would be a guess that sounds like silence on the
+/// line.
 #[async_trait]
-pub trait TelecomProvider: Send + Sync {
+pub trait TelecomProvider: Send + Sync + super::call_media::MediaFrameCodec {
     fn kind(&self) -> TelecomKind;
 
     /// Ask the carrier whether the credential works. The only thing that may
@@ -294,7 +299,16 @@ pub trait TelecomProvider: Send + Sync {
 
     /// Place a call. The caller has already cleared this with the approval
     /// policy; a provider must never decide for itself that a call is fine.
-    async fn place_call(&self, to_number: &str, answer_url: &str) -> Result<CallHandle, String>;
+    ///
+    /// `record` is the account's own recording setting. A carrier that cannot
+    /// record a call it places must refuse rather than place an unrecorded one:
+    /// an operator who turned recording on may be relying on it.
+    async fn place_call(
+        &self,
+        to_number: &str,
+        answer_url: &str,
+        record: bool,
+    ) -> Result<CallHandle, String>;
 
     /// End a call we placed or answered.
     async fn hangup(&self, provider_call_id: &str) -> Result<(), String>;
@@ -378,19 +392,13 @@ mod tests {
             (TelecomKind::Plivo, "<Stream", "streamId"),
         ];
         for (kind, expected_markup, expected_stream_key) in cases {
-            let provider = build_provider(TelecomConfig {
-                account_id: "tel-1".into(),
-                kind,
-                carrier_account_id: "carrier-1".into(),
-                from_number: "+15550000000".into(),
-                secret: "secret".into(),
-                public_base_url: Some("https://calls.example.test".into()),
-                webhook_public_key: Some(STANDARD_TEST_KEY.into()),
-            })
-            .expect("provider");
+            let provider = build_provider(config(kind)).expect("provider");
 
             let format = provider.media_stream().expect("streams audio");
-            assert_eq!(format.stream_id_key, expected_stream_key);
+            assert_eq!(
+                format.stream_id_path.last().copied(),
+                Some(expected_stream_key)
+            );
             let document = provider
                 .answer_instructions("wss://calls.example.test/v1/telecom/tel-1/media?sig=a&b=1")
                 .expect("answers");
@@ -400,6 +408,62 @@ mod tests {
                 "the URL is escaped for the markup it is placed in: {}",
                 document.body
             );
+        }
+    }
+
+    #[test]
+    fn each_carrier_spells_an_outbound_frame_its_own_way() {
+        use crate::daemon::call_media::MediaFrameCodec;
+
+        let twilio = build_provider(config(TelecomKind::Twilio)).expect("twilio");
+        let frame: serde_json::Value =
+            serde_json::from_str(&twilio.encode_media_frame("QUJD", "MZ-stream")).expect("json");
+        assert_eq!(frame["event"], "media");
+        assert_eq!(
+            frame["streamSid"], "MZ-stream",
+            "Twilio discards a frame that does not echo its stream id"
+        );
+        assert_eq!(
+            twilio.media_stream().expect("streams").outbound_chunk_ms,
+            20
+        );
+
+        let plivo = build_provider(config(TelecomKind::Plivo)).expect("plivo");
+        let frame: serde_json::Value =
+            serde_json::from_str(&plivo.encode_media_frame("QUJD", "ignored")).expect("json");
+        assert_eq!(frame["event"], "playAudio");
+        assert_eq!(
+            frame["media"]["contentType"], "audio/x-mulaw",
+            "Plivo refuses audio that does not say what it is"
+        );
+        assert_eq!(frame["media"]["sampleRate"], 8000);
+        assert_eq!(
+            plivo.media_stream().expect("streams").stream_id_path,
+            ["start", "streamId"],
+            "Plivo nests its stream id inside the start event"
+        );
+
+        let telnyx = build_provider(config(TelecomKind::Telnyx)).expect("telnyx");
+        let frame: serde_json::Value =
+            serde_json::from_str(&telnyx.encode_media_frame("QUJD", "tx-stream")).expect("json");
+        assert_eq!(frame["event"], "media");
+        assert_eq!(frame["stream_id"], "tx-stream");
+        assert_eq!(
+            telnyx.media_stream().expect("streams").outbound_chunk_ms,
+            1_000,
+            "Telnyx accepts at most one payload a second, so frames are a second long"
+        );
+    }
+
+    fn config(kind: TelecomKind) -> TelecomConfig {
+        TelecomConfig {
+            account_id: "tel-1".into(),
+            kind,
+            carrier_account_id: "carrier-1".into(),
+            from_number: "+15550000000".into(),
+            secret: "secret".into(),
+            public_base_url: Some("https://calls.example.test".into()),
+            webhook_public_key: Some(STANDARD_TEST_KEY.into()),
         }
     }
 

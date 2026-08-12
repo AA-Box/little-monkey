@@ -28,6 +28,8 @@ const BASE: TelecomAccount = {
   from_number: "+15550000000",
   has_credential: true,
   public_base_url: "https://calls.example.test",
+  greeting: "Support line, how can I help?",
+  supports_recording: true,
   inbound_policy: "reject",
   outbound_approval: "never",
   limits: {
@@ -131,6 +133,24 @@ describe("TelephonyPanel", () => {
     fireEvent.click(await screen.findByText("+15550000000"));
 
     expect(await screen.findByText(/nowhere to deliver/i)).toBeTruthy();
+  });
+
+  it("warns when a number answers calls without saying anything first", async () => {
+    mockAccounts([{ ...BASE, inbound_policy: "answer", greeting: null }]);
+    render(<TelephonyPanel />);
+    fireEvent.click(await screen.findByText("+15550000000"));
+
+    expect(await screen.findByText(/hears silence/i)).toBeTruthy();
+  });
+
+  it("will not offer recording on a carrier that cannot record a streamed call", async () => {
+    mockAccounts([{ ...BASE, kind: "plivo", kind_label: "Plivo", supports_recording: false }]);
+    render(<TelephonyPanel />);
+    fireEvent.click(await screen.findByText("+15550000000"));
+
+    const toggle = (await screen.findByLabelText("Record calls")) as HTMLInputElement;
+    expect(toggle.disabled).toBe(true);
+    expect(screen.getByText(/cannot record a call it is also streaming/i)).toBeTruthy();
   });
 
   it("offers no test carrier to configure", async () => {

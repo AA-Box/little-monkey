@@ -1584,6 +1584,7 @@ pub fn run() {
             daemon_commands::telecom_set_policy,
             daemon_commands::telecom_set_limits,
             daemon_commands::telecom_set_credential,
+            daemon_commands::telecom_set_greeting,
             daemon_commands::telecom_calls,
             daemon_commands::telecom_callback_url,
             daemon_commands::telecom_remove,

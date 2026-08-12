@@ -70,6 +70,9 @@ pub struct SentSms {
 pub struct DialedCall {
     pub to_number: String,
     pub answer_url: String,
+    /// Whether the account asked for this call to be recorded, so a test can
+    /// prove the setting reached the carrier rather than stopping at the UI.
+    pub record: bool,
 }
 
 impl MockProvider {
@@ -180,10 +183,37 @@ enum MockWebhookBody {
     Ignored,
 }
 
+/// The mock streams like Twilio does, which is the shape the media-session
+/// tests are written against. Still no IO: frames are strings.
+const MEDIA_FORMAT: crate::daemon::call_media::MediaStreamFormat =
+    crate::daemon::call_media::MediaStreamFormat {
+        stream_id_path: &["streamSid"],
+        outbound_chunk_ms: 20,
+    };
+
+impl crate::daemon::call_media::MediaFrameCodec for MockProvider {
+    fn format(&self) -> crate::daemon::call_media::MediaStreamFormat {
+        MEDIA_FORMAT
+    }
+
+    fn encode_media_frame(&self, payload_b64: &str, stream_id: &str) -> String {
+        serde_json::json!({
+            "event": "media",
+            "streamSid": stream_id,
+            "media": { "payload": payload_b64 },
+        })
+        .to_string()
+    }
+}
+
 #[async_trait]
 impl TelecomProvider for MockProvider {
     fn kind(&self) -> TelecomKind {
         TelecomKind::Mock
+    }
+
+    fn media_stream(&self) -> Option<crate::daemon::call_media::MediaStreamFormat> {
+        Some(MEDIA_FORMAT)
     }
 
     async fn probe(&self) -> ChannelHealth {
@@ -207,11 +237,17 @@ impl TelecomProvider for MockProvider {
         }
     }
 
-    async fn place_call(&self, to_number: &str, answer_url: &str) -> Result<CallHandle, String> {
+    async fn place_call(
+        &self,
+        to_number: &str,
+        answer_url: &str,
+        record: bool,
+    ) -> Result<CallHandle, String> {
         let mut state = self.state.lock().unwrap();
         state.dialed_calls.push(DialedCall {
             to_number: to_number.to_string(),
             answer_url: answer_url.to_string(),
+            record,
         });
         if let Some(outcome) = state.call_outcomes.pop_front() {
             return outcome;
@@ -418,6 +454,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_recording_setting_reaches_the_carrier() {
+        let provider = provider();
+        let _ = provider
+            .place_call("+15551230000", "https://example.com/answer", true)
+            .await;
+        assert!(
+            provider.dialed_calls()[0].record,
+            "a stored recording setting that never reaches the carrier records nothing"
+        );
+    }
+
+    #[tokio::test]
     async fn place_call_records_the_dial_and_returns_queued_outcomes() {
         let provider = provider();
         provider.queue_call_outcome(Ok(CallHandle {
@@ -425,13 +473,14 @@ mod tests {
             state: CallState::Queued,
         }));
         let handle = provider
-            .place_call("+1", "https://example.com/answer")
+            .place_call("+1", "https://example.com/answer", false)
             .await
             .unwrap();
         assert_eq!(handle.provider_call_id, "scripted-1");
         assert_eq!(
             provider.dialed_calls(),
             vec![DialedCall {
+                record: false,
                 to_number: "+1".to_string(),
                 answer_url: "https://example.com/answer".to_string(),
             }]

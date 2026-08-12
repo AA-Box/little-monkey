@@ -24,6 +24,7 @@ import {
   telecomProbe,
   telecomRemove,
   telecomSetCredential,
+  telecomSetGreeting,
   telecomSetLimits,
   telecomSetPolicy,
 } from "../../lib/telecomClient";
@@ -53,6 +54,7 @@ export function TelephonyPanel() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [secret, setSecret] = useState("");
+  const [greeting, setGreeting] = useState("");
   const [draft, setDraft] = useState({
     kind: "twilio",
     label: "",
@@ -87,6 +89,11 @@ export function TelephonyPanel() {
   useEffect(() => {
     if (selected) void loadCalls(selected);
   }, [selected, loadCalls]);
+
+  useEffect(() => {
+    const account = accounts?.find((entry) => entry.account_id === selected);
+    setGreeting(account?.greeting ?? "");
+  }, [selected, accounts]);
 
   const run = useCallback(
     async (key: string, action: () => Promise<unknown>, done?: string) => {
@@ -313,6 +320,34 @@ export function TelephonyPanel() {
           </div>
           <p className="mt-2 text-xs text-faint">{t("TelephonyPanel.policyScope")}</p>
 
+          <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3 sm:flex-row sm:items-end">
+            <label className="min-w-0 flex-1 text-xs text-muted">
+              {t("TelephonyPanel.greeting")}
+              <input
+                className={`${INPUT} mt-1`}
+                value={greeting}
+                onChange={(event) => setGreeting(event.target.value)}
+                placeholder={t("TelephonyPanel.greetingPlaceholder")}
+              />
+            </label>
+            <Button
+              size="sm"
+              disabled={busy !== null}
+              onClick={() =>
+                void run(
+                  "greeting",
+                  () => telecomSetGreeting(account.account_id, greeting.trim()),
+                  t("TelephonyPanel.greetingSaved"),
+                )
+              }
+            >
+              {t("TelephonyPanel.saveGreeting")}
+            </Button>
+          </div>
+          {account.inbound_policy !== "reject" && !account.greeting && (
+            <p className="mt-1 text-xs text-warning">{t("TelephonyPanel.noGreeting")}</p>
+          )}
+
           <div className="mt-3 grid gap-3 border-t border-border pt-3 sm:grid-cols-3">
             <label className="text-xs text-muted">
               {t("TelephonyPanel.maxConcurrent")}
@@ -370,7 +405,7 @@ export function TelephonyPanel() {
             <input
               type="checkbox"
               checked={account.limits.recording_enabled}
-              disabled={busy !== null}
+              disabled={busy !== null || !account.supports_recording}
               onChange={(event) =>
                 void run("limits", () =>
                   telecomSetLimits(account.account_id, { recording: event.target.checked }),
@@ -379,7 +414,11 @@ export function TelephonyPanel() {
             />
             {t("TelephonyPanel.recording")}
           </label>
-          <p className="mt-1 text-xs text-faint">{t("TelephonyPanel.recordingHint")}</p>
+          <p className="mt-1 text-xs text-faint">
+            {account.supports_recording
+              ? t("TelephonyPanel.recordingHint")
+              : t("TelephonyPanel.recordingUnsupported")}
+          </p>
 
           <div className="mt-3 border-t border-border pt-3">
             <h5 className="text-xs font-semibold">{t("TelephonyPanel.recentCalls")}</h5>

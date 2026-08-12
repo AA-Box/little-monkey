@@ -129,10 +129,7 @@ impl TelecomProvider for PlivoProvider {
     }
 
     fn media_stream(&self) -> Option<crate::daemon::call_media::MediaStreamFormat> {
-        Some(crate::daemon::call_media::MediaStreamFormat {
-            stream_id_key: "streamId",
-            outbound_event: "playAudio",
-        })
+        Some(MEDIA_FORMAT)
     }
 
     /// Plivo XML. `<Stream bidirectional="true">` is the equivalent verb, and
@@ -242,7 +239,22 @@ impl TelecomProvider for PlivoProvider {
         }
     }
 
-    async fn place_call(&self, to_number: &str, answer_url: &str) -> Result<CallHandle, String> {
+    async fn place_call(
+        &self,
+        to_number: &str,
+        answer_url: &str,
+        record: bool,
+    ) -> Result<CallHandle, String> {
+        if record {
+            // Plivo records with a `<Record>` element in the call flow, which
+            // cannot run alongside the bidirectional stream this call needs.
+            // Saying so is better than placing a call the operator believes is
+            // being recorded and is not.
+            return Err(
+                "Plivo cannot record a streamed call. Turn recording off for this number, or record at the carrier."
+                    .to_string(),
+            );
+        }
         let client = self.client()?;
         let body = serde_json::json!({
             "from": self.from_number,
@@ -443,6 +455,22 @@ struct PlivoCallResponse {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn plivo_refuses_to_place_a_call_it_cannot_record() {
+        // Recording on Plivo needs a `<Record>` element, which cannot run
+        // alongside the bidirectional stream a conversation needs. Refusing is
+        // the honest answer; placing an unrecorded call while the operator
+        // believes it is recorded is not.
+        let provider = provider_with_base("http://127.0.0.1:1");
+
+        let error = provider
+            .place_call("+15551230000", "https://example.test/answer", true)
+            .await
+            .expect_err("refused");
+
+        assert!(error.contains("cannot record a streamed call"));
+    }
+
     use super::*;
 
     fn config(base_url: &str) -> TelecomConfig {
@@ -690,5 +718,34 @@ mod tests {
             SendOutcome::NeedsReconciliation { .. } => {}
             other => panic!("expected NeedsReconciliation, got {other:?}"),
         }
+    }
+}
+
+/// How this carrier's media stream is shaped. See
+/// [`crate::daemon::call_media::MediaStreamFormat`] for why each field exists.
+const MEDIA_FORMAT: crate::daemon::call_media::MediaStreamFormat =
+    crate::daemon::call_media::MediaStreamFormat {
+        stream_id_path: &["start", "streamId"],
+        outbound_chunk_ms: 20,
+    };
+
+impl crate::daemon::call_media::MediaFrameCodec for PlivoProvider {
+    fn format(&self) -> crate::daemon::call_media::MediaStreamFormat {
+        MEDIA_FORMAT
+    }
+
+    fn encode_media_frame(&self, payload_b64: &str, stream_id: &str) -> String {
+        // Plivo plays audio back under its own event, and refuses a frame that
+        // does not say what the bytes are. It does not want its stream id back.
+        let _ = stream_id;
+        serde_json::json!({
+            "event": "playAudio",
+            "media": {
+                "contentType": "audio/x-mulaw",
+                "sampleRate": 8000,
+                "payload": payload_b64,
+            },
+        })
+        .to_string()
     }
 }

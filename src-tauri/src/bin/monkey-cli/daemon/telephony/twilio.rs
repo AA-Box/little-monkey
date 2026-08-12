@@ -157,10 +157,7 @@ impl TelecomProvider for TwilioProvider {
     }
 
     fn media_stream(&self) -> Option<crate::daemon::call_media::MediaStreamFormat> {
-        Some(crate::daemon::call_media::MediaStreamFormat {
-            stream_id_key: "streamSid",
-            outbound_event: "media",
-        })
+        Some(MEDIA_FORMAT)
     }
 
     /// TwiML. `<Connect><Stream>` is bidirectional: Twilio streams the caller's
@@ -273,13 +270,23 @@ impl TelecomProvider for TwilioProvider {
         }
     }
 
-    async fn place_call(&self, to_number: &str, answer_url: &str) -> Result<CallHandle, String> {
+    async fn place_call(
+        &self,
+        to_number: &str,
+        answer_url: &str,
+        record: bool,
+    ) -> Result<CallHandle, String> {
         let client = self.client()?;
-        let params = [
+        let mut params = vec![
             ("To", to_number),
             ("From", self.from_number.as_str()),
             ("Url", answer_url),
         ];
+        if record {
+            // Twilio records the whole call from answer and stores it under the
+            // operator's own account, where their retention settings apply.
+            params.push(("Record", "true"));
+        }
         let request = client
             .post(self.calls_url())
             .basic_auth(&self.account_sid, Some(&self.auth_token))
@@ -821,5 +828,30 @@ mod tests {
             SendOutcome::NeedsReconciliation { .. } => {}
             other => panic!("expected NeedsReconciliation, got {other:?}"),
         }
+    }
+}
+
+/// How this carrier's media stream is shaped. See
+/// [`crate::daemon::call_media::MediaStreamFormat`] for why each field exists.
+const MEDIA_FORMAT: crate::daemon::call_media::MediaStreamFormat =
+    crate::daemon::call_media::MediaStreamFormat {
+        stream_id_path: &["streamSid"],
+        outbound_chunk_ms: 20,
+    };
+
+impl crate::daemon::call_media::MediaFrameCodec for TwilioProvider {
+    fn format(&self) -> crate::daemon::call_media::MediaStreamFormat {
+        MEDIA_FORMAT
+    }
+
+    fn encode_media_frame(&self, payload_b64: &str, stream_id: &str) -> String {
+        // Twilio requires its own stream id echoed on every outbound frame;
+        // a frame without it is discarded silently.
+        serde_json::json!({
+            "event": "media",
+            "streamSid": stream_id,
+            "media": { "payload": payload_b64 },
+        })
+        .to_string()
     }
 }

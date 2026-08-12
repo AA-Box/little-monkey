@@ -181,6 +181,8 @@ pub struct TelecomCallRecord {
     pub job_id: Option<String>,
     pub idempotency_key: String,
     pub last_error: Option<String>,
+    /// Spoken when the call connects. See `DAEMON_V8_SQL`.
+    pub opening_line: Option<String>,
     pub started_at_ms: Option<i64>,
     pub ended_at_ms: Option<i64>,
     pub created_at_ms: i64,
@@ -395,8 +397,8 @@ impl DaemonStore {
                 "INSERT INTO telecom_calls (
                     call_id, account_id, provider_call_id, direction, peer_number, state,
                     session_key, job_id, idempotency_key, last_error, started_at_ms, ended_at_ms,
-                    created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                    created_at_ms, updated_at_ms, opening_line
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(account_id, idempotency_key) DO NOTHING",
                 params![
                     record.call_id,
@@ -413,6 +415,7 @@ impl DaemonStore {
                     record.ended_at_ms,
                     record.created_at_ms,
                     record.updated_at_ms,
+                    record.opening_line,
                 ],
             )
             .map_err(|error| format!("Failed to start call: {error}"))?;
@@ -441,7 +444,7 @@ impl DaemonStore {
             .query_row(
                 "SELECT call_id, account_id, provider_call_id, direction, peer_number, state,
                         session_key, job_id, idempotency_key, last_error, started_at_ms,
-                        ended_at_ms, created_at_ms, updated_at_ms
+                        ended_at_ms, created_at_ms, updated_at_ms, opening_line
                  FROM telecom_calls WHERE call_id=?1",
                 [call_id],
                 read_telecom_call,
@@ -462,7 +465,7 @@ impl DaemonStore {
             .query_row(
                 "SELECT call_id, account_id, provider_call_id, direction, peer_number, state,
                         session_key, job_id, idempotency_key, last_error, started_at_ms,
-                        ended_at_ms, created_at_ms, updated_at_ms
+                        ended_at_ms, created_at_ms, updated_at_ms, opening_line
                  FROM telecom_calls WHERE account_id=?1 AND provider_call_id=?2",
                 params![account_id, provider_call_id],
                 read_telecom_call,
@@ -568,7 +571,7 @@ impl DaemonStore {
             .prepare(
                 "SELECT call_id, account_id, provider_call_id, direction, peer_number, state,
                         session_key, job_id, idempotency_key, last_error, started_at_ms,
-                        ended_at_ms, created_at_ms, updated_at_ms
+                        ended_at_ms, created_at_ms, updated_at_ms, opening_line
                  FROM telecom_calls
                  WHERE account_id=?1 AND state NOT IN ('completed','failed','needs_reconciliation')
                  ORDER BY created_at_ms ASC",
@@ -594,7 +597,7 @@ impl DaemonStore {
             .prepare(
                 "SELECT call_id, account_id, provider_call_id, direction, peer_number, state,
                         session_key, job_id, idempotency_key, last_error, started_at_ms,
-                        ended_at_ms, created_at_ms, updated_at_ms
+                        ended_at_ms, created_at_ms, updated_at_ms, opening_line
                  FROM telecom_calls WHERE account_id=?1
                  ORDER BY created_at_ms DESC LIMIT ?2",
             )
@@ -883,6 +886,7 @@ fn read_telecom_call(
         ended_at_ms: row.get(11)?,
         created_at_ms: row.get(12)?,
         updated_at_ms: row.get(13)?,
+        opening_line: row.get(14)?,
     }))
 }
 
@@ -939,6 +943,7 @@ mod tests {
             session_key: None,
             job_id: None,
             idempotency_key: idempotency_key.into(),
+            opening_line: None,
             last_error: None,
             started_at_ms: None,
             ended_at_ms: None,

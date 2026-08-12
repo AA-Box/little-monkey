@@ -2022,6 +2022,18 @@ pub async fn telecom_set_limits(
     command(args).await.map(|_| ())
 }
 
+/// What the number says when an answered call connects.
+#[tauri::command]
+pub async fn telecom_set_greeting(account_id: String, text: String) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    if text.chars().count() > 600 {
+        return Err("That greeting is too long to say on a phone call".to_string());
+    }
+    command(vec!["telecom".into(), "greeting".into(), account_id, text])
+        .await
+        .map(|_| ())
+}
+
 #[tauri::command]
 pub async fn telecom_calls(account_id: String, limit: u32) -> Result<Value, String> {
     let account_id = channel_id("account id", &account_id)?;

@@ -102,6 +102,10 @@ pub(crate) fn handle_carrier_event(
                 // an inbound call: a redelivered callback finds this row rather
                 // than creating a second one.
                 idempotency_key: format!("inbound:{provider_call_id}"),
+                // An inbound call says whatever greeting the operator wrote for
+                // this number; the media session falls back to it too, so a
+                // redelivered ring cannot lose it.
+                opening_line: None,
                 last_error: (!answered).then(|| {
                     if at_capacity {
                         "This number was already at its concurrent-call limit".to_string()

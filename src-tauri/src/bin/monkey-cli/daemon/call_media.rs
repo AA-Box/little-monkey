@@ -40,20 +40,24 @@ const HANGOVER_MS: u32 = 700;
 /// The longest single utterance transcribed. A caller who talks past this is
 /// answered rather than left talking into a machine that stopped listening.
 const MAX_UTTERANCE_MS: u32 = 20_000;
-/// 20 ms of audio, the frame size every carrier streams.
-const FRAME_SAMPLES: usize = (CALL_SAMPLE_RATE as usize) / 50;
 
-/// How a carrier spells its media-stream JSON.
+/// What one carrier's media stream is actually shaped like.
 ///
-/// Every carrier sends the same thing — base64 µ-law in a JSON envelope — under
-/// different key names, so the difference is data rather than three copies of
-/// the same loop.
+/// The three carriers are close enough to look interchangeable and different
+/// enough that treating them as such produces silence on two of them. What
+/// differs is captured here; what differs *more* than a field name — how an
+/// outbound frame is spelled — is the carrier's own
+/// [`TelecomProvider::encode_media_frame`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MediaStreamFormat {
-    /// Key holding the stream identifier the carrier expects echoed back.
-    pub stream_id_key: &'static str,
-    /// Value of `event` on an outbound audio frame.
-    pub outbound_event: &'static str,
+    /// Where the stream identifier lives in an inbound frame. Plivo nests it
+    /// under `start`, the other two put it at the top level, and reading the
+    /// wrong one means echoing an empty id back at a carrier that requires it.
+    pub stream_id_path: &'static [&'static str],
+    /// How much audio goes in one outbound frame. Twilio and Plivo take the
+    /// carrier's own 20 ms frame; Telnyx accepts at most one payload per
+    /// second, so anything smaller is dropped on the floor.
+    pub outbound_chunk_ms: u32,
 }
 
 /// A carrier media socket, abstracted so the conversation loop can be driven by
@@ -147,14 +151,16 @@ pub(crate) async fn run_media_session(
     socket: &mut dyn MediaSocket,
     speech: &dyn CallSpeech,
     sink: &dyn CallTurnSink,
-    format: MediaStreamFormat,
+    carrier: &dyn MediaFrameCodec,
     call: CallIdentity,
 ) -> MediaSessionReport {
+    let format = carrier.format();
     let mut report = MediaSessionReport::default();
     let mut detector = UtteranceDetector::new(HANGOVER_MS, MAX_UTTERANCE_MS);
     let mut to_speak = register_speaker(&call.call_id);
     let mut stream_id = String::new();
     let mut turn_index = 0;
+    let mut spoke_opening = call.opening_line.is_none();
 
     loop {
         let frame = tokio::select! {
@@ -163,7 +169,8 @@ pub(crate) async fn run_media_session(
             Some(text) = to_speak.recv() => {
                 match speech.synthesize(&text).await {
                     Ok(samples) => {
-                        report.frames_spoken += send_audio(socket, &samples, format, &stream_id).await;
+                        report.frames_spoken +=
+                            send_audio(socket, &samples, carrier, format, &stream_id).await;
                     }
                     Err(error) => eprintln!("monkey daemon: could not speak on {}: {error}", call.call_id),
                 }
@@ -175,17 +182,33 @@ pub(crate) async fn run_media_session(
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&frame) else {
             continue;
         };
-        if let Some(id) = value
-            .get(format.stream_id_key)
-            .and_then(serde_json::Value::as_str)
-        {
-            stream_id = id.to_string();
+        if let Some(id) = read_path(&value, format.stream_id_path) {
+            stream_id = id;
         }
         match value.get("event").and_then(serde_json::Value::as_str) {
             Some("stop") => break,
             Some("media") => {}
             // start, mark, connected, clear: nothing to hear.
             _ => continue,
+        }
+        // The greeting goes out on the first audio frame rather than on the
+        // start event, because that is the first moment the carrier is
+        // demonstrably carrying audio in both directions. A call that opens
+        // with silence sounds broken to whoever picked up.
+        if !spoke_opening {
+            spoke_opening = true;
+            if let Some(line) = call.opening_line.as_deref() {
+                match speech.synthesize(line).await {
+                    Ok(samples) => {
+                        report.frames_spoken +=
+                            send_audio(socket, &samples, carrier, format, &stream_id).await;
+                    }
+                    Err(error) => eprintln!(
+                        "monkey daemon: could not speak the opening line on {}: {error}",
+                        call.call_id
+                    ),
+                }
+            }
         }
         let Some(payload) = value
             .get("media")
@@ -231,6 +254,11 @@ pub(crate) async fn run_media_session(
                 call.call_id
             ),
         }
+        if call.single_turn {
+            // Voicemail: the caller leaves one message and the line closes.
+            // Staying open would be a conversation, which is the other policy.
+            break;
+        }
     }
 
     unregister_speaker(&call.call_id);
@@ -244,26 +272,62 @@ pub(crate) struct CallIdentity {
     pub call_id: String,
     pub peer_number: String,
     pub session_key: String,
+    /// Spoken as soon as audio is flowing: the number's greeting on an inbound
+    /// call, or what the agent asked to say on an outbound one. `None` means
+    /// the line opens silently, which only makes sense when the other end
+    /// called us and is already talking.
+    pub opening_line: Option<String>,
+    /// Voicemail: take one message and hang up, rather than hold a
+    /// conversation.
+    pub single_turn: bool,
+}
+
+/// The half of a media stream that no two carriers spell the same way.
+///
+/// Implemented by each carrier rather than switched on here: Twilio wants its
+/// `streamSid` echoed on every frame, Plivo wants a `playAudio` event carrying
+/// the content type and sample rate, and Telnyx wants `media` under an RTP
+/// bidirectional stream and drops anything faster than one payload a second.
+pub(crate) trait MediaFrameCodec: Send + Sync {
+    fn format(&self) -> MediaStreamFormat;
+    /// One outbound audio frame, already base64 µ-law.
+    fn encode_media_frame(&self, payload_b64: &str, stream_id: &str) -> String;
+}
+
+/// Read a nested string out of an inbound frame, e.g. `["start", "streamId"]`.
+fn read_path(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut cursor = value;
+    for key in path {
+        cursor = cursor.get(key)?;
+    }
+    cursor.as_str().map(str::to_string)
 }
 
 async fn send_audio(
     socket: &mut dyn MediaSocket,
     samples: &[i16],
+    carrier: &dyn MediaFrameCodec,
     format: MediaStreamFormat,
     stream_id: &str,
 ) -> u32 {
     let mut sent = 0;
-    for chunk in samples.chunks(FRAME_SAMPLES) {
+    let chunk_samples =
+        (CALL_SAMPLE_RATE as usize / 1_000) * format.outbound_chunk_ms.max(20) as usize;
+    for chunk in samples.chunks(chunk_samples) {
         let payload: Vec<u8> = chunk.iter().copied().map(encode_mulaw).collect();
-        let frame = serde_json::json!({
-            "event": format.outbound_event,
-            format.stream_id_key: stream_id,
-            "media": { "payload": STANDARD.encode(payload) },
-        });
-        if socket.send(frame.to_string()).await.is_err() {
+        let frame = carrier.encode_media_frame(&STANDARD.encode(payload), stream_id);
+        if socket.send(frame).await.is_err() {
             break;
         }
         sent += 1;
+        // A carrier that caps payloads per second drops anything faster, so
+        // the pacing is part of sending correctly rather than politeness.
+        if format.outbound_chunk_ms >= 1_000 {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                u64::from(format.outbound_chunk_ms) - 50,
+            ))
+            .await;
+        }
     }
     sent
 }
@@ -375,10 +439,27 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const FORMAT: MediaStreamFormat = MediaStreamFormat {
-        stream_id_key: "streamSid",
-        outbound_event: "media",
-    };
+    /// A carrier shaped like Twilio: stream id at the top level, echoed back
+    /// on every frame, 20 ms per frame.
+    struct FakeCarrier;
+
+    impl MediaFrameCodec for FakeCarrier {
+        fn format(&self) -> MediaStreamFormat {
+            MediaStreamFormat {
+                stream_id_path: &["streamSid"],
+                outbound_chunk_ms: 20,
+            }
+        }
+
+        fn encode_media_frame(&self, payload_b64: &str, stream_id: &str) -> String {
+            serde_json::json!({
+                "event": "media",
+                "streamSid": stream_id,
+                "media": { "payload": payload_b64 },
+            })
+            .to_string()
+        }
+    }
 
     struct ScriptedSocket {
         inbound: Vec<String>,
@@ -454,6 +535,8 @@ mod tests {
             call_id: "call-1".into(),
             peer_number: "+15551234567".into(),
             session_key: "call:tel-1:call-1".into(),
+            opening_line: None,
+            single_turn: false,
         }
     }
 
@@ -484,7 +567,7 @@ mod tests {
                 heard: "what is the deploy status",
             },
             &sink,
-            FORMAT,
+            &FakeCarrier,
             identity(),
         )
         .await;
@@ -513,7 +596,7 @@ mod tests {
             &mut socket,
             &FakeSpeech { heard: "unused" },
             &sink,
-            FORMAT,
+            &FakeCarrier,
             identity(),
         )
         .await;
@@ -536,7 +619,7 @@ mod tests {
                 &mut socket,
                 &FakeSpeech { heard: "unused" },
                 &RecordingSink::default(),
-                FORMAT,
+                &FakeCarrier,
                 identity(),
             )
             .await
@@ -563,6 +646,70 @@ mod tests {
             first["media"]["payload"].as_str().is_some(),
             "audio rides in the payload the carrier expects"
         );
+    }
+
+    #[tokio::test]
+    async fn the_line_opens_with_the_greeting_rather_than_with_silence() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut socket = ScriptedSocket {
+            inbound: vec![
+                serde_json::json!({ "event": "stop", "streamSid": "MZ1" }).to_string(),
+                media_frame(&vec![0; 800]),
+            ],
+            sent: sent.clone(),
+            linger: None,
+        };
+        let mut call = identity();
+        call.opening_line = Some("Hello, this is the support line.".into());
+
+        let report = run_media_session(
+            &mut socket,
+            &FakeSpeech { heard: "unused" },
+            &RecordingSink::default(),
+            &FakeCarrier,
+            call,
+        )
+        .await;
+
+        assert!(report.frames_spoken > 0, "the greeting was spoken");
+        let first: serde_json::Value =
+            serde_json::from_str(&sent.lock().unwrap()[0]).expect("json");
+        assert_eq!(
+            first["streamSid"], "MZ1",
+            "frames carry the carrier's own id"
+        );
+    }
+
+    #[tokio::test]
+    async fn voicemail_takes_one_message_and_stops() {
+        let mut socket = ScriptedSocket {
+            inbound: vec![
+                // More audio after the first message, which must not be read:
+                // the line is over once the message is taken.
+                media_frame(&speech_samples(8_000)),
+                media_frame(&vec![0; 8_000]),
+                media_frame(&speech_samples(8_000)),
+            ],
+            sent: Arc::new(Mutex::new(Vec::new())),
+            linger: None,
+        };
+        let mut call = identity();
+        call.single_turn = true;
+        let sink = RecordingSink::default();
+
+        let report = run_media_session(
+            &mut socket,
+            &FakeSpeech {
+                heard: "please call me back",
+            },
+            &sink,
+            &FakeCarrier,
+            call,
+        )
+        .await;
+
+        assert_eq!(report.turns_submitted, 1);
+        assert_eq!(sink.turns.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

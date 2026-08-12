@@ -129,10 +129,7 @@ impl TelecomProvider for TelnyxProvider {
     }
 
     fn media_stream(&self) -> Option<crate::daemon::call_media::MediaStreamFormat> {
-        Some(crate::daemon::call_media::MediaStreamFormat {
-            stream_id_key: "stream_id",
-            outbound_event: "media",
-        })
+        Some(MEDIA_FORMAT)
     }
 
     /// TeXML, Telnyx's TwiML-compatible document. Same shape, same verb names,
@@ -248,14 +245,27 @@ impl TelecomProvider for TelnyxProvider {
         }
     }
 
-    async fn place_call(&self, to_number: &str, answer_url: &str) -> Result<CallHandle, String> {
+    async fn place_call(
+        &self,
+        to_number: &str,
+        answer_url: &str,
+        record: bool,
+    ) -> Result<CallHandle, String> {
         let client = self.client()?;
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "connection_id": self.connection_id,
             "to": to_number,
             "from": self.from_number,
             "webhook_url": answer_url,
+            // Audio only flows both ways on an RTP bidirectional stream, and
+            // only µ-law matches what the rest of this pipeline speaks.
+            "stream_bidirectional_mode": "rtp",
+            "stream_bidirectional_codec": "PCMU",
         });
+        if record {
+            body["record"] = serde_json::json!("record-from-answer");
+            body["record_channels"] = serde_json::json!("single");
+        }
         let request = client
             .post(self.calls_url())
             .bearer_auth(&self.api_key)
@@ -799,5 +809,30 @@ mod tests {
             SendOutcome::NeedsReconciliation { .. } => {}
             other => panic!("expected NeedsReconciliation, got {other:?}"),
         }
+    }
+}
+
+/// How this carrier's media stream is shaped. See
+/// [`crate::daemon::call_media::MediaStreamFormat`] for why each field exists.
+const MEDIA_FORMAT: crate::daemon::call_media::MediaStreamFormat =
+    crate::daemon::call_media::MediaStreamFormat {
+        stream_id_path: &["stream_id"],
+        outbound_chunk_ms: 1_000,
+    };
+
+impl crate::daemon::call_media::MediaFrameCodec for TelnyxProvider {
+    fn format(&self) -> crate::daemon::call_media::MediaStreamFormat {
+        MEDIA_FORMAT
+    }
+
+    fn encode_media_frame(&self, payload_b64: &str, stream_id: &str) -> String {
+        // Telnyx accepts at most one payload per second on a bidirectional
+        // RTP stream, so frames here are a second of audio rather than 20 ms.
+        serde_json::json!({
+            "event": "media",
+            "stream_id": stream_id,
+            "media": { "payload": payload_b64 },
+        })
+        .to_string()
     }
 }

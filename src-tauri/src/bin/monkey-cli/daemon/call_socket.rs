@@ -20,6 +20,30 @@ use super::call_media::{
     run_media_session, CallIdentity, ConfiguredSpeech, MediaSocket, QueuedCallTurns,
 };
 use super::store::{DaemonPaths, DaemonStore};
+use super::telecom_store::{CallDirection, InboundCallPolicy};
+
+/// How many carrier media sockets may be open at once, across every account.
+///
+/// This endpoint is reachable by anyone who can reach the operator's public
+/// URL. The token check below is what stops them talking to a call, but the
+/// socket itself is allocated before any of that, so the count is the bound on
+/// what an unauthenticated caller can make this process hold.
+const MAX_MEDIA_SOCKETS: usize = 16;
+
+fn open_sockets() -> &'static std::sync::atomic::AtomicUsize {
+    static OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    &OPEN
+}
+
+/// Decrements the open-socket count however the session ends — normally, by
+/// error, or by panic.
+struct SocketSlot;
+
+impl Drop for SocketSlot {
+    fn drop(&mut self) {
+        open_sockets().fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// Verify a carrier's media connection and, if it checks out, hand the socket to
 /// the conversation loop.
@@ -89,9 +113,12 @@ pub(crate) async fn handle_media_upgrade(
     let Ok(provider) = super::telephony::provider_for_account(&account, secret) else {
         return refuse();
     };
-    let Some(format) = provider.media_stream() else {
+    if provider.media_stream().is_none() {
+        // A carrier that cannot stream audio can ring and text, but it cannot
+        // hold a conversation, and pretending otherwise connects a caller to
+        // silence.
         return refuse();
-    };
+    }
     let Some(session_key) = call.session_key.clone() else {
         return refuse();
     };
@@ -108,13 +135,35 @@ pub(crate) async fn handle_media_upgrade(
         return refuse();
     };
 
+    // What is said when the line opens. An outbound call carries the sentence
+    // the operator approved; an inbound one gets the number's greeting, if the
+    // operator wrote one. Voicemail takes one message and hangs up.
+    let single_turn = matches!(account.inbound_policy, InboundCallPolicy::Voicemail)
+        && matches!(call.direction, CallDirection::Inbound);
+    let opening_line = call.opening_line.clone().or_else(|| {
+        account
+            .non_secret_config
+            .get("greeting")
+            .and_then(|value| value.as_str())
+            .filter(|greeting| !greeting.trim().is_empty())
+            .map(str::to_string)
+    });
+    if open_sockets().fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_MEDIA_SOCKETS {
+        open_sockets().fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        return refuse();
+    }
+    let slot = SocketSlot;
+
     let identity = CallIdentity {
         account_id,
         call_id,
         peer_number: call.peer_number.clone(),
         session_key,
+        opening_line,
+        single_turn,
     };
     tokio::spawn(async move {
+        let _slot = slot;
         let upgraded = match hyper::upgrade::on(request).await {
             Ok(upgraded) => upgraded,
             Err(error) => {
@@ -145,7 +194,8 @@ pub(crate) async fn handle_media_upgrade(
         let speech = ConfiguredSpeech {
             app_data_dir: paths.root.clone(),
         };
-        let report = run_media_session(&mut socket, &speech, &sink, format, identity).await;
+        let report =
+            run_media_session(&mut socket, &speech, &sink, provider.as_ref(), identity).await;
         eprintln!(
             "monkey daemon: a call ended after {} turn(s)",
             report.turns_submitted

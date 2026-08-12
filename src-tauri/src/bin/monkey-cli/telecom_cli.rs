@@ -97,6 +97,13 @@ pub enum TelecomCmd {
         #[arg(long)]
         recording: Option<bool>,
     },
+    /// What this number says when a call connects. Without one, a caller who
+    /// is answered hears silence until they speak first.
+    Greeting {
+        account_id: String,
+        /// The words to say. Empty clears it.
+        text: Vec<String>,
+    },
     /// Recent calls on this number.
     Calls {
         account_id: String,
@@ -157,6 +164,7 @@ pub async fn dispatch(action: &TelecomCmd) -> Result<(), String> {
             *max_duration_s,
             *recording,
         ),
+        TelecomCmd::Greeting { account_id, text } => set_greeting(account_id, &text.join(" ")),
         TelecomCmd::Calls {
             account_id,
             limit,
@@ -194,6 +202,14 @@ pub(crate) fn account_json(account: &TelecomAccountRecord) -> serde_json::Value 
         "from_number": account.from_number,
         "has_credential": account.credential_ref.is_some(),
         "public_base_url": account.public_base_url,
+        "greeting": account
+            .non_secret_config
+            .get("greeting")
+            .and_then(|value| value.as_str()),
+        // Plivo records with an XML element that cannot run alongside the
+        // stream a conversation needs, so the UI can say so rather than
+        // offering a switch that turns into a refused call.
+        "supports_recording": !matches!(account.kind, TelecomKind::Plivo),
         "inbound_policy": account.inbound_policy.as_str(),
         "outbound_approval": account.outbound_approval.as_str(),
         "limits": {
@@ -473,6 +489,41 @@ fn set_limits(
         }
     );
     Ok(())
+}
+
+/// Store the line the number opens an answered call with.
+///
+/// Lives in the account's non-secret config rather than in a column of its own:
+/// it is operator-authored text about this number, like its label, and nothing
+/// in the daemon branches on it.
+fn set_greeting(account_id: &str, text: &str) -> Result<(), String> {
+    if text.chars().count() > 600 {
+        return Err("That greeting is too long to say on a phone call.".to_string());
+    }
+    let mut store = store()?;
+    let mut account = store
+        .telecom_account(account_id)?
+        .ok_or_else(|| format!("No such account '{account_id}'"))?;
+    let mut config = account.non_secret_config.clone();
+    let Some(object) = config.as_object_mut() else {
+        return Err("This account's settings are not a JSON object".to_string());
+    };
+    if text.trim().is_empty() {
+        object.remove("greeting");
+        println!("{account_id} will answer without saying anything first.");
+    } else {
+        object.insert(
+            "greeting".to_string(),
+            serde_json::Value::String(text.trim().to_string()),
+        );
+        println!(
+            "{account_id} will open an answered call with: {}",
+            text.trim()
+        );
+    }
+    account.non_secret_config = config;
+    account.updated_at_ms = now_ms();
+    store.upsert_telecom_account(&account)
 }
 
 fn calls(account_id: &str, limit: u32, json: bool) -> Result<(), String> {

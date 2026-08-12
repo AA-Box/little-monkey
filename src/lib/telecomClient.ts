@@ -34,6 +34,12 @@ export interface TelecomAccount {
   from_number: string;
   has_credential: boolean;
   public_base_url: string | null;
+  /** What the number says when an answered call connects. Without one, a
+   * caller hears silence until they speak first. */
+  greeting: string | null;
+  /** Whether this carrier can record a call it is also streaming. Plivo cannot:
+   * its recording element and its stream cannot both run. */
+  supports_recording: boolean;
   inbound_policy: InboundCallPolicy;
   outbound_approval: OutboundCallApproval;
   limits: CallLimits;
@@ -152,6 +158,8 @@ export const telecomSetLimits = (
     maxDurationS: limits.maxDurationS ?? null,
     recording: limits.recording ?? null,
   });
+export const telecomSetGreeting = (accountId: string, text: string) =>
+  invoke<void>("telecom_set_greeting", { accountId, text });
 export const telecomCalls = (accountId: string, limit = 20) =>
   invoke<TelecomCall[]>("telecom_calls", { accountId, limit });
 export const telecomCallbackUrl = (accountId: string) =>
@@ -186,5 +194,7 @@ export function setupGaps(account: TelecomAccount): string[] {
   if (account.public_base_url === null) gaps.push("public_url");
   if (!account.enabled) gaps.push("enabled");
   if (account.health.state !== "connected") gaps.push("probe");
+  // A number that answers without a greeting connects the caller to silence.
+  if (account.inbound_policy !== "reject" && !account.greeting) gaps.push("greeting");
   return gaps;
 }

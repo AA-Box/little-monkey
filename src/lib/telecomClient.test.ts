@@ -18,6 +18,8 @@ function account(overrides: Partial<TelecomAccount> = {}): TelecomAccount {
     from_number: "+15550000000",
     has_credential: true,
     public_base_url: "https://calls.example.test",
+    greeting: "Support line, how can I help?",
+    supports_recording: true,
     inbound_policy: "answer",
     outbound_approval: "approval",
     limits: {
@@ -79,6 +81,14 @@ describe("what an account still needs", () => {
       health: { state: "unconfigured", detail: null, last_error: null, probed_at_ms: 0 },
     });
     expect(setupGaps(unprobed)).toContain("probe");
+  });
+
+  it("counts answering with no greeting as unfinished", () => {
+    // A number that picks up and says nothing sounds broken to the caller.
+    expect(setupGaps(account({ greeting: null }))).toContain("greeting");
+    expect(setupGaps(account({ greeting: null, inbound_policy: "reject" }))).not.toContain(
+      "greeting",
+    );
   });
 
   it("lists what is missing in the order it should be fixed", () => {

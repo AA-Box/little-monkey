@@ -34,7 +34,17 @@ fn valid_e164(number: &str) -> bool {
 pub(crate) async fn place_call(
     account_id: &str,
     to_number: &str,
+    opening_line: &str,
 ) -> Result<serde_json::Value, String> {
+    // A call that opens with silence is worse than no call: the person who
+    // picked up hears nothing and hangs up, and it still cost money. The words
+    // are required, and they are what the approval prompt showed.
+    if opening_line.trim().is_empty() {
+        return Err("Say what the call is about; a call cannot open with silence.".to_string());
+    }
+    if opening_line.chars().count() > 600 {
+        return Err("That opening line is too long to say on a phone call.".to_string());
+    }
     if !valid_e164(to_number) {
         return Err(
             "A phone number must be in international format, like +15551234567.".to_string(),
@@ -78,6 +88,7 @@ pub(crate) async fn place_call(
         session_key: Some(format!("call:{}:{call_id}", account.account_id)),
         job_id: (!job_id.is_empty()).then(|| job_id.clone()),
         idempotency_key,
+        opening_line: Some(opening_line.trim().to_string()),
         last_error: None,
         started_at_ms: None,
         ended_at_ms: None,
@@ -120,7 +131,10 @@ pub(crate) async fn place_call(
         account.account_id
     );
 
-    match provider.place_call(to_number, &answer_url).await {
+    match provider
+        .place_call(to_number, &answer_url, account.limits.recording_enabled)
+        .await
+    {
         Ok(handle) => {
             if !handle.provider_call_id.is_empty() {
                 store.set_call_provider_id(&call_id, &handle.provider_call_id, now_ms)?;
@@ -196,8 +210,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_call_with_nothing_to_say_is_refused() {
+        let error = place_call("tel-1", "+15551234567", "   ")
+            .await
+            .expect_err("refused");
+        assert!(error.contains("cannot open with silence"));
+    }
+
+    #[tokio::test]
     async fn a_malformed_number_is_refused_before_anything_is_opened() {
-        let error = place_call("tel-1", "not-a-number")
+        let error = place_call("tel-1", "not-a-number", "hello, this is a test")
             .await
             .expect_err("refused");
         assert!(error.contains("international format"));
