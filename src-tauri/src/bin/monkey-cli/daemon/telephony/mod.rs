@@ -113,6 +113,31 @@ pub fn build_provider(
     })
 }
 
+/// Build the carrier a stored telephony account speaks to.
+///
+/// The credential arrives already resolved from the keychain, the same way a
+/// channel adapter's does. Every caller that has an account row wants exactly
+/// this mapping, so it lives here rather than being spelled out again at each
+/// call site.
+pub fn provider_for_account(
+    account: &super::telecom_store::TelecomAccountRecord,
+    secret: String,
+) -> Result<std::sync::Arc<dyn TelecomProvider>, String> {
+    build_provider(TelecomConfig {
+        account_id: account.account_id.clone(),
+        kind: account.kind,
+        carrier_account_id: account.carrier_account_id.clone(),
+        from_number: account.from_number.clone(),
+        secret,
+        public_base_url: account.public_base_url.clone(),
+        webhook_public_key: account
+            .non_secret_config
+            .get("webhook_public_key")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    })
+}
+
 /// Where a call is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

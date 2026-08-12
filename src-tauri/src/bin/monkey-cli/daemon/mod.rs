@@ -6,6 +6,7 @@ pub(crate) mod channel_store;
 pub(crate) mod channel_tool;
 pub(crate) mod channel_worker;
 mod engine;
+pub(crate) mod ingress_store;
 mod ledger;
 mod remote;
 mod scheduler;
@@ -2321,6 +2322,10 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
     // long-polling provider blocks for half a minute at a time, and the queue
     // must keep ticking while it does.
     channel_worker::spawn_channel_runtime(paths.clone());
+    // Call limits. Separate from the channel runtime because it enforces
+    // deadlines rather than moving messages: a call nobody is watching keeps
+    // costing money whether or not any provider is polling.
+    telecom_worker::spawn_telecom_runtime(paths.clone());
     spawn_webdav_backup_scheduler()?;
     if let Some(port) = config.webhook_port {
         webhook::spawn_local_listener(paths.clone(), port).await?;
