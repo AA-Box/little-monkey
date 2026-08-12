@@ -50,3 +50,25 @@ pub(crate) fn build_adapter(config: &AdapterConfig<'_>) -> Result<Arc<dyn Channe
         }
     })
 }
+
+/// Build the delivered-to adapter an account's provider needs.
+///
+/// Separate from [`build_adapter`] because the two halves answer different
+/// questions: this one is asked "who signed this body", and only the four
+/// providers that are delivered to can answer it at all.
+pub(crate) fn build_webhook_adapter(
+    config: &AdapterConfig<'_>,
+) -> Result<Box<dyn super::channel_adapter::WebhookChannelAdapter>, String> {
+    Ok(match config.account.kind {
+        ChannelKind::WhatsApp => Box::new(whatsapp::WhatsAppAdapter::new(config)?),
+        ChannelKind::Line => Box::new(line::LineAdapter::new(config)?),
+        ChannelKind::Teams => Box::new(teams::TeamsAdapter::new(config)?),
+        ChannelKind::GoogleChat => Box::new(google_chat::GoogleChatAdapter::new(config)?),
+        other => {
+            return Err(format!(
+                "{} is not delivered to over a webhook",
+                other.label()
+            ))
+        }
+    })
+}

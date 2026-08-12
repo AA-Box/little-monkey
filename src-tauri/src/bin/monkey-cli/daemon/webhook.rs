@@ -42,6 +42,15 @@ async fn handle(paths: DaemonPaths, request: Request<Incoming>) -> Response<Full
     if request.method() != Method::POST {
         return response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
     }
+    if let Some(account_id) = request
+        .uri()
+        .path()
+        .strip_prefix("/v1/channels/")
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+        .map(str::to_string)
+    {
+        return handle_channel_delivery(paths, account_id, request).await;
+    }
     let Some(trigger_id) = request
         .uri()
         .path()
@@ -100,6 +109,92 @@ async fn handle(paths: DaemonPaths, request: Request<Incoming>) -> Response<Full
         Ok(IngestOutcome::Rejected) => response(StatusCode::UNAUTHORIZED, "rejected"),
         Err(error) => json_error(StatusCode::BAD_REQUEST, &error),
     }
+}
+
+/// One delivery from a messaging provider that posts rather than being polled.
+///
+/// The signature is checked by the provider's own adapter, over the exact bytes
+/// received, before anything is parsed or stored. Nothing here reads `Host` or
+/// any `X-Forwarded-*` header: those are attacker-controlled, and a provider
+/// whose signature covers its callback URL is given the operator's own
+/// configured value from the account instead.
+///
+/// The listener still binds loopback only. Reaching it from the internet is the
+/// operator's own tunnel or reverse proxy, which is the same posture the
+/// existing trigger route has.
+async fn handle_channel_delivery(
+    paths: DaemonPaths,
+    account_id: String,
+    request: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let headers: Vec<(String, String)> = request
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
+        })
+        .collect();
+    let body = match Limited::new(request.into_body(), MAX_WEBHOOK_BYTES)
+        .collect()
+        .await
+    {
+        Ok(value) => value.to_bytes(),
+        Err(_) => return response(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+    };
+    let now_ms = match super::now_ms()
+        .and_then(|value| i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string()))
+    {
+        Ok(value) => value,
+        Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "clock_error"),
+    };
+
+    let mut store = match DaemonStore::open(&paths) {
+        Ok(store) => store,
+        Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"),
+    };
+    let account = match store.channel_account(&account_id) {
+        Ok(Some(account)) if account.enabled => account,
+        // An unknown or disabled account is a 404 rather than an explanation:
+        // a stranger probing the endpoint learns nothing about what exists.
+        Ok(_) => return response(StatusCode::NOT_FOUND, "not_found"),
+        Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"),
+    };
+    let secret = match &account.credential_ref {
+        Some(reference) => super::channel_adapter::ChannelSecrets::get(
+            &super::channel_adapter::KeyringChannelSecrets,
+            reference,
+        )
+        .unwrap_or_default(),
+        None => String::new(),
+    };
+    let config = super::channel_adapter::AdapterConfig {
+        account: &account,
+        secret,
+    };
+    let adapter = match super::adapters::build_webhook_adapter(&config) {
+        Ok(adapter) => adapter,
+        Err(_) => return response(StatusCode::NOT_FOUND, "not_found"),
+    };
+
+    let envelopes = match adapter.verify_and_normalize(&headers, &body, None, now_ms) {
+        Ok(envelopes) => envelopes,
+        // Deliberately opaque, and deliberately not recorded: an unverified
+        // body has not earned a row in the durable event log.
+        Err(_) => return response(StatusCode::UNAUTHORIZED, "rejected"),
+    };
+    if envelopes.is_empty() {
+        return response(StatusCode::OK, "ignored");
+    }
+
+    let queue = super::DaemonChannelQueue::new(paths.clone());
+    let report = super::channel_worker::ingest_batch(&mut store, &queue, &envelopes, now_ms);
+    if report.failed > 0 && report.accepted == 0 {
+        return response(StatusCode::INTERNAL_SERVER_ERROR, "not_queued");
+    }
+    response(StatusCode::ACCEPTED, "accepted")
 }
 
 fn header(headers: &hyper::HeaderMap, name: &str) -> Option<String> {
