@@ -227,6 +227,13 @@ system-memory = "0.1.7"
 # backup/restore. Bundling avoids depending on whatever SQLite version happens
 # to be installed on a user's machine; backup/limits support bounded portable
 # snapshots and hostile-input guardrails.
+# Held at 0.37 by `matrix-sdk-sqlite`, not by anything in this tree.
+# `libsqlite3-sys` declares `links = "sqlite3"`, so exactly one version of it
+# may exist in a binary: the Matrix crypto store's rusqlite and ours have to
+# be the same. Bumping this without upstream bumping theirs fails at
+# resolution, loudly, which is the failure mode we want. When
+# `matrix-sdk-sqlite` moves to a newer rusqlite, move with it — nothing here
+# depends on 0.37 specifically.
 rusqlite = { version = "0.37", features = ["bundled", "backup", "limits"] }
 # terminal.rs: one cross-platform pseudoterminal implementation for the
 # in-app terminal. The frontend intentionally stays a thin line-oriented
@@ -234,11 +241,25 @@ rusqlite = { version = "0.37", features = ["bundled", "backup", "limits"] }
 # workspace validation all remain in Rust.
 portable-pty = "0.9.0"
 enigo = "0.6.1"
+# Matrix end-to-end encryption. `matrix-sdk-crypto` owns the Olm/Megolm
+# ratchets and the key store; this tree only ships its requests over its own
+# hardened HTTP. Hand-rolling either the crypto or its persistence is how
+# someone's private conversation becomes a bug report, so both come from the
+# crate the Matrix Rust SDK is built on.
+#
+# `crypto-store` pulls `matrix-sdk-base` (and with it `decancer`, whose
+# `impl Add<_> for String` makes `String + &String` ambiguous tree-wide —
+# write `format!` instead). That, and the rusqlite pin above, are the price
+# of not maintaining a crypto store here. Both are compile-time loud.
 matrix-sdk-crypto = "0.18"
 matrix-sdk-sqlite = { version = "0.18", default-features = false, features = ["crypto-store"] }
-ruma = { version = "0.16", features = ["client-api-c", "events"] }
-http = "1"
+# Ruma types are reached through `matrix-sdk-common`'s re-export rather than a
+# second direct `ruma`, so this tree cannot compile against a different
+# feature set from the one the crypto machine was built with.
 matrix-sdk-common = "0.18"
+# Only for rebuilding a homeserver reply into the `http::Response` that ruma's
+# `IncomingResponse` parses.
+http = "1"
 
 # model_sources.rs: advisory cross-process install locks on macOS/Linux keep
 # desktop and CLI pulls from mutating the same resumable partial download.

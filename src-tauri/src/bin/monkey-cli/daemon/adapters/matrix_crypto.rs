@@ -21,6 +21,14 @@
 //!   store means every already-shared Megolm session is unreadable, and the
 //!   account shows up to everyone else as a brand-new unverified device.
 //!
+//! # Types come from the crate, not from a second `ruma`
+//!
+//! Every Matrix type here is reached through `matrix_sdk_common::ruma`, the
+//! re-export the crypto crate itself compiles against. Declaring our own
+//! `ruma` dependency would let this tree pick a different feature set from
+//! the one the machine was built with — the kind of mismatch that surfaces as
+//! an event that will not deserialize rather than as a version error.
+//!
 //! # The device is the token's device
 //!
 //! An access token belongs to a device the homeserver already knows about.
@@ -32,21 +40,23 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use matrix_sdk_common::ruma::api::client::keys::{
+    claim_keys, get_keys, upload_keys, upload_signatures::v3 as upload_signatures,
+};
+use matrix_sdk_common::ruma::api::client::message::send_message_event;
+use matrix_sdk_common::ruma::api::client::sync::sync_events::DeviceLists;
+use matrix_sdk_common::ruma::api::client::to_device::send_event_to_device;
+use matrix_sdk_common::ruma::api::IncomingResponse;
+use matrix_sdk_common::ruma::events::AnyMessageLikeEventContent;
+use matrix_sdk_common::ruma::serde::Raw;
+use matrix_sdk_common::ruma::{
+    self as ruma, DeviceId, OwnedDeviceId, OwnedRoomId, OwnedUserId, TransactionId, UserId,
+};
 use matrix_sdk_crypto::types::requests::{
     AnyIncomingResponse, AnyOutgoingRequest, OutgoingRequest,
 };
 use matrix_sdk_crypto::{DecryptionSettings, EncryptionSettings, OlmMachine, TrustRequirement};
 use matrix_sdk_sqlite::SqliteCryptoStore;
-use ruma::api::client::keys::{
-    claim_keys, get_keys, upload_keys, upload_signatures::v3 as upload_signatures,
-};
-use ruma::api::client::message::send_message_event;
-use ruma::api::client::sync::sync_events::DeviceLists;
-use ruma::api::client::to_device::send_event_to_device;
-use ruma::api::IncomingResponse;
-use ruma::events::AnyMessageLikeEventContent;
-use ruma::serde::Raw;
-use ruma::{DeviceId, OwnedDeviceId, OwnedRoomId, OwnedUserId, TransactionId, UserId};
 use serde_json::{json, Value};
 
 /// Everything encryption needs that the plain REST adapter already has.

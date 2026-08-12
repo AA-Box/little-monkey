@@ -3378,7 +3378,6 @@ dependencies = [
  "reqwest",
  "ring",
  "rmcp",
- "ruma",
  "rusqlite",
  "rustls",
  "rustyline",
