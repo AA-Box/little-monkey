@@ -78,8 +78,14 @@ export interface ProviderGuide {
   credentialLabel: string;
   whereToGetIt: string;
   docsUrl: string;
-  /** Extra non-secret settings this provider needs, as JSON keys. */
+  /** Extra non-secret settings this provider needs, as JSON keys. Never a
+   * secret: these are stored in the account row, not the keychain. */
   configKeys: string[];
+  /** The parts the credential is made of, when it is more than one value.
+   * Setup collects each one and saves them as the single JSON bundle the
+   * adapter parses, so nobody has to know the wire shape. Omitted means the
+   * credential is one value pasted whole. */
+  secretFields?: { key: string; label: string }[];
 }
 
 export const PROVIDER_GUIDES: ProviderGuide[] = [
@@ -88,10 +94,10 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
   { kind: "slack", label: "Slack", transport: "socket", credentialLabel: "Bot and app tokens (JSON)", whereToGetIt: "Slack API → your app → OAuth (xoxb bot token) and Basic Information (xapp app-level token with connections:write).", docsUrl: "https://api.slack.com/apis/socket-mode", configKeys: [] },
   { kind: "mattermost", label: "Mattermost", transport: "socket", credentialLabel: "Personal access token", whereToGetIt: "Your Mattermost profile → Security → Personal Access Tokens.", docsUrl: "https://developers.mattermost.com/integrate/reference/personal-access-token/", configKeys: ["base_url"] },
   { kind: "irc", label: "IRC", transport: "socket", credentialLabel: "SASL password", whereToGetIt: "The account password registered with the network's services (NickServ).", docsUrl: "https://ircv3.net/specs/extensions/sasl-3.1", configKeys: ["server", "port", "nick", "channels", "use_sasl"] },
-  { kind: "whatsapp", label: "WhatsApp", transport: "webhook", credentialLabel: "Access token", whereToGetIt: "Meta for Developers → your app → WhatsApp → API Setup. You also need the app secret for signature verification.", docsUrl: "https://developers.facebook.com/docs/whatsapp/cloud-api", configKeys: ["phone_number_id", "app_secret"] },
-  { kind: "line", label: "LINE", transport: "webhook", credentialLabel: "Channel access token", whereToGetIt: "LINE Developers Console → your channel → Messaging API. The channel secret verifies signatures.", docsUrl: "https://developers.line.biz/en/docs/messaging-api/", configKeys: ["channel_secret"] },
-  { kind: "teams", label: "Microsoft Teams", transport: "webhook", credentialLabel: "App password", whereToGetIt: "Azure Bot resource → Configuration → Microsoft App ID and a client secret.", docsUrl: "https://learn.microsoft.com/azure/bot-service/", configKeys: ["app_id", "tenant_id"] },
-  { kind: "google_chat", label: "Google Chat", transport: "webhook", credentialLabel: "Service account key (JSON)", whereToGetIt: "Google Cloud Console → Chat API → create a service account and download its key.", docsUrl: "https://developers.google.com/chat/api/guides/auth", configKeys: ["project_number", "space"] },
+  { kind: "whatsapp", label: "WhatsApp", transport: "webhook", credentialLabel: "WhatsApp credentials", whereToGetIt: "Meta for Developers → your app → WhatsApp → API Setup for the access token and phone number ID; App settings → Basic for the app secret. The verify token is yours to invent — type the same value here and into Meta's webhook form.", docsUrl: "https://developers.facebook.com/docs/whatsapp/cloud-api", configKeys: ["phone_number_id"], secretFields: [{ key: "access_token", label: "Access token" }, { key: "app_secret", label: "App secret" }, { key: "verify_token", label: "Verify token (you choose it)" }] },
+  { kind: "line", label: "LINE", transport: "webhook", credentialLabel: "LINE credentials", whereToGetIt: "LINE Developers Console → your channel → Messaging API for the access token, and Basic settings for the channel secret that verifies signatures.", docsUrl: "https://developers.line.biz/en/docs/messaging-api/", configKeys: [], secretFields: [{ key: "channel_access_token", label: "Channel access token" }, { key: "channel_secret", label: "Channel secret" }] },
+  { kind: "teams", label: "Microsoft Teams", transport: "webhook", credentialLabel: "Client secret", whereToGetIt: "Azure Bot resource → Configuration for the Microsoft App ID and tenant ID; Certificates & secrets for a client secret.", docsUrl: "https://learn.microsoft.com/azure/bot-service/", configKeys: ["app_id", "tenant_id"], secretFields: [{ key: "app_password", label: "Client secret" }] },
+  { kind: "google_chat", label: "Google Chat", transport: "webhook", credentialLabel: "Service account key (paste the whole JSON file)", whereToGetIt: "Google Cloud Console → Chat API → create a service account and download its key. Paste the file's contents unchanged.", docsUrl: "https://developers.google.com/chat/api/guides/auth", configKeys: ["project_number"] },
 ];
 
 export const channelsList = () => invoke<{ accounts: ChannelAccount[] }>("channels_list");

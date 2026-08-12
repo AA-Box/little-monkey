@@ -39,16 +39,28 @@ pub async fn spawn_local_listener(paths: DaemonPaths, port: u16) -> Result<(), S
 }
 
 async fn handle(paths: DaemonPaths, request: Request<Incoming>) -> Response<Full<Bytes>> {
-    if request.method() != Method::POST {
-        return response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
-    }
-    if let Some(account_id) = request
+    let channel_account = request
         .uri()
         .path()
         .strip_prefix("/v1/channels/")
         .filter(|value| !value.is_empty() && !value.contains('/'))
-        .map(str::to_string)
-    {
+        .map(str::to_string);
+    // A GET reaches exactly one thing: the subscription handshake a provider
+    // performs before it will save the callback URL at all. Everything else
+    // stays POST-only.
+    if request.method() == Method::GET {
+        return match channel_account {
+            Some(account_id) => {
+                let query = request.uri().query().unwrap_or_default().to_string();
+                handle_channel_verification(paths, account_id, &query)
+            }
+            None => response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
+        };
+    }
+    if request.method() != Method::POST {
+        return response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
+    }
+    if let Some(account_id) = channel_account {
         return handle_channel_delivery(paths, account_id, request).await;
     }
     if let Some(account_id) = request
@@ -160,32 +172,9 @@ async fn handle_channel_delivery(
         Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "clock_error"),
     };
 
-    let mut store = match DaemonStore::open(&paths) {
-        Ok(store) => store,
-        Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"),
-    };
-    let account = match store.channel_account(&account_id) {
-        Ok(Some(account)) if account.enabled => account,
-        // An unknown or disabled account is a 404 rather than an explanation:
-        // a stranger probing the endpoint learns nothing about what exists.
-        Ok(_) => return response(StatusCode::NOT_FOUND, "not_found"),
-        Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"),
-    };
-    let secret = match &account.credential_ref {
-        Some(reference) => super::channel_adapter::ChannelSecrets::get(
-            &super::channel_adapter::KeyringChannelSecrets,
-            reference,
-        )
-        .unwrap_or_default(),
-        None => String::new(),
-    };
-    let config = super::channel_adapter::AdapterConfig {
-        account: &account,
-        secret,
-    };
-    let adapter = match super::adapters::build_webhook_adapter(&config) {
-        Ok(adapter) => adapter,
-        Err(_) => return response(StatusCode::NOT_FOUND, "not_found"),
+    let (mut store, adapter) = match open_webhook_adapter(&paths, &account_id) {
+        Ok(pair) => pair,
+        Err(refusal) => return refusal,
     };
 
     let envelopes = match adapter.verify_and_normalize(&headers, &body, None, now_ms) {
@@ -204,6 +193,80 @@ async fn handle_channel_delivery(
         return response(StatusCode::INTERNAL_SERVER_ERROR, "not_queued");
     }
     response(StatusCode::ACCEPTED, "accepted")
+}
+
+/// Open the store and build one account's webhook adapter, or the response
+/// that says why not.
+///
+/// An unknown account, a disabled one, and a provider that is not delivered to
+/// all answer the same flat 404: a stranger probing the endpoint learns
+/// nothing about what exists.
+fn open_webhook_adapter(
+    paths: &DaemonPaths,
+    account_id: &str,
+) -> Result<
+    (
+        DaemonStore,
+        Box<dyn super::channel_adapter::WebhookChannelAdapter>,
+    ),
+    Response<Full<Bytes>>,
+> {
+    let store = DaemonStore::open(paths)
+        .map_err(|_| response(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"))?;
+    let account = match store.channel_account(account_id) {
+        Ok(Some(account)) if account.enabled => account,
+        Ok(_) => return Err(response(StatusCode::NOT_FOUND, "not_found")),
+        Err(_) => {
+            return Err(response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "state_unavailable",
+            ))
+        }
+    };
+    let secret = match &account.credential_ref {
+        Some(reference) => super::channel_adapter::ChannelSecrets::get(
+            &super::channel_adapter::KeyringChannelSecrets,
+            reference,
+        )
+        .unwrap_or_default(),
+        None => String::new(),
+    };
+    let config = super::channel_adapter::AdapterConfig {
+        account: &account,
+        secret,
+    };
+    let adapter = super::adapters::build_webhook_adapter(&config)
+        .map_err(|_| response(StatusCode::NOT_FOUND, "not_found"))?;
+    Ok((store, adapter))
+}
+
+/// The subscription handshake a provider performs before it will accept the
+/// callback URL.
+///
+/// The adapter answers, because only it knows what its provider asks and what
+/// shared secret proves the asker is that provider. A refusal is a flat 403
+/// with no detail — the alternative tells whoever is probing which half of the
+/// handshake they got right.
+///
+/// The challenge is echoed as `text/plain`, which is what Meta requires: it
+/// compares the body byte for byte and a JSON wrapper fails the comparison.
+fn handle_channel_verification(
+    paths: DaemonPaths,
+    account_id: String,
+    query: &str,
+) -> Response<Full<Bytes>> {
+    let (_store, adapter) = match open_webhook_adapter(&paths, &account_id) {
+        Ok(pair) => pair,
+        Err(refusal) => return refusal,
+    };
+    match adapter.verification_challenge(query) {
+        Some(challenge) => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Full::new(Bytes::from(challenge)))
+            .expect("challenge response is valid"),
+        None => response(StatusCode::FORBIDDEN, "rejected"),
+    }
 }
 
 /// One callback from a carrier.

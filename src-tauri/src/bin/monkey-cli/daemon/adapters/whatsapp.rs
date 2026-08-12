@@ -38,6 +38,13 @@ struct WhatsAppNonSecretConfig {
 struct WhatsAppSecrets {
     app_secret: String,
     access_token: String,
+    /// The token the operator typed into Meta's "Verify token" box. A shared
+    /// secret like the other two, so it lives with them in the keychain and
+    /// not in `non_secret_config`. Defaulted because an account configured
+    /// before this handshake existed still has to build — it simply cannot
+    /// answer a challenge until the operator saves one.
+    #[serde(default)]
+    verify_token: String,
 }
 
 pub struct WhatsAppAdapter {
@@ -45,6 +52,7 @@ pub struct WhatsAppAdapter {
     phone_number_id: String,
     app_secret: String,
     access_token: String,
+    verify_token: String,
     /// The Graph API origin. Always [`GRAPH_API_BASE`] in production;
     /// swappable in tests so `send`/`probe` can be exercised against a
     /// loopback fixture instead of the real network.
@@ -71,6 +79,7 @@ impl WhatsAppAdapter {
             phone_number_id: non_secret.phone_number_id,
             app_secret: secrets.app_secret,
             access_token: secrets.access_token,
+            verify_token: secrets.verify_token,
             graph_api_base: GRAPH_API_BASE.to_string(),
         })
     }
@@ -110,6 +119,38 @@ impl WebhookChannelAdapter for WhatsAppAdapter {
         let payload: JsonValue = serde_json::from_slice(body)
             .map_err(|error| format!("WhatsApp webhook body is not valid JSON: {error}"))?;
         Ok(normalize_payload(&payload, &self.account_id, now_ms))
+    }
+
+    /// Meta's subscription handshake: it GETs the callback URL with a verify
+    /// token the operator chose, and only saves the URL if the exact
+    /// `hub.challenge` comes back.
+    ///
+    /// The comparison is constant-time and an unconfigured token never
+    /// matches, so this endpoint cannot be turned into an oracle for guessing
+    /// the token one request at a time. Nothing else about the account is
+    /// revealed either way — the caller answers a mismatch with a flat 403.
+    fn verification_challenge(&self, query: &str) -> Option<String> {
+        if self.verify_token.is_empty() {
+            return None;
+        }
+        let params: std::collections::BTreeMap<String, String> =
+            url::form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect();
+        if params.get("hub.mode").map(String::as_str) != Some("subscribe") {
+            return None;
+        }
+        let offered = params.get("hub.verify_token")?;
+        // Digests are compared, not the tokens: two SHA-256 outputs compare in
+        // a way that leaks nothing about the inputs, so a plain `==` here is
+        // not the timing side channel that comparing the tokens directly
+        // would be.
+        let expected = ring::digest::digest(&ring::digest::SHA256, self.verify_token.as_bytes());
+        let actual = ring::digest::digest(&ring::digest::SHA256, offered.as_bytes());
+        if expected.as_ref() != actual.as_ref() {
+            return None;
+        }
+        params.get("hub.challenge").cloned()
     }
 }
 
@@ -607,6 +648,93 @@ mod tests {
             0,
         );
         assert!(result.is_err());
+    }
+
+    /// The adapter as Meta's dashboard meets it during setup: same secrets
+    /// plus the verify token the operator typed into the subscription form.
+    fn adapter_with_verify_token(verify_token: &str) -> WhatsAppAdapter {
+        let account = test_account(serde_json::json!({ "phone_number_id": "1234567890" }));
+        let secret = serde_json::json!({
+            "app_secret": "s3cret",
+            "access_token": "tok",
+            "verify_token": verify_token,
+        })
+        .to_string();
+        WhatsAppAdapter::new(&AdapterConfig {
+            account: &account,
+            secret,
+        })
+        .expect("adapter builds")
+    }
+
+    #[test]
+    fn a_correct_verify_token_echoes_the_challenge() {
+        let adapter = adapter_with_verify_token("chosen-by-the-operator");
+        let answer = adapter.verification_challenge(
+            "hub.mode=subscribe&hub.verify_token=chosen-by-the-operator&hub.challenge=1158201444",
+        );
+        assert_eq!(answer.as_deref(), Some("1158201444"));
+    }
+
+    #[test]
+    fn a_percent_encoded_challenge_is_echoed_decoded() {
+        let adapter = adapter_with_verify_token("tok en");
+        let answer = adapter.verification_challenge(
+            "hub.mode=subscribe&hub.verify_token=tok%20en&hub.challenge=a%2Bb%20c",
+        );
+        assert_eq!(answer.as_deref(), Some("a+b c"));
+    }
+
+    #[test]
+    fn a_wrong_verify_token_answers_nothing() {
+        let adapter = adapter_with_verify_token("chosen-by-the-operator");
+        assert!(adapter
+            .verification_challenge(
+                "hub.mode=subscribe&hub.verify_token=guessed&hub.challenge=1158201444"
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn a_prefix_of_the_verify_token_is_not_close_enough() {
+        let adapter = adapter_with_verify_token("chosen-by-the-operator");
+        assert!(adapter
+            .verification_challenge("hub.mode=subscribe&hub.verify_token=chosen&hub.challenge=x")
+            .is_none());
+    }
+
+    #[test]
+    fn an_account_with_no_verify_token_answers_nothing() {
+        // Not even to an empty offered token: an unconfigured account must not
+        // be the one endpoint that any challenge passes.
+        let adapter = adapter_with_verify_token("");
+        assert!(adapter
+            .verification_challenge("hub.mode=subscribe&hub.verify_token=&hub.challenge=x")
+            .is_none());
+    }
+
+    #[test]
+    fn a_challenge_without_the_subscribe_mode_is_refused() {
+        let adapter = adapter_with_verify_token("chosen-by-the-operator");
+        assert!(adapter
+            .verification_challenge(
+                "hub.mode=unsubscribe&hub.verify_token=chosen-by-the-operator&hub.challenge=x"
+            )
+            .is_none());
+        assert!(adapter
+            .verification_challenge("hub.verify_token=chosen-by-the-operator&hub.challenge=x")
+            .is_none());
+    }
+
+    #[test]
+    fn an_account_saved_before_verify_tokens_existed_still_builds() {
+        // The credential bundle predating this field must not become
+        // unparseable — the account keeps working, it just cannot answer a
+        // subscription handshake until the operator saves a token.
+        let adapter = adapter("s3cret", "tok");
+        assert!(adapter
+            .verification_challenge("hub.mode=subscribe&hub.verify_token=&hub.challenge=x")
+            .is_none());
     }
 
     #[test]

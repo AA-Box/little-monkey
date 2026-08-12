@@ -1120,6 +1120,7 @@ export const en: Record<string, string> = {
   "ChannelsPanel.credentialSaved": "Credential saved to your keychain. Test the connection to confirm it works.",
   "ChannelsPanel.setupInstructions": "Open setup instructions",
   "ChannelsPanel.callbackHint": "Point the provider's webhook at your own public URL followed by",
+  "ChannelsPanel.callbackVerifyHint": "Save the verify token here first. Meta checks it once, by calling this URL, before it will accept the webhook.",
   "ChannelsPanel.dmPolicy": "Direct messages",
   "ChannelsPanel.groupPolicy": "Groups and channels",
   "ChannelsPanel.activation": "Reply in groups",

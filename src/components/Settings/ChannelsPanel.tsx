@@ -54,6 +54,7 @@ export function ChannelsPanel() {
   const [notice, setNotice] = useState<string | null>(null);
   const [draft, setDraft] = useState({ kind: "telegram", label: "", config: "" });
   const [secret, setSecret] = useState("");
+  const [secretParts, setSecretParts] = useState<Record<string, string>>({});
   const [routeDraft, setRouteDraft] = useState({ recipe: "", scope: "account" as "account" | "global" });
 
   const load = useCallback(async () => {
@@ -80,7 +81,13 @@ export function ChannelsPanel() {
     }
   }, []);
 
-  useEffect(() => { if (selected) void loadDetail(selected); }, [selected, loadDetail]);
+  // Anything typed for one account is dropped when another is selected: a
+  // half-entered credential must never be saved against a different account.
+  useEffect(() => {
+    setSecret("");
+    setSecretParts({});
+    if (selected) void loadDetail(selected);
+  }, [selected, loadDetail]);
 
   const run = useCallback(async (key: string, action: () => Promise<unknown>, done?: string) => {
     setBusy(key);
@@ -100,6 +107,18 @@ export function ChannelsPanel() {
 
   const account = accounts?.find((entry) => entry.account_id === selected) ?? null;
   const guide = PROVIDER_GUIDES.find((entry) => entry.kind === (account?.kind ?? draft.kind));
+
+  // A provider whose credential is several values is collected field by field
+  // and saved as the one JSON bundle its adapter parses. Nobody should have to
+  // know that shape, and typing it by hand is how a working token ends up
+  // rejected as malformed.
+  const fields = guide?.secretFields ?? [];
+  const credentialValue = fields.length > 0
+    ? JSON.stringify(Object.fromEntries(fields.map((field) => [field.key, secretParts[field.key] ?? ""])))
+    : secret;
+  const credentialReady = fields.length > 0
+    ? fields.every((field) => (secretParts[field.key] ?? "").length > 0)
+    : secret.length > 0;
 
   if (accounts === null) {
     return <p className="flex items-center gap-2 text-sm text-muted"><Loader2 size={14} className="animate-spin" />{t("ChannelsPanel.loading")}</p>;
@@ -172,13 +191,33 @@ export function ChannelsPanel() {
           </div>
 
           <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3 sm:flex-row sm:items-end">
-            <label className="min-w-0 flex-1 text-xs text-muted">{guide?.credentialLabel ?? t("ChannelsPanel.credential")}
-              <input className={`${INPUT} mt-1`} type="password" value={secret} onChange={(event) => setSecret(event.target.value)} placeholder="••••••••" />
-            </label>
+            {fields.length > 0 ? (
+              <div className="grid min-w-0 flex-1 gap-2 sm:grid-cols-2">
+                {fields.map((field) => (
+                  <label key={field.key} className="min-w-0 text-xs text-muted">{field.label}
+                    <input
+                      className={`${INPUT} mt-1`}
+                      type="password"
+                      value={secretParts[field.key] ?? ""}
+                      onChange={(event) => setSecretParts({ ...secretParts, [field.key]: event.target.value })}
+                      placeholder="••••••••"
+                    />
+                  </label>
+                ))}
+              </div>
+            ) : (
+              <label className="min-w-0 flex-1 text-xs text-muted">{guide?.credentialLabel ?? t("ChannelsPanel.credential")}
+                <input className={`${INPUT} mt-1`} type="password" value={secret} onChange={(event) => setSecret(event.target.value)} placeholder="••••••••" />
+              </label>
+            )}
             <Button
               size="sm"
-              disabled={busy !== null || secret.length === 0}
-              onClick={() => void run("secret", async () => { await channelsSetCredential(account.account_id, secret); setSecret(""); }, t("ChannelsPanel.credentialSaved"))}
+              disabled={busy !== null || !credentialReady}
+              onClick={() => void run("secret", async () => {
+                await channelsSetCredential(account.account_id, credentialValue);
+                setSecret("");
+                setSecretParts({});
+              }, t("ChannelsPanel.credentialSaved"))}
             ><KeyRound size={14} />{t("ChannelsPanel.saveCredential")}</Button>
           </div>
           {guide && (
@@ -193,6 +232,7 @@ export function ChannelsPanel() {
           {needsPublicCallback(account.kind) && (
             <p className="mt-3 rounded-md border border-border bg-background p-2 text-xs text-muted">
               {t("ChannelsPanel.callbackHint")} <code className="text-foreground">{callbackPath(account.account_id)}</code>
+              {account.kind === "whatsapp" && <span className="mt-1 block">{t("ChannelsPanel.callbackVerifyHint")}</span>}
             </p>
           )}
 

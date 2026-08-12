@@ -94,6 +94,20 @@ pub trait WebhookChannelAdapter: Send + Sync {
         public_base_url: Option<&str>,
         now_ms: i64,
     ) -> Result<Vec<ChannelEnvelope>, String>;
+
+    /// Answer this provider's webhook-registration handshake, if it has one.
+    ///
+    /// Meta will not save a callback URL until the endpoint echoes the
+    /// `hub.challenge` it sends, so without an answer here an operator cannot
+    /// finish WhatsApp setup at all. `query` is the raw query string of a GET
+    /// to the account's callback path.
+    ///
+    /// `None` refuses, which is both the default and the right answer for
+    /// every provider that has no such handshake — the route turns it into a
+    /// flat 403 rather than a hint about what would have worked.
+    fn verification_challenge(&self, _query: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Keychain-backed credential storage for messaging accounts.
