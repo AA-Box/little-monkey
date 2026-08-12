@@ -6,6 +6,7 @@ pub(crate) mod channel_store;
 pub(crate) mod channel_tool;
 pub(crate) mod channel_worker;
 mod engine;
+pub(crate) mod ingress_store;
 mod ledger;
 mod remote;
 mod scheduler;

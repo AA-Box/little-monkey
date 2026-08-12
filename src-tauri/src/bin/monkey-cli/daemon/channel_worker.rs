@@ -24,7 +24,7 @@ use little_monkey_lib::channels::ingress::ConversationIngress;
 use little_monkey_lib::channels::types::{ChannelEnvelope, SendOutcome};
 
 use super::channel_adapter::ChannelAdapter;
-use super::channel_ingress::{self, IngressPlan, OutboxPayload, PlannedDecision};
+use super::channel_ingress::{self, IngressPlan, OutboxPayload, PlannedDecision, SubmitOutcome};
 use super::channel_store::{EventDirection, EventDisposition, NewChannelEvent};
 use super::store::DaemonStore;
 
@@ -53,9 +53,13 @@ pub(crate) struct InboundReport {
     pub challenged: u32,
     pub ignored: u32,
     pub duplicates: u32,
-    /// Messages that could not be planned at all (no route, storage failure).
-    /// Counted rather than propagated: one bad message must not stop the batch.
+    /// Messages that could not be planned at all (no route, storage failure),
+    /// or whose turn ran out of submission attempts. Counted rather than
+    /// propagated: one bad message must not stop the batch.
     pub failed: u32,
+    /// Turns that are durably accepted but did not reach the queue this pass.
+    /// Not lost — the next recovery pass re-submits them.
+    pub deferred: u32,
 }
 
 /// Feed one adapter batch through the ingress gate.
@@ -75,8 +79,13 @@ pub(crate) fn ingest_batch(
         match channel_ingress::plan_channel_ingress(store, envelope, now_ms) {
             Ok(IngressPlan { event_id, decision }) => match decision {
                 PlannedDecision::Run { ingress, params } => {
-                    match queue.submit(&ingress, params) {
-                        Ok(job_id) => {
+                    // Durable accept first, queue second. A crash in between
+                    // leaves a row `recover_pending_ingress` finishes, rather
+                    // than a message the provider considers delivered and the
+                    // event log would refuse as a duplicate.
+                    match channel_ingress::submit_ingress(store, queue, &ingress, &params, now_ms) {
+                        Ok(SubmitOutcome::Queued { job_id, .. })
+                        | Ok(SubmitOutcome::AlreadyQueued { job_id, .. }) => {
                             report.accepted += 1;
                             // Best effort: the run is already queued, and
                             // failing to annotate the event must not undo it.
@@ -85,6 +94,26 @@ pub(crate) fn ingest_batch(
                                 EventDisposition::Accepted,
                                 None,
                                 Some(&job_id),
+                            );
+                        }
+                        Ok(SubmitOutcome::Deferred { error, .. }) => {
+                            // Accepted durably, not queued yet. Counted as a
+                            // failure of this pass, but the turn is not lost.
+                            report.deferred += 1;
+                            let _ = store.set_channel_event_disposition(
+                                &event_id,
+                                EventDisposition::Accepted,
+                                Some(&error),
+                                None,
+                            );
+                        }
+                        Ok(SubmitOutcome::Parked { .. }) => {
+                            report.failed += 1;
+                            let _ = store.set_channel_event_disposition(
+                                &event_id,
+                                EventDisposition::Failed,
+                                Some("The turn could not be queued and was parked"),
+                                None,
                             );
                         }
                         Err(error) => {
@@ -242,6 +271,21 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
         }
 
         let queue: Arc<dyn RunQueue> = Arc::new(super::DaemonChannelQueue::new(paths.clone()));
+
+        // Turns that were accepted but never queued are the other half of a
+        // crash: the provider considers them delivered, so nobody else will
+        // ever send them again.
+        if let (Ok(mut store), Ok(now)) = (DaemonStore::open(&paths), current_ms()) {
+            match channel_ingress::recover_pending_ingress(&mut store, queue.as_ref(), now) {
+                Ok(recovery) if recovery.resubmitted + recovery.parked > 0 => eprintln!(
+                    "monkey daemon: resumed {} accepted turn(s) after a restart, parked {}",
+                    recovery.resubmitted, recovery.parked
+                ),
+                Ok(_) => {}
+                Err(error) => eprintln!("monkey daemon: could not resume accepted turns: {error}"),
+            }
+        }
+
         let mut adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::new();
         let mut next_reload_ms = 0_u64;
 
@@ -558,13 +602,19 @@ mod tests {
         };
 
         let report = ingest_batch(&mut store, &queue, &[envelope("1"), envelope("2")], NOW);
-        assert_eq!(report.failed, 2);
+        assert_eq!(report.deferred, 2);
         assert_eq!(report.accepted, 0);
+        assert_eq!(report.failed, 0);
+
+        // The queue refused, but the turns are not lost: both are durably
+        // accepted, and the next recovery pass is what re-submits them.
         let events = store.recent_channel_events("acct-1", 10).unwrap();
         assert_eq!(events.len(), 2);
         assert!(events
             .iter()
-            .all(|event| event.disposition == EventDisposition::Failed));
+            .all(|event| event.disposition == EventDisposition::Accepted));
+        assert!(events.iter().all(|event| event.job_id.is_none()));
+        assert_eq!(store.pending_ingress_turns(10).unwrap().len(), 2);
     }
 
     #[tokio::test]

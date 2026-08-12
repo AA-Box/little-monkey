@@ -1858,6 +1858,59 @@ ALTER TABLE telecom_accounts ADD COLUMN max_duration_s INTEGER NOT NULL DEFAULT 
 ALTER TABLE telecom_accounts ADD COLUMN recording_enabled INTEGER NOT NULL DEFAULT 0;
 "#;
 
+const DAEMON_V8: i64 = 8;
+const DAEMON_V8_CHECKSUM: &str = "daemon-jobs-v8-ingress-turns";
+
+/// Accepted conversation turns, whatever origin they arrived on.
+///
+/// This is the one table that spans the messaging channels, the phone, a paired
+/// device, a peer node and the voice stack, because "a turn was accepted and
+/// must run exactly once" is the same fact for all of them. Each origin keeps
+/// its own event log — `channel_events`, `telecom_events` — for what the
+/// provider said; this records what Little Monkey decided to do about it.
+///
+/// # The window this closes
+///
+/// Recording an inbound event makes it deduplicated, not durable: a process
+/// that dies between recording the event and enqueuing the run leaves a message
+/// that the provider will never redeliver (it was acknowledged) and that the
+/// event log will refuse as a duplicate if it does. A row here is written in
+/// the same breath as the accept decision and cleared only once the queue has
+/// the job, so recovery has both the fact and the payload it needs to finish.
+///
+/// # Exactly once
+///
+/// `dedupe_key` is UNIQUE and carries the origin identity
+/// (`source:account:event_id`), so redelivery collapses. `job_id` is the
+/// queue's deterministic id, so a recovery pass that races the original
+/// submission produces one job rather than two.
+const DAEMON_V8_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS ingress_turns (
+    ingress_id TEXT PRIMARY KEY,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL CHECK (source IN (
+        'desktop','mobile','messaging_channel','peer','voice','telephone'
+    )),
+    source_account_id TEXT NOT NULL,
+    source_event_id TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('accepted','queued','failed')),
+    ingress_json TEXT NOT NULL,
+    params_json TEXT NOT NULL,
+    job_id TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    last_error TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS ingress_turns_pending_idx
+    ON ingress_turns(state, created_at_ms);
+CREATE INDEX IF NOT EXISTS ingress_turns_recent_idx
+    ON ingress_turns(created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS ingress_turns_job_idx ON ingress_turns(job_id);
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -1876,12 +1929,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V5, DAEMON_V5_CHECKSUM, DAEMON_V5_SQL),
     (DAEMON_V6, DAEMON_V6_CHECKSUM, DAEMON_V6_SQL),
     (DAEMON_V7, DAEMON_V7_CHECKSUM, DAEMON_V7_SQL),
+    (DAEMON_V8, DAEMON_V8_CHECKSUM, DAEMON_V8_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V7;
+const DAEMON_LATEST: i64 = DAEMON_V8;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
