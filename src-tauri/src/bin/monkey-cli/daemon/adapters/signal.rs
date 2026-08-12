@@ -342,6 +342,9 @@ fn parse_event(line: &str) -> Option<ChannelEnvelope> {
                         .map(AttachmentKind::from_mime)
                         .unwrap_or(AttachmentKind::Other);
                     Some(ChannelAttachment {
+                        stored_artifact_id: None,
+                        text_excerpt: None,
+                        fetch_error: None,
                         provider_id: Some(id.clone()),
                         kind,
                         filename: item
@@ -422,7 +425,7 @@ impl ChannelAdapter for SignalAdapter {
             inbound_transport: InboundTransport::Helper,
             max_text_chars: MAX_TEXT_CHARS,
             supports_threads: false,
-            supports_attachments: true,
+            supports_attachments: false, // inbound only: this adapter does not upload files yet
             supports_mention_metadata: false,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,

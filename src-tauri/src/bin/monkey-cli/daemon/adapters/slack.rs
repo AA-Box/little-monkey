@@ -468,6 +468,9 @@ fn normalize_message_event(
                 .filter_map(|file| {
                     let handle = file.get("id")?.as_str()?.to_string();
                     Some(ChannelAttachment {
+                        stored_artifact_id: None,
+                        text_excerpt: None,
+                        fetch_error: None,
                         provider_id: Some(handle.clone()),
                         kind: file
                             .get("mimetype")
