@@ -41,6 +41,15 @@ pub fn credential_ref(account_id: &str) -> String {
     format!("channel:{account_id}")
 }
 
+/// Keychain account name for one telephony account's carrier credential.
+///
+/// Same service, different prefix: a carrier credential is written by the
+/// desktop and read by the daemon exactly like a messaging one, and the two
+/// namespaces are kept apart so an account id can never collide across them.
+pub fn telecom_credential_ref(account_id: &str) -> String {
+    format!("telecom:{account_id}")
+}
+
 pub mod ingress;
 pub mod policy;
 pub mod routing;

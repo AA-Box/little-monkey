@@ -1536,7 +1536,10 @@ fn normalize_windows_task_xml(xml: &str) -> String {
         .replacen("encoding=\"utf-16\"", "encoding=\"UTF-8\"", 1)
 }
 
-fn xml_escape(value: &str) -> String {
+/// Escape a value for XML markup. Shared with the carrier answer documents in
+/// `telephony::` — a URL built from the operator's own configuration is still
+/// interpolated into markup somebody else parses.
+pub(crate) fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")

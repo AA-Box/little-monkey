@@ -265,9 +265,10 @@ pub fn place_call_tool_def() -> serde_json::Value {
                 "type": "object",
                 "properties": {
                     "account_id": { "type": "string", "description": "The telephony account to call from." },
-                    "to_number": { "type": "string", "description": "The number to call, in international format, e.g. +15551234567." }
+                    "to_number": { "type": "string", "description": "The number to call, in international format, e.g. +15551234567." },
+                    "opening_line": { "type": "string", "description": "What to say as soon as the call connects — who is calling and why. A call cannot open with silence." }
                 },
-                "required": ["account_id", "to_number"],
+                "required": ["account_id", "to_number", "opening_line"],
                 "additionalProperties": false
             }
         }
