@@ -39,6 +39,19 @@ pub async fn spawn_local_listener(paths: DaemonPaths, port: u16) -> Result<(), S
 }
 
 async fn handle(paths: DaemonPaths, request: Request<Incoming>) -> Response<Full<Bytes>> {
+    // A carrier media stream arrives as a GET that upgrades, so it is matched
+    // before the method gates below — it is neither a provider handshake nor a
+    // delivery.
+    if let Some(account_id) = request
+        .uri()
+        .path()
+        .strip_prefix("/v1/telecom/")
+        .and_then(|rest| rest.strip_suffix("/media"))
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+        .map(str::to_string)
+    {
+        return super::call_socket::handle_media_upgrade(paths, account_id, request).await;
+    }
     let channel_account = request
         .uri()
         .path()
@@ -56,6 +69,24 @@ async fn handle(paths: DaemonPaths, request: Request<Incoming>) -> Response<Full
             }
             None => response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
         };
+    }
+    // An outbound MMS attachment: the carrier fetches it with the signed URL the
+    // SMS adapter minted. Matched before the method gates for the same reason
+    // the media socket is — it is a GET, and it is neither a handshake nor a
+    // delivery.
+    if let Some(account_id) = request
+        .uri()
+        .path()
+        .strip_prefix("/v1/telecom/")
+        .and_then(|rest| rest.strip_suffix("/file"))
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+        .map(str::to_string)
+    {
+        return serve_signed_attachment(
+            paths,
+            account_id,
+            request.uri().query().unwrap_or_default(),
+        );
     }
     if request.method() != Method::POST {
         return response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
@@ -408,19 +439,7 @@ async fn handle_carrier_callback(
         .unwrap_or_default(),
         None => String::new(),
     };
-    let provider = match super::telephony::build_provider(super::telephony::TelecomConfig {
-        account_id: account.account_id.clone(),
-        kind: account.kind,
-        carrier_account_id: account.carrier_account_id.clone(),
-        from_number: account.from_number.clone(),
-        secret,
-        public_base_url: account.public_base_url.clone(),
-        webhook_public_key: account
-            .non_secret_config
-            .get("webhook_public_key")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-    }) {
+    let provider = match super::telephony::provider_for_account(&account, secret.clone()) {
         Ok(provider) => provider,
         Err(_) => return response(StatusCode::NOT_FOUND, "not_found"),
     };
@@ -449,9 +468,67 @@ async fn handle_carrier_callback(
 
     let queue = super::DaemonChannelQueue::new(paths.clone());
     match super::telecom_worker::handle_carrier_event(&mut store, &queue, &account, event, now_ms) {
+        // An answered call is the one case where the carrier needs more than an
+        // acknowledgement: it is asking what to do with the line, and the answer
+        // is "stream the audio here". A call the policy or the concurrency limit
+        // refused gets the plain acknowledgement, which leaves the carrier to
+        // its own no-answer handling rather than connecting anything.
+        Ok(super::telecom_worker::CarrierOutcome::Call {
+            call_id,
+            answered: true,
+        }) => match answer_document(&provider, &account, &secret, &call_id, now_ms) {
+            Some(document) => xml_response(document),
+            None => response(StatusCode::ACCEPTED, "accepted"),
+        },
         Ok(_) => response(StatusCode::ACCEPTED, "accepted"),
         Err(_) => response(StatusCode::INTERNAL_SERVER_ERROR, "not_handled"),
     }
+}
+
+/// How long a media-stream token is good for.
+///
+/// Long enough for a carrier to answer and dial the socket, short enough that a
+/// URL captured from a log is worthless by the time anyone reads it. The token
+/// is bound to one call as well, so this only bounds the window on that call.
+const MEDIA_TOKEN_TTL_MS: i64 = 120_000;
+
+/// Build the carrier's answer document, pointing at this call's media socket.
+///
+/// `None` when the account has no public URL configured or the carrier has no
+/// media stream: without both there is nowhere for the audio to go, and a
+/// document that connects a caller to silence is worse than not answering.
+fn answer_document(
+    provider: &std::sync::Arc<dyn super::telephony::TelecomProvider>,
+    account: &super::telecom_store::TelecomAccountRecord,
+    secret: &str,
+    call_id: &str,
+    now_ms: i64,
+) -> Option<super::telephony::AnswerDocument> {
+    provider.media_stream()?;
+    let base = account.public_base_url.as_deref()?.trim_end_matches('/');
+    let socket_base = base
+        .strip_prefix("https://")
+        .map(|rest| format!("wss://{rest}"))
+        .or_else(|| {
+            base.strip_prefix("http://")
+                .map(|rest| format!("ws://{rest}"))
+        })?;
+    let expires_at_ms = now_ms + MEDIA_TOKEN_TTL_MS;
+    let token =
+        super::telephony::media_stream_token(secret, &account.account_id, call_id, expires_at_ms);
+    let url = format!(
+        "{socket_base}/v1/telecom/{}/media?call={call_id}&exp={expires_at_ms}&sig={token}",
+        account.account_id
+    );
+    provider.answer_instructions(&url)
+}
+
+fn xml_response(document: super::telephony::AnswerDocument) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, document.content_type)
+        .body(Full::new(Bytes::from(document.body)))
+        .unwrap_or_else(|_| response(StatusCode::INTERNAL_SERVER_ERROR, "response_failed"))
 }
 
 /// The carrier's own identifier for this event, which is what dedupe hangs on.
@@ -586,4 +663,99 @@ mod tests {
             .filter(|value| !value.contains('/'))
             .is_none());
     }
+}
+
+/// The largest attachment served to a carrier. The per-type caps in
+/// `adapters::sms` are the real limit; this only bounds what is read from disk
+/// before those are applied.
+const MAX_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Hand a carrier one attachment, if it presents a valid signed URL.
+///
+/// This is the only path by which a stored artifact leaves this machine
+/// unauthenticated, so it is narrow on purpose: one artifact named in the
+/// signature, an expiry, the account's own credential as the key, and no
+/// directory, listing or range semantics. Every refusal is the same "not
+/// found": the endpoint is public, and a specific error is a hint.
+fn serve_signed_attachment(
+    paths: DaemonPaths,
+    account_id: String,
+    query: &str,
+) -> Response<Full<Bytes>> {
+    let params: std::collections::BTreeMap<&str, &str> = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .collect();
+    let (Some(artifact_id), Some(expires_at_ms), Some(token)) = (
+        params.get("artifact").copied(),
+        params
+            .get("exp")
+            .and_then(|value| value.parse::<i64>().ok()),
+        params.get("sig").copied(),
+    ) else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    let Ok(now_ms) = super::now_ms()
+        .and_then(|value| i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string()))
+    else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    let Ok(store) = DaemonStore::open(&paths) else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    let Ok(Some(account)) = store.telecom_account(&account_id) else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    if !account.enabled {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    }
+    let secret = match &account.credential_ref {
+        Some(reference) => super::channel_adapter::ChannelSecrets::get(
+            &super::channel_adapter::KeyringChannelSecrets,
+            reference,
+        )
+        .unwrap_or_default(),
+        None => String::new(),
+    };
+    if super::telephony::verify_media_file_token(
+        &secret,
+        &account_id,
+        artifact_id,
+        expires_at_ms,
+        token,
+        now_ms,
+    )
+    .is_err()
+    {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    }
+    let Some(app_data) = paths.root.parent() else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    let Ok(artifacts) = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
+        app_data.join("content-v1"),
+        MAX_ATTACHMENT_BYTES,
+    ) else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    let Ok(bytes) = artifacts.read(artifact_id) else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    // The type is read from the bytes themselves rather than from anything the
+    // request or the artifact metadata claims. A carrier cannot deliver an
+    // attachment it cannot identify, and this process will not name a type it
+    // has not looked at.
+    let Some(media_type) = super::adapters::sms::sniff_media_type(&bytes) else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    if super::adapters::sms::media_limit(media_type).is_none_or(|limit| bytes.len() > limit) {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, media_type)
+        // A carrier fetches this once; nothing downstream should keep it.
+        .header("cache-control", "no-store")
+        .body(Full::new(Bytes::from(bytes)))
+        .unwrap_or_else(|_| response(StatusCode::NOT_FOUND, "not_found"))
 }
