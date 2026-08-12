@@ -210,6 +210,155 @@ pub(crate) async fn drain_outbox_once(
     Ok(report)
 }
 
+/// Interval between passes when nothing is happening. Long-polling adapters
+/// block inside `poll` for their own window, so this only paces the idle case.
+const IDLE_TICK_MS: u64 = 2_000;
+
+/// How often the account list and its adapters are rebuilt, so enabling an
+/// account in the UI takes effect without restarting the daemon.
+const RELOAD_INTERVAL_MS: u64 = 30_000;
+
+/// Run the channel subsystem for as long as the daemon lives.
+///
+/// One task for every account rather than one per account: polling is a
+/// blocking wait, not a busy loop, and a handful of accounts cost a handful of
+/// awaits.
+// ponytail: sequential per-account polling. If one slow provider starves the
+// others, give each account its own task and keep this as the supervisor.
+pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
+    tokio::spawn(async move {
+        // A send that was in flight when the process died cannot be retried
+        // safely, so the first thing a fresh runtime does is park those rows.
+        if let Ok(mut store) = DaemonStore::open(&paths) {
+            if let Ok(now) = current_ms() {
+                if let Ok(parked) = store.requeue_stuck_sending(now) {
+                    if parked > 0 {
+                        eprintln!(
+                            "monkey daemon: {parked} outbound message(s) need reconciliation after a restart"
+                        );
+                    }
+                }
+            }
+        }
+
+        let queue: Arc<dyn RunQueue> = Arc::new(super::DaemonChannelQueue::new(paths.clone()));
+        let mut adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::new();
+        let mut next_reload_ms = 0_u64;
+
+        loop {
+            let now = match current_ms() {
+                Ok(now) => now,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(IDLE_TICK_MS)).await;
+                    continue;
+                }
+            };
+            let now_u64 = u64::try_from(now).unwrap_or(0);
+
+            if now_u64 >= next_reload_ms {
+                next_reload_ms = now_u64.saturating_add(RELOAD_INTERVAL_MS);
+                match DaemonStore::open(&paths) {
+                    Ok(store) => adapters = load_adapters(&store),
+                    Err(error) => eprintln!("monkey daemon: channels paused: {error}"),
+                }
+            }
+
+            let mut store = match DaemonStore::open(&paths) {
+                Ok(store) => store,
+                Err(error) => {
+                    eprintln!("monkey daemon: channels paused: {error}");
+                    tokio::time::sleep(std::time::Duration::from_millis(IDLE_TICK_MS)).await;
+                    continue;
+                }
+            };
+
+            let mut worked = false;
+            for (account_id, adapter) in &adapters {
+                match poll_account_once(
+                    &mut store,
+                    queue.as_ref(),
+                    account_id,
+                    adapter.as_ref(),
+                    now,
+                )
+                .await
+                {
+                    Ok(report) => {
+                        worked |= report.accepted + report.challenged + report.duplicates > 0
+                    }
+                    // One provider being unreachable must not stop the others,
+                    // and must not stop the outbox either.
+                    Err(error) => eprintln!("monkey daemon: channel {account_id} poll: {error}"),
+                }
+            }
+
+            match drain_outbox_once(&mut store, &adapters, now).await {
+                Ok(report) => worked |= report.sent + report.retrying > 0,
+                Err(error) => eprintln!("monkey daemon: channel outbox: {error}"),
+            }
+
+            if !worked {
+                tokio::time::sleep(std::time::Duration::from_millis(IDLE_TICK_MS)).await;
+            }
+        }
+    });
+}
+
+/// Build an adapter for every enabled account, resolving each credential from
+/// the keychain at load time so no adapter ever reads it itself.
+fn load_adapters(store: &DaemonStore) -> BTreeMap<String, Arc<dyn ChannelAdapter>> {
+    use super::channel_adapter::{AdapterConfig, ChannelSecrets, KeyringChannelSecrets};
+
+    let secrets = KeyringChannelSecrets;
+    let mut adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::new();
+    let accounts = match store.channel_accounts() {
+        Ok(accounts) => accounts,
+        Err(error) => {
+            eprintln!("monkey daemon: could not read channel accounts: {error}");
+            return adapters;
+        }
+    };
+    for account in accounts.into_iter().filter(|account| account.enabled) {
+        let secret = match &account.credential_ref {
+            Some(reference) => match secrets.get(reference) {
+                Ok(secret) => secret,
+                Err(error) => {
+                    eprintln!(
+                        "monkey daemon: channel account {} has no usable credential: {error}",
+                        account.account_id
+                    );
+                    continue;
+                }
+            },
+            None => String::new(),
+        };
+        let config = AdapterConfig {
+            account: &account,
+            secret,
+        };
+        match super::adapters::build_adapter(&config) {
+            Ok(adapter) => {
+                adapters.insert(account.account_id.clone(), adapter);
+            }
+            Err(error) => eprintln!(
+                "monkey daemon: channel account {} is not runnable: {error}",
+                account.account_id
+            ),
+        }
+    }
+    adapters
+}
+
+fn current_ms() -> Result<i64, String> {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "System clock is before the Unix epoch".to_string())?
+            .as_millis(),
+    )
+    .map_err(|_| "System clock is beyond the supported range".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

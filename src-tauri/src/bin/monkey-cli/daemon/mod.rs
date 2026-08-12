@@ -2313,6 +2313,10 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
     )
     .await?;
     spawn_knowledge_refresh_scheduler()?;
+    // Messaging channels. Its own task rather than a step in the loop below: a
+    // long-polling provider blocks for half a minute at a time, and the queue
+    // must keep ticking while it does.
+    channel_worker::spawn_channel_runtime(paths.clone());
     spawn_webdav_backup_scheduler()?;
     if let Some(port) = config.webhook_port {
         webhook::spawn_local_listener(paths.clone(), port).await?;
