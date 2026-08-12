@@ -40,9 +40,15 @@ use super::store::{
 pub trait MobileChatQueue: Send + Sync {
     /// Queues one chat turn. `client_key` is the mobile message id — the
     /// implementation derives a deterministic job id from it, so replaying
-    /// the same signed request can never double-queue. Returns the durable
-    /// run id.
-    fn queue_chat(&self, client_key: &str, prompt: &str) -> Result<String, String>;
+    /// the same signed request can never double-queue. `session_id` is the
+    /// conversation the turn belongs to, which is what the durable ingress
+    /// record keys its session on. Returns the durable run id.
+    fn queue_chat(
+        &self,
+        session_id: &str,
+        client_key: &str,
+        prompt: &str,
+    ) -> Result<String, String>;
     /// Resolves the durable run id previously queued for `client_key`, if
     /// the job has one yet.
     fn chat_run_id(&self, client_key: &str) -> Result<Option<String>, String>;
@@ -1569,7 +1575,7 @@ impl RemoteApi {
                 })
                 .map_err(internal)?;
         }
-        match queue.queue_chat(&message_id, text) {
+        match queue.queue_chat(session_id, &message_id, text) {
             Ok(_run_id) => {}
             Err(error) => {
                 let mut store = self.locked_store()?;
@@ -2906,7 +2912,12 @@ mod tests {
     }
 
     impl MobileChatQueue for FakeChatQueue {
-        fn queue_chat(&self, client_key: &str, prompt: &str) -> Result<String, String> {
+        fn queue_chat(
+            &self,
+            _session_id: &str,
+            client_key: &str,
+            prompt: &str,
+        ) -> Result<String, String> {
             self.queued
                 .lock()
                 .unwrap()

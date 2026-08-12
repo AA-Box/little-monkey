@@ -1264,6 +1264,15 @@ async fn run_inner(
     if let Some(snapshot) = &recipe.desktop_turn {
         perms.set_allow_network(snapshot.permission_policy.allow_network);
     }
+    // The one place `allow_external_mutations` is read. It was recorded on the
+    // run's immutable snapshot and then had no reader at all, which meant a
+    // tool that leaves an effect outside this machine had nothing to consult.
+    // A desktop turn carries its own value; a daemon child inherits the
+    // policy this run was queued under.
+    perms.set_allow_external_mutations(match &recipe.desktop_turn {
+        Some(snapshot) => snapshot.permission_policy.allow_external_mutations,
+        None => permission_policy(mode, approval_timeout_ms).allow_external_mutations,
+    });
     let mut history: Vec<serde_json::Value> = recipe
         .desktop_turn
         .as_ref()

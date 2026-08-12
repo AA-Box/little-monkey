@@ -9,6 +9,7 @@
 
 mod acp;
 mod agent;
+mod channels_cli;
 mod chat;
 mod checkpoints_cli;
 mod cmds;
@@ -375,6 +376,13 @@ enum Cmd {
         /// System prompt overriding the model's default
         #[arg(long)]
         system: Option<String>,
+    },
+    /// Configure and inspect messaging channels — the accounts Little Monkey
+    /// receives external messages on, who may talk to it, and where those
+    /// messages run.
+    Channels {
+        #[command(subcommand)]
+        action: channels_cli::ChannelsCmd,
     },
     /// Show what recent configuration changes touched, across personas,
     /// rules/memory files, MCP servers and workflow definitions — the
@@ -1439,6 +1447,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             .await;
             return;
         }
+        Cmd::Channels { action } => channels_cli::dispatch(action).await,
         Cmd::Revisions { change, limit } => revisions_cli::list(change.as_deref(), *limit),
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
             Ok(count) => {

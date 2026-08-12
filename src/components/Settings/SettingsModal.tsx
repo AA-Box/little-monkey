@@ -18,6 +18,7 @@ import {
   ListOrdered,
   Lock,
   MessageSquare,
+  MessagesSquare,
   MonitorCheck,
   MousePointerClick,
   Palette,
@@ -62,6 +63,7 @@ import { EcosystemPanel } from "./EcosystemPanel";
 import { RuntimeHubPanel } from "./RuntimeHubPanel";
 import { BrowserVerificationPanel } from "./BrowserVerificationPanel";
 import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel";
+import { ChannelsPanel } from "./ChannelsPanel";
 import { ResourceLedgerPanel } from "./ResourceLedgerPanel";
 import { GitDeliveryPanel } from "./GitDeliveryPanel";
 import { TriagePanel } from "../Triage/TriagePanel";
@@ -95,7 +97,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-type StaticSettingsTab = "local" | "ollama" | "providers" | "automation" | "rules" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "profiles" | "approvalchains" | "localapps" | "comparelab" | "resources" | "updates";
+type StaticSettingsTab = "local" | "ollama" | "providers" | "automation" | "rules" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "channels" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "profiles" | "approvalchains" | "localapps" | "comparelab" | "resources" | "updates";
 export type SettingsTab = StaticSettingsTab | ProviderSettingsTab;
 
 const ICONS: Record<StaticSettingsTab, LucideIcon> = {
@@ -118,6 +120,7 @@ const ICONS: Record<StaticSettingsTab, LucideIcon> = {
   browser: MonitorCheck,
   gitdelivery: GitPullRequest,
   background: Bot,
+  channels: MessagesSquare,
   companion: Sparkles,
   security: ShieldCheck,
   privacy: Lock,
@@ -138,7 +141,7 @@ const GROUPS: { labelKey: string; ids: StaticSettingsTab[] }[] = [
   { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "updates", "security", "privacy", "diagnostics", "approvalchains", "profiles", "team", "companion", "desktopcontrol", "shortcuts", "usage", "resources", "portability"] },
   { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers", "comparelab"] },
   { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "memorystudio", "tasks", "localapps"] },
-  { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "triage", "background", "connectors", "prompts", "apiserver"] },
+  { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "triage", "background", "connectors", "channels", "prompts", "apiserver"] },
 ];
 
 const LABEL_KEYS: Record<StaticSettingsTab, string> = {
@@ -161,6 +164,7 @@ const LABEL_KEYS: Record<StaticSettingsTab, string> = {
   browser: "SettingsModal.tabBrowserVerification",
   gitdelivery: "SettingsModal.tabGitDelivery",
   background: "SettingsModal.tabBackgroundAgents",
+  channels: "SettingsModal.tabChannels",
   companion: "SettingsModal.tabCompanion",
   security: "SettingsModal.tabSecurityDoctor",
   privacy: "SettingsModal.tabPrivacyFirewall",
@@ -451,6 +455,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "triage" && <TriagePanel />}
               {tab === "approvalchains" && <ApprovalChainsPanel />}
               {tab === "background" && <BackgroundAgentsPanel />}
+              {tab === "channels" && <ChannelsPanel />}
               {tab === "companion" && <CompanionPanel />}
               {tab === "updates" && <UpdatesPanel />}
               {tab === "security" && <SecurityDoctorPanel />}
