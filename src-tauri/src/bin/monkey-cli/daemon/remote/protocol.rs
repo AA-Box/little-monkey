@@ -131,9 +131,7 @@ impl DeviceCapability {
     pub fn is_physical(self) -> bool {
         PHYSICAL_DEVICE_CAPABILITIES.contains(&self)
     }
-}
 
-impl DeviceCapability {
     pub fn for_action(action: RemoteAction) -> Self {
         match action {
             RemoteAction::ViewRuns => Self::ViewRuns,

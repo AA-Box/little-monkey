@@ -6,8 +6,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::protocol::{
     legacy_capabilities, random_token, random_token_id, sha256_hex, validate_capabilities,
-    AuditEntry, ControllerProfile, DeviceCapability, PairAcceptResponse, RemoteScopes,
-    RotationBundle, REMOTE_PROTOCOL_VERSION,
+    AuditEntry, ControllerProfile, DeviceCapability, DeviceCommandState, DeviceSurface,
+    PairAcceptResponse, RemoteScopes, RotationBundle, DEVICE_LEASE_MS,
+    MAX_DEVICE_COMMAND_ARG_BYTES, REMOTE_PROTOCOL_VERSION,
 };
 
 /// Profile-scoped (K23): the default profile keeps this exact service name,
@@ -185,6 +186,51 @@ CREATE TABLE IF NOT EXISTS remote_placements (
 
 CREATE INDEX IF NOT EXISTS remote_placements_alias_idx
     ON remote_placements(alias,updated_at_ms DESC);
+
+-- What a paired physical device says it is and can do. One row per device,
+-- replaced wholesale each time it reconnects: this is a current-state report,
+-- not a history, and a stale half-merged surface would make the effective
+-- capability answer wrong. Deliberately not `remote_nodes`, which holds compute
+-- placement metadata for a different kind of peer entirely.
+CREATE TABLE IF NOT EXISTS remote_device_surface (
+    device_id TEXT PRIMARY KEY REFERENCES remote_devices(device_id) ON DELETE CASCADE,
+    surface_json BLOB NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+) STRICT;
+
+-- The durable command queue. `remote_commands` above is the replay guard for
+-- inbound signed requests; this is the opposite direction — work the runner
+-- queues FOR a device — and shares nothing with it but the database.
+CREATE TABLE IF NOT EXISTS remote_device_actions (
+    command_id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL REFERENCES remote_devices(device_id) ON DELETE RESTRICT,
+    capability TEXT NOT NULL,
+    arguments_json BLOB NOT NULL,
+    -- Digest of the exact argument bytes queued, so what the device did is
+    -- auditable against what was asked even after the arguments are pruned.
+    arguments_sha256 TEXT NOT NULL CHECK(length(arguments_sha256)=64),
+    source_run_id TEXT,
+    source_session_id TEXT,
+    source_tool_call_id TEXT,
+    state TEXT NOT NULL CHECK(state IN
+        ('queued','leased','running','succeeded','failed','cancelled','expired')),
+    attempt INTEGER NOT NULL DEFAULT 0,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    lease_expires_at_ms INTEGER,
+    started_at_ms INTEGER,
+    completed_at_ms INTEGER,
+    result_json BLOB,
+    artifact_sha256 TEXT,
+    artifact_bytes INTEGER,
+    artifact_media_type TEXT,
+    error TEXT
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS remote_device_actions_queue_idx
+    ON remote_device_actions(device_id,state,created_at_ms);
 "#;
 
 pub trait RemoteSecretStore: Send + Sync {
@@ -348,6 +394,61 @@ pub struct PlacementRecord {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
+
+/// What the caller asks for when queueing a device command. Separate from
+/// [`DeviceCommandRecord`] because the command id, state and timestamps are the
+/// store's to mint, not the caller's.
+#[derive(Debug, Clone)]
+pub struct DeviceCommandRequest {
+    pub device_id: String,
+    pub capability: DeviceCapability,
+    pub arguments: serde_json::Value,
+    /// The run, session and tool call that asked for this, so a physical action
+    /// is traceable back to the turn that caused it.
+    pub source_run_id: Option<String>,
+    pub source_session_id: Option<String>,
+    pub source_tool_call_id: Option<String>,
+    pub expires_at_ms: u64,
+}
+
+/// An artifact a device produced, already written to disk by the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceArtifact {
+    pub sha256: String,
+    pub bytes: u64,
+    pub media_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceCommandRecord {
+    pub command_id: String,
+    pub device_id: String,
+    pub capability: DeviceCapability,
+    pub arguments: serde_json::Value,
+    pub arguments_sha256: String,
+    pub source_run_id: Option<String>,
+    pub source_session_id: Option<String>,
+    pub source_tool_call_id: Option<String>,
+    pub state: DeviceCommandState,
+    pub attempt: u32,
+    pub cancel_requested: bool,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub lease_expires_at_ms: Option<u64>,
+    pub started_at_ms: Option<u64>,
+    pub completed_at_ms: Option<u64>,
+    pub result: Option<serde_json::Value>,
+    pub artifact: Option<DeviceArtifact>,
+    pub error: Option<String>,
+}
+
+const DEVICE_COMMAND_SELECT: &str = "SELECT command_id,device_id,capability,arguments_json,
+        arguments_sha256,source_run_id,source_session_id,source_tool_call_id,state,attempt,
+        cancel_requested,created_at_ms,updated_at_ms,expires_at_ms,lease_expires_at_ms,
+        started_at_ms,completed_at_ms,result_json,artifact_sha256,artifact_bytes,
+        artifact_media_type,error
+     FROM remote_device_actions";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandReservation {
@@ -1129,6 +1230,425 @@ impl RemoteStore {
             .map_err(|error| error.to_string())
     }
 
+    // --- Physical devices: advertised surface and command queue -----------
+
+    /// Replaces what a device says about itself. Whole-row replacement is the
+    /// point — see the table comment.
+    pub fn save_device_surface(
+        &mut self,
+        device_id: &str,
+        surface: &DeviceSurface,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        surface.validate()?;
+        self.connection
+            .execute(
+                "INSERT INTO remote_device_surface(device_id,surface_json,updated_at_ms)
+                 VALUES(?1,?2,?3)
+                 ON CONFLICT(device_id) DO UPDATE SET surface_json=excluded.surface_json,
+                    updated_at_ms=excluded.updated_at_ms",
+                params![
+                    device_id,
+                    serde_json::to_vec(surface).map_err(|error| error.to_string())?,
+                    to_i64(now_ms)?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn device_surface(&self, device_id: &str) -> Result<Option<DeviceSurface>, String> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT surface_json FROM remote_device_surface WHERE device_id=?1",
+                [device_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        // A surface written by a newer device build this runner cannot parse is
+        // read as no surface at all: the effective-capability rule then denies
+        // every physical capability, which is the safe direction.
+        Ok(stored.and_then(|bytes| serde_json::from_slice(&bytes).ok()))
+    }
+
+    /// Queues one command for a device.
+    ///
+    /// The caller has already checked the capability is effective; this refuses
+    /// anything it can still see is wrong (unknown or revoked device, oversized
+    /// arguments) so a queue row never exists for a command that could not run.
+    pub fn enqueue_device_command(
+        &mut self,
+        request: &DeviceCommandRequest,
+        now_ms: u64,
+    ) -> Result<DeviceCommandRecord, String> {
+        let device = self
+            .device(&request.device_id)?
+            .ok_or_else(|| format!("Unknown remote device '{}'", request.device_id))?;
+        if !device.active() {
+            return Err("Remote device is revoked".to_string());
+        }
+        let arguments =
+            serde_json::to_vec(&request.arguments).map_err(|error| error.to_string())?;
+        if arguments.len() > MAX_DEVICE_COMMAND_ARG_BYTES {
+            return Err("Device command arguments exceed 8 KiB".to_string());
+        }
+        if request.expires_at_ms <= now_ms {
+            return Err("Device command expiry must be in the future".to_string());
+        }
+        let command_id = format!("dcmd-{}", random_token_id(18)?);
+        let arguments_sha256 = sha256_hex(&arguments);
+        self.connection
+            .execute(
+                "INSERT INTO remote_device_actions(
+                    command_id,device_id,capability,arguments_json,arguments_sha256,
+                    source_run_id,source_session_id,source_tool_call_id,state,
+                    created_at_ms,updated_at_ms,expires_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'queued',?9,?9,?10)",
+                params![
+                    command_id,
+                    request.device_id,
+                    capability_token(request.capability),
+                    arguments,
+                    arguments_sha256,
+                    request.source_run_id,
+                    request.source_session_id,
+                    request.source_tool_call_id,
+                    to_i64(now_ms)?,
+                    to_i64(request.expires_at_ms)?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        self.audit(
+            now_ms,
+            Some(&request.device_id),
+            "device_command_queue",
+            Some(&command_id),
+            "allowed",
+            Some(&arguments_sha256),
+        )?;
+        self.device_command(&command_id)?
+            .ok_or_else(|| "Queued device command disappeared".to_string())
+    }
+
+    /// Advances every command whose deadline has passed.
+    ///
+    /// Two different rules, which is the safety property this whole design
+    /// exists for:
+    /// * a `leased` command whose lease ran out goes back to `queued` — the
+    ///   device never said it started, so nothing physical happened and another
+    ///   connection may take it;
+    /// * a `running` command is NEVER requeued. The device was told to open the
+    ///   camera. When its overall expiry passes with no report, it terminates as
+    ///   `failed` with an explicit unproven note, because a second attempt could
+    ///   take a second photograph.
+    pub fn expire_device_commands(&mut self, now_ms: u64) -> Result<u64, String> {
+        let now = to_i64(now_ms)?;
+        let mut changed = 0u64;
+        changed += self
+            .connection
+            .execute(
+                "UPDATE remote_device_actions
+                 SET state='queued', lease_expires_at_ms=NULL, updated_at_ms=?1
+                 WHERE state='leased' AND lease_expires_at_ms IS NOT NULL
+                   AND lease_expires_at_ms <= ?1 AND expires_at_ms > ?1",
+                params![now],
+            )
+            .map_err(|error| error.to_string())? as u64;
+        changed += self
+            .connection
+            .execute(
+                "UPDATE remote_device_actions
+                 SET state='expired', completed_at_ms=?1, updated_at_ms=?1,
+                     error=COALESCE(error,'The command expired before a device took it')
+                 WHERE state IN ('queued','leased') AND expires_at_ms <= ?1",
+                params![now],
+            )
+            .map_err(|error| error.to_string())? as u64;
+        changed += self
+            .connection
+            .execute(
+                "UPDATE remote_device_actions
+                 SET state='failed', completed_at_ms=?1, updated_at_ms=?1,
+                     error=COALESCE(error,
+                       'The device started this command and never reported back; \
+                        whether the action happened is unproven')
+                 WHERE state='running' AND expires_at_ms <= ?1",
+                params![now],
+            )
+            .map_err(|error| error.to_string())? as u64;
+        Ok(changed)
+    }
+
+    /// Hands the oldest queued command to this device under a lease.
+    ///
+    /// A command with a pending cancel is resolved here rather than handed out:
+    /// nothing physical has happened yet, so cancelling is truthful.
+    pub fn lease_device_command(
+        &mut self,
+        device_id: &str,
+        lease_ms: u64,
+        now_ms: u64,
+    ) -> Result<Option<DeviceCommandRecord>, String> {
+        self.expire_device_commands(now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE remote_device_actions
+                 SET state='cancelled', completed_at_ms=?2, updated_at_ms=?2,
+                     error=COALESCE(error,'Cancelled before the device took it')
+                 WHERE device_id=?1 AND state='queued' AND cancel_requested=1",
+                params![device_id, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        let next = transaction
+            .query_row(
+                "SELECT command_id FROM remote_device_actions
+                 WHERE device_id=?1 AND state='queued'
+                 ORDER BY created_at_ms ASC, command_id ASC LIMIT 1",
+                [device_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(command_id) = next else {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        };
+        // The lease never outlives the command's own expiry — a 30-second lease
+        // on a command with 5 seconds left would otherwise let a device start
+        // work the operator's deadline had already passed.
+        transaction
+            .execute(
+                "UPDATE remote_device_actions
+                 SET state='leased', attempt=attempt+1, updated_at_ms=?2,
+                     lease_expires_at_ms=MIN(?3,expires_at_ms)
+                 WHERE command_id=?1",
+                params![
+                    command_id,
+                    to_i64(now_ms)?,
+                    to_i64(now_ms.saturating_add(lease_ms.min(DEVICE_LEASE_MS)))?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        self.device_command(&command_id)
+    }
+
+    /// The device says it is about to touch hardware.
+    ///
+    /// Returns `false` when the command was already `running`, which is how a
+    /// reconnecting device that lost the response to its first `start` learns
+    /// not to perform the action again. Any other non-`leased` state is an
+    /// error: a cancelled or expired command must not begin.
+    pub fn start_device_command(
+        &mut self,
+        device_id: &str,
+        command_id: &str,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        let record = self
+            .device_command(command_id)?
+            .filter(|record| record.device_id == device_id)
+            .ok_or_else(|| "Unknown device command".to_string())?;
+        match record.state {
+            DeviceCommandState::Running => return Ok(false),
+            DeviceCommandState::Leased => {}
+            other => return Err(format!("A {} command cannot be started", other.as_str())),
+        }
+        if record.cancel_requested {
+            self.connection
+                .execute(
+                    "UPDATE remote_device_actions
+                     SET state='cancelled', completed_at_ms=?2, updated_at_ms=?2,
+                         error=COALESCE(error,'Cancelled before the device started it')
+                     WHERE command_id=?1 AND state='leased'",
+                    params![command_id, to_i64(now_ms)?],
+                )
+                .map_err(|error| error.to_string())?;
+            return Err("The command was cancelled before it started".to_string());
+        }
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE remote_device_actions
+                 SET state='running', started_at_ms=?2, updated_at_ms=?2
+                 WHERE command_id=?1 AND state='leased'",
+                params![command_id, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("The command changed state concurrently".to_string());
+        }
+        self.audit(
+            now_ms,
+            Some(device_id),
+            "device_command_start",
+            Some(command_id),
+            "allowed",
+            Some(&record.arguments_sha256),
+        )?;
+        Ok(true)
+    }
+
+    /// Records the device's terminal report. Idempotent: a retried report for a
+    /// command that already reached a terminal state leaves the first one alone.
+    pub fn complete_device_command(
+        &mut self,
+        device_id: &str,
+        command_id: &str,
+        outcome: DeviceCommandState,
+        result: Option<&serde_json::Value>,
+        artifact: Option<&DeviceArtifact>,
+        error: Option<&str>,
+        now_ms: u64,
+    ) -> Result<DeviceCommandRecord, String> {
+        if !outcome.terminal() {
+            return Err("A device command completes in a terminal state".to_string());
+        }
+        let record = self
+            .device_command(command_id)?
+            .filter(|record| record.device_id == device_id)
+            .ok_or_else(|| "Unknown device command".to_string())?;
+        if record.state.terminal() {
+            return Ok(record);
+        }
+        let encoded = result
+            .map(|value| serde_json::to_vec(value))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "UPDATE remote_device_actions
+                 SET state=?2, completed_at_ms=?3, updated_at_ms=?3, result_json=?4,
+                     artifact_sha256=?5, artifact_bytes=?6, artifact_media_type=?7, error=?8
+                 WHERE command_id=?1",
+                params![
+                    command_id,
+                    outcome.as_str(),
+                    to_i64(now_ms)?,
+                    encoded,
+                    artifact.map(|artifact| artifact.sha256.clone()),
+                    artifact
+                        .map(|artifact| to_i64(artifact.bytes))
+                        .transpose()?,
+                    artifact.map(|artifact| artifact.media_type.clone()),
+                    error.map(|value| bounded(value, 4_096)),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        self.audit(
+            now_ms,
+            Some(device_id),
+            "device_command_complete",
+            Some(command_id),
+            outcome.as_str(),
+            Some(&record.arguments_sha256),
+        )?;
+        self.device_command(command_id)?
+            .ok_or_else(|| "Completed device command disappeared".to_string())
+    }
+
+    /// Asks for a cancellation, truthfully.
+    ///
+    /// A queued or leased command is cancelled outright. A `running` one only
+    /// gets the flag: the device may already have taken the photograph, and
+    /// reporting "cancelled" would claim an effect was undone that was not.
+    pub fn request_device_cancel(
+        &mut self,
+        command_id: &str,
+        now_ms: u64,
+    ) -> Result<DeviceCommandRecord, String> {
+        let record = self
+            .device_command(command_id)?
+            .ok_or_else(|| "Unknown device command".to_string())?;
+        if record.state.terminal() {
+            return Ok(record);
+        }
+        let sql = if matches!(record.state, DeviceCommandState::Running) {
+            "UPDATE remote_device_actions SET cancel_requested=1, updated_at_ms=?2
+             WHERE command_id=?1"
+        } else {
+            "UPDATE remote_device_actions
+             SET cancel_requested=1, state='cancelled', completed_at_ms=?2, updated_at_ms=?2,
+                 error=COALESCE(error,'Cancelled before the device started it')
+             WHERE command_id=?1"
+        };
+        self.connection
+            .execute(sql, params![command_id, to_i64(now_ms)?])
+            .map_err(|error| error.to_string())?;
+        self.audit(
+            now_ms,
+            Some(&record.device_id),
+            "device_command_cancel",
+            Some(command_id),
+            if matches!(record.state, DeviceCommandState::Running) {
+                "requested"
+            } else {
+                "cancelled"
+            },
+            None,
+        )?;
+        self.device_command(command_id)?
+            .ok_or_else(|| "Cancelled device command disappeared".to_string())
+    }
+
+    pub fn device_command(&self, command_id: &str) -> Result<Option<DeviceCommandRecord>, String> {
+        self.connection
+            .query_row(
+                &format!("{DEVICE_COMMAND_SELECT} WHERE command_id=?1"),
+                [command_id],
+                read_device_command,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Recent commands for one device, newest first — what the operator's
+    /// device card lists.
+    pub fn device_commands(
+        &self,
+        device_id: &str,
+        limit: u32,
+    ) -> Result<Vec<DeviceCommandRecord>, String> {
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "{DEVICE_COMMAND_SELECT} WHERE device_id=?1
+                 ORDER BY created_at_ms DESC, command_id DESC LIMIT ?2"
+            ))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![device_id, i64::from(limit.min(200))],
+                read_device_command,
+            )
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Every command not yet in a terminal state, across all devices — what the
+    /// Security Doctor reads to see whether a microphone is open right now.
+    pub fn active_device_commands(&self) -> Result<Vec<DeviceCommandRecord>, String> {
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "{DEVICE_COMMAND_SELECT} WHERE state IN ('queued','leased','running')
+                 ORDER BY created_at_ms ASC"
+            ))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], read_device_command)
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     /// Every paired controller alias on this machine — the set of nodes it
     /// could place work on, before any of them has been described.
     pub fn controller_aliases(&self) -> Result<Vec<String>, String> {
@@ -1569,6 +2089,76 @@ fn read_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecord> {
     })
 }
 
+/// The wire token for a capability, taken from its own serde representation so
+/// the database and the protocol can never drift apart.
+fn capability_token(capability: DeviceCapability) -> String {
+    serde_json::to_value(capability)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn parse_capability(value: &str) -> Result<DeviceCapability, String> {
+    serde_json::from_value(serde_json::Value::String(value.to_string()))
+        .map_err(|_| format!("Unknown device capability '{value}'"))
+}
+
+fn read_device_command(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceCommandRecord> {
+    let convert = |index: usize, error: String| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        )
+    };
+    let arguments_bytes: Vec<u8> = row.get(3)?;
+    let arguments: serde_json::Value =
+        serde_json::from_slice(&arguments_bytes).map_err(|error| convert(3, error.to_string()))?;
+    let capability =
+        parse_capability(&row.get::<_, String>(2)?).map_err(|error| convert(2, error))?;
+    let state =
+        DeviceCommandState::parse(&row.get::<_, String>(8)?).map_err(|error| convert(8, error))?;
+    let result = row
+        .get::<_, Option<Vec<u8>>>(17)?
+        .map(|bytes| serde_json::from_slice(&bytes))
+        .transpose()
+        .map_err(|error| convert(17, error.to_string()))?;
+    let artifact = match (
+        row.get::<_, Option<String>>(18)?,
+        row.get::<_, Option<i64>>(19)?,
+        row.get::<_, Option<String>>(20)?,
+    ) {
+        (Some(sha256), Some(bytes), Some(media_type)) => Some(DeviceArtifact {
+            sha256,
+            bytes: from_i64(bytes)?,
+            media_type,
+        }),
+        _ => None,
+    };
+    Ok(DeviceCommandRecord {
+        command_id: row.get(0)?,
+        device_id: row.get(1)?,
+        capability,
+        arguments,
+        arguments_sha256: row.get(4)?,
+        source_run_id: row.get(5)?,
+        source_session_id: row.get(6)?,
+        source_tool_call_id: row.get(7)?,
+        state,
+        attempt: u32::try_from(row.get::<_, i64>(9)?).unwrap_or(u32::MAX),
+        cancel_requested: row.get::<_, i64>(10)? != 0,
+        created_at_ms: from_i64(row.get(11)?)?,
+        updated_at_ms: from_i64(row.get(12)?)?,
+        expires_at_ms: from_i64(row.get(13)?)?,
+        lease_expires_at_ms: row.get::<_, Option<i64>>(14)?.map(from_i64).transpose()?,
+        started_at_ms: row.get::<_, Option<i64>>(15)?.map(from_i64).transpose()?,
+        completed_at_ms: row.get::<_, Option<i64>>(16)?.map(from_i64).transpose()?,
+        result,
+        artifact,
+        error: row.get(21)?,
+    })
+}
+
 pub fn runner_secret_slot(device_id: &str, generation: u64) -> String {
     format!("runner:{device_id}:{generation}")
 }
@@ -1754,6 +2344,245 @@ mod tests {
                 "GET",
                 "/runs",
                 1_204,
+            )
+            .is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn paired(store: &mut RemoteStore, secrets: &FakeSecrets, scopes: &RemoteScopes) -> String {
+        let invitation = store.create_invitation(scopes, 1_000, 2_000).unwrap();
+        store
+            .accept_invitation(
+                &invitation.pairing_id,
+                &invitation.token,
+                "phone",
+                "runner-one",
+                1_100,
+                secrets,
+            )
+            .unwrap()
+            .device_id
+    }
+
+    fn queue(store: &mut RemoteStore, device_id: &str, now_ms: u64) -> DeviceCommandRecord {
+        store
+            .enqueue_device_command(
+                &DeviceCommandRequest {
+                    device_id: device_id.to_string(),
+                    capability: DeviceCapability::CameraCapture,
+                    arguments: serde_json::json!({ "position": "back" }),
+                    source_run_id: Some("run-one".into()),
+                    source_session_id: None,
+                    source_tool_call_id: Some("call-1".into()),
+                    expires_at_ms: now_ms + 300_000,
+                },
+                now_ms,
+            )
+            .unwrap()
+    }
+
+    /// The core safety property: a lease that lapses before the device says it
+    /// started is safely requeued, and one that lapses after is not — because
+    /// the camera may already have fired.
+    #[test]
+    fn a_lapsed_lease_requeues_only_while_nothing_physical_has_happened() {
+        let (root, mut store, secrets, scopes) = fixture();
+        let device_id = paired(&mut store, &secrets, &scopes);
+        let queued = queue(&mut store, &device_id, 10_000);
+
+        let leased = store
+            .lease_device_command(&device_id, DEVICE_LEASE_MS, 10_001)
+            .unwrap()
+            .unwrap();
+        assert_eq!(leased.command_id, queued.command_id);
+        assert_eq!(leased.state, DeviceCommandState::Leased);
+        assert_eq!(leased.attempt, 1);
+
+        // Lease lapses with no `start`: the command is available again.
+        store.expire_device_commands(50_000).unwrap();
+        let requeued = store.device_command(&queued.command_id).unwrap().unwrap();
+        assert_eq!(requeued.state, DeviceCommandState::Queued);
+        let released = store
+            .lease_device_command(&device_id, DEVICE_LEASE_MS, 50_001)
+            .unwrap()
+            .unwrap();
+        assert_eq!(released.attempt, 2, "a requeue is a second attempt");
+
+        // Now the device starts. From here the lease lapsing must NOT requeue.
+        assert!(store
+            .start_device_command(&device_id, &queued.command_id, 50_002)
+            .unwrap());
+        store.expire_device_commands(90_000).unwrap();
+        let still_running = store.device_command(&queued.command_id).unwrap().unwrap();
+        assert_eq!(
+            still_running.state,
+            DeviceCommandState::Running,
+            "a started command is never handed to another connection"
+        );
+        assert!(store
+            .lease_device_command(&device_id, DEVICE_LEASE_MS, 90_001)
+            .unwrap()
+            .is_none());
+
+        // A reconnecting device that lost its first `start` response is told
+        // the action already began rather than being allowed to repeat it.
+        assert!(!store
+            .start_device_command(&device_id, &queued.command_id, 90_002)
+            .unwrap());
+
+        // Overall expiry with no report terminates it as failed-and-unproven,
+        // never as a retry.
+        store.expire_device_commands(400_000).unwrap();
+        let abandoned = store.device_command(&queued.command_id).unwrap().unwrap();
+        assert_eq!(abandoned.state, DeviceCommandState::Failed);
+        assert!(abandoned.error.unwrap().contains("unproven"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Cancellation has to be honest about what it can still prevent.
+    #[test]
+    fn cancelling_stops_a_queued_command_and_only_flags_a_running_one() {
+        let (root, mut store, secrets, scopes) = fixture();
+        let device_id = paired(&mut store, &secrets, &scopes);
+
+        let early = queue(&mut store, &device_id, 10_000);
+        let cancelled = store
+            .request_device_cancel(&early.command_id, 10_001)
+            .unwrap();
+        assert_eq!(cancelled.state, DeviceCommandState::Cancelled);
+        assert!(store
+            .lease_device_command(&device_id, DEVICE_LEASE_MS, 10_002)
+            .unwrap()
+            .is_none());
+
+        let late = queue(&mut store, &device_id, 20_000);
+        store
+            .lease_device_command(&device_id, DEVICE_LEASE_MS, 20_001)
+            .unwrap()
+            .unwrap();
+        store
+            .start_device_command(&device_id, &late.command_id, 20_002)
+            .unwrap();
+        let flagged = store
+            .request_device_cancel(&late.command_id, 20_003)
+            .unwrap();
+        assert_eq!(
+            flagged.state,
+            DeviceCommandState::Running,
+            "a running command is not retroactively undone"
+        );
+        assert!(flagged.cancel_requested);
+
+        // The device's own report decides the terminal state, and a retried
+        // report does not overwrite it.
+        let completed = store
+            .complete_device_command(
+                &device_id,
+                &late.command_id,
+                DeviceCommandState::Succeeded,
+                Some(&serde_json::json!({ "captured": true })),
+                Some(&DeviceArtifact {
+                    sha256: "a".repeat(64),
+                    bytes: 12,
+                    media_type: "image/jpeg".into(),
+                }),
+                None,
+                20_004,
+            )
+            .unwrap();
+        assert_eq!(completed.state, DeviceCommandState::Succeeded);
+        let retried = store
+            .complete_device_command(
+                &device_id,
+                &late.command_id,
+                DeviceCommandState::Failed,
+                None,
+                None,
+                Some("second thoughts"),
+                20_005,
+            )
+            .unwrap();
+        assert_eq!(retried.state, DeviceCommandState::Succeeded);
+        assert_eq!(retried.artifact.unwrap().bytes, 12);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The queue outlives the process. Reopening the database must find a
+    /// leased command exactly where it was, and a restart must not lose the
+    /// arguments digest that makes it auditable.
+    #[test]
+    fn a_leased_command_survives_a_restart_of_the_runner() {
+        let (root, mut store, secrets, scopes) = fixture();
+        let device_id = paired(&mut store, &secrets, &scopes);
+        let queued = queue(&mut store, &device_id, 10_000);
+        store
+            .lease_device_command(&device_id, DEVICE_LEASE_MS, 10_001)
+            .unwrap()
+            .unwrap();
+        drop(store);
+
+        let mut reopened = RemoteStore::open(&root).unwrap();
+        let found = reopened
+            .device_command(&queued.command_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.state, DeviceCommandState::Leased);
+        assert_eq!(found.arguments_sha256, queued.arguments_sha256);
+        assert_eq!(found.source_run_id.as_deref(), Some("run-one"));
+        // Past the lease, the new process picks it back up rather than
+        // stranding it.
+        let released = reopened
+            .lease_device_command(&device_id, DEVICE_LEASE_MS, 60_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(released.command_id, queued.command_id);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_surface_is_replaced_wholesale_and_a_revoked_device_takes_no_commands() {
+        let (root, mut store, secrets, scopes) = fixture();
+        let device_id = paired(&mut store, &secrets, &scopes);
+        let mut surface = DeviceSurface {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            platform: "android".into(),
+            platform_version: "15".into(),
+            app_version: "1.3.0".into(),
+            device_model: "Pixel".into(),
+            capabilities: BTreeSet::from([DeviceCapability::CameraCapture]),
+            permissions: Default::default(),
+            constraints: Default::default(),
+            reported_at_ms: 10_000,
+        };
+        store
+            .save_device_surface(&device_id, &surface, 10_000)
+            .unwrap();
+        surface.capabilities = BTreeSet::from([DeviceCapability::LocationRead]);
+        store
+            .save_device_surface(&device_id, &surface, 11_000)
+            .unwrap();
+        let stored = store.device_surface(&device_id).unwrap().unwrap();
+        assert_eq!(
+            stored.capabilities,
+            BTreeSet::from([DeviceCapability::LocationRead]),
+            "a re-advertised surface replaces the old one rather than merging"
+        );
+
+        store
+            .revoke_device(&device_id, "sold", 12_000, &secrets, None)
+            .unwrap();
+        assert!(store
+            .enqueue_device_command(
+                &DeviceCommandRequest {
+                    device_id: device_id.clone(),
+                    capability: DeviceCapability::LocationRead,
+                    arguments: serde_json::json!({}),
+                    source_run_id: None,
+                    source_session_id: None,
+                    source_tool_call_id: None,
+                    expires_at_ms: 300_000,
+                },
+                12_001,
             )
             .is_err());
         let _ = std::fs::remove_dir_all(root);
