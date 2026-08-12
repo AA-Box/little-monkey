@@ -26,7 +26,8 @@ mod macos {
     use sha2::{Digest, Sha256};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-    use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
+    use tokio::sync::{mpsc, oneshot, Mutex};
+    use tokio::time::Instant;
 
     use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
     use little_monkey_lib::channels::types::{
@@ -37,6 +38,10 @@ mod macos {
 
     const INBOUND_CHANNEL_CAPACITY: usize = 256;
     const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+    /// How long to wait before spawning the helper again after an attempt,
+    /// so a helper that exits on startup is retried at a bounded rate
+    /// rather than once per `poll`.
+    const RESTART_COOLDOWN: Duration = Duration::from_secs(5);
     /// Messages.app splits long iMessages client-side; there is no
     /// server-enforced cap this adapter can query. A conservative budget —
     /// ponytail: revisit if a real helper reports the split boundary it
@@ -77,7 +82,11 @@ mod macos {
         inbound_tx: mpsc::Sender<ChannelEnvelope>,
         inbound_rx: Mutex<mpsc::Receiver<ChannelEnvelope>>,
         shared: Arc<Shared>,
-        started: OnceCell<Result<(), String>>,
+        /// Serializes spawn attempts and remembers when the last one was
+        /// made — not a one-shot cell, for the same reason as `signal.rs`: a
+        /// helper the user quits (or that Messages.app takes down with it)
+        /// has to be startable again without restarting the daemon.
+        last_start: Mutex<Option<Instant>>,
     }
 
     impl ImessageAdapter {
@@ -110,7 +119,7 @@ mod macos {
                     stdin: Mutex::new(None),
                     alive: AtomicBool::new(false),
                 }),
-                started: OnceCell::new(),
+                last_start: Mutex::new(None),
             })
         }
 
@@ -129,41 +138,55 @@ mod macos {
             }
         }
 
+        /// Start the helper, or restart it if a previous one exited. See
+        /// `signal.rs`'s `ensure_started` for the reasoning; `alive` is the
+        /// whole condition and [`RESTART_COOLDOWN`] bounds how often a
+        /// helper that dies immediately is retried.
         async fn ensure_started(&self) -> Result<(), String> {
-            self.started
-                .get_or_init(|| async {
-                    if let Some(error) = self.helper_missing() {
-                        return Err(error);
-                    }
-                    let mut command = Command::new(&self.helper_path);
-                    command
-                        .args(["--handle", &self.handle, "stream"])
-                        .stdin(std::process::Stdio::piped())
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::null());
-                    let mut child = command
-                        .spawn()
-                        .map_err(|error| format!("Failed to start the iMessage helper: {error}"))?;
-                    let stdin = child
-                        .stdin
-                        .take()
-                        .ok_or_else(|| "iMessage helper has no stdin".to_string())?;
-                    let stdout = child
-                        .stdout
-                        .take()
-                        .ok_or_else(|| "iMessage helper has no stdout".to_string())?;
-                    *self.shared.stdin.lock().await = Some(stdin);
-                    self.shared.alive.store(true, Ordering::SeqCst);
-                    tokio::spawn(run_rpc_loop(
-                        child,
-                        stdout,
-                        self.shared.clone(),
-                        self.inbound_tx.clone(),
-                    ));
-                    Ok(())
-                })
-                .await
-                .clone()
+            if self.shared.alive.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let mut last_start = self.last_start.lock().await;
+            if self.shared.alive.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if let Some(attempted_at) = *last_start {
+                if attempted_at.elapsed() < RESTART_COOLDOWN {
+                    return Err(
+                        "The iMessage helper stopped; waiting before starting it again".to_string(),
+                    );
+                }
+            }
+            *last_start = Some(Instant::now());
+            if let Some(error) = self.helper_missing() {
+                return Err(error);
+            }
+            let mut command = Command::new(&self.helper_path);
+            command
+                .args(["--handle", &self.handle, "stream"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            let mut child = command
+                .spawn()
+                .map_err(|error| format!("Failed to start the iMessage helper: {error}"))?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "iMessage helper has no stdin".to_string())?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| "iMessage helper has no stdout".to_string())?;
+            *self.shared.stdin.lock().await = Some(stdin);
+            self.shared.alive.store(true, Ordering::SeqCst);
+            tokio::spawn(run_rpc_loop(
+                child,
+                stdout,
+                self.shared.clone(),
+                self.inbound_tx.clone(),
+            ));
+            Ok(())
         }
 
         async fn call(&self, method: &str, params: Value) -> Result<Value, CallError> {
@@ -244,11 +267,10 @@ mod macos {
         }
         shared.alive.store(false, Ordering::SeqCst);
         *shared.stdin.lock().await = None;
-        let mut pending = shared.pending.lock().await;
-        for (_, sender) in pending.drain() {
-            let _ = sender.send(Err("The iMessage helper exited".to_string()));
-        }
-        drop(pending);
+        // Dropped rather than answered with an error, same as `signal.rs`: a
+        // request the helper never replied to is ambiguous — it may have been
+        // acted on — and only a dropped sender reaches `call`'s ambiguous arm.
+        shared.pending.lock().await.clear();
         let _ = child.wait().await;
     }
 
@@ -613,6 +635,127 @@ mod macos {
                 secret: String::new(),
             };
             assert!(ImessageAdapter::new(&config).is_ok());
+        }
+
+        /// Drives a *fake* helper — a shell script speaking this module's own
+        /// stdio convention. No Messages.app, no Full Disk Access, no real
+        /// conversation: the lifecycle (spawn, request/response, inbound
+        /// event, malformed line, crash, restart) is provable on a machine
+        /// that has never been signed in to iMessage.
+        mod fake_helper {
+            use super::*;
+            use little_monkey_lib::channels::types::HealthState;
+            use std::os::unix::fs::PermissionsExt;
+
+            /// Each line goes out through `/bin/echo` so no shell stdio
+            /// buffer can hold it back — see `signal.rs`'s equivalent.
+            fn write_fake_helper(name: &str) -> std::path::PathBuf {
+                let path = std::env::temp_dir().join(format!(
+                    "monkey-fake-imessage-{name}-{}",
+                    uuid::Uuid::new_v4().simple()
+                ));
+                let script = r#"#!/bin/sh
+/bin/echo '{"type":"message","guid":"GUID-1","sender":"+15551230001","text":"hello there","timestamp":1700000000000}'
+/bin/echo 'this line is not JSON'
+while IFS= read -r line; do
+  case "$line" in
+    *crash*) exit 7 ;;
+  esac
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  /bin/echo "{\"id\":$id,\"result\":{\"guid\":\"GUID-SENT\"}}"
+done
+"#;
+                std::fs::write(&path, script).expect("write fake helper");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod fake helper");
+                path
+            }
+
+            fn helper_account(
+                path: &std::path::Path,
+            ) -> super::super::super::super::super::channel_store::ChannelAccountRecord
+            {
+                test_account(json!({
+                    "helper_path": path.to_string_lossy(),
+                    "handle": "user@example.com",
+                }))
+            }
+
+            #[tokio::test]
+            async fn probes_and_streams_inbound_ignoring_unparseable_lines() {
+                let path = write_fake_helper("probe");
+                let account = helper_account(&path);
+                let adapter = ImessageAdapter::new(&AdapterConfig {
+                    account: &account,
+                    secret: String::new(),
+                })
+                .expect("adapter");
+
+                let health = adapter.probe().await;
+                assert_eq!(health.state, HealthState::Connected);
+
+                let batch = adapter.poll(None).await.expect("poll");
+                assert_eq!(batch.envelopes.len(), 1, "the junk line must not normalize");
+                assert_eq!(batch.envelopes[0].provider_event_id, "GUID-1");
+                let _ = std::fs::remove_file(&path);
+            }
+
+            #[tokio::test]
+            async fn a_send_the_helper_acknowledges_carries_its_guid() {
+                let path = write_fake_helper("send");
+                let account = helper_account(&path);
+                let adapter = ImessageAdapter::new(&AdapterConfig {
+                    account: &account,
+                    secret: String::new(),
+                })
+                .expect("adapter");
+
+                match adapter
+                    .send(&OutboundMessage {
+                        account_id: "acct-1".to_string(),
+                        kind: ChannelKind::IMessage,
+                        conversation_id: "+15551230001".to_string(),
+                        thread_id: None,
+                        text: "ack".to_string(),
+                        attachments: Vec::new(),
+                        reply_to_provider_id: None,
+                        idempotency_key: "idem-1".to_string(),
+                    })
+                    .await
+                {
+                    SendOutcome::Sent {
+                        provider_message_id,
+                    } => assert_eq!(provider_message_id.as_deref(), Some("GUID-SENT")),
+                    other => panic!("expected Sent, got {other:?}"),
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+
+            #[tokio::test]
+            async fn a_helper_that_exits_is_started_again_rather_than_left_dead() {
+                let path = write_fake_helper("restart");
+                let account = helper_account(&path);
+                let adapter = ImessageAdapter::new(&AdapterConfig {
+                    account: &account,
+                    secret: String::new(),
+                })
+                .expect("adapter");
+
+                assert_eq!(adapter.probe().await.state, HealthState::Connected);
+                // A request in flight when the helper dies is ambiguous — it
+                // may have been acted on — never a permanent failure.
+                assert!(matches!(
+                    adapter.call("crash", json!({})).await,
+                    Err(CallError::Ambiguous(_))
+                ));
+                assert!(!adapter.shared.alive.load(Ordering::SeqCst));
+                // Within the cooldown: an error, not a respawn per poll.
+                assert_eq!(adapter.probe().await.state, HealthState::Error);
+                // Past it: back up, without restarting the daemon.
+                *adapter.last_start.lock().await = None;
+                assert_eq!(adapter.probe().await.state, HealthState::Connected);
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
 }

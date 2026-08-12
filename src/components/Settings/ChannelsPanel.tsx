@@ -9,6 +9,7 @@ import {
   type GroupActivation,
   type PendingSender,
   PROVIDER_GUIDES,
+  buildProviderConfig,
   callbackPath,
   channelsAdd,
   channelsAddRoute,
@@ -22,6 +23,7 @@ import {
   channelsSenders,
   channelsSetCredential,
   channelsSetPolicy,
+  missingRequiredConfig,
   needsPublicCallback,
 } from "../../lib/channelsClient";
 import { Button } from "../ui";
@@ -42,6 +44,24 @@ function healthTone(state: ChannelHealthState): string {
   return "text-muted";
 }
 
+/** The operator-facing name of a stored setting, falling back to the raw key
+ * for anything a guide does not describe — an account configured from the
+ * terminal can carry keys the UI has never heard of. */
+function configLabel(kind: string, key: string): string {
+  const field = PROVIDER_GUIDES.find((guide) => guide.kind === kind)?.configFields.find(
+    (entry) => entry.key === key,
+  );
+  return field?.label ?? key;
+}
+
+/** Settings are shown, not edited, so a value only has to be legible.
+ * Objects are rendered as JSON rather than `[object Object]`. */
+function formatConfigValue(value: unknown): string {
+  if (Array.isArray(value)) return value.join(", ");
+  if (typeof value === "string") return value;
+  return JSON.stringify(value) ?? "";
+}
+
 export function ChannelsPanel() {
   const { t } = useT();
   const [accounts, setAccounts] = useState<ChannelAccount[] | null>(null);
@@ -52,8 +72,10 @@ export function ChannelsPanel() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [draft, setDraft] = useState({ kind: "telegram", label: "", config: "" });
+  const [draft, setDraft] = useState({ kind: "telegram", label: "" });
+  const [configDraft, setConfigDraft] = useState<Record<string, string>>({});
   const [secret, setSecret] = useState("");
+  const [secretParts, setSecretParts] = useState<Record<string, string>>({});
   const [routeDraft, setRouteDraft] = useState({ recipe: "", scope: "account" as "account" | "global" });
 
   const load = useCallback(async () => {
@@ -80,7 +102,13 @@ export function ChannelsPanel() {
     }
   }, []);
 
-  useEffect(() => { if (selected) void loadDetail(selected); }, [selected, loadDetail]);
+  // Anything typed for one account is dropped when another is selected: a
+  // half-entered credential must never be saved against a different account.
+  useEffect(() => {
+    setSecret("");
+    setSecretParts({});
+    if (selected) void loadDetail(selected);
+  }, [selected, loadDetail]);
 
   const run = useCallback(async (key: string, action: () => Promise<unknown>, done?: string) => {
     setBusy(key);
@@ -100,6 +128,20 @@ export function ChannelsPanel() {
 
   const account = accounts?.find((entry) => entry.account_id === selected) ?? null;
   const guide = PROVIDER_GUIDES.find((entry) => entry.kind === (account?.kind ?? draft.kind));
+  const draftGuide = PROVIDER_GUIDES.find((entry) => entry.kind === draft.kind);
+  const missingConfig = missingRequiredConfig(draftGuide?.configFields ?? [], configDraft);
+
+  // A provider whose credential is several values is collected field by field
+  // and saved as the one JSON bundle its adapter parses. Nobody should have to
+  // know that shape, and typing it by hand is how a working token ends up
+  // rejected as malformed.
+  const fields = guide?.secretFields ?? [];
+  const credentialValue = fields.length > 0
+    ? JSON.stringify(Object.fromEntries(fields.map((field) => [field.key, secretParts[field.key] ?? ""])))
+    : secret;
+  const credentialReady = fields.length > 0
+    ? fields.every((field) => (secretParts[field.key] ?? "").length > 0)
+    : secret.length > 0;
 
   if (accounts === null) {
     return <p className="flex items-center gap-2 text-sm text-muted"><Loader2 size={14} className="animate-spin" />{t("ChannelsPanel.loading")}</p>;
@@ -155,8 +197,25 @@ export function ChannelsPanel() {
               <p className="mt-1 text-xs text-muted">
                 {t("ChannelsPanel.transport")}: {guide ? t(`ChannelsPanel.transport_${guide.transport}`) : account.kind}
               </p>
+              {/* What the last probe actually reported: the helper's version,
+                  the homeserver identity it answered as, how many encrypted
+                  events an adapter had to skip. Health with no detail is a
+                  colour and nothing else. */}
+              {account.health_detail && <p className="mt-1 text-xs text-muted">{account.health_detail}</p>}
               {account.last_error && <p className="mt-1 text-xs text-danger">{account.last_error}</p>}
-              {!account.has_credential && <p className="mt-1 text-xs text-warning">{t("ChannelsPanel.needsCredential")}</p>}
+              {account.credential_required && !account.has_credential && (
+                <p className="mt-1 text-xs text-warning">{t("ChannelsPanel.needsCredential")}</p>
+              )}
+              {Object.keys(account.non_secret_config).length > 0 && (
+                <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 text-xs text-faint">
+                  {Object.entries(account.non_secret_config).map(([key, value]) => (
+                    <div key={key} className="contents">
+                      <dt>{configLabel(account.kind, key)}</dt>
+                      <dd className="min-w-0 truncate text-muted">{formatConfigValue(value)}</dd>
+                    </div>
+                  ))}
+                </dl>
+              )}
             </div>
             <div className="flex flex-wrap gap-2">
               <Button size="sm" disabled={busy !== null} onClick={() => void run("probe", () => channelsProbe(account.account_id))}>
@@ -172,14 +231,42 @@ export function ChannelsPanel() {
           </div>
 
           <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3 sm:flex-row sm:items-end">
-            <label className="min-w-0 flex-1 text-xs text-muted">{guide?.credentialLabel ?? t("ChannelsPanel.credential")}
-              <input className={`${INPUT} mt-1`} type="password" value={secret} onChange={(event) => setSecret(event.target.value)} placeholder="••••••••" />
-            </label>
-            <Button
-              size="sm"
-              disabled={busy !== null || secret.length === 0}
-              onClick={() => void run("secret", async () => { await channelsSetCredential(account.account_id, secret); setSecret(""); }, t("ChannelsPanel.credentialSaved"))}
-            ><KeyRound size={14} />{t("ChannelsPanel.saveCredential")}</Button>
+            {!account.credential_required ? (
+              // Signal and iMessage authenticate through the helper the
+              // operator installed, and IRC without SASL has nothing to log in
+              // with. Showing a credential box here would invite someone to
+              // paste a secret nothing will ever read.
+              <p className="min-w-0 flex-1 text-xs text-muted">{t("ChannelsPanel.noCredentialNeeded")}</p>
+            ) : fields.length > 0 ? (
+              <div className="grid min-w-0 flex-1 gap-2 sm:grid-cols-2">
+                {fields.map((field) => (
+                  <label key={field.key} className="min-w-0 text-xs text-muted">{field.label}
+                    <input
+                      className={`${INPUT} mt-1`}
+                      type="password"
+                      value={secretParts[field.key] ?? ""}
+                      onChange={(event) => setSecretParts({ ...secretParts, [field.key]: event.target.value })}
+                      placeholder="••••••••"
+                    />
+                  </label>
+                ))}
+              </div>
+            ) : (
+              <label className="min-w-0 flex-1 text-xs text-muted">{guide?.credentialLabel ?? t("ChannelsPanel.credential")}
+                <input className={`${INPUT} mt-1`} type="password" value={secret} onChange={(event) => setSecret(event.target.value)} placeholder="••••••••" />
+              </label>
+            )}
+            {account.credential_required && (
+              <Button
+                size="sm"
+                disabled={busy !== null || !credentialReady}
+                onClick={() => void run("secret", async () => {
+                  await channelsSetCredential(account.account_id, credentialValue);
+                  setSecret("");
+                  setSecretParts({});
+                }, t("ChannelsPanel.credentialSaved"))}
+              ><KeyRound size={14} />{t("ChannelsPanel.saveCredential")}</Button>
+            )}
           </div>
           {guide && (
             <p className="mt-2 text-xs text-faint">
@@ -193,6 +280,7 @@ export function ChannelsPanel() {
           {needsPublicCallback(account.kind) && (
             <p className="mt-3 rounded-md border border-border bg-background p-2 text-xs text-muted">
               {t("ChannelsPanel.callbackHint")} <code className="text-foreground">{callbackPath(account.account_id)}</code>
+              {account.kind === "whatsapp" && <span className="mt-1 block">{t("ChannelsPanel.callbackVerifyHint")}</span>}
             </p>
           )}
 
@@ -279,25 +367,68 @@ export function ChannelsPanel() {
 
       <section className="rounded-lg border border-border bg-surface p-4">
         <h4 className="text-sm font-semibold">{t("ChannelsPanel.addAccount")}</h4>
-        <div className="mt-3 grid gap-2 sm:grid-cols-3">
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
           <label className="text-xs text-muted">{t("ChannelsPanel.provider")}
-            <select className={`${INPUT} mt-1`} value={draft.kind} onChange={(event) => setDraft({ ...draft, kind: event.target.value })}>
+            <select
+              className={`${INPUT} mt-1`}
+              value={draft.kind}
+              onChange={(event) => {
+                // Settings typed for one provider mean nothing to another.
+                setDraft({ ...draft, kind: event.target.value });
+                setConfigDraft({});
+              }}
+            >
               {PROVIDER_GUIDES.map((entry) => <option key={entry.kind} value={entry.kind}>{entry.label}</option>)}
             </select>
           </label>
           <label className="text-xs text-muted">{t("ChannelsPanel.label")}
             <input className={`${INPUT} mt-1`} value={draft.label} onChange={(event) => setDraft({ ...draft, label: event.target.value })} placeholder={t("ChannelsPanel.labelPlaceholder")} />
           </label>
-          <label className="text-xs text-muted">{t("ChannelsPanel.settingsJson")}
-            <input className={`${INPUT} mt-1`} value={draft.config} onChange={(event) => setDraft({ ...draft, config: event.target.value })} placeholder={guide && guide.configKeys.length > 0 ? `{"${guide.configKeys[0]}": "…"}` : "{}"} />
-          </label>
+          {(draftGuide?.configFields ?? []).map((field) => (
+            <label key={field.key} className="text-xs text-muted">
+              {field.label}{field.required ? " *" : ""}
+              {field.type === "boolean" ? (
+                <select
+                  className={`${INPUT} mt-1`}
+                  value={configDraft[field.key] ?? "false"}
+                  onChange={(event) => setConfigDraft({ ...configDraft, [field.key]: event.target.value })}
+                >
+                  <option value="false">{t("ChannelsPanel.no")}</option>
+                  <option value="true">{t("ChannelsPanel.yes")}</option>
+                </select>
+              ) : (
+                <input
+                  className={`${INPUT} mt-1`}
+                  inputMode={field.type === "number" ? "numeric" : undefined}
+                  value={configDraft[field.key] ?? ""}
+                  onChange={(event) => setConfigDraft({ ...configDraft, [field.key]: event.target.value })}
+                  placeholder={field.placeholder ?? ""}
+                />
+              )}
+              {field.hint && <span className="mt-1 block text-faint">{field.hint}</span>}
+            </label>
+          ))}
         </div>
+        {draftGuide?.requiresPlatform === "macos" && (
+          <p className="mt-2 text-xs text-warning">{t("ChannelsPanel.macOnly")}</p>
+        )}
+        {missingConfig.length > 0 && (
+          <p className="mt-2 text-xs text-faint">{t("ChannelsPanel.missingSettings")} {missingConfig.join(", ")}</p>
+        )}
         <p className="mt-2 text-xs text-faint">{t("ChannelsPanel.addHint")}</p>
         <Button
           className="mt-2"
           size="sm"
-          disabled={busy !== null || draft.label.trim().length === 0}
-          onClick={() => void run("add", () => channelsAdd(draft.kind, draft.label.trim(), draft.config.trim() || null), t("ChannelsPanel.added"))}
+          disabled={busy !== null || draft.label.trim().length === 0 || missingConfig.length > 0}
+          onClick={() => void run("add", async () => {
+            const config = buildProviderConfig(draftGuide?.configFields ?? [], configDraft);
+            await channelsAdd(
+              draft.kind,
+              draft.label.trim(),
+              Object.keys(config).length > 0 ? JSON.stringify(config) : null,
+            );
+            setConfigDraft({});
+          }, t("ChannelsPanel.added"))}
         >{t("ChannelsPanel.add")}</Button>
       </section>
 

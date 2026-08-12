@@ -14,8 +14,8 @@
 use async_trait::async_trait;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
-    ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
-    ProviderCapabilities, SendOutcome,
+    ChannelHealth, ChannelKind, ChannelSender, DeliveryReceipt, DeliveryState, InboundTransport,
+    OutboundMessage, ProviderCapabilities, SendOutcome,
 };
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -38,6 +38,13 @@ struct WhatsAppNonSecretConfig {
 struct WhatsAppSecrets {
     app_secret: String,
     access_token: String,
+    /// The token the operator typed into Meta's "Verify token" box. A shared
+    /// secret like the other two, so it lives with them in the keychain and
+    /// not in `non_secret_config`. Defaulted because an account configured
+    /// before this handshake existed still has to build — it simply cannot
+    /// answer a challenge until the operator saves one.
+    #[serde(default)]
+    verify_token: String,
 }
 
 pub struct WhatsAppAdapter {
@@ -45,6 +52,7 @@ pub struct WhatsAppAdapter {
     phone_number_id: String,
     app_secret: String,
     access_token: String,
+    verify_token: String,
     /// The Graph API origin. Always [`GRAPH_API_BASE`] in production;
     /// swappable in tests so `send`/`probe` can be exercised against a
     /// loopback fixture instead of the real network.
@@ -71,6 +79,7 @@ impl WhatsAppAdapter {
             phone_number_id: non_secret.phone_number_id,
             app_secret: secrets.app_secret,
             access_token: secrets.access_token,
+            verify_token: secrets.verify_token,
             graph_api_base: GRAPH_API_BASE.to_string(),
         })
     }
@@ -79,6 +88,44 @@ impl WhatsAppAdapter {
     fn with_base_url(mut self, base: &str) -> Self {
         self.graph_api_base = base.to_string();
         self
+    }
+
+    /// One entry of `value.statuses`. An unknown status word is dropped rather
+    /// than guessed at: recording a delivery that may not have happened is
+    /// worse than recording nothing.
+    fn normalize_status(&self, status: &JsonValue, now_ms: i64) -> Option<DeliveryReceipt> {
+        let provider_message_id = status.get("id").and_then(JsonValue::as_str)?;
+        let state = match status.get("status").and_then(JsonValue::as_str)? {
+            "sent" => DeliveryState::Sent,
+            "delivered" => DeliveryState::Delivered,
+            "read" => DeliveryState::Read,
+            "failed" => DeliveryState::Failed,
+            _ => return None,
+        };
+        // Meta nests the reason under `errors[0]`, and its `title` is the part
+        // written for a human. The code goes with it because that is what the
+        // provider's own documentation is indexed by.
+        let error = status
+            .get("errors")
+            .and_then(JsonValue::as_array)
+            .and_then(|errors| errors.first())
+            .map(|first| {
+                let title = first
+                    .get("title")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("Delivery failed");
+                match first.get("code").and_then(JsonValue::as_i64) {
+                    Some(code) => format!("{title} (WhatsApp error {code})"),
+                    None => title.to_string(),
+                }
+            });
+        Some(DeliveryReceipt {
+            account_id: self.account_id.clone(),
+            provider_message_id: provider_message_id.to_string(),
+            state,
+            error,
+            observed_at_ms: now_ms,
+        })
     }
 }
 
@@ -110,6 +157,67 @@ impl WebhookChannelAdapter for WhatsAppAdapter {
         let payload: JsonValue = serde_json::from_slice(body)
             .map_err(|error| format!("WhatsApp webhook body is not valid JSON: {error}"))?;
         Ok(normalize_payload(&payload, &self.account_id, now_ms))
+    }
+
+    /// Meta reports what happened to a message we sent — `sent`, `delivered`,
+    /// `read` or `failed` — in the same webhook, alongside (or instead of) any
+    /// inbound messages.
+    ///
+    /// A failure carries the reason, and the reasons matter operationally: a
+    /// 24-hour session window that closed, or a recipient who never opted in,
+    /// looks exactly like a successful send until the status arrives.
+    fn delivery_receipts(&self, body: &[u8], now_ms: i64) -> Vec<DeliveryReceipt> {
+        let Ok(payload) = serde_json::from_slice::<JsonValue>(body) else {
+            return Vec::new();
+        };
+        payload
+            .get("entry")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("changes").and_then(JsonValue::as_array))
+            .flatten()
+            .filter_map(|change| {
+                change
+                    .get("value")
+                    .and_then(|value| value.get("statuses"))
+                    .and_then(JsonValue::as_array)
+            })
+            .flatten()
+            .filter_map(|status| self.normalize_status(status, now_ms))
+            .collect()
+    }
+
+    /// Meta's subscription handshake: it GETs the callback URL with a verify
+    /// token the operator chose, and only saves the URL if the exact
+    /// `hub.challenge` comes back.
+    ///
+    /// The comparison is constant-time and an unconfigured token never
+    /// matches, so this endpoint cannot be turned into an oracle for guessing
+    /// the token one request at a time. Nothing else about the account is
+    /// revealed either way — the caller answers a mismatch with a flat 403.
+    fn verification_challenge(&self, query: &str) -> Option<String> {
+        if self.verify_token.is_empty() {
+            return None;
+        }
+        let params: std::collections::BTreeMap<String, String> =
+            url::form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect();
+        if params.get("hub.mode").map(String::as_str) != Some("subscribe") {
+            return None;
+        }
+        let offered = params.get("hub.verify_token")?;
+        // Digests are compared, not the tokens: two SHA-256 outputs compare in
+        // a way that leaks nothing about the inputs, so a plain `==` here is
+        // not the timing side channel that comparing the tokens directly
+        // would be.
+        let expected = ring::digest::digest(&ring::digest::SHA256, self.verify_token.as_bytes());
+        let actual = ring::digest::digest(&ring::digest::SHA256, offered.as_bytes());
+        if expected.as_ref() != actual.as_ref() {
+            return None;
+        }
+        params.get("hub.challenge").cloned()
     }
 }
 
@@ -607,6 +715,164 @@ mod tests {
             0,
         );
         assert!(result.is_err());
+    }
+
+    /// The adapter as Meta's dashboard meets it during setup: same secrets
+    /// plus the verify token the operator typed into the subscription form.
+    fn adapter_with_verify_token(verify_token: &str) -> WhatsAppAdapter {
+        let account = test_account(serde_json::json!({ "phone_number_id": "1234567890" }));
+        let secret = serde_json::json!({
+            "app_secret": "s3cret",
+            "access_token": "tok",
+            "verify_token": verify_token,
+        })
+        .to_string();
+        WhatsAppAdapter::new(&AdapterConfig {
+            account: &account,
+            secret,
+        })
+        .expect("adapter builds")
+    }
+
+    #[test]
+    fn a_failed_status_reports_the_reason_the_message_never_arrived() {
+        let body = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "statuses": [{
+                            "id": "wamid.OUT1",
+                            "status": "failed",
+                            "recipient_id": "15550001111",
+                            "errors": [{
+                                "code": 131047,
+                                "title": "Re-engagement message"
+                            }]
+                        }]
+                    }
+                }]
+            }]
+        })
+        .to_string();
+        let receipts = adapter("s3cret", "tok").delivery_receipts(body.as_bytes(), 1_700_000_000);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].provider_message_id, "wamid.OUT1");
+        assert_eq!(receipts[0].state, DeliveryState::Failed);
+        assert_eq!(
+            receipts[0].error.as_deref(),
+            Some("Re-engagement message (WhatsApp error 131047)")
+        );
+        assert_eq!(receipts[0].observed_at_ms, 1_700_000_000);
+    }
+
+    #[test]
+    fn every_progress_state_is_reported_and_an_unknown_one_is_not() {
+        let body = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "statuses": [
+                            {"id": "m1", "status": "sent"},
+                            {"id": "m2", "status": "delivered"},
+                            {"id": "m3", "status": "read"},
+                            {"id": "m4", "status": "warped"},
+                            {"status": "delivered"}
+                        ]
+                    }
+                }]
+            }]
+        })
+        .to_string();
+        let receipts = adapter("s3cret", "tok").delivery_receipts(body.as_bytes(), 0);
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| (receipt.provider_message_id.as_str(), receipt.state))
+                .collect::<Vec<_>>(),
+            vec![
+                ("m1", DeliveryState::Sent),
+                ("m2", DeliveryState::Delivered),
+                ("m3", DeliveryState::Read),
+            ],
+            "an unrecognized status word and an id-less entry are both dropped"
+        );
+    }
+
+    #[test]
+    fn a_body_carrying_only_messages_reports_no_receipts() {
+        let receipts = adapter("s3cret", "tok").delivery_receipts(&text_message_body(), 0);
+        assert!(receipts.is_empty());
+    }
+
+    #[test]
+    fn a_correct_verify_token_echoes_the_challenge() {
+        let adapter = adapter_with_verify_token("chosen-by-the-operator");
+        let answer = adapter.verification_challenge(
+            "hub.mode=subscribe&hub.verify_token=chosen-by-the-operator&hub.challenge=1158201444",
+        );
+        assert_eq!(answer.as_deref(), Some("1158201444"));
+    }
+
+    #[test]
+    fn a_percent_encoded_challenge_is_echoed_decoded() {
+        let adapter = adapter_with_verify_token("tok en");
+        let answer = adapter.verification_challenge(
+            "hub.mode=subscribe&hub.verify_token=tok%20en&hub.challenge=a%2Bb%20c",
+        );
+        assert_eq!(answer.as_deref(), Some("a+b c"));
+    }
+
+    #[test]
+    fn a_wrong_verify_token_answers_nothing() {
+        let adapter = adapter_with_verify_token("chosen-by-the-operator");
+        assert!(adapter
+            .verification_challenge(
+                "hub.mode=subscribe&hub.verify_token=guessed&hub.challenge=1158201444"
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn a_prefix_of_the_verify_token_is_not_close_enough() {
+        let adapter = adapter_with_verify_token("chosen-by-the-operator");
+        assert!(adapter
+            .verification_challenge("hub.mode=subscribe&hub.verify_token=chosen&hub.challenge=x")
+            .is_none());
+    }
+
+    #[test]
+    fn an_account_with_no_verify_token_answers_nothing() {
+        // Not even to an empty offered token: an unconfigured account must not
+        // be the one endpoint that any challenge passes.
+        let adapter = adapter_with_verify_token("");
+        assert!(adapter
+            .verification_challenge("hub.mode=subscribe&hub.verify_token=&hub.challenge=x")
+            .is_none());
+    }
+
+    #[test]
+    fn a_challenge_without_the_subscribe_mode_is_refused() {
+        let adapter = adapter_with_verify_token("chosen-by-the-operator");
+        assert!(adapter
+            .verification_challenge(
+                "hub.mode=unsubscribe&hub.verify_token=chosen-by-the-operator&hub.challenge=x"
+            )
+            .is_none());
+        assert!(adapter
+            .verification_challenge("hub.verify_token=chosen-by-the-operator&hub.challenge=x")
+            .is_none());
+    }
+
+    #[test]
+    fn an_account_saved_before_verify_tokens_existed_still_builds() {
+        // The credential bundle predating this field must not become
+        // unparseable — the account keeps working, it just cannot answer a
+        // subscription handshake until the operator saves a token.
+        let adapter = adapter("s3cret", "tok");
+        assert!(adapter
+            .verification_challenge("hub.mode=subscribe&hub.verify_token=&hub.challenge=x")
+            .is_none());
     }
 
     #[test]

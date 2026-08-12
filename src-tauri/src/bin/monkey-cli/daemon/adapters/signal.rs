@@ -37,7 +37,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::time::Instant;
 
 use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
 use little_monkey_lib::channels::types::{
@@ -48,6 +49,11 @@ use little_monkey_lib::channels::types::{
 
 const INBOUND_CHANNEL_CAPACITY: usize = 256;
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long to wait before spawning the helper again after an attempt. A
+/// helper that dies on startup (unregistered account, broken install) would
+/// otherwise be respawned once per `poll`, which is a process-spawn loop
+/// against the operator's own machine.
+const RESTART_COOLDOWN: Duration = Duration::from_secs(5);
 /// Signal has no server-enforced hard cap; this is signal-cli's own
 /// practical ceiling before it starts truncating. Not a wire limit this
 /// adapter has verified against every server version — ponytail: revisit if
@@ -91,9 +97,12 @@ pub struct SignalAdapter {
     inbound_tx: mpsc::Sender<ChannelEnvelope>,
     inbound_rx: Mutex<mpsc::Receiver<ChannelEnvelope>>,
     shared: Arc<Shared>,
-    /// Guards the one-time spawn. `new` itself stays side-effect-free, same
-    /// reasoning as the Discord/Mattermost adapters' own `started` field.
-    started: OnceCell<Result<(), String>>,
+    /// Serializes spawn attempts and remembers when the last one was made.
+    /// `new` itself stays side-effect-free, same reasoning as the
+    /// Discord/Mattermost adapters' own `started` field — but unlike a
+    /// one-shot cell this allows a *re*start: signal-cli that crashes or is
+    /// killed must not leave the account dead until the daemon restarts.
+    last_start: Mutex<Option<Instant>>,
 }
 
 impl SignalAdapter {
@@ -126,7 +135,7 @@ impl SignalAdapter {
                 stdin: Mutex::new(None),
                 alive: AtomicBool::new(false),
             }),
-            started: OnceCell::new(),
+            last_start: Mutex::new(None),
         })
     }
 
@@ -141,41 +150,59 @@ impl SignalAdapter {
         }
     }
 
+    /// Start the helper, or restart it if a previous one exited.
+    ///
+    /// `alive` is the whole condition: `run_rpc_loop` clears it on EOF, so the
+    /// next call here spawns a fresh helper rather than reporting forever that
+    /// one "is not running". Attempts are rate-limited by [`RESTART_COOLDOWN`]
+    /// and serialized by `last_start`, so concurrent callers produce one
+    /// process, not one each.
     async fn ensure_started(&self) -> Result<(), String> {
-        self.started
-            .get_or_init(|| async {
-                if let Some(error) = self.helper_missing() {
-                    return Err(error);
-                }
-                let mut command = Command::new(&self.helper_path);
-                command
-                    .args(["-a", &self.account, "--output=json", "jsonRpc"])
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null());
-                let mut child = command
-                    .spawn()
-                    .map_err(|error| format!("Failed to start the signal-cli helper: {error}"))?;
-                let stdin = child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| "signal-cli helper has no stdin".to_string())?;
-                let stdout = child
-                    .stdout
-                    .take()
-                    .ok_or_else(|| "signal-cli helper has no stdout".to_string())?;
-                *self.shared.stdin.lock().await = Some(stdin);
-                self.shared.alive.store(true, Ordering::SeqCst);
-                tokio::spawn(run_rpc_loop(
-                    child,
-                    stdout,
-                    self.shared.clone(),
-                    self.inbound_tx.clone(),
-                ));
-                Ok(())
-            })
-            .await
-            .clone()
+        if self.shared.alive.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut last_start = self.last_start.lock().await;
+        // Re-checked under the lock: whoever held it may have just started one.
+        if self.shared.alive.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if let Some(attempted_at) = *last_start {
+            if attempted_at.elapsed() < RESTART_COOLDOWN {
+                return Err(
+                    "The signal-cli helper stopped; waiting before starting it again".to_string(),
+                );
+            }
+        }
+        *last_start = Some(Instant::now());
+        if let Some(error) = self.helper_missing() {
+            return Err(error);
+        }
+        let mut command = Command::new(&self.helper_path);
+        command
+            .args(["-a", &self.account, "--output=json", "jsonRpc"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("Failed to start the signal-cli helper: {error}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "signal-cli helper has no stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "signal-cli helper has no stdout".to_string())?;
+        *self.shared.stdin.lock().await = Some(stdin);
+        self.shared.alive.store(true, Ordering::SeqCst);
+        tokio::spawn(run_rpc_loop(
+            child,
+            stdout,
+            self.shared.clone(),
+            self.inbound_tx.clone(),
+        ));
+        Ok(())
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, CallError> {
@@ -260,11 +287,11 @@ async fn run_rpc_loop(
     }
     shared.alive.store(false, Ordering::SeqCst);
     *shared.stdin.lock().await = None;
-    let mut pending = shared.pending.lock().await;
-    for (_, sender) in pending.drain() {
-        let _ = sender.send(Err("The signal-cli helper exited".to_string()));
-    }
-    drop(pending);
+    // Dropped, not answered with an error: a request the helper never replied
+    // to is *ambiguous*, not a provider rejection, and `call` distinguishes
+    // the two by whether the sender was dropped. Sending `Err` here would
+    // classify an in-flight send as a permanent failure and lose the message.
+    shared.pending.lock().await.clear();
     let _ = child.wait().await;
 }
 
@@ -647,5 +674,158 @@ mod tests {
             secret: String::new(),
         };
         assert!(SignalAdapter::new(&config).is_ok());
+    }
+
+    /// Everything below drives a *fake* helper: a shell script that speaks the
+    /// same newline-delimited JSON-RPC signal-cli does. No real signal-cli, no
+    /// Signal account, no network — which is what makes the lifecycle
+    /// (spawn, request/response, notification, malformed line, crash,
+    /// restart) provable in CI at all.
+    ///
+    /// Unix only, because the fixture is a `#!/bin/sh` script. The adapter
+    /// itself is not platform-specific; the fake is.
+    #[cfg(unix)]
+    mod fake_helper {
+        use super::*;
+        use little_monkey_lib::channels::types::HealthState;
+        use std::os::unix::fs::PermissionsExt;
+
+        /// Writes a fake signal-cli and returns its path.
+        ///
+        /// It emits one `receive` notification and one unparseable line
+        /// immediately, then answers every request with a `version`-shaped
+        /// result — except a `crash` request, which makes it exit like a
+        /// helper that died mid-conversation.
+        ///
+        /// Each line goes out through `/bin/echo` rather than the shell's own
+        /// builtin: a separate process writing and exiting cannot leave the
+        /// line sitting in a shell's stdio buffer, which is the difference
+        /// between this test being deterministic and being flaky.
+        fn write_fake_helper(name: &str) -> std::path::PathBuf {
+            let path = std::env::temp_dir().join(format!(
+                "monkey-fake-signal-{name}-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let script = r#"#!/bin/sh
+/bin/echo '{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"source":"+15551230001","sourceName":"Ada","timestamp":1700000000000,"dataMessage":{"message":"hello there"}}}}'
+/bin/echo 'this line is not JSON'
+while IFS= read -r line; do
+  case "$line" in
+    *crash*) exit 7 ;;
+  esac
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  /bin/echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"version\":\"0.13.0\",\"timestamp\":1700000000001}}"
+done
+"#;
+            std::fs::write(&path, script).expect("write fake helper");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake helper");
+            path
+        }
+
+        fn helper_account(
+            path: &std::path::Path,
+        ) -> super::super::super::super::channel_store::ChannelAccountRecord {
+            test_account(json!({
+                "helper_path": path.to_string_lossy(),
+                "account": "+15550000000",
+            }))
+        }
+
+        #[tokio::test]
+        async fn probes_over_the_helpers_own_json_rpc() {
+            let path = write_fake_helper("probe");
+            let account = helper_account(&path);
+            let adapter = SignalAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+
+            let health = adapter.probe().await;
+            assert_eq!(health.state, HealthState::Connected);
+            assert_eq!(health.detail.as_deref(), Some("+15550000000"));
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[tokio::test]
+        async fn streams_inbound_notifications_and_ignores_unparseable_lines() {
+            let path = write_fake_helper("inbound");
+            let account = helper_account(&path);
+            let adapter = SignalAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+
+            let batch = adapter.poll(None).await.expect("poll");
+            assert_eq!(batch.envelopes.len(), 1, "the junk line must not normalize");
+            assert_eq!(batch.envelopes[0].text, "hello there");
+            assert_eq!(
+                batch.envelopes[0].provider_event_id,
+                "+15551230001:1700000000000"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[tokio::test]
+        async fn a_send_the_helper_acknowledges_is_sent() {
+            let path = write_fake_helper("send");
+            let account = helper_account(&path);
+            let adapter = SignalAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+
+            let outcome = adapter
+                .send(&OutboundMessage {
+                    account_id: "acct-1".to_string(),
+                    kind: ChannelKind::Signal,
+                    conversation_id: "+15551230001".to_string(),
+                    thread_id: None,
+                    text: "ack".to_string(),
+                    attachments: Vec::new(),
+                    reply_to_provider_id: None,
+                    idempotency_key: "idem-1".to_string(),
+                })
+                .await;
+            match outcome {
+                SendOutcome::Sent {
+                    provider_message_id,
+                } => assert_eq!(provider_message_id.as_deref(), Some("1700000000001")),
+                other => panic!("expected Sent, got {other:?}"),
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[tokio::test]
+        async fn a_helper_that_exits_is_started_again_rather_than_left_dead() {
+            let path = write_fake_helper("restart");
+            let account = helper_account(&path);
+            let adapter = SignalAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+
+            assert_eq!(adapter.probe().await.state, HealthState::Connected);
+            // The helper dies mid-request: the in-flight call must resolve as
+            // ambiguous rather than hang, and the account must not be stuck.
+            let died = adapter.call("crash", json!({})).await;
+            assert!(matches!(died, Err(CallError::Ambiguous(_))));
+            assert!(!adapter.shared.alive.load(Ordering::SeqCst));
+
+            // Within the cooldown, the answer is a plain error — not a second
+            // process spawned on every poll.
+            assert_eq!(adapter.probe().await.state, HealthState::Error);
+
+            // Once the cooldown has passed, the next call brings the helper
+            // back. Simulated by clearing the attempt stamp so the test does
+            // not sleep for it.
+            *adapter.last_start.lock().await = None;
+            assert_eq!(adapter.probe().await.state, HealthState::Connected);
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }

@@ -39,16 +39,28 @@ pub async fn spawn_local_listener(paths: DaemonPaths, port: u16) -> Result<(), S
 }
 
 async fn handle(paths: DaemonPaths, request: Request<Incoming>) -> Response<Full<Bytes>> {
-    if request.method() != Method::POST {
-        return response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
-    }
-    if let Some(account_id) = request
+    let channel_account = request
         .uri()
         .path()
         .strip_prefix("/v1/channels/")
         .filter(|value| !value.is_empty() && !value.contains('/'))
-        .map(str::to_string)
-    {
+        .map(str::to_string);
+    // A GET reaches exactly one thing: the subscription handshake a provider
+    // performs before it will save the callback URL at all. Everything else
+    // stays POST-only.
+    if request.method() == Method::GET {
+        return match channel_account {
+            Some(account_id) => {
+                let query = request.uri().query().unwrap_or_default().to_string();
+                handle_channel_verification(paths, account_id, &query)
+            }
+            None => response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
+        };
+    }
+    if request.method() != Method::POST {
+        return response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
+    }
+    if let Some(account_id) = channel_account {
         return handle_channel_delivery(paths, account_id, request).await;
     }
     if let Some(account_id) = request
@@ -160,16 +172,66 @@ async fn handle_channel_delivery(
         Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "clock_error"),
     };
 
-    let mut store = match DaemonStore::open(&paths) {
-        Ok(store) => store,
-        Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"),
+    let (mut store, adapter) = match open_webhook_adapter(&paths, &account_id) {
+        Ok(pair) => pair,
+        Err(refusal) => return *refusal,
     };
-    let account = match store.channel_account(&account_id) {
+
+    let envelopes = match adapter.verify_and_normalize(&headers, &body, None, now_ms) {
+        Ok(envelopes) => envelopes,
+        // Deliberately opaque, and deliberately not recorded: an unverified
+        // body has not earned a row in the durable event log.
+        Err(_) => return response(StatusCode::UNAUTHORIZED, "rejected"),
+    };
+    // What the provider says happened to messages we already sent. Recorded
+    // before the inbound work because it is cheap and must survive even a
+    // delivery that carries nothing else — a status-only body is the normal
+    // shape of a failure report.
+    let receipts = record_delivery_receipts(&mut store, adapter.delivery_receipts(&body, now_ms));
+
+    if envelopes.is_empty() {
+        return response(
+            StatusCode::OK,
+            if receipts > 0 { "recorded" } else { "ignored" },
+        );
+    }
+
+    let queue = super::DaemonChannelQueue::new(paths.clone());
+    let report = super::channel_worker::ingest_batch(&mut store, &queue, &envelopes, now_ms);
+    if report.failed > 0 && report.accepted == 0 {
+        return response(StatusCode::INTERNAL_SERVER_ERROR, "not_queued");
+    }
+    response(StatusCode::ACCEPTED, "accepted")
+}
+
+/// An open store plus the adapter for the account the request named.
+type OpenedWebhookAccount = (
+    DaemonStore,
+    Box<dyn super::channel_adapter::WebhookChannelAdapter>,
+);
+
+/// Open the store and build one account's webhook adapter, or the response
+/// that says why not.
+///
+/// An unknown account, a disabled one, and a provider that is not delivered to
+/// all answer the same flat 404: a stranger probing the endpoint learns
+/// nothing about what exists.
+fn open_webhook_adapter(
+    paths: &DaemonPaths,
+    account_id: &str,
+) -> Result<OpenedWebhookAccount, Box<Response<Full<Bytes>>>> {
+    let refuse = |status, text| Box::new(response(status, text));
+    let store = DaemonStore::open(paths)
+        .map_err(|_| refuse(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"))?;
+    let account = match store.channel_account(account_id) {
         Ok(Some(account)) if account.enabled => account,
-        // An unknown or disabled account is a 404 rather than an explanation:
-        // a stranger probing the endpoint learns nothing about what exists.
-        Ok(_) => return response(StatusCode::NOT_FOUND, "not_found"),
-        Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"),
+        Ok(_) => return Err(refuse(StatusCode::NOT_FOUND, "not_found")),
+        Err(_) => {
+            return Err(refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "state_unavailable",
+            ))
+        }
     };
     let secret = match &account.credential_ref {
         Some(reference) => super::channel_adapter::ChannelSecrets::get(
@@ -183,27 +245,93 @@ async fn handle_channel_delivery(
         account: &account,
         secret,
     };
-    let adapter = match super::adapters::build_webhook_adapter(&config) {
-        Ok(adapter) => adapter,
-        Err(_) => return response(StatusCode::NOT_FOUND, "not_found"),
-    };
+    let adapter = super::adapters::build_webhook_adapter(&config)
+        .map_err(|_| refuse(StatusCode::NOT_FOUND, "not_found"))?;
+    Ok((store, adapter))
+}
 
-    let envelopes = match adapter.verify_and_normalize(&headers, &body, None, now_ms) {
-        Ok(envelopes) => envelopes,
-        // Deliberately opaque, and deliberately not recorded: an unverified
-        // body has not earned a row in the durable event log.
-        Err(_) => return response(StatusCode::UNAUTHORIZED, "rejected"),
-    };
-    if envelopes.is_empty() {
-        return response(StatusCode::OK, "ignored");
-    }
+/// Record what a provider says happened to messages we already sent.
+///
+/// Each transition is its own row, keyed `status:<message id>:<state>`, for
+/// two reasons: the send itself already owns the row keyed on the bare message
+/// id, and a provider that redelivers the same status must collapse onto the
+/// row it wrote the first time rather than adding another. Returns how many
+/// were new.
+///
+/// A receipt is deliberately not a turn. Nobody is speaking, so nothing is
+/// queued and nothing runs — the operator sees it in the account's activity
+/// list, which is where a message that quietly failed to arrive becomes
+/// visible.
+fn record_delivery_receipts(
+    store: &mut DaemonStore,
+    receipts: Vec<little_monkey_lib::channels::types::DeliveryReceipt>,
+) -> usize {
+    use super::channel_store::{EventDirection, EventDisposition, NewChannelEvent};
+    use little_monkey_lib::channels::types::DeliveryState;
 
-    let queue = super::DaemonChannelQueue::new(paths.clone());
-    let report = super::channel_worker::ingest_batch(&mut store, &queue, &envelopes, now_ms);
-    if report.failed > 0 && report.accepted == 0 {
-        return response(StatusCode::INTERNAL_SERVER_ERROR, "not_queued");
+    let mut recorded = 0;
+    for receipt in receipts {
+        let disposition = match receipt.state {
+            DeliveryState::Failed => EventDisposition::Failed,
+            _ => EventDisposition::Accepted,
+        };
+        let envelope_json = serde_json::to_string(&receipt).unwrap_or_default();
+        let outcome = store.record_channel_event(&NewChannelEvent {
+            account_id: receipt.account_id.clone(),
+            source: little_monkey_lib::channels::ingress::ConversationSource::MessagingChannel,
+            direction: EventDirection::Outbound,
+            provider_event_id: format!(
+                "status:{}:{}",
+                receipt.provider_message_id,
+                receipt.state.as_str()
+            ),
+            // A receipt names a message, not a conversation: the provider does
+            // not repeat which thread it was in, and inventing one would put
+            // the row under a conversation that may not exist.
+            conversation_id: format!("message:{}", receipt.provider_message_id),
+            thread_id: None,
+            sender_id: None,
+            envelope_json,
+            disposition,
+            received_at_ms: receipt.observed_at_ms,
+        });
+        if matches!(
+            outcome,
+            Ok(super::channel_store::EventRecording::Recorded { .. })
+        ) {
+            recorded += 1;
+        }
     }
-    response(StatusCode::ACCEPTED, "accepted")
+    recorded
+}
+
+/// The subscription handshake a provider performs before it will accept the
+/// callback URL.
+///
+/// The adapter answers, because only it knows what its provider asks and what
+/// shared secret proves the asker is that provider. A refusal is a flat 403
+/// with no detail — the alternative tells whoever is probing which half of the
+/// handshake they got right.
+///
+/// The challenge is echoed as `text/plain`, which is what Meta requires: it
+/// compares the body byte for byte and a JSON wrapper fails the comparison.
+fn handle_channel_verification(
+    paths: DaemonPaths,
+    account_id: String,
+    query: &str,
+) -> Response<Full<Bytes>> {
+    let (_store, adapter) = match open_webhook_adapter(&paths, &account_id) {
+        Ok(pair) => pair,
+        Err(refusal) => return *refusal,
+    };
+    match adapter.verification_challenge(query) {
+        Some(challenge) => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Full::new(Bytes::from(challenge)))
+            .expect("challenge response is valid"),
+        None => response(StatusCode::FORBIDDEN, "rejected"),
+    }
 }
 
 /// One callback from a carrier.
@@ -370,6 +498,68 @@ fn json_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use little_monkey_lib::channels::types::{DeliveryReceipt, DeliveryState};
+
+    /// A store holding the account the receipts belong to — in production the
+    /// route has already looked it up before any of this runs.
+    fn seeded_store() -> DaemonStore {
+        use little_monkey_lib::channels::policy::ChannelAccessPolicy;
+        use little_monkey_lib::channels::types::{ChannelHealth, ChannelKind, HealthState};
+
+        let mut store = DaemonStore::open_in_memory().expect("open store");
+        store
+            .upsert_channel_account(&super::super::channel_store::ChannelAccountRecord {
+                account_id: "acct-wa".to_string(),
+                kind: ChannelKind::WhatsApp,
+                label: "Test WhatsApp".to_string(),
+                enabled: true,
+                non_secret_config: serde_json::json!({ "phone_number_id": "1234567890" }),
+                credential_ref: Some("wa-cred".to_string()),
+                access_policy: ChannelAccessPolicy::default(),
+                health: ChannelHealth {
+                    state: HealthState::Unconfigured,
+                    detail: None,
+                    last_error: None,
+                    probed_at_ms: 0,
+                },
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .expect("seed account");
+        store
+    }
+
+    fn receipt(state: DeliveryState) -> DeliveryReceipt {
+        DeliveryReceipt {
+            account_id: "acct-wa".to_string(),
+            provider_message_id: "wamid.OUT1".to_string(),
+            state,
+            error: None,
+            observed_at_ms: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn a_redelivered_status_is_recorded_once_and_each_transition_separately() {
+        let mut store = seeded_store();
+        assert_eq!(
+            record_delivery_receipts(&mut store, vec![receipt(DeliveryState::Sent)]),
+            1
+        );
+        // Providers retry. The same status arriving twice must not become two
+        // rows in the operator's activity list.
+        assert_eq!(
+            record_delivery_receipts(&mut store, vec![receipt(DeliveryState::Sent)]),
+            0
+        );
+        // A later transition on the same message is genuinely new.
+        assert_eq!(
+            record_delivery_receipts(&mut store, vec![receipt(DeliveryState::Delivered)]),
+            1
+        );
+    }
+
     #[test]
     fn route_rejects_nested_trigger_paths() {
         let path = "/v1/triggers/a/b";
