@@ -141,7 +141,7 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
   },
   {
     kind: "matrix", label: "Matrix", transport: "long_poll", credentialLabel: "Access token",
-    whereToGetIt: "Your own homeserver account's access token — in Element: Settings → Help & About → Advanced → Access Token. Treat it like a password.",
+    whereToGetIt: "Your own homeserver account's access token — in Element: Settings → Help & About → Advanced → Access Token. Treat it like a password. Encrypted rooms work: this app appears as the device that token belongs to, and messages sent before it joined stay unreadable until you verify it from another of your clients.",
     docsUrl: "https://spec.matrix.org/latest/client-server-api/",
     configFields: [
       { key: "homeserver_url", label: "Homeserver", type: "text", required: true, placeholder: "https://matrix.example.org" },
