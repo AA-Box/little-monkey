@@ -1632,6 +1632,101 @@ impl RemoteStore {
             .map_err(|error| error.to_string())
     }
 
+    /// Replaces one device's operator grant, after pairing.
+    ///
+    /// The one way a device's capability set changes without re-pairing, so
+    /// every rule that held at pairing time is re-checked here: the legacy run
+    /// actions stay covered, dependent capabilities stay together, and a
+    /// revoked device is not re-armed. Returns the stored set.
+    pub fn set_device_capabilities(
+        &mut self,
+        device_id: &str,
+        capabilities: &BTreeSet<DeviceCapability>,
+        now_ms: u64,
+    ) -> Result<BTreeSet<DeviceCapability>, String> {
+        let device = self
+            .device(device_id)?
+            .ok_or_else(|| format!("Unknown remote device '{device_id}'"))?;
+        if !device.active() {
+            return Err("A revoked device cannot be granted capabilities".to_string());
+        }
+        validate_capabilities(capabilities, &device.scopes)?;
+        self.connection
+            .execute(
+                "INSERT INTO remote_device_capabilities(device_id,capabilities_json)
+                 VALUES(?1,?2)
+                 ON CONFLICT(device_id) DO UPDATE SET capabilities_json=excluded.capabilities_json",
+                params![
+                    device_id,
+                    serde_json::to_vec(capabilities).map_err(|error| error.to_string())?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        // Anything already queued under a grant that has just been withdrawn is
+        // stopped here rather than at lease time, so the run waiting on it hears
+        // promptly and the operator's revocation is immediate.
+        let withdrawn = device
+            .capabilities
+            .difference(capabilities)
+            .map(|capability| capability_token(*capability))
+            .collect::<Vec<_>>();
+        if !withdrawn.is_empty() {
+            let placeholders = withdrawn
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("?{}", index + 3))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut arguments: Vec<Box<dyn rusqlite::ToSql>> =
+                vec![Box::new(device_id.to_string()), Box::new(to_i64(now_ms)?)];
+            arguments.extend(
+                withdrawn
+                    .into_iter()
+                    .map(|token| Box::new(token) as Box<dyn rusqlite::ToSql>),
+            );
+            self.connection
+                .execute(
+                    &format!(
+                        "UPDATE remote_device_actions
+                         SET state='cancelled', completed_at_ms=?2, updated_at_ms=?2,
+                             error=COALESCE(error,'The capability was revoked')
+                         WHERE device_id=?1 AND state IN ('queued','leased')
+                           AND capability IN ({placeholders})"
+                    ),
+                    rusqlite::params_from_iter(arguments.iter().map(|value| value.as_ref())),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        self.audit(
+            now_ms,
+            Some(device_id),
+            "device_capabilities_set",
+            Some(device_id),
+            "allowed",
+            None,
+        )?;
+        Ok(capabilities.clone())
+    }
+
+    /// How many commands are waiting for this device right now. The long-poll
+    /// peeks with this rather than leasing, so a waiting connection takes no
+    /// command it is not about to hand over.
+    pub fn pending_device_command_count(
+        &self,
+        device_id: &str,
+        now_ms: u64,
+    ) -> Result<u32, String> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM remote_device_actions
+                 WHERE device_id=?1 AND state='queued' AND expires_at_ms > ?2",
+                params![device_id, to_i64(now_ms)?],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
     /// Every command not yet in a terminal state, across all devices — what the
     /// Security Doctor reads to see whether a microphone is open right now.
     pub fn active_device_commands(&self) -> Result<Vec<DeviceCommandRecord>, String> {

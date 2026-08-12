@@ -96,6 +96,10 @@ pub enum RemotePlane {
     /// Placement and live migration (K17/K18) — the only way a run authored
     /// elsewhere starts here.
     Node,
+    /// A paired physical device's own hardware: what it advertises, and the
+    /// durable queue of commands the runner has for it. The only plane whose
+    /// effects happen somewhere other than this machine.
+    Device,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +243,36 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
         plane: RemotePlane::Mobile,
         method: "DELETE",
         path: "/v1/remote/mobile/devices/self",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/surface",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "GET",
+        path: "/v1/remote/device/state",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "GET",
+        path: "/v1/remote/device/commands/next",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/commands/{command_id}/start",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/commands/{command_id}/result",
         gate: RemoteGate::SelfService,
     },
     RemoteRouteSpec {
