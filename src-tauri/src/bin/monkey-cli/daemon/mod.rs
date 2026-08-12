@@ -10,7 +10,7 @@ pub(crate) mod ingress_store;
 mod ledger;
 pub(crate) mod peer_ingress;
 pub(crate) mod peer_store;
-mod remote;
+pub(crate) mod remote;
 mod scheduler;
 mod service;
 pub(crate) mod store;

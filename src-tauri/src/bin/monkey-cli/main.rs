@@ -24,6 +24,7 @@ mod managed_model_cli;
 mod mcp_cli;
 mod modelfile;
 mod ollama_api;
+mod peers_cli;
 mod permission;
 mod plugins_cli;
 mod processes_cli;
@@ -390,6 +391,12 @@ enum Cmd {
     Ingress {
         #[command(subcommand)]
         action: ingress_cli::IngressCmd,
+    },
+    /// Pair with another Little Monkey installation and exchange bounded
+    /// messages and task requests with it.
+    Peers {
+        #[command(subcommand)]
+        action: peers_cli::PeersCmd,
     },
     /// Show what recent configuration changes touched, across personas,
     /// rules/memory files, MCP servers and workflow definitions — the
@@ -1456,6 +1463,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
         }
         Cmd::Channels { action } => channels_cli::dispatch(action).await,
         Cmd::Ingress { action } => ingress_cli::dispatch(action),
+        Cmd::Peers { action } => peers_cli::dispatch(action).await,
         Cmd::Revisions { change, limit } => revisions_cli::list(change.as_deref(), *limit),
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
             Ok(count) => {

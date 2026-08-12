@@ -629,6 +629,69 @@ impl RemoteStore {
             .map_err(|error| error.to_string())
     }
 
+    /// Replace one device's peer grants, leaving every other capability alone.
+    ///
+    /// Scoped to the three peer capabilities on purpose: this is the operator
+    /// changing what a peer may ask for, and it must not become a way to hand a
+    /// peer the control plane. Everything the pairing already had — including
+    /// nothing, which is what a peer-only pairing has — is preserved exactly.
+    pub fn set_peer_capabilities(
+        &mut self,
+        device_id: &str,
+        peer_capabilities: &BTreeSet<DeviceCapability>,
+        now_ms: u64,
+    ) -> Result<DeviceRecord, String> {
+        if !crate::daemon::remote::protocol::is_peer_only(peer_capabilities)
+            && !peer_capabilities.is_empty()
+        {
+            return Err("Only peer capabilities can be granted here".to_string());
+        }
+        let mut device = self
+            .device(device_id)?
+            .ok_or_else(|| format!("Unknown paired device '{device_id}'"))?;
+        if !device.active() {
+            return Err("This pairing was revoked".to_string());
+        }
+        let mut capabilities: BTreeSet<DeviceCapability> = if device.capabilities.is_empty() {
+            legacy_capabilities(&device.scopes)
+        } else {
+            device.capabilities.clone()
+        };
+        capabilities.retain(|capability| {
+            !matches!(
+                capability,
+                DeviceCapability::PeerMessage
+                    | DeviceCapability::PeerTaskRequest
+                    | DeviceCapability::PeerArtifact
+            )
+        });
+        capabilities.extend(peer_capabilities.iter().copied());
+        device.scopes.validate_with_capabilities(&capabilities)?;
+        validate_capabilities(&capabilities, &device.scopes)?;
+        let stored = serde_json::to_vec(&capabilities).map_err(|error| error.to_string())?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO remote_device_capabilities(device_id,capabilities_json)
+                 VALUES(?1,?2)
+                 ON CONFLICT(device_id) DO UPDATE SET capabilities_json=excluded.capabilities_json",
+                params![device_id, stored],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE remote_devices SET updated_at_ms=?2 WHERE device_id=?1",
+                params![device_id, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        device.capabilities = capabilities;
+        Ok(device)
+    }
+
     pub fn revoke_device(
         &mut self,
         device_id: &str,
