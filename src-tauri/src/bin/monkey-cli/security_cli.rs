@@ -204,13 +204,32 @@ pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> R
                 Ok(None) => {}
                 Err(error) => runtime.native_skills_error = Some(error.to_string()),
             }
-            let report = run_security_audit(&SecurityAuditRequest {
+            let mut report = run_security_audit(&SecurityAuditRequest {
                 app_data_dir: data_dir.to_path_buf(),
                 workspace: workspace.map(Path::to_path_buf),
                 deep: *deep,
                 fix: *fix,
                 runtime,
             })?;
+            // Peer state lives in the two databases the daemon owns, which the
+            // library cannot open. Appended here rather than duplicated there,
+            // so there is still one report.
+            if let Ok(paths) = crate::daemon::store::DaemonPaths::resolve() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+                    .unwrap_or(0);
+                for finding in crate::daemon::peer_audit::audit_peers(&paths, now) {
+                    match finding.status {
+                        FindingStatus::Pass => report.summary.passed += 1,
+                        FindingStatus::Info => report.summary.informational += 1,
+                        FindingStatus::Warning => report.summary.warnings += 1,
+                        FindingStatus::Critical => report.summary.critical += 1,
+                        FindingStatus::Fixed => report.summary.fixed += 1,
+                    }
+                    report.findings.push(finding);
+                }
+            }
             if *json {
                 println!(
                     "{}",

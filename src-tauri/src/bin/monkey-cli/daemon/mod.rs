@@ -8,6 +8,7 @@ pub(crate) mod channel_worker;
 mod engine;
 pub(crate) mod ingress_store;
 mod ledger;
+pub(crate) mod peer_audit;
 pub(crate) mod peer_ingress;
 pub(crate) mod peer_store;
 pub(crate) mod peer_tool;
