@@ -57,8 +57,12 @@
           <input id="deviceName" name="deviceName" autocomplete="nickname" maxlength="80" required placeholder="Ahmad's phone">
 
           <label for="invitationFile">Pairing invitation</label>
-          <input id="invitationFile" name="invitationFile" type="file" accept="application/json,.json" required>
+          <input id="invitationFile" name="invitationFile" type="file" accept="application/json,.json">
           <p class="field-help">Choose the protected JSON created by <code>remote pair-create</code>.</p>
+
+          <label for="pairingCode">Or paste a pairing code</label>
+          <input id="pairingCode" name="pairingCode" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="littlemonkey://pair/…">
+          <p class="field-help">The short code from <code>remote pair-create --qr</code>. It carries the same one-time token and the same certificate pin.</p>
 
           <div id="invitationPreview" class="preview-card" hidden>
             <dl>
@@ -78,6 +82,8 @@
       </section>
 
       <section id="dashboardView" hidden>
+        <p id="staleBanner" class="stale-banner" role="status" hidden></p>
+
         <div class="dashboard-toolbar">
           <div>
             <p class="eyebrow">Scoped controller</p>
@@ -90,6 +96,25 @@
             <button id="forgetButton" class="button ghost" type="button">Forget browser</button>
           </div>
         </div>
+
+        <section id="devicePanel" class="panel device-panel" aria-labelledby="deviceTitle" hidden>
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">This device</p>
+              <h2 id="deviceTitle">Hardware the runner may use</h2>
+            </div>
+          </div>
+          <dl class="device-grid">
+            <div><dt>Little Monkey granted</dt><dd id="deviceGranted">—</dd></div>
+            <div><dt>This device supports</dt><dd id="deviceSupported">—</dd></div>
+            <div><dt>Operating system permits</dt><dd id="devicePermissions">—</dd></div>
+            <div><dt>Effective</dt><dd id="deviceEffective">—</dd></div>
+          </dl>
+          <p class="field-help">
+            An action needs all three. Anything missing from “effective” is refused with the reason,
+            and nothing here can grant itself.
+          </p>
+        </section>
 
         <div class="workspace-grid">
           <aside class="panel run-sidebar" aria-labelledby="runsTitle">
