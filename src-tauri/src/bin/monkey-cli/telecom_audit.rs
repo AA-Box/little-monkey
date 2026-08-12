@@ -37,6 +37,21 @@ pub(crate) fn telecom_findings(now_ms: i64) -> Vec<SecurityFinding> {
         return Vec::new();
     };
     let mut findings = Vec::new();
+    // A number set to answer with no transcription backend is a feature that
+    // looks on and does nothing: the caller talks and every turn is dropped.
+    if accounts.iter().any(|account| {
+        account.enabled && !matches!(account.inbound_policy, InboundCallPolicy::Reject)
+    }) {
+        if let Err(error) = little_monkey_lib::m7_companion::call_speech_readiness(&paths.root) {
+            findings.push(f(
+                "telephony.no_speech_backend",
+                "A number answers calls this machine cannot understand",
+                &error,
+                FindingStatus::Critical,
+                Some("Configure transcription in Settings > Companion, or set the number to reject calls."),
+            ));
+        }
+    }
     for account in accounts.iter().filter(|account| account.enabled) {
         findings.extend(audit_account(account));
         if let Ok(calls) = store.recent_calls(&account.account_id, 50) {

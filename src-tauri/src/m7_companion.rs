@@ -1150,6 +1150,45 @@ pub async fn m7_transcribe_audio(
     })
 }
 
+/// Whether this machine can turn call audio into text at all.
+///
+/// Answering the phone with no transcription backend configured is a feature
+/// that looks enabled and does nothing: the caller talks, and every turn is
+/// dropped. Callers of the telephony surface ask this so they can say so
+/// before somebody discovers it on a live call.
+pub fn call_speech_readiness(app_data_dir: &Path) -> Result<(), String> {
+    let voice = M7CompanionState::production(app_data_dir)?.config()?.voice;
+    match voice.backend {
+        TranscriptionBackendKind::LocalWhisper => {
+            if voice
+                .whisper_binary
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+                || voice
+                    .whisper_model
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                return Err(
+                    "Local transcription has no whisper binary or model configured, so nothing said on a call can be understood."
+                        .to_string(),
+                );
+            }
+        }
+        TranscriptionBackendKind::Provider => {
+            if voice.provider_id.as_deref().unwrap_or_default().is_empty() {
+                return Err(
+                    "Transcription is set to a hosted provider, but no provider is chosen, so nothing said on a call can be understood."
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Transcribe an audio file with the operator's own configured backend.
 ///
 /// The entry point for callers outside the desktop command layer — today the

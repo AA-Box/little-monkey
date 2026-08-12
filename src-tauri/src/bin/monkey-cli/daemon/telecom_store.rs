@@ -104,6 +104,29 @@ impl Default for CallLimits {
     }
 }
 
+/// Which conversation a call continues.
+///
+/// A person who calls back usually means to carry on the last conversation, so
+/// the default keys the session to their number. `per_call` is for a line where
+/// each call is a different matter — a booking line, a reception desk — and
+/// carrying context across callers would be wrong.
+pub fn call_session_key(
+    account: &TelecomAccountRecord,
+    peer_number: &str,
+    call_id: &str,
+) -> String {
+    let per_call = account
+        .non_secret_config
+        .get("session_scope")
+        .and_then(|value| value.as_str())
+        == Some("per_call");
+    if per_call {
+        format!("call:{}:{call_id}", account.account_id)
+    } else {
+        format!("call:{}:{peer_number}", account.account_id)
+    }
+}
+
 impl CallLimits {
     /// Clamp to what the schema and a sane operator can mean. A zero here would
     /// otherwise read as "no limit" and mean the opposite of what the column is
@@ -1029,6 +1052,27 @@ mod tests {
             )
             .expect("record again");
         assert!(matches!(recorded, TelecomEventRecording::Recorded { .. }));
+    }
+
+    #[test]
+    fn a_caller_who_rings_back_continues_the_same_conversation() {
+        let mut account = account("tel-1");
+        let first = call_session_key(&account, "+15551234567", "call-1");
+        let second = call_session_key(&account, "+15551234567", "call-2");
+        assert_eq!(first, second, "the same person keeps their session");
+        assert_ne!(
+            first,
+            call_session_key(&account, "+15559999999", "call-3"),
+            "a different caller does not inherit it"
+        );
+
+        // A line where each call is a different matter says so, and then two
+        // calls from one number are two conversations.
+        account.non_secret_config = serde_json::json!({ "session_scope": "per_call" });
+        assert_ne!(
+            call_session_key(&account, "+15551234567", "call-1"),
+            call_session_key(&account, "+15551234567", "call-2")
+        );
     }
 
     #[test]

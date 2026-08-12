@@ -85,6 +85,7 @@ pub(crate) fn handle_carrier_event(
                     account.inbound_policy,
                     InboundCallPolicy::Answer | InboundCallPolicy::Voicemail
                 );
+            let peer = from_number.clone();
             let record = TelecomCallRecord {
                 call_id: call_id.clone(),
                 account_id: account.account_id.clone(),
@@ -96,7 +97,8 @@ pub(crate) fn handle_carrier_event(
                 } else {
                     CallState::Completed
                 },
-                session_key: answered.then(|| format!("call:{}:{call_id}", account.account_id)),
+                session_key: answered
+                    .then(|| super::telecom_store::call_session_key(account, &peer, &call_id)),
                 job_id: None,
                 // The carrier's own call id is the natural idempotency key for
                 // an inbound call: a redelivered callback finds this row rather

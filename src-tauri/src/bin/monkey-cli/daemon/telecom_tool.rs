@@ -85,7 +85,9 @@ pub(crate) async fn place_call(
         direction: CallDirection::Outbound,
         peer_number: to_number.to_string(),
         state: CallState::Queued,
-        session_key: Some(format!("call:{}:{call_id}", account.account_id)),
+        session_key: Some(super::telecom_store::call_session_key(
+            &account, to_number, &call_id,
+        )),
         job_id: (!job_id.is_empty()).then(|| job_id.clone()),
         idempotency_key,
         opening_line: Some(opening_line.trim().to_string()),
