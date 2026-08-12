@@ -129,16 +129,33 @@ pub trait WebhookChannelAdapter: Send + Sync {
 /// so a blob that grew between the two cannot slip past.
 pub const MAX_ATTACHMENT_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Where an adapter gets an attachment's bytes.
+///
+/// A trait for the same reason [`ChannelSecrets`] is one: the real
+/// implementation resolves the daemon's own paths, which a test has no business
+/// creating. Injecting it is what lets the multipart upload itself be exercised
+/// against a loopback server rather than only the branch that picks the method.
+pub trait BlobSource: Send + Sync {
+    fn read(&self, artifact_id: &str) -> Result<Vec<u8>, String>;
+}
+
+/// The production source: the daemon's own content store.
+pub struct DaemonBlobs;
+
+impl BlobSource for DaemonBlobs {
+    fn read(&self, artifact_id: &str) -> Result<Vec<u8>, String> {
+        let paths = super::store::DaemonPaths::resolve()?;
+        read_blob(&paths, artifact_id)
+    }
+}
+
 /// Read one outbound attachment's bytes out of the content store.
 ///
 /// Attachments are copied into the store when the reply is queued, not read
 /// from disk at send time: an outbox row can be retried minutes later, and the
 /// file the agent meant is the one that existed when it said so, not whatever
 /// occupies that path now.
-pub fn attachment_bytes(
-    paths: &super::store::DaemonPaths,
-    attachment: &little_monkey_lib::channels::types::OutboundAttachment,
-) -> Result<Vec<u8>, String> {
+pub fn read_blob(paths: &super::store::DaemonPaths, artifact_id: &str) -> Result<Vec<u8>, String> {
     let app_data = paths
         .root
         .parent()
@@ -149,7 +166,7 @@ pub fn attachment_bytes(
     )
     .map_err(|error| format!("Failed to open the content store: {error}"))?;
     store
-        .read(&attachment.artifact_id)
+        .read(artifact_id)
         .map_err(|error| format!("Failed to read the attachment: {error}"))
 }
 
@@ -349,6 +366,107 @@ mod tests {
             ChannelKind::WhatsApp,
         ] {
             assert!(credential_required(&account(kind, serde_json::json!({}))));
+        }
+    }
+}
+
+/// Loopback HTTP fixtures for adapter tests.
+///
+/// Kept here rather than duplicated per adapter because the upload paths all
+/// need the same two things: the exact bytes a provider received, and more than
+/// one canned response in order. Every server accepts a fixed number of
+/// connections and then returns, so a test can never leave a listener behind.
+#[cfg(test)]
+pub(crate) mod test_http {
+    use std::io::{Read, Write};
+    use std::sync::mpsc::{channel, Receiver};
+
+    /// Serve `responses` in order, one per connection, and hand back every
+    /// request received in full.
+    ///
+    /// The body is read by `Content-Length` rather than to EOF, because a
+    /// multipart upload keeps the connection open until it has been answered.
+    pub(crate) fn serve(responses: Vec<(u16, String)>) -> (String, Receiver<Vec<u8>>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (sender, receiver) = channel();
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut received = Vec::new();
+                let mut scratch = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_length = 0usize;
+                loop {
+                    match stream.read(&mut scratch) {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            received.extend_from_slice(&scratch[..count]);
+                            if header_end.is_none() {
+                                if let Some(index) = find(&received, b"\r\n\r\n") {
+                                    header_end = Some(index + 4);
+                                    content_length = content_length_of(&received[..index]);
+                                }
+                            }
+                            if let Some(start) = header_end {
+                                // A multipart upload has no Content-Length —
+                                // reqwest streams it chunked — so the end of
+                                // the body is the terminating zero-length
+                                // chunk. Answering before it arrives closes the
+                                // connection under a request still being
+                                // written, which the client reports as a
+                                // failure to send at all.
+                                let complete = if content_length > 0 {
+                                    received.len() >= start + content_length
+                                } else {
+                                    find(&received[start..], b"0\r\n\r\n").is_some()
+                                };
+                                if complete {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = sender.send(received);
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), receiver)
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn content_length_of(headers: &[u8]) -> usize {
+        String::from_utf8_lossy(headers)
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0)
+    }
+
+    /// A blob source holding one file, so an upload test needs no daemon.
+    pub(crate) struct FixtureBlobs(pub Vec<u8>);
+
+    impl super::BlobSource for FixtureBlobs {
+        fn read(&self, _artifact_id: &str) -> Result<Vec<u8>, String> {
+            Ok(self.0.clone())
         }
     }
 }

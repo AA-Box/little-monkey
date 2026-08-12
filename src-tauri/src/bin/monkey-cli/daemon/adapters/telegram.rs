@@ -47,6 +47,12 @@ pub struct TelegramAdapter {
     /// `false` and let the ingress gate handle it.
     self_id: Mutex<Option<i64>>,
     self_username: Mutex<Option<String>>,
+    /// The Bot API origin. Always [`API_BASE`] in production; swappable in
+    /// tests so an upload can be exercised against a loopback fixture.
+    api_base: String,
+    /// Where an outbound attachment's bytes come from. The daemon's content
+    /// store in production, a fixture in tests.
+    blobs: std::sync::Arc<dyn crate::daemon::channel_adapter::BlobSource>,
 }
 
 impl TelegramAdapter {
@@ -58,13 +64,30 @@ impl TelegramAdapter {
             token: config.secret.clone(),
             self_id: Mutex::new(None),
             self_username: Mutex::new(None),
+            api_base: API_BASE.to_string(),
+            blobs: std::sync::Arc::new(crate::daemon::channel_adapter::DaemonBlobs),
         })
+    }
+
+    #[cfg(test)]
+    fn with_base_url(mut self, base: &str) -> Self {
+        self.api_base = base.to_string();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_blobs(
+        mut self,
+        blobs: std::sync::Arc<dyn crate::daemon::channel_adapter::BlobSource>,
+    ) -> Self {
+        self.blobs = blobs;
+        self
     }
 
     /// `https://api.telegram.org/bot<token>/<method>`. Never logged and never
     /// handed to a diagnostic unredacted — see [`Self::redact`].
     fn method_url(&self, method: &str) -> String {
-        format!("{API_BASE}/bot{}/{method}", self.token)
+        format!("{}/bot{}/{method}", self.api_base, self.token)
     }
 
     /// Scrubs the bot token out of any string before it becomes a
@@ -106,9 +129,9 @@ impl TelegramAdapter {
         message: &OutboundMessage,
         attachment: &little_monkey_lib::channels::types::OutboundAttachment,
     ) -> Result<Option<String>, SendOutcome> {
-        let paths = crate::daemon::store::DaemonPaths::resolve()
-            .map_err(|error| SendOutcome::PermanentFailure { error })?;
-        let bytes = crate::daemon::channel_adapter::attachment_bytes(&paths, attachment)
+        let bytes = self
+            .blobs
+            .read(&attachment.artifact_id)
             .map_err(|error| SendOutcome::PermanentFailure { error })?;
         let mime = crate::daemon::channel_adapter::attachment_mime(attachment).to_string();
         let filename = attachment
@@ -319,7 +342,10 @@ impl ChannelAdapter for TelegramAdapter {
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
         let mut chunks = split_utf16_chunks(&message.text, MAX_MESSAGE_UTF16);
-        if chunks.is_empty() {
+        // A reply that is only a file sends only the file. Pushing an empty
+        // chunk here would post a blank message first, which Telegram rejects
+        // and which nobody asked for.
+        if chunks.is_empty() && message.attachments.is_empty() {
             chunks.push(String::new());
         }
         let client = match self.client() {
@@ -772,6 +798,123 @@ struct TelegramUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An adapter pointed at a loopback fixture, holding one file.
+    fn upload_adapter(base: &str, bytes: &[u8]) -> TelegramAdapter {
+        let account = crate::daemon::channel_store::ChannelAccountRecord {
+            account_id: "acct-tg".into(),
+            kind: ChannelKind::Telegram,
+            label: "Test".into(),
+            enabled: true,
+            non_secret_config: serde_json::json!({}),
+            credential_ref: Some("tg".into()),
+            access_policy: little_monkey_lib::channels::policy::ChannelAccessPolicy::default(),
+            health: ChannelHealth {
+                state: little_monkey_lib::channels::types::HealthState::Unconfigured,
+                detail: None,
+                last_error: None,
+                probed_at_ms: 0,
+            },
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        };
+        TelegramAdapter::new(&AdapterConfig {
+            account: &account,
+            secret: "bot-token".into(),
+        })
+        .expect("adapter")
+        .with_base_url(base)
+        .with_blobs(std::sync::Arc::new(
+            crate::daemon::channel_adapter::test_http::FixtureBlobs(bytes.to_vec()),
+        ))
+    }
+
+    fn message_with_file(filename: &str) -> OutboundMessage {
+        OutboundMessage {
+            account_id: "acct-tg".into(),
+            kind: ChannelKind::Telegram,
+            conversation_id: "chat-7".into(),
+            thread_id: None,
+            text: String::new(),
+            attachments: vec![little_monkey_lib::channels::types::OutboundAttachment {
+                artifact_id: "blob-1".into(),
+                filename: Some(filename.to_string()),
+                mime_type: None,
+            }],
+            reply_to_provider_id: Some("42".into()),
+            idempotency_key: "reply-1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_png_is_uploaded_to_sendphoto_with_the_bytes_in_the_body() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            200,
+            r#"{"ok":true,"result":{"message_id":99,"chat":{"id":7,"type":"private"}}}"#
+                .to_string(),
+        )]);
+        let adapter = upload_adapter(&base, b"\x89PNG-not-really");
+
+        let outcome = adapter.send(&message_with_file("shot.png")).await;
+        assert!(
+            matches!(&outcome, SendOutcome::Sent { provider_message_id } if provider_message_id.as_deref() == Some("99")),
+            "{outcome:?}"
+        );
+
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request");
+        let text = String::from_utf8_lossy(&request);
+        assert!(text.starts_with("POST /botbot-token/sendPhoto"), "{text}");
+        assert!(text.contains("multipart/form-data"), "{text}");
+        assert!(text.contains("name=\"photo\""), "{text}");
+        assert!(text.contains("filename=\"shot.png\""), "{text}");
+        assert!(text.contains("name=\"chat_id\""), "{text}");
+        assert!(text.contains("name=\"reply_to_message_id\""), "{text}");
+        // The file the store held is what went on the wire, not a placeholder.
+        assert!(
+            request
+                .windows(b"PNG-not-really".len())
+                .any(|window| window == b"PNG-not-really"),
+            "the uploaded bytes are missing from the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pdf_is_uploaded_to_senddocument() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            200,
+            r#"{"ok":true,"result":{"message_id":100,"chat":{"id":7,"type":"private"}}}"#
+                .to_string(),
+        )]);
+        let adapter = upload_adapter(&base, b"%PDF-1.7");
+
+        let outcome = adapter.send(&message_with_file("report.pdf")).await;
+        assert!(matches!(outcome, SendOutcome::Sent { .. }), "{outcome:?}");
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request");
+        let text = String::from_utf8_lossy(&request);
+        assert!(
+            text.starts_with("POST /botbot-token/sendDocument"),
+            "{text}"
+        );
+        assert!(text.contains("name=\"document\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_upload_is_a_permanent_failure_and_not_a_retry() {
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            400,
+            r#"{"ok":false,"description":"file too big"}"#.to_string(),
+        )]);
+        let adapter = upload_adapter(&base, b"bytes");
+        let outcome = adapter.send(&message_with_file("shot.png")).await;
+        assert!(
+            matches!(outcome, SendOutcome::PermanentFailure { .. }),
+            "{outcome:?}"
+        );
+    }
 
     #[test]
     fn a_picture_is_uploaded_as_a_photo_and_everything_else_as_a_document() {

@@ -57,6 +57,9 @@ pub struct WhatsAppAdapter {
     /// swappable in tests so `send`/`probe` can be exercised against a
     /// loopback fixture instead of the real network.
     graph_api_base: String,
+    /// Where an outbound attachment's bytes come from. The daemon's content
+    /// store in production, a fixture in tests.
+    blobs: std::sync::Arc<dyn crate::daemon::channel_adapter::BlobSource>,
 }
 
 impl WhatsAppAdapter {
@@ -81,12 +84,22 @@ impl WhatsAppAdapter {
             access_token: secrets.access_token,
             verify_token: secrets.verify_token,
             graph_api_base: GRAPH_API_BASE.to_string(),
+            blobs: std::sync::Arc::new(crate::daemon::channel_adapter::DaemonBlobs),
         })
     }
 
     #[cfg(test)]
     fn with_base_url(mut self, base: &str) -> Self {
         self.graph_api_base = base.to_string();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_blobs(
+        mut self,
+        blobs: std::sync::Arc<dyn crate::daemon::channel_adapter::BlobSource>,
+    ) -> Self {
+        self.blobs = blobs;
         self
     }
 
@@ -345,9 +358,9 @@ impl WhatsAppAdapter {
         client: &reqwest::Client,
         attachment: &little_monkey_lib::channels::types::OutboundAttachment,
     ) -> Result<String, SendOutcome> {
-        let paths = crate::daemon::store::DaemonPaths::resolve()
-            .map_err(|error| SendOutcome::PermanentFailure { error })?;
-        let bytes = crate::daemon::channel_adapter::attachment_bytes(&paths, attachment)
+        let bytes = self
+            .blobs
+            .read(&attachment.artifact_id)
             .map_err(|error| SendOutcome::PermanentFailure { error })?;
         let mime = crate::daemon::channel_adapter::attachment_mime(attachment).to_string();
         let filename = attachment
@@ -871,6 +884,127 @@ mod tests {
             secret,
         })
         .expect("adapter builds")
+    }
+
+    fn upload_adapter(base: &str, bytes: &[u8]) -> WhatsAppAdapter {
+        let account = test_account(serde_json::json!({ "phone_number_id": "1234567890" }));
+        let secret = serde_json::json!({
+            "app_secret": "s3cret",
+            "access_token": "tok",
+        })
+        .to_string();
+        WhatsAppAdapter::new(&AdapterConfig {
+            account: &account,
+            secret,
+        })
+        .expect("adapter builds")
+        .with_base_url(base)
+        .with_blobs(std::sync::Arc::new(
+            crate::daemon::channel_adapter::test_http::FixtureBlobs(bytes.to_vec()),
+        ))
+    }
+
+    fn message_with_file(filename: &str) -> OutboundMessage {
+        OutboundMessage {
+            account_id: "acct-wa".into(),
+            kind: ChannelKind::WhatsApp,
+            conversation_id: "15550001111".into(),
+            thread_id: None,
+            text: String::new(),
+            attachments: vec![little_monkey_lib::channels::types::OutboundAttachment {
+                artifact_id: "blob-1".into(),
+                filename: Some(filename.to_string()),
+                mime_type: None,
+            }],
+            reply_to_provider_id: None,
+            idempotency_key: "reply-1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_is_uploaded_first_and_then_sent_by_its_media_id() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![
+            (200, r#"{"id":"media-77"}"#.to_string()),
+            (200, r#"{"messages":[{"id":"wamid.OUT9"}]}"#.to_string()),
+        ]);
+        let adapter = upload_adapter(&base, b"%PDF-1.7 report");
+
+        let outcome = adapter.send(&message_with_file("report.pdf")).await;
+        assert!(
+            matches!(&outcome, SendOutcome::Sent { provider_message_id } if provider_message_id.as_deref() == Some("wamid.OUT9")),
+            "{outcome:?}"
+        );
+
+        let upload = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("upload request");
+        let upload_text = String::from_utf8_lossy(&upload);
+        assert!(
+            upload_text.starts_with("POST /1234567890/media"),
+            "{upload_text}"
+        );
+        assert!(upload_text.contains("multipart/form-data"), "{upload_text}");
+        assert!(
+            upload_text.contains("name=\"messaging_product\""),
+            "the Cloud API rejects an upload that does not name the product"
+        );
+        assert!(
+            upload_text.contains("filename=\"report.pdf\""),
+            "{upload_text}"
+        );
+        assert!(
+            upload
+                .windows(b"%PDF-1.7 report".len())
+                .any(|w| w == b"%PDF-1.7 report"),
+            "the uploaded bytes are missing from the request"
+        );
+
+        let message = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("message request");
+        let message_text = String::from_utf8_lossy(&message);
+        assert!(
+            message_text.starts_with("POST /1234567890/messages"),
+            "{message_text}"
+        );
+        // The id the upload returned is what the message carries — bytes are
+        // never inlined into a message body on this API.
+        assert!(
+            message_text.contains(r#""id":"media-77""#),
+            "{message_text}"
+        );
+        assert!(
+            message_text.contains(r#""type":"document""#),
+            "{message_text}"
+        );
+        assert!(
+            message_text.contains(r#""filename":"report.pdf""#),
+            "{message_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_upload_never_becomes_a_message() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            400,
+            r#"{"error":{"message":"Unsupported file type","code":100}}"#.to_string(),
+        )]);
+        let adapter = upload_adapter(&base, b"bytes");
+
+        let outcome = adapter.send(&message_with_file("thing.xyz")).await;
+        assert!(
+            matches!(&outcome, SendOutcome::PermanentFailure { error } if error.contains("Unsupported file type")),
+            "{outcome:?}"
+        );
+        requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("upload request");
+        assert!(
+            requests
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a failed upload must not be followed by a message naming a media id that does not exist"
+        );
     }
 
     #[test]
