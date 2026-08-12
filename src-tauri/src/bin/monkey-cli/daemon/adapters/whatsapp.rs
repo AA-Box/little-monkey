@@ -14,8 +14,8 @@
 use async_trait::async_trait;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
-    ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
-    ProviderCapabilities, SendOutcome,
+    ChannelHealth, ChannelKind, ChannelSender, DeliveryReceipt, DeliveryState, InboundTransport,
+    OutboundMessage, ProviderCapabilities, SendOutcome,
 };
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -89,6 +89,44 @@ impl WhatsAppAdapter {
         self.graph_api_base = base.to_string();
         self
     }
+
+    /// One entry of `value.statuses`. An unknown status word is dropped rather
+    /// than guessed at: recording a delivery that may not have happened is
+    /// worse than recording nothing.
+    fn normalize_status(&self, status: &JsonValue, now_ms: i64) -> Option<DeliveryReceipt> {
+        let provider_message_id = status.get("id").and_then(JsonValue::as_str)?;
+        let state = match status.get("status").and_then(JsonValue::as_str)? {
+            "sent" => DeliveryState::Sent,
+            "delivered" => DeliveryState::Delivered,
+            "read" => DeliveryState::Read,
+            "failed" => DeliveryState::Failed,
+            _ => return None,
+        };
+        // Meta nests the reason under `errors[0]`, and its `title` is the part
+        // written for a human. The code goes with it because that is what the
+        // provider's own documentation is indexed by.
+        let error = status
+            .get("errors")
+            .and_then(JsonValue::as_array)
+            .and_then(|errors| errors.first())
+            .map(|first| {
+                let title = first
+                    .get("title")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("Delivery failed");
+                match first.get("code").and_then(JsonValue::as_i64) {
+                    Some(code) => format!("{title} (WhatsApp error {code})"),
+                    None => title.to_string(),
+                }
+            });
+        Some(DeliveryReceipt {
+            account_id: self.account_id.clone(),
+            provider_message_id: provider_message_id.to_string(),
+            state,
+            error,
+            observed_at_ms: now_ms,
+        })
+    }
 }
 
 impl WebhookChannelAdapter for WhatsAppAdapter {
@@ -119,6 +157,35 @@ impl WebhookChannelAdapter for WhatsAppAdapter {
         let payload: JsonValue = serde_json::from_slice(body)
             .map_err(|error| format!("WhatsApp webhook body is not valid JSON: {error}"))?;
         Ok(normalize_payload(&payload, &self.account_id, now_ms))
+    }
+
+    /// Meta reports what happened to a message we sent — `sent`, `delivered`,
+    /// `read` or `failed` — in the same webhook, alongside (or instead of) any
+    /// inbound messages.
+    ///
+    /// A failure carries the reason, and the reasons matter operationally: a
+    /// 24-hour session window that closed, or a recipient who never opted in,
+    /// looks exactly like a successful send until the status arrives.
+    fn delivery_receipts(&self, body: &[u8], now_ms: i64) -> Vec<DeliveryReceipt> {
+        let Ok(payload) = serde_json::from_slice::<JsonValue>(body) else {
+            return Vec::new();
+        };
+        payload
+            .get("entry")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("changes").and_then(JsonValue::as_array))
+            .flatten()
+            .filter_map(|change| {
+                change
+                    .get("value")
+                    .and_then(|value| value.get("statuses"))
+                    .and_then(JsonValue::as_array)
+            })
+            .flatten()
+            .filter_map(|status| self.normalize_status(status, now_ms))
+            .collect()
     }
 
     /// Meta's subscription handshake: it GETs the callback URL with a verify
@@ -665,6 +732,77 @@ mod tests {
             secret,
         })
         .expect("adapter builds")
+    }
+
+    #[test]
+    fn a_failed_status_reports_the_reason_the_message_never_arrived() {
+        let body = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "statuses": [{
+                            "id": "wamid.OUT1",
+                            "status": "failed",
+                            "recipient_id": "15550001111",
+                            "errors": [{
+                                "code": 131047,
+                                "title": "Re-engagement message"
+                            }]
+                        }]
+                    }
+                }]
+            }]
+        })
+        .to_string();
+        let receipts = adapter("s3cret", "tok").delivery_receipts(body.as_bytes(), 1_700_000_000);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].provider_message_id, "wamid.OUT1");
+        assert_eq!(receipts[0].state, DeliveryState::Failed);
+        assert_eq!(
+            receipts[0].error.as_deref(),
+            Some("Re-engagement message (WhatsApp error 131047)")
+        );
+        assert_eq!(receipts[0].observed_at_ms, 1_700_000_000);
+    }
+
+    #[test]
+    fn every_progress_state_is_reported_and_an_unknown_one_is_not() {
+        let body = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "statuses": [
+                            {"id": "m1", "status": "sent"},
+                            {"id": "m2", "status": "delivered"},
+                            {"id": "m3", "status": "read"},
+                            {"id": "m4", "status": "warped"},
+                            {"status": "delivered"}
+                        ]
+                    }
+                }]
+            }]
+        })
+        .to_string();
+        let receipts = adapter("s3cret", "tok").delivery_receipts(body.as_bytes(), 0);
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| (receipt.provider_message_id.as_str(), receipt.state))
+                .collect::<Vec<_>>(),
+            vec![
+                ("m1", DeliveryState::Sent),
+                ("m2", DeliveryState::Delivered),
+                ("m3", DeliveryState::Read),
+            ],
+            "an unrecognized status word and an id-less entry are both dropped"
+        );
+    }
+
+    #[test]
+    fn a_body_carrying_only_messages_reports_no_receipts() {
+        let receipts = adapter("s3cret", "tok").delivery_receipts(&text_message_body(), 0);
+        assert!(receipts.is_empty());
     }
 
     #[test]

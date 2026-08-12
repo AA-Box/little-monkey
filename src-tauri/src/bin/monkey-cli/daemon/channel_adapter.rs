@@ -27,7 +27,8 @@
 use super::channel_store::ChannelAccountRecord;
 use async_trait::async_trait;
 use little_monkey_lib::channels::types::{
-    ChannelEnvelope, ChannelHealth, ChannelKind, OutboundMessage, ProviderCapabilities, SendOutcome,
+    ChannelEnvelope, ChannelHealth, ChannelKind, DeliveryReceipt, OutboundMessage,
+    ProviderCapabilities, SendOutcome,
 };
 
 /// One batch of inbound events plus the cursor to resume from.
@@ -94,6 +95,16 @@ pub trait WebhookChannelAdapter: Send + Sync {
         public_base_url: Option<&str>,
         now_ms: i64,
     ) -> Result<Vec<ChannelEnvelope>, String>;
+
+    /// Delivery progress this same body reports for messages already sent.
+    ///
+    /// Separate from the envelopes because a receipt is not a turn: nobody is
+    /// speaking, so nothing runs. It is only ever called on a body whose
+    /// signature already verified, and the default is empty for providers that
+    /// report nothing.
+    fn delivery_receipts(&self, _body: &[u8], _now_ms: i64) -> Vec<DeliveryReceipt> {
+        Vec::new()
+    }
 
     /// Answer this provider's webhook-registration handshake, if it has one.
     ///
