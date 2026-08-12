@@ -227,13 +227,18 @@ system-memory = "0.1.7"
 # backup/restore. Bundling avoids depending on whatever SQLite version happens
 # to be installed on a user's machine; backup/limits support bounded portable
 # snapshots and hostile-input guardrails.
-rusqlite = { version = "0.40.1", features = ["bundled", "backup", "limits"] }
+rusqlite = { version = "0.37", features = ["bundled", "backup", "limits"] }
 # terminal.rs: one cross-platform pseudoterminal implementation for the
 # in-app terminal. The frontend intentionally stays a thin line-oriented
 # terminal surface; process ownership, output bounds, cancellation, and
 # workspace validation all remain in Rust.
 portable-pty = "0.9.0"
 enigo = "0.6.1"
+matrix-sdk-crypto = "0.18"
+matrix-sdk-sqlite = { version = "0.18", default-features = false, features = ["crypto-store"] }
+ruma = { version = "0.16", features = ["client-api-c", "events"] }
+http = "1"
+matrix-sdk-common = "0.18"
 
 # model_sources.rs: advisory cross-process install locks on macOS/Linux keep
 # desktop and CLI pulls from mutating the same resumable partial download.

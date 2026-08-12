@@ -983,7 +983,7 @@ mod tests {
     fn no_secret_appears_in_any_rendered_error_string() {
         let adapter = adapter("super-secret-app-value", "super-secret-token-value");
         let body = text_message_body();
-        let bad_signature = "sha256=".to_string() + &"00".repeat(32);
+        let bad_signature = format!("sha256={}", "00".repeat(32));
         let error = adapter
             .verify_and_normalize(
                 &[("x-hub-signature-256".to_string(), bad_signature)],

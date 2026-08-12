@@ -14,6 +14,7 @@ pub(crate) mod irc;
 pub(crate) mod jwt;
 pub(crate) mod line;
 pub(crate) mod matrix;
+pub(crate) mod matrix_crypto;
 pub(crate) mod mattermost;
 pub(crate) mod signal;
 pub(crate) mod slack;
