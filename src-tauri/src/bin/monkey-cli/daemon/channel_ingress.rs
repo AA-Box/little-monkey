@@ -395,10 +395,11 @@ pub(crate) fn run_params_for(target: &RouteTarget, ingress: &ConversationIngress
 /// operator, and wrapping their words as untrusted data would tell the model to
 /// ignore its own owner.
 pub(super) fn message_param(ingress: &ConversationIngress, source: &str) -> String {
+    let body = ingress.body_for_model();
     if ingress.needs_untrusted_wrapping() {
-        crate::agent::wrap_untrusted_content(source, ingress.text.as_untrusted_str())
+        crate::agent::wrap_untrusted_content(source, &body)
     } else {
-        ingress.text.as_untrusted_str().to_string()
+        body
     }
 }
 
