@@ -146,7 +146,15 @@ pub(crate) async fn poll_account_once(
     now_ms: i64,
 ) -> Result<InboundReport, String> {
     let cursor = store.channel_cursor(account_id, POLL_CURSOR_KEY)?;
-    let batch = adapter.poll(cursor.as_deref()).await?;
+    let mut batch = adapter.poll(cursor.as_deref()).await?;
+    // Files are fetched before the turn becomes durable, so the stored event is
+    // the turn as the agent will see it rather than a promise to look later.
+    super::channel_adapter::hydrate_attachments(
+        adapter,
+        &super::channel_adapter::DaemonBlobs,
+        &mut batch.envelopes,
+    )
+    .await;
     let report = ingest_batch(store, queue, &batch.envelopes, now_ms);
     if let Some(next) = batch.cursor {
         store.set_channel_cursor(account_id, POLL_CURSOR_KEY, &next, now_ms)?;
@@ -302,7 +310,7 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
             if now_u64 >= next_reload_ms {
                 next_reload_ms = now_u64.saturating_add(RELOAD_INTERVAL_MS);
                 match DaemonStore::open(&paths) {
-                    Ok(store) => adapters = load_adapters(&store),
+                    Ok(store) => adapters = load_adapters(&paths, &store),
                     Err(error) => eprintln!("monkey daemon: channels paused: {error}"),
                 }
             }
@@ -350,7 +358,10 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
 
 /// Build an adapter for every enabled account, resolving each credential from
 /// the keychain at load time so no adapter ever reads it itself.
-fn load_adapters(store: &DaemonStore) -> BTreeMap<String, Arc<dyn ChannelAdapter>> {
+fn load_adapters(
+    paths: &super::store::DaemonPaths,
+    store: &DaemonStore,
+) -> BTreeMap<String, Arc<dyn ChannelAdapter>> {
     use super::channel_adapter::{AdapterConfig, ChannelSecrets, KeyringChannelSecrets};
 
     let secrets = KeyringChannelSecrets;
@@ -366,7 +377,7 @@ fn load_adapters(store: &DaemonStore) -> BTreeMap<String, Arc<dyn ChannelAdapter
         // An SMS account's carrier credential lives on the telephony account of
         // the same id, not on this row, so it is built from there.
         if account.kind == little_monkey_lib::channels::types::ChannelKind::Sms {
-            match build_sms_adapter(store, &secrets, &account.account_id) {
+            match build_sms_adapter(paths, store, &secrets, &account.account_id) {
                 Ok(adapter) => {
                     adapters.insert(account.account_id.clone(), adapter);
                 }
@@ -414,6 +425,7 @@ fn load_adapters(store: &DaemonStore) -> BTreeMap<String, Arc<dyn ChannelAdapter
 /// `telecom_worker::ensure_sms_channel_account`), and the carrier credential
 /// only ever sits on the telephony row.
 fn build_sms_adapter(
+    paths: &super::store::DaemonPaths,
     store: &DaemonStore,
     secrets: &dyn super::channel_adapter::ChannelSecrets,
     account_id: &str,
@@ -425,8 +437,15 @@ fn build_sms_adapter(
         Some(reference) => secrets.get(reference)?,
         None => String::new(),
     };
+    // The app data directory is the daemon root's parent, the same derivation
+    // the remote API uses to find the shared blob store.
+    let app_data = paths
+        .root
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| "the daemon root has no app-data parent".to_string())?;
     Ok(Arc::new(super::adapters::sms::SmsAdapter::new(
-        &telecom, secret,
+        &telecom, secret, app_data,
     )?))
 }
 

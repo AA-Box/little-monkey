@@ -1,5 +1,8 @@
 pub(crate) mod adapters;
 mod admission;
+mod call_audio;
+pub(crate) mod call_media;
+pub(crate) mod call_socket;
 pub(crate) mod channel_adapter;
 pub(crate) mod channel_ingress;
 pub(crate) mod channel_store;

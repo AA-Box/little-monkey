@@ -211,24 +211,20 @@ pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> R
                 fix: *fix,
                 runtime,
             })?;
+            // Telephony findings are appended here rather than produced inside
+            // the doctor: the doctor runs in the library, and the numbers live
+            // in the daemon's own store, which only this process has open.
+            append_findings(
+                &mut report,
+                crate::telecom_audit::telecom_findings(now_ms_for_audit()),
+            );
             // Peer state lives in the two databases the daemon owns, which the
-            // library cannot open. Appended here rather than duplicated there,
-            // so there is still one report.
+            // library cannot open either.
             if let Ok(paths) = crate::daemon::store::DaemonPaths::resolve() {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
-                    .unwrap_or(0);
-                for finding in crate::daemon::peer_audit::audit_peers(&paths, now) {
-                    match finding.status {
-                        FindingStatus::Pass => report.summary.passed += 1,
-                        FindingStatus::Info => report.summary.informational += 1,
-                        FindingStatus::Warning => report.summary.warnings += 1,
-                        FindingStatus::Critical => report.summary.critical += 1,
-                        FindingStatus::Fixed => report.summary.fixed += 1,
-                    }
-                    report.findings.push(finding);
-                }
+                append_findings(
+                    &mut report,
+                    crate::daemon::peer_audit::audit_peers(&paths, now_ms_for_audit()),
+                );
             }
             if *json {
                 println!(
@@ -979,4 +975,34 @@ mod tests {
         ));
         print_chain_verdict("run-legacy", &intact_but_uncovered);
     }
+}
+
+/// Fold extra findings into a finished report, keeping its summary honest.
+///
+/// The summary is what an operator reads first, so a finding that is not
+/// counted may as well not exist.
+fn append_findings(
+    report: &mut little_monkey_lib::security_doctor::SecurityAuditReport,
+    findings: Vec<little_monkey_lib::security_doctor::SecurityFinding>,
+) {
+    for finding in findings {
+        match finding.status {
+            FindingStatus::Pass => report.summary.passed += 1,
+            FindingStatus::Info => report.summary.informational += 1,
+            FindingStatus::Warning => report.summary.warnings += 1,
+            FindingStatus::Critical => report.summary.critical += 1,
+            FindingStatus::Fixed => report.summary.fixed += 1,
+        }
+        report.findings.push(finding);
+    }
+}
+
+fn now_ms_for_audit() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or_default(),
+    )
+    .unwrap_or(i64::MAX)
 }

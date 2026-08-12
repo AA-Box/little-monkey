@@ -37,6 +37,8 @@ mod skills_cli;
 mod sse;
 mod stacks_cli;
 mod task;
+mod telecom_audit;
+mod telecom_cli;
 mod tools_cli;
 mod tools_def;
 mod verify_cli;
@@ -397,6 +399,12 @@ enum Cmd {
     Peers {
         #[command(subcommand)]
         action: peers_cli::PeersCmd,
+    },
+    /// Configure the operator's own carrier accounts — the numbers Little
+    /// Monkey texts and calls from, what each may do, and what a call may cost.
+    Telecom {
+        #[command(subcommand)]
+        action: telecom_cli::TelecomCmd,
     },
     /// Show what recent configuration changes touched, across personas,
     /// rules/memory files, MCP servers and workflow definitions — the
@@ -1464,6 +1472,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
         Cmd::Channels { action } => channels_cli::dispatch(action).await,
         Cmd::Ingress { action } => ingress_cli::dispatch(action),
         Cmd::Peers { action } => peers_cli::dispatch(action).await,
+        Cmd::Telecom { action } => telecom_cli::dispatch(action).await,
         Cmd::Revisions { change, limit } => revisions_cli::list(change.as_deref(), *limit),
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
             Ok(count) => {
