@@ -57,6 +57,9 @@ pub struct WhatsAppAdapter {
     /// swappable in tests so `send`/`probe` can be exercised against a
     /// loopback fixture instead of the real network.
     graph_api_base: String,
+    /// Where an outbound attachment's bytes come from. The daemon's content
+    /// store in production, a fixture in tests.
+    blobs: std::sync::Arc<dyn crate::daemon::channel_adapter::BlobSource>,
 }
 
 impl WhatsAppAdapter {
@@ -81,12 +84,22 @@ impl WhatsAppAdapter {
             access_token: secrets.access_token,
             verify_token: secrets.verify_token,
             graph_api_base: GRAPH_API_BASE.to_string(),
+            blobs: std::sync::Arc::new(crate::daemon::channel_adapter::DaemonBlobs),
         })
     }
 
     #[cfg(test)]
     fn with_base_url(mut self, base: &str) -> Self {
         self.graph_api_base = base.to_string();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_blobs(
+        mut self,
+        blobs: std::sync::Arc<dyn crate::daemon::channel_adapter::BlobSource>,
+    ) -> Self {
+        self.blobs = blobs;
         self
     }
 
@@ -268,6 +281,39 @@ impl ChannelAdapter for WhatsAppAdapter {
         Ok(InboundBatch::default())
     }
 
+    /// Meta hands out a media id, not a URL. The id is exchanged for a
+    /// short-lived download URL on the Graph API, and that URL still needs the
+    /// same bearer token — an unauthenticated GET of it returns nothing.
+    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("That WhatsApp attachment carries no media id".to_string());
+        };
+        let client = little_monkey_lib::egress::hardened()
+            .build()
+            .map_err(|error| format!("Failed to build client: {error}"))?;
+        let request = client
+            .get(format!("{}/{handle}", self.graph_api_base))
+            .bearer_auth(&self.access_token);
+        let response = little_monkey_lib::egress::send(request)
+            .await
+            .map_err(|_| "WhatsApp did not answer the media lookup".to_string())?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "WhatsApp returned {} for the media lookup",
+                response.status()
+            ));
+        }
+        let body: JsonValue = response
+            .json()
+            .await
+            .map_err(|_| "WhatsApp's media lookup was not JSON".to_string())?;
+        let url = body
+            .get("url")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "WhatsApp named no download URL for that media id".to_string())?;
+        crate::daemon::channel_adapter::fetch_url(url, Some(&self.access_token)).await
+    }
+
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
         let client = match little_monkey_lib::egress::hardened().build() {
             Ok(client) => client,
@@ -277,13 +323,135 @@ impl ChannelAdapter for WhatsAppAdapter {
                 }
             }
         };
+
+        // Text first, then one message per file. The Cloud API has no way to
+        // put several files in one message, and a caption is limited to 1024
+        // characters — far below what a reply may contain — so the text is not
+        // folded into the first attachment.
+        let mut last = SendOutcome::Sent {
+            provider_message_id: None,
+        };
+        if !message.text.trim().is_empty() {
+            last = self
+                .post_message(
+                    &client,
+                    serde_json::json!({
+                        "messaging_product": "whatsapp",
+                        "to": message.conversation_id,
+                        "type": "text",
+                        "text": { "body": message.text },
+                    }),
+                )
+                .await;
+            if !matches!(last, SendOutcome::Sent { .. }) {
+                return last;
+            }
+        }
+        for attachment in &message.attachments {
+            let media_id = match self.upload_media(&client, attachment).await {
+                Ok(id) => id,
+                Err(outcome) => return outcome,
+            };
+            let media_type =
+                media_type_for(crate::daemon::channel_adapter::attachment_mime(attachment));
+            let mut media = serde_json::json!({ "id": media_id });
+            if media_type == "document" {
+                if let Some(filename) = attachment.filename.clone() {
+                    media["filename"] = JsonValue::from(filename);
+                }
+            }
+            last = self
+                .post_message(
+                    &client,
+                    serde_json::json!({
+                        "messaging_product": "whatsapp",
+                        "to": message.conversation_id,
+                        "type": media_type,
+                        media_type: media,
+                    }),
+                )
+                .await;
+            if !matches!(last, SendOutcome::Sent { .. }) {
+                return last;
+            }
+        }
+        last
+    }
+}
+
+impl WhatsAppAdapter {
+    /// Upload one file and return the media id the Cloud API assigns it.
+    ///
+    /// Meta will not accept bytes inline in a message: a file is uploaded
+    /// first, and the id it returns is what a message carries. The id expires
+    /// (30 days at the time of writing), which is fine — it is used within the
+    /// same send.
+    async fn upload_media(
+        &self,
+        client: &reqwest::Client,
+        attachment: &little_monkey_lib::channels::types::OutboundAttachment,
+    ) -> Result<String, SendOutcome> {
+        let bytes = self
+            .blobs
+            .read(&attachment.artifact_id)
+            .map_err(|error| SendOutcome::PermanentFailure { error })?;
+        let mime = crate::daemon::channel_adapter::attachment_mime(attachment).to_string();
+        let filename = attachment
+            .filename
+            .clone()
+            .unwrap_or_else(|| "attachment".to_string());
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename)
+            .mime_str(&mime)
+            .map_err(|_| SendOutcome::PermanentFailure {
+                error: format!("'{mime}' is not a MIME type WhatsApp can be given"),
+            })?;
+        let form = reqwest::multipart::Form::new()
+            .text("messaging_product", "whatsapp")
+            .part("file", part);
+        let url = format!("{}/{}/media", self.graph_api_base, self.phone_number_id);
+        let request = client
+            .post(url)
+            .bearer_auth(&self.access_token)
+            .multipart(form);
+        let response = match little_monkey_lib::egress::send(request).await {
+            Ok(response) => response,
+            Err(error) => return Err(map_transport_error(&error)),
+        };
+        let status = response.status();
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => return Err(map_transport_error(&error)),
+        };
+        let parsed: JsonValue = serde_json::from_slice(&bytes).unwrap_or(JsonValue::Null);
+        if !status.is_success() {
+            let error = parsed
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("WhatsApp rejected the upload")
+                .to_string();
+            return Err(if status.is_server_error() || status.as_u16() == 429 {
+                SendOutcome::RetryableFailure {
+                    error,
+                    retry_after_ms: None,
+                }
+            } else {
+                SendOutcome::PermanentFailure { error }
+            });
+        }
+        parsed
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| SendOutcome::NeedsReconciliation {
+                error: "WhatsApp accepted the upload but named no media id".to_string(),
+            })
+    }
+
+    /// POST one already-built message body to the Cloud API.
+    async fn post_message(&self, client: &reqwest::Client, body: JsonValue) -> SendOutcome {
         let url = format!("{}/{}/messages", self.graph_api_base, self.phone_number_id);
-        let body = serde_json::json!({
-            "messaging_product": "whatsapp",
-            "to": message.conversation_id,
-            "type": "text",
-            "text": { "body": message.text },
-        });
         let request = client.post(url).bearer_auth(&self.access_token).json(&body);
         let response = match little_monkey_lib::egress::send(request).await {
             Ok(response) => response,
@@ -354,6 +522,23 @@ impl ChannelAdapter for WhatsAppAdapter {
         SendOutcome::PermanentFailure {
             error: error_message,
         }
+    }
+}
+
+/// Which Cloud API message type carries this MIME type.
+///
+/// SVG is a document rather than an image: WhatsApp's image types are JPEG and
+/// PNG only, and offering it as an image is a rejected send instead of a file
+/// that arrives.
+fn media_type_for(mime: &str) -> &'static str {
+    if mime == "image/jpeg" || mime == "image/png" {
+        "image"
+    } else if mime.starts_with("audio/") {
+        "audio"
+    } else if mime.starts_with("video/") {
+        "video"
+    } else {
+        "document"
     }
 }
 
@@ -507,6 +692,9 @@ fn normalize_message(
                 .map(str::to_string);
             if let Some(handle) = provider_id.clone() {
                 attachments.push(ChannelAttachment {
+                    stored_artifact_id: None,
+                    text_excerpt: None,
+                    fetch_error: None,
                     provider_id,
                     kind,
                     filename,
@@ -732,6 +920,139 @@ mod tests {
             secret,
         })
         .expect("adapter builds")
+    }
+
+    fn upload_adapter(base: &str, bytes: &[u8]) -> WhatsAppAdapter {
+        let account = test_account(serde_json::json!({ "phone_number_id": "1234567890" }));
+        let secret = serde_json::json!({
+            "app_secret": "s3cret",
+            "access_token": "tok",
+        })
+        .to_string();
+        WhatsAppAdapter::new(&AdapterConfig {
+            account: &account,
+            secret,
+        })
+        .expect("adapter builds")
+        .with_base_url(base)
+        .with_blobs(std::sync::Arc::new(
+            crate::daemon::channel_adapter::test_http::FixtureBlobs(bytes.to_vec()),
+        ))
+    }
+
+    fn message_with_file(filename: &str) -> OutboundMessage {
+        OutboundMessage {
+            account_id: "acct-wa".into(),
+            kind: ChannelKind::WhatsApp,
+            conversation_id: "15550001111".into(),
+            thread_id: None,
+            text: String::new(),
+            attachments: vec![little_monkey_lib::channels::types::OutboundAttachment {
+                artifact_id: "blob-1".into(),
+                filename: Some(filename.to_string()),
+                mime_type: None,
+            }],
+            reply_to_provider_id: None,
+            idempotency_key: "reply-1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_is_uploaded_first_and_then_sent_by_its_media_id() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![
+            (200, r#"{"id":"media-77"}"#.to_string()),
+            (200, r#"{"messages":[{"id":"wamid.OUT9"}]}"#.to_string()),
+        ]);
+        let adapter = upload_adapter(&base, b"%PDF-1.7 report");
+
+        let outcome = adapter.send(&message_with_file("report.pdf")).await;
+        assert!(
+            matches!(&outcome, SendOutcome::Sent { provider_message_id } if provider_message_id.as_deref() == Some("wamid.OUT9")),
+            "{outcome:?}"
+        );
+
+        let upload = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("upload request");
+        let upload_text = String::from_utf8_lossy(&upload);
+        assert!(
+            upload_text.starts_with("POST /1234567890/media"),
+            "{upload_text}"
+        );
+        assert!(upload_text.contains("multipart/form-data"), "{upload_text}");
+        assert!(
+            upload_text.contains("name=\"messaging_product\""),
+            "the Cloud API rejects an upload that does not name the product"
+        );
+        assert!(
+            upload_text.contains("filename=\"report.pdf\""),
+            "{upload_text}"
+        );
+        assert!(
+            upload
+                .windows(b"%PDF-1.7 report".len())
+                .any(|w| w == b"%PDF-1.7 report"),
+            "the uploaded bytes are missing from the request"
+        );
+
+        let message = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("message request");
+        let message_text = String::from_utf8_lossy(&message);
+        assert!(
+            message_text.starts_with("POST /1234567890/messages"),
+            "{message_text}"
+        );
+        // The id the upload returned is what the message carries — bytes are
+        // never inlined into a message body on this API.
+        assert!(
+            message_text.contains(r#""id":"media-77""#),
+            "{message_text}"
+        );
+        assert!(
+            message_text.contains(r#""type":"document""#),
+            "{message_text}"
+        );
+        assert!(
+            message_text.contains(r#""filename":"report.pdf""#),
+            "{message_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_upload_never_becomes_a_message() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            400,
+            r#"{"error":{"message":"Unsupported file type","code":100}}"#.to_string(),
+        )]);
+        let adapter = upload_adapter(&base, b"bytes");
+
+        let outcome = adapter.send(&message_with_file("thing.xyz")).await;
+        assert!(
+            matches!(&outcome, SendOutcome::PermanentFailure { error } if error.contains("Unsupported file type")),
+            "{outcome:?}"
+        );
+        requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("upload request");
+        assert!(
+            requests
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a failed upload must not be followed by a message naming a media id that does not exist"
+        );
+    }
+
+    #[test]
+    fn only_the_two_image_types_whatsapp_accepts_are_sent_as_images() {
+        assert_eq!(media_type_for("image/png"), "image");
+        assert_eq!(media_type_for("image/jpeg"), "image");
+        // Accepted by the API as a file, rejected as an image.
+        assert_eq!(media_type_for("image/svg+xml"), "document");
+        assert_eq!(media_type_for("image/webp"), "document");
+        assert_eq!(media_type_for("audio/mpeg"), "audio");
+        assert_eq!(media_type_for("video/mp4"), "video");
+        assert_eq!(media_type_for("application/pdf"), "document");
     }
 
     #[test]

@@ -203,12 +203,12 @@ async fn handle_channel_delivery(
         Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "clock_error"),
     };
 
-    let (mut store, adapter) = match open_webhook_adapter(&paths, &account_id) {
+    let (mut store, adapter, fetcher) = match open_webhook_adapter(&paths, &account_id) {
         Ok(pair) => pair,
         Err(refusal) => return *refusal,
     };
 
-    let envelopes = match adapter.verify_and_normalize(&headers, &body, None, now_ms) {
+    let mut envelopes = match adapter.verify_and_normalize(&headers, &body, None, now_ms) {
         Ok(envelopes) => envelopes,
         // Deliberately opaque, and deliberately not recorded: an unverified
         // body has not earned a row in the durable event log.
@@ -219,6 +219,19 @@ async fn handle_channel_delivery(
     // delivery that carries nothing else — a status-only body is the normal
     // shape of a failure report.
     let receipts = record_delivery_receipts(&mut store, adapter.delivery_receipts(&body, now_ms));
+
+    if !envelopes.is_empty() {
+        // Same as the polled path: the bytes are fetched before the turn is
+        // durable, so what is stored is what the agent will be shown.
+        if let Some(fetcher) = fetcher.as_deref() {
+            super::channel_adapter::hydrate_attachments(
+                fetcher,
+                &super::channel_adapter::DaemonBlobs,
+                &mut envelopes,
+            )
+            .await;
+        }
+    }
 
     if envelopes.is_empty() {
         return response(
@@ -239,6 +252,10 @@ async fn handle_channel_delivery(
 type OpenedWebhookAccount = (
     DaemonStore,
     Box<dyn super::channel_adapter::WebhookChannelAdapter>,
+    // The same provider as a polling adapter, when it is also one. Only used
+    // to download attachments — the two halves are the same struct for every
+    // provider that is delivered to.
+    Option<std::sync::Arc<dyn super::channel_adapter::ChannelAdapter>>,
 );
 
 /// Open the store and build one account's webhook adapter, or the response
@@ -278,7 +295,8 @@ fn open_webhook_adapter(
     };
     let adapter = super::adapters::build_webhook_adapter(&config)
         .map_err(|_| refuse(StatusCode::NOT_FOUND, "not_found"))?;
-    Ok((store, adapter))
+    let fetcher = super::adapters::build_adapter(&config).ok();
+    Ok((store, adapter, fetcher))
 }
 
 /// Record what a provider says happened to messages we already sent.
@@ -351,7 +369,7 @@ fn handle_channel_verification(
     account_id: String,
     query: &str,
 ) -> Response<Full<Bytes>> {
-    let (_store, adapter) = match open_webhook_adapter(&paths, &account_id) {
+    let (_store, adapter, _fetcher) = match open_webhook_adapter(&paths, &account_id) {
         Ok(pair) => pair,
         Err(refusal) => return *refusal,
     };

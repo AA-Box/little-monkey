@@ -315,6 +315,28 @@ pub struct ChannelAttachment {
     /// How the bytes are obtained. Either an https URL or a provider handle the
     /// adapter knows how to resolve.
     pub source: AttachmentSource,
+    /// Content-store id once the bytes have actually been fetched.
+    ///
+    /// Absent until ingest downloads them, and absent forever if the download
+    /// was refused or failed — which is why it is an `Option` rather than a
+    /// flag: an id that exists is a promise the bytes are on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_artifact_id: Option<String>,
+    /// Why the bytes are not here, when they are not.
+    ///
+    /// Recorded rather than swallowed: an attachment that was too large or
+    /// whose download failed is something the person who sent it should be
+    /// told about, not something to silently ignore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_error: Option<String>,
+    /// The beginning of the file's own text, when it is text at all.
+    ///
+    /// Filled at ingest for attachments that decode as UTF-8, which is what
+    /// lets an agent answer a question about a log or a CSV somebody sent
+    /// instead of being told a file exists. Bounded, and untrusted exactly like
+    /// the message body — a file's contents are the sender's words too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_excerpt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

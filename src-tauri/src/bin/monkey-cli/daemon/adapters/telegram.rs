@@ -47,6 +47,12 @@ pub struct TelegramAdapter {
     /// `false` and let the ingress gate handle it.
     self_id: Mutex<Option<i64>>,
     self_username: Mutex<Option<String>>,
+    /// The Bot API origin. Always [`API_BASE`] in production; swappable in
+    /// tests so an upload can be exercised against a loopback fixture.
+    api_base: String,
+    /// Where an outbound attachment's bytes come from. The daemon's content
+    /// store in production, a fixture in tests.
+    blobs: std::sync::Arc<dyn crate::daemon::channel_adapter::BlobSource>,
 }
 
 impl TelegramAdapter {
@@ -58,13 +64,30 @@ impl TelegramAdapter {
             token: config.secret.clone(),
             self_id: Mutex::new(None),
             self_username: Mutex::new(None),
+            api_base: API_BASE.to_string(),
+            blobs: std::sync::Arc::new(crate::daemon::channel_adapter::DaemonBlobs),
         })
+    }
+
+    #[cfg(test)]
+    fn with_base_url(mut self, base: &str) -> Self {
+        self.api_base = base.to_string();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_blobs(
+        mut self,
+        blobs: std::sync::Arc<dyn crate::daemon::channel_adapter::BlobSource>,
+    ) -> Self {
+        self.blobs = blobs;
+        self
     }
 
     /// `https://api.telegram.org/bot<token>/<method>`. Never logged and never
     /// handed to a diagnostic unredacted — see [`Self::redact`].
     fn method_url(&self, method: &str) -> String {
-        format!("{API_BASE}/bot{}/{method}", self.token)
+        format!("{}/bot{}/{method}", self.api_base, self.token)
     }
 
     /// Scrubs the bot token out of any string before it becomes a
@@ -86,6 +109,110 @@ impl TelegramAdapter {
         little_monkey_lib::egress::hardened()
             .build()
             .map_err(|error| self.redact(error.to_string()))
+    }
+
+    /// Upload one file with `sendPhoto` or `sendDocument`.
+    ///
+    /// A picture is sent as a photo so it renders inline in the chat, and
+    /// everything else as a document so Telegram does not re-encode it. The
+    /// bytes come from the content store, where the reply tool copied them when
+    /// the agent asked — a retry minutes later sends what was meant then, not
+    /// whatever now occupies that path.
+    ///
+    /// `Err` carries the outcome the outbox should record, which is the same
+    /// distinction the text path makes: a failed handshake provably never left
+    /// this machine, anything later is unknown and must be reconciled rather
+    /// than retried into a duplicate upload.
+    async fn send_one_attachment(
+        &self,
+        client: &reqwest::Client,
+        message: &OutboundMessage,
+        attachment: &little_monkey_lib::channels::types::OutboundAttachment,
+    ) -> Result<Option<String>, SendOutcome> {
+        let bytes = self
+            .blobs
+            .read(&attachment.artifact_id)
+            .map_err(|error| SendOutcome::PermanentFailure { error })?;
+        let mime = crate::daemon::channel_adapter::attachment_mime(attachment).to_string();
+        let filename = attachment
+            .filename
+            .clone()
+            .unwrap_or_else(|| "attachment".to_string());
+        let (method, field) = upload_method(&mime);
+
+        let part = match reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename)
+            .mime_str(&mime)
+        {
+            Ok(part) => part,
+            Err(_) => reqwest::multipart::Part::bytes(Vec::new()),
+        };
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", message.conversation_id.clone())
+            .part(field.to_string(), part);
+        if let Some(thread_id) = message.thread_id.clone() {
+            form = form.text("message_thread_id", thread_id);
+        }
+        if let Some(reply_to) = message.reply_to_provider_id.clone() {
+            form = form.text("reply_to_message_id", reply_to);
+        }
+
+        let request = client.post(self.method_url(method)).multipart(form);
+        let response = match little_monkey_lib::egress::send(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(if error.is_connect() {
+                    SendOutcome::RetryableFailure {
+                        error: self.redact(format!("Could not connect to Telegram: {error}")),
+                        retry_after_ms: None,
+                    }
+                } else {
+                    SendOutcome::NeedsReconciliation {
+                        error: self.redact(format!("Telegram upload outcome unknown: {error}")),
+                    }
+                });
+            }
+        };
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        if status.as_u16() == 429 {
+            let retry_after_ms = serde_json::from_str::<TelegramErrorResponse>(&body_text)
+                .ok()
+                .and_then(|error| error.parameters)
+                .and_then(|parameters| parameters.retry_after)
+                .map(|seconds| seconds * 1000);
+            return Err(SendOutcome::RetryableFailure {
+                error: "Telegram rate-limited the upload (429)".to_string(),
+                retry_after_ms,
+            });
+        }
+        if !status.is_success() {
+            return Err(SendOutcome::PermanentFailure {
+                error: self.redact(format!("Telegram returned {status} for {method}")),
+            });
+        }
+        match serde_json::from_str::<TelegramApiResponse<TelegramMessage>>(&body_text) {
+            Ok(parsed) if parsed.ok => {
+                Ok(parsed.result.map(|message| message.message_id.to_string()))
+            }
+            _ => Err(SendOutcome::NeedsReconciliation {
+                error: format!("Telegram accepted {method} but returned an unparseable response"),
+            }),
+        }
+    }
+}
+
+/// The API method and form field one MIME type should be uploaded through.
+///
+/// A picture goes as a photo so it renders inline in the chat. Everything else
+/// goes as a document, which is also the right answer for SVG: Telegram's photo
+/// path re-encodes what it is given, and an SVG that survives as a file is more
+/// useful than one that arrives as a raster.
+fn upload_method(mime: &str) -> (&'static str, &'static str) {
+    if mime.starts_with("image/") && mime != "image/svg+xml" {
+        ("sendPhoto", "photo")
+    } else {
+        ("sendDocument", "document")
     }
 }
 
@@ -213,9 +340,65 @@ impl ChannelAdapter for TelegramAdapter {
         })
     }
 
+    /// Telegram hands out a `file_id`, not a URL: it is resolved with
+    /// `getFile`, which answers with a short-lived path under the bot's own
+    /// file endpoint. Both calls carry the token, which is why this cannot be
+    /// the generic URL download.
+    async fn fetch_attachment(
+        &self,
+        attachment: &little_monkey_lib::channels::types::ChannelAttachment,
+    ) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return crate::daemon::channel_adapter::fetch_url(
+                match &attachment.source {
+                    AttachmentSource::Url { url } => url,
+                    AttachmentSource::ProviderHandle { .. } => unreachable!(),
+                },
+                None,
+            )
+            .await;
+        };
+        let client = self.client()?;
+        let request = client
+            .get(self.method_url("getFile"))
+            .query(&[("file_id", handle.as_str())]);
+        let response = little_monkey_lib::egress::send(request)
+            .await
+            .map_err(|error| self.redact(format!("Telegram getFile failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Telegram returned {} for getFile",
+                response.status()
+            ));
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|error| self.redact(error.to_string()))?;
+        let file_path = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("result")?
+                    .get("file_path")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| "Telegram named no path for that file".to_string())?;
+        crate::daemon::channel_adapter::fetch_url(
+            &format!("{}/file/bot{}/{file_path}", self.api_base, self.token),
+            None,
+        )
+        .await
+        .map_err(|error| self.redact(error))
+    }
+
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
         let mut chunks = split_utf16_chunks(&message.text, MAX_MESSAGE_UTF16);
-        if chunks.is_empty() {
+        // A reply that is only a file sends only the file. Pushing an empty
+        // chunk here would post a blank message first, which Telegram rejects
+        // and which nobody asked for.
+        if chunks.is_empty() && message.attachments.is_empty() {
             chunks.push(String::new());
         }
         let client = match self.client() {
@@ -291,6 +474,12 @@ impl ChannelAdapter for TelegramAdapter {
                             .to_string(),
                     };
                 }
+            }
+        }
+        for attachment in &message.attachments {
+            match self.send_one_attachment(&client, message, attachment).await {
+                Ok(message_id) => last_message_id = message_id.or(last_message_id),
+                Err(outcome) => return outcome,
             }
         }
         SendOutcome::Sent {
@@ -369,6 +558,9 @@ fn normalize_update(
     if let Some(sizes) = &message.photo {
         if let Some(largest) = sizes.iter().max_by_key(|size| size.width * size.height) {
             attachments.push(ChannelAttachment {
+                stored_artifact_id: None,
+                text_excerpt: None,
+                fetch_error: None,
                 provider_id: Some(largest.file_id.clone()),
                 kind: AttachmentKind::Image,
                 filename: None,
@@ -382,6 +574,9 @@ fn normalize_update(
     }
     if let Some(document) = &message.document {
         attachments.push(ChannelAttachment {
+            stored_artifact_id: None,
+            text_excerpt: None,
+            fetch_error: None,
             provider_id: Some(document.file_id.clone()),
             kind: AttachmentKind::Document,
             filename: document.file_name.clone(),
@@ -394,6 +589,9 @@ fn normalize_update(
     }
     if let Some(voice) = &message.voice {
         attachments.push(ChannelAttachment {
+            stored_artifact_id: None,
+            text_excerpt: None,
+            fetch_error: None,
             provider_id: Some(voice.file_id.clone()),
             kind: AttachmentKind::Audio,
             filename: None,
@@ -406,6 +604,9 @@ fn normalize_update(
     }
     if let Some(audio) = &message.audio {
         attachments.push(ChannelAttachment {
+            stored_artifact_id: None,
+            text_excerpt: None,
+            fetch_error: None,
             provider_id: Some(audio.file_id.clone()),
             kind: AttachmentKind::Audio,
             filename: audio.file_name.clone(),
@@ -418,6 +619,9 @@ fn normalize_update(
     }
     if let Some(video) = &message.video {
         attachments.push(ChannelAttachment {
+            stored_artifact_id: None,
+            text_excerpt: None,
+            fetch_error: None,
             provider_id: Some(video.file_id.clone()),
             kind: AttachmentKind::Video,
             filename: None,
@@ -662,6 +866,298 @@ struct TelegramUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An adapter pointed at a loopback fixture, holding one file.
+    fn upload_adapter(base: &str, bytes: &[u8]) -> TelegramAdapter {
+        let account = crate::daemon::channel_store::ChannelAccountRecord {
+            account_id: "acct-tg".into(),
+            kind: ChannelKind::Telegram,
+            label: "Test".into(),
+            enabled: true,
+            non_secret_config: serde_json::json!({}),
+            credential_ref: Some("tg".into()),
+            access_policy: little_monkey_lib::channels::policy::ChannelAccessPolicy::default(),
+            health: ChannelHealth {
+                state: little_monkey_lib::channels::types::HealthState::Unconfigured,
+                detail: None,
+                last_error: None,
+                probed_at_ms: 0,
+            },
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        };
+        TelegramAdapter::new(&AdapterConfig {
+            account: &account,
+            secret: "bot-token".into(),
+        })
+        .expect("adapter")
+        .with_base_url(base)
+        .with_blobs(std::sync::Arc::new(
+            crate::daemon::channel_adapter::test_http::FixtureBlobs(bytes.to_vec()),
+        ))
+    }
+
+    fn message_with_file(filename: &str) -> OutboundMessage {
+        OutboundMessage {
+            account_id: "acct-tg".into(),
+            kind: ChannelKind::Telegram,
+            conversation_id: "chat-7".into(),
+            thread_id: None,
+            text: String::new(),
+            attachments: vec![little_monkey_lib::channels::types::OutboundAttachment {
+                artifact_id: "blob-1".into(),
+                filename: Some(filename.to_string()),
+                mime_type: None,
+            }],
+            reply_to_provider_id: Some("42".into()),
+            idempotency_key: "reply-1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_png_is_uploaded_to_sendphoto_with_the_bytes_in_the_body() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            200,
+            r#"{"ok":true,"result":{"message_id":99,"chat":{"id":7,"type":"private"}}}"#
+                .to_string(),
+        )]);
+        let adapter = upload_adapter(&base, b"\x89PNG-not-really");
+
+        let outcome = adapter.send(&message_with_file("shot.png")).await;
+        assert!(
+            matches!(&outcome, SendOutcome::Sent { provider_message_id } if provider_message_id.as_deref() == Some("99")),
+            "{outcome:?}"
+        );
+
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request");
+        let text = String::from_utf8_lossy(&request);
+        assert!(text.starts_with("POST /botbot-token/sendPhoto"), "{text}");
+        assert!(text.contains("multipart/form-data"), "{text}");
+        assert!(text.contains("name=\"photo\""), "{text}");
+        assert!(text.contains("filename=\"shot.png\""), "{text}");
+        assert!(text.contains("name=\"chat_id\""), "{text}");
+        assert!(text.contains("name=\"reply_to_message_id\""), "{text}");
+        // The file the store held is what went on the wire, not a placeholder.
+        assert!(
+            request
+                .windows(b"PNG-not-really".len())
+                .any(|window| window == b"PNG-not-really"),
+            "the uploaded bytes are missing from the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pdf_is_uploaded_to_senddocument() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            200,
+            r#"{"ok":true,"result":{"message_id":100,"chat":{"id":7,"type":"private"}}}"#
+                .to_string(),
+        )]);
+        let adapter = upload_adapter(&base, b"%PDF-1.7");
+
+        let outcome = adapter.send(&message_with_file("report.pdf")).await;
+        assert!(matches!(outcome, SendOutcome::Sent { .. }), "{outcome:?}");
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request");
+        let text = String::from_utf8_lossy(&request);
+        assert!(
+            text.starts_with("POST /botbot-token/sendDocument"),
+            "{text}"
+        );
+        assert!(text.contains("name=\"document\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_inbound_file_is_resolved_through_getfile_and_then_downloaded() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![
+            (
+                200,
+                r#"{"ok":true,"result":{"file_id":"f1","file_path":"documents/build.log"}}"#
+                    .to_string(),
+            ),
+            (200, "error: nope".to_string()),
+        ]);
+        let adapter = upload_adapter(&base, b"unused");
+        let attachment = ChannelAttachment {
+            provider_id: Some("f1".into()),
+            kind: AttachmentKind::Document,
+            filename: Some("build.log".into()),
+            mime_type: Some("text/plain".into()),
+            declared_size_bytes: None,
+            source: AttachmentSource::ProviderHandle {
+                handle: "f1".into(),
+            },
+            stored_artifact_id: None,
+            text_excerpt: None,
+            fetch_error: None,
+        };
+
+        let bytes = adapter
+            .fetch_attachment(&attachment)
+            .await
+            .expect("downloaded");
+        assert_eq!(bytes, b"error: nope");
+
+        let lookup = String::from_utf8_lossy(
+            &requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("getFile"),
+        )
+        .to_string();
+        assert!(
+            lookup.starts_with("GET /botbot-token/getFile?file_id=f1"),
+            "{lookup}"
+        );
+        let download = String::from_utf8_lossy(
+            &requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("download"),
+        )
+        .to_string();
+        // The path Telegram named, under the bot's own file endpoint.
+        assert!(
+            download.starts_with("GET /file/botbot-token/documents/build.log"),
+            "{download}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydration_stores_the_bytes_and_keeps_a_text_excerpt() {
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![
+            (
+                200,
+                r#"{"ok":true,"result":{"file_path":"documents/build.log"}}"#.to_string(),
+            ),
+            (200, "error: nope".to_string()),
+        ]);
+        let adapter = upload_adapter(&base, b"unused");
+        let mut envelopes = vec![ChannelEnvelope {
+            account_id: "acct-tg".into(),
+            kind: ChannelKind::Telegram,
+            provider_event_id: "1".into(),
+            conversation: ChannelConversation::direct("chat-7"),
+            sender: ChannelSender::new("user-3"),
+            text: String::new(),
+            attachments: vec![ChannelAttachment {
+                provider_id: Some("f1".into()),
+                kind: AttachmentKind::Document,
+                filename: Some("build.log".into()),
+                mime_type: Some("text/plain".into()),
+                declared_size_bytes: None,
+                source: AttachmentSource::ProviderHandle {
+                    handle: "f1".into(),
+                },
+                stored_artifact_id: None,
+                text_excerpt: None,
+                fetch_error: None,
+            }],
+            reply_to_provider_id: None,
+            mentions_self: false,
+            received_at_ms: 0,
+            metadata: Default::default(),
+        }];
+
+        crate::daemon::channel_adapter::hydrate_attachments(
+            &adapter,
+            &crate::daemon::channel_adapter::test_http::FixtureBlobs(Vec::new()),
+            &mut envelopes,
+        )
+        .await;
+
+        let attachment = &envelopes[0].attachments[0];
+        assert_eq!(
+            attachment.stored_artifact_id.as_deref(),
+            Some("fixture-blob")
+        );
+        assert_eq!(attachment.text_excerpt.as_deref(), Some("error: nope"));
+        assert_eq!(attachment.declared_size_bytes, Some(11));
+        assert!(attachment.fetch_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_download_the_provider_refuses_is_recorded_on_the_attachment() {
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            404,
+            r#"{"ok":false}"#.to_string(),
+        )]);
+        let adapter = upload_adapter(&base, b"unused");
+        let mut envelopes = vec![ChannelEnvelope {
+            account_id: "acct-tg".into(),
+            kind: ChannelKind::Telegram,
+            provider_event_id: "1".into(),
+            conversation: ChannelConversation::direct("chat-7"),
+            sender: ChannelSender::new("user-3"),
+            text: "look".into(),
+            attachments: vec![ChannelAttachment {
+                provider_id: Some("gone".into()),
+                kind: AttachmentKind::Image,
+                filename: Some("gone.png".into()),
+                mime_type: None,
+                declared_size_bytes: None,
+                source: AttachmentSource::ProviderHandle {
+                    handle: "gone".into(),
+                },
+                stored_artifact_id: None,
+                text_excerpt: None,
+                fetch_error: None,
+            }],
+            reply_to_provider_id: None,
+            mentions_self: false,
+            received_at_ms: 0,
+            metadata: Default::default(),
+        }];
+
+        crate::daemon::channel_adapter::hydrate_attachments(
+            &adapter,
+            &crate::daemon::channel_adapter::test_http::FixtureBlobs(Vec::new()),
+            &mut envelopes,
+        )
+        .await;
+
+        let attachment = &envelopes[0].attachments[0];
+        assert!(attachment.stored_artifact_id.is_none());
+        assert!(
+            attachment
+                .fetch_error
+                .as_deref()
+                .is_some_and(|error| error.contains("404")),
+            "{:?}",
+            attachment.fetch_error
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_upload_is_a_permanent_failure_and_not_a_retry() {
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            400,
+            r#"{"ok":false,"description":"file too big"}"#.to_string(),
+        )]);
+        let adapter = upload_adapter(&base, b"bytes");
+        let outcome = adapter.send(&message_with_file("shot.png")).await;
+        assert!(
+            matches!(outcome, SendOutcome::PermanentFailure { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_picture_is_uploaded_as_a_photo_and_everything_else_as_a_document() {
+        assert_eq!(upload_method("image/png"), ("sendPhoto", "photo"));
+        assert_eq!(upload_method("image/jpeg"), ("sendPhoto", "photo"));
+        assert_eq!(
+            upload_method("application/pdf"),
+            ("sendDocument", "document")
+        );
+        // Telegram's photo path re-encodes, which destroys an SVG.
+        assert_eq!(upload_method("image/svg+xml"), ("sendDocument", "document"));
+        assert_eq!(
+            upload_method("application/octet-stream"),
+            ("sendDocument", "document")
+        );
+    }
 
     const PRIVATE_MESSAGE: &str = r#"{
         "update_id": 100,
