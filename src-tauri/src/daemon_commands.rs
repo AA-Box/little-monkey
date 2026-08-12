@@ -244,6 +244,11 @@ pub struct RemotePairRequest {
     /// Empty for a runner-only controller — see the CLI's `--mobile` flag.
     #[serde(default)]
     pub mobile_capabilities: Vec<String>,
+    /// Grants over the device's own hardware (camera, microphone, location, …).
+    /// Empty means this runner can ask the device for nothing physical,
+    /// whatever the device advertises — see the CLI's `--device` flag.
+    #[serde(default)]
+    pub device_capabilities: Vec<String>,
 }
 
 fn cli_path() -> PathBuf {
@@ -346,6 +351,26 @@ fn validate_remote_pair_request(request: &RemotePairRequest) -> Result<(), Strin
         .any(|capability| !allowed_mobile.contains(&capability.as_str()))
     {
         return Err("Unknown mobile companion capability".to_string());
+    }
+    // Must stay in step with `protocol::PHYSICAL_DEVICE_CAPABILITIES`. The CLI
+    // re-checks it against the enum itself, so an unknown value fails there
+    // too; this refuses it before a sidecar process is spawned.
+    let allowed_device = [
+        "device_info",
+        "camera_capture",
+        "microphone_capture",
+        "location_read",
+        "notification_post",
+        "screen_capture",
+        "audio_playback",
+        "voice_stream",
+    ];
+    if request
+        .device_capabilities
+        .iter()
+        .any(|capability| !allowed_device.contains(&capability.as_str()))
+    {
+        return Err("Unknown device hardware capability".to_string());
     }
     if request.run_ids.is_empty() && request.workspace_ids.is_empty() {
         return Err("Pairing requires an exact run id or declared workspace id".to_string());
@@ -1097,6 +1122,9 @@ pub async fn remote_pair_create(request: RemotePairRequest) -> Result<String, St
     }
     for capability in request.mobile_capabilities {
         args.extend(["--mobile".into(), capability]);
+    }
+    for capability in request.device_capabilities {
+        args.extend(["--device".into(), capability]);
     }
     command(args).await
 }

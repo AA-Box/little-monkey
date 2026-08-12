@@ -126,6 +126,9 @@ export interface RemotePairRequest {
   /** First-party mobile-companion grants. Additive to `actions` and never
    * widening the run scope; omitted/empty means a runner-only controller. */
   mobileCapabilities?: string[];
+  /** Grants over the device's own hardware. Omitted/empty means this runner
+   * can ask the device for nothing physical, whatever it advertises. */
+  deviceCapabilities?: string[];
 }
 
 export const MAX_REMOTE_ARTIFACT_BYTES = 32 * 1024 * 1024;
@@ -174,6 +177,72 @@ export const remotePairList = () => invoke<string>("remote_pair_list");
 export const remotePairRevoke = (deviceId: string, reason: string) => invoke<string>("remote_pair_revoke", { deviceId, reason });
 export const remotePairRotate = (deviceId: string, output: string) => invoke<string>("remote_pair_rotate", { deviceId, output });
 export const remoteAudit = (limit = 100) => invoke<unknown>("remote_audit", { limit });
+
+/** Physical capabilities an operator may grant a paired device over its own
+ * hardware — see `protocol::PHYSICAL_DEVICE_CAPABILITIES` on the node. Ordered
+ * weakest-first, matching the CLI's own picker order. */
+export const DEVICE_CAPABILITIES = [
+  "device_info",
+  "notification_post",
+  "location_read",
+  "audio_playback",
+  "camera_capture",
+  "microphone_capture",
+  "screen_capture",
+  "voice_stream",
+] as const;
+
+/** One command queued for a device, as `device-list`/`device-commands` report it. */
+export interface RemoteDeviceCommandRow {
+  command_id: string;
+  device_id: string;
+  capability: string;
+  /** `queued` | `leased` | `running` | `succeeded` | `failed` | `cancelled` | `expired`. */
+  state: string;
+  attempt: number;
+  cancel_requested: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+  expires_at_ms: number;
+  source_run_id: string | null;
+  artifact: { sha256: string; bytes: number; media_type: string } | null;
+  error: string | null;
+}
+
+/** One paired physical device.
+ *
+ * The four capability fields are deliberately separate rather than merged:
+ * "why can this phone not take a photo" has four different answers — not
+ * granted, not supported by that build, not permitted by its OS, or all three
+ * fine — and an operator has to be able to see which one applies. */
+export interface RemoteDeviceRow {
+  device_id: string;
+  device_name: string;
+  revoked: boolean;
+  secret_generation: number;
+  granted: string[];
+  /** `null` until the device has reported its surface at least once. */
+  advertised: string[] | null;
+  os_permissions: Record<string, string> | null;
+  effective: string[];
+  platform: string | null;
+  platform_version: string | null;
+  app_version: string | null;
+  device_model: string | null;
+  last_seen_at_ms: number | null;
+  /** The daemon's clock when it answered, so "last seen" is measured against
+   * the machine that recorded it rather than this one. */
+  now_ms: number;
+  recent_commands: RemoteDeviceCommandRow[];
+}
+
+export const remoteDeviceList = () => invoke<{ devices: RemoteDeviceRow[] }>("remote_device_list");
+export const remoteDeviceGrant = (deviceId: string, capabilities: string[]) =>
+  invoke<string>("remote_device_grant", { deviceId, capabilities });
+export const remoteDeviceCommands = (deviceId: string, limit = 20) =>
+  invoke<{ commands: RemoteDeviceCommandRow[] }>("remote_device_commands", { deviceId, limit });
+export const remoteDeviceCancel = (commandId: string) =>
+  invoke<string>("remote_device_cancel", { commandId });
 
 /** One node this machine may place work on, as `monkey daemon remote node-list --json` reports it (roadmap K17 S1). */
 export interface RemoteNodeRow {
@@ -420,6 +489,16 @@ export function validateRemotePairRequest(request: RemotePairRequest): string[] 
   }
   if (mobile.includes("run-workflows") && !mobile.includes("view-tasks")) {
     warnings.push("Mobile workflow launch also requires view-tasks.");
+  }
+  const device = request.deviceCapabilities ?? [];
+  if (device.some((capability) => !(DEVICE_CAPABILITIES as readonly string[]).includes(capability))) {
+    warnings.push("Unknown device hardware capability.");
+  }
+  // Same rule the node enforces: a continuous stream cannot be the only
+  // microphone grant, or withdrawing microphone capture would leave the
+  // microphone reachable.
+  if (device.includes("voice_stream") && !device.includes("microphone_capture")) {
+    warnings.push("Streaming voice also requires microphone_capture.");
   }
   return warnings;
 }
