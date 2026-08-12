@@ -366,6 +366,27 @@ fn run_params(
     params
 }
 
+/// Run parameters for a source that carries its own target rather than
+/// resolving a route from an envelope — a phone call, today.
+///
+/// The same shape [`run_params`] builds, minus the envelope: a call has a
+/// caller and a transcript, not a provider message.
+pub(crate) fn run_params_for(target: &RouteTarget, ingress: &ConversationIngress) -> Vec<String> {
+    let mut params: Vec<String> = target
+        .params
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    if !target.params.contains_key(MESSAGE_PARAM) {
+        let source = format!("a phone call on {}", ingress.source_account_id);
+        params.push(format!(
+            "{MESSAGE_PARAM}={}",
+            message_param(ingress, &source)
+        ));
+    }
+    params
+}
+
 /// The message text as a run parameter, wrapped when its author is not the
 /// operator.
 ///
