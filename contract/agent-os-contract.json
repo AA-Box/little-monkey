@@ -451,6 +451,18 @@
       "gate": "self_service"
     },
     {
+      "plane": "device",
+      "method": "POST",
+      "path": "/v1/remote/device/push",
+      "gate": "self_service"
+    },
+    {
+      "plane": "device",
+      "method": "DELETE",
+      "path": "/v1/remote/device/push",
+      "gate": "self_service"
+    },
+    {
       "plane": "node",
       "method": "GET",
       "path": "/v1/remote/node",

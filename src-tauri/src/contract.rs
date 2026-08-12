@@ -276,6 +276,18 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
         gate: RemoteGate::SelfService,
     },
     RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/push",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "DELETE",
+        path: "/v1/remote/device/push",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
         plane: RemotePlane::Node,
         method: "GET",
         path: "/v1/remote/node",

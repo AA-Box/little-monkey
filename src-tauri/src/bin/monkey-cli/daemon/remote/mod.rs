@@ -4,6 +4,7 @@ mod desktop;
 pub(crate) mod device;
 pub(crate) mod migrate;
 mod protocol;
+pub(crate) mod push;
 mod server;
 mod store;
 mod web;
@@ -82,6 +83,31 @@ pub enum RemoteCmd {
     },
     /// Ask for a queued or running command to be cancelled.
     DeviceCancel { command_id: String },
+    /// Point push at your own Firebase project. Little Monkey ships no project,
+    /// no service account and no relay: this is your configuration, stored in
+    /// app-private state on this machine.
+    PushConfigure {
+        /// Your Firebase project id.
+        #[arg(long = "project-id")]
+        project_id: String,
+        /// Your service account JSON key, which is copied into app-private
+        /// state rather than read from wherever it was downloaded.
+        #[arg(long = "service-account")]
+        service_account: PathBuf,
+        /// Allow notifications to carry specifics. Off by default: the visible
+        /// text of a push is the least private thing this system produces.
+        #[arg(long = "include-detail")]
+        include_detail: bool,
+    },
+    /// Show whether push is configured, and which devices are reachable.
+    PushStatus {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop sending push without forgetting the configuration.
+    PushDisable,
+    /// Send one harmless test notification to a registered device.
+    PushTest { device_id: String },
     /// Accept a one-time invitation on a control PC/phone client profile.
     Accept {
         invitation: PathBuf,
@@ -461,6 +487,50 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
             limit,
             json,
         } => device_commands(&paths, device_id, *limit, *json)?,
+        RemoteCmd::PushConfigure {
+            project_id,
+            service_account,
+            include_detail,
+        } => {
+            let config = push::configure(&paths, project_id, service_account, *include_detail)?;
+            println!(
+                "Push will use your Firebase project '{}' with the key copied into app-private state.\nNotification detail is {}.",
+                config.project_id,
+                if config.include_detail {
+                    "included"
+                } else {
+                    "withheld — a push says what kind of thing happened, not what it said"
+                }
+            );
+        }
+        RemoteCmd::PushStatus { json } => push_status(&paths, *json)?,
+        RemoteCmd::PushDisable => {
+            let mut config = push::load_config(&paths)?
+                .ok_or_else(|| "Push is not configured on this machine".to_string())?;
+            config.enabled = false;
+            push::save_config(&paths, &config)?;
+            println!("Push is disabled. Registrations and configuration are kept.");
+        }
+        RemoteCmd::PushTest { device_id } => {
+            let delivered = push::notify_device(
+                &paths,
+                device_id,
+                &push::PushNotification {
+                    kind: push::PushKind::SecurityAlert,
+                    target_id: Some(device_id.clone()),
+                    detail: Some("Test notification from your own runner".to_string()),
+                },
+            )
+            .await?;
+            println!(
+                "{}",
+                if delivered {
+                    "Delivered to your provider. If nothing arrives, the device has not granted notifications."
+                } else {
+                    "Nothing was sent: push is not configured here, or that device has not registered."
+                }
+            );
+        }
         RemoteCmd::DeviceCancel { command_id } => {
             let record =
                 RemoteStore::open(&paths.root)?.request_device_cancel(command_id, now_ms()?)?;
@@ -1344,6 +1414,52 @@ async fn device_action(paths: &DaemonPaths, args: &RemoteDeviceActionArgs) -> Re
             "  artifact: {} bytes of {} (sha256 {})",
             artifact.bytes, artifact.media_type, artifact.sha256
         );
+    }
+    Ok(())
+}
+
+fn push_status(paths: &DaemonPaths, json: bool) -> Result<(), String> {
+    let config = push::load_config(paths)?;
+    let registrations = RemoteStore::open(&paths.root)?.push_registrations()?;
+    let value = serde_json::json!({
+        "configured": config.is_some(),
+        "enabled": config.as_ref().is_some_and(|config| config.enabled),
+        "backend": config.as_ref().map(|config| config.backend.clone()),
+        "project_id": config.as_ref().map(|config| config.project_id.clone()),
+        "include_detail": config.as_ref().is_some_and(|config| config.include_detail),
+        // Never the token itself: it is the device's address, and printing it
+        // into a terminal or a support log helps nobody.
+        "registered_devices": registrations
+            .iter()
+            .map(|(device_id, backend, _)| serde_json::json!({
+                "device_id": device_id,
+                "backend": backend,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    if json {
+        return print_json(value);
+    }
+    match config {
+        None => println!(
+            "Push is not configured. It needs your own Firebase project — Little Monkey ships none."
+        ),
+        Some(config) => println!(
+            "Push backend {} for project {} ({}){}.\n{} device(s) registered.",
+            config.backend,
+            config.project_id,
+            if config.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            if config.include_detail {
+                ", detail included"
+            } else {
+                ", detail withheld"
+            },
+            registrations.len()
+        ),
     }
     Ok(())
 }

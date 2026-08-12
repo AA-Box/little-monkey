@@ -698,6 +698,15 @@ impl RemoteApi {
             ("POST", ["v1", "remote", "device", "commands", command_id, "result"]) => {
                 self.device_command_result(&request.body, device, command_id, now_ms)
             }
+            // Registering where to reach this device, and withdrawing it. Both
+            // self-service for the same reason as the routes above: a push
+            // address grants nothing — a woken device still has to make an
+            // ordinary signed request — and a device must always be able to
+            // stop being woken.
+            ("POST", ["v1", "remote", "device", "push"]) => {
+                self.device_push_register(&request.body, device_id, now_ms)
+            }
+            ("DELETE", ["v1", "remote", "device", "push"]) => self.device_push_forget(device_id),
             // --- Versioned `/v1/remote/node/*` placement plane (roadmap K17).
             // A second plane beside the control plane above, sharing only this
             // transport. The control-plane routes act on runs the node already
@@ -2067,6 +2076,52 @@ impl RemoteApi {
                 "state": record.state.as_str(),
             }),
             Some(record.command_id),
+        ))
+    }
+
+    fn device_push_register(
+        &self,
+        body: &[u8],
+        device_id: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let parsed: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|error| (400, format!("Invalid push registration: {error}")))?;
+        let backend = parsed
+            .get("backend")
+            .and_then(|value| value.as_str())
+            .ok_or((400, "A push registration needs a 'backend'".to_string()))?;
+        let token = parsed
+            .get("token")
+            .and_then(|value| value.as_str())
+            .ok_or((400, "A push registration needs a 'token'".to_string()))?;
+        self.locked_store()?
+            .save_push_registration(device_id, backend, token, now_ms)
+            .map_err(|error| (400, error))?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "registered": true,
+            }),
+            Some(device_id.to_string()),
+        ))
+    }
+
+    fn device_push_forget(
+        &self,
+        device_id: &str,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        self.locked_store()?
+            .delete_push_registration(device_id)
+            .map_err(internal)?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "registered": false,
+            }),
+            Some(device_id.to_string()),
         ))
     }
 

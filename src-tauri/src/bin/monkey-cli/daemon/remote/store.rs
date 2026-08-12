@@ -231,6 +231,17 @@ CREATE TABLE IF NOT EXISTS remote_device_actions (
 
 CREATE INDEX IF NOT EXISTS remote_device_actions_queue_idx
     ON remote_device_actions(device_id,state,created_at_ms);
+
+-- Where to reach a device when it is not connected. One row per device: a push
+-- token is a current address, not a history, and a stale one is worse than
+-- none. The token is the provider's, opaque here, and grants nothing — a woken
+-- device still has to make an ordinary signed request.
+CREATE TABLE IF NOT EXISTS remote_push_registrations (
+    device_id TEXT PRIMARY KEY REFERENCES remote_devices(device_id) ON DELETE CASCADE,
+    backend TEXT NOT NULL,
+    token TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+) STRICT;
 "#;
 
 pub trait RemoteSecretStore: Send + Sync {
@@ -1706,6 +1717,88 @@ impl RemoteStore {
             None,
         )?;
         Ok(capabilities.clone())
+    }
+
+    // --- Push registrations ------------------------------------------------
+
+    /// Records where to reach one device. Replacing rather than appending: a
+    /// device that re-registers has a new address, and delivering to the old
+    /// one would at best fail and at worst reach a phone that was wiped and
+    /// handed on.
+    pub fn save_push_registration(
+        &mut self,
+        device_id: &str,
+        backend: &str,
+        token: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        if token.trim().is_empty() || token.len() > 4_096 {
+            return Err("A push token must be 1-4096 characters".to_string());
+        }
+        if !matches!(backend, "fcm") {
+            return Err(format!("Unsupported push backend '{backend}'"));
+        }
+        self.connection
+            .execute(
+                "INSERT INTO remote_push_registrations(device_id,backend,token,updated_at_ms)
+                 VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(device_id) DO UPDATE SET backend=excluded.backend,
+                    token=excluded.token, updated_at_ms=excluded.updated_at_ms",
+                params![device_id, backend, token, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn delete_push_registration(&mut self, device_id: &str) -> Result<(), String> {
+        self.connection
+            .execute(
+                "DELETE FROM remote_push_registrations WHERE device_id=?1",
+                [device_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// The push address for one device, if it has registered and is not
+    /// revoked. A revoked device is never woken: the join is the enforcement.
+    pub fn push_registration(&self, device_id: &str) -> Result<Option<(String, String)>, String> {
+        self.connection
+            .query_row(
+                "SELECT r.backend, r.token
+                 FROM remote_push_registrations r
+                 JOIN remote_devices d ON d.device_id = r.device_id
+                 WHERE r.device_id=?1 AND d.revoked_at_ms IS NULL",
+                [device_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Every reachable device, for a broadcast such as an approval request.
+    pub fn push_registrations(&self) -> Result<Vec<(String, String, String)>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT r.device_id, r.backend, r.token
+                 FROM remote_push_registrations r
+                 JOIN remote_devices d ON d.device_id = r.device_id
+                 WHERE d.revoked_at_ms IS NULL
+                 ORDER BY r.device_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 
     /// How many commands are waiting for this device right now. The long-poll
