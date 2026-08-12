@@ -82,6 +82,35 @@ pub struct TelecomConfig {
     /// this value is ever used to reconstruct a signed URL — never a `Host` or
     /// `X-Forwarded-*` header from the request.
     pub public_base_url: Option<String>,
+    /// A carrier-published public key for verifying callbacks, base64, when the
+    /// carrier signs with one it does not derive from the API credential
+    /// (Telnyx's Ed25519 key). Not a secret — it verifies, it does not sign.
+    pub webhook_public_key: Option<String>,
+}
+
+/// Build the carrier a telephony account speaks to.
+///
+/// The one place a [`TelecomKind`] becomes code. A carrier that cannot be built
+/// from what the operator configured is an error naming what is missing, so the
+/// account simply does not run rather than half-working.
+pub fn build_provider(
+    config: TelecomConfig,
+) -> Result<std::sync::Arc<dyn TelecomProvider>, String> {
+    Ok(match config.kind {
+        TelecomKind::Twilio => std::sync::Arc::new(twilio::TwilioProvider::new(config)),
+        TelecomKind::Plivo => std::sync::Arc::new(plivo::PlivoProvider::new(config)),
+        TelecomKind::Mock => std::sync::Arc::new(mock::MockProvider::new(config)),
+        TelecomKind::Telnyx => {
+            // Telnyx signs callbacks with an Ed25519 key published in the
+            // portal, separate from the API key that authenticates our
+            // requests. Without it a callback cannot be verified, and an
+            // unverifiable callback is not something to accept anyway.
+            let key = config.webhook_public_key.clone().ok_or_else(|| {
+                "This Telnyx account has no webhook public key configured, so carrier callbacks cannot be verified. Copy it from the Telnyx portal into the account's settings.".to_string()
+            })?;
+            std::sync::Arc::new(telnyx::TelnyxProvider::new(config, &key)?)
+        }
+    })
 }
 
 /// Where a call is in its life.

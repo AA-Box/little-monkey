@@ -512,6 +512,7 @@ mod tests {
             from_number: "+15550001111".to_string(),
             secret: "test-auth-token".to_string(),
             public_base_url: Some(base_url.to_string()),
+            webhook_public_key: None,
         }
     }
 

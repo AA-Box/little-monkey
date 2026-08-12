@@ -292,6 +292,7 @@ mod tests {
             from_number: "+15550001111".to_string(),
             secret: "shared-test-secret".to_string(),
             public_base_url: None,
+            webhook_public_key: None,
         }
     }
 
