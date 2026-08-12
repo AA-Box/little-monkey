@@ -158,12 +158,12 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
     ],
   },
   {
-    kind: "imessage", label: "iMessage", transport: "helper", credentialLabel: "None — the helper holds the account", credentialOptional: true, requiresPlatform: "macos",
-    whereToGetIt: "macOS only, and only through a helper you install yourself. Grant it the normal macOS permissions it asks for; nothing here disables SIP, injects into Messages, or reads its database directly.",
+    kind: "imessage", label: "iMessage", transport: "helper", credentialLabel: "None — macOS holds the account", credentialOptional: true, requiresPlatform: "macos",
+    whereToGetIt: "macOS only, using the Mac you are already signed in to Messages on. Two normal macOS permissions are needed: Full Disk Access, so the Messages database can be read, and Automation for Messages, so replies can be sent. Nothing disables SIP, injects into Messages, or asks for your Apple ID password.",
     docsUrl: "https://support.apple.com/guide/messages/welcome/mac",
     configFields: [
-      { key: "helper_path", label: "Helper path", type: "text", required: true, placeholder: "/usr/local/bin/imessage-helper" },
       { key: "handle", label: "Your iMessage handle", type: "text", required: true, placeholder: "you@example.com" },
+      { key: "helper_path", label: "Helper path (optional)", type: "text", placeholder: "/usr/local/bin/imessage-helper", hint: "Leave empty to use Messages on this Mac directly. Set it only if you run your own helper process." },
     ],
   },
   { kind: "whatsapp", label: "WhatsApp", transport: "webhook", credentialLabel: "WhatsApp credentials", whereToGetIt: "Meta for Developers → your app → WhatsApp → API Setup for the access token and phone number ID; App settings → Basic for the app secret. The verify token is yours to invent — type the same value here and into Meta's webhook form.", docsUrl: "https://developers.facebook.com/docs/whatsapp/cloud-api", configFields: [{ key: "phone_number_id", label: "Phone number ID", type: "text", required: true }], secretFields: [{ key: "access_token", label: "Access token" }, { key: "app_secret", label: "App secret" }, { key: "verify_token", label: "Verify token (you choose it)" }] },
