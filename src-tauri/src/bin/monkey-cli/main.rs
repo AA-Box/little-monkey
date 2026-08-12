@@ -18,6 +18,7 @@ mod contract_cli;
 mod daemon;
 mod durable_run;
 mod embed_cli;
+mod ingress_cli;
 mod launcher;
 mod managed_model_cli;
 mod mcp_cli;
@@ -383,6 +384,12 @@ enum Cmd {
     Channels {
         #[command(subcommand)]
         action: channels_cli::ChannelsCmd,
+    },
+    /// Inspect turns that arrived from outside — a message, a call, a paired
+    /// device, a peer, a voice turn — and the runs they became.
+    Ingress {
+        #[command(subcommand)]
+        action: ingress_cli::IngressCmd,
     },
     /// Show what recent configuration changes touched, across personas,
     /// rules/memory files, MCP servers and workflow definitions — the
@@ -1448,6 +1455,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             return;
         }
         Cmd::Channels { action } => channels_cli::dispatch(action).await,
+        Cmd::Ingress { action } => ingress_cli::dispatch(action),
         Cmd::Revisions { change, limit } => revisions_cli::list(change.as_deref(), *limit),
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
             Ok(count) => {

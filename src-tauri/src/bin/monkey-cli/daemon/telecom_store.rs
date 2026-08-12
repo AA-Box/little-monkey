@@ -79,6 +79,45 @@ impl OutboundCallApproval {
     }
 }
 
+/// What one account is allowed to spend, in calls rather than currency.
+///
+/// Every field bounds something with a cost attached — a concurrent call, a
+/// ring nobody answers, a call left open, a recording of somebody who did not
+/// ask to be recorded — so [`CallLimits::default`] is the cautious answer and
+/// an operator has to choose anything looser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallLimits {
+    pub max_concurrent_calls: u32,
+    pub ring_timeout_s: u32,
+    pub max_duration_s: u32,
+    pub recording_enabled: bool,
+}
+
+impl Default for CallLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_calls: 1,
+            ring_timeout_s: 60,
+            max_duration_s: 1_800,
+            recording_enabled: false,
+        }
+    }
+}
+
+impl CallLimits {
+    /// Clamp to what the schema and a sane operator can mean. A zero here would
+    /// otherwise read as "no limit" and mean the opposite of what the column is
+    /// for.
+    pub fn sanitized(self) -> Self {
+        Self {
+            max_concurrent_calls: self.max_concurrent_calls.clamp(1, 100),
+            ring_timeout_s: self.ring_timeout_s.clamp(5, 600),
+            max_duration_s: self.max_duration_s.clamp(30, 14_400),
+            recording_enabled: self.recording_enabled,
+        }
+    }
+}
+
 /// A stored carrier account.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TelecomAccountRecord {
@@ -94,6 +133,7 @@ pub struct TelecomAccountRecord {
     pub non_secret_config: serde_json::Value,
     pub inbound_policy: InboundCallPolicy,
     pub outbound_approval: OutboundCallApproval,
+    pub limits: CallLimits,
     pub health: ChannelHealth,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -154,6 +194,33 @@ pub enum CallRecording {
     Duplicate { call_id: String },
 }
 
+/// Which limit a live call outlived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitBreach {
+    /// Nobody picked up inside the account's ring timeout.
+    RingTimeout,
+    /// The call has been connected longer than the account allows.
+    MaxDuration,
+}
+
+impl LimitBreach {
+    pub fn detail(self) -> &'static str {
+        match self {
+            LimitBreach::RingTimeout => "No answer inside this account's ring timeout",
+            LimitBreach::MaxDuration => "Ended at this account's maximum call duration",
+        }
+    }
+}
+
+/// A live call that has outlived one of its account's limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverdueCall {
+    pub call_id: String,
+    pub account_id: String,
+    pub provider_call_id: Option<String>,
+    pub breach: LimitBreach,
+}
+
 /// Outcome of [`DaemonStore::record_telecom_event`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TelecomEventRecording {
@@ -171,14 +238,19 @@ impl DaemonStore {
     pub fn upsert_telecom_account(&mut self, account: &TelecomAccountRecord) -> Result<(), String> {
         let non_secret_config =
             serde_json::to_string(&account.non_secret_config).map_err(|error| error.to_string())?;
+        // Sanitized on the way in, so a limit read back is always one the rest
+        // of the subsystem can act on.
+        let limits = account.limits.sanitized();
         self.connection
             .execute(
                 "INSERT INTO telecom_accounts (
                     account_id, kind, label, enabled, carrier_account_id, from_number,
                     credential_ref, public_base_url, non_secret_config_json, inbound_policy,
-                    outbound_approval, health, health_detail, last_error, last_probe_at_ms,
+                    outbound_approval, max_concurrent_calls, ring_timeout_s, max_duration_s,
+                    recording_enabled, health, health_detail, last_error, last_probe_at_ms,
                     created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                           ?17, ?18, ?19, ?20, ?21)
                  ON CONFLICT(account_id) DO UPDATE SET
                     kind = excluded.kind,
                     label = excluded.label,
@@ -190,6 +262,10 @@ impl DaemonStore {
                     non_secret_config_json = excluded.non_secret_config_json,
                     inbound_policy = excluded.inbound_policy,
                     outbound_approval = excluded.outbound_approval,
+                    max_concurrent_calls = excluded.max_concurrent_calls,
+                    ring_timeout_s = excluded.ring_timeout_s,
+                    max_duration_s = excluded.max_duration_s,
+                    recording_enabled = excluded.recording_enabled,
                     health = excluded.health,
                     health_detail = excluded.health_detail,
                     last_error = excluded.last_error,
@@ -207,6 +283,10 @@ impl DaemonStore {
                     non_secret_config,
                     account.inbound_policy.as_str(),
                     account.outbound_approval.as_str(),
+                    limits.max_concurrent_calls,
+                    limits.ring_timeout_s,
+                    limits.max_duration_s,
+                    limits.recording_enabled,
                     account.health.state.as_str(),
                     account.health.detail,
                     account.health.last_error,
@@ -228,7 +308,8 @@ impl DaemonStore {
                 "SELECT account_id, kind, label, enabled, carrier_account_id, from_number,
                         credential_ref, public_base_url, non_secret_config_json, inbound_policy,
                         outbound_approval, health, health_detail, last_error, last_probe_at_ms,
-                        created_at_ms, updated_at_ms
+                        created_at_ms, updated_at_ms, max_concurrent_calls, ring_timeout_s,
+                        max_duration_s, recording_enabled
                  FROM telecom_accounts WHERE account_id=?1",
                 [account_id],
                 read_telecom_account,
@@ -245,7 +326,8 @@ impl DaemonStore {
                 "SELECT account_id, kind, label, enabled, carrier_account_id, from_number,
                         credential_ref, public_base_url, non_secret_config_json, inbound_policy,
                         outbound_approval, health, health_detail, last_error, last_probe_at_ms,
-                        created_at_ms, updated_at_ms
+                        created_at_ms, updated_at_ms, max_concurrent_calls, ring_timeout_s,
+                        max_duration_s, recording_enabled
                  FROM telecom_accounts ORDER BY created_at_ms ASC",
             )
             .map_err(|error| error.to_string())?;
@@ -544,6 +626,94 @@ impl DaemonStore {
             .map_err(|error| error.to_string())
     }
 
+    /// Calls that have outlived a limit, with the limit they broke.
+    ///
+    /// Read rather than written here so the caller can hang the call up at the
+    /// carrier before the row is closed: a row marked completed while the
+    /// carrier still has the line open is a bill that keeps running.
+    pub fn overdue_calls(&self, now_ms: i64) -> Result<Vec<OverdueCall>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT c.call_id, c.account_id, c.provider_call_id, c.state,
+                        c.started_at_ms, c.created_at_ms, a.ring_timeout_s, a.max_duration_s
+                 FROM telecom_calls c
+                 JOIN telecom_accounts a ON a.account_id = c.account_id
+                 WHERE c.state IN ('queued','ringing','in_progress')",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                let call_id: String = row.get(0)?;
+                let account_id: String = row.get(1)?;
+                let provider_call_id: Option<String> = row.get(2)?;
+                let state_token: String = row.get(3)?;
+                let started_at_ms: Option<i64> = row.get(4)?;
+                let created_at_ms: i64 = row.get(5)?;
+                let ring_timeout_s: i64 = row.get(6)?;
+                let max_duration_s: i64 = row.get(7)?;
+                Ok((
+                    call_id,
+                    account_id,
+                    provider_call_id,
+                    state_token,
+                    started_at_ms,
+                    created_at_ms,
+                    ring_timeout_s,
+                    max_duration_s,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut overdue = Vec::new();
+        for row in rows {
+            let (
+                call_id,
+                account_id,
+                provider_call_id,
+                state_token,
+                started_at_ms,
+                created_at_ms,
+                ring_timeout_s,
+                max_duration_s,
+            ) = row.map_err(|error| error.to_string())?;
+            let Some(state) = CallState::parse(&state_token) else {
+                continue;
+            };
+            let breach = match state {
+                CallState::InProgress => (now_ms - started_at_ms.unwrap_or(created_at_ms)
+                    > max_duration_s.saturating_mul(1_000))
+                .then_some(LimitBreach::MaxDuration),
+                CallState::Queued | CallState::Ringing => (now_ms - created_at_ms
+                    > ring_timeout_s.saturating_mul(1_000))
+                .then_some(LimitBreach::RingTimeout),
+                _ => None,
+            };
+            if let Some(breach) = breach {
+                overdue.push(OverdueCall {
+                    call_id,
+                    account_id,
+                    provider_call_id,
+                    breach,
+                });
+            }
+        }
+        Ok(overdue)
+    }
+
+    /// How many calls this account has live right now. What the concurrency
+    /// limit is compared against before a new one is allowed to start.
+    pub fn live_call_count(&self, account_id: &str) -> Result<u32, String> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM telecom_calls
+                 WHERE account_id=?1 AND state IN ('queued','ringing','in_progress')",
+                [account_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+            .map_err(|error| error.to_string())
+    }
+
     // -- Events (carrier callback dedupe) -------------------------------------
 
     pub fn record_telecom_event(
@@ -638,6 +808,10 @@ fn read_telecom_account(
     let probed_at_ms: i64 = row.get(14)?;
     let created_at_ms: i64 = row.get(15)?;
     let updated_at_ms: i64 = row.get(16)?;
+    let max_concurrent_calls: i64 = row.get(17)?;
+    let ring_timeout_s: i64 = row.get(18)?;
+    let max_duration_s: i64 = row.get(19)?;
+    let recording_enabled: i64 = row.get(20)?;
 
     let non_secret_config: serde_json::Value = match serde_json::from_str(&non_secret_config_json) {
         Ok(value) => value,
@@ -660,6 +834,13 @@ fn read_telecom_account(
         non_secret_config,
         inbound_policy,
         outbound_approval,
+        limits: CallLimits {
+            max_concurrent_calls: u32::try_from(max_concurrent_calls).unwrap_or(1),
+            ring_timeout_s: u32::try_from(ring_timeout_s).unwrap_or(60),
+            max_duration_s: u32::try_from(max_duration_s).unwrap_or(1_800),
+            recording_enabled: recording_enabled != 0,
+        }
+        .sanitized(),
         health: ChannelHealth {
             state: health_state,
             detail,
@@ -722,6 +903,7 @@ mod tests {
             non_secret_config: serde_json::json!({}),
             inbound_policy: InboundCallPolicy::Voicemail,
             outbound_approval: OutboundCallApproval::Approval,
+            limits: CallLimits::default(),
             health: ChannelHealth {
                 state: HealthState::Disconnected,
                 detail: None,

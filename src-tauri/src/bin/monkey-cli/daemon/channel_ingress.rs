@@ -35,6 +35,7 @@ use super::channel_store::{
     ChannelAccountRecord, EventDirection, EventDisposition, EventRecording, NewChannelEvent,
     NewOutboxMessage, StoredSenderAuthorization,
 };
+use super::ingress_store::{IngressAcceptance, IngressState};
 use super::store::DaemonStore;
 use super::trigger::sha256_hex;
 use super::QueueOrigin;
@@ -423,6 +424,159 @@ pub(super) fn queue_options_for(
     }
 }
 
+/// How many times a turn may fail to reach the queue before it is parked.
+///
+/// Low, because the failures this counts are local ones — the store, the
+/// config, the kill switch — and a turn that cannot be queued after a handful
+/// of restarts needs an operator, not another attempt.
+pub(super) const MAX_SUBMIT_ATTEMPTS: u32 = 5;
+
+/// How many pending turns one recovery pass takes. Bounded so a large backlog
+/// cannot hold the daemon's startup for an unbounded time.
+const RECOVERY_BATCH: u32 = 64;
+
+/// What submitting one accepted turn did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubmitOutcome {
+    /// Accepted here and queued now.
+    Queued { ingress_id: String, job_id: String },
+    /// A previous pass already queued this turn; nothing was submitted again.
+    AlreadyQueued { ingress_id: String, job_id: String },
+    /// A previous pass parked this turn. Nothing was submitted.
+    Parked { ingress_id: String },
+    /// Durably accepted but not queued. Recovery will try again.
+    Deferred { ingress_id: String, error: String },
+}
+
+/// Accept a turn durably, then queue it.
+///
+/// The order is the whole point. The row goes in first, so a crash before the
+/// queue write leaves a turn that recovery can finish rather than a message
+/// that was acknowledged to the provider and then lost. The queue write is
+/// deterministic-id'd, so a recovery pass that runs while the original
+/// submission is still in flight cannot produce a second run.
+///
+/// Every origin uses this: a messaging adapter, an inbound call, a peer
+/// handover and a voice utterance differ in how they *build* a
+/// [`ConversationIngress`], never in how it becomes a run.
+pub(crate) fn submit_ingress(
+    store: &mut DaemonStore,
+    queue: &dyn super::channel_worker::RunQueue,
+    ingress: &ConversationIngress,
+    params: &[String],
+    now_ms: i64,
+) -> Result<SubmitOutcome, String> {
+    let ingress_id = match store.accept_ingress_turn(ingress, params, now_ms)? {
+        IngressAcceptance::Accepted { ingress_id } => ingress_id,
+        IngressAcceptance::Existing {
+            ingress_id,
+            state,
+            job_id,
+        } => match state {
+            // A queued row always has a job id; treating a missing one as
+            // parked keeps the type honest rather than unwrapping.
+            IngressState::Queued => {
+                return Ok(match job_id {
+                    Some(job_id) => SubmitOutcome::AlreadyQueued { ingress_id, job_id },
+                    None => SubmitOutcome::Parked { ingress_id },
+                })
+            }
+            IngressState::Failed => return Ok(SubmitOutcome::Parked { ingress_id }),
+            IngressState::Accepted => ingress_id,
+        },
+    };
+    Ok(finish_submission(
+        store,
+        queue,
+        ingress,
+        params,
+        &ingress_id,
+        0,
+        now_ms,
+    ))
+}
+
+/// Re-submit turns that were accepted before the process stopped.
+///
+/// Runs at daemon start. Nothing here re-decides anything: the access gate, the
+/// route and the parameters were all frozen when the turn was accepted, and
+/// re-running the gate would let a policy edit silently drop a message that was
+/// already promised a run.
+pub(crate) fn recover_pending_ingress(
+    store: &mut DaemonStore,
+    queue: &dyn super::channel_worker::RunQueue,
+    now_ms: i64,
+) -> Result<IngressRecovery, String> {
+    let pending = store.pending_ingress_turns(RECOVERY_BATCH)?;
+    let mut recovery = IngressRecovery::default();
+    for turn in pending {
+        match finish_submission(
+            store,
+            queue,
+            &turn.ingress,
+            &turn.params,
+            &turn.ingress_id,
+            turn.attempts,
+            now_ms,
+        ) {
+            SubmitOutcome::Queued { .. } | SubmitOutcome::AlreadyQueued { .. } => {
+                recovery.resubmitted += 1
+            }
+            SubmitOutcome::Parked { .. } => recovery.parked += 1,
+            SubmitOutcome::Deferred { .. } => recovery.deferred += 1,
+        }
+    }
+    Ok(recovery)
+}
+
+/// What one recovery pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct IngressRecovery {
+    pub resubmitted: u32,
+    /// Still accepted; a later pass will try again.
+    pub deferred: u32,
+    /// Out of attempts. An operator has to look at these.
+    pub parked: u32,
+}
+
+/// Queue an already-accepted turn and record what happened to it.
+fn finish_submission(
+    store: &mut DaemonStore,
+    queue: &dyn super::channel_worker::RunQueue,
+    ingress: &ConversationIngress,
+    params: &[String],
+    ingress_id: &str,
+    attempts: u32,
+    now_ms: i64,
+) -> SubmitOutcome {
+    match queue.submit(ingress, params.to_vec()) {
+        Ok(job_id) => {
+            // The run exists. Failing to annotate the row must not undo it —
+            // the deterministic job id means the worst case is one wasted
+            // recovery attempt that the queue collapses.
+            let _ = store.mark_ingress_queued(ingress_id, &job_id, now_ms);
+            SubmitOutcome::Queued {
+                ingress_id: ingress_id.to_string(),
+                job_id,
+            }
+        }
+        Err(error) => {
+            let terminal = attempts.saturating_add(1) >= MAX_SUBMIT_ATTEMPTS;
+            let _ = store.mark_ingress_submit_failed(ingress_id, &error, terminal, now_ms);
+            if terminal {
+                SubmitOutcome::Parked {
+                    ingress_id: ingress_id.to_string(),
+                }
+            } else {
+                SubmitOutcome::Deferred {
+                    ingress_id: ingress_id.to_string(),
+                    error,
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,6 +899,251 @@ mod tests {
         let events = store.recent_channel_events("acct-1", 10).unwrap();
         assert_eq!(events[0].disposition, EventDisposition::Failed);
         assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
+    }
+
+    /// A queue that records what it was asked to run and can be told to fail,
+    /// which is how a crash between "accepted" and "queued" is simulated
+    /// without a process actually dying.
+    #[derive(Default)]
+    struct FakeQueue {
+        submissions: std::sync::Mutex<Vec<(ConversationIngress, Vec<String>)>>,
+        failing: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeQueue {
+        fn failing() -> Self {
+            let queue = FakeQueue::default();
+            queue
+                .failing
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            queue
+        }
+
+        fn recover(&self) {
+            self.failing
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn submissions(&self) -> Vec<(ConversationIngress, Vec<String>)> {
+            self.submissions.lock().expect("lock").clone()
+        }
+    }
+
+    impl super::super::channel_worker::RunQueue for FakeQueue {
+        fn submit(
+            &self,
+            ingress: &ConversationIngress,
+            params: Vec<String>,
+        ) -> Result<String, String> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("the queue is unavailable".to_string());
+            }
+            self.submissions
+                .lock()
+                .expect("lock")
+                .push((ingress.clone(), params));
+            Ok(ingress.deterministic_job_id())
+        }
+    }
+
+    fn ingress_for(source: ConversationSource, event_id: &str) -> ConversationIngress {
+        ConversationIngress::direct(
+            source,
+            "acct-1",
+            event_id,
+            format!("{}:session-1", source.as_str()),
+            "ship it",
+            RouteTarget::new("chat"),
+            NOW,
+        )
+    }
+
+    #[test]
+    fn every_origin_reaches_the_queue_through_the_same_call() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let queue = FakeQueue::default();
+
+        for source in [
+            ConversationSource::MessagingChannel,
+            ConversationSource::Peer,
+            ConversationSource::Voice,
+            ConversationSource::Telephone,
+            ConversationSource::Mobile,
+            ConversationSource::Desktop,
+        ] {
+            let ingress = ingress_for(source, "e-1");
+            let outcome = submit_ingress(&mut store, &queue, &ingress, &[], NOW).expect("submit");
+            assert_eq!(
+                outcome,
+                SubmitOutcome::Queued {
+                    ingress_id: match &outcome {
+                        SubmitOutcome::Queued { ingress_id, .. } => ingress_id.clone(),
+                        other => panic!("expected a queued turn, got {other:?}"),
+                    },
+                    job_id: ingress.deterministic_job_id(),
+                }
+            );
+        }
+
+        assert_eq!(queue.submissions().len(), 6);
+        assert_eq!(store.recent_ingress_turns(10).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn a_turn_the_queue_refuses_is_still_durably_accepted() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let queue = FakeQueue::failing();
+        let ingress = ingress_for(ConversationSource::Telephone, "call-1");
+
+        let SubmitOutcome::Deferred { ingress_id, error } =
+            submit_ingress(&mut store, &queue, &ingress, &["message=hi".into()], NOW)
+                .expect("submit")
+        else {
+            panic!("expected the turn to be deferred");
+        };
+        assert!(error.contains("unavailable"));
+        assert!(queue.submissions().is_empty());
+
+        // The restart: the same durable row, re-submitted verbatim.
+        queue.recover();
+        let recovery = recover_pending_ingress(&mut store, &queue, NOW + 1_000).expect("recover");
+        assert_eq!(
+            recovery,
+            IngressRecovery {
+                resubmitted: 1,
+                deferred: 0,
+                parked: 0,
+            }
+        );
+
+        let submissions = queue.submissions();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].0, ingress);
+        assert_eq!(submissions[0].1, ["message=hi"]);
+
+        let stored = store.ingress_turn(&ingress_id).unwrap().expect("row");
+        assert_eq!(stored.state, IngressState::Queued);
+        assert_eq!(
+            stored.job_id.as_deref(),
+            Some(ingress.deterministic_job_id().as_str())
+        );
+    }
+
+    #[test]
+    fn a_restart_after_the_queue_took_the_turn_does_not_run_it_again() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let queue = FakeQueue::default();
+        let ingress = ingress_for(ConversationSource::Peer, "handover-1");
+
+        submit_ingress(&mut store, &queue, &ingress, &[], NOW).expect("submit");
+        let recovery = recover_pending_ingress(&mut store, &queue, NOW + 1).expect("recover");
+
+        assert_eq!(recovery, IngressRecovery::default());
+        assert_eq!(queue.submissions().len(), 1);
+    }
+
+    #[test]
+    fn a_redelivery_after_a_restart_collapses_onto_the_queued_turn() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let queue = FakeQueue::default();
+        let ingress = ingress_for(ConversationSource::MessagingChannel, "e-1");
+
+        let first = submit_ingress(&mut store, &queue, &ingress, &[], NOW).expect("submit");
+        let second =
+            submit_ingress(&mut store, &queue, &ingress, &[], NOW + 60_000).expect("resubmit");
+
+        let (
+            SubmitOutcome::Queued { ingress_id, job_id },
+            SubmitOutcome::AlreadyQueued {
+                ingress_id: same_id,
+                job_id: same_job,
+            },
+        ) = (first, second)
+        else {
+            panic!("expected the redelivery to collapse");
+        };
+        assert_eq!(ingress_id, same_id);
+        assert_eq!(job_id, same_job);
+        assert_eq!(queue.submissions().len(), 1);
+    }
+
+    #[test]
+    fn recovery_replays_the_frozen_route_rather_than_re_deciding() {
+        let mut store = store_with_account(open_policy());
+        let queue = FakeQueue::failing();
+        let planned = plan(&mut store, &dm("ship it", "1"));
+        let PlannedDecision::Run { ingress, params } = planned.decision else {
+            panic!("expected a run");
+        };
+        submit_ingress(&mut store, &queue, &ingress, &params, NOW).expect("submit");
+
+        // The operator edits the route, and the sender loses access, while the
+        // turn is sitting in the accepted state.
+        store.delete_channel_route("route-1").unwrap();
+        let mut account = store.channel_account("acct-1").unwrap().unwrap();
+        account.access_policy = ChannelAccessPolicy {
+            direct: AccessPolicy::Disabled,
+            ..open_policy()
+        };
+        store.upsert_channel_account(&account).unwrap();
+
+        queue.recover();
+        assert_eq!(
+            recover_pending_ingress(&mut store, &queue, NOW + 1).expect("recover"),
+            IngressRecovery {
+                resubmitted: 1,
+                deferred: 0,
+                parked: 0,
+            }
+        );
+        let submissions = queue.submissions();
+        assert_eq!(submissions[0].0.route_digest, ingress.route_digest);
+        assert_eq!(submissions[0].0.target.recipe, "chat");
+        assert_eq!(submissions[0].1, params);
+    }
+
+    #[test]
+    fn a_turn_that_never_queues_is_parked_rather_than_retried_forever() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let queue = FakeQueue::failing();
+        let ingress = ingress_for(ConversationSource::Voice, "utt-1");
+
+        submit_ingress(&mut store, &queue, &ingress, &[], NOW).expect("submit");
+        for _ in 1..MAX_SUBMIT_ATTEMPTS {
+            recover_pending_ingress(&mut store, &queue, NOW).expect("recover");
+        }
+
+        assert!(store.pending_ingress_turns(10).unwrap().is_empty());
+        let parked = &store.recent_ingress_turns(10).unwrap()[0];
+        assert_eq!(parked.state, IngressState::Failed);
+        assert_eq!(parked.attempts, MAX_SUBMIT_ATTEMPTS);
+
+        // A parked turn stays parked: a redelivery must not restart the loop.
+        queue.recover();
+        assert!(matches!(
+            submit_ingress(&mut store, &queue, &ingress, &[], NOW).expect("resubmit"),
+            SubmitOutcome::Parked { .. }
+        ));
+        assert!(queue.submissions().is_empty());
+    }
+
+    #[test]
+    fn the_durable_turn_carries_the_source_and_session_a_ui_can_show() {
+        let mut store = store_with_account(open_policy());
+        let queue = FakeQueue::default();
+        let PlannedDecision::Run { ingress, params } =
+            plan(&mut store, &dm("ship it", "1")).decision
+        else {
+            panic!("expected a run");
+        };
+        submit_ingress(&mut store, &queue, &ingress, &params, NOW).expect("submit");
+
+        let listed = &store.recent_ingress_turns(10).unwrap()[0];
+        assert_eq!(listed.source, ConversationSource::MessagingChannel);
+        assert_eq!(listed.source_account_id, "acct-1");
+        assert_eq!(listed.session_key, ingress.session_key);
+        assert_eq!(listed.state, IngressState::Queued);
+        assert!(listed.last_error.is_none());
     }
 
     #[test]

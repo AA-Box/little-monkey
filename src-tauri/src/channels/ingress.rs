@@ -423,6 +423,36 @@ mod tests {
         assert_eq!(ingress.reply_depth, 2);
     }
 
+    /// The daemon stores this record and reads it back after a restart, which
+    /// makes its serialized shape a compatibility surface: a turn accepted by
+    /// the build before an upgrade still has to load on the build after it.
+    #[test]
+    fn a_turn_serialized_before_the_optional_fields_existed_still_loads() {
+        let stored = serde_json::json!({
+            "source": "messaging_channel",
+            "source_account_id": "acct-1",
+            "source_event_id": "42",
+            "session_key": "channel:telegram:acct-1:chat-7",
+            "text": "ship it",
+            "target": RouteTarget::new("chat"),
+            "route_digest": RouteTarget::new("chat").digest(),
+            "received_at_ms": 1_700_000_000_000_i64,
+        });
+
+        let restored: ConversationIngress = serde_json::from_value(stored).expect("deserialize");
+        assert_eq!(restored.reply_depth, 0);
+        assert!(!restored.automation_origin);
+        assert!(restored.attachments.is_empty());
+        assert!(restored.route_id.is_none());
+        // The identity a re-submission deduplicates on has to survive too, or
+        // recovery queues a second run for a turn that already has one.
+        assert_eq!(restored.dedupe_key(), "messaging_channel:acct-1:42");
+        assert_eq!(
+            restored.deterministic_job_id(),
+            ConversationIngress::from_channel(&envelope(), &route()).deterministic_job_id()
+        );
+    }
+
     #[test]
     fn untrusted_text_survives_a_json_round_trip_as_a_plain_string() {
         let ingress = ConversationIngress::from_channel(&envelope(), &route());

@@ -1871,3 +1871,30 @@ pub async fn channels_set_credential(account_id: String, secret: String) -> Resu
     .await
     .map(|_| ())
 }
+
+// --- Conversation ingress -------------------------------------------------
+
+/// Turns that arrived from outside, across every origin, with the run each one
+/// became.
+///
+/// One command rather than one per subsystem: the desktop asks the same
+/// question about a Telegram message, an inbound call and a peer handover, and
+/// the answer has the same shape. The listing carries identifiers, state and
+/// failure reasons — never message text, and never a credential.
+#[tauri::command]
+pub async fn ingress_turns(source: Option<String>, limit: u32) -> Result<Value, String> {
+    let mut args = vec!["ingress".into(), "list".into()];
+    if let Some(source) = source {
+        // Parsed against the enum rather than pattern-checked, so the only
+        // strings that can become a process argument are the six the durable
+        // contract defines.
+        let source = crate::channels::ingress::ConversationSource::parse(&source)
+            .ok_or_else(|| format!("Unknown conversation source '{source}'"))?;
+        args.push("--source".into());
+        args.push(source.as_str().to_string());
+    }
+    args.push("--limit".into());
+    args.push(limit.clamp(1, 200).to_string());
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
