@@ -738,7 +738,7 @@ pub(crate) fn queue_client_recipe(
 /// keeps this path from inventing an implicit target resolution of its own.
 pub(crate) const MOBILE_CHAT_RECIPE: &str = "mobile-chat";
 
-fn mobile_chat_job_id(client_key: &str) -> String {
+pub(crate) fn mobile_chat_job_id(client_key: &str) -> String {
     format!(
         "job-{}",
         &sha256_hex(format!("mobile-chat:{client_key}").as_bytes())[..32]
@@ -2321,6 +2321,11 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
     )
     .await?;
     spawn_knowledge_refresh_scheduler()?;
+    // What tells a paired phone that a run wants an approval, or has finished.
+    // Its own task, reading the job table the rest of this process writes, so a
+    // transition raises its notification whichever code path caused it — the
+    // scheduler, a reporting child, or the crash reconciler.
+    remote::watch::spawn(paths.clone());
     // Messaging channels. Its own task rather than a step in the loop below: a
     // long-polling provider blocks for half a minute at a time, and the queue
     // must keep ticking while it does.

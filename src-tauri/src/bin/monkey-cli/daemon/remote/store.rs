@@ -7,7 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use super::protocol::{
     legacy_capabilities, random_token, random_token_id, sha256_hex, validate_capabilities,
     AuditEntry, ControllerProfile, DeviceCapability, DeviceCommandState, DeviceSurface,
-    PairAcceptResponse, RemoteScopes, RotationBundle, DEVICE_LEASE_MS,
+    PairAcceptResponse, RemoteScopes, RotationBundle, VoiceSessionState, DEVICE_LEASE_MS,
     MAX_DEVICE_COMMAND_ARG_BYTES, REMOTE_PROTOCOL_VERSION,
 };
 
@@ -242,6 +242,51 @@ CREATE TABLE IF NOT EXISTS remote_push_registrations (
     token TEXT NOT NULL,
     updated_at_ms INTEGER NOT NULL
 ) STRICT;
+
+-- One live microphone stream. The audio itself is appended to a file beside the
+-- database; this row is the ledger for it — how many chunks have been accepted,
+-- how many bytes are on disk, and whether the stream is still open.
+--
+-- `next_sequence` is the whole exactly-once story: a chunk is written only when
+-- its sequence is the one expected, and the counter moves only after the bytes
+-- are on disk. A device that retries a chunk it already delivered is answered
+-- with "already have it" rather than appending a second copy.
+--
+-- The command row it names is the *control* command; cancelling that command is
+-- how an operator stops the stream, which is why the session carries no cancel
+-- flag of its own.
+CREATE TABLE IF NOT EXISTS remote_voice_sessions (
+    session_id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL REFERENCES remote_devices(device_id) ON DELETE RESTRICT,
+    command_id TEXT NOT NULL REFERENCES remote_device_actions(command_id) ON DELETE RESTRICT,
+    state TEXT NOT NULL CHECK(state IN ('open','closed','failed')),
+    media_type TEXT,
+    next_sequence INTEGER NOT NULL DEFAULT 0,
+    bytes INTEGER NOT NULL DEFAULT 0,
+    source_run_id TEXT,
+    source_session_id TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    deadline_ms INTEGER NOT NULL,
+    closed_at_ms INTEGER,
+    error TEXT
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS remote_voice_sessions_device_idx
+    ON remote_voice_sessions(device_id,created_at_ms);
+
+-- What the run watcher has already told the devices about. One row per job
+-- holding the last state a notification was raised for, so a watcher that polls
+-- every couple of seconds does not send "run finished" forty times, and a
+-- daemon restart does not re-send what it already sent.
+--
+-- Keyed on the job rather than the run because a job is what has states; rows
+-- are pruned once they are older than any notification could still be about.
+CREATE TABLE IF NOT EXISTS remote_push_watch (
+    job_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    notified_at_ms INTEGER NOT NULL
+) STRICT;
 "#;
 
 pub trait RemoteSecretStore: Send + Sync {
@@ -452,6 +497,59 @@ pub struct DeviceCommandRecord {
     pub result: Option<serde_json::Value>,
     pub artifact: Option<DeviceArtifact>,
     pub error: Option<String>,
+}
+
+/// One microphone stream's ledger row. The audio lives beside the database —
+/// see `voice::audio_path` — and `bytes` is how much of it the runner holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceSessionRecord {
+    pub session_id: String,
+    pub device_id: String,
+    pub command_id: String,
+    pub state: VoiceSessionState,
+    pub media_type: Option<String>,
+    /// The sequence number the runner will accept next. Also the count of
+    /// chunks already written.
+    pub next_sequence: u64,
+    pub bytes: u64,
+    pub source_run_id: Option<String>,
+    pub source_session_id: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub deadline_ms: u64,
+    pub closed_at_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+const VOICE_SESSION_SELECT: &str = "SELECT session_id,device_id,command_id,state,media_type,
+        next_sequence,bytes,source_run_id,source_session_id,created_at_ms,updated_at_ms,
+        deadline_ms,closed_at_ms,error
+     FROM remote_voice_sessions";
+
+fn read_voice_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<VoiceSessionRecord> {
+    let state = VoiceSessionState::parse(&row.get::<_, String>(3)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    Ok(VoiceSessionRecord {
+        session_id: row.get(0)?,
+        device_id: row.get(1)?,
+        command_id: row.get(2)?,
+        state,
+        media_type: row.get(4)?,
+        next_sequence: from_i64(row.get(5)?)?,
+        bytes: from_i64(row.get(6)?)?,
+        source_run_id: row.get(7)?,
+        source_session_id: row.get(8)?,
+        created_at_ms: from_i64(row.get(9)?)?,
+        updated_at_ms: from_i64(row.get(10)?)?,
+        deadline_ms: from_i64(row.get(11)?)?,
+        closed_at_ms: row.get::<_, Option<i64>>(12)?.map(from_i64).transpose()?,
+        error: row.get(13)?,
+    })
 }
 
 const DEVICE_COMMAND_SELECT: &str = "SELECT command_id,device_id,capability,arguments_json,
@@ -1832,6 +1930,246 @@ impl RemoteStore {
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map([], read_device_command)
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    // --- Voice streams ----------------------------------------------------
+
+    /// Opens the ledger row for a stream the control command has just been
+    /// queued for.
+    ///
+    /// The session id is minted by the caller because it has to travel *in* the
+    /// command's arguments: the device learns which session to post its audio
+    /// to from the command itself, and never invents one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_voice_session(
+        &mut self,
+        session_id: &str,
+        device_id: &str,
+        command_id: &str,
+        source_run_id: Option<&str>,
+        source_session_id: Option<&str>,
+        deadline_ms: u64,
+        now_ms: u64,
+    ) -> Result<VoiceSessionRecord, String> {
+        self.connection
+            .execute(
+                "INSERT INTO remote_voice_sessions(
+                    session_id,device_id,command_id,state,source_run_id,source_session_id,
+                    created_at_ms,updated_at_ms,deadline_ms)
+                 VALUES(?1,?2,?3,'open',?4,?5,?6,?6,?7)",
+                params![
+                    session_id,
+                    device_id,
+                    command_id,
+                    source_run_id,
+                    source_session_id,
+                    to_i64(now_ms)?,
+                    to_i64(deadline_ms)?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        self.audit(
+            now_ms,
+            Some(device_id),
+            "voice_session_open",
+            Some(session_id),
+            "allowed",
+            None,
+        )?;
+        self.voice_session(session_id)?
+            .ok_or_else(|| "Opened voice session disappeared".to_string())
+    }
+
+    /// Records that `bytes` for `sequence` are on disk.
+    ///
+    /// Called **after** the append, never before: the counter is the runner's
+    /// statement that it holds those bytes, and moving it first would let a
+    /// crash between the two lose audio while claiming to have it.
+    pub fn commit_voice_chunk(
+        &mut self,
+        session_id: &str,
+        bytes: u64,
+        media_type: Option<&str>,
+        now_ms: u64,
+    ) -> Result<VoiceSessionRecord, String> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE remote_voice_sessions
+                 SET next_sequence=next_sequence+1, bytes=bytes+?2,
+                     media_type=COALESCE(media_type,?3), updated_at_ms=?4
+                 WHERE session_id=?1 AND state='open'",
+                params![session_id, to_i64(bytes)?, media_type, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("The voice session is not open".to_string());
+        }
+        self.voice_session(session_id)?
+            .ok_or_else(|| "Voice session disappeared".to_string())
+    }
+
+    /// Ends a stream. Idempotent: a device that posts `close` twice, or that
+    /// closes a session the runner already timed out, gets the stored answer
+    /// rather than an error it can do nothing about.
+    pub fn close_voice_session(
+        &mut self,
+        session_id: &str,
+        error: Option<&str>,
+        now_ms: u64,
+    ) -> Result<VoiceSessionRecord, String> {
+        let record = self
+            .voice_session(session_id)?
+            .ok_or_else(|| "Unknown voice session".to_string())?;
+        if record.state != VoiceSessionState::Open {
+            return Ok(record);
+        }
+        let state = if error.is_some() {
+            VoiceSessionState::Failed
+        } else {
+            VoiceSessionState::Closed
+        };
+        self.connection
+            .execute(
+                "UPDATE remote_voice_sessions
+                 SET state=?2, error=?3, closed_at_ms=?4, updated_at_ms=?4
+                 WHERE session_id=?1",
+                params![session_id, state.as_str(), error, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        self.audit(
+            now_ms,
+            Some(&record.device_id),
+            "voice_session_close",
+            Some(session_id),
+            state.as_str(),
+            None,
+        )?;
+        self.voice_session(session_id)?
+            .ok_or_else(|| "Closed voice session disappeared".to_string())
+    }
+
+    pub fn voice_session(&self, session_id: &str) -> Result<Option<VoiceSessionRecord>, String> {
+        self.connection
+            .query_row(
+                &format!("{VOICE_SESSION_SELECT} WHERE session_id=?1"),
+                [session_id],
+                read_voice_session,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Sessions newest-first, optionally for one device.
+    pub fn voice_sessions(
+        &self,
+        device_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<VoiceSessionRecord>, String> {
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "{VOICE_SESSION_SELECT}
+                 WHERE (?1 IS NULL OR device_id=?1)
+                 ORDER BY created_at_ms DESC LIMIT ?2"
+            ))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![device_id, i64::from(limit)], read_voice_session)
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Closes every stream whose deadline has passed.
+    ///
+    /// A stream is the one thing here that holds a microphone open, so its
+    /// bound is enforced by the runner and not only by the phone: a device that
+    /// stops posting — flat battery, tunnel, a build with a broken timer —
+    /// still has its session closed and its control command failed.
+    pub fn expire_voice_sessions(&mut self, now_ms: u64) -> Result<Vec<String>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT session_id FROM remote_voice_sessions
+                 WHERE state='open' AND deadline_ms <= ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let expired = statement
+            .query_map([to_i64(now_ms)?], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        drop(statement);
+        for session_id in &expired {
+            self.close_voice_session(
+                session_id,
+                Some("The stream passed its deadline without being closed"),
+                now_ms,
+            )?;
+        }
+        Ok(expired)
+    }
+
+    // --- What the run watcher has already said -----------------------------
+
+    /// Records that a notification was raised for `job_id` in `state`, and
+    /// answers whether this is the first time.
+    ///
+    /// `false` is the common case and the point: the watcher re-reads the same
+    /// active jobs every tick and must notify on the *edge*, not on the level.
+    pub fn mark_push_notified(
+        &mut self,
+        job_id: &str,
+        state: &str,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        let changed = self
+            .connection
+            .execute(
+                "INSERT INTO remote_push_watch(job_id,state,notified_at_ms)
+                 VALUES(?1,?2,?3)
+                 ON CONFLICT(job_id) DO UPDATE SET state=excluded.state,
+                    notified_at_ms=excluded.notified_at_ms
+                 WHERE remote_push_watch.state <> excluded.state",
+                params![job_id, state, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+
+    pub fn prune_push_watch(&mut self, before_ms: u64) -> Result<u64, String> {
+        self.connection
+            .execute(
+                "DELETE FROM remote_push_watch WHERE notified_at_ms < ?1",
+                [to_i64(before_ms)?],
+            )
+            .map(|deleted| deleted as u64)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Mobile chat message ids from the recent past, so the watcher can tell a
+    /// finished chat turn from a finished workflow and say "new response"
+    /// rather than "run finished".
+    pub fn recent_mobile_message_ids(
+        &self,
+        since_ms: u64,
+        limit: u32,
+    ) -> Result<Vec<String>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT message_id FROM remote_mobile_messages
+                 WHERE created_at_ms >= ?1 ORDER BY created_at_ms DESC LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![to_i64(since_ms)?, i64::from(limit)], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())

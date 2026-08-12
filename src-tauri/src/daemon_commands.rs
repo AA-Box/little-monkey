@@ -1342,6 +1342,8 @@ pub async fn tool_device_action(
     title: Option<String>,
     body: Option<String>,
     text: Option<String>,
+    run_id: Option<String>,
+    artifact_id: Option<String>,
     wait_ms: Option<u64>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
@@ -1383,6 +1385,14 @@ pub async fn tool_device_action(
     ] {
         if let Some(value) = value {
             validate_token(flag, &value, 1_024)?;
+            args.extend([flag.into(), value]);
+        }
+    }
+    // Ids, not free text: an artifact reference reaches the artifact route, so
+    // it goes through the same validation every other id on this bridge does.
+    for (flag, value) in [("--run-id", run_id), ("--artifact-id", artifact_id)] {
+        if let Some(value) = value {
+            validate_id(flag, &value)?;
             args.extend([flag.into(), value]);
         }
     }

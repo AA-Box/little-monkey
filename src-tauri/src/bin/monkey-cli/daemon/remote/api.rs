@@ -27,8 +27,8 @@ use super::protocol::{
     DesktopControlStartRequest, DesktopControlStopRequest, DeviceCapability, DeviceCommand,
     DeviceCommandResult, DeviceCommandState, DeviceSurface, MigrationAcceptRequest,
     MigrationPreflightRequest, MigrationReceipt, PairAcceptRequest, RemoteAction, RemoteHostConfig,
-    RemoteScopes, RunSummary, SignedRequestHeaders, DEVICE_LEASE_MS, MAX_REMOTE_BODY_BYTES,
-    REMOTE_PROTOCOL_VERSION,
+    RemoteScopes, RunSummary, SignedRequestHeaders, VoiceChunkRequest, VoiceCloseRequest,
+    DEVICE_LEASE_MS, MAX_REMOTE_BODY_BYTES, MAX_VOICE_CHUNK_BYTES, REMOTE_PROTOCOL_VERSION,
 };
 use super::store::{
     CommandReservation, DeviceArtifact, DeviceRecord, KeyringRemoteSecrets, MobileCaptureRecord,
@@ -697,6 +697,19 @@ impl RemoteApi {
             }
             ("POST", ["v1", "remote", "device", "commands", command_id, "result"]) => {
                 self.device_command_result(&request.body, device, command_id, now_ms)
+            }
+            // The audio of a live stream, while its control command is still
+            // running. Gated on the grant — an operator who revokes
+            // `voice_stream` mid-stream closes the microphone with the next
+            // chunk — and on owning the session, which the device was told
+            // about in the command it leased and never invents for itself.
+            ("POST", ["v1", "remote", "device", "voice", session_id, "chunk"]) => {
+                require_capability(device, DeviceCapability::VoiceStream)
+                    .and_then(|_| self.voice_chunk(&request.body, device, session_id, now_ms))
+            }
+            ("POST", ["v1", "remote", "device", "voice", session_id, "close"]) => {
+                require_capability(device, DeviceCapability::VoiceStream)
+                    .and_then(|_| self.voice_close(&request.body, device, session_id, now_ms))
             }
             // Registering where to reach this device, and withdrawing it. Both
             // self-service for the same reason as the routes above: a push
@@ -1943,6 +1956,10 @@ impl RemoteApi {
         now_ms: u64,
     ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
         let mut store = self.locked_store()?;
+        // A stream whose deadline passed is closed here, on the same sweep that
+        // expires stale commands: the device that abandoned it is by definition
+        // not the one asking for work, so this is where someone else notices.
+        super::voice::expire(&mut store, now_ms).map_err(internal)?;
         let surface = store.device_surface(&device.device_id).map_err(internal)?;
         let effective = effective_capabilities(&device.capabilities, surface.as_ref());
         // Bounded: each iteration retires exactly one now-unauthorized command,
@@ -2077,6 +2094,94 @@ impl RemoteApi {
                 "state": record.state.as_str(),
             }),
             Some(record.command_id),
+        ))
+    }
+
+    /// One chunk of a live microphone stream.
+    ///
+    /// The store lock is taken once and held across the disk write on purpose:
+    /// that is what makes "check the sequence, append, move the counter" atomic,
+    /// and therefore what stops two concurrent posts of the same chunk from
+    /// writing the audio twice.
+    fn voice_chunk(
+        &self,
+        body: &[u8],
+        device: &DeviceRecord,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let request: VoiceChunkRequest = serde_json::from_slice(body)
+            .map_err(|error| (400, format!("Invalid voice chunk: {error}")))?;
+        request.validate().map_err(|error| (400, error))?;
+        let audio = STANDARD
+            .decode(&request.audio_base64)
+            .map_err(|_| (400, "Voice chunk audio is not valid base64".to_string()))?;
+        if audio.len() > MAX_VOICE_CHUNK_BYTES {
+            return Err((413, "Voice chunk exceeds the per-chunk ceiling".to_string()));
+        }
+        let mut store = self.locked_store()?;
+        let outcome = super::voice::accept_chunk(
+            &self.paths.root,
+            &mut store,
+            &device.device_id,
+            session_id,
+            &request,
+            &audio,
+            now_ms,
+        )?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "session_id": session_id,
+                "accepted": outcome.accepted,
+                "next_sequence": outcome.next_sequence,
+                "bytes": outcome.bytes,
+                // The device's stop signal, on the reply to a request it is
+                // already making. No second poll exists for a cancellation to
+                // be missed on.
+                "stop": outcome.stop,
+            }),
+            Some(session_id.to_string()),
+        ))
+    }
+
+    /// The device ending a stream, and with it the control command it rode on.
+    fn voice_close(
+        &self,
+        body: &[u8],
+        device: &DeviceRecord,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let request: VoiceCloseRequest = if body.is_empty() {
+            VoiceCloseRequest {
+                protocol_version: REMOTE_PROTOCOL_VERSION,
+                error: None,
+            }
+        } else {
+            serde_json::from_slice(body)
+                .map_err(|error| (400, format!("Invalid voice close: {error}")))?
+        };
+        request.validate().map_err(|error| (400, error))?;
+        let mut store = self.locked_store()?;
+        let record = super::voice::close(
+            &mut store,
+            &device.device_id,
+            session_id,
+            request.error.as_deref(),
+            now_ms,
+        )?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "session_id": record.session_id,
+                "state": record.state.as_str(),
+                "chunks": record.next_sequence,
+                "bytes": record.bytes,
+            }),
+            Some(record.session_id),
         ))
     }
 
@@ -4358,6 +4463,234 @@ mod tests {
             ),
             2_000,
         )
+    }
+
+    /// A whole voice stream over the signed plane: leased, started, audio
+    /// posted in order, stopped by an operator, closed by the device.
+    ///
+    /// The two properties worth having a test for are both about what happens
+    /// when the link is unreliable. A chunk delivered twice must be stored once
+    /// — otherwise a phone on a bad connection produces stuttering audio that
+    /// nothing downstream can detect. And an operator's stop must reach the
+    /// microphone, which it does on the answer to a chunk the device is already
+    /// posting rather than on a poll it might not make.
+    #[test]
+    fn a_voice_stream_survives_a_retry_and_stops_when_an_operator_says_so() {
+        let (root, api, _secrets, device_id, secret) = fixture();
+        grant(
+            &api,
+            &device_id,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+            ],
+        );
+        assert_eq!(
+            advertise(
+                &api,
+                &device_id,
+                &secret,
+                1,
+                &[
+                    DeviceCapability::MicrophoneCapture,
+                    DeviceCapability::VoiceStream
+                ],
+                &[
+                    (DeviceCapability::MicrophoneCapture, OsPermission::Granted),
+                    (DeviceCapability::VoiceStream, OsPermission::Granted),
+                ],
+            )
+            .status,
+            200
+        );
+
+        let session_id = "vs-testsessionidentifier".to_string();
+        let command_id = {
+            let mut store = api.store.lock().unwrap();
+            let command = store
+                .enqueue_device_command(
+                    &DeviceCommandRequest {
+                        device_id: device_id.clone(),
+                        capability: DeviceCapability::VoiceStream,
+                        arguments: serde_json::json!({
+                            "session_id": session_id,
+                            "duration_ms": 60_000,
+                            "chunk_ms": 1_000,
+                        }),
+                        source_run_id: None,
+                        source_session_id: None,
+                        source_tool_call_id: None,
+                        expires_at_ms: 300_000,
+                    },
+                    2_000,
+                )
+                .unwrap();
+            store
+                .open_voice_session(
+                    &session_id,
+                    &device_id,
+                    &command.command_id,
+                    None,
+                    None,
+                    200_000,
+                    2_000,
+                )
+                .unwrap();
+            command.command_id
+        };
+
+        // Lease and start, exactly as a photograph would.
+        let leased = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                2,
+                "cmd-vlease",
+                "GET",
+                "/v1/remote/device/commands/next",
+                b"",
+            ),
+            2_000,
+        );
+        assert_eq!(leased.status, 200);
+        let start_path = format!("/v1/remote/device/commands/{command_id}/start");
+        assert_eq!(
+            api.handle(
+                signed(
+                    &device_id,
+                    &secret,
+                    3,
+                    "cmd-vstart",
+                    "POST",
+                    &start_path,
+                    b"{}"
+                ),
+                2_000,
+            )
+            .status,
+            200
+        );
+
+        let chunk_path = format!("/v1/remote/device/voice/{session_id}/chunk");
+        let chunk = |sequence: u64, audio: &[u8], first: bool| {
+            serde_json::to_vec(&VoiceChunkRequest {
+                protocol_version: REMOTE_PROTOCOL_VERSION,
+                sequence,
+                audio_base64: STANDARD.encode(audio),
+                media_type: first.then(|| "audio/webm".to_string()),
+                last: false,
+            })
+            .unwrap()
+        };
+        let first = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                4,
+                "cmd-vchunk-0",
+                "POST",
+                &chunk_path,
+                &chunk(0, b"opus-one", true),
+            ),
+            2_100,
+        );
+        assert_eq!(first.status, 200);
+        let first: serde_json::Value = serde_json::from_slice(&first.body).unwrap();
+        assert_eq!(first["accepted"], serde_json::json!(true));
+        assert_eq!(first["next_sequence"], serde_json::json!(1));
+        assert_eq!(first["stop"], serde_json::json!(false));
+
+        // The device's reply was lost, so it sends chunk 0 again. The runner
+        // already holds it: the answer says so, and nothing is appended.
+        let retry = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                5,
+                "cmd-vchunk-0b",
+                "POST",
+                &chunk_path,
+                &chunk(0, b"opus-one", false),
+            ),
+            2_200,
+        );
+        let retry: serde_json::Value = serde_json::from_slice(&retry.body).unwrap();
+        assert_eq!(retry["accepted"], serde_json::json!(false));
+        assert_eq!(retry["bytes"], serde_json::json!(8));
+
+        // An operator stops the stream. The device has not asked for anything
+        // since, so this is the moment nothing has told it yet.
+        api.store
+            .lock()
+            .unwrap()
+            .request_device_cancel(&command_id, 2_300)
+            .unwrap();
+
+        let second = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                6,
+                "cmd-vchunk-1",
+                "POST",
+                &chunk_path,
+                &chunk(1, b"opus-two", false),
+            ),
+            2_400,
+        );
+        let second: serde_json::Value = serde_json::from_slice(&second.body).unwrap();
+        assert_eq!(
+            second["stop"],
+            serde_json::json!(true),
+            "an operator's stop must reach the microphone on the next chunk"
+        );
+        // Still accepted: the audio already recorded is not thrown away just
+        // because someone asked for the stream to end.
+        assert_eq!(second["accepted"], serde_json::json!(true));
+
+        let close_path = format!("/v1/remote/device/voice/{session_id}/close");
+        let closed = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                7,
+                "cmd-vclose",
+                "POST",
+                &close_path,
+                br#"{"protocol_version":1}"#,
+            ),
+            2_500,
+        );
+        assert_eq!(closed.status, 200);
+        let closed: serde_json::Value = serde_json::from_slice(&closed.body).unwrap();
+        assert_eq!(closed["state"], serde_json::json!("closed"));
+        assert_eq!(closed["chunks"], serde_json::json!(2));
+
+        // Exactly the bytes that were recorded, once each, in order.
+        assert_eq!(
+            std::fs::read(super::super::voice::audio_path(
+                &api.paths.root,
+                &session_id
+            ))
+            .unwrap(),
+            b"opus-oneopus-two"
+        );
+
+        // A closed session takes nothing more.
+        let late = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                8,
+                "cmd-vchunk-late",
+                "POST",
+                &chunk_path,
+                &chunk(2, b"opus-three", false),
+            ),
+            2_600,
+        );
+        assert_eq!(late.status, 409);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The end-to-end shape task 06 is judged on: a device advertises, a

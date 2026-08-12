@@ -105,9 +105,14 @@ pub enum DeviceCapability {
     NotificationPost,
     ScreenCapture,
     AudioPlayback,
-    /// Reserved for the Talk surface. Present here so a pairing made now can
-    /// carry the grant, and so the intersection rules treat it like every
-    /// other physical capability; no command dispatches it yet.
+    /// A continuous microphone stream, rather than one bounded recording.
+    ///
+    /// Dispatched as a *control* command — "open the microphone for this
+    /// session" — whose audio never travels in the command's own result: the
+    /// device posts it in chunks to the voice routes while the command is
+    /// running, and the command's terminal report is the summary. That split is
+    /// why this is not reachable through the discrete `device_action` tool: the
+    /// tool's contract is one request, one answer, and a stream has neither.
     VoiceStream,
 }
 
@@ -964,6 +969,138 @@ impl DeviceCommandResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceCommandStartRequest {}
+
+// --- Voice streaming ------------------------------------------------------
+//
+// A `voice_stream` command opens a *session*; the audio arrives afterwards on
+// the two routes below, one chunk at a time, while the command is still
+// `running`. Keeping the audio off the command result is what makes the stream
+// bounded: a result is capped at 8 KiB and an artifact at the pairing's budget,
+// neither of which can hold minutes of microphone.
+
+/// Largest single chunk a device may post. A second of Opus is a few kilobytes;
+/// this is room for a device that batches badly, not for a file upload.
+pub const MAX_VOICE_CHUNK_BYTES: usize = 512 * 1024;
+/// Ceiling on one whole session's audio, whatever the device claims it will
+/// send. Reached, the session fails and the command fails with it.
+pub const MAX_VOICE_SESSION_BYTES: u64 = 32 * 1024 * 1024;
+/// Longest a stream may stay open. A microphone that is never closed because a
+/// phone went into a tunnel is exactly what this bounds.
+pub const MAX_VOICE_SESSION_MS: u64 = 10 * 60 * 1_000;
+/// Container formats a device may declare. Closed set: the bytes are stored
+/// verbatim and handed to whatever plays them later, so an unbounded media type
+/// would be an unbounded string in a filename-adjacent position.
+pub const VOICE_MEDIA_TYPES: &[&str] = &[
+    "audio/webm",
+    "audio/webm;codecs=opus",
+    "audio/ogg",
+    "audio/ogg;codecs=opus",
+    "audio/mp4",
+    "audio/wav",
+];
+
+/// `open -> closed | failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceSessionState {
+    Open,
+    Closed,
+    Failed,
+}
+
+impl VoiceSessionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        Ok(match value {
+            "open" => Self::Open,
+            "closed" => Self::Closed,
+            "failed" => Self::Failed,
+            other => return Err(format!("Unknown voice session state '{other}'")),
+        })
+    }
+}
+
+/// One chunk of a live stream.
+///
+/// `sequence` is what makes the append exactly-once over a link that drops: the
+/// runner accepts only the sequence it is expecting next, treats anything lower
+/// as a duplicate it already has, and refuses anything higher rather than
+/// writing a hole into the audio.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceChunkRequest {
+    pub protocol_version: u32,
+    pub sequence: u64,
+    pub audio_base64: String,
+    /// Declared on the first chunk and ignored afterwards — a session's
+    /// container cannot change halfway through it.
+    #[serde(default)]
+    pub media_type: Option<String>,
+    /// The device saying this is the last chunk. Advisory: `close` is what ends
+    /// a session, so a stream cut off mid-flight still closes on the runner's
+    /// own deadline.
+    #[serde(default)]
+    pub last: bool,
+}
+
+impl VoiceChunkRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.protocol_version != REMOTE_PROTOCOL_VERSION {
+            return Err(format!(
+                "Unsupported remote protocol version {}",
+                self.protocol_version
+            ));
+        }
+        // Base64 inflates by 4/3; checking the encoded length refuses an
+        // oversized chunk before decoding it.
+        if self.audio_base64.len() > MAX_VOICE_CHUNK_BYTES * 4 / 3 + 4 {
+            return Err(format!(
+                "A voice chunk may carry at most {MAX_VOICE_CHUNK_BYTES} bytes"
+            ));
+        }
+        if self.audio_base64.is_empty() {
+            return Err("A voice chunk carries no audio".to_string());
+        }
+        if let Some(media_type) = &self.media_type {
+            if !VOICE_MEDIA_TYPES.contains(&media_type.as_str()) {
+                return Err(format!("Unsupported voice media type '{media_type}'"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The device ending a stream. An `error` here closes the session `failed`,
+/// which is how a microphone that was denied halfway through is reported.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceCloseRequest {
+    pub protocol_version: u32,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl VoiceCloseRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.protocol_version != REMOTE_PROTOCOL_VERSION {
+            return Err(format!(
+                "Unsupported remote protocol version {}",
+                self.protocol_version
+            ));
+        }
+        if self.error.as_ref().is_some_and(|error| error.len() > 4_096) {
+            return Err("Voice session error text exceeds 4 KiB".to_string());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

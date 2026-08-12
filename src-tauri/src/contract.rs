@@ -45,7 +45,7 @@ use crate::http_route_registry::{
 /// * **minor**: anything additive — a new route, method, tool, or optional
 ///   parameter.
 /// * **patch**: descriptions and other non-structural wording.
-pub const CONTRACT_VERSION: &str = "1.3.0";
+pub const CONTRACT_VERSION: &str = "1.4.0";
 
 /// How long a surface stays after it is announced deprecated.
 ///
@@ -274,6 +274,22 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
         method: "POST",
         path: "/v1/remote/device/commands/{command_id}/result",
         gate: RemoteGate::SelfService,
+    },
+    // A live stream's audio. Unlike the routes above these carry a capability
+    // gate, because they are not self-service: the device is acting on a grant
+    // an operator made, and withdrawing `voice_stream` closes the microphone on
+    // the next chunk.
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/voice/{session_id}/chunk",
+        gate: RemoteGate::Capability("VoiceStream"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/voice/{session_id}/close",
+        gate: RemoteGate::Capability("VoiceStream"),
     },
     RemoteRouteSpec {
         plane: RemotePlane::Device,

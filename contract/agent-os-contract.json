@@ -1,5 +1,5 @@
 {
-  "contract_version": "1.3.0",
+  "contract_version": "1.4.0",
   "support_window_days": 180,
   "http_routes": [
     {
@@ -452,6 +452,18 @@
     },
     {
       "plane": "device",
+      "method": "POST",
+      "path": "/v1/remote/device/voice/{session_id}/chunk",
+      "gate": "capability:VoiceStream"
+    },
+    {
+      "plane": "device",
+      "method": "POST",
+      "path": "/v1/remote/device/voice/{session_id}/close",
+      "gate": "capability:VoiceStream"
+    },
+    {
+      "plane": "device",
       "method": "GET",
       "path": "/v1/remote/device/push/key",
       "gate": "self_service"
@@ -849,7 +861,7 @@
             "type": "string"
           },
           "action": {
-            "description": "device_info reads the device's own platform and capabilities. camera_capture takes one still. microphone_capture records for a bounded time. location_read takes one fix (never continuous tracking). notification_post shows a notification. screen_capture captures the screen with the device's own consent prompt. audio_playback speaks text aloud on the device.",
+            "description": "device_info reads the device's own platform and capabilities. camera_capture takes one still. microphone_capture records for a bounded time. location_read takes one fix (never continuous tracking). notification_post shows a notification. screen_capture captures the screen, and needs the device to have armed screen sharing first. audio_playback either plays a stored run artifact on the device or speaks text aloud.",
             "enum": [
               "device_info",
               "camera_capture",
@@ -859,6 +871,10 @@
               "screen_capture",
               "audio_playback"
             ],
+            "type": "string"
+          },
+          "artifact_id": {
+            "description": "audio_playback only: which audio artifact of that run to play.",
             "type": "string"
           },
           "body": {
@@ -881,8 +897,12 @@
             ],
             "type": "string"
           },
+          "run_id": {
+            "description": "audio_playback only: the run an audio artifact belongs to. The device fetches it over its own paired connection, so it also needs the read_artifacts grant.",
+            "type": "string"
+          },
           "text": {
-            "description": "audio_playback only: what to speak, up to 1024 characters.",
+            "description": "audio_playback only: what to speak, up to 1024 characters. Use this or run_id + artifact_id, never both.",
             "type": "string"
           },
           "title": {

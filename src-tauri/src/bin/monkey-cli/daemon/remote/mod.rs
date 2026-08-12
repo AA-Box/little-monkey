@@ -7,6 +7,8 @@ pub(crate) mod protocol;
 pub(crate) mod push;
 mod server;
 pub(crate) mod store;
+pub(crate) mod voice;
+pub(crate) mod watch;
 mod web;
 
 pub use desktop::DesktopControlRuntime;
@@ -83,6 +85,35 @@ pub enum RemoteCmd {
     },
     /// Ask for a queued or running command to be cancelled.
     DeviceCancel { command_id: String },
+    /// Open a live microphone stream on a paired device.
+    ///
+    /// Returns as soon as the stream is queued; the audio arrives while it
+    /// runs. `voice-stop` ends it early, and the runner closes it on its own
+    /// deadline whatever the device does.
+    VoiceStart {
+        #[arg(long)]
+        device_id: Option<String>,
+        /// How long to listen for, in milliseconds.
+        #[arg(long, default_value_t = voice::DEFAULT_STREAM_MS)]
+        duration_ms: u64,
+    },
+    /// Stop a live stream. The microphone closes on the device's next chunk.
+    VoiceStop { session_id: String },
+    /// Recent voice streams and how much audio each one holds.
+    VoiceList {
+        #[arg(long)]
+        device_id: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Copy one stream's audio out of app-private state.
+    VoiceSave {
+        session_id: String,
+        #[arg(long, short)]
+        output: PathBuf,
+    },
     /// Turn on push. Little Monkey ships no push project, no key and no relay:
     /// this is your configuration, stored in app-private state on this machine.
     ///
@@ -333,9 +364,15 @@ pub struct RemoteDeviceActionArgs {
     pub title: Option<String>,
     #[arg(long)]
     pub body: Option<String>,
-    /// Text for audio_playback to speak.
+    /// Text for audio_playback to speak. Use this or --run-id/--artifact-id.
     #[arg(long)]
     pub text: Option<String>,
+    /// The run an audio artifact belongs to, for audio_playback.
+    #[arg(long = "run-id")]
+    pub run_id: Option<String>,
+    /// Which audio artifact of that run to play.
+    #[arg(long = "artifact-id")]
+    pub artifact_id: Option<String>,
     #[arg(long = "wait-ms", default_value_t = 60_000)]
     pub wait_ms: u64,
     #[arg(long)]
@@ -569,6 +606,85 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
                 } else {
                     "Nothing was sent: push is not configured here, or that device has not registered."
                 }
+            );
+        }
+        RemoteCmd::VoiceStart {
+            device_id,
+            duration_ms,
+        } => {
+            let record = voice::start(
+                &paths,
+                device_id.as_deref(),
+                *duration_ms,
+                None,
+                None,
+                now_ms()?,
+            )
+            .await?;
+            println!(
+                "Listening on {} as {} (command {}). The microphone opens when the device takes \
+                 the command; stop it early with `monkey-cli daemon remote voice-stop {}`.",
+                record.device_id, record.session_id, record.command_id, record.session_id
+            );
+        }
+        RemoteCmd::VoiceStop { session_id } => {
+            let record = voice::stop(&paths, session_id, now_ms()?)?;
+            println!(
+                "{} is {} with {} chunks ({} bytes).{}",
+                record.session_id,
+                record.state.as_str(),
+                record.next_sequence,
+                record.bytes,
+                if record.state == protocol::VoiceSessionState::Open {
+                    " The device is still holding the microphone; it closes on its next chunk."
+                } else {
+                    ""
+                }
+            );
+        }
+        RemoteCmd::VoiceList {
+            device_id,
+            limit,
+            json,
+        } => {
+            let sessions = voice::sessions(&paths, device_id.as_deref(), *limit)?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &sessions.iter().map(voice::session_json).collect::<Vec<_>>()
+                    )
+                    .map_err(|error| error.to_string())?
+                );
+            } else if sessions.is_empty() {
+                println!("No voice streams have been opened on this machine.");
+            } else {
+                for record in &sessions {
+                    println!(
+                        "{}  {:<7}  {} chunks  {} bytes  {}",
+                        record.session_id,
+                        record.state.as_str(),
+                        record.next_sequence,
+                        record.bytes,
+                        record.device_id
+                    );
+                }
+            }
+        }
+        RemoteCmd::VoiceSave { session_id, output } => {
+            let record = voice::session(&paths, session_id)?
+                .ok_or_else(|| format!("Unknown voice session '{session_id}'"))?;
+            let source = voice::audio_path(&paths.root, &record.session_id);
+            if !source.exists() {
+                return Err(format!("{session_id} has no audio yet"));
+            }
+            std::fs::copy(&source, output)
+                .map_err(|error| format!("Could not write {}: {error}", output.display()))?;
+            println!(
+                "Wrote {} bytes of {} to {}.",
+                record.bytes,
+                record.media_type.as_deref().unwrap_or("audio"),
+                output.display()
             );
         }
         RemoteCmd::DeviceCancel { command_id } => {
@@ -1431,6 +1547,8 @@ async fn device_action(paths: &DaemonPaths, args: &RemoteDeviceActionArgs) -> Re
         ("title", args.title.clone()),
         ("body", args.body.clone()),
         ("text", args.text.clone()),
+        ("run_id", args.run_id.clone()),
+        ("artifact_id", args.artifact_id.clone()),
     ] {
         if let Some(value) = value {
             arguments.insert(key.to_string(), serde_json::Value::String(value));

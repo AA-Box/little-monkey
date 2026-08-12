@@ -12,7 +12,8 @@
 use std::collections::BTreeSet;
 
 use super::protocol::{
-    effective_capabilities, DeviceCapability, DeviceCommandState, MAX_DEVICE_COMMAND_ARG_BYTES,
+    effective_capabilities, validate_id, DeviceCapability, DeviceCommandState,
+    MAX_DEVICE_COMMAND_ARG_BYTES,
 };
 use super::store::{DeviceCommandRecord, DeviceCommandRequest, RemoteStore};
 use crate::daemon::store::DaemonPaths;
@@ -73,54 +74,87 @@ pub fn validate_arguments(
     arguments: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let field = |name: &str| arguments.get(name).and_then(|value| value.as_str());
-    let normalized = match capability {
-        DeviceCapability::DeviceInfo | DeviceCapability::ScreenCapture => serde_json::json!({}),
-        DeviceCapability::CameraCapture => {
-            let position = field("position").unwrap_or("back");
-            if !matches!(position, "front" | "back") {
-                return Err("Camera position must be 'front' or 'back'".to_string());
+    let normalized =
+        match capability {
+            DeviceCapability::DeviceInfo | DeviceCapability::ScreenCapture => serde_json::json!({}),
+            DeviceCapability::CameraCapture => {
+                let position = field("position").unwrap_or("back");
+                if !matches!(position, "front" | "back") {
+                    return Err("Camera position must be 'front' or 'back'".to_string());
+                }
+                serde_json::json!({ "position": position })
             }
-            serde_json::json!({ "position": position })
-        }
-        DeviceCapability::MicrophoneCapture => {
-            let duration_ms = arguments
-                .get("duration_ms")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(10_000);
-            if duration_ms == 0 || duration_ms > MAX_RECORDING_MS {
-                return Err(format!(
-                    "Recording duration must be between 1 ms and {MAX_RECORDING_MS} ms"
-                ));
+            DeviceCapability::MicrophoneCapture => {
+                let duration_ms = arguments
+                    .get("duration_ms")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(10_000);
+                if duration_ms == 0 || duration_ms > MAX_RECORDING_MS {
+                    return Err(format!(
+                        "Recording duration must be between 1 ms and {MAX_RECORDING_MS} ms"
+                    ));
+                }
+                serde_json::json!({ "duration_ms": duration_ms })
             }
-            serde_json::json!({ "duration_ms": duration_ms })
-        }
-        DeviceCapability::LocationRead => {
-            let accuracy = field("accuracy").unwrap_or("coarse");
-            if !matches!(accuracy, "coarse" | "precise") {
-                return Err("Location accuracy must be 'coarse' or 'precise'".to_string());
+            DeviceCapability::LocationRead => {
+                let accuracy = field("accuracy").unwrap_or("coarse");
+                if !matches!(accuracy, "coarse" | "precise") {
+                    return Err("Location accuracy must be 'coarse' or 'precise'".to_string());
+                }
+                serde_json::json!({ "accuracy": accuracy })
             }
-            serde_json::json!({ "accuracy": accuracy })
-        }
-        DeviceCapability::NotificationPost => {
-            let title = field("title")
-                .map(str::trim)
-                .filter(|value| !value.is_empty() && value.len() <= 128)
-                .ok_or("A notification needs a 'title' of 1-128 characters")?;
-            let body = field("body")
-                .map(str::trim)
-                .filter(|value| value.len() <= 512)
-                .ok_or("A notification 'body' may be at most 512 characters")?;
-            serde_json::json!({ "title": title, "body": body })
-        }
-        DeviceCapability::AudioPlayback => {
-            let text = field("text")
-                .map(str::trim)
-                .filter(|value| !value.is_empty() && value.len() <= 1_024)
-                .ok_or("Audio playback needs 'text' of 1-1024 characters to speak")?;
-            serde_json::json!({ "text": text })
-        }
-        other => return Err(format!("'{other:?}' is not a discrete device command")),
-    };
+            DeviceCapability::NotificationPost => {
+                let title = field("title")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && value.len() <= 128)
+                    .ok_or("A notification needs a 'title' of 1-128 characters")?;
+                let body = field("body")
+                    .map(str::trim)
+                    .filter(|value| value.len() <= 512)
+                    .ok_or("A notification 'body' may be at most 512 characters")?;
+                serde_json::json!({ "title": title, "body": body })
+            }
+            // Two shapes, because "play this" and "say this" are different asks and
+            // collapsing them would mean one of the two is a lie. An artifact plays
+            // the recorded bytes; `text` is spoken by the device's own synthesizer.
+            // Never both: a device would have to choose, and whichever it chose
+            // would be a surprise.
+            DeviceCapability::AudioPlayback => {
+                let artifact_id = field("artifact_id")
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty());
+                let run_id = field("run_id").map(str::trim).filter(|v| !v.is_empty());
+                let text = field("text")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && value.len() <= 1_024);
+                match (artifact_id, run_id, text) {
+                    (Some(_), Some(_), Some(_)) => {
+                        return Err(
+                            "Audio playback takes either an artifact to play or 'text' to speak, \
+                         not both"
+                                .to_string(),
+                        )
+                    }
+                    (Some(artifact_id), Some(run_id), None) => {
+                        validate_id(artifact_id)?;
+                        validate_id(run_id)?;
+                        serde_json::json!({ "artifact_id": artifact_id, "run_id": run_id })
+                    }
+                    (Some(_), None, _) | (None, Some(_), _) => return Err(
+                        "Playing an artifact needs both 'run_id' and 'artifact_id' — the device \
+                         reads it back through the run it belongs to"
+                            .to_string(),
+                    ),
+                    (None, None, Some(text)) => serde_json::json!({ "text": text }),
+                    (None, None, None) => return Err(
+                        "Audio playback needs either 'text' of 1-1024 characters to speak, or a \
+                         'run_id' and 'artifact_id' to play"
+                            .to_string(),
+                    ),
+                }
+            }
+            other => return Err(format!("'{other:?}' is not a discrete device command")),
+        };
     if serde_json::to_vec(&normalized)
         .map(|encoded| encoded.len())
         .unwrap_or(usize::MAX)
@@ -233,6 +267,25 @@ pub async fn dispatch(
     let wait_ms = request.wait_ms.clamp(1_000, MAX_WAIT_MS);
     let mut store = RemoteStore::open(&paths.root)?;
     let device_id = resolve_target(&store, request.capability, request.device_id.as_deref())?;
+    // Playing a stored artifact means the device fetches it over the ordinary
+    // signed artifact route, under the run scope it was already paired with.
+    // Refused here rather than left to fail on the phone, because "the speaker
+    // stayed silent" is a poor way to learn a grant is missing. The run scope
+    // itself is not re-checked here: that is the artifact route's job, and a
+    // second copy of it could only ever disagree.
+    if arguments.get("artifact_id").is_some()
+        && !store.device(&device_id)?.is_some_and(|device| {
+            device
+                .capabilities
+                .contains(&DeviceCapability::ReadArtifacts)
+        })
+    {
+        return Err(
+            "Playing a stored artifact also requires the read_artifacts grant, which this device \
+             does not have"
+                .to_string(),
+        );
+    }
     let queued = store.enqueue_device_command(
         &DeviceCommandRequest {
             device_id,

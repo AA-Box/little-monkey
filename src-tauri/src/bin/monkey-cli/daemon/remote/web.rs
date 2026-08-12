@@ -217,6 +217,64 @@ mod tests {
         );
     }
 
+    /// The three things this client used to only pretend to do.
+    ///
+    /// Each assertion pins a *capability the runner will now dispatch*, so the
+    /// grant and the implementation cannot drift apart again:
+    ///
+    /// - `voice_stream` was advertised as `() => false`, which meant a grant an
+    ///   operator could make and a command no client would ever take. It is a
+    ///   real recorder now, and this fails if it goes back to a stub.
+    /// - `screen_capture` prompted on every single command, so an unattended
+    ///   capture was impossible and the honest OS permission was never
+    ///   "granted". One armed display stream replaces both.
+    /// - `audio_playback` could only speak a sentence. It plays real audio now,
+    ///   fetched over the artifact route that already exists.
+    #[test]
+    fn the_client_implements_every_physical_capability_it_advertises() {
+        let javascript = String::from_utf8(
+            asset("GET", "/v1/remote/ui/app.js")
+                .expect("javascript asset")
+                .body,
+        )
+        .unwrap();
+
+        // A live stream: recorder, sequenced chunks, and a close that always
+        // runs. `stopTracks` in the `finally` is what closes the microphone
+        // when the stream fails rather than ends.
+        assert!(javascript.contains("async function streamVoice("));
+        assert!(javascript.contains("new MediaRecorder(stream)"));
+        assert!(javascript.contains("/voice/${encodeURIComponent(sessionId)}/chunk"));
+        assert!(javascript.contains("/voice/${encodeURIComponent(sessionId)}/close"));
+        // The runner owns the sequence counter; a client that invented its own
+        // would double-append after a dropped reply.
+        assert!(javascript.contains("sequence = Number(answer.next_sequence"));
+        // The stop signal rides the reply to a chunk, so a cancellation needs
+        // no second poll to be seen.
+        assert!(javascript.contains("if (answer.stop === true)"));
+        assert!(
+            !javascript.contains("voice_stream: () => false"),
+            "voice_stream is grantable and dispatched; advertising it as unsupported \
+             makes the grant a dead letter"
+        );
+
+        // One armed screen share, reused, and honestly reported.
+        assert!(javascript.contains("function screenShareIsLive()"));
+        assert!(javascript.contains("async function armScreenShare()"));
+        assert!(javascript.contains("track.addEventListener(\"ended\""));
+        assert!(
+            javascript.contains("return screenShareIsLive() ? \"granted\" : \"undetermined\""),
+            "the OS permission reported for screen capture must follow the armed stream"
+        );
+
+        // Real audio, through the artifact route that already exists rather
+        // than a second way to move bytes to a device.
+        assert!(javascript.contains("async function playArtifact("));
+        assert!(javascript.contains("/artifacts/${encodeURIComponent(artifactId)}"));
+        assert!(javascript.contains("new Audio(url)"));
+        assert!(javascript.contains("URL.revokeObjectURL(url)"));
+    }
+
     /// Offline means read-only. A device showing cached runs must not offer
     /// controls whose effect it cannot see, and must never buffer them for
     /// replay on reconnect.

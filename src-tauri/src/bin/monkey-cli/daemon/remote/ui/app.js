@@ -29,18 +29,18 @@ const DEVICE_CAPABILITIES = {
   location_read: () => Boolean(navigator.geolocation),
   notification_post: () => "Notification" in window,
   screen_capture: () => Boolean(navigator.mediaDevices?.getDisplayMedia),
-  audio_playback: () => Boolean(window.speechSynthesis),
-  // Reserved for the Talk surface; this build has no stream implementation, so
-  // it is never advertised and therefore never effective.
-  voice_stream: () => false,
+  // Either half is enough to be useful: an artifact is played back through the
+  // audio element, and `text` is spoken by the synthesizer.
+  audio_playback: () => Boolean(window.speechSynthesis) || typeof Audio === "function",
+  voice_stream: () => Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder),
 };
 
 // Which Permissions API name answers for each capability, where one does.
-// Screen capture has none by design — the OS asks at the moment of capture —
-// so it is reported undetermined until a capture proves otherwise.
 const PERMISSION_NAMES = {
   camera_capture: "camera",
   microphone_capture: "microphone",
+  // A stream is the microphone, so it is the microphone's permission.
+  voice_stream: "microphone",
   location_read: "geolocation",
 };
 
@@ -51,6 +51,9 @@ const LEASE_WAIT_MS = 25_000;
 // Bounds on what this client will do regardless of what it is asked, so a
 // runner that has been tampered with cannot hold the camera open.
 const MAX_RECORDING_MS = 300_000;
+// The runner's own stream ceiling, restated here so a tampered runner cannot
+// hold this microphone open past it.
+const MAX_STREAM_MS = 10 * 60 * 1_000;
 const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
 const TERMINAL_STATUSES = new Set([
   "succeeded",
@@ -70,6 +73,10 @@ const state = {
   activeCommand: null,
   commandLoopRunning: false,
   pushSubscribed: false,
+  // The armed display stream. Held so a screen capture needs no second consent
+  // prompt; while it is null, screen capture is reported as not permitted and
+  // the runner will not queue one.
+  screenStream: null,
   // True when the runs on screen came from the offline cache rather than the
   // runner. Every side-effecting control is disabled while this is set.
   stale: false,
@@ -132,6 +139,8 @@ const ui = Object.fromEntries(
     "staleBanner",
     "pushButton",
     "pushStatus",
+    "screenShareButton",
+    "screenShareStatus",
     "connectionDot",
     "connectionText",
     "toast",
@@ -1297,6 +1306,27 @@ function bindEvents() {
     }
   });
 
+  ui.screenShareButton?.addEventListener("click", async () => {
+    setButtonBusy(ui.screenShareButton, true, "Working…");
+    try {
+      if (screenShareIsLive()) {
+        disarmScreenShare();
+        showToast("Screen capture is off. The runner can no longer capture this screen.");
+      } else {
+        await armScreenShare();
+        showToast("Screen capture is on until you stop sharing.");
+      }
+      // The runner's view of what is permitted has just changed, and it is the
+      // runner that decides whether a capture is effective.
+      await advertiseDevice();
+    } catch (error) {
+      handleError(error, "Screen sharing could not be changed");
+    } finally {
+      setButtonBusy(ui.screenShareButton, false);
+      renderScreenShare();
+    }
+  });
+
   ui.killButton.addEventListener("click", () => void engageKillSwitch());
   ui.artifactForm.addEventListener("submit", fetchArtifact);
   ui.forgetButton.addEventListener("click", async () => {
@@ -1363,6 +1393,17 @@ function parsePairingCode(value) {
 // --- What this device is --------------------------------------------------
 
 async function readOsPermission(capability) {
+  // Screen capture has no Permissions API name: a browser asks at the moment of
+  // capture and forgets afterwards, which would mean a prompt on every single
+  // command. Holding one armed display stream is what replaces that — while it
+  // is live the permission genuinely is granted, and the moment the user stops
+  // sharing (from this page or from the browser's own bar) it genuinely is not.
+  // Reporting it this way is what makes "effective" tell the truth: an unarmed
+  // device is not asked to capture a screen it would have to interrupt someone
+  // for.
+  if (capability === "screen_capture") {
+    return screenShareIsLive() ? "granted" : "undetermined";
+  }
   const name = PERMISSION_NAMES[capability];
   if (!name) return "undetermined";
   if (!navigator.permissions?.query) return "undetermined";
@@ -1476,13 +1517,71 @@ async function captureStill(position) {
   }
 }
 
-async function captureScreen() {
+// --- The armed screen share -----------------------------------------------
+//
+// One display stream, held open by the user's explicit choice, reused by every
+// screen capture until they stop it. Without this each command would open the
+// browser's share picker again — which means a capture only ever happens while
+// someone is looking at the phone, and an unattended one is impossible.
+//
+// It is not a way around consent: the browser still asks once, the page still
+// shows what is shared, and the browser's own "stop sharing" control ends it
+// from outside this page. That is why the `ended` listener below re-advertises
+// rather than trying to reacquire — the honest report is that the permission is
+// gone.
+
+function screenShareIsLive() {
+  return Boolean(state.screenStream?.getVideoTracks?.().some((track) => track.readyState === "live"));
+}
+
+async function armScreenShare() {
+  if (screenShareIsLive()) return true;
   const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
-  try {
-    return await frameFromStream(stream, "image/png", undefined);
-  } finally {
-    stopTracks(stream);
+  state.screenStream = stream;
+  for (const track of stream.getVideoTracks()) {
+    track.addEventListener("ended", () => {
+      // Stopped from the browser's own sharing bar. Drop it and tell the runner
+      // immediately, so a queued capture fails with "not permitted" instead of
+      // interrupting someone with a fresh prompt.
+      if (state.screenStream === stream) state.screenStream = null;
+      renderScreenShare();
+      advertiseDevice().catch(() => {});
+    });
   }
+  renderScreenShare();
+  return true;
+}
+
+function disarmScreenShare() {
+  stopTracks(state.screenStream);
+  state.screenStream = null;
+  renderScreenShare();
+}
+
+function renderScreenShare() {
+  if (!ui.screenShareButton) return;
+  const live = screenShareIsLive();
+  const supported = DEVICE_CAPABILITIES.screen_capture();
+  ui.screenShareButton.hidden = !supported;
+  ui.screenShareButton.textContent = live ? "Stop screen capture" : "Allow screen capture";
+  if (ui.screenShareStatus) {
+    ui.screenShareStatus.textContent = supported
+      ? live
+        ? "The runner may capture this screen until you stop sharing."
+        : "Screen capture stays unavailable to the runner until you share once."
+      : "This browser cannot capture its screen.";
+  }
+}
+
+async function captureScreen() {
+  if (!screenShareIsLive()) {
+    // Never a silent prompt: the runner was told this was not permitted, and
+    // this path exists only if that report raced with the user stopping.
+    throw new Error("Screen sharing is not armed on this device");
+  }
+  // The armed stream is deliberately NOT stopped afterwards — it is the whole
+  // reason a second capture needs no second prompt.
+  return await frameFromStream(state.screenStream, "image/png", undefined);
 }
 
 async function frameFromStream(stream, mediaType, quality) {
@@ -1587,6 +1686,173 @@ function speak(text) {
   });
 }
 
+function base64ToBytes(encoded) {
+  const binary = atob(String(encoded || ""));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+// Plays a stored artifact rather than speaking a sentence about it.
+//
+// The bytes are fetched over the ordinary signed artifact route, under the run
+// scope this device was already paired with — there is no second way in, and a
+// device without `read_artifacts` cannot reach one at all.
+async function playArtifact(runId, artifactId) {
+  const artifact = await signedRequest(
+    "GET",
+    `/v1/remote/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}`,
+  );
+  const mediaType = String(artifact.media_type || "audio/mpeg");
+  if (!mediaType.startsWith("audio/")) {
+    throw new Error(`'${artifact.name || artifactId}' is ${mediaType}, which is not audio`);
+  }
+  const blob = new Blob([base64ToBytes(artifact.content_base64)], { type: mediaType });
+  const url = URL.createObjectURL(blob);
+  const audio = new Audio(url);
+  try {
+    await audio.play();
+    // Polled rather than awaiting `ended` alone, so a cancellation reaches a
+    // long recording instead of waiting it out.
+    while (!audio.ended && !state.activeCommand?.cancelled) {
+      await delay(200);
+    }
+    if (!audio.ended) audio.pause();
+    return {
+      result: {
+        played: audio.ended,
+        artifact_id: artifactId,
+        media_type: mediaType,
+        bytes: artifact.size_bytes ?? null,
+        cancelled: Boolean(state.activeCommand?.cancelled),
+      },
+    };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function playAudio(argumentsValue) {
+  if (argumentsValue.artifact_id && argumentsValue.run_id) {
+    return await playArtifact(argumentsValue.run_id, argumentsValue.artifact_id);
+  }
+  if (!window.speechSynthesis) {
+    throw new Error("This device cannot speak text");
+  }
+  return await speak(argumentsValue.text);
+}
+
+// --- A live microphone stream ----------------------------------------------
+//
+// The control command stays `running` for as long as the microphone is open;
+// the audio does not travel in its result but in chunks, to the session the
+// command named. Two things end it: the duration it was given, and the runner
+// answering `stop: true` — which arrives on the reply to a chunk this device is
+// posting anyway, so a cancellation needs no second poll to be noticed.
+
+// Containers the runner accepts. A recorder that reports anything else has its
+// type normalized to the family it belongs to rather than being refused, since
+// what matters to the runner is what the bytes are, not how a browser spells it.
+const VOICE_MEDIA_TYPES = new Set([
+  "audio/webm",
+  "audio/webm;codecs=opus",
+  "audio/ogg",
+  "audio/ogg;codecs=opus",
+  "audio/mp4",
+  "audio/wav",
+]);
+
+function voiceMediaType(recorded) {
+  const value = String(recorded || "audio/webm").replace(/\s+/g, "");
+  if (VOICE_MEDIA_TYPES.has(value)) return value;
+  for (const family of ["audio/webm", "audio/ogg", "audio/mp4", "audio/wav"]) {
+    if (value.startsWith(family)) return family;
+  }
+  return "audio/webm";
+}
+
+async function streamVoice(argumentsValue) {
+  const sessionId = String(argumentsValue.session_id || "");
+  if (!validId(sessionId)) throw new Error("The runner did not name a voice session");
+  const durationMs = Math.min(Math.max(Number(argumentsValue.duration_ms) || 60_000, 1_000), MAX_STREAM_MS);
+  const chunkMs = Math.min(Math.max(Number(argumentsValue.chunk_ms) || 1_000, 250), 5_000);
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  const recorder = new MediaRecorder(stream);
+  const mediaType = voiceMediaType(recorder.mimeType);
+  const pending = [];
+  recorder.ondataavailable = (event) => {
+    if (event.data?.size) pending.push(event.data);
+  };
+  let sequence = 0;
+  let bytes = 0;
+  let stopped = null;
+
+  // One chunk at a time, in order: the runner accepts only the sequence it is
+  // expecting, so uploads must not overlap.
+  const drain = async () => {
+    while (pending.length > 0 && !stopped) {
+      const blob = pending.shift();
+      const answer = await signedRequest(
+        "POST",
+        `/v1/remote/device/voice/${encodeURIComponent(sessionId)}/chunk`,
+        {
+          protocol_version: PROTOCOL_VERSION,
+          sequence,
+          audio_base64: await blobToBase64(blob),
+          media_type: sequence === 0 ? mediaType : null,
+          last: false,
+        },
+      );
+      // The runner is the counter's authority; following its answer is what
+      // makes a retry after a dropped reply land on the right sequence.
+      sequence = Number(answer.next_sequence ?? sequence + 1);
+      bytes = Number(answer.bytes ?? bytes + blob.size);
+      if (answer.stop === true) stopped = "The runner stopped the stream";
+    }
+  };
+
+  const started = Date.now();
+  try {
+    recorder.start(chunkMs);
+    while (Date.now() - started < durationMs && !stopped && !state.activeCommand?.cancelled) {
+      await delay(Math.min(chunkMs, 500));
+      await drain();
+    }
+    if (state.activeCommand?.cancelled) stopped = "Cancelled on the device";
+    recorder.stop();
+    // One last slice is emitted by `stop()`; give it a moment to arrive.
+    await delay(250);
+    // Drained even when stopping, so the last second of audio is not lost —
+    // `stopped` is cleared for exactly this and then restored.
+    const reason = stopped;
+    stopped = null;
+    await drain();
+    stopped = reason;
+  } finally {
+    // Always: a microphone left open after a failed stream is the failure that
+    // matters here.
+    stopTracks(stream);
+    try {
+      await signedRequest("POST", `/v1/remote/device/voice/${encodeURIComponent(sessionId)}/close`, {
+        protocol_version: PROTOCOL_VERSION,
+        error: null,
+      });
+    } catch {
+      // The runner closes it on its own deadline; nothing here can do better.
+    }
+  }
+  return {
+    result: {
+      session_id: sessionId,
+      chunks: sequence,
+      bytes,
+      media_type: mediaType,
+      duration_ms: Date.now() - started,
+      stopped_because: stopped || "the requested duration elapsed",
+    },
+  };
+}
+
 // Runs one leased command and returns the terminal report to send back.
 async function performCommand(command) {
   const argumentsValue = command.arguments || {};
@@ -1610,7 +1876,9 @@ async function performCommand(command) {
     case "notification_post":
       return { outcome: "succeeded", result: (await postNotification(argumentsValue)).result };
     case "audio_playback":
-      return { outcome: "succeeded", result: (await speak(argumentsValue.text)).result };
+      return { outcome: "succeeded", result: (await playAudio(argumentsValue)).result };
+    case "voice_stream":
+      return { outcome: "succeeded", result: (await streamVoice(argumentsValue)).result };
     default:
       // Honest refusal rather than a silent success: the runner records the
       // reason and the waiting run reads it.
@@ -1937,6 +2205,7 @@ async function initialize() {
     handleError(error, "This device could not report what it can do");
   }
   void refreshPushState();
+  renderScreenShare();
   // Deliberately not awaited: the loop runs for the life of the page.
   void runCommandLoop();
 }

@@ -339,7 +339,7 @@ export const TOOLS: ToolDef[] = [
               'audio_playback',
             ],
             description:
-              'device_info reads the device\'s own platform and capabilities. camera_capture takes one still. microphone_capture records for a bounded time. location_read takes one fix (never continuous tracking). notification_post shows a notification. screen_capture captures the screen with the device\'s own consent prompt. audio_playback speaks text aloud on the device.',
+              'device_info reads the device\'s own platform and capabilities. camera_capture takes one still. microphone_capture records for a bounded time. location_read takes one fix (never continuous tracking). notification_post shows a notification. screen_capture captures the screen, and needs the device to have armed screen sharing first. audio_playback either plays a stored run artifact on the device or speaks text aloud.',
           },
           device_id: {
             type: 'string',
@@ -365,7 +365,17 @@ export const TOOLS: ToolDef[] = [
           body: { type: 'string', description: 'notification_post only: up to 512 characters.' },
           text: {
             type: 'string',
-            description: 'audio_playback only: what to speak, up to 1024 characters.',
+            description:
+              'audio_playback only: what to speak, up to 1024 characters. Use this or run_id + artifact_id, never both.',
+          },
+          run_id: {
+            type: 'string',
+            description:
+              'audio_playback only: the run an audio artifact belongs to. The device fetches it over its own paired connection, so it also needs the read_artifacts grant.',
+          },
+          artifact_id: {
+            type: 'string',
+            description: 'audio_playback only: which audio artifact of that run to play.',
           },
           wait_ms: {
             type: 'integer',

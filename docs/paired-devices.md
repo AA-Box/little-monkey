@@ -40,8 +40,9 @@ None implies another. The one dependency is that `voice_stream` also requires
 recording, and without the rule, withdrawing `microphone_capture` would leave
 the microphone reachable.
 
-`voice_stream` is reserved for the Talk surface: it can be granted now, but no
-discrete command dispatches it.
+`voice_stream` is not reachable through `device_action`, and that is not a gap:
+a discrete command is one request and one answer, and a stream has neither. It
+has its own commands — see below.
 
 ## Granting
 
@@ -77,6 +78,45 @@ monkey daemon remote device-action camera_capture --position front --wait-ms 300
 Both go through the ordinary permission gate, and both are validated on the
 runner — a device build with a lenient parser cannot be talked into a
 ten-minute recording.
+
+`audio_playback` takes either text for the device to speak, or a stored run
+artifact for it to play:
+
+```bash
+monkey daemon remote device-action audio_playback --text "the build is green"
+monkey daemon remote device-action audio_playback --run-id <run> --artifact-id <artifact>
+```
+
+Playing an artifact means the device fetches it over the ordinary signed
+artifact route, under the run scope it was already paired with — so it also
+needs the `read_artifacts` grant, and there is no second way to move bytes onto
+a device.
+
+## Listening: voice streams
+
+A stream is not a command with a large answer, so it is not one here. The queue
+carries the *control* command — "open the microphone for this session" — and the
+audio arrives on its own routes, chunk by chunk, while that command runs.
+
+```bash
+monkey daemon remote voice-start --duration-ms 30000
+monkey daemon remote voice-list
+monkey daemon remote voice-stop <session-id>
+monkey daemon remote voice-save <session-id> --output room.webm
+```
+
+`voice-stop` cancels the control command; the device learns it was stopped from
+the answer to the next chunk it posts, closes the microphone, and closes the
+session itself. "The runner stopped listening" and "the microphone is closed"
+are different statements, and only the device can make the second one.
+
+Chunks carry a sequence number, so a phone on a bad connection that re-sends one
+is told the runner already has it rather than having the audio appended twice.
+The runner also closes a stream on its own deadline, and fails the control
+command with the effect recorded as unproven — a device that walked into a
+tunnel leaves a closed session behind, not an open one.
+
+There is no transcription here. The audio is stored as audio.
 
 ## Exactly once
 
@@ -143,12 +183,20 @@ one exception, because an alert you cannot identify is not actionable.
 A push grants nothing: the woken device still makes an ordinary signed request
 to learn or do anything.
 
-Two things raise a notification today: queueing a device command wakes the
-target device (without it, a phone with its screen off never reconnects to take
-the command), and revoking a device tells the devices that still work. Approval
-and run-completion notifications need a daemon-side watcher on the run event
-stream, which does not exist yet — the payload kinds are defined and the
-delivery path is real, but nothing raises them.
+What raises one:
+
+* A run stops for an approval, finishes, or fails. The daemon watches its own
+  job table for these, so a transition raises its notification whichever code
+  path caused it — the scheduler, a reporting child, or the crash reconciler.
+  A finished mobile chat turn says "new response" rather than "run finished".
+* A device command is queued, which wakes the target device — without it, a
+  phone with its screen off never reconnects to take the command.
+* A device is revoked, which tells the devices that still work.
+
+Notifications follow the edge, not the level: the same waiting approval seen on
+every poll wakes a phone once, and a daemon restart does not re-send what it
+already sent. A machine with no device registered for push decides nothing and
+reads no keys.
 
 ## What the Security Doctor checks
 
@@ -160,9 +208,11 @@ lock screen.
 ## Limits
 
 * The bundled mobile client is the browser controller the runner serves. It uses
-  public web platform APIs, so what it can do is what the browser exposes:
-  `screen_capture` needs the browser's own consent prompt every time, and
-  `audio_playback` speaks text rather than playing an arbitrary audio file.
+  public web platform APIs, so what it can do is what the browser exposes.
+  `screen_capture` needs the device to arm screen sharing once — the browser
+  asks then, and the runner treats the OS permission as granted only while that
+  share is live, so a capture never interrupts anyone with a fresh prompt and
+  an unarmed device is simply not asked.
 * Location is a single fix. There is no continuous background tracking, by
   construction — the client never registers a watch.
 * An artifact is bounded by the pairing's artifact budget and by the device's own
