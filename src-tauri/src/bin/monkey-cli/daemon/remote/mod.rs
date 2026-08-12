@@ -3,10 +3,10 @@ mod client;
 mod desktop;
 pub(crate) mod device;
 pub(crate) mod migrate;
-mod protocol;
+pub(crate) mod protocol;
 pub(crate) mod push;
 mod server;
-mod store;
+pub(crate) mod store;
 mod web;
 
 pub use desktop::DesktopControlRuntime;
