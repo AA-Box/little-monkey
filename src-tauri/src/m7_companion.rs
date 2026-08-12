@@ -1150,6 +1150,145 @@ pub async fn m7_transcribe_audio(
     })
 }
 
+/// Whether this machine can turn call audio into text at all.
+///
+/// Answering the phone with no transcription backend configured is a feature
+/// that looks enabled and does nothing: the caller talks, and every turn is
+/// dropped. Callers of the telephony surface ask this so they can say so
+/// before somebody discovers it on a live call.
+pub fn call_speech_readiness(app_data_dir: &Path) -> Result<(), String> {
+    let voice = M7CompanionState::production(app_data_dir)?.config()?.voice;
+    match voice.backend {
+        TranscriptionBackendKind::LocalWhisper => {
+            if voice
+                .whisper_binary
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+                || voice
+                    .whisper_model
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                return Err(
+                    "Local transcription has no whisper binary or model configured, so nothing said on a call can be understood."
+                        .to_string(),
+                );
+            }
+        }
+        TranscriptionBackendKind::Provider => {
+            if voice.provider_id.as_deref().unwrap_or_default().is_empty() {
+                return Err(
+                    "Transcription is set to a hosted provider, but no provider is chosen, so nothing said on a call can be understood."
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Transcribe an audio file with the operator's own configured backend.
+///
+/// The entry point for callers outside the desktop command layer — today the
+/// phone-call pipeline in the daemon. It deliberately goes through the same
+/// [`M7CompanionState`] and the same `transcribe_path` as the desktop does: a
+/// phone call must not get a speech stack of its own, or an operator who
+/// configured local Whisper would find their calls quietly sent to a hosted
+/// provider instead.
+///
+/// No capture grant is involved because no capture happens: the audio is
+/// already in hand, having arrived from the carrier the operator configured.
+pub async fn transcribe_call_audio(app_data_dir: &Path, path: &Path) -> Result<String, String> {
+    let state = M7CompanionState::production(app_data_dir)?;
+    let job_id = format!("call-stt-{}", Uuid::new_v4().simple());
+    let cancellation = state.begin_job(&job_id)?;
+    let result = transcribe_path(&state, &job_id, path, &cancellation, false).await;
+    state.finish_job(&job_id);
+    result.map(|(text, _backend, _segments)| text)
+}
+
+/// Synthesize `text` to a WAV file with the operator's system voice.
+///
+/// The speaking half of the same rule: [`m7_tts_speak`] plays to this machine's
+/// speakers, which is the wrong destination for a call, so this writes the same
+/// system synthesizer's output to a file the caller can send to the carrier.
+/// Same voice setting, same synthesizer, different destination.
+pub async fn synthesize_speech_to_wav(
+    app_data_dir: &Path,
+    text: &str,
+    destination: &Path,
+) -> Result<(), String> {
+    if text.is_empty() || text.len() > MAX_CAPTURE_TEXT_BYTES {
+        return Err("Speech text is empty or exceeds its limit".to_string());
+    }
+    let voice = M7CompanionState::production(app_data_dir)?
+        .config()?
+        .voice
+        .tts_voice
+        .filter(|value| !value.is_empty());
+    let destination_arg = destination.to_string_lossy().to_string();
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = tokio::process::Command::new("/usr/bin/say");
+        if let Some(voice) = voice {
+            command.args(["-v", &voice]);
+        }
+        // 16-bit little-endian at the rate every carrier stream uses, so the
+        // call side has nothing to resample.
+        command.args(["--data-format=LEI16@8000", "-o", &destination_arg]);
+        command.arg(text);
+        command
+    };
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        // espeak-ng writes a WAV; spd-say (used for desktop playback) cannot,
+        // which is why this is the one place the two diverge.
+        let mut command = tokio::process::Command::new("espeak-ng");
+        if let Some(voice) = voice {
+            command.args(["-v", &voice]);
+        }
+        command.args(["-w", &destination_arg, "--", text]);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let escaped_text = text.replace('\'', "''");
+        let escaped_path = destination_arg.replace('\'', "''");
+        let select_voice = voice
+            .map(|voice| format!("$s.SelectVoice('{}');", voice.replace('\'', "''")))
+            .unwrap_or_default();
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; {select_voice} $s.SetOutputToWaveFile('{escaped_path}'); $s.Speak('{escaped_text}'); $s.Dispose()"
+            ),
+        ]);
+        command
+    };
+
+    let status = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .status()
+        .await
+        .map_err(|error| format!("Could not start system speech: {error}"))?;
+    if !status.success() {
+        return Err(format!("System speech exited with {status}"));
+    }
+    if !destination.is_file() {
+        return Err("System speech produced no audio".to_string());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn m7_tts_speak(
     state: tauri::State<'_, M7CompanionState>,

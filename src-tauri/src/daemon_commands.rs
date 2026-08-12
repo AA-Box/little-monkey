@@ -1898,3 +1898,198 @@ pub async fn ingress_turns(source: Option<String>, limit: u32) -> Result<Value, 
     args.push("--json".into());
     parse_json(&command(args).await?)
 }
+// --- Telephony ------------------------------------------------------------
+//
+// The same arrangement as the messaging channel commands above: fixed-argument
+// wrappers over `monkey telecom …`, so the rules live in one place and the
+// desktop never gets an arbitrary command executor.
+//
+// `telecom_set_credential` is the only path a carrier secret takes across this
+// boundary, and it goes straight to the keychain rather than through an
+// argument vector.
+
+#[tauri::command]
+pub async fn telecom_list() -> Result<Value, String> {
+    parse_json(&command(vec!["telecom".into(), "list".into(), "--json".into()]).await?)
+}
+
+#[tauri::command]
+pub async fn telecom_add(
+    kind: String,
+    label: String,
+    carrier_account_id: String,
+    from_number: String,
+    public_url: Option<String>,
+    config: Option<String>,
+) -> Result<Value, String> {
+    validate_token("carrier", &kind, 32)?;
+    validate_token("label", &label, 120)?;
+    validate_token("carrier account id", &carrier_account_id, 128)?;
+    validate_token("number", &from_number, 20)?;
+    let mut args = vec![
+        "telecom".into(),
+        "add".into(),
+        kind,
+        label,
+        carrier_account_id,
+        from_number,
+    ];
+    if let Some(url) = public_url {
+        validate_token("public URL", &url, 512)?;
+        args.push("--public-url".into());
+        args.push(url);
+    }
+    if let Some(config) = config {
+        serde_json::from_str::<Value>(&config)
+            .map_err(|error| format!("Carrier settings must be a JSON object: {error}"))?;
+        args.push("--config".into());
+        args.push(config);
+    }
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
+/// Probe a carrier account. The only path that can move one to `connected`.
+#[tauri::command]
+pub async fn telecom_probe(account_id: String) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "telecom".into(),
+            "probe".into(),
+            account_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn telecom_enable(account_id: String, enabled: bool) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let mut args = vec!["telecom".into(), "enable".into(), account_id];
+    if !enabled {
+        args.push("--off".into());
+    }
+    command(args).await.map(|_| ())
+}
+
+#[tauri::command]
+pub async fn telecom_set_policy(
+    account_id: String,
+    inbound: Option<String>,
+    outbound: Option<String>,
+) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let mut args = vec!["telecom".into(), "policy".into(), account_id];
+    if let Some(value) = inbound {
+        validate_token("inbound policy", &value, 16)?;
+        args.push("--inbound".into());
+        args.push(value);
+    }
+    if let Some(value) = outbound {
+        validate_token("outbound approval", &value, 16)?;
+        args.push("--outbound".into());
+        args.push(value);
+    }
+    command(args).await.map(|_| ())
+}
+
+#[tauri::command]
+pub async fn telecom_set_limits(
+    account_id: String,
+    max_concurrent: Option<u32>,
+    ring_timeout_s: Option<u32>,
+    max_duration_s: Option<u32>,
+    recording: Option<bool>,
+) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let mut args = vec!["telecom".into(), "limits".into(), account_id];
+    for (flag, value) in [
+        ("--max-concurrent", max_concurrent),
+        ("--ring-timeout-s", ring_timeout_s),
+        ("--max-duration-s", max_duration_s),
+    ] {
+        if let Some(value) = value {
+            args.push(flag.into());
+            args.push(value.to_string());
+        }
+    }
+    if let Some(recording) = recording {
+        args.push("--recording".into());
+        args.push(recording.to_string());
+    }
+    command(args).await.map(|_| ())
+}
+
+/// What the number says when an answered call connects.
+#[tauri::command]
+pub async fn telecom_set_greeting(account_id: String, text: String) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    if text.chars().count() > 600 {
+        return Err("That greeting is too long to say on a phone call".to_string());
+    }
+    command(vec!["telecom".into(), "greeting".into(), account_id, text])
+        .await
+        .map(|_| ())
+}
+
+#[tauri::command]
+pub async fn telecom_calls(account_id: String, limit: u32) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "telecom".into(),
+            "calls".into(),
+            account_id,
+            "--limit".into(),
+            limit.clamp(1, 200).to_string(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// The URL the operator pastes into their carrier's console.
+#[tauri::command]
+pub async fn telecom_callback_url(account_id: String) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "telecom".into(),
+            "callback-url".into(),
+            account_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn telecom_remove(account_id: String) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    command(vec!["telecom".into(), "remove".into(), account_id])
+        .await
+        .map(|_| ())
+}
+
+/// Store a carrier credential.
+///
+/// Writes the same keychain entry the daemon reads, named by the one definition
+/// both sides share. The value is never echoed back, never logged and never
+/// returned; the account row only ever learns that a credential exists.
+#[tauri::command]
+pub async fn telecom_set_credential(account_id: String, secret: String) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    if secret.is_empty() || secret.len() > 8192 {
+        return Err("A carrier credential must contain 1-8192 bytes".to_string());
+    }
+    let reference = crate::channels::telecom_credential_ref(&account_id);
+    keyring::Entry::new(&crate::channels::KEYCHAIN_SERVICE, &reference)
+        .map_err(|error| format!("Failed to open the telephony keychain entry: {error}"))?
+        .set_password(&secret)
+        .map_err(|error| format!("Failed to save the carrier credential: {error}"))?;
+    command(vec!["telecom".into(), "mark-credential".into(), account_id])
+        .await
+        .map(|_| ())
+}

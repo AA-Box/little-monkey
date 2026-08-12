@@ -904,10 +904,22 @@ async fn execute_tool_call(
         }
         let account_id = args["account_id"].as_str().unwrap_or_default().to_string();
         let to_number = args["to_number"].as_str().unwrap_or_default().to_string();
-        let detail = format!("call {to_number} from {account_id}");
+        let opening_line = args["opening_line"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        // The approval prompt shows the words that will be said, because the
+        // words are most of what the operator is approving.
+        let detail = format!("call {to_number} from {account_id} and say: {opening_line}");
         return match perms.request("place_call", &detail).await {
             Ok(()) => {
-                match crate::daemon::telecom_tool::place_call(&account_id, &to_number).await {
+                match crate::daemon::telecom_tool::place_call(
+                    &account_id,
+                    &to_number,
+                    &opening_line,
+                )
+                .await
+                {
                     Ok(value) => value.to_string(),
                     Err(error) => serde_json::json!({ "error": error }).to_string(),
                 }

@@ -39,7 +39,10 @@ use little_monkey_lib::channels::types::{
     ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender, SendOutcome,
 };
 
-use super::{CallHandle, CallState, TelecomConfig, TelecomEvent, TelecomKind, TelecomProvider};
+use super::{
+    AnswerDocument, CallHandle, CallState, TelecomConfig, TelecomEvent, TelecomKind,
+    TelecomProvider,
+};
 
 const API_BASE: &str = "https://api.telnyx.com/v2";
 
@@ -125,6 +128,24 @@ impl TelecomProvider for TelnyxProvider {
         TelecomKind::Telnyx
     }
 
+    fn media_stream(&self) -> Option<crate::daemon::call_media::MediaStreamFormat> {
+        Some(MEDIA_FORMAT)
+    }
+
+    /// TeXML, Telnyx's TwiML-compatible document. Same shape, same verb names,
+    /// different host — which is why the two are written out separately rather
+    /// than shared: a compatibility layer that silently drifts is worse than two
+    /// short strings.
+    fn answer_instructions(&self, media_url: &str) -> Option<AnswerDocument> {
+        Some(AnswerDocument {
+            content_type: "text/xml; charset=utf-8",
+            body: format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Connect><Stream url=\"{}\" bidirectionalMode=\"rtp\"/></Connect></Response>",
+                crate::daemon::service::xml_escape(media_url)
+            ),
+        })
+    }
+
     async fn probe(&self) -> ChannelHealth {
         let now = now_ms();
         if self.api_key.trim().is_empty() {
@@ -159,17 +180,26 @@ impl TelecomProvider for TelnyxProvider {
         ChannelHealth::connected(now, Some(self.from_number.clone()))
     }
 
-    async fn send_sms(&self, to_number: &str, text: &str, idempotency_key: &str) -> SendOutcome {
+    async fn send_sms(
+        &self,
+        to_number: &str,
+        text: &str,
+        media_urls: &[String],
+        idempotency_key: &str,
+    ) -> SendOutcome {
         let _ = idempotency_key; // no caller-supplied dedupe key on /v2/messages
         let client = match self.client() {
             Ok(client) => client,
             Err(error) => return SendOutcome::PermanentFailure { error },
         };
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "from": self.from_number,
             "to": to_number,
             "text": text,
         });
+        if !media_urls.is_empty() {
+            body["media_urls"] = serde_json::json!(media_urls);
+        }
         let request = client
             .post(self.messages_url())
             .bearer_auth(&self.api_key)
@@ -224,14 +254,27 @@ impl TelecomProvider for TelnyxProvider {
         }
     }
 
-    async fn place_call(&self, to_number: &str, answer_url: &str) -> Result<CallHandle, String> {
+    async fn place_call(
+        &self,
+        to_number: &str,
+        answer_url: &str,
+        record: bool,
+    ) -> Result<CallHandle, String> {
         let client = self.client()?;
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "connection_id": self.connection_id,
             "to": to_number,
             "from": self.from_number,
             "webhook_url": answer_url,
+            // Audio only flows both ways on an RTP bidirectional stream, and
+            // only µ-law matches what the rest of this pipeline speaks.
+            "stream_bidirectional_mode": "rtp",
+            "stream_bidirectional_codec": "PCMU",
         });
+        if record {
+            body["record"] = serde_json::json!("record-from-answer");
+            body["record_channels"] = serde_json::json!("single");
+        }
         let request = client
             .post(self.calls_url())
             .bearer_auth(&self.api_key)
@@ -718,7 +761,7 @@ mod tests {
     async fn send_sms_maps_a_success_response_to_sent() {
         let base = serve_once("200 OK", r#"{"data":{"id":"msg-abc"}}"#);
         let provider = provider_with_base(&base);
-        let outcome = provider.send_sms("+15551230000", "hi", "idem-1").await;
+        let outcome = provider.send_sms("+15551230000", "hi", &[], "idem-1").await;
         assert_eq!(
             outcome,
             SendOutcome::Sent {
@@ -731,7 +774,7 @@ mod tests {
     async fn send_sms_maps_429_to_retryable() {
         let base = serve_once("429 Too Many Requests", "{}");
         let provider = provider_with_base(&base);
-        match provider.send_sms("+15551230000", "hi", "idem-1").await {
+        match provider.send_sms("+15551230000", "hi", &[], "idem-1").await {
             SendOutcome::RetryableFailure { .. } => {}
             other => panic!("expected RetryableFailure, got {other:?}"),
         }
@@ -741,7 +784,7 @@ mod tests {
     async fn send_sms_maps_403_to_permanent() {
         let base = serve_once("403 Forbidden", "{}");
         let provider = provider_with_base(&base);
-        match provider.send_sms("+15551230000", "hi", "idem-1").await {
+        match provider.send_sms("+15551230000", "hi", &[], "idem-1").await {
             SendOutcome::PermanentFailure { .. } => {}
             other => panic!("expected PermanentFailure, got {other:?}"),
         }
@@ -771,9 +814,42 @@ mod tests {
             }
         });
         let provider = provider_with_base(&format!("http://127.0.0.1:{port}"));
-        match provider.send_sms("+15551230000", "hi", "idem-1").await {
+        match provider.send_sms("+15551230000", "hi", &[], "idem-1").await {
             SendOutcome::NeedsReconciliation { .. } => {}
             other => panic!("expected NeedsReconciliation, got {other:?}"),
         }
+    }
+}
+
+/// How this carrier's media stream is shaped. See
+/// [`crate::daemon::call_media::MediaStreamFormat`] for why each field exists.
+const MEDIA_FORMAT: crate::daemon::call_media::MediaStreamFormat =
+    crate::daemon::call_media::MediaStreamFormat {
+        stream_id_path: &["stream_id"],
+        outbound_chunk_ms: 1_000,
+    };
+
+impl crate::daemon::call_media::MediaFrameCodec for TelnyxProvider {
+    fn format(&self) -> crate::daemon::call_media::MediaStreamFormat {
+        MEDIA_FORMAT
+    }
+
+    fn encode_clear_frame(&self, stream_id: &str) -> String {
+        serde_json::json!({
+            "event": "clear",
+            "stream_id": stream_id,
+        })
+        .to_string()
+    }
+
+    fn encode_media_frame(&self, payload_b64: &str, stream_id: &str) -> String {
+        // Telnyx accepts at most one payload per second on a bidirectional
+        // RTP stream, so frames here are a second of audio rather than 20 ms.
+        serde_json::json!({
+            "event": "media",
+            "stream_id": stream_id,
+            "media": { "payload": payload_b64 },
+        })
+        .to_string()
     }
 }

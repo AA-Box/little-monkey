@@ -85,6 +85,7 @@ pub(crate) fn handle_carrier_event(
                     account.inbound_policy,
                     InboundCallPolicy::Answer | InboundCallPolicy::Voicemail
                 );
+            let peer = from_number.clone();
             let record = TelecomCallRecord {
                 call_id: call_id.clone(),
                 account_id: account.account_id.clone(),
@@ -96,12 +97,17 @@ pub(crate) fn handle_carrier_event(
                 } else {
                     CallState::Completed
                 },
-                session_key: answered.then(|| format!("call:{}:{call_id}", account.account_id)),
+                session_key: answered
+                    .then(|| super::telecom_store::call_session_key(account, &peer, &call_id)),
                 job_id: None,
                 // The carrier's own call id is the natural idempotency key for
                 // an inbound call: a redelivered callback finds this row rather
                 // than creating a second one.
                 idempotency_key: format!("inbound:{provider_call_id}"),
+                // An inbound call says whatever greeting the operator wrote for
+                // this number; the media session falls back to it too, so a
+                // redelivered ring cannot lose it.
+                opening_line: None,
                 last_error: (!answered).then(|| {
                     if at_capacity {
                         "This number was already at its concurrent-call limit".to_string()

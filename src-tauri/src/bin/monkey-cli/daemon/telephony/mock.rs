@@ -62,6 +62,8 @@ struct MockState {
 pub struct SentSms {
     pub to_number: String,
     pub text: String,
+    /// Signed URLs the carrier would fetch for an MMS.
+    pub media_urls: Vec<String>,
     pub idempotency_key: String,
 }
 
@@ -70,6 +72,9 @@ pub struct SentSms {
 pub struct DialedCall {
     pub to_number: String,
     pub answer_url: String,
+    /// Whether the account asked for this call to be recorded, so a test can
+    /// prove the setting reached the carrier rather than stopping at the UI.
+    pub record: bool,
 }
 
 impl MockProvider {
@@ -180,21 +185,63 @@ enum MockWebhookBody {
     Ignored,
 }
 
+/// The mock streams like Twilio does, which is the shape the media-session
+/// tests are written against. Still no IO: frames are strings.
+const MEDIA_FORMAT: crate::daemon::call_media::MediaStreamFormat =
+    crate::daemon::call_media::MediaStreamFormat {
+        stream_id_path: &["streamSid"],
+        outbound_chunk_ms: 20,
+    };
+
+impl crate::daemon::call_media::MediaFrameCodec for MockProvider {
+    fn format(&self) -> crate::daemon::call_media::MediaStreamFormat {
+        MEDIA_FORMAT
+    }
+
+    fn encode_clear_frame(&self, stream_id: &str) -> String {
+        serde_json::json!({
+            "event": "clear",
+            "streamSid": stream_id,
+        })
+        .to_string()
+    }
+
+    fn encode_media_frame(&self, payload_b64: &str, stream_id: &str) -> String {
+        serde_json::json!({
+            "event": "media",
+            "streamSid": stream_id,
+            "media": { "payload": payload_b64 },
+        })
+        .to_string()
+    }
+}
+
 #[async_trait]
 impl TelecomProvider for MockProvider {
     fn kind(&self) -> TelecomKind {
         TelecomKind::Mock
     }
 
+    fn media_stream(&self) -> Option<crate::daemon::call_media::MediaStreamFormat> {
+        Some(MEDIA_FORMAT)
+    }
+
     async fn probe(&self) -> ChannelHealth {
         ChannelHealth::connected(now_ms(), Some(self.from_number.clone()))
     }
 
-    async fn send_sms(&self, to_number: &str, text: &str, idempotency_key: &str) -> SendOutcome {
+    async fn send_sms(
+        &self,
+        to_number: &str,
+        text: &str,
+        media_urls: &[String],
+        idempotency_key: &str,
+    ) -> SendOutcome {
         let mut state = self.state.lock().unwrap();
         state.sent_sms.push(SentSms {
             to_number: to_number.to_string(),
             text: text.to_string(),
+            media_urls: media_urls.to_vec(),
             idempotency_key: idempotency_key.to_string(),
         });
         if let Some(outcome) = state.sms_outcomes.pop_front() {
@@ -207,11 +254,17 @@ impl TelecomProvider for MockProvider {
         }
     }
 
-    async fn place_call(&self, to_number: &str, answer_url: &str) -> Result<CallHandle, String> {
+    async fn place_call(
+        &self,
+        to_number: &str,
+        answer_url: &str,
+        record: bool,
+    ) -> Result<CallHandle, String> {
         let mut state = self.state.lock().unwrap();
         state.dialed_calls.push(DialedCall {
             to_number: to_number.to_string(),
             answer_url: answer_url.to_string(),
+            record,
         });
         if let Some(outcome) = state.call_outcomes.pop_front() {
             return outcome;
@@ -384,8 +437,8 @@ mod tests {
     #[tokio::test]
     async fn send_sms_returns_a_deterministic_default_when_nothing_is_queued() {
         let provider = provider();
-        let first = provider.send_sms("+1", "a", "idem-1").await;
-        let second = provider.send_sms("+1", "b", "idem-2").await;
+        let first = provider.send_sms("+1", "a", &[], "idem-1").await;
+        let second = provider.send_sms("+1", "b", &[], "idem-2").await;
         assert_eq!(
             first,
             SendOutcome::Sent {
@@ -411,10 +464,34 @@ mod tests {
         provider.queue_sms_outcome(SendOutcome::PermanentFailure {
             error: "bad number".to_string(),
         });
-        let first = provider.send_sms("+1", "a", "idem-1").await;
-        let second = provider.send_sms("+1", "b", "idem-2").await;
+        let first = provider.send_sms("+1", "a", &[], "idem-1").await;
+        let second = provider.send_sms("+1", "b", &[], "idem-2").await;
         assert!(matches!(first, SendOutcome::RetryableFailure { .. }));
         assert!(matches!(second, SendOutcome::PermanentFailure { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_attachment_is_carried_as_a_media_url() {
+        let provider = provider();
+        let urls = vec!["https://calls.example.test/v1/telecom/tel-1/file?artifact=a".to_string()];
+
+        let _ = provider
+            .send_sms("+15551230000", "here", &urls, "idem-1")
+            .await;
+
+        assert_eq!(provider.sent_messages()[0].media_urls, urls);
+    }
+
+    #[tokio::test]
+    async fn the_recording_setting_reaches_the_carrier() {
+        let provider = provider();
+        let _ = provider
+            .place_call("+15551230000", "https://example.com/answer", true)
+            .await;
+        assert!(
+            provider.dialed_calls()[0].record,
+            "a stored recording setting that never reaches the carrier records nothing"
+        );
     }
 
     #[tokio::test]
@@ -425,13 +502,14 @@ mod tests {
             state: CallState::Queued,
         }));
         let handle = provider
-            .place_call("+1", "https://example.com/answer")
+            .place_call("+1", "https://example.com/answer", false)
             .await
             .unwrap();
         assert_eq!(handle.provider_call_id, "scripted-1");
         assert_eq!(
             provider.dialed_calls(),
             vec![DialedCall {
+                record: false,
                 to_number: "+1".to_string(),
                 answer_url: "https://example.com/answer".to_string(),
             }]
