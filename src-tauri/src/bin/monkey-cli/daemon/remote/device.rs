@@ -247,6 +247,27 @@ pub async fn dispatch(
     )?;
     drop(store);
 
+    // Wake the device. This is what makes the queue work on a phone whose
+    // screen is off: the long poll only reconnects once something wakes the
+    // app, so without this a command sits queued until someone happens to open
+    // the controller. Best-effort by design — a run must never fail because a
+    // notification could not be delivered, and the command is durable either
+    // way.
+    let _ = super::push::notify_device(
+        paths,
+        &queued.device_id,
+        &super::push::PushNotification {
+            kind: super::push::PushKind::DeviceActionAwaiting,
+            target_id: Some(queued.command_id.clone()),
+            detail: Some(format!(
+                "{} is waiting for you",
+                capability_token(request.capability).replace('_', " ")
+            )),
+        },
+        &super::store::KeyringRemoteSecrets,
+    )
+    .await;
+
     let started = std::time::Instant::now();
     loop {
         // Reopened each poll rather than held: the daemon writes to this

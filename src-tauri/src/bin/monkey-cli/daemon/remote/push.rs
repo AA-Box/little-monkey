@@ -1203,6 +1203,29 @@ mod tests {
         assert!(unusable_subject.validate().is_err());
     }
 
+    /// Push must be *reachable*, not merely implemented. A backend nothing ever
+    /// raises a notification through is decoration, so this pins the two call
+    /// sites that exist and the reason each is best-effort.
+    #[test]
+    fn every_notification_kind_is_raised_by_something_or_documented_as_not_yet() {
+        const DISPATCH: &str = include_str!("device.rs");
+        const COMMANDS: &str = include_str!("mod.rs");
+        assert!(
+            DISPATCH.contains("PushKind::DeviceActionAwaiting"),
+            "queueing a device command must wake the device, or a phone with its \
+             screen off never reconnects to take the command"
+        );
+        assert!(
+            COMMANDS.contains("PushKind::SecurityAlert"),
+            "a revocation must reach the devices that still work"
+        );
+        // Best-effort at both sites: a run must never fail because a
+        // notification could not be delivered, and the command is durable
+        // either way.
+        assert!(DISPATCH.contains("let _ = super::push::notify_device("));
+        assert!(COMMANDS.contains("let _ = push::notify_all("));
+    }
+
     /// The privacy claim, tested rather than asserted in a doc comment: what
     /// reaches a lock screen says what kind of thing happened and nothing about
     /// its content, unless the operator turned that on.

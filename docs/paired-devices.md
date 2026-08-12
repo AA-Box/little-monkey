@@ -143,6 +143,13 @@ one exception, because an alert you cannot identify is not actionable.
 A push grants nothing: the woken device still makes an ordinary signed request
 to learn or do anything.
 
+Two things raise a notification today: queueing a device command wakes the
+target device (without it, a phone with its screen off never reconnects to take
+the command), and revoking a device tells the devices that still work. Approval
+and run-completion notifications need a daemon-side watcher on the run event
+stream, which does not exist yet — the payload kinds are defined and the
+delivery path is real, but nothing raises them.
+
 ## What the Security Doctor checks
 
 `monkey security audit` reports which device may hear the room, which holds a

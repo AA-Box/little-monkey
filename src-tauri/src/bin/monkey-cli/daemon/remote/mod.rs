@@ -587,6 +587,20 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
             );
         }
         RemoteCmd::PairRevoke { device_id, reason } => {
+            // Told to the *other* devices, before the revocation lands: a
+            // revoked device is excluded from the push join by design, and the
+            // people who need to know a device was cut off are the ones still
+            // holding the others.
+            let _ = push::notify_all(
+                &paths,
+                &push::PushNotification {
+                    kind: push::PushKind::SecurityAlert,
+                    target_id: Some(device_id.clone()),
+                    detail: Some(format!("{device_id} was revoked on this runner")),
+                },
+                &KeyringRemoteSecrets,
+            )
+            .await;
             let mut store = RemoteStore::open(&paths.root)?;
             // The one-shot CLI process holds no live sessions; the resident
             // daemon force-stops any live session for this device on its next
