@@ -40,8 +40,9 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use little_monkey_lib::channels::types::{
-    ChannelConversation, ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender,
-    InboundTransport, OutboundMessage, ProviderCapabilities, SendOutcome,
+    AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
+    ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
+    ProviderCapabilities, SendOutcome,
 };
 use ring::rand::SystemRandom;
 use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
@@ -405,6 +406,38 @@ impl ChannelAdapter for GoogleChatAdapter {
             error: error_message,
         }
     }
+
+    /// Google Chat serves an uploaded file through its media endpoint, named by
+    /// the `resourceName` the message carried, with the same service-account
+    /// token the send path uses.
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("This Google Chat attachment has no resource name.".to_string());
+        };
+        // The resource name is path-concatenated and arrives inside a delivery,
+        // so anything that could climb out of `/v1/media/` is refused.
+        if handle.is_empty() || handle.contains("..") || handle.starts_with('/') {
+            return Err("That Google Chat resource name is not usable".to_string());
+        }
+        let token = self.access_token().await?;
+        let client = little_monkey_lib::egress::hardened()
+            .build()
+            .map_err(|error| format!("Could not build an HTTP client: {error}"))?;
+        crate::daemon::channel_adapter::download_bounded(
+            client
+                .get(format!(
+                    "{}/v1/media/{handle}?alt=media",
+                    self.chat_api_base
+                ))
+                .bearer_auth(token),
+            max_bytes,
+        )
+        .await
+    }
 }
 
 /// Strips PEM armor and base64-decodes to PKCS8 DER.
@@ -603,6 +636,41 @@ fn normalize_event(
         .map(|value| value.timestamp_millis())
         .unwrap_or(fallback_received_at_ms);
 
+    // Google Chat puts uploaded files in `message.attachment[]`, each naming a
+    // media resource the Chat API serves separately. Without this a message
+    // that was only a file normalized to empty text and the gate dropped it.
+    let attachments: Vec<ChannelAttachment> = message
+        .get("attachment")
+        .and_then(JsonValue::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let resource = item
+                        .get("attachmentDataRef")
+                        .and_then(|reference| reference.get("resourceName"))
+                        .and_then(JsonValue::as_str)?;
+                    let mime_type = item.get("contentType").and_then(JsonValue::as_str);
+                    Some(ChannelAttachment {
+                        provider_id: Some(resource.to_string()),
+                        kind: mime_type
+                            .map(AttachmentKind::from_mime)
+                            .unwrap_or(AttachmentKind::Other),
+                        filename: item
+                            .get("contentName")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string),
+                        mime_type: mime_type.map(str::to_string),
+                        declared_size_bytes: None,
+                        source: AttachmentSource::ProviderHandle {
+                            handle: resource.to_string(),
+                        },
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     Some(ChannelEnvelope {
         account_id: account_id.to_string(),
         kind: ChannelKind::GoogleChat,
@@ -610,7 +678,7 @@ fn normalize_event(
         conversation,
         sender,
         text,
-        attachments: Vec::new(),
+        attachments,
         reply_to_provider_id: None,
         mentions_self,
         received_at_ms,
@@ -620,6 +688,36 @@ fn normalize_event(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_uploaded_file_becomes_an_attachment_the_adapter_can_fetch() {
+        let event = serde_json::json!({
+            "type": "MESSAGE",
+            "space": {"name": "spaces/AAAA", "type": "ROOM"},
+            "message": {
+                "name": "spaces/AAAA/messages/BBBB",
+                "sender": {"name": "users/111", "displayName": "Ada"},
+                "text": "",
+                "attachment": [{
+                    "contentName": "report.pdf",
+                    "contentType": "application/pdf",
+                    "attachmentDataRef": {"resourceName": "uploads/xyz"}
+                }]
+            }
+        });
+
+        let envelope = normalize_event(&event, "acct-1", "users/bot", 0).expect("an envelope");
+
+        assert_eq!(envelope.attachments.len(), 1);
+        assert_eq!(
+            envelope.attachments[0].filename.as_deref(),
+            Some("report.pdf")
+        );
+        match &envelope.attachments[0].source {
+            AttachmentSource::ProviderHandle { handle } => assert_eq!(handle, "uploads/xyz"),
+            other => panic!("expected a provider handle, got {other:?}"),
+        }
+    }
     use super::*;
     use crate::daemon::channel_store::ChannelAccountRecord;
     use little_monkey_lib::channels::policy::ChannelAccessPolicy;

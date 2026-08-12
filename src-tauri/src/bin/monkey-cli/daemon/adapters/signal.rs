@@ -40,7 +40,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::Instant;
 
-use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
+use crate::daemon::channel_adapter::{
+    AdapterConfig, ChannelAdapter, InboundBatch, LoadedAttachment,
+};
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
     ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
@@ -422,9 +424,7 @@ impl ChannelAdapter for SignalAdapter {
             inbound_transport: InboundTransport::Helper,
             max_text_chars: MAX_TEXT_CHARS,
             supports_threads: false,
-            // Inbound only: the helper's own send has no attachment argument
-            // this adapter speaks yet.
-            supports_attachments: false,
+            supports_attachments: true,
             supports_mention_metadata: false,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
@@ -472,6 +472,51 @@ impl ChannelAdapter for SignalAdapter {
         // byte — so that prefix is the entire "which JSON-RPC field" signal
         // this adapter needs.
         let mut params = json!({ "message": message.text });
+        if message.conversation_id.starts_with('+') {
+            params["recipient"] = json!([message.conversation_id]);
+        } else {
+            params["groupId"] = json!(message.conversation_id);
+        }
+        match self.call("send", params).await {
+            Ok(result) => SendOutcome::Sent {
+                provider_message_id: result
+                    .get("timestamp")
+                    .and_then(Value::as_i64)
+                    .map(|timestamp| timestamp.to_string()),
+            },
+            Err(CallError::NotSent(error)) => SendOutcome::PermanentFailure { error },
+            Err(CallError::Ambiguous(error)) => SendOutcome::NeedsReconciliation { error },
+            Err(CallError::Remote(error)) => SendOutcome::PermanentFailure { error },
+        }
+    }
+
+    /// signal-cli takes attachments on the same `send` call, as RFC 2397 data
+    /// URIs (`data:<mime>;filename=<name>;base64,<data>`) rather than paths —
+    /// which means nothing has to write the bytes to a temporary file that a
+    /// crash could leave behind, and the helper never reads a path this daemon
+    /// chose.
+    async fn send_with_attachments(
+        &self,
+        message: &OutboundMessage,
+        files: &[LoadedAttachment],
+    ) -> SendOutcome {
+        if files.is_empty() {
+            return self.send(message).await;
+        }
+        let encoded: Vec<String> = files
+            .iter()
+            .map(|file| {
+                format!(
+                    "data:{};filename={};base64,{}",
+                    file.mime_type,
+                    // A filename with a `;` or `,` would split the data URI
+                    // itself, so the separators are the one thing removed.
+                    file.filename.replace([';', ','], "_"),
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &file.bytes)
+                )
+            })
+            .collect();
+        let mut params = json!({ "message": message.text, "attachments": encoded });
         if message.conversation_id.starts_with('+') {
             params["recipient"] = json!([message.conversation_id]);
         } else {
