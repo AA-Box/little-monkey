@@ -1325,8 +1325,12 @@ pub async fn remote_device_cancel(command_id: String) -> Result<String, String> 
 /// other command in this file, and the reason it is a fixed argument vector
 /// rather than a passthrough: the model's arguments arrive as named parameters
 /// and are re-emitted as named flags, never as a caller-supplied argv.
-#[tauri::command(rename_all = "snake_case")]
+// The `allow` precedes the command attribute deliberately: `lib.rs`'s
+// `every_tauri_command_is_reachable_from_the_invoke_handler` scans what sits
+// *between* `#[tauri::command` and `fn`, and anything it does not recognize
+// there makes the command invisible to that guard.
 #[allow(clippy::too_many_arguments)]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_device_action(
     app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
@@ -1429,6 +1433,7 @@ mod tests {
             workspace_ids: Vec::new(),
             max_artifact_bytes: 8 * 1024 * 1024,
             mobile_capabilities: Vec::new(),
+            device_capabilities: Vec::new(),
         };
         assert!(validate_remote_pair_request(&valid).is_ok());
 
