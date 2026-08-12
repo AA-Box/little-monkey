@@ -6,19 +6,30 @@
 //! issued by `chat@system.gserviceaccount.com`, audience the configured
 //! project number. Full validation is: verify issuer, audience and expiry
 //! (structural — cheap, no network), *and* verify the RS256 signature against
-//! one of Google's rotating public certificates, fetched from
-//! `https://www.googleapis.com/service_accounts/v1/metadata/x509/chat@system.gserviceaccount.com`
+//! one of Google's rotating public keys, published as a JWKS document at
+//! `https://www.googleapis.com/service_accounts/v1/jwk/chat@system.gserviceaccount.com`
 //! and cached.
 //!
-//! This adapter implements the structural checks and deliberately does not
-//! implement the certificate fetch and signature check —
-//! `TODO(google-chat-certs)`. Same reasoning as the Teams adapter's
-//! `TODO(teams-jwks)`: fetching and caching a remote, rotating certificate set
-//! correctly is a security-critical feature on its own, and a half-verified
-//! signature check is worse than an honest refusal, because it looks like
-//! verification. [`normalize_event`] — the pure mapping this adapter would use
-//! once certificate verification lands — is implemented and unit-tested
-//! against fixtures so wiring it in later is a small, reviewable change.
+//! This adapter implements both halves: the structural checks, and the
+//! signature check against a JWKS key set cached in [`JwksCache`]. The cache
+//! is refreshed from the async side — opportunistically in [`probe`](
+//! GoogleChatAdapter::probe), and, when a delivery names a `kid` the cache
+//! does not have, by exactly one bounded synchronous fetch bridged out of the
+//! trait's required-synchronous `verify_and_normalize` (see
+//! [`try_refresh_blocking`] for why that bridge is safe). A delivery whose
+//! `kid` is still unknown after that one attempt is refused, not retried —
+//! see [`GoogleChatAdapter::ensure_key_for_kid`].
+//!
+//! The JWKS verification core — JWT header/claims decoding without
+//! re-serialization, `alg` pinned to `RS256` by name (never trusted from the
+//! token), the JWKS fetch and cache, and the bounded sync-refresh bridge — is
+//! written once here and reused by the Teams adapter, since both providers
+//! publish RSA keys the same way (a JWKS document with `n`/`e` members). Only
+//! the two things that differ per provider — where the JWKS document lives,
+//! and the account-specific claims — stay adapter-local.
+//!
+//! [`normalize_event`] is the pure mapping from a verified event to an
+//! envelope, unit-tested against fixtures independently of verification.
 //!
 //! Outbound authenticates as the configured service account: a JWT assertion
 //! signed with its RSA private key is exchanged for an OAuth access token
@@ -38,12 +49,21 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::sync::Mutex;
 
+use super::jwt::{
+    decode_jwt, fetch_jwks_via_egress, try_refresh_blocking, validate_alg_is_rs256,
+    verify_rs256_signature, JwkRsaKey, JwksCache,
+};
 use crate::daemon::channel_adapter::{
     AdapterConfig, ChannelAdapter, InboundBatch, WebhookChannelAdapter,
 };
 
 const CHAT_API_BASE: &str = "https://chat.googleapis.com";
 const OAUTH_TOKEN_BASE: &str = "https://oauth2.googleapis.com";
+/// Google Chat's fixed JWKS endpoint for app-interaction deliveries. No
+/// account config overrides this one — unlike Teams, Google Chat does not
+/// vary it per tenant.
+const CHAT_JWKS_URL: &str =
+    "https://www.googleapis.com/service_accounts/v1/jwk/chat@system.gserviceaccount.com";
 /// Google Chat's own fixed JWT issuer for app-interaction deliveries.
 const EXPECTED_ISSUER: &str = "chat@system.gserviceaccount.com";
 const SKEW_SECS: i64 = 300;
@@ -53,6 +73,12 @@ const CHAT_BOT_SCOPE: &str = "https://www.googleapis.com/auth/chat.bot";
 #[derive(Debug, Deserialize)]
 struct GoogleChatNonSecretConfig {
     project_number: String,
+    /// This app's own Chat resource name (`users/<id>`), used only to detect
+    /// whether an inbound message `@mentions` this app. Optional and
+    /// non-secret: absent, `mentions_self` is conservatively always `false`
+    /// rather than guessed.
+    #[serde(default)]
+    bot_user_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,14 +93,25 @@ struct CachedToken {
 }
 
 pub struct GoogleChatAdapter {
+    account_id: String,
     project_number: String,
     client_email: String,
     /// PKCS8 DER, parsed once at construction so a malformed key is rejected
     /// at setup rather than on the first send.
     private_key_der: Vec<u8>,
+    /// This app's own Chat resource name, for `mentions_self` detection.
+    /// Empty when not configured, which makes `mentions_self` always `false`
+    /// rather than a guess.
+    bot_user_name: String,
     token_cache: Mutex<Option<CachedToken>>,
+    /// Cached RS256 JWKS keys for verifying inbound deliveries. See the
+    /// module doc for how this is kept warm.
+    jwks_cache: JwksCache,
     chat_api_base: String,
     oauth_token_base: String,
+    /// Where the JWKS document is fetched from. Always [`CHAT_JWKS_URL`] in
+    /// production; swappable in tests.
+    jwks_url: String,
 }
 
 impl GoogleChatAdapter {
@@ -99,12 +136,16 @@ impl GoogleChatAdapter {
             "Google Chat account private_key could not be parsed as RSA PKCS8".to_string()
         })?;
         Ok(Self {
+            account_id: config.account.account_id.clone(),
             project_number: non_secret.project_number,
             client_email: secrets.client_email,
             private_key_der,
+            bot_user_name: non_secret.bot_user_name.unwrap_or_default(),
             token_cache: Mutex::new(None),
+            jwks_cache: JwksCache::new(),
             chat_api_base: CHAT_API_BASE.to_string(),
             oauth_token_base: OAUTH_TOKEN_BASE.to_string(),
+            jwks_url: CHAT_JWKS_URL.to_string(),
         })
     }
 
@@ -113,6 +154,42 @@ impl GoogleChatAdapter {
         self.chat_api_base = chat_api_base.to_string();
         self.oauth_token_base = oauth_token_base.to_string();
         self
+    }
+
+    #[cfg(test)]
+    fn with_jwks_url(mut self, jwks_url: &str) -> Self {
+        self.jwks_url = jwks_url.to_string();
+        self
+    }
+
+    /// Fetches the JWKS document and replaces the cache on success. Used by
+    /// [`probe`](ChannelAdapter::probe) to keep the cache warm, and by
+    /// [`ensure_key_for_kid`](Self::ensure_key_for_kid) as the one bounded
+    /// synchronous attempt on an unknown `kid`.
+    async fn refresh_keys(&self, now_ms: i64) -> bool {
+        match fetch_jwks_via_egress(&self.jwks_url).await {
+            Ok(keys) => {
+                self.jwks_cache.replace(keys, now_ms);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The key for `kid`, fetching once more if the cache does not have it.
+    ///
+    /// A delivery whose `kid` is still unknown after that one attempt is
+    /// refused by the caller — this never loops or retries beyond the single
+    /// bridge, which is what keeps an attacker-supplied `kid` from driving
+    /// unbounded fetches.
+    fn ensure_key_for_kid(&self, kid: &str, now_ms: i64) -> Option<JwkRsaKey> {
+        if let Some(key) = self.jwks_cache.find(kid) {
+            return Some(key);
+        }
+        if try_refresh_blocking(|| self.refresh_keys(now_ms)) {
+            return self.jwks_cache.find(kid);
+        }
+        None
     }
 
     /// A cached OAuth access token, minting and exchanging a fresh
@@ -182,7 +259,7 @@ impl WebhookChannelAdapter for GoogleChatAdapter {
     fn verify_and_normalize(
         &self,
         headers: &[(String, String)],
-        _body: &[u8],
+        body: &[u8],
         _public_base_url: Option<&str>,
         now_ms: i64,
     ) -> Result<Vec<ChannelEnvelope>, String> {
@@ -196,15 +273,28 @@ impl WebhookChannelAdapter for GoogleChatAdapter {
         let token = authorization
             .strip_prefix("Bearer ")
             .ok_or_else(|| "Authorization header is not a Bearer token".to_string())?;
-        let claims = decode_jwt_claims(token)?;
-        validate_claims_structurally(&claims, &self.project_number, now_ms)?;
 
-        // Structural checks passed, but that is not verification — see the
-        // module doc. The body is deliberately never parsed past this point.
-        Err(
-            "Google Chat inbound signature verification is not implemented \
-             (TODO(google-chat-certs)); refusing unverified delivery"
-                .to_string(),
+        let decoded = decode_jwt(token)?;
+        validate_alg_is_rs256(&decoded.header)?;
+        validate_claims_structurally(&decoded.claims, &self.project_number, now_ms)?;
+        let kid = decoded
+            .header
+            .get("kid")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "JWT is missing kid".to_string())?;
+        let key = self
+            .ensure_key_for_kid(kid, now_ms)
+            .ok_or_else(|| "No matching signing key for this token's kid; refusing".to_string())?;
+        verify_rs256_signature(decoded.signing_input, &decoded.signature, &key)?;
+
+        // Only reached once the signature has verified against a key from
+        // Google's own JWKS — the body is never parsed before that.
+        let event: JsonValue = serde_json::from_slice(body)
+            .map_err(|_| "Google Chat event body is not valid JSON".to_string())?;
+        Ok(
+            normalize_event(&event, &self.account_id, &self.bot_user_name, now_ms)
+                .into_iter()
+                .collect(),
         )
     }
 }
@@ -229,6 +319,11 @@ impl ChannelAdapter for GoogleChatAdapter {
 
     async fn probe(&self) -> ChannelHealth {
         let now = now_ms();
+        // Best-effort: an inbound JWKS hiccup must not fail a probe whose
+        // job is reporting on the outbound credentials.
+        if self.jwks_cache.needs_refresh(now) {
+            let _ = self.refresh_keys(now).await;
+        }
         match self.access_token().await {
             Ok(_) => {
                 ChannelHealth::connected(now, Some("Service account credentials valid".to_string()))
@@ -361,24 +456,6 @@ fn mint_service_account_jwt(
         "{signing_input}.{}",
         URL_SAFE_NO_PAD.encode(signature)
     ))
-}
-
-/// Splits, base64url-decodes and JSON-parses a JWT's claims (the middle
-/// segment). Does not touch the signature.
-fn decode_jwt_claims(token: &str) -> Result<JsonValue, String> {
-    let mut parts = token.split('.');
-    let (Some(_header), Some(payload), Some(_signature)) =
-        (parts.next(), parts.next(), parts.next())
-    else {
-        return Err("Malformed JWT".to_string());
-    };
-    if parts.next().is_some() {
-        return Err("Malformed JWT".to_string());
-    }
-    let decoded = URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| "JWT payload is not valid base64url".to_string())?;
-    serde_json::from_slice(&decoded).map_err(|_| "JWT payload is not valid JSON".to_string())
 }
 
 fn validate_claims_structurally(
@@ -614,11 +691,18 @@ rBTxwRqn0v9lv8H7GtnYwaw=
         GoogleChatAdapter::new(&config).expect("adapter builds")
     }
 
+    /// A structurally-shaped but unsigned JWT: real base64url in all three
+    /// segments (so `decode_jwt` never trips over the fixture itself), but
+    /// the signature segment is not a genuine signature over anything. Used
+    /// only by tests below whose target is a *structural* claims check that
+    /// fires before signature verification is ever reached — never for a
+    /// test that expects the signature check itself to run.
     fn make_jwt(claims: &JsonValue) -> String {
         let header =
             URL_SAFE_NO_PAD.encode(serde_json::json!({"alg":"RS256","typ":"JWT"}).to_string());
         let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
-        format!("{header}.{payload}.unsigned-placeholder-signature")
+        let signature = URL_SAFE_NO_PAD.encode(b"unsigned-placeholder-signature");
+        format!("{header}.{payload}.{signature}")
     }
 
     fn valid_claims(now_secs: i64) -> JsonValue {
@@ -654,18 +738,240 @@ rBTxwRqn0v9lv8H7GtnYwaw=
 
     // --- Structural checks + mandatory refusal -----------------------------
 
+    /// A second, unrelated 2048-bit RSA test key: only ever used as the
+    /// "wrong signer" in tests below. Not used anywhere else and grants
+    /// access to nothing.
+    const TEST_WRONG_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEuwIBADANBgkqhkiG9w0BAQEFAASCBKUwggShAgEAAoIBAQDzgzLmiwnyEOF1
+FnDCygqdjmbhjbJjW2d5W5VC2cWTbqpJA+UitbAn9zalMm8HDxazOGn5VVMZU7Rj
+LFRqBsVStj8CKxzT/gSuODI8RQCgSSQV/RnymWmjk46E1/a3ArNMTuxK9oSqmPpG
+Z4jI8pqz6Q8rOvEkUrePOs0AgNcjOPM0hEqzU+a6M6sn7SQAuoSWIJZQShnjmPaJ
+syU907M6d3jTNqJux6klmce46cRIhfREu385Ez7x7MxB3tfvrXLZp+uPCLT602ta
+OZZYHKNkkw5SDZVLstDwLK+LrrruaY8OF8L7icUfg32b9/ff2J13iiOJeRENuDsg
+VrXu39RNAgMBAAECggEAXmsZmmCA27YF5UNtN2nlkc+8PmqVp4ayaVDEYCZWQGMh
+bawv9TRjeCuXqZgTirYkBBu0o3OdA+37vJRcqruzWO3HIo0a4WvV3sN1Xv8WTg/u
+CQSZQgKP/lfhY8rlI3LNmKHlZu+M4yTrrc7JL7k5mNaeBhIVnBLij4uqHy7VvBbA
+PicQa0a4IhLEd9Np1TlOpO73U5y6Q6xy/LDGcGRVGfgCpia2lCJl9YV0P4v2bqkB
+vOHsrG3lazOtvotzBz6qd0BIP8JdxaiHBGxlsuohl5ABTm5gzFq4QDqXPqeJW1i5
+/4uaWmdkXcl8bpBwtUtYRmh2wyKNuymu2+SBJB1ttQKBgQD7Vc9i52KzfAZoidV2
+JH+GmJm4GnI/mNp5LcIQf4cNTNESVZ9ZkQWSz+DGJDfHLaP43tQpp8U4+ORpz1as
+1Tza37dMO0yifGWzdIKkl4lZV7BGs3AM/pQrf9tCxVHI9jVPcdKzYvZBDcraz8se
+LUtH1Slm+sPGLnPVW+mSaHc7iwKBgQD4CDhXEJFEkBUd1xB1kXy6kfd05aP4jSWv
+WMfgIh5fH2BBneLBJ+VOa3LuXnZ4L/6EyyT73J12GYBhideRn4uqmszQIIAQW5vI
+G4SH6vMsDUr6+XBlm5gJUQ8R/f74pmjNk2iIqOOjxX/+3eW2Y7MMGATd2OSIVrmX
+sKqz9IQKhwKBgQCAzX8UnqQUe3EFTe3ZN+cq4TWWBeea9AiypWKY9eIOTNmwXbTm
+P83taR82LAVxy9AGkJuGJXaLNfJIz3sJ49XmDVRwestRUhMEnqb9FrPK14d9FCRO
+ZIEmscV6OIkrRhIX/qsOR58Pw7O741Wix2+XBoTLQ6PlApVWOF5BK8w+9QJ/CLhB
+Qs5STRbDp0joSznSKLz49iMcoKBVstRsMnUAnFd+CtCCKEg+x4L/h2HKyG7ng8Og
+iTo4Tu6WlNdDvNrfDiBjEu4RkoGl+GL/Rcf8xI+zEx+x0+Ckd69h2EAVtqgjBxcn
+laZaWmeXGF60tLTMlqBBi4sUfbaOz8ZmOe1etwKBgDaZUx+7ZphPj/RLtiIyK86c
+bdszfWD7/gqkY/cP+HUyH0wrZBwT7yQReEhzaHEDI1Aeqnotl37q5lu5tAHCK5HP
+U7+8WqqarVWRgm4Yhxhmi3lyoLNILeSR38ujqh0GCcPq06TgkxJYOUi/ZShf2XSD
+Z4Cr3JR0FbjywTd4IHU6
+-----END PRIVATE KEY-----";
+
+    /// `n`/`e` of [`TEST_PRIVATE_KEY_PEM`]'s public half, computed once
+    /// out-of-band (`openssl rsa ... -text`) and pasted here as the JWKS
+    /// values a real provider would publish — this is what
+    /// [`JwksCache::seed_for_test`] stands in for the network fetch.
+    const TEST_JWK_N: &str = "2s0aQeyxkfbzRHrdTfuCx3jDrRw-sx18u28eLf2JSNBFVT23pKMZKhuU1yyM6zqCnA6BIDr7OWaWVc3WhVueSdWJ1HUvOFort633ATQjTmVwv6LzqS70ziFP4KoxTNOUKrK10FSuv4kRznKDli7vOrOxq8JIyd0NK5GoyyjZV42eM2ZPHMqNxcEwKJtCc_GdZPwB7wp7k1u6JnFUTZyp-LzSs3W50lu8Bo1zbrr3CHvhHhCHwqXXfrtvjY-ILesDcRtDeMpZ8HfYn6mWl1-gnRfVqMopI1eWhQeSr58NgKlfJgKkAsJrFx5igpgJwkQK9M_Y3aeslGVumlsZybwJBw";
+    const TEST_JWK_E: &str = "AQAB";
+
+    fn test_jwk() -> JwkRsaKey {
+        JwkRsaKey {
+            n: URL_SAFE_NO_PAD.decode(TEST_JWK_N).unwrap(),
+            e: URL_SAFE_NO_PAD.decode(TEST_JWK_E).unwrap(),
+        }
+    }
+
+    /// Signs `claims` with `kid` in the header, using `private_key_pem`.
+    /// Real signing (not a placeholder), exercised against `ring`'s own
+    /// verifier the same way [`the_service_account_jwt_signs_and_verifies_with_its_own_public_key`]
+    /// already does for the outbound assertion — this is the same technique
+    /// aimed at an inbound delivery instead.
+    fn sign_test_jwt(claims: &JsonValue, kid: &str, private_key_pem: &str) -> String {
+        let header = serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": kid});
+        let signing_input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(header.to_string()),
+            URL_SAFE_NO_PAD.encode(claims.to_string()),
+        );
+        let der = pkcs8_der_from_pem(private_key_pem).unwrap();
+        let key_pair = RsaKeyPair::from_pkcs8(&der).unwrap();
+        let mut signature = vec![0u8; key_pair.public().modulus_len()];
+        key_pair
+            .sign(
+                &RSA_PKCS1_SHA256,
+                &SystemRandom::new(),
+                signing_input.as_bytes(),
+                &mut signature,
+            )
+            .unwrap();
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+
     #[test]
-    fn a_structurally_valid_token_is_still_refused_because_the_signature_is_unverified() {
-        let adapter = adapter();
+    fn a_genuine_signed_token_verifies_and_its_event_normalizes() {
+        let mut account = test_account();
+        account.non_secret_config =
+            serde_json::json!({ "project_number": "123456789", "bot_user_name": "users/bot" });
+        let secret = serde_json::json!({
+            "client_email": "bot@test-project.iam.gserviceaccount.com",
+            "private_key": TEST_PRIVATE_KEY_PEM,
+        })
+        .to_string();
+        let config = AdapterConfig {
+            account: &account,
+            secret,
+        };
+        let adapter = GoogleChatAdapter::new(&config).unwrap();
+        adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
+
         let now_ms = 1_700_000_000_000i64;
-        let jwt = make_jwt(&valid_claims(now_ms / 1000));
+        let jwt = sign_test_jwt(
+            &valid_claims(now_ms / 1000),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+        let body = serde_json::to_vec(&dm_message_event()).unwrap();
+        let envelopes = adapter
+            .verify_and_normalize(
+                &[("authorization".to_string(), format!("Bearer {jwt}"))],
+                &body,
+                None,
+                now_ms,
+            )
+            .expect("a genuinely signed, structurally valid token must verify");
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].text, "hello there");
+        assert_eq!(envelopes[0].conversation.kind, ConversationKind::Direct);
+    }
+
+    #[test]
+    fn a_token_signed_by_a_different_key_is_refused() {
+        let adapter = adapter();
+        adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
+        let now_ms = 1_700_000_000_000i64;
+        // Signed by TEST_WRONG_PRIVATE_KEY_PEM, but the cache under this
+        // `kid` holds TEST_PRIVATE_KEY_PEM's public key — the mismatch a
+        // forged token would produce.
+        let jwt = sign_test_jwt(
+            &valid_claims(now_ms / 1000),
+            "test-key-1",
+            TEST_WRONG_PRIVATE_KEY_PEM,
+        );
         let result = adapter.verify_and_normalize(
             &[("authorization".to_string(), format!("Bearer {jwt}"))],
             b"{}",
             None,
             now_ms,
         );
-        assert!(result.unwrap_err().contains("google-chat-certs"));
+        assert!(result.unwrap_err().contains("signature"));
+    }
+
+    #[test]
+    fn a_tampered_payload_is_refused() {
+        let adapter = adapter();
+        adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
+        let now_ms = 1_700_000_000_000i64;
+        let jwt = sign_test_jwt(
+            &valid_claims(now_ms / 1000),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+        let mut parts: Vec<&str> = jwt.split('.').collect();
+        let mut tampered_claims = valid_claims(now_ms / 1000);
+        tampered_claims["extra"] = serde_json::json!("tampered-after-signing");
+        let tampered_payload = URL_SAFE_NO_PAD.encode(tampered_claims.to_string());
+        parts[1] = &tampered_payload;
+        let tampered_jwt = parts.join(".");
+        let result = adapter.verify_and_normalize(
+            &[(
+                "authorization".to_string(),
+                format!("Bearer {tampered_jwt}"),
+            )],
+            b"{}",
+            None,
+            now_ms,
+        );
+        assert!(result.unwrap_err().contains("signature"));
+    }
+
+    #[test]
+    fn alg_none_is_refused() {
+        let adapter = adapter();
+        let now_ms = 1_700_000_000_000i64;
+        let header =
+            URL_SAFE_NO_PAD.encode(serde_json::json!({"alg":"none","typ":"JWT"}).to_string());
+        let payload = URL_SAFE_NO_PAD.encode(valid_claims(now_ms / 1000).to_string());
+        // A syntactically valid (if meaningless) signature segment, so the
+        // refusal under test is really the `alg` check and not an earlier
+        // "malformed JWT" bail-out over an empty segment.
+        let jwt = format!("{header}.{payload}.AAAA");
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            b"{}",
+            None,
+            now_ms,
+        );
+        assert!(result.unwrap_err().contains("alg"));
+    }
+
+    #[test]
+    fn an_hmac_alg_is_refused() {
+        let adapter = adapter();
+        let now_ms = 1_700_000_000_000i64;
+        let header =
+            URL_SAFE_NO_PAD.encode(serde_json::json!({"alg":"HS256","typ":"JWT"}).to_string());
+        let payload = URL_SAFE_NO_PAD.encode(valid_claims(now_ms / 1000).to_string());
+        let jwt = format!("{header}.{payload}.AAAA");
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            b"{}",
+            None,
+            now_ms,
+        );
+        assert!(result.unwrap_err().contains("alg"));
+    }
+
+    #[test]
+    fn an_unknown_kid_with_an_empty_cache_is_refused_and_does_not_spin() {
+        // A plain `#[test]`, deliberately: no Tokio runtime exists here, so
+        // `try_refresh_blocking`'s `Handle::try_current()` fails and the
+        // adapter never attempts a fetch at all. That this call returns
+        // promptly (rather than hanging on a hypothetical unbounded retry
+        // loop) is the "does not spin" guarantee, and it holds without a
+        // mock network because there is no network path to exercise here.
+        let adapter = adapter();
+        let now_ms = 1_700_000_000_000i64;
+        let jwt = sign_test_jwt(
+            &valid_claims(now_ms / 1000),
+            "a-kid-nobody-published",
+            TEST_PRIVATE_KEY_PEM,
+        );
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            b"{}",
+            None,
+            now_ms,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_not_yet_valid_token_fails() {
+        let adapter = adapter();
+        let now_ms = 1_700_000_000_000i64;
+        let mut claims = valid_claims(now_ms / 1000);
+        claims["iat"] = serde_json::json!(now_ms / 1000 + 3600);
+        let jwt = make_jwt(&claims);
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            b"{}",
+            None,
+            now_ms,
+        );
+        assert!(result.unwrap_err().contains("not yet valid"));
     }
 
     #[test]
@@ -959,6 +1265,11 @@ rBTxwRqn0v9lv8H7GtnYwaw=
         let token_base = serve_forever("200 OK", r#"{"access_token":"tok","expires_in":3600}"#);
         let health = adapter()
             .with_bases(CHAT_API_BASE, &token_base)
+            // Port 1 on loopback: nothing listens there, so the JWKS refresh
+            // probe() attempts fails fast with connection-refused rather than
+            // reaching the real Google endpoint. probe() treats that refresh
+            // as best-effort, so it does not affect the assertion below.
+            .with_jwks_url("http://127.0.0.1:1/jwks")
             .probe()
             .await;
         assert_eq!(health.state, HealthState::Connected);
@@ -969,6 +1280,7 @@ rBTxwRqn0v9lv8H7GtnYwaw=
         let token_base = serve_forever("401 Unauthorized", r#"{"error":"invalid_grant"}"#);
         let health = adapter()
             .with_bases(CHAT_API_BASE, &token_base)
+            .with_jwks_url("http://127.0.0.1:1/jwks")
             .probe()
             .await;
         assert_eq!(health.state, HealthState::Error);

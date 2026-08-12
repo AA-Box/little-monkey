@@ -11,6 +11,7 @@ pub(crate) mod discord;
 pub(crate) mod google_chat;
 pub(crate) mod imessage;
 pub(crate) mod irc;
+pub(crate) mod jwt;
 pub(crate) mod line;
 pub(crate) mod matrix;
 pub(crate) mod mattermost;

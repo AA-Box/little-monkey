@@ -8,27 +8,26 @@
 //! against a key from Microsoft's OpenID metadata document, which has to be
 //! fetched and cached (JWKS).
 //!
-//! This adapter implements the structural checks and deliberately does not
-//! implement the signature check — `TODO(teams-jwks)`. Fetching, caching and
-//! rotating a remote JWKS correctly (freshness, key rollover, the fetch
-//! itself being an authenticated-looking but attacker-reachable network call
-//! this adapter would make on every delivery) is a meaningfully sized,
-//! security-critical feature in its own right, not a detail to bolt on at the
-//! end of four adapters. Rather than ship a half-verified signature check —
-//! which is worse than none, because it *looks* like verification —
-//! [`TeamsAdapter::verify_and_normalize`] refuses every inbound delivery
-//! outright once the structural checks pass, with an error that says exactly
-//! why. [`normalize_activity`] — the pure mapping this adapter would use once
-//! JWKS verification lands — is implemented and unit-tested against fixtures
-//! so wiring it in later is a small, reviewable change rather than a new
-//! feature.
+//! This adapter implements both halves. The signature check reuses the
+//! provider-agnostic JWKS core in `google_chat.rs` (`super::google_chat`) —
+//! JWT decoding without re-serialization, `alg` pinned to `RS256` by name,
+//! the cache, and the bounded synchronous refresh bridge — since both
+//! providers publish RSA keys the same way (a JWKS document with `n`/`e`
+//! members). What is Teams-specific is *where* the document lives: rather
+//! than a fixed JWKS URL, Bot Framework publishes an OpenID Connect discovery
+//! document (default [`DEFAULT_OPENID_METADATA_URL`], overridable per account)
+//! whose `jwks_uri` names the actual JWKS. [`TeamsAdapter::refresh_keys`] is
+//! that two-step fetch; [`TeamsAdapter::ensure_key_for_kid`] is the sync-side
+//! lookup with the one-shot catch-up on an unknown `kid` — see
+//! `jwt::try_refresh_blocking`'s doc for why that bridge is safe.
+//!
+//! [`normalize_activity`] is the pure mapping from a verified activity to an
+//! envelope, unit-tested against fixtures independently of verification.
 //!
 //! Outbound uses the client-credentials flow against the configured tenant,
 //! with the resulting token cached and refreshed on expiry.
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine as _;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, BoundedMetadata, ChannelAttachment, ChannelConversation,
     ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
@@ -39,6 +38,10 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use super::jwt::{
+    decode_jwt, fetch_bytes_via_egress, fetch_jwks_via_egress, parse_jwks_uri_from_metadata,
+    try_refresh_blocking, validate_alg_is_rs256, verify_rs256_signature, JwkRsaKey, JwksCache,
+};
 use crate::daemon::channel_adapter::{
     AdapterConfig, ChannelAdapter, InboundBatch, WebhookChannelAdapter,
 };
@@ -52,11 +55,22 @@ const SKEW_SECS: i64 = 300;
 /// it exactly at the edge, or a request built just before expiry could be
 /// sent with a token that dies in flight.
 const TOKEN_REFRESH_SKEW_SECS: i64 = 60;
+/// The Bot Framework's own OpenID Connect discovery document, whose
+/// `jwks_uri` names the JWKS this adapter verifies signatures against.
+/// Fixed for every tenant in production; [`TeamsNonSecretConfig`] allows an
+/// account to override it, since Microsoft's own docs describe a government
+/// cloud variant at a different host.
+const DEFAULT_OPENID_METADATA_URL: &str =
+    "https://login.botframework.com/v1/.well-known/openidconfiguration";
 
 #[derive(Debug, Deserialize)]
 struct TeamsNonSecretConfig {
     app_id: String,
     tenant_id: String,
+    /// Overrides [`DEFAULT_OPENID_METADATA_URL`]. Non-secret: it names an
+    /// endpoint, not a credential.
+    #[serde(default)]
+    open_id_metadata_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,20 +84,26 @@ struct CachedToken {
 }
 
 pub struct TeamsAdapter {
+    account_id: String,
     app_id: String,
     tenant_id: String,
     app_password: String,
     token_cache: Mutex<Option<CachedToken>>,
     /// Validated `serviceUrl` per conversation. Only ever written by
     /// [`TeamsAdapter::record_conversation_service_url`], which validates
-    /// before inserting — `send` refuses to guess or derive one. Currently
-    /// never populated in production because `verify_and_normalize` refuses
-    /// every delivery (see the module doc); the mechanism exists so wiring in
-    /// JWKS verification later only has to call it.
+    /// before inserting — `send` refuses to guess or derive one. Populated
+    /// from every activity `verify_and_normalize` accepts (see that method).
     service_urls: Mutex<BTreeMap<String, String>>,
     /// Identity provider origin. Always [`LOGIN_BASE`] in production;
     /// swappable in tests.
     login_base: String,
+    /// Cached RS256 JWKS keys for verifying inbound deliveries. See the
+    /// module doc for how this is kept warm.
+    jwks_cache: JwksCache,
+    /// The OpenID Connect discovery document this adapter's `jwks_uri` comes
+    /// from. [`DEFAULT_OPENID_METADATA_URL`] unless overridden by account
+    /// config; swappable in tests.
+    metadata_url: String,
 }
 
 impl TeamsAdapter {
@@ -99,13 +119,20 @@ impl TeamsAdapter {
         if secrets.app_password.trim().is_empty() {
             return Err("Teams account credential is missing app_password".to_string());
         }
+        let metadata_url = non_secret
+            .open_id_metadata_url
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_OPENID_METADATA_URL.to_string());
         Ok(Self {
+            account_id: config.account.account_id.clone(),
             app_id: non_secret.app_id,
             tenant_id: non_secret.tenant_id,
             app_password: secrets.app_password,
             token_cache: Mutex::new(None),
             service_urls: Mutex::new(BTreeMap::new()),
             login_base: LOGIN_BASE.to_string(),
+            jwks_cache: JwksCache::new(),
+            metadata_url,
         })
     }
 
@@ -113,6 +140,45 @@ impl TeamsAdapter {
     fn with_login_base(mut self, base: &str) -> Self {
         self.login_base = base.to_string();
         self
+    }
+
+    #[cfg(test)]
+    fn with_metadata_url(mut self, url: &str) -> Self {
+        self.metadata_url = url.to_string();
+        self
+    }
+
+    /// Fetches the OpenID metadata document, follows its `jwks_uri`, and
+    /// replaces the cache on success. Used by [`probe`](ChannelAdapter::probe)
+    /// to keep the cache warm, and by [`ensure_key_for_kid`](Self::ensure_key_for_kid)
+    /// as the one bounded synchronous attempt on an unknown `kid`.
+    async fn refresh_keys(&self, now_ms: i64) -> bool {
+        let Ok(metadata) = fetch_bytes_via_egress(&self.metadata_url).await else {
+            return false;
+        };
+        let Ok(jwks_uri) = parse_jwks_uri_from_metadata(&metadata) else {
+            return false;
+        };
+        match fetch_jwks_via_egress(&jwks_uri).await {
+            Ok(keys) => {
+                self.jwks_cache.replace(keys, now_ms);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The key for `kid`, fetching once more if the cache does not have it.
+    /// See `jwt::try_refresh_blocking`'s doc for why exactly one
+    /// bridged attempt is safe and sufficient.
+    fn ensure_key_for_kid(&self, kid: &str, now_ms: i64) -> Option<JwkRsaKey> {
+        if let Some(key) = self.jwks_cache.find(kid) {
+            return Some(key);
+        }
+        if try_refresh_blocking(|| self.refresh_keys(now_ms)) {
+            return self.jwks_cache.find(kid);
+        }
+        None
     }
 
     /// Records a `serviceUrl` for a conversation, refusing anything that is
@@ -203,7 +269,7 @@ impl WebhookChannelAdapter for TeamsAdapter {
     fn verify_and_normalize(
         &self,
         headers: &[(String, String)],
-        _body: &[u8],
+        body: &[u8],
         _public_base_url: Option<&str>,
         now_ms: i64,
     ) -> Result<Vec<ChannelEnvelope>, String> {
@@ -218,17 +284,50 @@ impl WebhookChannelAdapter for TeamsAdapter {
         let token = authorization
             .strip_prefix("Bearer ")
             .ok_or_else(|| "Authorization header is not a Bearer token".to_string())?;
-        let claims = decode_jwt_claims(token)?;
-        validate_claims_structurally(&claims, &self.app_id, now_ms)?;
 
-        // Structural checks passed, but that is not verification — see the
-        // module doc. The body is deliberately never parsed past this point:
-        // an unverified delivery earns no normalization, exactly as a
-        // structurally-invalid one would.
-        Err(
-            "Teams inbound signature verification is not implemented (TODO(teams-jwks)); \
-             refusing unverified delivery"
-                .to_string(),
+        let decoded = decode_jwt(token)?;
+        validate_alg_is_rs256(&decoded.header)?;
+        validate_claims_structurally(&decoded.claims, &self.app_id, now_ms)?;
+        let kid = decoded
+            .header
+            .get("kid")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "JWT is missing kid".to_string())?;
+        let key = self
+            .ensure_key_for_kid(kid, now_ms)
+            .ok_or_else(|| "No matching signing key for this token's kid; refusing".to_string())?;
+        verify_rs256_signature(decoded.signing_input, &decoded.signature, &key)?;
+
+        // Only reached once the signature has verified against a key from
+        // the Bot Framework's own JWKS — the body is never parsed before
+        // that.
+        let activity: JsonValue = serde_json::from_slice(body)
+            .map_err(|_| "Teams activity body is not valid JSON".to_string())?;
+
+        // The `serviceUrl` this specific activity carries is the only way
+        // `send` learns where to POST for this conversation — record it now
+        // that the activity is verified, per `record_conversation_service_url`'s
+        // own doc. Best-effort: an invalid or absent `serviceUrl` still lets a
+        // valid activity normalize, it just cannot be replied to yet.
+        if let (Some(conversation_id), Some(service_url)) = (
+            activity
+                .get("conversation")
+                .and_then(|conversation| conversation.get("id"))
+                .and_then(JsonValue::as_str),
+            activity.get("serviceUrl").and_then(JsonValue::as_str),
+        ) {
+            let _ = self.record_conversation_service_url(conversation_id, service_url);
+        }
+
+        let bot_id = activity
+            .get("recipient")
+            .and_then(|recipient| recipient.get("id"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default();
+        Ok(
+            normalize_activity(&activity, &self.account_id, bot_id, now_ms)
+                .into_iter()
+                .collect(),
         )
     }
 }
@@ -253,6 +352,11 @@ impl ChannelAdapter for TeamsAdapter {
 
     async fn probe(&self) -> ChannelHealth {
         let now = now_ms();
+        // Best-effort: an inbound JWKS hiccup must not fail a probe whose
+        // job is reporting on the outbound credentials.
+        if self.jwks_cache.needs_refresh(now) {
+            let _ = self.refresh_keys(now).await;
+        }
         match self.access_token().await {
             Ok(_) => ChannelHealth::connected(now, Some("App credentials valid".to_string())),
             Err(error) => ChannelHealth::error(now, error),
@@ -377,25 +481,6 @@ fn validate_service_url(candidate: &str) -> Result<(), String> {
         return Err("serviceUrl is not on a Microsoft-owned Bot Framework host".to_string());
     }
     Ok(())
-}
-
-/// Splits, base64url-decodes and JSON-parses a JWT's claims (the middle
-/// segment). Does not touch the signature — that is the part this adapter
-/// does not verify.
-fn decode_jwt_claims(token: &str) -> Result<JsonValue, String> {
-    let mut parts = token.split('.');
-    let (Some(_header), Some(payload), Some(_signature)) =
-        (parts.next(), parts.next(), parts.next())
-    else {
-        return Err("Malformed JWT".to_string());
-    };
-    if parts.next().is_some() {
-        return Err("Malformed JWT".to_string());
-    }
-    let decoded = URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| "JWT payload is not valid base64url".to_string())?;
-    serde_json::from_slice(&decoded).map_err(|_| "JWT payload is not valid JSON".to_string())
 }
 
 fn validate_claims_structurally(
@@ -591,6 +676,8 @@ fn normalize_activity(
 mod tests {
     use super::*;
     use crate::daemon::channel_store::ChannelAccountRecord;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
     use little_monkey_lib::channels::policy::ChannelAccessPolicy;
     use little_monkey_lib::channels::types::{ConversationKind, HealthState};
     use std::io::{Read, Write};
@@ -628,11 +715,18 @@ mod tests {
         TeamsAdapter::new(&config).expect("adapter builds")
     }
 
+    /// A structurally-shaped but unsigned JWT: real base64url in all three
+    /// segments (so `decode_jwt` never trips over the fixture itself), but
+    /// the signature segment is not a genuine signature over anything. Used
+    /// only by tests below whose target is a *structural* claims check that
+    /// fires before signature verification is ever reached — never for a
+    /// test that expects the signature check itself to run.
     fn make_jwt(claims: &JsonValue) -> String {
         let header =
             URL_SAFE_NO_PAD.encode(serde_json::json!({"alg":"RS256","typ":"JWT"}).to_string());
         let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
-        format!("{header}.{payload}.unsigned-placeholder-signature")
+        let signature = URL_SAFE_NO_PAD.encode(b"unsigned-placeholder-signature");
+        format!("{header}.{payload}.{signature}")
     }
 
     fn valid_claims(now_secs: i64) -> JsonValue {
@@ -646,19 +740,302 @@ mod tests {
 
     // --- Structural checks + mandatory refusal -----------------------------
 
+    /// A 2048-bit RSA test key generated locally for these tests only, whose
+    /// public half is seeded into the JWKS cache as the "genuine" signer.
+    /// Not used anywhere else and grants access to nothing.
+    const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDSxaufYG907lGy
+3EZKuTZSppsN3d4R8whFTFsFgo+11Zp5plEImzXl469p+Nc4/afv56nsig4MegEe
+0A7jiBHSnLBSBnsvuCCEoXY+T1QXyDOmZ3ycr9uSkRmSXon/wglUIbs4VaYCg2SS
+tFPyOV+F4ebCNF5aY1RocZhe6tcSyWUHBxV5WMKXONCJ84qvON0f816/HUYgOnkN
++2QCiwou+12DqPC8zOlMtXBJVn/GJjZQwIOOac8LtFSeikTXDP1QaiP0ZvVCBXoA
+8cR9nWTKbgWqx2yLVsOJR2rZu5ZCCtlUoIZddej0ob520hhDDXZgkm/bfAXEpbGX
+NbZ0ZRHjAgMBAAECggEAA7gHJNhqabFsHEV0sWF+iuDJAD/3k3DVUYZdCMYv9kZe
+47dChhiu+m+/quqqvs+tmeGy3Cs8v42biB6lqfAUWGyj/nPXfT+4xdOk0XP23jXj
+FhQ3XPsMBb8CU38lh4S17hfA75KF9lS5KTl9+Fp4y/+bYbZ+KlwcTid1nR8e967b
+zDzFUKncj3RDA7/Hp7l3ziEjlasU1i8M12g4MaaFa1N3BVVXeHIuodl9uGAnY4C7
+fGdmji2iN7+0hQnf9V+RSXp60o1sKZq4e1dB8qoDqvDl1CCjmIyF1x3mGVzxKu3K
+JCjnz6h2qxPApuyn5z1fqWljn1vAUTwQ+LhwLAABuQKBgQDyD9WQX/CfGlVqcWau
+2npdjT5SHgDlbxBD1wrj2HojcU8HPCwarc9Xe6YRHILp/zELj0BH17FvSwYdO5DD
+9cJG5fJnoB91BqZgN7lGg9cGrCk/dC2a/CWjkOv61sIF6c6R5h0ql2XhPnEq34HO
+AgMQzoTsGvXGWm7cVd16p+KCHQKBgQDe6Jp72jKpEDm18PeNfr50cfQ1aFyK6zGn
+3e1qbFMU0uDgi3KfM3L2ZOu/4MUsUv8hy9uHTQB1leVIaqLLEHqbnhpj6fVH61QD
+HexFK3LBrfkJSefh+W67igPw4EgKIy9sRHBTT1ZJMnGTz2eS93peKiLVkw6MPXt9
+7WvQQRGj/wKBgQC9+7mFyBcF+NgjY//Qqr8xn8LTFqNjb8kXRbdRXr12Bd+d8Rc4
+lURQCEct1O/XEih/Rx6PhHXJwNt6pB6Z/tBNbvrTZDRsWBzLFdE/zAg/P25cVCXb
+J52vA/aCeH3twDUWA8LOg+c9YxHVMXkipCed0Ek5Omu+E4pBOs9LDmtT7QKBgQDE
+5HCQNYvKCarwKoh/UxSnhoBPLH+RtW2G+WBcQJKiMiKwNHxqYueI/FvAgKmpHSZ+
+k7K1MC7Xri94Z7ij5Upnap+k4WLmw9bRafzonBghO6pdqgpIcCp/PMl+Wp1HVwzs
+dQdCjzGINiZciTbTegV8Z3udaufOt//8m1o/+Tm7wQKBgQCUAcjcuBpvA2FE8bOi
+kzfC4v322JZgqBYmhrjLXTMnRDg2fQ2ZAMOm8z/FxOsqy0J8oHQdaApDwgt0VZjP
+0gZ72Ua/xANCeR0T6gSYZB3ujeC8ZzDsrwkLGYqU7JidHDGNZ/CaBcXSAILeYJv1
+nJ6EyR9+bBW08LJfpDG+U7oWYA==
+-----END PRIVATE KEY-----";
+
+    /// A second, unrelated 2048-bit RSA test key: only ever used as the
+    /// "wrong signer" in tests below.
+    const TEST_WRONG_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEuwIBADANBgkqhkiG9w0BAQEFAASCBKUwggShAgEAAoIBAQDzgzLmiwnyEOF1
+FnDCygqdjmbhjbJjW2d5W5VC2cWTbqpJA+UitbAn9zalMm8HDxazOGn5VVMZU7Rj
+LFRqBsVStj8CKxzT/gSuODI8RQCgSSQV/RnymWmjk46E1/a3ArNMTuxK9oSqmPpG
+Z4jI8pqz6Q8rOvEkUrePOs0AgNcjOPM0hEqzU+a6M6sn7SQAuoSWIJZQShnjmPaJ
+syU907M6d3jTNqJux6klmce46cRIhfREu385Ez7x7MxB3tfvrXLZp+uPCLT602ta
+OZZYHKNkkw5SDZVLstDwLK+LrrruaY8OF8L7icUfg32b9/ff2J13iiOJeRENuDsg
+VrXu39RNAgMBAAECggEAXmsZmmCA27YF5UNtN2nlkc+8PmqVp4ayaVDEYCZWQGMh
+bawv9TRjeCuXqZgTirYkBBu0o3OdA+37vJRcqruzWO3HIo0a4WvV3sN1Xv8WTg/u
+CQSZQgKP/lfhY8rlI3LNmKHlZu+M4yTrrc7JL7k5mNaeBhIVnBLij4uqHy7VvBbA
+PicQa0a4IhLEd9Np1TlOpO73U5y6Q6xy/LDGcGRVGfgCpia2lCJl9YV0P4v2bqkB
+vOHsrG3lazOtvotzBz6qd0BIP8JdxaiHBGxlsuohl5ABTm5gzFq4QDqXPqeJW1i5
+/4uaWmdkXcl8bpBwtUtYRmh2wyKNuymu2+SBJB1ttQKBgQD7Vc9i52KzfAZoidV2
+JH+GmJm4GnI/mNp5LcIQf4cNTNESVZ9ZkQWSz+DGJDfHLaP43tQpp8U4+ORpz1as
+1Tza37dMO0yifGWzdIKkl4lZV7BGs3AM/pQrf9tCxVHI9jVPcdKzYvZBDcraz8se
+LUtH1Slm+sPGLnPVW+mSaHc7iwKBgQD4CDhXEJFEkBUd1xB1kXy6kfd05aP4jSWv
+WMfgIh5fH2BBneLBJ+VOa3LuXnZ4L/6EyyT73J12GYBhideRn4uqmszQIIAQW5vI
+G4SH6vMsDUr6+XBlm5gJUQ8R/f74pmjNk2iIqOOjxX/+3eW2Y7MMGATd2OSIVrmX
+sKqz9IQKhwKBgQCAzX8UnqQUe3EFTe3ZN+cq4TWWBeea9AiypWKY9eIOTNmwXbTm
+P83taR82LAVxy9AGkJuGJXaLNfJIz3sJ49XmDVRwestRUhMEnqb9FrPK14d9FCRO
+ZIEmscV6OIkrRhIX/qsOR58Pw7O741Wix2+XBoTLQ6PlApVWOF5BK8w+9QJ/CLhB
+Qs5STRbDp0joSznSKLz49iMcoKBVstRsMnUAnFd+CtCCKEg+x4L/h2HKyG7ng8Og
+iTo4Tu6WlNdDvNrfDiBjEu4RkoGl+GL/Rcf8xI+zEx+x0+Ckd69h2EAVtqgjBxcn
+laZaWmeXGF60tLTMlqBBi4sUfbaOz8ZmOe1etwKBgDaZUx+7ZphPj/RLtiIyK86c
+bdszfWD7/gqkY/cP+HUyH0wrZBwT7yQReEhzaHEDI1Aeqnotl37q5lu5tAHCK5HP
+U7+8WqqarVWRgm4Yhxhmi3lyoLNILeSR38ujqh0GCcPq06TgkxJYOUi/ZShf2XSD
+Z4Cr3JR0FbjywTd4IHU6
+-----END PRIVATE KEY-----";
+
+    /// `n`/`e` of [`TEST_PRIVATE_KEY_PEM`]'s public half, computed once
+    /// out-of-band (`openssl rsa ... -text`) and pasted here as the JWKS
+    /// values a real provider would publish — this is what
+    /// `JwksCache::seed_for_test` stands in for the network fetch.
+    const TEST_JWK_N: &str = "0sWrn2BvdO5RstxGSrk2UqabDd3eEfMIRUxbBYKPtdWaeaZRCJs15eOvafjXOP2n7-ep7IoODHoBHtAO44gR0pywUgZ7L7gghKF2Pk9UF8gzpmd8nK_bkpEZkl6J_8IJVCG7OFWmAoNkkrRT8jlfheHmwjReWmNUaHGYXurXEsllBwcVeVjClzjQifOKrzjdH_Nevx1GIDp5DftkAosKLvtdg6jwvMzpTLVwSVZ_xiY2UMCDjmnPC7RUnopE1wz9UGoj9Gb1QgV6APHEfZ1kym4Fqsdsi1bDiUdq2buWQgrZVKCGXXXo9KG-dtIYQw12YJJv23wFxKWxlzW2dGUR4w";
+    const TEST_JWK_E: &str = "AQAB";
+
+    fn test_jwk() -> JwkRsaKey {
+        JwkRsaKey {
+            n: URL_SAFE_NO_PAD.decode(TEST_JWK_N).unwrap(),
+            e: URL_SAFE_NO_PAD.decode(TEST_JWK_E).unwrap(),
+        }
+    }
+
+    /// Strips PEM armor and base64-decodes to PKCS8 DER, for the test keys
+    /// above. `google_chat.rs` has an identical helper for its own tests;
+    /// small enough that duplicating it here beats reaching into another
+    /// module's private test code.
+    fn pem_to_der(pem: &str) -> Vec<u8> {
+        use base64::engine::general_purpose::STANDARD;
+        let body: String = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("");
+        STANDARD.decode(body.trim()).unwrap()
+    }
+
+    /// Signs `claims` with `kid` in the header, using `private_key_pem`.
+    fn sign_test_jwt(claims: &JsonValue, kid: &str, private_key_pem: &str) -> String {
+        use ring::rand::SystemRandom;
+        use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
+
+        let header = serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": kid});
+        let signing_input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(header.to_string()),
+            URL_SAFE_NO_PAD.encode(claims.to_string()),
+        );
+        let der = pem_to_der(private_key_pem);
+        let key_pair = RsaKeyPair::from_pkcs8(&der).unwrap();
+        let mut signature = vec![0u8; key_pair.public().modulus_len()];
+        key_pair
+            .sign(
+                &RSA_PKCS1_SHA256,
+                &SystemRandom::new(),
+                signing_input.as_bytes(),
+                &mut signature,
+            )
+            .unwrap();
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+
     #[test]
-    fn a_structurally_valid_token_is_still_refused_because_the_signature_is_unverified() {
+    fn a_genuine_signed_token_verifies_and_its_activity_normalizes() {
         let adapter = adapter();
+        adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
         let now_ms = 1_700_000_000_000i64;
-        let jwt = make_jwt(&valid_claims(now_ms / 1000));
+        let jwt = sign_test_jwt(
+            &valid_claims(now_ms / 1000),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+        let body = serde_json::to_vec(&personal_activity()).unwrap();
+        let envelopes = adapter
+            .verify_and_normalize(
+                &[("authorization".to_string(), format!("Bearer {jwt}"))],
+                &body,
+                None,
+                now_ms,
+            )
+            .expect("a genuinely signed, structurally valid token must verify");
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].text, "hello bot");
+        assert_eq!(envelopes[0].conversation.kind, ConversationKind::Direct);
+    }
+
+    #[test]
+    fn a_verified_activity_records_its_service_url_for_send() {
+        let adapter = adapter();
+        adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
+        let now_ms = 1_700_000_000_000i64;
+        let jwt = sign_test_jwt(
+            &valid_claims(now_ms / 1000),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+        let body = serde_json::to_vec(&personal_activity()).unwrap();
+        adapter
+            .verify_and_normalize(
+                &[("authorization".to_string(), format!("Bearer {jwt}"))],
+                &body,
+                None,
+                now_ms,
+            )
+            .expect("verification should succeed");
+        let cached = adapter
+            .service_urls
+            .lock()
+            .unwrap()
+            .get("19:conv1")
+            .cloned();
+        assert_eq!(
+            cached.as_deref(),
+            Some("https://smba.trafficmanager.net/amer/")
+        );
+    }
+
+    #[test]
+    fn a_token_signed_by_a_different_key_is_refused() {
+        let adapter = adapter();
+        adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
+        let now_ms = 1_700_000_000_000i64;
+        // Signed by TEST_WRONG_PRIVATE_KEY_PEM, but the cache under this
+        // `kid` holds TEST_PRIVATE_KEY_PEM's public key — the mismatch a
+        // forged token would produce.
+        let jwt = sign_test_jwt(
+            &valid_claims(now_ms / 1000),
+            "test-key-1",
+            TEST_WRONG_PRIVATE_KEY_PEM,
+        );
         let result = adapter.verify_and_normalize(
             &[("authorization".to_string(), format!("Bearer {jwt}"))],
             b"{}",
             None,
             now_ms,
         );
-        let error = result.unwrap_err();
-        assert!(error.contains("teams-jwks"));
+        assert!(result.unwrap_err().contains("signature"));
+    }
+
+    #[test]
+    fn a_tampered_payload_is_refused() {
+        let adapter = adapter();
+        adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
+        let now_ms = 1_700_000_000_000i64;
+        let jwt = sign_test_jwt(
+            &valid_claims(now_ms / 1000),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+        let mut parts: Vec<&str> = jwt.split('.').collect();
+        let mut tampered_claims = valid_claims(now_ms / 1000);
+        tampered_claims["extra"] = serde_json::json!("tampered-after-signing");
+        let tampered_payload = URL_SAFE_NO_PAD.encode(tampered_claims.to_string());
+        parts[1] = &tampered_payload;
+        let tampered_jwt = parts.join(".");
+        let result = adapter.verify_and_normalize(
+            &[(
+                "authorization".to_string(),
+                format!("Bearer {tampered_jwt}"),
+            )],
+            b"{}",
+            None,
+            now_ms,
+        );
+        assert!(result.unwrap_err().contains("signature"));
+    }
+
+    #[test]
+    fn alg_none_is_refused() {
+        let adapter = adapter();
+        let now_ms = 1_700_000_000_000i64;
+        let header =
+            URL_SAFE_NO_PAD.encode(serde_json::json!({"alg":"none","typ":"JWT"}).to_string());
+        let payload = URL_SAFE_NO_PAD.encode(valid_claims(now_ms / 1000).to_string());
+        // A syntactically valid (if meaningless) signature segment, so the
+        // refusal under test is really the `alg` check and not an earlier
+        // "malformed JWT" bail-out over an empty segment.
+        let jwt = format!("{header}.{payload}.AAAA");
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            b"{}",
+            None,
+            now_ms,
+        );
+        assert!(result.unwrap_err().contains("alg"));
+    }
+
+    #[test]
+    fn an_hmac_alg_is_refused() {
+        let adapter = adapter();
+        let now_ms = 1_700_000_000_000i64;
+        let header =
+            URL_SAFE_NO_PAD.encode(serde_json::json!({"alg":"HS256","typ":"JWT"}).to_string());
+        let payload = URL_SAFE_NO_PAD.encode(valid_claims(now_ms / 1000).to_string());
+        let jwt = format!("{header}.{payload}.AAAA");
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            b"{}",
+            None,
+            now_ms,
+        );
+        assert!(result.unwrap_err().contains("alg"));
+    }
+
+    #[test]
+    fn an_unknown_kid_with_an_empty_cache_is_refused_and_does_not_spin() {
+        // A plain `#[test]`, deliberately: no Tokio runtime exists here, so
+        // `jwt::try_refresh_blocking`'s `Handle::try_current()` fails
+        // and the adapter never attempts a fetch at all. That this call
+        // returns promptly (rather than hanging on a hypothetical unbounded
+        // retry loop) is the "does not spin" guarantee, and it holds without
+        // a mock network because there is no network path to exercise here.
+        let adapter = adapter();
+        let now_ms = 1_700_000_000_000i64;
+        let jwt = sign_test_jwt(
+            &valid_claims(now_ms / 1000),
+            "a-kid-nobody-published",
+            TEST_PRIVATE_KEY_PEM,
+        );
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            b"{}",
+            None,
+            now_ms,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_not_yet_valid_token_fails() {
+        let adapter = adapter();
+        let now_ms = 1_700_000_000_000i64;
+        let mut claims = valid_claims(now_ms / 1000);
+        claims["nbf"] = serde_json::json!(now_ms / 1000 + 3600);
+        let jwt = make_jwt(&claims);
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            b"{}",
+            None,
+            now_ms,
+        );
+        assert!(result.unwrap_err().contains("not yet valid"));
     }
 
     #[test]
@@ -972,7 +1349,14 @@ mod tests {
     #[tokio::test]
     async fn probe_reports_connected_when_the_token_exchange_succeeds() {
         let token_base = serve_forever("200 OK", r#"{"access_token":"tok","expires_in":3600}"#);
-        let adapter = adapter().with_login_base(&token_base);
+        let adapter = adapter()
+            .with_login_base(&token_base)
+            // Port 1 on loopback: nothing listens there, so the JWKS refresh
+            // probe() attempts fails fast with connection-refused rather than
+            // reaching the real Bot Framework metadata endpoint. probe()
+            // treats that refresh as best-effort, so it does not affect the
+            // assertion below.
+            .with_metadata_url("http://127.0.0.1:1/metadata");
         let health = adapter.probe().await;
         assert_eq!(health.state, HealthState::Connected);
     }
@@ -980,7 +1364,9 @@ mod tests {
     #[tokio::test]
     async fn probe_reports_error_when_the_token_exchange_fails_and_leaks_no_secret() {
         let token_base = serve_forever("401 Unauthorized", r#"{"error":"invalid_client"}"#);
-        let adapter = adapter().with_login_base(&token_base);
+        let adapter = adapter()
+            .with_login_base(&token_base)
+            .with_metadata_url("http://127.0.0.1:1/metadata");
         let health = adapter.probe().await;
         assert_eq!(health.state, HealthState::Error);
         let error = health.last_error.unwrap_or_default();
