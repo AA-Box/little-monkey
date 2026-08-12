@@ -881,9 +881,24 @@ async fn execute_tool_call(
             .to_string();
         }
         let text = args["text"].as_str().unwrap_or_default().to_string();
-        let preview: String = text.chars().take(120).collect();
+        let attachments: Vec<String> = args["attachments"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Attaching a file sends its contents to someone outside this machine,
+        // so the approval prompt names every file. A preview of the text alone
+        // would ask the operator to approve the one part that is not the risk.
+        let mut preview: String = text.chars().take(120).collect();
+        if !attachments.is_empty() {
+            preview.push_str(&format!(" [files: {}]", attachments.join(", ")));
+        }
         return match perms.request("send_message", &preview).await {
-            Ok(()) => match crate::daemon::channel_tool::send_message(&text) {
+            Ok(()) => match crate::daemon::channel_tool::send_message(&text, &attachments) {
                 Ok(value) => value.to_string(),
                 Err(error) => serde_json::json!({ "error": error }).to_string(),
             },

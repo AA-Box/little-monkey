@@ -422,7 +422,7 @@ impl ChannelAdapter for SignalAdapter {
             inbound_transport: InboundTransport::Helper,
             max_text_chars: MAX_TEXT_CHARS,
             supports_threads: false,
-            supports_attachments: true,
+            supports_attachments: false, // inbound only: this adapter does not upload files yet
             supports_mention_metadata: false,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,

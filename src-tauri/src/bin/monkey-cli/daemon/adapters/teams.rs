@@ -342,7 +342,7 @@ impl ChannelAdapter for TeamsAdapter {
         ProviderCapabilities {
             max_text_chars: 28000,
             supports_threads: false,
-            supports_attachments: true,
+            supports_attachments: false, // inbound only: this adapter does not upload files yet
             supports_mention_metadata: true,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,

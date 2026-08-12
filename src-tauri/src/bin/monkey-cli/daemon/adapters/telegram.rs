@@ -87,6 +87,110 @@ impl TelegramAdapter {
             .build()
             .map_err(|error| self.redact(error.to_string()))
     }
+
+    /// Upload one file with `sendPhoto` or `sendDocument`.
+    ///
+    /// A picture is sent as a photo so it renders inline in the chat, and
+    /// everything else as a document so Telegram does not re-encode it. The
+    /// bytes come from the content store, where the reply tool copied them when
+    /// the agent asked — a retry minutes later sends what was meant then, not
+    /// whatever now occupies that path.
+    ///
+    /// `Err` carries the outcome the outbox should record, which is the same
+    /// distinction the text path makes: a failed handshake provably never left
+    /// this machine, anything later is unknown and must be reconciled rather
+    /// than retried into a duplicate upload.
+    async fn send_one_attachment(
+        &self,
+        client: &reqwest::Client,
+        message: &OutboundMessage,
+        attachment: &little_monkey_lib::channels::types::OutboundAttachment,
+    ) -> Result<Option<String>, SendOutcome> {
+        let paths = crate::daemon::store::DaemonPaths::resolve()
+            .map_err(|error| SendOutcome::PermanentFailure { error })?;
+        let bytes = crate::daemon::channel_adapter::attachment_bytes(&paths, attachment)
+            .map_err(|error| SendOutcome::PermanentFailure { error })?;
+        let mime = crate::daemon::channel_adapter::attachment_mime(attachment).to_string();
+        let filename = attachment
+            .filename
+            .clone()
+            .unwrap_or_else(|| "attachment".to_string());
+        let (method, field) = upload_method(&mime);
+
+        let part = match reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename)
+            .mime_str(&mime)
+        {
+            Ok(part) => part,
+            Err(_) => reqwest::multipart::Part::bytes(Vec::new()),
+        };
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", message.conversation_id.clone())
+            .part(field.to_string(), part);
+        if let Some(thread_id) = message.thread_id.clone() {
+            form = form.text("message_thread_id", thread_id);
+        }
+        if let Some(reply_to) = message.reply_to_provider_id.clone() {
+            form = form.text("reply_to_message_id", reply_to);
+        }
+
+        let request = client.post(self.method_url(method)).multipart(form);
+        let response = match little_monkey_lib::egress::send(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(if error.is_connect() {
+                    SendOutcome::RetryableFailure {
+                        error: self.redact(format!("Could not connect to Telegram: {error}")),
+                        retry_after_ms: None,
+                    }
+                } else {
+                    SendOutcome::NeedsReconciliation {
+                        error: self.redact(format!("Telegram upload outcome unknown: {error}")),
+                    }
+                });
+            }
+        };
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        if status.as_u16() == 429 {
+            let retry_after_ms = serde_json::from_str::<TelegramErrorResponse>(&body_text)
+                .ok()
+                .and_then(|error| error.parameters)
+                .and_then(|parameters| parameters.retry_after)
+                .map(|seconds| seconds * 1000);
+            return Err(SendOutcome::RetryableFailure {
+                error: "Telegram rate-limited the upload (429)".to_string(),
+                retry_after_ms,
+            });
+        }
+        if !status.is_success() {
+            return Err(SendOutcome::PermanentFailure {
+                error: self.redact(format!("Telegram returned {status} for {method}")),
+            });
+        }
+        match serde_json::from_str::<TelegramApiResponse<TelegramMessage>>(&body_text) {
+            Ok(parsed) if parsed.ok => {
+                Ok(parsed.result.map(|message| message.message_id.to_string()))
+            }
+            _ => Err(SendOutcome::NeedsReconciliation {
+                error: format!("Telegram accepted {method} but returned an unparseable response"),
+            }),
+        }
+    }
+}
+
+/// The API method and form field one MIME type should be uploaded through.
+///
+/// A picture goes as a photo so it renders inline in the chat. Everything else
+/// goes as a document, which is also the right answer for SVG: Telegram's photo
+/// path re-encodes what it is given, and an SVG that survives as a file is more
+/// useful than one that arrives as a raster.
+fn upload_method(mime: &str) -> (&'static str, &'static str) {
+    if mime.starts_with("image/") && mime != "image/svg+xml" {
+        ("sendPhoto", "photo")
+    } else {
+        ("sendDocument", "document")
+    }
 }
 
 fn now_ms() -> i64 {
@@ -291,6 +395,12 @@ impl ChannelAdapter for TelegramAdapter {
                             .to_string(),
                     };
                 }
+            }
+        }
+        for attachment in &message.attachments {
+            match self.send_one_attachment(&client, message, attachment).await {
+                Ok(message_id) => last_message_id = message_id.or(last_message_id),
+                Err(outcome) => return outcome,
             }
         }
         SendOutcome::Sent {
@@ -662,6 +772,22 @@ struct TelegramUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_picture_is_uploaded_as_a_photo_and_everything_else_as_a_document() {
+        assert_eq!(upload_method("image/png"), ("sendPhoto", "photo"));
+        assert_eq!(upload_method("image/jpeg"), ("sendPhoto", "photo"));
+        assert_eq!(
+            upload_method("application/pdf"),
+            ("sendDocument", "document")
+        );
+        // Telegram's photo path re-encodes, which destroys an SVG.
+        assert_eq!(upload_method("image/svg+xml"), ("sendDocument", "document"));
+        assert_eq!(
+            upload_method("application/octet-stream"),
+            ("sendDocument", "document")
+        );
+    }
 
     const PRIVATE_MESSAGE: &str = r#"{
         "update_id": 100,

@@ -236,7 +236,12 @@ pub fn send_message_tool_def() -> serde_json::Value {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "text": { "type": "string", "description": "The message to send." }
+                    "text": { "type": "string", "description": "The message to send." },
+                    "attachments": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional files to send with the message, as paths inside this run's own directory. At most 4, each under 16 MB. Not every provider can carry files."
+                    }
                 },
                 "required": ["text"],
                 "additionalProperties": false

@@ -121,6 +121,75 @@ pub trait WebhookChannelAdapter: Send + Sync {
     }
 }
 
+/// Largest single file an agent may attach to a reply.
+///
+/// Well under every provider's own limit, and chosen so a runaway model cannot
+/// push a disk image through the outbox one reply at a time. The cap is applied
+/// twice — when the file is imported, and again when the bytes are read back —
+/// so a blob that grew between the two cannot slip past.
+pub const MAX_ATTACHMENT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read one outbound attachment's bytes out of the content store.
+///
+/// Attachments are copied into the store when the reply is queued, not read
+/// from disk at send time: an outbox row can be retried minutes later, and the
+/// file the agent meant is the one that existed when it said so, not whatever
+/// occupies that path now.
+pub fn attachment_bytes(
+    paths: &super::store::DaemonPaths,
+    attachment: &little_monkey_lib::channels::types::OutboundAttachment,
+) -> Result<Vec<u8>, String> {
+    let app_data = paths
+        .root
+        .parent()
+        .ok_or_else(|| "Daemon root has no app-data parent".to_string())?;
+    let store = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
+        app_data.join("content-v1"),
+        MAX_ATTACHMENT_BYTES,
+    )
+    .map_err(|error| format!("Failed to open the content store: {error}"))?;
+    store
+        .read(&attachment.artifact_id)
+        .map_err(|error| format!("Failed to read the attachment: {error}"))
+}
+
+/// The MIME type to send a file as.
+///
+/// The attachment's own type when the tool recorded one, else guessed from the
+/// extension, else the generic byte stream — never a guess at the *contents*,
+/// which is the provider's business and not something to assert wrongly.
+pub fn attachment_mime(
+    attachment: &little_monkey_lib::channels::types::OutboundAttachment,
+) -> &str {
+    if let Some(mime) = attachment.mime_type.as_deref() {
+        return mime;
+    }
+    let extension = attachment
+        .filename
+        .as_deref()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" | "log" => "text/plain",
+        "md" => "text/markdown",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "zip" => "application/zip",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Whether this account cannot work until a credential is stored.
 ///
 /// True for every provider Little Monkey authenticates to itself. It is false
