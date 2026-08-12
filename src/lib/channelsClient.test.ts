@@ -33,7 +33,7 @@ describe("channels setup guidance", () => {
     // never received.
     for (const guide of PROVIDER_GUIDES) {
       for (const key of guide.configKeys) {
-        expect(key).not.toMatch(/secret|token|password|key$/);
+        expect(key).not.toMatch(/secret|token|password|key/);
       }
     }
   });
