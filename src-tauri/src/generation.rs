@@ -61,9 +61,22 @@ const MAX_BATCH_COUNT: u32 = 8;
 /// anything, and llama.cpp clamps the number to the layers a model actually
 /// has rather than erroring on an overshoot.
 const SPEECH_GPU_LAYERS: u32 = 999;
-/// Weights are tens of gigabytes and are read lazily from disk on first use,
-/// so first-token latency after launch is dominated by IO, not compute.
-const READY_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long the engine may say *nothing at all* before a launch is called
+/// dead.
+///
+/// Not a budget for the whole load. Weights are tens of gigabytes read lazily
+/// from disk, and how long that takes is a property of the model, not of this
+/// app: an image-to-video pair like Wan 2.2 A14B loads two 14B diffusion
+/// models plus a text encoder and a VAE, which routinely outruns any
+/// wall-clock ceiling small enough to catch a genuinely hung engine. Silence
+/// is what actually separates the two — `sd-server` narrates its load line by
+/// line, so an engine that is working says so, and one that has wedged says
+/// nothing.
+const READY_SILENCE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Ceiling on the single readiness probe, so a wedged socket cannot hold the
+/// request open forever. The silence watchdog is what normally ends the wait;
+/// this only bounds the case where the engine keeps talking but never answers.
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 
 /// One `sd-server` command-line weight slot. The mapping to a flag is the
 /// entire model-specific surface: a new architecture picks different slots
@@ -1685,6 +1698,50 @@ impl GenerationEngineState {
         Ok(())
     }
 
+    /// A fingerprint of everything the engine has said so far, used as a
+    /// heartbeat while it loads.
+    ///
+    /// The tail is length-capped, so a long load reaches the cap and then keeps
+    /// the same length while its *content* rolls forward — hence a hash rather
+    /// than a byte count. Sampling lines never reach the tail at all, so they
+    /// are folded in separately.
+    pub fn output_mark(&self) -> (u64, Option<(u32, u32)>) {
+        let Ok(state) = self.inner.lock() else {
+            return (0, None);
+        };
+        let said = state
+            .stderr_tail
+            .as_ref()
+            .and_then(|tail| {
+                tail.lock().ok().map(|value| {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    std::hash::Hash::hash(&*value, &mut hasher);
+                    std::hash::Hasher::finish(&hasher)
+                })
+            })
+            .unwrap_or(0);
+        let sampling = state
+            .sampling
+            .as_ref()
+            .and_then(|cell| cell.lock().ok().and_then(|value| *value));
+        (said, sampling)
+    }
+
+    /// The engine's own last words, ready to append to a failure message.
+    fn stderr_detail(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .ok()?
+            .stderr_tail
+            .as_ref()
+            .and_then(|tail| {
+                tail.lock()
+                    .ok()
+                    .map(|value| engine_failure_detail(value.trim()))
+            })
+            .filter(|value| !value.is_empty())
+    }
+
     /// True when the child has already exited; used to fail a readiness wait
     /// fast instead of polling a dead process for five minutes.
     ///
@@ -1791,59 +1848,95 @@ impl GenerationEngineState {
                     .to_string()
             })
             .unwrap_or_default();
-        let deadline = Instant::now() + READY_TIMEOUT;
-        while Instant::now() < deadline {
+        let mut spoken = self.output_mark();
+        let mut spoke_at = Instant::now();
+        loop {
             if let Some(failure) = self.child_exited()? {
                 self.stop()?;
                 return Err(failure);
             }
-            // Wait out the whole deadline on one probe rather than abandoning a
-            // short one every half second. `sd-server` answers `/capabilities`
-            // from its worker pool, and a big model warms up for a minute or
-            // more before the first answer comes back — every probe we give up
-            // on leaves its handler thread blocked, so a 2s timeout drains the
-            // pool in seconds and the engine can never answer at all. A dead
-            // child drops the connection, so this still fails fast.
-            let remaining = deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_secs(1));
-            if let Ok(response) =
-                crate::egress::send(client.get(&capabilities).timeout(remaining)).await
-            {
-                // A foreign service could answer on this port while our child
-                // is losing the bind. Prove the child is still alive after the
-                // response, exactly as `llama.rs` does — and prove the answer
-                // came from the model we asked for, because an engine holding
-                // different weights accepts the connection and then rejects
-                // every job with a bare 400.
-                if response.status().is_success()
-                    && response
-                        .json::<Value>()
-                        .await
-                        .ok()
-                        .and_then(|body| {
-                            body.pointer("/model/path")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        })
-                        .is_some_and(|loaded| loaded == expected_model_path)
-                {
-                    if let Some(failure) = self.child_exited()? {
-                        self.stop()?;
-                        return Err(failure);
+            // Hold one probe open rather than abandoning a short one every half
+            // second. `sd-server` answers `/capabilities` from its worker pool,
+            // and a big model warms up for a minute or more before the first
+            // answer comes back — every probe we give up on leaves its handler
+            // thread blocked, so a short timeout drains the pool in seconds and
+            // the engine can never answer at all. The watchdog below is what
+            // ends the wait, and it does so without touching the request.
+            let probe = crate::egress::send(client.get(&capabilities).timeout(READY_PROBE_TIMEOUT));
+            tokio::pin!(probe);
+            let answered = loop {
+                tokio::select! {
+                    result = &mut probe => break Some(result),
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                        if let Some(failure) = self.child_exited()? {
+                            self.stop()?;
+                            return Err(failure);
+                        }
+                        let heard = self.output_mark();
+                        if heard != spoken {
+                            spoken = heard;
+                            spoke_at = Instant::now();
+                        } else if spoke_at.elapsed() >= READY_SILENCE_TIMEOUT {
+                            break None;
+                        }
                     }
-                    // It has answered once, so everything else may now ask it
-                    // things without waiting out a load it cannot see.
-                    if let Ok(mut state) = self.inner.lock() {
-                        state.ready = true;
-                    }
-                    return Ok(base_url);
                 }
+            };
+            let response = match answered {
+                Some(Ok(response)) => response,
+                // A transport error against a child that is still alive is a
+                // connection refused while the listener comes up. Try again.
+                Some(Err(_)) => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                None => {
+                    // The engine's own last words, for the same reason
+                    // `child_exited` carries them: "did not become ready" alone
+                    // names the symptom and hides every cause.
+                    let detail = self.stderr_detail();
+                    self.stop()?;
+                    let headline = format!(
+                        "Generation engine went silent for {}s while loading and never became ready",
+                        READY_SILENCE_TIMEOUT.as_secs()
+                    );
+                    return Err(match detail {
+                        Some(detail) => format!("{headline}:\n{detail}"),
+                        None => headline,
+                    });
+                }
+            };
+            // A foreign service could answer on this port while our child
+            // is losing the bind. Prove the child is still alive after the
+            // response, exactly as `llama.rs` does — and prove the answer
+            // came from the model we asked for, because an engine holding
+            // different weights accepts the connection and then rejects
+            // every job with a bare 400.
+            if response.status().is_success()
+                && response
+                    .json::<Value>()
+                    .await
+                    .ok()
+                    .and_then(|body| {
+                        body.pointer("/model/path")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .is_some_and(|loaded| loaded == expected_model_path)
+            {
+                if let Some(failure) = self.child_exited()? {
+                    self.stop()?;
+                    return Err(failure);
+                }
+                // It has answered once, so everything else may now ask it
+                // things without waiting out a load it cannot see.
+                if let Ok(mut state) = self.inner.lock() {
+                    state.ready = true;
+                }
+                return Ok(base_url);
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        self.stop()?;
-        Err("Generation engine did not become ready in time".to_string())
     }
 }
 
@@ -3673,6 +3766,50 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
         assert_eq!(capabilities.features.get("mask_image"), Some(&true));
         assert_eq!(capabilities.features.get("control_image"), Some(&false));
         assert_eq!(capabilities.features.get("ip_adapter_image"), None);
+    }
+
+    /// The readiness wait is ended by silence, not by elapsed time, so a load
+    /// that is still narrating itself must never look silent. The tail is
+    /// capped, so once a verbose load fills it the length stops changing while
+    /// the content keeps rolling — a byte count would call that silence and
+    /// kill a model that was loading normally.
+    #[test]
+    fn a_rolling_capped_tail_still_reads_as_the_engine_talking() {
+        let tail = Arc::new(Mutex::new(String::new()));
+        let engine = GenerationEngineState {
+            inner: Mutex::new(EngineProcess {
+                stderr_tail: Some(Arc::clone(&tail)),
+                ..EngineProcess::default()
+            }),
+        };
+        let say = |line: &str| {
+            let mut buffer = tail.lock().unwrap();
+            buffer.push_str(line);
+            buffer.push('\n');
+            if buffer.len() > MAX_STDERR_TAIL {
+                let (capped, _) =
+                    crate::output_cap::cap_tail(std::mem::take(&mut buffer), MAX_STDERR_TAIL);
+                *buffer = capped;
+            }
+        };
+
+        let quiet = engine.output_mark();
+        say("loading tensors 1/400");
+        let talking = engine.output_mark();
+        assert_ne!(quiet, talking);
+
+        // Past the cap: same length every time, different words.
+        for step in 0..600 {
+            say(&format!("loading tensors {step}/400 of a very large model"));
+        }
+        let capped_len = tail.lock().unwrap().len();
+        let at_cap = engine.output_mark();
+        say("loading tensors 601/400 of a very large model");
+        assert_eq!(tail.lock().unwrap().len(), capped_len);
+        assert_ne!(at_cap, engine.output_mark());
+
+        // Nothing said, nothing changed — that is what ends the wait.
+        assert_eq!(engine.output_mark(), engine.output_mark());
     }
 
     /// An engine that is up but still loading has an address and must not be

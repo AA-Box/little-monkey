@@ -49,9 +49,18 @@ const BACKENDS_FILE: &str = "studio-backends.json";
 const MAX_BACKENDS: usize = 32;
 /// Keeps a corrupt or hand-edited gallery from being read without bound.
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
-/// A long clip on a constrained machine can legitimately sample for a long
-/// time; this exists so a wedged engine cannot poll forever.
-const JOB_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// How long a running job may show *no sign of movement at all* before it is
+/// called wedged and cancelled.
+///
+/// Not a budget for the whole run. A clip's cost is the user's own choice —
+/// frames times resolution times steps, and then a VAE decode that dominates
+/// everything else — so any wall-clock ceiling is really a hidden cap on the
+/// settings the picker offers. This measures stillness instead: sampling step,
+/// queue position, and the engine's own output are all watched, and a job that
+/// changes none of them for this long has stopped rather than slowed. The
+/// window is wide because the decode phase is genuinely quiet on some
+/// architectures.
+const JOB_STALL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// One tool run, end to end. Unlike a generation this is a single synchronous
 /// request — there is no job to poll — so the deadline covers the operation
 /// itself and not just a round trip.
@@ -900,18 +909,26 @@ async fn run_diffusion(
         GenerationProgressEvent::new(&job_id, "submitted"),
     );
 
-    let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
+    let mut moving = (engine.output_mark(), u32::MAX);
+    let mut moved_at = tokio::time::Instant::now();
     loop {
-        if tokio::time::Instant::now() >= deadline {
-            generation::cancel_job(&client, &base_url, &job_id).await;
-            return Err("Generation exceeded its time limit".to_string());
-        }
         match generation::poll_job(&client, &base_url, &job_id).await? {
             JobProgress::Running { queue_position } => {
                 let mut event = GenerationProgressEvent::new(&job_id, "running")
                     .with_progress(engine.progress());
                 event.queue_position = queue_position;
                 let _ = app.emit("studio://progress", event);
+                let now = (engine.output_mark(), queue_position);
+                if now != moving {
+                    moving = now;
+                    moved_at = tokio::time::Instant::now();
+                } else if moved_at.elapsed() >= JOB_STALL_TIMEOUT {
+                    generation::cancel_job(&client, &base_url, &job_id).await;
+                    return Err(format!(
+                        "Generation stopped making progress for {} minutes and was cancelled",
+                        JOB_STALL_TIMEOUT.as_secs() / 60
+                    ));
+                }
             }
             JobProgress::Completed(media) => return Ok(media),
             JobProgress::Failed(error) => return Err(error),
