@@ -42,6 +42,9 @@ pub(crate) fn build_adapter(config: &AdapterConfig<'_>) -> Result<Arc<dyn Channe
         ChannelKind::Line => Arc::new(line::LineAdapter::new(config)?),
         ChannelKind::Teams => Arc::new(teams::TeamsAdapter::new(config)?),
         ChannelKind::GoogleChat => Arc::new(google_chat::GoogleChatAdapter::new(config)?),
+        ChannelKind::Matrix => Arc::new(matrix::MatrixAdapter::new(config)?),
+        ChannelKind::Signal => Arc::new(signal::SignalAdapter::new(config)?),
+        ChannelKind::IMessage => Arc::new(imessage::ImessageAdapter::new(config)?),
         other => {
             return Err(format!(
                 "Little Monkey has no {} adapter in this build",
