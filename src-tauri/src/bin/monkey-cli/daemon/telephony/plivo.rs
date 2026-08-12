@@ -420,6 +420,11 @@ fn normalize_plivo_params(
                 source: AttachmentSource::Url {
                     url: media.media_url,
                 },
+                // Filled by ingest once the bytes are actually fetched; a
+                // webhook carries only the address of the media.
+                stored_artifact_id: None,
+                fetch_error: None,
+                text_excerpt: None,
             })
             .collect();
         let mut metadata = BoundedMetadata::new();
