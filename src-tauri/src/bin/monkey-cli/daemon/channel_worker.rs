@@ -602,13 +602,19 @@ mod tests {
         };
 
         let report = ingest_batch(&mut store, &queue, &[envelope("1"), envelope("2")], NOW);
-        assert_eq!(report.failed, 2);
+        assert_eq!(report.deferred, 2);
         assert_eq!(report.accepted, 0);
+        assert_eq!(report.failed, 0);
+
+        // The queue refused, but the turns are not lost: both are durably
+        // accepted, and the next recovery pass is what re-submits them.
         let events = store.recent_channel_events("acct-1", 10).unwrap();
         assert_eq!(events.len(), 2);
         assert!(events
             .iter()
-            .all(|event| event.disposition == EventDisposition::Failed));
+            .all(|event| event.disposition == EventDisposition::Accepted));
+        assert!(events.iter().all(|event| event.job_id.is_none()));
+        assert_eq!(store.pending_ingress_turns(10).unwrap().len(), 2);
     }
 
     #[tokio::test]
