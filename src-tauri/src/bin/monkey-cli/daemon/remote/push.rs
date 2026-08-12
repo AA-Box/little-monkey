@@ -883,9 +883,13 @@ impl WebPushBackend {
     ) -> Result<(String, Vec<(String, String)>, Vec<u8>), String> {
         subscription.validate()?;
         let plaintext = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
-        let mut salt = [0u8; 16];
-        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut salt)
-            .map_err(|_| "The operating system random generator failed".to_string())?;
+        // `generate` rather than filling a zeroed buffer: there is then no
+        // array literal for a reader — or a scanner — to mistake for a
+        // hard-coded salt, and no zero-valued salt that could survive an
+        // ignored error.
+        let salt: [u8; 16] = ring::rand::generate(&ring::rand::SystemRandom::new())
+            .map_err(|_| "The operating system random generator failed".to_string())?
+            .expose();
         let ephemeral = ring::agreement::EphemeralPrivateKey::generate(
             &ring::agreement::ECDH_P256,
             &ring::rand::SystemRandom::new(),
@@ -1017,8 +1021,7 @@ mod tests {
             ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::ECDH_P256, &rng)
                 .unwrap();
         let ua_public = ua_private.compute_public_key().unwrap().as_ref().to_vec();
-        let mut auth_secret = [0u8; 16];
-        ring::rand::SecureRandom::fill(&rng, &mut auth_secret).unwrap();
+        let auth_secret: [u8; 16] = ring::rand::generate(&rng).unwrap().expose();
 
         let subscription = WebPushSubscription {
             endpoint: "https://push.example.invalid/subscription/abc".into(),
@@ -1035,8 +1038,7 @@ mod tests {
         .payload(false);
         let plaintext = serde_json::to_vec(&payload).unwrap();
 
-        let mut salt = [0u8; 16];
-        ring::rand::SecureRandom::fill(&rng, &mut salt).unwrap();
+        let salt: [u8; 16] = ring::rand::generate(&rng).unwrap().expose();
         let as_private =
             ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::ECDH_P256, &rng)
                 .unwrap();
