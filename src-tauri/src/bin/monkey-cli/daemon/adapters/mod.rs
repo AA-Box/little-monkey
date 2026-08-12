@@ -10,6 +10,8 @@
 pub(crate) mod discord;
 pub(crate) mod google_chat;
 pub(crate) mod imessage;
+#[cfg(target_os = "macos")]
+pub(crate) mod imessage_native;
 pub(crate) mod irc;
 pub(crate) mod jwt;
 pub(crate) mod line;
