@@ -906,10 +906,12 @@ async fn execute_tool_call(
         let to_number = args["to_number"].as_str().unwrap_or_default().to_string();
         let detail = format!("call {to_number} from {account_id}");
         return match perms.request("place_call", &detail).await {
-            Ok(()) => match crate::daemon::telecom_tool::place_call(&account_id, &to_number).await {
-                Ok(value) => value.to_string(),
-                Err(error) => serde_json::json!({ "error": error }).to_string(),
-            },
+            Ok(()) => {
+                match crate::daemon::telecom_tool::place_call(&account_id, &to_number).await {
+                    Ok(value) => value.to_string(),
+                    Err(error) => serde_json::json!({ "error": error }).to_string(),
+                }
+            }
             Err(error) => serde_json::json!({ "error": error }).to_string(),
         };
     }

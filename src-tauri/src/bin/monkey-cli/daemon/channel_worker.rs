@@ -319,6 +319,20 @@ fn load_adapters(store: &DaemonStore) -> BTreeMap<String, Arc<dyn ChannelAdapter
         }
     };
     for account in accounts.into_iter().filter(|account| account.enabled) {
+        // An SMS account's carrier credential lives on the telephony account of
+        // the same id, not on this row, so it is built from there.
+        if account.kind == little_monkey_lib::channels::types::ChannelKind::Sms {
+            match build_sms_adapter(store, &secrets, &account.account_id) {
+                Ok(adapter) => {
+                    adapters.insert(account.account_id.clone(), adapter);
+                }
+                Err(error) => eprintln!(
+                    "monkey daemon: SMS account {} cannot send: {error}",
+                    account.account_id
+                ),
+            }
+            continue;
+        }
         let secret = match &account.credential_ref {
             Some(reference) => match secrets.get(reference) {
                 Ok(secret) => secret,
@@ -347,6 +361,29 @@ fn load_adapters(store: &DaemonStore) -> BTreeMap<String, Arc<dyn ChannelAdapter
         }
     }
     adapters
+}
+
+/// Build the adapter that answers texts for one telephony account.
+///
+/// Separate from the loop above because it reads a different table: an SMS
+/// channel account is a shadow of a telephony account (see
+/// `telecom_worker::ensure_sms_channel_account`), and the carrier credential
+/// only ever sits on the telephony row.
+fn build_sms_adapter(
+    store: &DaemonStore,
+    secrets: &dyn super::channel_adapter::ChannelSecrets,
+    account_id: &str,
+) -> Result<Arc<dyn ChannelAdapter>, String> {
+    let telecom = store
+        .telecom_account(account_id)?
+        .ok_or_else(|| "its telephony account no longer exists".to_string())?;
+    let secret = match &telecom.credential_ref {
+        Some(reference) => secrets.get(reference)?,
+        None => String::new(),
+    };
+    Ok(Arc::new(super::adapters::sms::SmsAdapter::new(
+        &telecom, secret,
+    )?))
 }
 
 fn current_ms() -> Result<i64, String> {

@@ -17,6 +17,7 @@ pub(crate) mod matrix;
 pub(crate) mod mattermost;
 pub(crate) mod signal;
 pub(crate) mod slack;
+pub(crate) mod sms;
 pub(crate) mod teams;
 pub(crate) mod telegram;
 pub(crate) mod whatsapp;
@@ -29,9 +30,9 @@ use super::channel_adapter::{AdapterConfig, ChannelAdapter};
 
 /// Build the adapter an account's provider needs.
 ///
-/// The one place a `ChannelKind` becomes code. A kind with no adapter yet is an
-/// error naming the provider rather than a silent no-op, so an operator who
-/// configures one is told, and the account simply never polls.
+/// The one place a `ChannelKind` becomes code. Exhaustive on purpose: a new
+/// provider kind fails to compile here until somebody decides what it maps to,
+/// rather than silently becoming an account that never runs.
 pub(crate) fn build_adapter(config: &AdapterConfig<'_>) -> Result<Arc<dyn ChannelAdapter>, String> {
     Ok(match config.account.kind {
         ChannelKind::Telegram => Arc::new(telegram::TelegramAdapter::new(config)?),
@@ -46,11 +47,11 @@ pub(crate) fn build_adapter(config: &AdapterConfig<'_>) -> Result<Arc<dyn Channe
         ChannelKind::Matrix => Arc::new(matrix::MatrixAdapter::new(config)?),
         ChannelKind::Signal => Arc::new(signal::SignalAdapter::new(config)?),
         ChannelKind::IMessage => Arc::new(imessage::ImessageAdapter::new(config)?),
-        other => {
-            return Err(format!(
-                "Little Monkey has no {} adapter in this build",
-                other.label()
-            ))
+        // SMS is the one provider whose credential lives on a telephony account
+        // rather than a channel account, so it is built from that row instead —
+        // see `channel_worker::load_adapters`.
+        ChannelKind::Sms => {
+            return Err("An SMS account is built from its telephony account".to_string())
         }
     })
 }

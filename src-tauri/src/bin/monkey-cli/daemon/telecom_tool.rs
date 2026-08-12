@@ -17,7 +17,7 @@
 
 use super::store::{DaemonPaths, DaemonStore};
 use super::telecom_store::{CallDirection, CallRecording, OutboundCallApproval, TelecomCallRecord};
-use super::telephony::{build_provider, CallState, TelecomConfig};
+use super::telephony::{provider_for_account, CallState};
 
 /// Environment variable naming the job a task child is running, set by the
 /// daemon. Absent for every other kind of run.
@@ -31,9 +31,14 @@ fn valid_e164(number: &str) -> bool {
 }
 
 /// Place one call.
-pub(crate) async fn place_call(account_id: &str, to_number: &str) -> Result<serde_json::Value, String> {
+pub(crate) async fn place_call(
+    account_id: &str,
+    to_number: &str,
+) -> Result<serde_json::Value, String> {
     if !valid_e164(to_number) {
-        return Err("A phone number must be in international format, like +15551234567.".to_string());
+        return Err(
+            "A phone number must be in international format, like +15551234567.".to_string(),
+        );
     }
     let paths = DaemonPaths::resolve()?;
     let mut store = DaemonStore::open(&paths)?;
@@ -94,19 +99,7 @@ pub(crate) async fn place_call(account_id: &str, to_number: &str) -> Result<serd
         .unwrap_or_default(),
         None => String::new(),
     };
-    let provider = build_provider(TelecomConfig {
-        account_id: account.account_id.clone(),
-        kind: account.kind,
-        carrier_account_id: account.carrier_account_id.clone(),
-        from_number: account.from_number.clone(),
-        secret,
-        public_base_url: account.public_base_url.clone(),
-        webhook_public_key: account
-            .non_secret_config
-            .get("webhook_public_key")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-    })?;
+    let provider = provider_for_account(&account, secret)?;
 
     // The carrier calls us back on this account's own callback path under the
     // operator's configured public URL. Without one there is nowhere for the
@@ -115,7 +108,11 @@ pub(crate) async fn place_call(account_id: &str, to_number: &str) -> Result<serd
         .public_base_url
         .clone()
         .ok_or_else(|| "This account has no public callback URL configured, so a call would have nowhere to connect.".to_string())?;
-    let answer_url = format!("{}/v1/telecom/{}", base.trim_end_matches('/'), account.account_id);
+    let answer_url = format!(
+        "{}/v1/telecom/{}",
+        base.trim_end_matches('/'),
+        account.account_id
+    );
 
     match provider.place_call(to_number, &answer_url).await {
         Ok(handle) => {
@@ -131,7 +128,12 @@ pub(crate) async fn place_call(account_id: &str, to_number: &str) -> Result<serd
         Err(error) => {
             // The row stays. A failure here may still have reached the carrier,
             // and a call that might exist is not something to forget about.
-            store.advance_call(&call_id, CallState::NeedsReconciliation, Some(&error), now_ms)?;
+            store.advance_call(
+                &call_id,
+                CallState::NeedsReconciliation,
+                Some(&error),
+                now_ms,
+            )?;
             Err(format!("The carrier did not confirm the call: {error}"))
         }
     }
@@ -176,14 +178,22 @@ mod tests {
         assert!(valid_e164("+4670123456"));
         assert!(!valid_e164("15551234567"), "a missing plus is not E.164");
         assert!(!valid_e164("+1555"), "too short to be a real number");
-        assert!(!valid_e164("+1555123456789012"), "too long to be a real number");
-        assert!(!valid_e164("+1555; DROP"), "no punctuation reaches a carrier");
+        assert!(
+            !valid_e164("+1555123456789012"),
+            "too long to be a real number"
+        );
+        assert!(
+            !valid_e164("+1555; DROP"),
+            "no punctuation reaches a carrier"
+        );
         assert!(!valid_e164(""));
     }
 
     #[tokio::test]
     async fn a_malformed_number_is_refused_before_anything_is_opened() {
-        let error = place_call("tel-1", "not-a-number").await.expect_err("refused");
+        let error = place_call("tel-1", "not-a-number")
+            .await
+            .expect_err("refused");
         assert!(error.contains("international format"));
     }
 }
