@@ -647,8 +647,9 @@ mod tests {
     }
 }
 
-/// The largest attachment served to a carrier. Matches the cap the SMS adapter
-/// applies when it mints the URL, so the two cannot disagree.
+/// The largest attachment served to a carrier. The per-type caps in
+/// `adapters::sms` are the real limit; this only bounds what is read from disk
+/// before those are applied.
 const MAX_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Hand a carrier one attachment, if it presents a valid signed URL.
@@ -722,11 +723,21 @@ fn serve_signed_attachment(
     let Ok(bytes) = artifacts.read(artifact_id) else {
         return response(StatusCode::NOT_FOUND, "not_found");
     };
+    // The type is read from the bytes themselves rather than from anything the
+    // request or the artifact metadata claims. A carrier cannot deliver an
+    // attachment it cannot identify, and this process will not name a type it
+    // has not looked at.
+    let Some(media_type) = super::adapters::sms::sniff_media_type(&bytes) else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    if super::adapters::sms::media_limit(media_type).is_none_or(|limit| bytes.len() > limit) {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    }
     Response::builder()
         .status(StatusCode::OK)
-        // The bytes are whatever the operator attached; naming a type this
-        // process did not verify would be a claim it cannot make.
-        .header(CONTENT_TYPE, "application/octet-stream")
+        .header(CONTENT_TYPE, media_type)
+        // A carrier fetches this once; nothing downstream should keep it.
+        .header("cache-control", "no-store")
         .body(Full::new(Bytes::from(bytes)))
         .unwrap_or_else(|_| response(StatusCode::NOT_FOUND, "not_found"))
 }

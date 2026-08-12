@@ -45,14 +45,76 @@ struct MediaSigning {
 
 /// How long a carrier has to fetch an attachment before its URL stops working.
 ///
-/// Carriers fetch promptly; the window only has to cover a retry or two. Every
-/// minute past that is a minute the URL is worth stealing.
-const MEDIA_FILE_TTL_MS: i64 = 15 * 60 * 1_000;
+/// Carriers fetch promptly; the window only has to cover a retry or two. The
+/// whole query string is a bearer capability for that window — worth keeping
+/// out of proxy logs, and worth expiring quickly.
+const MEDIA_FILE_TTL_MS: i64 = 10 * 60 * 1_000;
 
-/// The largest attachment this pipeline will hand a carrier. MMS is capped far
-/// below this by every carrier anyway; the point is to refuse before reading a
-/// large blob into memory.
-const MAX_MMS_BYTES: usize = 5 * 1024 * 1024;
+/// One media item per message. Carriers accept more, and every one of them
+/// bills per segment for it; a reply that quietly sends six pictures is a bill
+/// nobody agreed to.
+const MAX_ATTACHMENTS_PER_MESSAGE: usize = 1;
+
+/// What a carrier will accept, and how big.
+///
+/// Photographs get the larger allowance because that is what people send;
+/// everything else is capped an order of magnitude lower, because a large
+/// non-image attachment on MMS is nearly always a mistake and always a bill.
+/// A type not on this list is refused rather than sent as bytes with no name:
+/// a carrier that cannot tell what it received delivers nothing useful.
+const MEDIA_TYPES: &[(&str, usize)] = &[
+    ("image/jpeg", 5_000_000),
+    ("image/png", 5_000_000),
+    ("image/gif", 5_000_000),
+    ("image/webp", 500_000),
+    ("audio/mpeg", 500_000),
+    ("audio/wav", 500_000),
+    ("video/mp4", 500_000),
+    ("application/pdf", 500_000),
+];
+
+/// Identify an attachment from its own first bytes.
+///
+/// The declared type is whatever produced the artifact said it was, which is
+/// not the same as what the bytes are — and it is the bytes a carrier fetches.
+/// Sniffing is the only claim this process can actually stand behind, and it is
+/// also what the file route serves the attachment as.
+pub(crate) fn sniff_media_type(bytes: &[u8]) -> Option<&'static str> {
+    let starts = |prefix: &[u8]| bytes.starts_with(prefix);
+    if starts(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if starts(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if starts(b"GIF87a") || starts(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if starts(b"RIFF") && bytes.len() > 12 && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if starts(b"RIFF") && bytes.len() > 12 && &bytes[8..12] == b"WAVE" {
+        return Some("audio/wav");
+    }
+    if starts(b"ID3") || starts(&[0xFF, 0xFB]) || starts(&[0xFF, 0xF3]) {
+        return Some("audio/mpeg");
+    }
+    if bytes.len() > 12 && &bytes[4..8] == b"ftyp" {
+        return Some("video/mp4");
+    }
+    if starts(b"%PDF-") {
+        return Some("application/pdf");
+    }
+    None
+}
+
+/// The cap for one media type, or `None` when a carrier will not take it.
+pub(crate) fn media_limit(media_type: &str) -> Option<usize> {
+    MEDIA_TYPES
+        .iter()
+        .find(|(known, _)| *known == media_type)
+        .map(|(_, limit)| *limit)
+}
 
 impl SmsAdapter {
     /// Build the adapter for a telephony account. `secret` is that account's
@@ -99,9 +161,20 @@ impl SmsAdapter {
                     .to_string(),
             );
         };
+        if message.attachments.len() > MAX_ATTACHMENTS_PER_MESSAGE {
+            return Err(format!(
+                "A text can carry {MAX_ATTACHMENTS_PER_MESSAGE} attachment; this reply has {}.",
+                message.attachments.len()
+            ));
+        }
+        let largest = MEDIA_TYPES
+            .iter()
+            .map(|(_, limit)| *limit)
+            .max()
+            .unwrap_or_default();
         let store = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
             media.app_data_dir.join("content-v1"),
-            MAX_MMS_BYTES as u64,
+            largest as u64,
         )
         .map_err(|error| error.to_string())?;
         let expires_at_ms = now_ms()? + MEDIA_FILE_TTL_MS;
@@ -111,8 +184,18 @@ impl SmsAdapter {
             let bytes = store
                 .read(&attachment.artifact_id)
                 .map_err(|error| format!("That attachment could not be read: {error}"))?;
-            if bytes.len() > MAX_MMS_BYTES {
-                return Err("That attachment is too large to send as MMS.".to_string());
+            let Some(media_type) = sniff_media_type(&bytes) else {
+                return Err(
+                    "That attachment is not a type a carrier will deliver, so it was not sent."
+                        .to_string(),
+                );
+            };
+            let limit = media_limit(media_type).unwrap_or_default();
+            if bytes.len() > limit {
+                return Err(format!(
+                    "That {media_type} attachment is {} bytes, over the {limit}-byte limit for MMS.",
+                    bytes.len()
+                ));
             }
             let signature = super::super::telephony::media_file_token(
                 &media.secret,
@@ -308,7 +391,10 @@ mod tests {
         ));
         let store = little_monkey_lib::artifact_store::ArtifactStore::new(root.join("content-v1"))
             .expect("store");
-        let blob = store.put(b"a tiny png").expect("put");
+        // A real PNG header, because the pipeline identifies media by its bytes.
+        let blob = store
+            .put(b"\x89PNG\r\n\x1a\nand then some pixels")
+            .expect("put");
         let mut with_url = account();
         with_url.public_base_url = Some("https://calls.example.test".into());
         let adapter =
@@ -356,6 +442,82 @@ mod tests {
         )
         .is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_attachment_is_identified_by_its_own_bytes() {
+        assert_eq!(
+            sniff_media_type(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            sniff_media_type(b"\x89PNG\r\n\x1a\nrest"),
+            Some("image/png")
+        );
+        assert_eq!(sniff_media_type(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(sniff_media_type(b"%PDF-1.7"), Some("application/pdf"));
+        // A file that says it is a PNG and is not gets no claim made for it.
+        assert_eq!(sniff_media_type(b"this is just text"), None);
+    }
+
+    #[test]
+    fn a_photograph_gets_more_room_than_everything_else() {
+        assert_eq!(media_limit("image/jpeg"), Some(5_000_000));
+        assert_eq!(media_limit("application/pdf"), Some(500_000));
+        assert_eq!(media_limit("application/x-msdownload"), None);
+    }
+
+    #[tokio::test]
+    async fn an_attachment_a_carrier_cannot_identify_is_refused() {
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-mms-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let store = little_monkey_lib::artifact_store::ArtifactStore::new(root.join("content-v1"))
+            .expect("store");
+        let blob = store.put(b"not a media file at all").expect("put");
+        let mut with_url = account();
+        with_url.public_base_url = Some("https://calls.example.test".into());
+        let adapter =
+            SmsAdapter::new(&with_url, "carrier-secret".into(), root.clone()).expect("adapter");
+        let mut message = reply("look at this");
+        message
+            .attachments
+            .push(little_monkey_lib::channels::types::OutboundAttachment {
+                artifact_id: blob.id,
+                filename: Some("payload.png".into()),
+                mime_type: Some("image/png".into()),
+            });
+
+        let error = adapter.media_urls(&message).expect_err("refused");
+
+        assert!(
+            error.contains("not a type a carrier will deliver"),
+            "the declared type is not evidence: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_reply_carrying_several_attachments_is_refused_rather_than_billed() {
+        let mut with_url = account();
+        with_url.public_base_url = Some("https://calls.example.test".into());
+        let adapter =
+            SmsAdapter::new(&with_url, "secret".into(), std::env::temp_dir()).expect("adapter");
+        let mut message = reply("two things");
+        for _ in 0..2 {
+            message
+                .attachments
+                .push(little_monkey_lib::channels::types::OutboundAttachment {
+                    artifact_id: "artifact-1".into(),
+                    filename: None,
+                    mime_type: None,
+                });
+        }
+
+        let error = adapter.media_urls(&message).expect_err("refused");
+
+        assert!(error.contains("1 attachment"), "{error}");
     }
 
     #[tokio::test]

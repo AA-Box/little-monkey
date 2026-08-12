@@ -37,6 +37,13 @@ use super::call_audio::{
 
 /// Silence that ends a caller's turn.
 const HANGOVER_MS: u32 = 700;
+/// How much continuous speech counts as the caller interrupting.
+///
+/// One loud frame is a door, a cough, or the caller's own audio echoing back
+/// off a speakerphone. Requiring it to persist is what tells an interruption
+/// apart from a room — and it is the honest version of this without a voice
+/// activity detector, which is a model dependency this does not carry.
+const BARGE_IN_MS: u32 = 240;
 /// The longest single utterance transcribed. A caller who talks past this is
 /// answered rather than left talking into a machine that stopped listening.
 const MAX_UTTERANCE_MS: u32 = 20_000;
@@ -176,6 +183,12 @@ pub(crate) async fn run_media_session(
     let mut stream_id = String::new();
     let mut turn_index = 0;
     let mut spoke_opening = call.opening_line.is_none();
+    // Consecutive milliseconds of caller speech heard while the agent is
+    // talking. Reset by any quiet frame, so only sustained speech interrupts.
+    let mut speech_over_us_ms = 0_u32;
+    // The greeting is not interrupted: it is who is calling and why, and a
+    // caller who talks over "hello" has not been told anything yet.
+    let mut greeting_playing = false;
     // Audio waiting to go out, one carrier frame each. Held here rather than
     // written in a loop so the caller can interrupt: a sentence already handed
     // to the socket cannot be taken back.
@@ -206,6 +219,9 @@ pub(crate) async fn run_media_session(
                     }
                     report.frames_spoken += 1;
                 }
+                if pending.is_empty() {
+                    greeting_playing = false;
+                }
                 continue;
             }
             frame = socket.recv() => frame,
@@ -231,7 +247,10 @@ pub(crate) async fn run_media_session(
             spoke_opening = true;
             if let Some(line) = call.opening_line.as_deref() {
                 match speech.synthesize(line).await {
-                    Ok(samples) => queue_audio(&mut pending, &samples, carrier, format, &stream_id),
+                    Ok(samples) => {
+                        greeting_playing = true;
+                        queue_audio(&mut pending, &samples, carrier, format, &stream_id);
+                    }
                     Err(error) => eprintln!(
                         "monkey daemon: could not speak the opening line on {}: {error}",
                         call.call_id
@@ -252,17 +271,26 @@ pub(crate) async fn run_media_session(
         let samples: Vec<i16> = bytes.iter().copied().map(decode_mulaw).collect();
         // Barge-in: somebody talking over the agent means they stopped
         // listening, so the rest of the sentence is dropped here and cleared at
-        // the carrier, which is still holding what was already sent.
-        if !pending.is_empty() && super::call_audio::contains_speech(&samples) {
-            pending.clear();
-            report.interruptions += 1;
-            if socket
-                .send(carrier.encode_clear_frame(&stream_id))
-                .await
-                .is_err()
-            {
-                break;
+        // the carrier, which is still holding what was already sent. Sustained
+        // speech only, and never over the greeting.
+        if pending.is_empty() || greeting_playing {
+            speech_over_us_ms = 0;
+        } else if super::call_audio::contains_speech(&samples) {
+            speech_over_us_ms += frame_ms(samples.len());
+            if speech_over_us_ms >= BARGE_IN_MS {
+                speech_over_us_ms = 0;
+                pending.clear();
+                report.interruptions += 1;
+                if socket
+                    .send(carrier.encode_clear_frame(&stream_id))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
+        } else {
+            speech_over_us_ms = 0;
         }
         let UtteranceProgress::Complete(utterance) = detector.push(&samples) else {
             continue;
@@ -376,6 +404,11 @@ fn read_path(value: &serde_json::Value, path: &[&str]) -> Option<String> {
         cursor = cursor.get(key)?;
     }
     cursor.as_str().map(str::to_string)
+}
+
+/// How long a batch of samples lasts, in milliseconds.
+fn frame_ms(samples: usize) -> u32 {
+    u32::try_from(samples * 1_000 / CALL_SAMPLE_RATE as usize).unwrap_or(u32::MAX)
 }
 
 /// Cut synthesized speech into this carrier's frames and queue them.
@@ -560,6 +593,9 @@ mod tests {
     }
 
     struct ScriptedSocket {
+        /// Held shut until the test says the agent is talking, so "the caller
+        /// interrupts" is a fact about ordering rather than a race.
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
         inbound: Vec<String>,
         sent: Arc<Mutex<Vec<String>>>,
         /// Held open until the test's speaking is done, so the session does not
@@ -570,6 +606,10 @@ mod tests {
     #[async_trait]
     impl MediaSocket for ScriptedSocket {
         async fn recv(&mut self) -> Option<String> {
+            if let Some(gate) = self.gate.as_mut() {
+                let _ = gate.await;
+                self.gate = None;
+            }
             if let Some(frame) = self.inbound.pop() {
                 return Some(frame);
             }
@@ -681,6 +721,7 @@ mod tests {
                 serde_json::json!({ "event": "start", "streamSid": "MZ1" }).to_string(),
             ],
             sent: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
             linger: None,
         };
         let sink = RecordingSink::default();
@@ -710,6 +751,7 @@ mod tests {
                 media_frame(&vec![0; 16_000]),
             ],
             sent: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
             linger: None,
         };
         let sink = RecordingSink::default();
@@ -734,6 +776,7 @@ mod tests {
         let mut socket = ScriptedSocket {
             inbound: Vec::new(),
             sent: sent.clone(),
+            gate: None,
             linger: Some(linger),
         };
         let session = async {
@@ -780,6 +823,7 @@ mod tests {
             sent: sent.clone(),
             // The line stays open while the greeting plays, the way a carrier's
             // does; the session ends when the socket closes.
+            gate: None,
             linger: Some(linger),
         };
         let mut call = identity_for("call-greeting");
@@ -803,49 +847,96 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_caller_talking_over_the_agent_cuts_it_off() {
+    /// One 20 ms frame of somebody talking.
+    fn talking_frame() -> String {
+        media_frame(&speech_samples(160))
+    }
+
+    /// Drive a call whose agent is mid-sentence while the caller talks over it
+    /// for `frames` × 20 ms, and report what the session did.
+    async fn interrupted_after(
+        frames: usize,
+        call: CallIdentity,
+    ) -> (MediaSessionReport, Vec<String>) {
+        let (open_gate, gate) = tokio::sync::oneshot::channel();
+        let (release, linger) = tokio::sync::oneshot::channel();
         let sent = Arc::new(Mutex::new(Vec::new()));
+        let call_id = call.call_id.clone();
+        let speaking_first = call.opening_line.is_none();
         let mut socket = ScriptedSocket {
-            inbound: vec![
-                // Read last: the caller starts talking while the greeting,
-                // which is far longer than one frame, is still playing.
-                serde_json::json!({ "event": "stop", "streamSid": "MZ1" }).to_string(),
-                media_frame(&speech_samples(1_600)),
-                media_frame(&vec![0; 160]),
-            ],
+            gate: Some(gate),
+            // `recv` pops from the back.
+            inbound: std::iter::repeat_with(talking_frame).take(frames).collect(),
             sent: sent.clone(),
-            linger: None,
+            linger: Some(linger),
         };
-        let mut call = identity_for("call-bargein");
-        call.opening_line = Some("x".repeat(400));
-
-        let report = run_media_session(
-            &mut socket,
-            &FakeSpeech::new("stop"),
-            &RecordingSink::default(),
-            &FakeCarrier,
-            call,
-        )
-        .await;
-
-        assert_eq!(report.interruptions, 1, "the caller interrupted once");
+        let speech = FakeSpeech::new("heard");
+        let sink = RecordingSink::default();
+        let session = run_media_session(&mut socket, &speech, &sink, &FakeCarrier, call);
+        let caller = async {
+            if speaking_first {
+                for _ in 0..50 {
+                    if speak_on_call(&call_id, &"x".repeat(8_000)).is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            let _ = open_gate.send(());
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let _ = release.send(());
+        };
+        let (report, ()) = tokio::join!(session, caller);
         let frames = sent.lock().unwrap().clone();
-        let cleared = frames
+        (report, frames)
+    }
+
+    fn cleared(frames: &[String]) -> bool {
+        frames
             .iter()
             .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
-            .any(|frame| frame["event"] == "clear");
+            .any(|frame| frame["event"] == "clear")
+    }
+
+    #[tokio::test]
+    async fn a_caller_talking_over_the_agent_cuts_it_off() {
+        // 12 frames is 240 ms: sustained talking, not a noise.
+        let (report, frames) = interrupted_after(12, identity_for("call-bargein")).await;
+
+        assert_eq!(report.interruptions, 1, "the caller interrupted once");
         assert!(
-            cleared,
+            cleared(&frames),
             "the carrier is told to drop what it is still holding"
         );
-        // 400 characters of speech is 400 frames from the fake synthesizer;
-        // being interrupted means most of them were never sent.
         assert!(
-            report.frames_spoken < 100,
-            "the rest of the sentence was dropped, sent {}",
+            report.frames_spoken < 40,
+            "the rest of the sentence was dropped, sent {} of 50 frames",
             report.frames_spoken
         );
+    }
+
+    #[tokio::test]
+    async fn a_noise_in_the_room_does_not_cut_the_agent_off() {
+        // Four frames is 80 ms — a door, a cough, or the caller's own audio
+        // echoing back off a speakerphone.
+        let (report, frames) = interrupted_after(4, identity_for("call-noise")).await;
+
+        assert_eq!(report.interruptions, 0);
+        assert!(!cleared(&frames));
+    }
+
+    #[tokio::test]
+    async fn the_greeting_itself_is_never_interrupted() {
+        // A caller who talks over "hello, this is…" has not been told who is
+        // calling yet, so the greeting finishes.
+        let mut call = identity_for("call-greeting-bargein");
+        call.opening_line = Some("x".repeat(8_000));
+
+        let (report, frames) = interrupted_after(30, call).await;
+
+        assert_eq!(report.interruptions, 0);
+        assert!(!cleared(&frames));
     }
 
     #[tokio::test]
@@ -859,6 +950,7 @@ mod tests {
                 media_frame(&speech_samples(8_000)),
             ],
             sent: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
             linger: None,
         };
         let mut call = identity_for("call-voicemail");
