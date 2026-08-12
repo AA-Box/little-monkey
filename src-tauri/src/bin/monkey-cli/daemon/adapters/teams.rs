@@ -621,6 +621,9 @@ fn normalize_activity(
                     let content_url = attachment.get("contentUrl").and_then(JsonValue::as_str)?;
                     let mime_type = attachment.get("contentType").and_then(JsonValue::as_str);
                     Some(ChannelAttachment {
+                        stored_artifact_id: None,
+                        text_excerpt: None,
+                        fetch_error: None,
                         provider_id: None,
                         kind: mime_type
                             .map(AttachmentKind::from_mime)

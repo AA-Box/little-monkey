@@ -281,6 +281,39 @@ impl ChannelAdapter for WhatsAppAdapter {
         Ok(InboundBatch::default())
     }
 
+    /// Meta hands out a media id, not a URL. The id is exchanged for a
+    /// short-lived download URL on the Graph API, and that URL still needs the
+    /// same bearer token — an unauthenticated GET of it returns nothing.
+    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("That WhatsApp attachment carries no media id".to_string());
+        };
+        let client = little_monkey_lib::egress::hardened()
+            .build()
+            .map_err(|error| format!("Failed to build client: {error}"))?;
+        let request = client
+            .get(format!("{}/{handle}", self.graph_api_base))
+            .bearer_auth(&self.access_token);
+        let response = little_monkey_lib::egress::send(request)
+            .await
+            .map_err(|_| "WhatsApp did not answer the media lookup".to_string())?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "WhatsApp returned {} for the media lookup",
+                response.status()
+            ));
+        }
+        let body: JsonValue = response
+            .json()
+            .await
+            .map_err(|_| "WhatsApp's media lookup was not JSON".to_string())?;
+        let url = body
+            .get("url")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "WhatsApp named no download URL for that media id".to_string())?;
+        crate::daemon::channel_adapter::fetch_url(url, Some(&self.access_token)).await
+    }
+
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
         let client = match little_monkey_lib::egress::hardened().build() {
             Ok(client) => client,
@@ -659,6 +692,9 @@ fn normalize_message(
                 .map(str::to_string);
             if let Some(handle) = provider_id.clone() {
                 attachments.push(ChannelAttachment {
+                    stored_artifact_id: None,
+                    text_excerpt: None,
+                    fetch_error: None,
                     provider_id,
                     kind,
                     filename,

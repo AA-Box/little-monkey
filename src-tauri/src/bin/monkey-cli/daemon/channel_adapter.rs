@@ -27,8 +27,8 @@
 use super::channel_store::ChannelAccountRecord;
 use async_trait::async_trait;
 use little_monkey_lib::channels::types::{
-    ChannelEnvelope, ChannelHealth, ChannelKind, DeliveryReceipt, OutboundMessage,
-    ProviderCapabilities, SendOutcome,
+    AttachmentSource, ChannelAttachment, ChannelEnvelope, ChannelHealth, ChannelKind,
+    DeliveryReceipt, OutboundMessage, ProviderCapabilities, SendOutcome,
 };
 
 /// One batch of inbound events plus the cursor to resume from.
@@ -71,6 +71,118 @@ pub trait ChannelAdapter: Send + Sync {
     /// an adapter that cannot prove a request never left the machine must say
     /// `NeedsReconciliation` rather than `RetryableFailure`.
     async fn send(&self, message: &OutboundMessage) -> SendOutcome;
+
+    /// Download one inbound attachment.
+    ///
+    /// The default handles [`AttachmentSource::Url`], which is what most
+    /// providers hand out, through the hardened client every other request
+    /// uses. A provider that instead gives an opaque handle has to resolve it
+    /// itself — that is a second authenticated call only the adapter knows how
+    /// to make — and says so rather than pretending it cannot be done.
+    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+        match &attachment.source {
+            AttachmentSource::Url { url } => fetch_url(url, None).await,
+            AttachmentSource::ProviderHandle { .. } => Err(format!(
+                "Little Monkey cannot download {} attachments yet",
+                self.kind().label()
+            )),
+        }
+    }
+}
+
+/// GET one attachment URL under the size cap, optionally with a bearer token.
+///
+/// Shared by the default implementation and by the adapters that first resolve
+/// a handle into a URL. The body is read in chunks and abandoned the moment it
+/// crosses the cap, so an oversized file costs the cap and not its own size —
+/// a `Content-Length` cannot be trusted to be the truth about what follows.
+pub async fn fetch_url(url: &str, bearer: Option<&str>) -> Result<Vec<u8>, String> {
+    let client = little_monkey_lib::egress::hardened()
+        .build()
+        .map_err(|error| format!("Failed to build the download client: {error}"))?;
+    let mut request = client.get(url);
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    let response = little_monkey_lib::egress::send(request)
+        .await
+        .map_err(|_| "The attachment could not be downloaded".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "The provider returned {} for the attachment",
+            response.status()
+        ));
+    }
+    let mut response = response;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "The attachment download was interrupted".to_string())?
+    {
+        if bytes.len() as u64 + chunk.len() as u64 > MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "The attachment is larger than the {MAX_ATTACHMENT_BYTES}-byte limit"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// How much of a text file is carried into the turn.
+///
+/// Enough to answer a question about a log or a short CSV, small enough that
+/// one file cannot crowd out the conversation it arrived in.
+const MAX_TEXT_EXCERPT_CHARS: usize = 4_000;
+
+/// The beginning of a file's text, when the bytes are text at all.
+///
+/// A file that is not valid UTF-8 has no excerpt rather than a mangled one —
+/// lossy decoding of a JPEG produces thousands of replacement characters and
+/// answers no question anybody asked.
+fn text_excerpt(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let mut excerpt: String = text.chars().take(MAX_TEXT_EXCERPT_CHARS).collect();
+    if text.chars().count() > MAX_TEXT_EXCERPT_CHARS {
+        excerpt.push('…');
+    }
+    Some(excerpt)
+}
+
+/// Download every attachment on a batch of envelopes and store the bytes.
+///
+/// Runs before ingest, so what becomes durable is the turn as the agent will
+/// see it. A failure is recorded on the attachment rather than dropped: an
+/// attachment that was too large or that the provider refused is something the
+/// sender should be told about, and silence would make it look as though
+/// nothing was sent at all.
+pub async fn hydrate_attachments(
+    adapter: &dyn ChannelAdapter,
+    blobs: &dyn BlobSource,
+    envelopes: &mut [ChannelEnvelope],
+) {
+    for envelope in envelopes.iter_mut() {
+        for attachment in envelope.attachments.iter_mut() {
+            if attachment.stored_artifact_id.is_some() {
+                continue;
+            }
+            match adapter.fetch_attachment(attachment).await {
+                Ok(bytes) => match blobs.write(&bytes) {
+                    Ok(artifact_id) => {
+                        attachment.stored_artifact_id = Some(artifact_id);
+                        attachment.declared_size_bytes = Some(bytes.len() as u64);
+                        attachment.text_excerpt = text_excerpt(&bytes);
+                    }
+                    Err(error) => attachment.fetch_error = Some(error),
+                },
+                Err(error) => attachment.fetch_error = Some(error),
+            }
+        }
+    }
 }
 
 /// Providers that are delivered to rather than polled.
@@ -137,6 +249,11 @@ pub const MAX_ATTACHMENT_BYTES: u64 = 16 * 1024 * 1024;
 /// against a loopback server rather than only the branch that picks the method.
 pub trait BlobSource: Send + Sync {
     fn read(&self, artifact_id: &str) -> Result<Vec<u8>, String>;
+
+    /// Store bytes and return the id they can be read back by. Used by
+    /// inbound hydration, which has bytes and needs somewhere durable to put
+    /// them before the turn is queued.
+    fn write(&self, bytes: &[u8]) -> Result<String, String>;
 }
 
 /// The production source: the daemon's own content store.
@@ -147,6 +264,29 @@ impl BlobSource for DaemonBlobs {
         let paths = super::store::DaemonPaths::resolve()?;
         read_blob(&paths, artifact_id)
     }
+
+    fn write(&self, bytes: &[u8]) -> Result<String, String> {
+        let paths = super::store::DaemonPaths::resolve()?;
+        content_store(&paths)?
+            .put(bytes)
+            .map(|blob| blob.id)
+            .map_err(|error| format!("Failed to store the attachment: {error}"))
+    }
+}
+
+/// The daemon's content store, sized to the attachment cap.
+fn content_store(
+    paths: &super::store::DaemonPaths,
+) -> Result<little_monkey_lib::artifact_store::ArtifactStore, String> {
+    let app_data = paths
+        .root
+        .parent()
+        .ok_or_else(|| "Daemon root has no app-data parent".to_string())?;
+    little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
+        app_data.join("content-v1"),
+        MAX_ATTACHMENT_BYTES,
+    )
+    .map_err(|error| format!("Failed to open the content store: {error}"))
 }
 
 /// Read one outbound attachment's bytes out of the content store.
@@ -156,16 +296,7 @@ impl BlobSource for DaemonBlobs {
 /// file the agent meant is the one that existed when it said so, not whatever
 /// occupies that path now.
 pub fn read_blob(paths: &super::store::DaemonPaths, artifact_id: &str) -> Result<Vec<u8>, String> {
-    let app_data = paths
-        .root
-        .parent()
-        .ok_or_else(|| "Daemon root has no app-data parent".to_string())?;
-    let store = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
-        app_data.join("content-v1"),
-        MAX_ATTACHMENT_BYTES,
-    )
-    .map_err(|error| format!("Failed to open the content store: {error}"))?;
-    store
+    content_store(paths)?
         .read(artifact_id)
         .map_err(|error| format!("Failed to read the attachment: {error}"))
 }
@@ -400,6 +531,7 @@ pub(crate) mod test_http {
                 let mut scratch = [0u8; 4096];
                 let mut header_end = None;
                 let mut content_length = 0usize;
+                let mut chunked = false;
                 loop {
                     match stream.read(&mut scratch) {
                         Ok(0) => break,
@@ -409,6 +541,9 @@ pub(crate) mod test_http {
                                 if let Some(index) = find(&received, b"\r\n\r\n") {
                                     header_end = Some(index + 4);
                                     content_length = content_length_of(&received[..index]);
+                                    chunked = String::from_utf8_lossy(&received[..index])
+                                        .to_ascii_lowercase()
+                                        .contains("transfer-encoding: chunked");
                                 }
                             }
                             if let Some(start) = header_end {
@@ -421,8 +556,13 @@ pub(crate) mod test_http {
                                 // failure to send at all.
                                 let complete = if content_length > 0 {
                                     received.len() >= start + content_length
-                                } else {
+                                } else if chunked {
                                     find(&received[start..], b"0\r\n\r\n").is_some()
+                                } else {
+                                    // No length and no chunking means no body —
+                                    // a GET. Waiting for one costs the read
+                                    // timeout and proves nothing.
+                                    true
                                 };
                                 if complete {
                                     break;
@@ -467,6 +607,10 @@ pub(crate) mod test_http {
     impl super::BlobSource for FixtureBlobs {
         fn read(&self, _artifact_id: &str) -> Result<Vec<u8>, String> {
             Ok(self.0.clone())
+        }
+
+        fn write(&self, _bytes: &[u8]) -> Result<String, String> {
+            Ok("fixture-blob".to_string())
         }
     }
 }

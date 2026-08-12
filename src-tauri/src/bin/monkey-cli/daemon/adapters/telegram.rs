@@ -340,6 +340,59 @@ impl ChannelAdapter for TelegramAdapter {
         })
     }
 
+    /// Telegram hands out a `file_id`, not a URL: it is resolved with
+    /// `getFile`, which answers with a short-lived path under the bot's own
+    /// file endpoint. Both calls carry the token, which is why this cannot be
+    /// the generic URL download.
+    async fn fetch_attachment(
+        &self,
+        attachment: &little_monkey_lib::channels::types::ChannelAttachment,
+    ) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return crate::daemon::channel_adapter::fetch_url(
+                match &attachment.source {
+                    AttachmentSource::Url { url } => url,
+                    AttachmentSource::ProviderHandle { .. } => unreachable!(),
+                },
+                None,
+            )
+            .await;
+        };
+        let client = self.client()?;
+        let request = client
+            .get(self.method_url("getFile"))
+            .query(&[("file_id", handle.as_str())]);
+        let response = little_monkey_lib::egress::send(request)
+            .await
+            .map_err(|error| self.redact(format!("Telegram getFile failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Telegram returned {} for getFile",
+                response.status()
+            ));
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|error| self.redact(error.to_string()))?;
+        let file_path = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("result")?
+                    .get("file_path")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| "Telegram named no path for that file".to_string())?;
+        crate::daemon::channel_adapter::fetch_url(
+            &format!("{}/file/bot{}/{file_path}", self.api_base, self.token),
+            None,
+        )
+        .await
+        .map_err(|error| self.redact(error))
+    }
+
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
         let mut chunks = split_utf16_chunks(&message.text, MAX_MESSAGE_UTF16);
         // A reply that is only a file sends only the file. Pushing an empty
@@ -505,6 +558,9 @@ fn normalize_update(
     if let Some(sizes) = &message.photo {
         if let Some(largest) = sizes.iter().max_by_key(|size| size.width * size.height) {
             attachments.push(ChannelAttachment {
+                stored_artifact_id: None,
+                text_excerpt: None,
+                fetch_error: None,
                 provider_id: Some(largest.file_id.clone()),
                 kind: AttachmentKind::Image,
                 filename: None,
@@ -518,6 +574,9 @@ fn normalize_update(
     }
     if let Some(document) = &message.document {
         attachments.push(ChannelAttachment {
+            stored_artifact_id: None,
+            text_excerpt: None,
+            fetch_error: None,
             provider_id: Some(document.file_id.clone()),
             kind: AttachmentKind::Document,
             filename: document.file_name.clone(),
@@ -530,6 +589,9 @@ fn normalize_update(
     }
     if let Some(voice) = &message.voice {
         attachments.push(ChannelAttachment {
+            stored_artifact_id: None,
+            text_excerpt: None,
+            fetch_error: None,
             provider_id: Some(voice.file_id.clone()),
             kind: AttachmentKind::Audio,
             filename: None,
@@ -542,6 +604,9 @@ fn normalize_update(
     }
     if let Some(audio) = &message.audio {
         attachments.push(ChannelAttachment {
+            stored_artifact_id: None,
+            text_excerpt: None,
+            fetch_error: None,
             provider_id: Some(audio.file_id.clone()),
             kind: AttachmentKind::Audio,
             filename: audio.file_name.clone(),
@@ -554,6 +619,9 @@ fn normalize_update(
     }
     if let Some(video) = &message.video {
         attachments.push(ChannelAttachment {
+            stored_artifact_id: None,
+            text_excerpt: None,
+            fetch_error: None,
             provider_id: Some(video.file_id.clone()),
             kind: AttachmentKind::Video,
             filename: None,
@@ -900,6 +968,165 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("name=\"document\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_inbound_file_is_resolved_through_getfile_and_then_downloaded() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![
+            (
+                200,
+                r#"{"ok":true,"result":{"file_id":"f1","file_path":"documents/build.log"}}"#
+                    .to_string(),
+            ),
+            (200, "error: nope".to_string()),
+        ]);
+        let adapter = upload_adapter(&base, b"unused");
+        let attachment = ChannelAttachment {
+            provider_id: Some("f1".into()),
+            kind: AttachmentKind::Document,
+            filename: Some("build.log".into()),
+            mime_type: Some("text/plain".into()),
+            declared_size_bytes: None,
+            source: AttachmentSource::ProviderHandle {
+                handle: "f1".into(),
+            },
+            stored_artifact_id: None,
+            text_excerpt: None,
+            fetch_error: None,
+        };
+
+        let bytes = adapter
+            .fetch_attachment(&attachment)
+            .await
+            .expect("downloaded");
+        assert_eq!(bytes, b"error: nope");
+
+        let lookup = String::from_utf8_lossy(
+            &requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("getFile"),
+        )
+        .to_string();
+        assert!(
+            lookup.starts_with("GET /botbot-token/getFile?file_id=f1"),
+            "{lookup}"
+        );
+        let download = String::from_utf8_lossy(
+            &requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("download"),
+        )
+        .to_string();
+        // The path Telegram named, under the bot's own file endpoint.
+        assert!(
+            download.starts_with("GET /file/botbot-token/documents/build.log"),
+            "{download}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydration_stores_the_bytes_and_keeps_a_text_excerpt() {
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![
+            (
+                200,
+                r#"{"ok":true,"result":{"file_path":"documents/build.log"}}"#.to_string(),
+            ),
+            (200, "error: nope".to_string()),
+        ]);
+        let adapter = upload_adapter(&base, b"unused");
+        let mut envelopes = vec![ChannelEnvelope {
+            account_id: "acct-tg".into(),
+            kind: ChannelKind::Telegram,
+            provider_event_id: "1".into(),
+            conversation: ChannelConversation::direct("chat-7"),
+            sender: ChannelSender::new("user-3"),
+            text: String::new(),
+            attachments: vec![ChannelAttachment {
+                provider_id: Some("f1".into()),
+                kind: AttachmentKind::Document,
+                filename: Some("build.log".into()),
+                mime_type: Some("text/plain".into()),
+                declared_size_bytes: None,
+                source: AttachmentSource::ProviderHandle {
+                    handle: "f1".into(),
+                },
+                stored_artifact_id: None,
+                text_excerpt: None,
+                fetch_error: None,
+            }],
+            reply_to_provider_id: None,
+            mentions_self: false,
+            received_at_ms: 0,
+            metadata: Default::default(),
+        }];
+
+        crate::daemon::channel_adapter::hydrate_attachments(
+            &adapter,
+            &crate::daemon::channel_adapter::test_http::FixtureBlobs(Vec::new()),
+            &mut envelopes,
+        )
+        .await;
+
+        let attachment = &envelopes[0].attachments[0];
+        assert_eq!(
+            attachment.stored_artifact_id.as_deref(),
+            Some("fixture-blob")
+        );
+        assert_eq!(attachment.text_excerpt.as_deref(), Some("error: nope"));
+        assert_eq!(attachment.declared_size_bytes, Some(11));
+        assert!(attachment.fetch_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_download_the_provider_refuses_is_recorded_on_the_attachment() {
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            404,
+            r#"{"ok":false}"#.to_string(),
+        )]);
+        let adapter = upload_adapter(&base, b"unused");
+        let mut envelopes = vec![ChannelEnvelope {
+            account_id: "acct-tg".into(),
+            kind: ChannelKind::Telegram,
+            provider_event_id: "1".into(),
+            conversation: ChannelConversation::direct("chat-7"),
+            sender: ChannelSender::new("user-3"),
+            text: "look".into(),
+            attachments: vec![ChannelAttachment {
+                provider_id: Some("gone".into()),
+                kind: AttachmentKind::Image,
+                filename: Some("gone.png".into()),
+                mime_type: None,
+                declared_size_bytes: None,
+                source: AttachmentSource::ProviderHandle {
+                    handle: "gone".into(),
+                },
+                stored_artifact_id: None,
+                text_excerpt: None,
+                fetch_error: None,
+            }],
+            reply_to_provider_id: None,
+            mentions_self: false,
+            received_at_ms: 0,
+            metadata: Default::default(),
+        }];
+
+        crate::daemon::channel_adapter::hydrate_attachments(
+            &adapter,
+            &crate::daemon::channel_adapter::test_http::FixtureBlobs(Vec::new()),
+            &mut envelopes,
+        )
+        .await;
+
+        let attachment = &envelopes[0].attachments[0];
+        assert!(attachment.stored_artifact_id.is_none());
+        assert!(
+            attachment
+                .fetch_error
+                .as_deref()
+                .is_some_and(|error| error.contains("404")),
+            "{:?}",
+            attachment.fetch_error
+        );
     }
 
     #[tokio::test]

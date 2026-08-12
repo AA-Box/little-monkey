@@ -146,7 +146,15 @@ pub(crate) async fn poll_account_once(
     now_ms: i64,
 ) -> Result<InboundReport, String> {
     let cursor = store.channel_cursor(account_id, POLL_CURSOR_KEY)?;
-    let batch = adapter.poll(cursor.as_deref()).await?;
+    let mut batch = adapter.poll(cursor.as_deref()).await?;
+    // Files are fetched before the turn becomes durable, so the stored event is
+    // the turn as the agent will see it rather than a promise to look later.
+    super::channel_adapter::hydrate_attachments(
+        adapter,
+        &super::channel_adapter::DaemonBlobs,
+        &mut batch.envelopes,
+    )
+    .await;
     let report = ingest_batch(store, queue, &batch.envelopes, now_ms);
     if let Some(next) = batch.cursor {
         store.set_channel_cursor(account_id, POLL_CURSOR_KEY, &next, now_ms)?;

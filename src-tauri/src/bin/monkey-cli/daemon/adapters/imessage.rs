@@ -332,6 +332,9 @@ mod macos {
                             .map(AttachmentKind::from_mime)
                             .unwrap_or(AttachmentKind::Other);
                         Some(ChannelAttachment {
+                            stored_artifact_id: None,
+                            text_excerpt: None,
+                            fetch_error: None,
                             provider_id: None,
                             kind,
                             filename: item

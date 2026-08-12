@@ -267,7 +267,7 @@ impl ConversationIngress {
             body.push('\n');
         }
         body.push_str(&format!(
-            "\n[{} sent with this message. Little Monkey has not downloaded them and you cannot open them.]",
+            "\n[{} sent with this message.]",
             match self.attachments.len() {
                 1 => "1 attachment was".to_string(),
                 count => format!("{count} attachments were"),
@@ -280,7 +280,7 @@ impl ConversationIngress {
             .enumerate()
         {
             body.push_str(&format!(
-                "\n[{}: {}{}{}]",
+                "\n[{}: {}{}{}{}]",
                 index + 1,
                 attachment.kind.as_str(),
                 match &attachment.filename {
@@ -292,8 +292,32 @@ impl ConversationIngress {
                     (Some(mime), None) => format!(", {}", one_line(mime)),
                     (None, Some(size)) => format!(", {size} bytes"),
                     (None, None) => String::new(),
+                },
+                // Each attachment says what actually happened to it. A file
+                // that failed to download must not read the same as one whose
+                // contents follow.
+                match (
+                    &attachment.fetch_error,
+                    &attachment.text_excerpt,
+                    &attachment.stored_artifact_id
+                ) {
+                    (Some(error), _, _) => format!(" — not downloaded: {}", one_line(error)),
+                    (None, Some(_), _) => " — its text follows".to_string(),
+                    (None, None, Some(_)) =>
+                        " — downloaded, but not something you can read".to_string(),
+                    (None, None, None) => " — not downloaded".to_string(),
                 }
             ));
+            if let Some(excerpt) = &attachment.text_excerpt {
+                // The file's own contents, fenced so the model can see where
+                // they start and stop. Still inside the untrusted wrapper the
+                // caller puts around this whole body: a file somebody sent is
+                // that person's words, not instructions.
+                body.push_str(&format!(
+                    "\n<<<file {}>>>\n{excerpt}\n<<<end file>>>",
+                    index + 1
+                ));
+            }
         }
         if self.attachments.len() > MAX_LISTED_ATTACHMENTS {
             body.push_str(&format!(
@@ -495,6 +519,9 @@ mod tests {
 
         let mut with_file = silent.clone();
         with_file.attachments.push(ChannelAttachment {
+            stored_artifact_id: None,
+            text_excerpt: None,
+            fetch_error: None,
             provider_id: Some("file-1".into()),
             kind: crate::channels::types::AttachmentKind::Image,
             filename: Some("shot.png".into()),
@@ -513,6 +540,9 @@ mod tests {
         size: Option<u64>,
     ) -> ChannelAttachment {
         ChannelAttachment {
+            stored_artifact_id: None,
+            text_excerpt: None,
+            fetch_error: None,
             provider_id: Some("file-1".into()),
             kind: crate::channels::types::AttachmentKind::Image,
             filename: filename.map(str::to_string),
@@ -538,8 +568,8 @@ mod tests {
             body.contains("image \"shot.png\", image/png, 1024 bytes"),
             "{body}"
         );
-        // The agent is told it cannot open them rather than left to guess.
-        assert!(body.contains("cannot open"), "{body}");
+        // A file nobody fetched says so, rather than leaving the agent to guess.
+        assert!(body.contains("not downloaded"), "{body}");
     }
 
     #[test]
@@ -557,6 +587,48 @@ mod tests {
         assert_eq!(
             ConversationIngress::from_channel(&envelope(), &route()).body_for_model(),
             "ship it"
+        );
+    }
+
+    #[test]
+    fn a_downloaded_text_file_hands_the_model_its_contents() {
+        let mut with_log = envelope();
+        let mut attached = attachment(Some("build.log"), Some("text/plain"), Some(12));
+        attached.stored_artifact_id = Some("blob-1".into());
+        attached.text_excerpt = Some("error: nope".into());
+        with_log.attachments.push(attached);
+
+        let body = ConversationIngress::from_channel(&with_log, &route()).body_for_model();
+        assert!(body.contains("its text follows"), "{body}");
+        assert!(
+            body.contains("<<<file 1>>>\nerror: nope\n<<<end file>>>"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_binary_file_says_it_was_stored_and_not_that_it_can_be_read() {
+        let mut with_image = envelope();
+        let mut attached = attachment(Some("shot.png"), Some("image/png"), Some(2048));
+        attached.stored_artifact_id = Some("blob-2".into());
+        with_image.attachments.push(attached);
+
+        let body = ConversationIngress::from_channel(&with_image, &route()).body_for_model();
+        assert!(body.contains("not something you can read"), "{body}");
+        assert!(!body.contains("its text follows"), "{body}");
+    }
+
+    #[test]
+    fn a_download_that_failed_says_why() {
+        let mut refused = envelope();
+        let mut attached = attachment(Some("huge.bin"), None, None);
+        attached.fetch_error = Some("The attachment is larger than the limit".into());
+        refused.attachments.push(attached);
+
+        let body = ConversationIngress::from_channel(&refused, &route()).body_for_model();
+        assert!(
+            body.contains("not downloaded: The attachment is larger"),
+            "{body}"
         );
     }
 
