@@ -28,7 +28,9 @@ use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
+use crate::daemon::channel_adapter::{
+    AdapterConfig, ChannelAdapter, InboundBatch, LoadedAttachment,
+};
 
 const INBOUND_CHANNEL_CAPACITY: usize = 256;
 const POLL_WAIT: Duration = Duration::from_secs(20);
@@ -158,7 +160,7 @@ impl ChannelAdapter for MattermostAdapter {
         ProviderCapabilities {
             max_text_chars: MATTERMOST_MAX_TEXT_CHARS,
             supports_threads: true,
-            supports_attachments: false,
+            supports_attachments: true,
             supports_mention_metadata: true,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
@@ -267,6 +269,109 @@ impl ChannelAdapter for MattermostAdapter {
         }
         SendOutcome::Sent {
             provider_message_id: last_id,
+        }
+    }
+
+    /// Mattermost uploads first and posts second: `/api/v4/files` returns file
+    /// ids, and the post that carries them names those ids. Both halves use the
+    /// same bot token.
+    async fn send_with_attachments(
+        &self,
+        message: &OutboundMessage,
+        files: &[LoadedAttachment],
+    ) -> SendOutcome {
+        if files.is_empty() {
+            return self.send(message).await;
+        }
+        let mut form =
+            reqwest::multipart::Form::new().text("channel_id", message.conversation_id.clone());
+        for file in files {
+            let part = reqwest::multipart::Part::bytes(file.bytes.clone())
+                .file_name(file.filename.clone())
+                .mime_str(&file.mime_type)
+                .unwrap_or_else(|_| {
+                    reqwest::multipart::Part::bytes(file.bytes.clone())
+                        .file_name(file.filename.clone())
+                });
+            form = form.part("files", part);
+        }
+        let request = self
+            .http
+            .post(format!("{}/api/v4/files", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .multipart(form);
+        let response = match little_monkey_lib::egress::send(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                let is_connect = error.is_connect();
+                let error = scrub(&error.to_string(), &self.token);
+                return if is_connect {
+                    SendOutcome::RetryableFailure {
+                        error,
+                        retry_after_ms: None,
+                    }
+                } else {
+                    // An upload that may have landed leaves an orphaned file
+                    // rather than a visible post, so nothing is retried blind.
+                    SendOutcome::NeedsReconciliation { error }
+                };
+            }
+        };
+        let status = response.status().as_u16();
+        if let Some(outcome) = map_send_status(status, false, None) {
+            return outcome;
+        }
+        let file_ids: Vec<String> = match response.json::<Value>().await {
+            Ok(value) => value
+                .get("file_infos")
+                .and_then(Value::as_array)
+                .map(|infos| {
+                    infos
+                        .iter()
+                        .filter_map(|info| {
+                            info.get("id").and_then(Value::as_str).map(str::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        if file_ids.is_empty() {
+            return SendOutcome::NeedsReconciliation {
+                error: "Mattermost accepted the upload but named no files".to_string(),
+            };
+        }
+        let mut body = serde_json::json!({
+            "channel_id": message.conversation_id,
+            "message": message.text,
+            "file_ids": file_ids,
+        });
+        if let Some(root_id) = &message.thread_id {
+            body["root_id"] = Value::String(root_id.clone());
+        }
+        let request = self
+            .http
+            .post(format!("{}/api/v4/posts", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .json(&body);
+        let response = match little_monkey_lib::egress::send(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                return SendOutcome::NeedsReconciliation {
+                    error: scrub(&error.to_string(), &self.token),
+                }
+            }
+        };
+        let status = response.status().as_u16();
+        if let Some(outcome) = map_send_status(status, false, None) {
+            return outcome;
+        }
+        SendOutcome::Sent {
+            provider_message_id: response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_string)),
         }
     }
 

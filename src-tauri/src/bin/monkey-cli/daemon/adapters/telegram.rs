@@ -21,7 +21,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
+use crate::daemon::channel_adapter::{
+    AdapterConfig, ChannelAdapter, InboundBatch, LoadedAttachment,
+};
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
     ChannelHealth, ChannelKind, ChannelSender, ConversationKind, InboundTransport, OutboundMessage,
@@ -37,6 +39,10 @@ const API_BASE: &str = "https://api.telegram.org";
 /// outside the Basic Multilingual Plane, which is rare enough that a caller
 /// sizing a message against this constant will not be surprised.
 const MAX_MESSAGE_UTF16: usize = 4096;
+
+/// Telegram's caption limit on a photo or document, in characters. Longer text
+/// is sent as its own message rather than truncated.
+const MAX_CAPTION_CHARS: usize = 1024;
 
 pub struct TelegramAdapter {
     token: String,
@@ -292,6 +298,108 @@ impl ChannelAdapter for TelegramAdapter {
                     };
                 }
             }
+        }
+        SendOutcome::Sent {
+            provider_message_id: last_message_id,
+        }
+    }
+
+    /// Telegram takes files as multipart uploads. Photos go through
+    /// `sendPhoto` so they are shown inline, everything else through
+    /// `sendDocument` so it arrives intact — an image sent as a document is
+    /// still an image, but a document sent as a photo is re-encoded.
+    ///
+    /// The text becomes the first file's caption when it fits Telegram's 1024
+    /// character caption limit; anything longer is sent as its own message
+    /// first, because a truncated caption loses the part the model meant.
+    async fn send_with_attachments(
+        &self,
+        message: &OutboundMessage,
+        files: &[LoadedAttachment],
+    ) -> SendOutcome {
+        if files.is_empty() {
+            return self.send(message).await;
+        }
+        let client = match self.client() {
+            Ok(client) => client,
+            Err(error) => return SendOutcome::PermanentFailure { error },
+        };
+        let caption_fits = message.text.chars().count() <= MAX_CAPTION_CHARS;
+        let mut last_message_id = None;
+        if !message.text.is_empty() && !caption_fits {
+            match self.send(message).await {
+                SendOutcome::Sent {
+                    provider_message_id,
+                } => last_message_id = provider_message_id,
+                // The text did not go, so the files must not either: a caption
+                // arriving without the message it belongs to is worse than
+                // nothing arriving.
+                other => return other,
+            }
+        }
+        for (index, file) in files.iter().enumerate() {
+            let is_photo =
+                file.mime_type.starts_with("image/") && file.mime_type != "image/svg+xml";
+            let (method, field) = if is_photo {
+                ("sendPhoto", "photo")
+            } else {
+                ("sendDocument", "document")
+            };
+            let part = reqwest::multipart::Part::bytes(file.bytes.clone())
+                .file_name(file.filename.clone())
+                .mime_str(&file.mime_type)
+                .unwrap_or_else(|_| {
+                    reqwest::multipart::Part::bytes(file.bytes.clone())
+                        .file_name(file.filename.clone())
+                });
+            let mut form = reqwest::multipart::Form::new()
+                .text("chat_id", message.conversation_id.clone())
+                .part(field.to_string(), part);
+            if index == 0 && caption_fits && !message.text.is_empty() {
+                form = form.text("caption", message.text.clone());
+            }
+            if let Some(thread_id) = message.thread_id.clone() {
+                form = form.text("message_thread_id", thread_id);
+            }
+            let request = client.post(self.method_url(method)).multipart(form);
+            let response = match little_monkey_lib::egress::send(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    return if error.is_connect() {
+                        SendOutcome::RetryableFailure {
+                            error: self.redact(format!("Could not connect to Telegram: {error}")),
+                            retry_after_ms: None,
+                        }
+                    } else {
+                        // Past the handshake the upload may have completed, so
+                        // this is never retried blind.
+                        SendOutcome::NeedsReconciliation {
+                            error: self.redact(format!("Telegram upload outcome unknown: {error}")),
+                        }
+                    };
+                }
+            };
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            if !status.is_success() {
+                let error = self.redact(format!("Telegram returned {status} for {method}"));
+                return if last_message_id.is_some() {
+                    SendOutcome::NeedsReconciliation { error }
+                } else if status.as_u16() == 429 || status.is_server_error() {
+                    SendOutcome::RetryableFailure {
+                        error,
+                        retry_after_ms: None,
+                    }
+                } else {
+                    SendOutcome::PermanentFailure { error }
+                };
+            }
+            last_message_id =
+                serde_json::from_str::<TelegramApiResponse<TelegramMessage>>(&body_text)
+                    .ok()
+                    .and_then(|parsed| parsed.result)
+                    .map(|sent| sent.message_id.to_string())
+                    .or(last_message_id);
         }
         SendOutcome::Sent {
             provider_message_id: last_message_id,

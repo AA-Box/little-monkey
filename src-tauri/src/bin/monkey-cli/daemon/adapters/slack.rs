@@ -40,7 +40,9 @@ use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
+use crate::daemon::channel_adapter::{
+    AdapterConfig, ChannelAdapter, InboundBatch, LoadedAttachment,
+};
 
 const API_BASE: &str = "https://slack.com/api";
 /// Slack's `chat.postMessage` `text` field limit.
@@ -141,7 +143,7 @@ impl ChannelAdapter for SlackAdapter {
         ProviderCapabilities {
             max_text_chars: SLACK_MAX_TEXT_CHARS,
             supports_threads: true,
-            supports_attachments: false,
+            supports_attachments: true,
             // Slack's events carry no first-class "you were mentioned" flag —
             // mention gating has to scan `text` for `<@BOT_ID>` itself.
             supports_mention_metadata: false,
@@ -271,6 +273,141 @@ impl ChannelAdapter for SlackAdapter {
         }
         SendOutcome::Sent {
             provider_message_id: last_ts,
+        }
+    }
+
+    /// Slack's current upload flow is three calls: ask for a one-time upload
+    /// URL, POST the bytes to it, then complete the upload naming the channel.
+    /// The older `files.upload` endpoint is retired, so this is the only path
+    /// that still works.
+    ///
+    /// The text rides `initial_comment` on the completing call, so the file and
+    /// what the model said about it arrive as one message.
+    async fn send_with_attachments(
+        &self,
+        message: &OutboundMessage,
+        files: &[LoadedAttachment],
+    ) -> SendOutcome {
+        if files.is_empty() {
+            return self.send(message).await;
+        }
+        let mut uploaded: Vec<Value> = Vec::with_capacity(files.len());
+        for file in files {
+            let request = self
+                .http
+                .get(format!("{API_BASE}/files.getUploadURLExternal"))
+                .header("Authorization", format!("Bearer {}", self.secret.bot_token))
+                .query(&[
+                    ("filename", file.filename.as_str()),
+                    ("length", &file.bytes.len().to_string()),
+                ]);
+            let response = match little_monkey_lib::egress::send(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    return SendOutcome::RetryableFailure {
+                        error: scrub(&error.to_string(), &self.secret.bot_token),
+                        retry_after_ms: None,
+                    }
+                }
+            };
+            let body: Value = response.json().await.unwrap_or(Value::Null);
+            if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                return SendOutcome::PermanentFailure {
+                    error: format!(
+                        "Slack refused the upload URL: {}",
+                        body.get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown_error")
+                    ),
+                };
+            }
+            let (Some(upload_url), Some(file_id)) = (
+                body.get("upload_url").and_then(Value::as_str),
+                body.get("file_id").and_then(Value::as_str),
+            ) else {
+                return SendOutcome::PermanentFailure {
+                    error: "Slack returned no upload URL".to_string(),
+                };
+            };
+            let part = reqwest::multipart::Part::bytes(file.bytes.clone())
+                .file_name(file.filename.clone())
+                .mime_str(&file.mime_type)
+                .unwrap_or_else(|_| {
+                    reqwest::multipart::Part::bytes(file.bytes.clone())
+                        .file_name(file.filename.clone())
+                });
+            // The upload URL is single-use and already carries its own
+            // authorization, so the bot token is deliberately not sent to it.
+            let upload = self
+                .http
+                .post(upload_url)
+                .multipart(reqwest::multipart::Form::new().part("file", part));
+            match little_monkey_lib::egress::send(upload).await {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => {
+                    return SendOutcome::PermanentFailure {
+                        error: format!("Slack refused the upload ({})", response.status().as_u16()),
+                    }
+                }
+                Err(error) => {
+                    let is_connect = error.is_connect();
+                    let error = scrub(&error.to_string(), &self.secret.bot_token);
+                    return if is_connect {
+                        SendOutcome::RetryableFailure {
+                            error,
+                            retry_after_ms: None,
+                        }
+                    } else {
+                        SendOutcome::NeedsReconciliation { error }
+                    };
+                }
+            }
+            uploaded.push(serde_json::json!({ "id": file_id, "title": file.filename }));
+        }
+        let mut body = serde_json::json!({
+            "files": uploaded,
+            "channel_id": message.conversation_id,
+        });
+        if !message.text.is_empty() {
+            body["initial_comment"] = Value::String(message.text.clone());
+        }
+        if let Some(thread_id) = &message.thread_id {
+            body["thread_ts"] = Value::String(thread_id.clone());
+        }
+        let request = self
+            .http
+            .post(format!("{API_BASE}/files.completeUploadExternal"))
+            .header("Authorization", format!("Bearer {}", self.secret.bot_token))
+            .json(&body);
+        let response = match little_monkey_lib::egress::send(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                // The bytes are already in Slack's store; whether the message
+                // exists is what is unknown.
+                return SendOutcome::NeedsReconciliation {
+                    error: scrub(&error.to_string(), &self.secret.bot_token),
+                };
+            }
+        };
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            return SendOutcome::PermanentFailure {
+                error: format!(
+                    "Slack refused to complete the upload: {}",
+                    body.get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown_error")
+                ),
+            };
+        }
+        SendOutcome::Sent {
+            provider_message_id: body
+                .get("files")
+                .and_then(Value::as_array)
+                .and_then(|files| files.first())
+                .and_then(|file| file.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
         }
     }
 

@@ -342,7 +342,9 @@ impl ChannelAdapter for TeamsAdapter {
         ProviderCapabilities {
             max_text_chars: 28000,
             supports_threads: false,
-            supports_attachments: true,
+            // Inbound attachments are fetched; sending one is not implemented,
+            // and the trait's default refuses by name rather than dropping it.
+            supports_attachments: false,
             supports_mention_metadata: true,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,

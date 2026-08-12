@@ -26,7 +26,9 @@ use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
+use crate::daemon::channel_adapter::{
+    AdapterConfig, ChannelAdapter, InboundBatch, LoadedAttachment,
+};
 
 const API_BASE: &str = "https://discord.com/api/v10";
 const GATEWAY_VERSION: &str = "10";
@@ -110,7 +112,7 @@ impl ChannelAdapter for DiscordAdapter {
         ProviderCapabilities {
             max_text_chars: DISCORD_MAX_TEXT_CHARS,
             supports_threads: true,
-            supports_attachments: false,
+            supports_attachments: true,
             supports_mention_metadata: true,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
@@ -237,6 +239,100 @@ impl ChannelAdapter for DiscordAdapter {
         }
         SendOutcome::Sent {
             provider_message_id: last_id,
+        }
+    }
+
+    /// Discord takes files on the same message-create endpoint, as multipart
+    /// with the JSON body in `payload_json` and each file in `files[n]`. One
+    /// request carries the text and every file, so a caller never sees a
+    /// caption arrive separately from what it captions.
+    async fn send_with_attachments(
+        &self,
+        message: &OutboundMessage,
+        files: &[LoadedAttachment],
+    ) -> SendOutcome {
+        if files.is_empty() {
+            return self.send(message).await;
+        }
+        // Text longer than one Discord message is sent first, exactly as the
+        // text-only path splits it; the files then ride the final message.
+        let mut leading = split_message(&message.text, DISCORD_MAX_TEXT_CHARS);
+        let last = leading.pop().unwrap_or_default();
+        let mut any_sent = false;
+        if !leading.is_empty() {
+            let head = OutboundMessage {
+                text: leading.join(""),
+                attachments: Vec::new(),
+                ..message.clone()
+            };
+            match self.send(&head).await {
+                SendOutcome::Sent { .. } => any_sent = true,
+                other => return other,
+            }
+        }
+        let mut body = serde_json::json!({ "content": last });
+        if !any_sent {
+            if let Some(reply_to) = &message.reply_to_provider_id {
+                body["message_reference"] = serde_json::json!({ "message_id": reply_to });
+            }
+        }
+        let mut form = reqwest::multipart::Form::new().text("payload_json", body.to_string());
+        for (index, file) in files.iter().enumerate() {
+            let part = reqwest::multipart::Part::bytes(file.bytes.clone())
+                .file_name(file.filename.clone())
+                .mime_str(&file.mime_type)
+                .unwrap_or_else(|_| {
+                    reqwest::multipart::Part::bytes(file.bytes.clone())
+                        .file_name(file.filename.clone())
+                });
+            form = form.part(format!("files[{index}]"), part);
+        }
+        let request = self
+            .http
+            .post(format!(
+                "{API_BASE}/channels/{}/messages",
+                message.conversation_id
+            ))
+            .header("Authorization", format!("Bot {}", self.token))
+            .multipart(form);
+        let response = match little_monkey_lib::egress::send(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                // A connect failure provably never left this machine, so it is
+                // safe to retry. Anything later may have uploaded the file
+                // already, and a blind retry would post it twice.
+                let is_connect = error.is_connect();
+                let error = scrub(&error.to_string(), &self.token);
+                return if is_connect && !any_sent {
+                    SendOutcome::RetryableFailure {
+                        error,
+                        retry_after_ms: None,
+                    }
+                } else {
+                    SendOutcome::NeedsReconciliation { error }
+                };
+            }
+        };
+        let status = response.status();
+        let retry_after_ms = if status.as_u16() == 429 {
+            parse_retry_after_seconds(
+                response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|value| value.to_str().ok()),
+            )
+        } else {
+            None
+        };
+        if let Some(outcome) = map_send_status(status.as_u16(), any_sent, retry_after_ms) {
+            return outcome;
+        }
+        SendOutcome::Sent {
+            provider_message_id: response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_string)),
         }
     }
 }

@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelAdapter, InboundBatch, WebhookChannelAdapter,
+    AdapterConfig, ChannelAdapter, InboundBatch, LoadedAttachment, WebhookChannelAdapter,
 };
 
 const GRAPH_API_BASE: &str = "https://graph.facebook.com/v21.0";
@@ -353,6 +353,165 @@ impl ChannelAdapter for WhatsAppAdapter {
         }
         SendOutcome::PermanentFailure {
             error: error_message,
+        }
+    }
+
+    /// WhatsApp uploads media first and then sends a message that names the
+    /// returned id. Images and video carry the text as a caption; anything
+    /// else is a document, and the text goes as its own message because the
+    /// Cloud API drops a caption on some document types.
+    async fn send_with_attachments(
+        &self,
+        message: &OutboundMessage,
+        files: &[LoadedAttachment],
+    ) -> SendOutcome {
+        if files.is_empty() {
+            return self.send(message).await;
+        }
+        let client = match little_monkey_lib::egress::hardened().build() {
+            Ok(client) => client,
+            Err(error) => {
+                return SendOutcome::PermanentFailure {
+                    error: format!("Failed to build client: {error}"),
+                }
+            }
+        };
+        let mut any_sent = false;
+        let mut last_id = None;
+        let captions_first_file = files.first().is_some_and(|file| {
+            file.mime_type.starts_with("image/") || file.mime_type.starts_with("video/")
+        });
+        if !message.text.is_empty() && !captions_first_file {
+            match self.send(message).await {
+                SendOutcome::Sent {
+                    provider_message_id,
+                } => {
+                    any_sent = true;
+                    last_id = provider_message_id;
+                }
+                other => return other,
+            }
+        }
+        for (index, file) in files.iter().enumerate() {
+            let part = reqwest::multipart::Part::bytes(file.bytes.clone())
+                .file_name(file.filename.clone())
+                .mime_str(&file.mime_type)
+                .unwrap_or_else(|_| {
+                    reqwest::multipart::Part::bytes(file.bytes.clone())
+                        .file_name(file.filename.clone())
+                });
+            let form = reqwest::multipart::Form::new()
+                .text("messaging_product", "whatsapp")
+                .text("type", file.mime_type.clone())
+                .part("file", part);
+            let upload = client
+                .post(format!(
+                    "{}/{}/media",
+                    self.graph_api_base, self.phone_number_id
+                ))
+                .bearer_auth(&self.access_token)
+                .multipart(form);
+            let response = match little_monkey_lib::egress::send(upload).await {
+                Ok(response) => response,
+                Err(error) => {
+                    return if any_sent {
+                        SendOutcome::NeedsReconciliation {
+                            error: format!("WhatsApp upload outcome unknown: {error}"),
+                        }
+                    } else {
+                        map_transport_error(&error)
+                    }
+                }
+            };
+            if !response.status().is_success() {
+                let error = format!(
+                    "WhatsApp refused the media upload ({})",
+                    response.status().as_u16()
+                );
+                return if any_sent {
+                    SendOutcome::NeedsReconciliation { error }
+                } else {
+                    SendOutcome::PermanentFailure { error }
+                };
+            }
+            let media_id = match response.json::<JsonValue>().await {
+                Ok(value) => value
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string),
+                Err(_) => None,
+            };
+            let Some(media_id) = media_id else {
+                return SendOutcome::NeedsReconciliation {
+                    error: "WhatsApp accepted the upload but returned no media id".to_string(),
+                };
+            };
+            let message_type = if file.mime_type.starts_with("image/") {
+                "image"
+            } else if file.mime_type.starts_with("video/") {
+                "video"
+            } else if file.mime_type.starts_with("audio/") {
+                "audio"
+            } else {
+                "document"
+            };
+            let mut media = serde_json::json!({ "id": media_id });
+            if message_type == "document" {
+                media["filename"] = JsonValue::String(file.filename.clone());
+            }
+            if index == 0 && captions_first_file && !message.text.is_empty() {
+                media["caption"] = JsonValue::String(message.text.clone());
+            }
+            let body = serde_json::json!({
+                "messaging_product": "whatsapp",
+                "to": message.conversation_id,
+                "type": message_type,
+                message_type: media,
+            });
+            let request = client
+                .post(format!(
+                    "{}/{}/messages",
+                    self.graph_api_base, self.phone_number_id
+                ))
+                .bearer_auth(&self.access_token)
+                .json(&body);
+            let response = match little_monkey_lib::egress::send(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    return SendOutcome::NeedsReconciliation {
+                        error: format!("WhatsApp send outcome unknown: {error}"),
+                    }
+                }
+            };
+            if !response.status().is_success() {
+                let error = format!(
+                    "WhatsApp refused the media message ({})",
+                    response.status().as_u16()
+                );
+                return if any_sent {
+                    SendOutcome::NeedsReconciliation { error }
+                } else {
+                    SendOutcome::PermanentFailure { error }
+                };
+            }
+            any_sent = true;
+            last_id = response
+                .json::<JsonValue>()
+                .await
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("messages")
+                        .and_then(JsonValue::as_array)
+                        .and_then(|messages| messages.first())
+                        .and_then(|entry| entry.get("id"))
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string)
+                })
+                .or(last_id);
+        }
+        SendOutcome::Sent {
+            provider_message_id: last_id,
         }
     }
 

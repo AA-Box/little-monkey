@@ -1618,6 +1618,23 @@ fn write_snapshot(path: &Path, recipe: &Recipe) -> Result<(), String> {
 ///
 /// Names arrive already sanitized by the worker; they are re-checked here
 /// because this is the function that concatenates them onto a path.
+/// The daemon's own artifact store, where a reply's attachments live between
+/// the tool queueing them and the outbox sending them.
+///
+/// Same root the paired-controller artifact route reads (`content-v1` beside
+/// the daemon root), so a file staged here is one artifact, not a second copy
+/// in a second store.
+pub(crate) fn artifact_store_for_daemon(
+) -> Result<little_monkey_lib::artifact_store::ArtifactStore, String> {
+    let paths = DaemonPaths::resolve()?;
+    let app_data = paths
+        .root
+        .parent()
+        .ok_or_else(|| "Daemon root has no app-data parent".to_string())?;
+    little_monkey_lib::artifact_store::ArtifactStore::new(app_data.join("content-v1"))
+        .map_err(|error| format!("Could not open the artifact store: {error}"))
+}
+
 pub(crate) fn write_inbound_files(
     recipe_name: &str,
     job_id: &str,

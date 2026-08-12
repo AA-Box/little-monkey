@@ -408,7 +408,9 @@ mod macos {
                 inbound_transport: InboundTransport::Helper,
                 max_text_chars: MAX_TEXT_CHARS,
                 supports_threads: false,
-                supports_attachments: true,
+                // Inbound only: the helper protocol has no send-side
+                // attachment argument yet.
+                supports_attachments: false,
                 supports_mention_metadata: false,
                 supports_idempotency_key: false,
                 supports_delivery_receipts: false,

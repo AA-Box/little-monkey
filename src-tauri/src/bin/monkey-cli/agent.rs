@@ -881,9 +881,29 @@ async fn execute_tool_call(
             .to_string();
         }
         let text = args["text"].as_str().unwrap_or_default().to_string();
-        let preview: String = text.chars().take(120).collect();
+        let attachments: Vec<String> = args["attachments"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The approval prompt names the files as well as the text: sending a
+        // file is a different decision from sending a sentence, and an operator
+        // approving one has not approved the other.
+        let preview: String = if attachments.is_empty() {
+            text.chars().take(120).collect()
+        } else {
+            format!(
+                "{} [with {}]",
+                text.chars().take(80).collect::<String>(),
+                attachments.join(", ")
+            )
+        };
         return match perms.request("send_message", &preview).await {
-            Ok(()) => match crate::daemon::channel_tool::send_message(&text) {
+            Ok(()) => match crate::daemon::channel_tool::send_message(&text, &attachments) {
                 Ok(value) => value.to_string(),
                 Err(error) => serde_json::json!({ "error": error }).to_string(),
             },

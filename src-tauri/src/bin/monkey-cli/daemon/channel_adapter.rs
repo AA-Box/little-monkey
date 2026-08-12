@@ -73,6 +73,29 @@ pub trait ChannelAdapter: Send + Sync {
     /// `NeedsReconciliation` rather than `RetryableFailure`.
     async fn send(&self, message: &OutboundMessage) -> SendOutcome;
 
+    /// Send one message that carries files.
+    ///
+    /// Separate from [`send`](ChannelAdapter::send) because most of what an
+    /// adapter does is identical either way, and because the default is the
+    /// honest answer for a provider whose upload API is not implemented here:
+    /// a refusal that names the provider, rather than a message that silently
+    /// arrives without the file it was supposed to carry.
+    async fn send_with_attachments(
+        &self,
+        message: &OutboundMessage,
+        files: &[LoadedAttachment],
+    ) -> SendOutcome {
+        if files.is_empty() {
+            return self.send(message).await;
+        }
+        SendOutcome::PermanentFailure {
+            error: format!(
+                "Little Monkey cannot attach files to a {} message yet.",
+                self.kind().label()
+            ),
+        }
+    }
+
     /// Resolve one inbound attachment to its bytes, refusing anything over
     /// `max_bytes`.
     ///
@@ -101,6 +124,19 @@ pub trait ChannelAdapter: Send + Sync {
             }
         }
     }
+}
+
+/// One outbound attachment with its bytes already loaded from the artifact
+/// store, which is where the tool put them when the reply was queued.
+///
+/// The outbox row itself stores only the artifact id: a reply carrying a 5 MiB
+/// screenshot must not put 5 MiB of base64 into the daemon database, and the
+/// bytes are already content-addressed and deduplicated where they are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoadedAttachment {
+    pub filename: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
 }
 
 /// Read a response body into memory, refusing to exceed `max_bytes`.

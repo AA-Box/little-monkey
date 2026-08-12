@@ -23,7 +23,7 @@ use std::sync::Arc;
 use little_monkey_lib::channels::ingress::ConversationIngress;
 use little_monkey_lib::channels::types::{ChannelEnvelope, SendOutcome};
 
-use super::channel_adapter::ChannelAdapter;
+use super::channel_adapter::{ChannelAdapter, LoadedAttachment};
 use super::channel_ingress::{self, IngressPlan, OutboxPayload, PlannedDecision, SubmitOutcome};
 use super::channel_store::{EventDirection, EventDisposition, NewChannelEvent};
 use super::store::DaemonStore;
@@ -43,7 +43,6 @@ const OUTBOX_BATCH: u32 = 16;
 /// enqueue.
 pub(crate) trait RunQueue: Send + Sync {
     /// Queues one accepted turn. Returns the daemon job id.
-    ///
     fn submit(&self, ingress: &ConversationIngress, params: Vec<String>) -> Result<String, String>;
 }
 
@@ -333,6 +332,57 @@ pub(crate) async fn poll_account_once(
     Ok(report)
 }
 
+/// Largest single file a reply may carry, and how many.
+///
+/// Deliberately below every provider's own limit: a send refused by the
+/// provider costs a round trip and lands in the operator's activity list as a
+/// failure, while a refusal here reaches the model as a plain answer it can act
+/// on.
+const MAX_OUTBOUND_FILES: usize = 4;
+const MAX_OUTBOUND_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Load a queued reply's attachments from the artifact store.
+///
+/// A missing artifact is a permanent failure rather than a silent send: a
+/// message that was supposed to carry a file and does not is worse than one
+/// that visibly did not go.
+fn load_outbound_attachments(
+    message: &little_monkey_lib::channels::types::OutboundMessage,
+) -> Result<Vec<LoadedAttachment>, String> {
+    if message.attachments.is_empty() {
+        return Ok(Vec::new());
+    }
+    if message.attachments.len() > MAX_OUTBOUND_FILES {
+        return Err(format!(
+            "A message may carry at most {MAX_OUTBOUND_FILES} files."
+        ));
+    }
+    let store = super::artifact_store_for_daemon()?;
+    let mut loaded = Vec::with_capacity(message.attachments.len());
+    for attachment in &message.attachments {
+        let bytes = store
+            .read(&attachment.artifact_id)
+            .map_err(|error| format!("An attached file is no longer readable: {error}"))?;
+        if bytes.len() as u64 > MAX_OUTBOUND_FILE_BYTES {
+            return Err(format!(
+                "An attached file is larger than {MAX_OUTBOUND_FILE_BYTES} bytes."
+            ));
+        }
+        loaded.push(LoadedAttachment {
+            filename: attachment
+                .filename
+                .clone()
+                .unwrap_or_else(|| "attachment".to_string()),
+            mime_type: attachment
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            bytes,
+        });
+    }
+    Ok(loaded)
+}
+
 /// What one outbox drain did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct OutboxReport {
@@ -384,7 +434,17 @@ pub(crate) async fn drain_outbox_once(
                 continue;
             }
         };
-        let outcome = adapter.send(&payload.message).await;
+        // Bytes are loaded here, not in the adapter: the artifact store is the
+        // daemon's, and an adapter that could open it would be one step from
+        // reading artifacts that have nothing to do with its account.
+        let outcome = match load_outbound_attachments(&payload.message) {
+            Ok(files) => {
+                adapter
+                    .send_with_attachments(&payload.message, &files)
+                    .await
+            }
+            Err(error) => SendOutcome::PermanentFailure { error },
+        };
         match &outcome {
             SendOutcome::Sent {
                 provider_message_id,
