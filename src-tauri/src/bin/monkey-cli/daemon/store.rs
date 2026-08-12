@@ -1754,6 +1754,90 @@ CREATE TABLE IF NOT EXISTS channel_cursors (
 ) STRICT;
 "#;
 
+const DAEMON_V6: i64 = 6;
+const DAEMON_V6_CHECKSUM: &str = "daemon-jobs-v6-telephony";
+
+/// Telephony state: the carrier accounts an operator owns and the calls that
+/// went through them.
+///
+/// SMS deliberately has no tables here. An inbound text is a `ChannelEnvelope`
+/// and lives in `channel_events` like every other message, which is the whole
+/// point of routing SMS through the messaging subsystem rather than beside it.
+/// What telephony adds that messaging has no concept of is a *call*.
+///
+/// # Two separate powers
+///
+/// `inbound_policy` and `outbound_approval` are separate columns because they
+/// are separate decisions. An operator who lets Little Monkey answer the phone
+/// has not agreed to let it dial out, and a schema that stored one flag would
+/// make that distinction impossible to express.
+///
+/// # Money
+///
+/// Every row here can cost the operator money at their carrier, which is why
+/// `telecom_calls` keeps `needs_reconciliation` as a state of its own: a call
+/// that may already have been placed is never retried automatically, and the
+/// row stays for a human to settle.
+const DAEMON_V6_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS telecom_accounts (
+    account_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('twilio','telnyx','plivo','mock')),
+    label TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+    carrier_account_id TEXT NOT NULL,
+    from_number TEXT NOT NULL CHECK (length(from_number) > 0),
+    credential_ref TEXT,
+    public_base_url TEXT,
+    non_secret_config_json TEXT NOT NULL,
+    inbound_policy TEXT NOT NULL CHECK (inbound_policy IN ('reject','voicemail','answer')),
+    outbound_approval TEXT NOT NULL CHECK (outbound_approval IN ('never','approval','allow')),
+    health TEXT NOT NULL CHECK (health IN (
+        'unconfigured','disconnected','connecting','connected','degraded','unsupported','error'
+    )),
+    health_detail TEXT,
+    last_error TEXT,
+    last_probe_at_ms INTEGER,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS telecom_calls (
+    call_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES telecom_accounts(account_id) ON DELETE CASCADE,
+    provider_call_id TEXT,
+    direction TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
+    peer_number TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'queued','ringing','in_progress','completed','failed','needs_reconciliation'
+    )),
+    session_key TEXT,
+    job_id TEXT,
+    idempotency_key TEXT NOT NULL,
+    last_error TEXT,
+    started_at_ms INTEGER,
+    ended_at_ms INTEGER,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    UNIQUE(account_id, idempotency_key)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS telecom_calls_live_idx
+    ON telecom_calls(account_id, state, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS telecom_calls_provider_idx
+    ON telecom_calls(account_id, provider_call_id);
+
+CREATE TABLE IF NOT EXISTS telecom_events (
+    event_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES telecom_accounts(account_id) ON DELETE CASCADE,
+    provider_event_id TEXT NOT NULL CHECK (length(provider_event_id) > 0),
+    kind TEXT NOT NULL,
+    call_id TEXT,
+    payload_digest TEXT NOT NULL,
+    received_at_ms INTEGER NOT NULL CHECK (received_at_ms > 0),
+    UNIQUE(account_id, provider_event_id)
+) STRICT;
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -1770,12 +1854,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V3, DAEMON_V3_CHECKSUM, DAEMON_V3_SQL),
     (DAEMON_V4, DAEMON_V4_CHECKSUM, DAEMON_V4_SQL),
     (DAEMON_V5, DAEMON_V5_CHECKSUM, DAEMON_V5_SQL),
+    (DAEMON_V6, DAEMON_V6_CHECKSUM, DAEMON_V6_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V5;
+const DAEMON_LATEST: i64 = DAEMON_V6;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
