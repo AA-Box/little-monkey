@@ -1607,6 +1607,43 @@ fn write_snapshot(path: &Path, recipe: &Recipe) -> Result<(), String> {
     store::restrict_file(path)
 }
 
+/// Write one turn's fetched attachments where its run will be able to read
+/// them.
+///
+/// The destination is the run's own workspace, because that is the only place
+/// the agent's file tools may look: a path outside it is refused by the same
+/// confinement that stops a run reading the rest of the disk, so writing there
+/// would produce files nothing could open. Channel runs never take an owned
+/// worktree, so the recipe's workspace is the workspace.
+///
+/// Names arrive already sanitized by the worker; they are re-checked here
+/// because this is the function that concatenates them onto a path.
+pub(crate) fn write_inbound_files(
+    recipe_name: &str,
+    job_id: &str,
+    files: &[channel_worker::InboundFile],
+) -> Result<(), String> {
+    let workspace_root = std::env::current_dir().ok();
+    let global_config_roots = little_monkey_lib::app_paths::agent_config_roots()?.ordered();
+    let (recipe, recipe_path) = recipes::resolve_recipe_with_path(
+        recipe_name,
+        workspace_root.as_deref(),
+        &global_config_roots,
+    )?;
+    let workspace = resolve_recipe_workspace(&recipe, &recipe_path)?;
+    let directory = workspace.join(channel_worker::inbox_relative_dir(job_id));
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("Could not create the attachment directory: {error}"))?;
+    for file in files {
+        if file.name.contains('/') || file.name.contains('\\') || file.name.contains("..") {
+            continue;
+        }
+        std::fs::write(directory.join(&file.name), &file.bytes)
+            .map_err(|error| format!("Could not save an attachment: {error}"))?;
+    }
+    Ok(())
+}
+
 fn resolve_recipe_workspace(recipe: &Recipe, recipe_path: &Path) -> Result<PathBuf, String> {
     let value = match &recipe.workspace {
         Some(value) => recipe_path

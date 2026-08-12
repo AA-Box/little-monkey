@@ -26,9 +26,10 @@
 
 use super::channel_store::ChannelAccountRecord;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use little_monkey_lib::channels::types::{
-    ChannelEnvelope, ChannelHealth, ChannelKind, DeliveryReceipt, OutboundMessage,
-    ProviderCapabilities, SendOutcome,
+    AttachmentSource, ChannelAttachment, ChannelEnvelope, ChannelHealth, ChannelKind,
+    DeliveryReceipt, OutboundMessage, ProviderCapabilities, SendOutcome,
 };
 
 /// One batch of inbound events plus the cursor to resume from.
@@ -71,6 +72,71 @@ pub trait ChannelAdapter: Send + Sync {
     /// an adapter that cannot prove a request never left the machine must say
     /// `NeedsReconciliation` rather than `RetryableFailure`.
     async fn send(&self, message: &OutboundMessage) -> SendOutcome;
+
+    /// Resolve one inbound attachment to its bytes, refusing anything over
+    /// `max_bytes`.
+    ///
+    /// The default handles the providers that hand out a plain URL. A provider
+    /// that hands out an opaque id instead — a Telegram `file_id`, a WhatsApp
+    /// media id, an `mxc://` URI — overrides this, because resolving that id is
+    /// the one part only its own adapter knows how to do.
+    ///
+    /// Refusing is always allowed: an attachment that cannot be fetched leaves
+    /// the run with the message text and a note, never with a file that is
+    /// secretly empty.
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        match &attachment.source {
+            AttachmentSource::Url { url } => {
+                let client = little_monkey_lib::egress::hardened()
+                    .build()
+                    .map_err(|error| format!("Could not build an HTTP client: {error}"))?;
+                download_bounded(client.get(url), max_bytes).await
+            }
+            AttachmentSource::ProviderHandle { .. } => {
+                Err("This provider's attachments cannot be downloaded yet.".to_string())
+            }
+        }
+    }
+}
+
+/// Read a response body into memory, refusing to exceed `max_bytes`.
+///
+/// The declared `Content-Length` is checked first so an oversized file costs one
+/// round trip rather than a full transfer, but it is not trusted: the streaming
+/// loop enforces the same cap against what actually arrives, which is what stops
+/// a provider (or something impersonating one) from streaming until the daemon
+/// runs out of memory.
+pub(crate) async fn download_bounded(
+    request: reqwest::RequestBuilder,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    let response = little_monkey_lib::egress::send(request)
+        .await
+        .map_err(|error| format!("The attachment could not be fetched: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "The provider refused the attachment download ({})",
+            status.as_u16()
+        ));
+    }
+    if response.content_length().is_some_and(|len| len > max_bytes) {
+        return Err(format!("The attachment is larger than {max_bytes} bytes."));
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("The attachment transfer failed: {error}"))?;
+        if bytes.len() as u64 + chunk.len() as u64 > max_bytes {
+            return Err(format!("The attachment is larger than {max_bytes} bytes."));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// Providers that are delivered to rather than polled.

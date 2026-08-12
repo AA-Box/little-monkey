@@ -355,6 +355,54 @@ impl ChannelAdapter for WhatsAppAdapter {
             error: error_message,
         }
     }
+
+    /// WhatsApp delivers a media id, not a URL. `GET /{media-id}` returns a
+    /// short-lived download URL, and that URL still requires the same bearer
+    /// token — an unauthenticated fetch of it returns 401, which is why this
+    /// cannot fall back to the trait's plain-URL default.
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("This WhatsApp attachment has no media id.".to_string());
+        };
+        let client = little_monkey_lib::egress::hardened()
+            .build()
+            .map_err(|error| format!("Could not build an HTTP client: {error}"))?;
+        let response = little_monkey_lib::egress::send(
+            client
+                .get(format!("{}/{handle}", self.graph_api_base))
+                .bearer_auth(&self.access_token),
+        )
+        .await
+        .map_err(|error| format!("WhatsApp media lookup failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "WhatsApp refused the media lookup ({})",
+                response.status().as_u16()
+            ));
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|error| format!("WhatsApp media lookup failed: {error}"))?;
+        let url = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| "WhatsApp returned no download URL for that media".to_string())?;
+        crate::daemon::channel_adapter::download_bounded(
+            client.get(url).bearer_auth(&self.access_token),
+            max_bytes,
+        )
+        .await
+    }
 }
 
 /// Verifies `sha256=<hex>` over `body` with a constant-time comparison.

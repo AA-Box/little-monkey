@@ -391,6 +391,68 @@ impl ChannelAdapter for MatrixAdapter {
             },
         }
     }
+
+    /// Matrix identifies media by an `mxc://` URI, which is not fetchable on
+    /// its own. Since Matrix 1.11 the download endpoint is authenticated and
+    /// lives under `/_matrix/client/v1/media`; homeservers older than that only
+    /// answer on the unauthenticated `/_matrix/media/v3` path, so a 404 or 401
+    /// on the first falls back to the second rather than losing the file.
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("This Matrix attachment has no mxc URI.".to_string());
+        };
+        let (server_name, media_id) =
+            parse_mxc(handle).ok_or_else(|| format!("'{handle}' is not a usable mxc:// URI"))?;
+        let client = self.client()?;
+        let authenticated = format!(
+            "{}/_matrix/client/v1/media/download/{server_name}/{media_id}",
+            self.homeserver_url
+        );
+        match crate::daemon::channel_adapter::download_bounded(
+            self.authorize(client.get(&authenticated)),
+            max_bytes,
+        )
+        .await
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.contains("(404)") || error.contains("(401)") => {
+                let legacy = format!(
+                    "{}/_matrix/media/v3/download/{server_name}/{media_id}",
+                    self.homeserver_url
+                );
+                crate::daemon::channel_adapter::download_bounded(
+                    self.authorize(client.get(legacy)),
+                    max_bytes,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Splits `mxc://<server>/<media-id>` into its two halves.
+///
+/// Both halves are checked for path separators and `..` before they are
+/// concatenated into a download URL: the URI arrives inside a room event, which
+/// means anyone in the room can choose it.
+fn parse_mxc(uri: &str) -> Option<(String, String)> {
+    let rest = uri.strip_prefix("mxc://")?;
+    let (server_name, media_id) = rest.split_once('/')?;
+    let usable = |part: &str| {
+        !part.is_empty()
+            && part != ".."
+            && !part.contains('/')
+            && !part.contains('\\')
+            && !part.contains('?')
+            && !part.contains('#')
+    };
+    (usable(server_name) && usable(media_id))
+        .then(|| (server_name.to_string(), media_id.to_string()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -584,6 +646,17 @@ fn normalize_message_event(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_mxc_uri_splits_only_when_both_halves_are_usable() {
+        assert_eq!(
+            parse_mxc("mxc://example.org/AbCdEf"),
+            Some(("example.org".to_string(), "AbCdEf".to_string()))
+        );
+        assert_eq!(parse_mxc("mxc://example.org/../../secret"), None);
+        assert_eq!(parse_mxc("https://example.org/AbCdEf"), None);
+        assert_eq!(parse_mxc("mxc://example.org/"), None);
+    }
+
     use super::*;
 
     const SELF_ID: &str = "@self:example.org";

@@ -172,7 +172,7 @@ async fn handle_channel_delivery(
         Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "clock_error"),
     };
 
-    let (mut store, adapter) = match open_webhook_adapter(&paths, &account_id) {
+    let (mut store, adapter, fetcher) = match open_webhook_adapter(&paths, &account_id) {
         Ok(pair) => pair,
         Err(refusal) => return *refusal,
     };
@@ -197,17 +197,26 @@ async fn handle_channel_delivery(
     }
 
     let queue = super::DaemonChannelQueue::new(paths.clone());
-    let report = super::channel_worker::ingest_batch(&mut store, &queue, &envelopes, now_ms);
+    let report = super::channel_worker::ingest_batch(
+        &mut store,
+        &queue,
+        fetcher.as_deref(),
+        &envelopes,
+        now_ms,
+    )
+    .await;
     if report.failed > 0 && report.accepted == 0 {
         return response(StatusCode::INTERNAL_SERVER_ERROR, "not_queued");
     }
     response(StatusCode::ACCEPTED, "accepted")
 }
 
-/// An open store plus the adapter for the account the request named.
+/// An open store, the adapter that verifies the account's deliveries, and the
+/// full adapter that can fetch what those deliveries reference.
 type OpenedWebhookAccount = (
     DaemonStore,
     Box<dyn super::channel_adapter::WebhookChannelAdapter>,
+    Option<std::sync::Arc<dyn super::channel_adapter::ChannelAdapter>>,
 );
 
 /// Open the store and build one account's webhook adapter, or the response
@@ -247,7 +256,12 @@ fn open_webhook_adapter(
     };
     let adapter = super::adapters::build_webhook_adapter(&config)
         .map_err(|_| refuse(StatusCode::NOT_FOUND, "not_found"))?;
-    Ok((store, adapter))
+    // The verifying half and the fetching half are two different traits on the
+    // same provider. The second is what downloads an accepted delivery's
+    // attachments; a provider without one simply does not fetch, and its turns
+    // still run with their text.
+    let fetcher = super::adapters::build_adapter(&config).ok();
+    Ok((store, adapter, fetcher))
 }
 
 /// Record what a provider says happened to messages we already sent.
@@ -320,7 +334,7 @@ fn handle_channel_verification(
     account_id: String,
     query: &str,
 ) -> Response<Full<Bytes>> {
-    let (_store, adapter) = match open_webhook_adapter(&paths, &account_id) {
+    let (_store, adapter, _fetcher) = match open_webhook_adapter(&paths, &account_id) {
         Ok(pair) => pair,
         Err(refusal) => return *refusal,
     };
@@ -430,7 +444,9 @@ async fn handle_carrier_callback(
     }
 
     let queue = super::DaemonChannelQueue::new(paths.clone());
-    match super::telecom_worker::handle_carrier_event(&mut store, &queue, &account, event, now_ms) {
+    match super::telecom_worker::handle_carrier_event(&mut store, &queue, &account, event, now_ms)
+        .await
+    {
         Ok(_) => response(StatusCode::ACCEPTED, "accepted"),
         Err(_) => response(StatusCode::INTERNAL_SERVER_ERROR, "not_handled"),
     }

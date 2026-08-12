@@ -269,6 +269,31 @@ impl ChannelAdapter for MattermostAdapter {
             provider_message_id: last_id,
         }
     }
+
+    /// Mattermost serves the bytes for a post's file id straight from the API,
+    /// authenticated with the same bot token as everything else.
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("This Mattermost attachment has no file id.".to_string());
+        };
+        // The id is path-concatenated, and it arrives inside a post anybody in
+        // the channel can craft, so anything that could climb out of
+        // `/api/v4/files/` is refused instead of escaped.
+        if handle.is_empty() || !handle.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err("That Mattermost file id is not usable".to_string());
+        }
+        crate::daemon::channel_adapter::download_bounded(
+            self.http
+                .get(format!("{}/api/v4/files/{handle}", self.base_url))
+                .bearer_auth(&self.token),
+            max_bytes,
+        )
+        .await
+    }
 }
 
 fn now_ms() -> i64 {

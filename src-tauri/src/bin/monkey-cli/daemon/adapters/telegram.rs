@@ -297,6 +297,67 @@ impl ChannelAdapter for TelegramAdapter {
             provider_message_id: last_message_id,
         }
     }
+
+    /// Telegram hands out a `file_id`, not a URL: `getFile` exchanges it for a
+    /// path valid for about an hour, and the bytes live under a different host
+    /// prefix (`/file/bot<token>/`) than the API methods do.
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("This Telegram attachment has no file id.".to_string());
+        };
+        let client = self.client()?;
+        let response = little_monkey_lib::egress::send(
+            client
+                .get(self.method_url("getFile"))
+                .query(&[("file_id", handle.as_str())]),
+        )
+        .await
+        .map_err(|error| self.redact(format!("Telegram getFile failed: {error}")))?;
+        let body = response
+            .text()
+            .await
+            .map_err(|error| self.redact(format!("Telegram getFile failed: {error}")))?;
+        let parsed = serde_json::from_str::<TelegramApiResponse<TelegramFile>>(&body)
+            .map_err(|_| "Telegram returned an unparseable getFile response".to_string())?;
+        let file_path = parsed
+            .result
+            .filter(|_| parsed.ok)
+            .and_then(|file| file.file_path)
+            .ok_or_else(|| "Telegram did not return a path for that file".to_string())?;
+        if !usable_file_path(&file_path) {
+            return Err("Telegram returned an unusable file path".to_string());
+        }
+        let url = format!("{API_BASE}/file/bot{}/{file_path}", self.token);
+        crate::daemon::channel_adapter::download_bounded(client.get(url), max_bytes)
+            .await
+            .map_err(|error| self.redact(error))
+    }
+}
+
+/// Whether a `getFile` path may be concatenated onto the download endpoint.
+///
+/// The path is Telegram's own answer, but it is still string-joined into a URL,
+/// so anything that could climb out of `/file/bot<token>/` — or start a new
+/// authority — is refused rather than normalized.
+fn usable_file_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains("..")
+        && !path.starts_with('/')
+        && !path.starts_with('\\')
+        && !path.contains("://")
+        && !path.contains('?')
+        && !path.contains('#')
+}
+
+/// `getFile`'s result. Only the path matters here — the size Telegram reports
+/// is advisory, and the byte cap is enforced against what actually arrives.
+#[derive(Debug, serde::Deserialize)]
+struct TelegramFile {
+    file_path: Option<String>,
 }
 
 /// The new cursor to persist: the highest `update_id` seen in `updates`, or
@@ -661,6 +722,15 @@ struct TelegramUpdate {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_file_path_that_could_leave_the_download_endpoint_is_refused() {
+        assert!(usable_file_path("photos/file_0.jpg"));
+        assert!(!usable_file_path("../bot123456:secret/getMe"));
+        assert!(!usable_file_path("/etc/passwd"));
+        assert!(!usable_file_path("https://evil.example.com/x"));
+        assert!(!usable_file_path(""));
+    }
+
     use super::*;
 
     const PRIVATE_MESSAGE: &str = r#"{

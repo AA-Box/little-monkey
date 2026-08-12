@@ -487,6 +487,58 @@ impl ChannelAdapter for SignalAdapter {
             Err(CallError::Remote(error)) => SendOutcome::PermanentFailure { error },
         }
     }
+
+    /// signal-cli keeps received attachments in its own store and hands them
+    /// out by id through `getAttachment`, base64-encoded. Nothing here reads
+    /// that store directly — the helper owns it, the same way it owns the
+    /// account keys.
+    ///
+    /// A helper too old to know the method answers with a JSON-RPC error,
+    /// which surfaces as a refusal rather than an empty file.
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("This Signal attachment has no id.".to_string());
+        };
+        let result = self
+            .call("getAttachment", json!({ "id": handle }))
+            .await
+            .map_err(|error| match error {
+                CallError::NotSent(error)
+                | CallError::Ambiguous(error)
+                | CallError::Remote(error) => error,
+            })?;
+        // signal-cli has returned the payload both as a bare string and inside
+        // a `data` field across versions; both are accepted rather than
+        // pinning one and failing on the other.
+        let encoded = result
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| {
+                result
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| "The helper returned no attachment data".to_string())?;
+        // Base64 inflates by 4/3, so the encoded form is bounded first: this
+        // refuses an oversized attachment before it is decoded into memory.
+        if encoded.len() as u64 > max_bytes.saturating_mul(4).div_ceil(3) + 4 {
+            return Err(format!("The attachment is larger than {max_bytes} bytes."));
+        }
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            encoded.as_bytes(),
+        )
+        .map_err(|_| "The helper returned unreadable attachment data".to_string())?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(format!("The attachment is larger than {max_bytes} bytes."));
+        }
+        Ok(bytes)
+    }
 }
 
 #[cfg(test)]

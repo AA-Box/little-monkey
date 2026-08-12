@@ -273,6 +273,50 @@ impl ChannelAdapter for SlackAdapter {
             provider_message_id: last_ts,
         }
     }
+
+    /// Slack shares a file id. `files.info` exchanges it for `url_private`,
+    /// which is on Slack's own host and needs the bot token as a bearer header
+    /// — fetching it unauthenticated silently returns Slack's HTML sign-in
+    /// page rather than an error, which is exactly the kind of "file arrived,
+    /// contents are garbage" outcome worth spending a second request to avoid.
+    ///
+    /// Needs the `files:read` scope; without it Slack answers
+    /// `missing_scope` and the attachment is refused by name.
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("This Slack attachment has no file id.".to_string());
+        };
+        let info = little_monkey_lib::egress::send(
+            self.http
+                .get(format!("{API_BASE}/files.info"))
+                .bearer_auth(&self.secret.bot_token)
+                .query(&[("file", handle.as_str())]),
+        )
+        .await
+        .map_err(|error| format!("Slack files.info failed: {error}"))?;
+        let body: Value = info.json().await.unwrap_or(Value::Null);
+        if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            let reason = body
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown_error");
+            return Err(format!("Slack refused files.info: {reason}"));
+        }
+        let url = body
+            .get("file")
+            .and_then(|file| file.get("url_private"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Slack returned no private URL for that file".to_string())?;
+        crate::daemon::channel_adapter::download_bounded(
+            self.http.get(url).bearer_auth(&self.secret.bot_token),
+            max_bytes,
+        )
+        .await
+    }
 }
 
 fn now_ms() -> i64 {

@@ -458,6 +458,35 @@ mod macos {
                 Err(CallError::Remote(error)) => SendOutcome::PermanentFailure { error },
             }
         }
+
+        /// The helper reports iMessage attachments as paths into the Messages
+        /// attachment store on this machine, so the bytes are read directly —
+        /// there is no network fetch and no second copy of the file.
+        ///
+        /// The size is checked from the directory entry before the read, so an
+        /// oversized attachment costs a `stat` rather than the whole file.
+        async fn fetch_attachment(
+            &self,
+            attachment: &ChannelAttachment,
+            max_bytes: u64,
+        ) -> Result<Vec<u8>, String> {
+            let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+                return Err("This iMessage attachment has no path.".to_string());
+            };
+            let path = std::path::Path::new(handle);
+            let metadata = tokio::fs::metadata(path)
+                .await
+                .map_err(|error| format!("That attachment is no longer readable: {error}"))?;
+            if !metadata.is_file() {
+                return Err("That iMessage attachment is not a file".to_string());
+            }
+            if metadata.len() > max_bytes {
+                return Err(format!("The attachment is larger than {max_bytes} bytes."));
+            }
+            tokio::fs::read(path)
+                .await
+                .map_err(|error| format!("That attachment could not be read: {error}"))
+        }
     }
 
     #[cfg(test)]

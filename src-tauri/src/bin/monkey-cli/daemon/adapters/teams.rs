@@ -457,6 +457,54 @@ impl ChannelAdapter for TeamsAdapter {
             error: error_message,
         }
     }
+
+    /// Teams attachments arrive as a `contentUrl`. Bot-hosted content on the
+    /// Bot Framework's own service hosts needs the bot's token; anything else
+    /// — a SharePoint or OneDrive link, or any host an attacker could put in an
+    /// activity — is fetched with no credential at all, because sending the
+    /// bot's bearer token to a host chosen by the message author would hand it
+    /// away.
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let AttachmentSource::Url { url } = &attachment.source else {
+            return Err("This Teams attachment has no content URL.".to_string());
+        };
+        let client = little_monkey_lib::egress::hardened()
+            .build()
+            .map_err(|error| format!("Could not build an HTTP client: {error}"))?;
+        let request = if is_bot_framework_host(url) {
+            let token = self.access_token().await?;
+            client.get(url).bearer_auth(token)
+        } else {
+            client.get(url)
+        };
+        crate::daemon::channel_adapter::download_bounded(request, max_bytes).await
+    }
+}
+
+/// Whether a URL is on a Bot Framework service host, and so may be sent the
+/// bot's own token.
+///
+/// Host suffixes are matched on a label boundary — `evil-botframework.com`
+/// must not pass as `botframework.com`, and neither must
+/// `botframework.com.attacker.example`.
+fn is_bot_framework_host(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    ["botframework.com", "trafficmanager.net"]
+        .iter()
+        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
 }
 
 /// `https` on a Microsoft-owned Bot Framework host. Bot Framework
@@ -674,6 +722,23 @@ fn normalize_activity(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_bot_framework_hosts_are_sent_the_bot_token() {
+        assert!(is_bot_framework_host(
+            "https://smba.trafficmanager.net/amer/"
+        ));
+        assert!(is_bot_framework_host("https://api.botframework.com/x"));
+        assert!(
+            !is_bot_framework_host("https://evil-botframework.com/x"),
+            "a suffix must match on a label boundary"
+        );
+        assert!(!is_bot_framework_host(
+            "https://botframework.com.evil.example/x"
+        ));
+        assert!(!is_bot_framework_host("http://api.botframework.com/x"));
+        assert!(!is_bot_framework_host("https://graph.microsoft.com/x"));
+    }
+
     use super::*;
     use crate::daemon::channel_store::ChannelAccountRecord;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
