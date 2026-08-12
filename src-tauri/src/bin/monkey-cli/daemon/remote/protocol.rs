@@ -75,6 +75,27 @@ pub enum DeviceCapability {
     /// its nearest neighbour and is not the same thing: that launches a workflow
     /// this node already holds, under this node's own policy.
     PlaceRuns,
+    /// Exchange bounded messages with this installation as a paired *peer*
+    /// rather than as a controller (roadmap: peer agents).
+    ///
+    /// Peer standing is its own grant and implies nothing else in this enum: a
+    /// peer that may talk cannot read runs, cannot approve, cannot place work
+    /// and cannot reach the desktop. `legacy_capabilities` never produces any
+    /// of the three, so an existing pairing does not silently become a peer
+    /// when this build ships.
+    PeerMessage,
+    /// Ask this installation to do something as a paired peer. The request
+    /// becomes an ordinary durable turn under this node's own recipe and
+    /// permission policy — it is a request, never an instruction.
+    ///
+    /// Separate from [`Self::PeerMessage`] because saying something and asking
+    /// for work are different acts, and an operator who allowed the first has
+    /// not agreed to the second.
+    PeerTaskRequest,
+    /// Attach artifact references to a peer thread. Separate again: handing
+    /// content over is not the same as talking, and it is the grant that
+    /// decides whether this node will fetch what a peer offers.
+    PeerArtifact,
     /// Hand this node a *frozen process image* from another owned node and let
     /// it resume the run (roadmap K18).
     ///

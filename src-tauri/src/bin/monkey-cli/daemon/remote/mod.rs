@@ -2,9 +2,9 @@ pub(crate) mod api;
 mod client;
 mod desktop;
 pub(crate) mod migrate;
-mod protocol;
+pub(crate) mod protocol;
 mod server;
-mod store;
+pub(crate) mod store;
 mod web;
 
 pub use desktop::DesktopControlRuntime;
