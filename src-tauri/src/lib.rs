@@ -1576,6 +1576,7 @@ pub fn run() {
             daemon_commands::channels_remove_route,
             daemon_commands::channels_events,
             daemon_commands::channels_remove,
+            daemon_commands::ingress_turns,
             daemon_commands::daemon_desktop_status,
             daemon_commands::daemon_desktop_decisions,
             daemon_commands::daemon_desktop_install,
