@@ -138,12 +138,32 @@ pub(crate) fn speak_on_call(call_id: &str, text: &str) -> Result<(), String> {
         .map_err(|_| format!("Call {call_id} is no longer on the line"))
 }
 
+/// Whether a media socket for this call is open right now.
+///
+/// The same registry [`speak_on_call`] delivers through, asked the other
+/// question: not "can I say something" but "is anyone still carrying this
+/// call's audio". A carrier that reconnects re-registers here, which is what
+/// tells a dropped stream apart from one that came back.
+pub(crate) fn is_on_the_line(call_id: &str) -> bool {
+    speakers()
+        .lock()
+        .map(|speakers| speakers.contains_key(call_id))
+        .unwrap_or(false)
+}
+
 fn register_speaker(call_id: &str) -> mpsc::UnboundedReceiver<String> {
     let (sender, receiver) = mpsc::unbounded_channel();
     if let Ok(mut speakers) = speakers().lock() {
         speakers.insert(call_id.to_string(), sender);
     }
     receiver
+}
+
+/// Register a live call by hand, standing in for the media session a carrier
+/// that reconnected would be running.
+#[cfg(test)]
+pub(crate) fn register_reconnected_call(call_id: &str) -> mpsc::UnboundedReceiver<String> {
+    register_speaker(call_id)
 }
 
 fn unregister_speaker(call_id: &str) {
@@ -162,6 +182,12 @@ pub(crate) struct MediaSessionReport {
     pub interruptions: u32,
     /// Voicemail recordings written to the artifact store.
     pub recordings_kept: u32,
+    /// The socket broke rather than being closed on purpose: no `stop` event,
+    /// no voicemail that had said its piece, just a stream that stopped
+    /// carrying audio. It is the difference between a call that ended and a
+    /// call nobody can hear any more, and only the second one needs somebody
+    /// to go and hang the line up.
+    pub stream_dropped: bool,
 }
 
 /// Run one call's audio until the carrier hangs up.
@@ -215,6 +241,7 @@ pub(crate) async fn run_media_session(
             )), if !pending.is_empty() => {
                 if let Some(frame) = pending.pop_front() {
                     if socket.send(frame).await.is_err() {
+                        report.stream_dropped = true;
                         break;
                     }
                     report.frames_spoken += 1;
@@ -226,7 +253,13 @@ pub(crate) async fn run_media_session(
             }
             frame = socket.recv() => frame,
         };
-        let Some(frame) = frame else { break };
+        let Some(frame) = frame else {
+            // The carrier closes with a `stop` event when the call is over.
+            // Reaching the end of the socket without one means the stream went
+            // away while the call was still live.
+            report.stream_dropped = true;
+            break;
+        };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&frame) else {
             continue;
         };
@@ -286,6 +319,7 @@ pub(crate) async fn run_media_session(
                     .await
                     .is_err()
                 {
+                    report.stream_dropped = true;
                     break;
                 }
             }
@@ -767,6 +801,41 @@ mod tests {
 
         assert_eq!(report, MediaSessionReport::default());
         assert!(sink.turns.lock().unwrap().is_empty());
+    }
+
+    /// The two ways a session ends have to be told apart: the carrier saying
+    /// the call is over, and the stream going away while it is still up. Only
+    /// the second one leaves a line for somebody to hang up.
+    #[tokio::test]
+    async fn a_socket_that_stops_short_of_a_stop_event_reports_a_dropped_stream() {
+        let ended = ScriptedSocket {
+            inbound: vec![serde_json::json!({ "event": "stop", "streamSid": "MZ1" }).to_string()],
+            sent: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
+            linger: None,
+        };
+        let dropped = ScriptedSocket {
+            inbound: Vec::new(),
+            sent: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
+            linger: None,
+        };
+
+        for (mut socket, call_id, expected) in [
+            (ended, "call-stopped", false),
+            (dropped, "call-dropped", true),
+        ] {
+            let report = run_media_session(
+                &mut socket,
+                &FakeSpeech::new("unused"),
+                &RecordingSink::default(),
+                &FakeCarrier,
+                identity_for(call_id),
+            )
+            .await;
+
+            assert_eq!(report.stream_dropped, expected, "{call_id}");
+        }
     }
 
     #[tokio::test]
