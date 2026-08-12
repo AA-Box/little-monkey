@@ -57,6 +57,12 @@ pub(crate) async fn place_call(
         }
         OutboundCallApproval::Approval | OutboundCallApproval::Allow => {}
     }
+    let live = store.live_call_count(account_id)?;
+    if live >= account.limits.max_concurrent_calls {
+        return Err(format!(
+            "This account is already on {live} call(s), which is its limit. Wait for one to end or raise the limit in Settings."
+        ));
+    }
 
     let job_id = std::env::var(JOB_ID_ENV).unwrap_or_default();
     let idempotency_key = format!("outbound:{job_id}:{to_number}");

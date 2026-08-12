@@ -92,7 +92,7 @@ mod tests {
     use super::*;
     use little_monkey_lib::channels::types::HealthState;
 
-    use super::super::super::telecom_store::{InboundCallPolicy, OutboundCallApproval};
+    use super::super::super::telecom_store::{CallLimits, InboundCallPolicy, OutboundCallApproval};
     use super::super::super::telephony::{mock::MockProvider, TelecomConfig, TelecomKind};
 
     const NOW: i64 = 1_700_000_000_000;
@@ -110,6 +110,7 @@ mod tests {
             non_secret_config: serde_json::json!({}),
             inbound_policy: InboundCallPolicy::Reject,
             outbound_approval: OutboundCallApproval::Never,
+            limits: CallLimits::default(),
             health: ChannelHealth {
                 state: HealthState::Disconnected,
                 detail: None,

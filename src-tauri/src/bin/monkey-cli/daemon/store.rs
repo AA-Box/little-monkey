@@ -1838,6 +1838,26 @@ CREATE TABLE IF NOT EXISTS telecom_events (
 ) STRICT;
 "#;
 
+const DAEMON_V7: i64 = 7;
+const DAEMON_V7_CHECKSUM: &str = "daemon-jobs-v7-call-limits";
+
+/// Per-account call limits, and the deadlines a live call is held to.
+///
+/// The defaults are the cautious ones: one call at a time, a ring given up on
+/// after a minute, a call cut at half an hour, and no recording. Every one of
+/// them bounds something that costs the operator money or records a person who
+/// did not ask to be recorded, so the safe value is the one an operator gets
+/// without choosing anything.
+///
+/// `ALTER TABLE ... ADD COLUMN` rather than a rebuild: the defaults are
+/// constants, so an existing row gets the safe limit without a data migration.
+const DAEMON_V7_SQL: &str = r#"
+ALTER TABLE telecom_accounts ADD COLUMN max_concurrent_calls INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE telecom_accounts ADD COLUMN ring_timeout_s INTEGER NOT NULL DEFAULT 60;
+ALTER TABLE telecom_accounts ADD COLUMN max_duration_s INTEGER NOT NULL DEFAULT 1800;
+ALTER TABLE telecom_accounts ADD COLUMN recording_enabled INTEGER NOT NULL DEFAULT 0;
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -1855,12 +1875,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V4, DAEMON_V4_CHECKSUM, DAEMON_V4_SQL),
     (DAEMON_V5, DAEMON_V5_CHECKSUM, DAEMON_V5_SQL),
     (DAEMON_V6, DAEMON_V6_CHECKSUM, DAEMON_V6_SQL),
+    (DAEMON_V7, DAEMON_V7_CHECKSUM, DAEMON_V7_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V6;
+const DAEMON_LATEST: i64 = DAEMON_V7;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
