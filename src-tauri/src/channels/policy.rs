@@ -649,6 +649,9 @@ mod tests {
         let mut message = envelope(ConversationKind::Direct, false);
         message.text = String::new();
         message.attachments.push(ChannelAttachment {
+            stored_artifact_id: None,
+            text_excerpt: None,
+            fetch_error: None,
             provider_id: Some("file-1".into()),
             kind: AttachmentKind::Image,
             filename: None,

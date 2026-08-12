@@ -1911,6 +1911,20 @@ CREATE INDEX IF NOT EXISTS ingress_turns_recent_idx
 CREATE INDEX IF NOT EXISTS ingress_turns_job_idx ON ingress_turns(job_id);
 "#;
 
+const DAEMON_V9: i64 = 9;
+const DAEMON_V9_CHECKSUM: &str = "daemon-jobs-v9-call-opening-line";
+
+/// What is said when a call connects.
+///
+/// A call that opens with silence sounds broken to whoever picked up, so both
+/// directions have an opening line: the number's greeting on an inbound call,
+/// and on an outbound one the sentence the agent was approved to say. It lives
+/// on the call rather than on the account because the outbound line is
+/// per-call, and the approval the operator gave was for those words.
+const DAEMON_V9_SQL: &str = r#"
+ALTER TABLE telecom_calls ADD COLUMN opening_line TEXT;
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -1930,12 +1944,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V6, DAEMON_V6_CHECKSUM, DAEMON_V6_SQL),
     (DAEMON_V7, DAEMON_V7_CHECKSUM, DAEMON_V7_SQL),
     (DAEMON_V8, DAEMON_V8_CHECKSUM, DAEMON_V8_SQL),
+    (DAEMON_V9, DAEMON_V9_CHECKSUM, DAEMON_V9_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V8;
+const DAEMON_LATEST: i64 = DAEMON_V9;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
