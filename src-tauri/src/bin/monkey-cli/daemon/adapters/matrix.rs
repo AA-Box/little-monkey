@@ -425,7 +425,7 @@ impl ChannelAdapter for MatrixAdapter {
             inbound_transport: InboundTransport::LongPoll,
             max_text_chars: MAX_TEXT_CHARS,
             supports_threads: false,
-            supports_attachments: true,
+            supports_attachments: false, // inbound only: this adapter does not upload files yet
             supports_mention_metadata: true,
             // The PUT txn_id below is a real caller-supplied idempotency key
             // the homeserver dedupes on.
@@ -729,6 +729,9 @@ fn normalize_message_event(
                     _ => AttachmentKind::Video,
                 };
                 attachments.push(ChannelAttachment {
+                    stored_artifact_id: None,
+                    text_excerpt: None,
+                    fetch_error: None,
                     provider_id: Some(mxc.to_string()),
                     kind,
                     filename: (!body_text.is_empty()).then(|| body_text.clone()),
@@ -1115,7 +1118,10 @@ mod tests {
         let capabilities = adapter.capabilities();
         assert_eq!(capabilities.max_text_chars, MAX_TEXT_CHARS);
         assert_eq!(capabilities.kind, ChannelKind::Matrix);
-        assert!(capabilities.supports_attachments);
+        // Inbound attachments are normalized, but nothing here uploads one, and
+        // the capability says what this adapter does rather than what Matrix
+        // could do.
+        assert!(!capabilities.supports_attachments);
     }
 
     #[test]

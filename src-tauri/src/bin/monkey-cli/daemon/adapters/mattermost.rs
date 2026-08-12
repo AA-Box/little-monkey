@@ -421,6 +421,9 @@ fn normalize_posted_event(
             ids.iter()
                 .filter_map(Value::as_str)
                 .map(|file_id| ChannelAttachment {
+                    stored_artifact_id: None,
+                    text_excerpt: None,
+                    fetch_error: None,
                     provider_id: Some(file_id.to_string()),
                     kind: AttachmentKind::Other,
                     filename: None,
