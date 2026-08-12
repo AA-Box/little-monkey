@@ -296,6 +296,9 @@ fn read_attachments(
             mime_type,
             declared_size_bytes: total_bytes.and_then(|bytes| u64::try_from(bytes).ok()),
             source: AttachmentSource::ProviderHandle { handle: path },
+            stored_artifact_id: None,
+            fetch_error: None,
+            text_excerpt: None,
         });
     }
     Ok(attachments)

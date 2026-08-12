@@ -249,6 +249,9 @@ fn ingress_for(envelope: &PeerEnvelope, device_id: &str, session_key: &str) -> C
             source: AttachmentSource::ProviderHandle {
                 handle: format!("peer:{device_id}:{}", artifact.artifact_id),
             },
+            stored_artifact_id: None,
+            fetch_error: None,
+            text_excerpt: None,
         })
         .collect();
     ingress

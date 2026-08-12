@@ -508,6 +508,11 @@ impl CallTurnSink for QueuedCallTurns<'_> {
                     source: little_monkey_lib::channels::types::AttachmentSource::ProviderHandle {
                         handle: artifact_id.to_string(),
                     },
+                    // The bytes are already in the artifact store, so nothing
+                    // needs hydrating.
+                    stored_artifact_id: Some(artifact_id.to_string()),
+                    fetch_error: None,
+                    text_excerpt: None,
                 });
         }
         let params = super::channel_ingress::run_params_for(&self.target, &ingress);

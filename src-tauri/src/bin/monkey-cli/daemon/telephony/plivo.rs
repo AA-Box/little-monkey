@@ -420,6 +420,9 @@ fn normalize_plivo_params(
                 source: AttachmentSource::Url {
                     url: media.media_url,
                 },
+                stored_artifact_id: None,
+                fetch_error: None,
+                text_excerpt: None,
             })
             .collect();
         let mut metadata = BoundedMetadata::new();
