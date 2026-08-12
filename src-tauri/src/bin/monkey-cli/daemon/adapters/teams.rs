@@ -342,7 +342,7 @@ impl ChannelAdapter for TeamsAdapter {
         ProviderCapabilities {
             max_text_chars: 28000,
             supports_threads: false,
-            supports_attachments: true,
+            supports_attachments: false, // inbound only: this adapter does not upload files yet
             supports_mention_metadata: true,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
@@ -621,6 +621,9 @@ fn normalize_activity(
                     let content_url = attachment.get("contentUrl").and_then(JsonValue::as_str)?;
                     let mime_type = attachment.get("contentType").and_then(JsonValue::as_str);
                     Some(ChannelAttachment {
+                        stored_artifact_id: None,
+                        text_excerpt: None,
+                        fetch_error: None,
                         provider_id: None,
                         kind: mime_type
                             .map(AttachmentKind::from_mime)

@@ -556,6 +556,9 @@ fn normalize_message_create(
                         .map(AttachmentKind::from_mime)
                         .unwrap_or(AttachmentKind::Other);
                     Some(ChannelAttachment {
+                        stored_artifact_id: None,
+                        text_excerpt: None,
+                        fetch_error: None,
                         provider_id: attachment
                             .get("id")
                             .and_then(Value::as_str)
