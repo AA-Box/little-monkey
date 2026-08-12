@@ -23,7 +23,7 @@ use std::sync::Arc;
 use little_monkey_lib::channels::ingress::ConversationIngress;
 use little_monkey_lib::channels::types::{ChannelEnvelope, SendOutcome};
 
-use super::channel_adapter::{ChannelAdapter, LoadedAttachment};
+use super::channel_adapter::ChannelAdapter;
 use super::channel_ingress::{self, IngressPlan, OutboxPayload, PlannedDecision, SubmitOutcome};
 use super::channel_store::{EventDirection, EventDisposition, NewChannelEvent};
 use super::store::DaemonStore;
@@ -44,156 +44,6 @@ const OUTBOX_BATCH: u32 = 16;
 pub(crate) trait RunQueue: Send + Sync {
     /// Queues one accepted turn. Returns the daemon job id.
     fn submit(&self, ingress: &ConversationIngress, params: Vec<String>) -> Result<String, String>;
-}
-
-/// One fetched attachment, ready to be written where the run can read it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InboundFile {
-    /// Already sanitized: the sender chose the original name.
-    pub name: String,
-    pub bytes: Vec<u8>,
-}
-
-/// Directory, relative to the run's workspace, that a turn's attachments are
-/// written into. Per job, so two conversations never see each other's files.
-pub(crate) fn inbox_relative_dir(job_id: &str) -> String {
-    format!(".little-monkey/inbox/{job_id}")
-}
-
-/// At most this many attachments are fetched per message.
-const MAX_INBOUND_FILES: usize = 4;
-/// Largest single attachment fetched, in bytes.
-const MAX_INBOUND_FILE_BYTES: u64 = 8 * 1024 * 1024;
-/// Largest total per message, so four maximum-size files cannot be used to
-/// write 32 MiB into the workspace.
-const MAX_INBOUND_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
-
-/// Fetch a turn's attachments, bounded in count and size.
-///
-/// Deliberately runs *after* the ingress gate, never before: fetching a
-/// stranger's file before their message has been allowed would make an unpaired
-/// sender able to spend this machine's bandwidth and disk.
-///
-/// A refusal is never fatal — the run still happens with the text, and the
-/// skipped file is named in the note so the model does not answer as if it saw
-/// something it did not.
-async fn fetch_inbound_files(
-    adapter: Option<&dyn ChannelAdapter>,
-    ingress: &ConversationIngress,
-) -> (Vec<InboundFile>, Vec<String>) {
-    let mut files = Vec::new();
-    let mut skipped = Vec::new();
-    let Some(adapter) = adapter else {
-        for attachment in &ingress.attachments {
-            skipped.push(describe_skipped(
-                attachment,
-                "no adapter is available to fetch it",
-            ));
-        }
-        return (files, skipped);
-    };
-    let mut total: u64 = 0;
-    for (index, attachment) in ingress.attachments.iter().enumerate() {
-        if files.len() >= MAX_INBOUND_FILES {
-            skipped.push(describe_skipped(
-                attachment,
-                "only the first few attachments of a message are fetched",
-            ));
-            continue;
-        }
-        let remaining = MAX_INBOUND_TOTAL_BYTES.saturating_sub(total);
-        let budget = MAX_INBOUND_FILE_BYTES.min(remaining);
-        if budget == 0 {
-            skipped.push(describe_skipped(
-                attachment,
-                "the message's size budget is used up",
-            ));
-            continue;
-        }
-        match adapter.fetch_attachment(attachment, budget).await {
-            Ok(bytes) => {
-                total += bytes.len() as u64;
-                files.push(InboundFile {
-                    name: safe_file_name(index, attachment.filename.as_deref()),
-                    bytes,
-                });
-            }
-            Err(error) => skipped.push(describe_skipped(attachment, &error)),
-        }
-    }
-    (files, skipped)
-}
-
-fn describe_skipped(
-    attachment: &little_monkey_lib::channels::types::ChannelAttachment,
-    reason: &str,
-) -> String {
-    let name = attachment.filename.as_deref().unwrap_or("an attachment");
-    format!("{name}: {reason}")
-}
-
-/// A filesystem-safe name for one attachment.
-///
-/// The sender picked the original, so it is not trusted with anything: the
-/// index prefix makes collisions impossible, every character outside a small
-/// allowlist becomes `_`, and the result is length-bounded. A name that
-/// survives this cannot traverse, hide (`.`-prefixed), or collide.
-fn safe_file_name(index: usize, filename: Option<&str>) -> String {
-    let raw = filename.unwrap_or("attachment");
-    let cleaned: String = raw
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .take(64)
-        .collect();
-    let cleaned = cleaned.trim_matches('.').to_string();
-    if cleaned.is_empty() {
-        format!("{index}-attachment")
-    } else {
-        format!("{index}-{cleaned}")
-    }
-}
-
-/// Append a note naming the files that were saved, and the ones that were not.
-///
-/// Written into the `message` parameter the planner already built, after the
-/// untrusted-content wrapper rather than inside it: the paths are this
-/// daemon's own words, and only the message text came from a stranger.
-fn annotate_params_with_files(
-    mut params: Vec<String>,
-    relative_dir: &str,
-    files: &[InboundFile],
-    skipped: &[String],
-) -> Vec<String> {
-    if files.is_empty() && skipped.is_empty() {
-        return params;
-    }
-    let mut note = String::new();
-    if !files.is_empty() {
-        let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
-        note.push_str(&format!(
-            "\n\n[Attachments saved in {relative_dir}/: {}]",
-            names.join(", ")
-        ));
-    }
-    if !skipped.is_empty() {
-        note.push_str(&format!(
-            "\n[Attachments that could not be fetched: {}]",
-            skipped.join("; ")
-        ));
-    }
-    for param in &mut params {
-        if let Some(rest) = param.strip_prefix("message=") {
-            *param = format!("message={rest}{note}");
-            return params;
-        }
-    }
-    params
 }
 
 /// What one inbound pass did, for the caller's logs and for tests.
@@ -218,13 +68,9 @@ pub(crate) struct InboundReport {
 /// than written here so the caller can persist it after the whole batch is
 /// durable — a cursor written before the events it covers would skip them
 /// permanently after a crash.
-/// `adapter` is what fetches an accepted message's attachments. `None` means
-/// the caller has no adapter for this account — the turn still runs, and the
-/// note tells the model the files were not retrieved.
-pub(crate) async fn ingest_batch(
+pub(crate) fn ingest_batch(
     store: &mut DaemonStore,
     queue: &dyn RunQueue,
-    adapter: Option<&dyn ChannelAdapter>,
     envelopes: &[ChannelEnvelope],
     now_ms: i64,
 ) -> InboundReport {
@@ -233,30 +79,6 @@ pub(crate) async fn ingest_batch(
         match channel_ingress::plan_channel_ingress(store, envelope, now_ms) {
             Ok(IngressPlan { event_id, decision }) => match decision {
                 PlannedDecision::Run { ingress, params } => {
-                    // Files first: the parameters that name them are about to
-                    // be persisted, and a recovery pass re-submits those
-                    // parameters without re-fetching anything.
-                    let (files, skipped) = if ingress.attachments.is_empty() {
-                        (Vec::new(), Vec::new())
-                    } else {
-                        fetch_inbound_files(adapter, &ingress).await
-                    };
-                    let job_id_for_files = ingress.deterministic_job_id();
-                    if !files.is_empty() {
-                        // Best effort: a photo that could not be saved still
-                        // gets its message answered, and the note says so.
-                        let _ = super::write_inbound_files(
-                            &ingress.target.recipe,
-                            &job_id_for_files,
-                            &files,
-                        );
-                    }
-                    let params = annotate_params_with_files(
-                        params,
-                        &inbox_relative_dir(&job_id_for_files),
-                        &files,
-                        &skipped,
-                    );
                     // Durable accept first, queue second. A crash in between
                     // leaves a row `recover_pending_ingress` finishes, rather
                     // than a message the provider considers delivered and the
@@ -324,63 +146,20 @@ pub(crate) async fn poll_account_once(
     now_ms: i64,
 ) -> Result<InboundReport, String> {
     let cursor = store.channel_cursor(account_id, POLL_CURSOR_KEY)?;
-    let batch = adapter.poll(cursor.as_deref()).await?;
-    let report = ingest_batch(store, queue, Some(adapter), &batch.envelopes, now_ms).await;
+    let mut batch = adapter.poll(cursor.as_deref()).await?;
+    // Files are fetched before the turn becomes durable, so the stored event is
+    // the turn as the agent will see it rather than a promise to look later.
+    super::channel_adapter::hydrate_attachments(
+        adapter,
+        &super::channel_adapter::DaemonBlobs,
+        &mut batch.envelopes,
+    )
+    .await;
+    let report = ingest_batch(store, queue, &batch.envelopes, now_ms);
     if let Some(next) = batch.cursor {
         store.set_channel_cursor(account_id, POLL_CURSOR_KEY, &next, now_ms)?;
     }
     Ok(report)
-}
-
-/// Largest single file a reply may carry, and how many.
-///
-/// Deliberately below every provider's own limit: a send refused by the
-/// provider costs a round trip and lands in the operator's activity list as a
-/// failure, while a refusal here reaches the model as a plain answer it can act
-/// on.
-const MAX_OUTBOUND_FILES: usize = 4;
-const MAX_OUTBOUND_FILE_BYTES: u64 = 8 * 1024 * 1024;
-
-/// Load a queued reply's attachments from the artifact store.
-///
-/// A missing artifact is a permanent failure rather than a silent send: a
-/// message that was supposed to carry a file and does not is worse than one
-/// that visibly did not go.
-fn load_outbound_attachments(
-    message: &little_monkey_lib::channels::types::OutboundMessage,
-) -> Result<Vec<LoadedAttachment>, String> {
-    if message.attachments.is_empty() {
-        return Ok(Vec::new());
-    }
-    if message.attachments.len() > MAX_OUTBOUND_FILES {
-        return Err(format!(
-            "A message may carry at most {MAX_OUTBOUND_FILES} files."
-        ));
-    }
-    let store = super::artifact_store_for_daemon()?;
-    let mut loaded = Vec::with_capacity(message.attachments.len());
-    for attachment in &message.attachments {
-        let bytes = store
-            .read(&attachment.artifact_id)
-            .map_err(|error| format!("An attached file is no longer readable: {error}"))?;
-        if bytes.len() as u64 > MAX_OUTBOUND_FILE_BYTES {
-            return Err(format!(
-                "An attached file is larger than {MAX_OUTBOUND_FILE_BYTES} bytes."
-            ));
-        }
-        loaded.push(LoadedAttachment {
-            filename: attachment
-                .filename
-                .clone()
-                .unwrap_or_else(|| "attachment".to_string()),
-            mime_type: attachment
-                .mime_type
-                .clone()
-                .unwrap_or_else(|| "application/octet-stream".to_string()),
-            bytes,
-        });
-    }
-    Ok(loaded)
 }
 
 /// What one outbox drain did.
@@ -434,17 +213,7 @@ pub(crate) async fn drain_outbox_once(
                 continue;
             }
         };
-        // Bytes are loaded here, not in the adapter: the artifact store is the
-        // daemon's, and an adapter that could open it would be one step from
-        // reading artifacts that have nothing to do with its account.
-        let outcome = match load_outbound_attachments(&payload.message) {
-            Ok(files) => {
-                adapter
-                    .send_with_attachments(&payload.message, &files)
-                    .await
-            }
-            Err(error) => SendOutcome::PermanentFailure { error },
-        };
+        let outcome = adapter.send(&payload.message).await;
         match &outcome {
             SendOutcome::Sent {
                 provider_message_id,
@@ -541,7 +310,7 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
             if now_u64 >= next_reload_ms {
                 next_reload_ms = now_u64.saturating_add(RELOAD_INTERVAL_MS);
                 match DaemonStore::open(&paths) {
-                    Ok(store) => adapters = load_adapters(&store),
+                    Ok(store) => adapters = load_adapters(&paths, &store),
                     Err(error) => eprintln!("monkey daemon: channels paused: {error}"),
                 }
             }
@@ -589,7 +358,10 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
 
 /// Build an adapter for every enabled account, resolving each credential from
 /// the keychain at load time so no adapter ever reads it itself.
-fn load_adapters(store: &DaemonStore) -> BTreeMap<String, Arc<dyn ChannelAdapter>> {
+fn load_adapters(
+    paths: &super::store::DaemonPaths,
+    store: &DaemonStore,
+) -> BTreeMap<String, Arc<dyn ChannelAdapter>> {
     use super::channel_adapter::{AdapterConfig, ChannelSecrets, KeyringChannelSecrets};
 
     let secrets = KeyringChannelSecrets;
@@ -605,7 +377,7 @@ fn load_adapters(store: &DaemonStore) -> BTreeMap<String, Arc<dyn ChannelAdapter
         // An SMS account's carrier credential lives on the telephony account of
         // the same id, not on this row, so it is built from there.
         if account.kind == little_monkey_lib::channels::types::ChannelKind::Sms {
-            match build_sms_adapter(store, &secrets, &account.account_id) {
+            match build_sms_adapter(paths, store, &secrets, &account.account_id) {
                 Ok(adapter) => {
                     adapters.insert(account.account_id.clone(), adapter);
                 }
@@ -653,6 +425,7 @@ fn load_adapters(store: &DaemonStore) -> BTreeMap<String, Arc<dyn ChannelAdapter
 /// `telecom_worker::ensure_sms_channel_account`), and the carrier credential
 /// only ever sits on the telephony row.
 fn build_sms_adapter(
+    paths: &super::store::DaemonPaths,
     store: &DaemonStore,
     secrets: &dyn super::channel_adapter::ChannelSecrets,
     account_id: &str,
@@ -664,8 +437,15 @@ fn build_sms_adapter(
         Some(reference) => secrets.get(reference)?,
         None => String::new(),
     };
+    // The app data directory is the daemon root's parent, the same derivation
+    // the remote API uses to find the shared blob store.
+    let app_data = paths
+        .root
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| "the daemon root has no app-data parent".to_string())?;
     Ok(Arc::new(super::adapters::sms::SmsAdapter::new(
-        &telecom, secret,
+        &telecom, secret, app_data,
     )?))
 }
 
@@ -699,7 +479,6 @@ mod tests {
     #[derive(Default)]
     struct FakeQueue {
         submitted: Mutex<Vec<String>>,
-        last_params: Mutex<Vec<String>>,
         fail: bool,
     }
 
@@ -707,9 +486,8 @@ mod tests {
         fn submit(
             &self,
             ingress: &ConversationIngress,
-            params: Vec<String>,
+            _params: Vec<String>,
         ) -> Result<String, String> {
-            self.last_params.lock().unwrap().clone_from(&params);
             if self.fail {
                 return Err("queue is full".to_string());
             }
@@ -767,17 +545,6 @@ mod tests {
             }
             outcomes.remove(0)
         }
-
-        async fn fetch_attachment(
-            &self,
-            attachment: &little_monkey_lib::channels::types::ChannelAttachment,
-            _max_bytes: u64,
-        ) -> Result<Vec<u8>, String> {
-            match attachment.filename.as_deref() {
-                Some("gone.png") => Err("the provider deleted it".to_string()),
-                _ => Ok(b"bytes".to_vec()),
-            }
-        }
     }
 
     fn seeded_store() -> DaemonStore {
@@ -829,136 +596,31 @@ mod tests {
         }
     }
 
-    fn ingress_with(
-        attachments: Vec<little_monkey_lib::channels::types::ChannelAttachment>,
-    ) -> ConversationIngress {
-        let mut envelope = envelope("with-files");
-        envelope.attachments = attachments;
-        let route = ChannelRoute {
-            route_id: "route-1".into(),
-            scope: RouteScope::account("acct-1"),
-            target: RouteTarget::new("chat"),
-            enabled: true,
-            created_at_ms: NOW,
-            updated_at_ms: NOW,
-        };
-        ConversationIngress::from_channel(&envelope, &route)
-    }
-
-    fn attachment(filename: &str) -> little_monkey_lib::channels::types::ChannelAttachment {
-        little_monkey_lib::channels::types::ChannelAttachment {
-            provider_id: Some(filename.to_string()),
-            kind: little_monkey_lib::channels::types::AttachmentKind::Image,
-            filename: Some(filename.to_string()),
-            mime_type: Some("image/png".into()),
-            declared_size_bytes: Some(5),
-            source: little_monkey_lib::channels::types::AttachmentSource::ProviderHandle {
-                handle: filename.to_string(),
-            },
-        }
-    }
-
-    #[tokio::test]
-    async fn attachments_are_fetched_bounded_and_never_keep_the_name_a_sender_chose() {
-        let adapter = FakeAdapter::new();
-        let ingress = ingress_with(vec![
-            attachment("../../etc/passwd"),
-            attachment("gone.png"),
-            attachment("b.png"),
-            attachment("c.png"),
-            attachment("d.png"),
-            attachment("e.png"),
-        ]);
-
-        let (files, skipped) = fetch_inbound_files(Some(&adapter), &ingress).await;
-
-        assert_eq!(files.len(), MAX_INBOUND_FILES, "the per-message cap holds");
-        assert_eq!(
-            files[0].name, "0-_.._etc_passwd",
-            "leading dots are stripped"
-        );
-        assert!(
-            files.iter().all(|file| !file.name.contains('/')),
-            "a sender-chosen name never survives as a path: {files:?}"
-        );
-        assert!(
-            skipped.iter().any(|note| note.contains("gone.png")),
-            "a file that could not be fetched is named, not silently dropped: {skipped:?}"
-        );
-    }
-
     #[test]
-    fn the_run_is_told_where_its_files_are_and_what_is_missing() {
-        let params = annotate_params_with_files(
-            vec!["message=hello".to_string()],
-            ".little-monkey/inbox/job-1",
-            &[InboundFile {
-                name: "0-photo.png".into(),
-                bytes: vec![1, 2, 3],
-            }],
-            &["scan.pdf: too large".to_string()],
-        );
-
-        let message = &params[0];
-        assert!(message.starts_with("message=hello"), "{message}");
-        assert!(
-            message.contains(".little-monkey/inbox/job-1/: 0-photo.png"),
-            "{message}"
-        );
-        assert!(message.contains("scan.pdf: too large"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn a_turn_with_no_fetcher_still_runs_on_its_text() {
-        let mut store = seeded_store();
-        let queue = FakeQueue::default();
-        let mut envelope = envelope("no-adapter");
-        envelope.attachments = vec![attachment("gone.png")];
-
-        let report = ingest_batch(&mut store, &queue, None, &[envelope], NOW).await;
-
-        assert_eq!(report.accepted, 1, "the text still runs");
-        let params = queue.last_params.lock().unwrap().clone();
-        assert!(
-            params
-                .iter()
-                .any(|param| param.contains("could not be fetched")),
-            "the model is told the file is missing: {params:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_batch_becomes_runs_and_a_replay_of_it_does_not() {
+    fn a_batch_becomes_runs_and_a_replay_of_it_does_not() {
         let mut store = seeded_store();
         let queue = FakeQueue::default();
         let batch = vec![envelope("1"), envelope("2")];
 
-        let first = ingest_batch(&mut store, &queue, None, &batch, NOW).await;
+        let first = ingest_batch(&mut store, &queue, &batch, NOW);
         assert_eq!(first.accepted, 2);
         assert_eq!(first.duplicates, 0);
 
-        let replay = ingest_batch(&mut store, &queue, None, &batch, NOW).await;
+        let replay = ingest_batch(&mut store, &queue, &batch, NOW);
         assert_eq!(replay.accepted, 0);
         assert_eq!(replay.duplicates, 2);
         assert_eq!(queue.submitted.lock().unwrap().len(), 2);
     }
 
-    #[tokio::test]
-    async fn a_queue_failure_is_recorded_and_does_not_stop_the_batch() {
+    #[test]
+    fn a_queue_failure_is_recorded_and_does_not_stop_the_batch() {
         let mut store = seeded_store();
         let queue = FakeQueue {
             fail: true,
             ..Default::default()
         };
 
-        let report = ingest_batch(
-            &mut store,
-            &queue,
-            None,
-            &[envelope("1"), envelope("2")],
-            NOW,
-        )
-        .await;
+        let report = ingest_batch(&mut store, &queue, &[envelope("1"), envelope("2")], NOW);
         assert_eq!(report.deferred, 2);
         assert_eq!(report.accepted, 0);
         assert_eq!(report.failed, 0);

@@ -1,19 +1,24 @@
 //! Matrix adapter: Client-Server REST API directly against the operator's
-//! own homeserver, long-polling `/sync`. No `matrix-sdk` dependency — this
-//! speaks the REST API by hand through
+//! own homeserver, long-polling `/sync`. The unencrypted half of the
+//! protocol is spoken by hand through
 //! `little_monkey_lib::egress::hardened()` / `egress::send`, this tree's one
 //! hardened `reqwest` entry point (see `egress.rs`).
 //!
-//! # Encryption is NOT implemented
+//! # Encryption
 //!
-//! This adapter cannot read `m.room.encrypted` events — no Olm/Megolm
-//! session handling, no device keys, no key backup. An encrypted room
-//! delivers events this adapter cannot decrypt; [`normalize_sync`] SKIPS
-//! them and COUNTS them rather than silently dropping them, and `poll`
-//! folds that count into a running total that `probe`'s connected detail
-//! surfaces, so an operator watching the account's health can notice rather
-//! than wonder why a room goes quiet. [`ProviderCapabilities`] makes no
-//! claim of encryption support, because there is none.
+//! Encrypted rooms work. Olm and Megolm come from `matrix-sdk-crypto` —
+//! wired up in [`super::matrix_crypto`], which owns every key and decides
+//! what requests need making, while this module's own hardened HTTP does the
+//! sending. Inbound `m.room.encrypted` events are decrypted in place before
+//! anything downstream sees the sync, and a message for an encrypted room is
+//! sent as `m.room.encrypted` or not at all: falling back to cleartext in a
+//! room that asked for encryption would put the message on the server in the
+//! clear.
+//!
+//! An event whose key never arrived is still SKIPPED and COUNTED rather than
+//! silently dropped, and `probe`'s detail surfaces the running total — with
+//! encryption working it stays at zero, so a number there means keys are not
+//! reaching this device.
 //!
 //! # DM detection
 //!
@@ -35,7 +40,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelAdapter, InboundBatch, LoadedAttachment,
+    fetch_url, load_attachments, AdapterConfig, BlobSource, ChannelAdapter, DaemonBlobs,
+    InboundBatch, LoadedAttachment,
 };
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
@@ -56,9 +62,18 @@ pub struct MatrixAdapter {
     /// `None` until the first successful (or attempted) `m.direct` fetch —
     /// see the module doc.
     dm_rooms: Mutex<Option<HashSet<String>>>,
-    /// Running total of `m.room.encrypted` events skipped across every
-    /// `poll` this adapter instance has made. Surfaced in `probe`'s detail.
+    /// Running total of `m.room.encrypted` events that could not be read
+    /// across every `poll` this adapter instance has made. With encryption
+    /// working this stays at zero; it rises when a key never arrived.
     encrypted_skipped: AtomicU64,
+    /// The account id, which names this account's own crypto store.
+    account_id: String,
+    /// Built on first use, because it needs a round trip to learn which
+    /// device the access token belongs to. `None` means encryption could not
+    /// be started at all — the adapter still runs, and encrypted rooms then
+    /// behave as they did before: counted, never guessed at.
+    crypto: tokio::sync::OnceCell<Option<std::sync::Arc<super::matrix_crypto::MatrixCrypto>>>,
+    blobs: std::sync::Arc<dyn BlobSource>,
 }
 
 impl MatrixAdapter {
@@ -87,7 +102,183 @@ impl MatrixAdapter {
             access_token: config.secret.clone(),
             dm_rooms: Mutex::new(None),
             encrypted_skipped: AtomicU64::new(0),
+            account_id: config.account.account_id.clone(),
+            crypto: tokio::sync::OnceCell::new(),
+            blobs: std::sync::Arc::new(DaemonBlobs),
         })
+    }
+
+    /// The encryption machine for this account, started once.
+    ///
+    /// The device id comes from `/account/whoami`: an access token already
+    /// belongs to a device the user can see in their own session list, and
+    /// inventing a new one would add an unverified device on every restart.
+    async fn crypto(&self) -> Option<&std::sync::Arc<super::matrix_crypto::MatrixCrypto>> {
+        self.crypto
+            .get_or_init(|| async {
+                let device_id = match self.whoami().await {
+                    Ok((_, Some(device_id))) => device_id,
+                    Ok((_, None)) => {
+                        eprintln!(
+                            "monkey daemon: Matrix homeserver reported no device for this token; \
+                             encrypted rooms will stay unreadable"
+                        );
+                        return None;
+                    }
+                    Err(error) => {
+                        eprintln!("monkey daemon: Matrix encryption could not start: {error}");
+                        return None;
+                    }
+                };
+                let root = match crate::daemon::store::DaemonPaths::resolve() {
+                    Ok(paths) => paths.root,
+                    Err(error) => {
+                        eprintln!(
+                            "monkey daemon: Matrix encryption has nowhere to store keys: {error}"
+                        );
+                        return None;
+                    }
+                };
+                let store_dir = root.join("matrix-crypto").join(&self.account_id);
+                match super::matrix_crypto::MatrixCrypto::new(
+                    &self.homeserver_url,
+                    &self.access_token,
+                    &self.user_id,
+                    &device_id,
+                    &store_dir,
+                )
+                .await
+                {
+                    Ok(crypto) => Some(std::sync::Arc::new(crypto)),
+                    Err(error) => {
+                        eprintln!("monkey daemon: Matrix encryption could not start: {error}");
+                        None
+                    }
+                }
+            })
+            .await
+            .as_ref()
+    }
+
+    /// Ask the homeserver who this token belongs to, and which device.
+    async fn whoami(&self) -> Result<(String, Option<String>), String> {
+        let client = self.client()?;
+        let url = format!("{}/_matrix/client/v3/account/whoami", self.homeserver_url);
+        let request = self.authorize(client.get(url));
+        let response = little_monkey_lib::egress::send(request)
+            .await
+            .map_err(|error| format!("Matrix whoami failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("Matrix returned {} for whoami", response.status()));
+        }
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|error| format!("Matrix whoami parse failed: {error}"))?;
+        let user_id = body
+            .get("user_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Matrix returned an unexpected whoami response".to_string())?
+            .to_string();
+        let device_id = body
+            .get("device_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok((user_id, device_id))
+    }
+
+    /// Replace every `m.room.encrypted` timeline event we hold a key for with
+    /// its cleartext, in place, before anything downstream sees the sync.
+    ///
+    /// The event's own envelope — id, sender, timestamp — is kept: only the
+    /// type and content come from the decrypted payload, because those are
+    /// the only parts encryption covers.
+    async fn decrypt_timeline(
+        &self,
+        sync: &mut Value,
+        crypto: &super::matrix_crypto::MatrixCrypto,
+    ) {
+        let Some(rooms) = sync
+            .get_mut("rooms")
+            .and_then(|rooms| rooms.get_mut("join"))
+            .and_then(Value::as_object_mut)
+        else {
+            return;
+        };
+        for (room_id, room) in rooms.iter_mut() {
+            let Some(events) = room
+                .get_mut("timeline")
+                .and_then(|timeline| timeline.get_mut("events"))
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            for event in events.iter_mut() {
+                if event.get("type").and_then(Value::as_str) != Some("m.room.encrypted") {
+                    continue;
+                }
+                let Ok(decrypted) = crypto.decrypt(event, room_id).await else {
+                    // Left as-is: `normalize_sync` counts it, which is what
+                    // surfaces "a key never reached us" in the account's
+                    // health instead of a message vanishing.
+                    continue;
+                };
+                if let Some(kind) = decrypted.event.get("type").cloned() {
+                    event["type"] = kind;
+                }
+                if let Some(content) = decrypted.event.get("content").cloned() {
+                    event["content"] = content;
+                }
+            }
+        }
+    }
+
+    /// Whether the room has `m.room.encryption` state set.
+    ///
+    /// Asked per send rather than cached: a room that turns encryption on
+    /// never turns it off again, and sending cleartext into a room that just
+    /// enabled it is exactly the mistake worth one extra GET.
+    async fn room_is_encrypted(&self, room_id: &str) -> bool {
+        let Ok(client) = self.client() else {
+            return false;
+        };
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/m.room.encryption",
+            self.homeserver_url,
+            encode_path_segment(room_id)
+        );
+        let request = self.authorize(client.get(url));
+        match little_monkey_lib::egress::send(request).await {
+            Ok(response) => response.status().is_success(),
+            Err(_) => false,
+        }
+    }
+
+    /// Everyone currently in the room, which is who a room key is shared
+    /// with. A member missed here is a member who cannot read the message.
+    async fn joined_members(&self, room_id: &str) -> Vec<String> {
+        let Ok(client) = self.client() else {
+            return Vec::new();
+        };
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/joined_members",
+            self.homeserver_url,
+            encode_path_segment(room_id)
+        );
+        let request = self.authorize(client.get(url));
+        let Ok(response) = little_monkey_lib::egress::send(request).await else {
+            return Vec::new();
+        };
+        if !response.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(body) = response.json::<Value>().await else {
+            return Vec::new();
+        };
+        body.get("joined")
+            .and_then(Value::as_object)
+            .map(|members| members.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     fn client(&self) -> Result<reqwest::Client, String> {
@@ -311,9 +502,21 @@ impl ChannelAdapter for MatrixAdapter {
         if !status.is_success() {
             return Err(format!("Matrix returned {status} for sync"));
         }
-        let body: SyncResponse = response
+        let mut raw: Value = response
             .json()
             .await
+            .map_err(|error| format!("Matrix sync parse failed: {error}"))?;
+        if let Some(crypto) = self.crypto().await {
+            // To-device events carry the room keys, so they are absorbed
+            // before the timeline is read: a key that arrives in the same
+            // sync as the message it unlocks is the normal case.
+            if let Err(error) = crypto.absorb_sync(&raw).await {
+                eprintln!("monkey daemon: Matrix encryption could not keep up: {error}");
+            }
+            let crypto = crypto.clone();
+            self.decrypt_timeline(&mut raw, &crypto).await;
+        }
+        let body: SyncResponse = serde_json::from_value(raw)
             .map_err(|error| format!("Matrix sync parse failed: {error}"))?;
         let dm_rooms = self.dm_room_ids().await;
         let (envelopes, encrypted_skipped) = normalize_sync(&body, &self.user_id, &dm_rooms);
@@ -329,6 +532,13 @@ impl ChannelAdapter for MatrixAdapter {
     }
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
+        if !message.attachments.is_empty() {
+            let files = match load_attachments(self.blobs.as_ref(), message) {
+                Ok(files) => files,
+                Err(outcome) => return outcome,
+            };
+            return self.send_with_attachments(message, &files).await;
+        }
         let client = match self.client() {
             Ok(client) => client,
             Err(error) => return SendOutcome::PermanentFailure { error },
@@ -342,8 +552,34 @@ impl ChannelAdapter for MatrixAdapter {
                 "m.in_reply_to": { "event_id": reply_to },
             });
         }
+        // An encrypted room gets an encrypted event. Sending cleartext into
+        // one is worse than failing: most clients hide or flag it, and the
+        // message is on the server in the clear either way.
+        let mut event_type = "m.room.message";
+        if let Some(crypto) = self.crypto().await {
+            if self.room_is_encrypted(&message.conversation_id).await {
+                let members = self.joined_members(&message.conversation_id).await;
+                match crypto
+                    .encrypt_for_room(&message.conversation_id, &members, &body)
+                    .await
+                {
+                    Ok(encrypted) => {
+                        body = encrypted;
+                        event_type = "m.room.encrypted";
+                    }
+                    Err(error) => {
+                        // Never fall back to cleartext: the room asked for
+                        // encryption, so a send that cannot be encrypted has
+                        // not happened.
+                        return SendOutcome::PermanentFailure {
+                            error: format!("Could not encrypt for this Matrix room: {error}"),
+                        };
+                    }
+                }
+            }
+        }
         let url = format!(
-            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            "{}/_matrix/client/v3/rooms/{}/send/{event_type}/{}",
             self.homeserver_url,
             encode_path_segment(&message.conversation_id),
             // Matrix dedupes a PUT by (access token, txn_id) — exactly the
@@ -394,6 +630,36 @@ impl ChannelAdapter for MatrixAdapter {
         }
     }
 
+    /// Matrix identifies media by an `mxc://` URI, which is not fetchable on
+    /// its own. Since Matrix 1.11 the download endpoint is authenticated and
+    /// lives under `/_matrix/client/v1/media`; homeservers older than that only
+    /// answer on the unauthenticated `/_matrix/media/v3` path, so a 404 or 401
+    /// on the first falls back to the second rather than losing the file.
+    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("This Matrix attachment has no mxc URI.".to_string());
+        };
+        let (server_name, media_id) =
+            parse_mxc(handle).ok_or_else(|| format!("'{handle}' is not a usable mxc:// URI"))?;
+        let authenticated = format!(
+            "{}/_matrix/client/v1/media/download/{server_name}/{media_id}",
+            self.homeserver_url
+        );
+        match fetch_url(&authenticated, Some(&self.access_token)).await {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.contains("404") || error.contains("401") => {
+                let legacy = format!(
+                    "{}/_matrix/media/v3/download/{server_name}/{media_id}",
+                    self.homeserver_url
+                );
+                fetch_url(&legacy, Some(&self.access_token)).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl MatrixAdapter {
     /// Matrix sends a file as its own event: the bytes are uploaded to the
     /// homeserver's media repository first, and the `mxc://` URI it returns
     /// becomes an `m.image`/`m.file` message. The text, if any, is a separate
@@ -408,8 +674,15 @@ impl ChannelAdapter for MatrixAdapter {
         message: &OutboundMessage,
         files: &[LoadedAttachment],
     ) -> SendOutcome {
-        if files.is_empty() {
-            return self.send(message).await;
+        // An encrypted room takes encrypted events only. Uploading the file to
+        // the media repository unencrypted and posting a cleartext m.file event
+        // would put in the clear exactly what the room asked to be encrypted,
+        // so the file is refused by name instead.
+        if self.room_is_encrypted(&message.conversation_id).await {
+            return SendOutcome::PermanentFailure {
+                error: "Little Monkey cannot attach files to an encrypted Matrix room yet."
+                    .to_string(),
+            };
         }
         let client = match self.client() {
             Ok(client) => client,
@@ -418,7 +691,11 @@ impl ChannelAdapter for MatrixAdapter {
         let mut any_sent = false;
         let mut last_event_id = None;
         if !message.text.is_empty() {
-            match self.send(message).await {
+            let text_only = OutboundMessage {
+                attachments: Vec::new(),
+                ..message.clone()
+            };
+            match self.send(&text_only).await {
                 SendOutcome::Sent {
                     provider_message_id,
                 } => {
@@ -522,48 +799,6 @@ impl ChannelAdapter for MatrixAdapter {
         }
         SendOutcome::Sent {
             provider_message_id: last_event_id,
-        }
-    }
-
-    /// Matrix identifies media by an `mxc://` URI, which is not fetchable on
-    /// its own. Since Matrix 1.11 the download endpoint is authenticated and
-    /// lives under `/_matrix/client/v1/media`; homeservers older than that only
-    /// answer on the unauthenticated `/_matrix/media/v3` path, so a 404 or 401
-    /// on the first falls back to the second rather than losing the file.
-    async fn fetch_attachment(
-        &self,
-        attachment: &ChannelAttachment,
-        max_bytes: u64,
-    ) -> Result<Vec<u8>, String> {
-        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
-            return Err("This Matrix attachment has no mxc URI.".to_string());
-        };
-        let (server_name, media_id) =
-            parse_mxc(handle).ok_or_else(|| format!("'{handle}' is not a usable mxc:// URI"))?;
-        let client = self.client()?;
-        let authenticated = format!(
-            "{}/_matrix/client/v1/media/download/{server_name}/{media_id}",
-            self.homeserver_url
-        );
-        match crate::daemon::channel_adapter::download_bounded(
-            self.authorize(client.get(&authenticated)),
-            max_bytes,
-        )
-        .await
-        {
-            Ok(bytes) => Ok(bytes),
-            Err(error) if error.contains("(404)") || error.contains("(401)") => {
-                let legacy = format!(
-                    "{}/_matrix/media/v3/download/{server_name}/{media_id}",
-                    self.homeserver_url
-                );
-                crate::daemon::channel_adapter::download_bounded(
-                    self.authorize(client.get(legacy)),
-                    max_bytes,
-                )
-                .await
-            }
-            Err(error) => Err(error),
         }
     }
 }
@@ -704,6 +939,9 @@ fn normalize_message_event(
                     _ => AttachmentKind::Video,
                 };
                 attachments.push(ChannelAttachment {
+                    stored_artifact_id: None,
+                    text_excerpt: None,
+                    fetch_error: None,
                     provider_id: Some(mxc.to_string()),
                     kind,
                     filename: (!body_text.is_empty()).then(|| body_text.clone()),
@@ -1101,6 +1339,9 @@ mod tests {
         let capabilities = adapter.capabilities();
         assert_eq!(capabilities.max_text_chars, MAX_TEXT_CHARS);
         assert_eq!(capabilities.kind, ChannelKind::Matrix);
+        // Inbound attachments are normalized, but nothing here uploads one, and
+        // the capability says what this adapter does rather than what Matrix
+        // could do.
         assert!(capabilities.supports_attachments);
     }
 

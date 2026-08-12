@@ -27,7 +27,8 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelAdapter, InboundBatch, LoadedAttachment,
+    load_attachments, AdapterConfig, BlobSource, ChannelAdapter, DaemonBlobs, InboundBatch,
+    LoadedAttachment,
 };
 
 const API_BASE: &str = "https://discord.com/api/v10";
@@ -65,6 +66,7 @@ pub struct DiscordAdapter {
     /// Guards the one-time spawn of the gateway task. See the module doc for
     /// why construction itself must stay side-effect-free.
     started: tokio::sync::OnceCell<()>,
+    blobs: Arc<dyn BlobSource>,
 }
 
 impl DiscordAdapter {
@@ -84,6 +86,7 @@ impl DiscordAdapter {
             inbound_rx: Mutex::new(rx),
             shared: Arc::new(Shared::default()),
             started: tokio::sync::OnceCell::new(),
+            blobs: Arc::new(DaemonBlobs),
         })
     }
 
@@ -181,6 +184,13 @@ impl ChannelAdapter for DiscordAdapter {
     }
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
+        if !message.attachments.is_empty() {
+            let files = match load_attachments(self.blobs.as_ref(), message) {
+                Ok(files) => files,
+                Err(outcome) => return outcome,
+            };
+            return self.send_with_attachments(message, &files).await;
+        }
         let mut chunks = split_message(&message.text, DISCORD_MAX_TEXT_CHARS);
         if chunks.is_empty() {
             chunks.push(String::new());
@@ -241,7 +251,9 @@ impl ChannelAdapter for DiscordAdapter {
             provider_message_id: last_id,
         }
     }
+}
 
+impl DiscordAdapter {
     /// Discord takes files on the same message-create endpoint, as multipart
     /// with the JSON body in `payload_json` and each file in `files[n]`. One
     /// request carries the text and every file, so a caller never sees a
@@ -251,9 +263,6 @@ impl ChannelAdapter for DiscordAdapter {
         message: &OutboundMessage,
         files: &[LoadedAttachment],
     ) -> SendOutcome {
-        if files.is_empty() {
-            return self.send(message).await;
-        }
         // Text longer than one Discord message is sent first, exactly as the
         // text-only path splits it; the files then ride the final message.
         let mut leading = split_message(&message.text, DISCORD_MAX_TEXT_CHARS);
@@ -652,6 +661,9 @@ fn normalize_message_create(
                         .map(AttachmentKind::from_mime)
                         .unwrap_or(AttachmentKind::Other);
                     Some(ChannelAttachment {
+                        stored_artifact_id: None,
+                        text_excerpt: None,
+                        fetch_error: None,
                         provider_id: attachment
                             .get("id")
                             .and_then(Value::as_str)

@@ -41,7 +41,8 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelAdapter, InboundBatch, LoadedAttachment,
+    fetch_url, load_attachments, AdapterConfig, BlobSource, ChannelAdapter, DaemonBlobs,
+    InboundBatch, LoadedAttachment,
 };
 
 const API_BASE: &str = "https://slack.com/api";
@@ -98,6 +99,7 @@ pub struct SlackAdapter {
     /// side-effect-free — see [`DiscordAdapter`](super::discord::DiscordAdapter)'s
     /// module doc for why.
     started: tokio::sync::OnceCell<()>,
+    blobs: Arc<dyn BlobSource>,
 }
 
 impl SlackAdapter {
@@ -115,6 +117,7 @@ impl SlackAdapter {
             inbound_rx: Mutex::new(rx),
             shared: Arc::new(Shared::default()),
             started: tokio::sync::OnceCell::new(),
+            blobs: Arc::new(DaemonBlobs),
         })
     }
 
@@ -208,6 +211,13 @@ impl ChannelAdapter for SlackAdapter {
     }
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
+        if !message.attachments.is_empty() {
+            let files = match load_attachments(self.blobs.as_ref(), message) {
+                Ok(files) => files,
+                Err(outcome) => return outcome,
+            };
+            return self.send_with_attachments(message, &files).await;
+        }
         let mut chunks = split_message(&message.text, SLACK_MAX_TEXT_CHARS);
         if chunks.is_empty() {
             chunks.push(String::new());
@@ -276,6 +286,44 @@ impl ChannelAdapter for SlackAdapter {
         }
     }
 
+    /// Slack shares a file id. `files.info` exchanges it for `url_private`,
+    /// which is on Slack's own host and needs the bot token as a bearer header
+    /// — fetching it unauthenticated silently returns Slack's HTML sign-in
+    /// page rather than an error, which is exactly the kind of "file arrived,
+    /// contents are garbage" outcome worth spending a second request to avoid.
+    ///
+    /// Needs the `files:read` scope; without it Slack answers
+    /// `missing_scope` and the attachment is refused by name.
+    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("This Slack attachment has no file id.".to_string());
+        };
+        let info = little_monkey_lib::egress::send(
+            self.http
+                .get(format!("{API_BASE}/files.info"))
+                .bearer_auth(&self.secret.bot_token)
+                .query(&[("file", handle.as_str())]),
+        )
+        .await
+        .map_err(|error| format!("Slack files.info failed: {error}"))?;
+        let body: Value = info.json().await.unwrap_or(Value::Null);
+        if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            let reason = body
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown_error");
+            return Err(format!("Slack refused files.info: {reason}"));
+        }
+        let url = body
+            .get("file")
+            .and_then(|file| file.get("url_private"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Slack returned no private URL for that file".to_string())?;
+        fetch_url(url, Some(&self.secret.bot_token)).await
+    }
+}
+
+impl SlackAdapter {
     /// Slack's current upload flow is three calls: ask for a one-time upload
     /// URL, POST the bytes to it, then complete the upload naming the channel.
     /// The older `files.upload` endpoint is retired, so this is the only path
@@ -288,9 +336,6 @@ impl ChannelAdapter for SlackAdapter {
         message: &OutboundMessage,
         files: &[LoadedAttachment],
     ) -> SendOutcome {
-        if files.is_empty() {
-            return self.send(message).await;
-        }
         let mut uploaded: Vec<Value> = Vec::with_capacity(files.len());
         for file in files {
             let request = self
@@ -409,50 +454,6 @@ impl ChannelAdapter for SlackAdapter {
                 .and_then(Value::as_str)
                 .map(str::to_string),
         }
-    }
-
-    /// Slack shares a file id. `files.info` exchanges it for `url_private`,
-    /// which is on Slack's own host and needs the bot token as a bearer header
-    /// — fetching it unauthenticated silently returns Slack's HTML sign-in
-    /// page rather than an error, which is exactly the kind of "file arrived,
-    /// contents are garbage" outcome worth spending a second request to avoid.
-    ///
-    /// Needs the `files:read` scope; without it Slack answers
-    /// `missing_scope` and the attachment is refused by name.
-    async fn fetch_attachment(
-        &self,
-        attachment: &ChannelAttachment,
-        max_bytes: u64,
-    ) -> Result<Vec<u8>, String> {
-        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
-            return Err("This Slack attachment has no file id.".to_string());
-        };
-        let info = little_monkey_lib::egress::send(
-            self.http
-                .get(format!("{API_BASE}/files.info"))
-                .bearer_auth(&self.secret.bot_token)
-                .query(&[("file", handle.as_str())]),
-        )
-        .await
-        .map_err(|error| format!("Slack files.info failed: {error}"))?;
-        let body: Value = info.json().await.unwrap_or(Value::Null);
-        if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            let reason = body
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown_error");
-            return Err(format!("Slack refused files.info: {reason}"));
-        }
-        let url = body
-            .get("file")
-            .and_then(|file| file.get("url_private"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| "Slack returned no private URL for that file".to_string())?;
-        crate::daemon::channel_adapter::download_bounded(
-            self.http.get(url).bearer_auth(&self.secret.bot_token),
-            max_bytes,
-        )
-        .await
     }
 }
 
@@ -649,6 +650,9 @@ fn normalize_message_event(
                 .filter_map(|file| {
                     let handle = file.get("id")?.as_str()?.to_string();
                     Some(ChannelAttachment {
+                        stored_artifact_id: None,
+                        text_excerpt: None,
+                        fetch_error: None,
                         provider_id: Some(handle.clone()),
                         kind: file
                             .get("mimetype")

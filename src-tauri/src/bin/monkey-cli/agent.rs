@@ -890,18 +890,13 @@ async fn execute_tool_call(
                     .collect()
             })
             .unwrap_or_default();
-        // The approval prompt names the files as well as the text: sending a
-        // file is a different decision from sending a sentence, and an operator
-        // approving one has not approved the other.
-        let preview: String = if attachments.is_empty() {
-            text.chars().take(120).collect()
-        } else {
-            format!(
-                "{} [with {}]",
-                text.chars().take(80).collect::<String>(),
-                attachments.join(", ")
-            )
-        };
+        // Attaching a file sends its contents to someone outside this machine,
+        // so the approval prompt names every file. A preview of the text alone
+        // would ask the operator to approve the one part that is not the risk.
+        let mut preview: String = text.chars().take(120).collect();
+        if !attachments.is_empty() {
+            preview.push_str(&format!(" [files: {}]", attachments.join(", ")));
+        }
         return match perms.request("send_message", &preview).await {
             Ok(()) => match crate::daemon::channel_tool::send_message(&text, &attachments) {
                 Ok(value) => value.to_string(),
@@ -924,10 +919,22 @@ async fn execute_tool_call(
         }
         let account_id = args["account_id"].as_str().unwrap_or_default().to_string();
         let to_number = args["to_number"].as_str().unwrap_or_default().to_string();
-        let detail = format!("call {to_number} from {account_id}");
+        let opening_line = args["opening_line"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        // The approval prompt shows the words that will be said, because the
+        // words are most of what the operator is approving.
+        let detail = format!("call {to_number} from {account_id} and say: {opening_line}");
         return match perms.request("place_call", &detail).await {
             Ok(()) => {
-                match crate::daemon::telecom_tool::place_call(&account_id, &to_number).await {
+                match crate::daemon::telecom_tool::place_call(
+                    &account_id,
+                    &to_number,
+                    &opening_line,
+                )
+                .await
+                {
                     Ok(value) => value.to_string(),
                     Err(error) => serde_json::json!({ "error": error }).to_string(),
                 }

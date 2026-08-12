@@ -10,10 +10,13 @@
 pub(crate) mod discord;
 pub(crate) mod google_chat;
 pub(crate) mod imessage;
+#[cfg(target_os = "macos")]
+pub(crate) mod imessage_native;
 pub(crate) mod irc;
 pub(crate) mod jwt;
 pub(crate) mod line;
 pub(crate) mod matrix;
+pub(crate) mod matrix_crypto;
 pub(crate) mod mattermost;
 pub(crate) mod signal;
 pub(crate) mod slack;
@@ -27,6 +30,26 @@ use std::sync::Arc;
 use little_monkey_lib::channels::types::ChannelKind;
 
 use super::channel_adapter::{AdapterConfig, ChannelAdapter};
+
+/// Whether Little Monkey can actually upload a file to this provider.
+///
+/// The one source of truth for the `supports_attachments` capability, so the
+/// flag means "this adapter implements the upload" rather than "the provider
+/// has a file API". A provider whose API supports files but whose adapter does
+/// not send them belongs on the false side: the difference is invisible to an
+/// operator, who only sees whether the file arrived.
+pub(crate) fn sends_attachments(kind: ChannelKind) -> bool {
+    matches!(
+        kind,
+        ChannelKind::Telegram
+            | ChannelKind::WhatsApp
+            | ChannelKind::Discord
+            | ChannelKind::Slack
+            | ChannelKind::Mattermost
+            | ChannelKind::Matrix
+            | ChannelKind::Signal
+    )
+}
 
 /// Build the adapter an account's provider needs.
 ///

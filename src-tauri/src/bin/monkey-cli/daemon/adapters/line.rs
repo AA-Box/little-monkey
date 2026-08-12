@@ -238,7 +238,6 @@ impl ChannelAdapter for LineAdapter {
     async fn fetch_attachment(
         &self,
         attachment: &ChannelAttachment,
-        max_bytes: u64,
     ) -> Result<Vec<u8>, String> {
         let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
             return Err("This LINE attachment has no message id.".to_string());
@@ -248,17 +247,9 @@ impl ChannelAdapter for LineAdapter {
         if handle.is_empty() || !handle.chars().all(|c| c.is_ascii_alphanumeric()) {
             return Err("That LINE message id is not usable".to_string());
         }
-        let client = little_monkey_lib::egress::hardened()
-            .build()
-            .map_err(|error| format!("Could not build an HTTP client: {error}"))?;
-        crate::daemon::channel_adapter::download_bounded(
-            client
-                .get(format!(
-                    "{}/v2/bot/message/{handle}/content",
-                    self.content_base
-                ))
-                .bearer_auth(&self.channel_access_token),
-            max_bytes,
+        crate::daemon::channel_adapter::fetch_url(
+            &format!("{}/v2/bot/message/{handle}/content", self.content_base),
+            Some(&self.channel_access_token),
         )
         .await
     }
@@ -431,6 +422,9 @@ fn normalize_event(
                         source: AttachmentSource::ProviderHandle {
                             handle: id.to_string(),
                         },
+                        stored_artifact_id: None,
+                        fetch_error: None,
+                        text_excerpt: None,
                     }]
                 })
                 .unwrap_or_default()

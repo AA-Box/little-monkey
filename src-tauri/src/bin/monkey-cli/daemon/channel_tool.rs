@@ -15,120 +15,13 @@
 //! - Reply depth is carried forward, which is what lets the inbound gate stop
 //!   two agents from talking to each other forever.
 
-use little_monkey_lib::channels::types::{ChannelEnvelope, OutboundMessage};
+use little_monkey_lib::channels::types::{ChannelEnvelope, OutboundAttachment, OutboundMessage};
 
+use super::channel_adapter::MAX_ATTACHMENT_BYTES;
 use super::channel_ingress::OutboxPayload;
 use super::channel_store::{ChannelOrigin, NewOutboxMessage, OutboxEnqueue};
 use super::store::{DaemonPaths, DaemonStore};
 use super::trigger::sha256_hex;
-
-/// How many files one reply may carry, and how large each may be. The same
-/// numbers the outbox enforces when it loads them again — checked here too so
-/// the model is told immediately rather than by a delivery failure minutes
-/// later.
-const MAX_REPLY_FILES: usize = 4;
-const MAX_REPLY_FILE_BYTES: u64 = 8 * 1024 * 1024;
-
-/// Stage the run's own files as artifacts the outbox can send.
-///
-/// Paths are the run's, relative to its workspace, and they are confined to it:
-/// this tool is reachable from a conversation with a stranger, so a path that
-/// resolves outside the workspace is refused rather than read. Symlinks are
-/// resolved before the check, so a link pointing out of the workspace is
-/// refused by where it lands, not by how it looks.
-fn stage_attachments(
-    paths: &[String],
-) -> Result<Vec<little_monkey_lib::channels::types::OutboundAttachment>, String> {
-    if paths.is_empty() {
-        return Ok(Vec::new());
-    }
-    if paths.len() > MAX_REPLY_FILES {
-        return Err(format!(
-            "A reply may carry at most {MAX_REPLY_FILES} files."
-        ));
-    }
-    let workspace = std::env::current_dir()
-        .and_then(|path| path.canonicalize())
-        .map_err(|error| format!("This run has no readable workspace: {error}"))?;
-    let store = super::artifact_store_for_daemon()?;
-    let mut staged = Vec::with_capacity(paths.len());
-    for raw in paths {
-        let resolved = resolve_in_workspace(&workspace, raw)?;
-        let metadata = std::fs::metadata(&resolved)
-            .map_err(|error| format!("'{raw}' could not be read: {error}"))?;
-        if !metadata.is_file() {
-            return Err(format!("'{raw}' is not a file."));
-        }
-        if metadata.len() > MAX_REPLY_FILE_BYTES {
-            return Err(format!(
-                "'{raw}' is larger than {MAX_REPLY_FILE_BYTES} bytes."
-            ));
-        }
-        let bytes = std::fs::read(&resolved)
-            .map_err(|error| format!("'{raw}' could not be read: {error}"))?;
-        let blob = store
-            .put(&bytes)
-            .map_err(|error| format!("'{raw}' could not be staged for sending: {error}"))?;
-        let filename = resolved
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| "attachment".to_string());
-        staged.push(little_monkey_lib::channels::types::OutboundAttachment {
-            artifact_id: blob.id,
-            mime_type: Some(mime_for(&filename)),
-            filename: Some(filename),
-        });
-    }
-    Ok(staged)
-}
-
-/// Resolve one caller-supplied path inside `workspace`, or refuse it.
-///
-/// Canonicalized first, so a symlink is judged by where it lands rather than
-/// by how it is spelled, and `..` cannot walk out and back in.
-fn resolve_in_workspace(
-    workspace: &std::path::Path,
-    raw: &str,
-) -> Result<std::path::PathBuf, String> {
-    let resolved = workspace
-        .join(raw)
-        .canonicalize()
-        .map_err(|_| format!("There is no file at '{raw}'."))?;
-    if !resolved.starts_with(workspace) {
-        return Err(format!("'{raw}' is outside this run's workspace."));
-    }
-    Ok(resolved)
-}
-
-/// A content type from the file extension.
-///
-/// Providers use it to decide whether something is shown inline or offered as
-/// a download. Unknown extensions get the generic type rather than a guess,
-/// which providers treat as a plain file.
-fn mime_for(filename: &str) -> String {
-    let extension = filename
-        .rsplit_once('.')
-        .map(|(_, extension)| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-    match extension.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "pdf" => "application/pdf",
-        "txt" | "log" => "text/plain",
-        "md" => "text/markdown",
-        "csv" => "text/csv",
-        "json" => "application/json",
-        "zip" => "application/zip",
-        "mp4" => "video/mp4",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        _ => "application/octet-stream",
-    }
-    .to_string()
-}
 
 /// Retry budget for an agent's reply. Matches the pairing challenge: a reply
 /// that will not go out in a few attempts needs an operator, not a longer tail.
@@ -189,6 +82,15 @@ pub(crate) fn send_message(
     if !account.enabled {
         return Err("The account this conversation belongs to is disabled.".to_string());
     }
+    // Refused before the files are read, not after: an agent that cannot send
+    // a file on this provider should not have caused it to be copied anywhere.
+    if !attachment_paths.is_empty() && !super::adapters::sends_attachments(account.kind) {
+        return Err(format!(
+            "Little Monkey cannot send files on {} yet, so nothing was queued.",
+            account.kind.label()
+        ));
+    }
+    let attachments = import_attachments(&paths, attachment_paths)?;
 
     // The depth of the message being answered plus one, so an exchange between
     // two automated systems is bounded rather than perpetual.
@@ -203,7 +105,7 @@ pub(crate) fn send_message(
             conversation_id: origin.conversation_id.clone(),
             thread_id: origin.thread_id.clone(),
             text: text.to_string(),
-            attachments: stage_attachments(attachment_paths)?,
+            attachments,
             reply_to_provider_id: Some(origin.provider_event_id.clone()),
             idempotency_key: idempotency_key.clone(),
         },
@@ -236,6 +138,98 @@ pub(crate) fn send_message(
     })
 }
 
+/// How many files one reply may carry.
+const MAX_ATTACHMENTS_PER_REPLY: usize = 4;
+
+/// Copy the files an agent asked to attach into the content store.
+///
+/// Sending a file to an outside conversation is the one part of this tool that
+/// could move data off the machine, so what it will accept is deliberately
+/// narrow:
+///
+/// - Paths are resolved against the run's own working directory, and the
+///   canonical result must still be inside it. `../../.ssh/id_rsa`, an absolute
+///   path, and a symlink pointing out of the workspace all fail the same check,
+///   because all three are compared after resolution rather than as text.
+/// - Only regular files. A directory, a device node or a fifo is refused rather
+///   than read.
+/// - Each file is capped at [`MAX_ATTACHMENT_BYTES`], and a reply at
+///   [`MAX_ATTACHMENTS_PER_REPLY`] files.
+///
+/// The bytes are copied now, not referenced: the outbox may retry this row
+/// minutes later, and the file the agent meant is the one that existed when it
+/// said so.
+fn import_attachments(
+    paths: &DaemonPaths,
+    requested: &[String],
+) -> Result<Vec<OutboundAttachment>, String> {
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root = std::env::current_dir()
+        .and_then(|directory| directory.canonicalize())
+        .map_err(|_| "This run has no working directory to attach files from.".to_string())?;
+    let app_data = paths
+        .root
+        .parent()
+        .ok_or_else(|| "Daemon root has no app-data parent".to_string())?;
+    let store = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
+        app_data.join("content-v1"),
+        MAX_ATTACHMENT_BYTES,
+    )
+    .map_err(|error| format!("Failed to open the content store: {error}"))?;
+    import_from(&root, &store, requested)
+}
+
+/// The confinement and size rules, separated from where the run's directory and
+/// the content store come from so they can be exercised without a daemon.
+fn import_from(
+    root: &std::path::Path,
+    store: &little_monkey_lib::artifact_store::ArtifactStore,
+    requested: &[String],
+) -> Result<Vec<OutboundAttachment>, String> {
+    if requested.len() > MAX_ATTACHMENTS_PER_REPLY {
+        return Err(format!(
+            "A reply may carry at most {MAX_ATTACHMENTS_PER_REPLY} files; this one asked for {}.",
+            requested.len()
+        ));
+    }
+    let mut imported = Vec::with_capacity(requested.len());
+    for path in requested {
+        let resolved = root
+            .join(path)
+            .canonicalize()
+            .map_err(|_| format!("There is no file at '{path}' in this run's directory."))?;
+        if !resolved.starts_with(root) {
+            return Err(format!(
+                "'{path}' is outside this run's directory, so it cannot be attached."
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(&resolved)
+            .map_err(|_| format!("'{path}' could not be read."))?;
+        if !metadata.is_file() {
+            return Err(format!("'{path}' is not a regular file."));
+        }
+        if metadata.len() > MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "'{path}' is {} bytes; the limit for one attachment is {MAX_ATTACHMENT_BYTES}.",
+                metadata.len()
+            ));
+        }
+        let blob = store
+            .import_file(&resolved)
+            .map_err(|error| format!("Failed to store '{path}': {error}"))?;
+        imported.push(OutboundAttachment {
+            artifact_id: blob.id,
+            filename: resolved
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string()),
+            mime_type: None,
+        });
+    }
+    Ok(imported)
+}
+
 /// Depth of the message being answered.
 ///
 /// Recomputed from the stored inbound envelope rather than carried in the
@@ -263,36 +257,8 @@ fn now_ms() -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn a_content_type_is_derived_from_the_extension() {
-        assert_eq!(mime_for("chart.PNG"), "image/png");
-        assert_eq!(mime_for("report.pdf"), "application/pdf");
-        assert_eq!(mime_for("archive.tar.gz"), "application/octet-stream");
-        assert_eq!(mime_for("noextension"), "application/octet-stream");
-    }
-
-    #[test]
-    fn a_path_outside_the_workspace_is_refused() {
-        let workspace =
-            std::env::temp_dir().join(format!("lm-attach-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(workspace.join("nested")).expect("workspace");
-        std::fs::write(workspace.join("nested/ok.txt"), b"hi").expect("file");
-        let outside = workspace.parent().expect("parent").join("outside.txt");
-        std::fs::write(&outside, b"secret").expect("file");
-        let workspace = workspace.canonicalize().expect("canonical");
-
-        assert!(resolve_in_workspace(&workspace, "nested/ok.txt").is_ok());
-        let escaped = resolve_in_workspace(&workspace, "../outside.txt");
-        assert!(
-            escaped.is_err_and(|error| error.contains("outside this run's workspace")),
-            "a path that climbs out of the workspace must be refused"
-        );
-
-        let _ = std::fs::remove_dir_all(&workspace);
-        let _ = std::fs::remove_file(&outside);
-    }
     use super::*;
+    use little_monkey_lib::artifact_store::ArtifactStore;
 
     #[test]
     fn an_empty_reply_is_refused_before_anything_is_opened() {
@@ -304,6 +270,125 @@ mod tests {
         let huge = "x".repeat(MAX_REPLY_CHARS + 1);
         let error = send_message(&huge, &[]).expect_err("too long");
         assert!(error.contains("at most"));
+    }
+
+    /// A run directory with one file in it, plus a content store to import
+    /// into. Both live in the same temp dir so nothing here touches the real
+    /// daemon or the shared ledger.
+    fn workspace() -> (std::path::PathBuf, std::path::PathBuf, ArtifactStore) {
+        let base =
+            std::env::temp_dir().join(format!("lm-attach-{}", uuid::Uuid::new_v4().simple()));
+        let root = base.join("run");
+        std::fs::create_dir_all(&root).expect("run dir");
+        std::fs::write(root.join("report.txt"), b"the build passed").expect("file");
+        let store =
+            ArtifactStore::with_max_blob_size(base.join("content-v1"), MAX_ATTACHMENT_BYTES)
+                .expect("store");
+        let base = base.canonicalize().expect("canonical base");
+        let root = root.canonicalize().expect("canonical run dir");
+        (base, root, store)
+    }
+
+    #[test]
+    fn a_file_in_the_run_directory_is_copied_into_the_content_store() {
+        let (_base, root, store) = workspace();
+        let imported = import_from(&root, &store, &["report.txt".to_string()]).expect("imported");
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].filename.as_deref(), Some("report.txt"));
+        // Copied, not referenced: the bytes survive the original being replaced.
+        std::fs::write(root.join("report.txt"), b"something else").expect("overwrite");
+        assert_eq!(
+            store.read(&imported[0].artifact_id).expect("read back"),
+            b"the build passed"
+        );
+    }
+
+    #[test]
+    fn a_path_climbing_out_of_the_run_directory_is_refused() {
+        let (base, root, store) = workspace();
+        std::fs::write(base.join("secret"), b"private key").expect("outside file");
+        let error = import_from(&root, &store, &["../secret".to_string()]).expect_err("refused");
+        assert!(error.contains("outside this run's directory"), "{error}");
+    }
+
+    #[test]
+    fn an_absolute_path_elsewhere_is_refused() {
+        let (base, root, store) = workspace();
+        let outside = base.join("secret");
+        std::fs::write(&outside, b"private key").expect("outside file");
+        let error =
+            import_from(&root, &store, &[outside.display().to_string()]).expect_err("refused");
+        assert!(error.contains("outside this run's directory"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_pointing_out_of_the_run_directory_is_refused() {
+        // The name is inside the workspace; the file is not. Comparing the
+        // resolved path rather than the requested one is what catches this.
+        let (base, root, store) = workspace();
+        let outside = base.join("secret");
+        std::fs::write(&outside, b"private key").expect("outside file");
+        std::os::unix::fs::symlink(&outside, root.join("innocent.txt")).expect("symlink");
+        let error = import_from(&root, &store, &["innocent.txt".to_string()]).expect_err("refused");
+        assert!(error.contains("outside this run's directory"), "{error}");
+    }
+
+    #[test]
+    fn a_directory_is_not_a_file() {
+        let (_base, root, store) = workspace();
+        std::fs::create_dir(root.join("logs")).expect("dir");
+        let error = import_from(&root, &store, &["logs".to_string()]).expect_err("refused");
+        assert!(error.contains("not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_file_is_named_rather_than_silently_dropped() {
+        let (_base, root, store) = workspace();
+        let error = import_from(&root, &store, &["nope.txt".to_string()]).expect_err("refused");
+        assert!(error.contains("no file at 'nope.txt'"), "{error}");
+    }
+
+    #[test]
+    fn more_files_than_the_cap_are_refused_before_any_are_copied() {
+        let (_base, root, store) = workspace();
+        let requested: Vec<String> = (0..MAX_ATTACHMENTS_PER_REPLY + 1)
+            .map(|_| "report.txt".to_string())
+            .collect();
+        let error = import_from(&root, &store, &requested).expect_err("refused");
+        assert!(error.contains("at most"), "{error}");
+    }
+
+    #[test]
+    fn only_the_providers_with_a_real_upload_accept_files() {
+        use little_monkey_lib::channels::types::ChannelKind;
+        assert!(super::super::adapters::sends_attachments(
+            ChannelKind::Telegram
+        ));
+        assert!(super::super::adapters::sends_attachments(
+            ChannelKind::WhatsApp
+        ));
+        for kind in [
+            ChannelKind::Matrix,
+            ChannelKind::Signal,
+            ChannelKind::Slack,
+            ChannelKind::Discord,
+            ChannelKind::Mattermost,
+        ] {
+            assert!(super::super::adapters::sends_attachments(kind), "{kind:?}");
+        }
+        // Inbound attachments are normalized for these, but nothing uploads
+        // one, and the tool refuses rather than queueing a reply that would
+        // arrive with the file missing.
+        for kind in [
+            ChannelKind::IMessage,
+            ChannelKind::Teams,
+            ChannelKind::Line,
+            ChannelKind::GoogleChat,
+            ChannelKind::Irc,
+        ] {
+            assert!(!super::super::adapters::sends_attachments(kind), "{kind:?}");
+        }
     }
 
     #[test]

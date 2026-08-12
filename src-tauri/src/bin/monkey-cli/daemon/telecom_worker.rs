@@ -37,7 +37,7 @@ pub(crate) enum CarrierOutcome {
 }
 
 /// Handle one verified event from a carrier.
-pub(crate) async fn handle_carrier_event(
+pub(crate) fn handle_carrier_event(
     store: &mut DaemonStore,
     queue: &dyn RunQueue,
     account: &TelecomAccountRecord,
@@ -47,10 +47,7 @@ pub(crate) async fn handle_carrier_event(
     match event {
         TelecomEvent::InboundSms(envelope) => {
             ensure_sms_channel_account(store, account, now_ms)?;
-            // SMS carries no attachment handles this adapter can resolve, so
-            // there is nothing for a fetcher to do here.
-            let report =
-                ingest_batch(store, queue, None, std::slice::from_ref(&*envelope), now_ms).await;
+            let report = ingest_batch(store, queue, std::slice::from_ref(&*envelope), now_ms);
             Ok(CarrierOutcome::Message {
                 accepted: report.accepted,
                 ignored: report.ignored + report.challenged + report.duplicates,
@@ -88,6 +85,7 @@ pub(crate) async fn handle_carrier_event(
                     account.inbound_policy,
                     InboundCallPolicy::Answer | InboundCallPolicy::Voicemail
                 );
+            let peer = from_number.clone();
             let record = TelecomCallRecord {
                 call_id: call_id.clone(),
                 account_id: account.account_id.clone(),
@@ -99,12 +97,17 @@ pub(crate) async fn handle_carrier_event(
                 } else {
                     CallState::Completed
                 },
-                session_key: answered.then(|| format!("call:{}:{call_id}", account.account_id)),
+                session_key: answered
+                    .then(|| super::telecom_store::call_session_key(account, &peer, &call_id)),
                 job_id: None,
                 // The carrier's own call id is the natural idempotency key for
                 // an inbound call: a redelivered callback finds this row rather
                 // than creating a second one.
                 idempotency_key: format!("inbound:{provider_call_id}"),
+                // An inbound call says whatever greeting the operator wrote for
+                // this number; the media session falls back to it too, so a
+                // redelivered ring cannot lose it.
+                opening_line: None,
                 last_error: (!answered).then(|| {
                     if at_capacity {
                         "This number was already at its concurrent-call limit".to_string()
@@ -401,8 +404,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_text_runs_through_the_messaging_gate_not_beside_it() {
+    #[test]
+    fn a_text_runs_through_the_messaging_gate_not_beside_it() {
         let (mut store, account) = seeded(InboundCallPolicy::Answer);
         // An approved sender and a route: the same two things any other
         // messaging account needs, because SMS is one.
@@ -425,7 +428,6 @@ mod tests {
             TelecomEvent::InboundSms(Box::new(text("hello", "sms-1"))),
             NOW,
         )
-        .await
         .expect("handled");
 
         // Pairing is the default for a stranger, so the first text is
@@ -448,8 +450,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_approved_sender_texting_becomes_a_run() {
+    #[test]
+    fn an_approved_sender_texting_becomes_a_run() {
         let (mut store, account) = seeded(InboundCallPolicy::Answer);
         store
             .insert_channel_route(&ChannelRoute {
@@ -469,8 +471,7 @@ mod tests {
             &account,
             TelecomEvent::InboundSms(Box::new(text("hello", "sms-1"))),
             NOW,
-        )
-        .await;
+        );
         store
             .upsert_channel_sender(
                 "tel-1",
@@ -496,7 +497,6 @@ mod tests {
             TelecomEvent::InboundSms(Box::new(text("status?", "sms-2"))),
             NOW,
         )
-        .await
         .expect("handled");
         assert_eq!(
             outcome,
@@ -508,8 +508,8 @@ mod tests {
         assert_eq!(queue.submitted.lock().unwrap().len(), 1);
     }
 
-    #[tokio::test]
-    async fn a_call_is_recorded_even_when_the_policy_refuses_it() {
+    #[test]
+    fn a_call_is_recorded_even_when_the_policy_refuses_it() {
         let (mut store, account) = seeded(InboundCallPolicy::Reject);
         let queue = FakeQueue::default();
 
@@ -525,7 +525,6 @@ mod tests {
             },
             NOW,
         )
-        .await
         .expect("handled");
 
         let CarrierOutcome::Call { call_id, answered } = outcome else {
@@ -537,8 +536,8 @@ mod tests {
         assert!(call.session_key.is_none(), "a refused call gets no session");
     }
 
-    #[tokio::test]
-    async fn a_redelivered_ring_does_not_become_a_second_call() {
+    #[test]
+    fn a_redelivered_ring_does_not_become_a_second_call() {
         let (mut store, account) = seeded(InboundCallPolicy::Answer);
         let queue = FakeQueue::default();
         let ring = || TelecomEvent::InboundCall {
@@ -548,18 +547,15 @@ mod tests {
             received_at_ms: NOW,
         };
 
-        let first = handle_carrier_event(&mut store, &queue, &account, ring(), NOW)
-            .await
-            .expect("first");
-        let second = handle_carrier_event(&mut store, &queue, &account, ring(), NOW)
-            .await
-            .expect("second");
+        let first = handle_carrier_event(&mut store, &queue, &account, ring(), NOW).expect("first");
+        let second =
+            handle_carrier_event(&mut store, &queue, &account, ring(), NOW).expect("second");
         assert_eq!(first, second);
         assert_eq!(store.recent_calls("tel-1", 10).expect("calls").len(), 1);
     }
 
-    #[tokio::test]
-    async fn a_second_caller_is_refused_while_the_line_is_busy() {
+    #[test]
+    fn a_second_caller_is_refused_while_the_line_is_busy() {
         let (mut store, account) = seeded(InboundCallPolicy::Answer);
         let queue = FakeQueue::default();
         let ring = |id: &str, from: &str| TelecomEvent::InboundCall {
@@ -576,7 +572,6 @@ mod tests {
             ring("c-1", "+15551110000"),
             NOW,
         )
-        .await
         .expect("first");
         let second = handle_carrier_event(
             &mut store,
@@ -585,7 +580,6 @@ mod tests {
             ring("c-2", "+15552220000"),
             NOW,
         )
-        .await
         .expect("second");
 
         assert_eq!(
@@ -626,7 +620,6 @@ mod tests {
             },
             NOW,
         )
-        .await
         .expect("ring") else {
             panic!("expected a call");
         };
@@ -668,7 +661,6 @@ mod tests {
             },
             NOW,
         )
-        .await
         .expect("ring") else {
             panic!("expected a call");
         };
@@ -692,8 +684,8 @@ mod tests {
             .contains("maximum call duration"));
     }
 
-    #[tokio::test]
-    async fn progress_for_an_unknown_call_creates_nothing() {
+    #[test]
+    fn progress_for_an_unknown_call_creates_nothing() {
         let (mut store, account) = seeded(InboundCallPolicy::Answer);
         let queue = FakeQueue::default();
 
@@ -708,15 +700,14 @@ mod tests {
             },
             NOW,
         )
-        .await
         .expect("handled");
 
         assert_eq!(outcome, CarrierOutcome::Nothing);
         assert!(store.recent_calls("tel-1", 10).expect("calls").is_empty());
     }
 
-    #[tokio::test]
-    async fn progress_advances_the_call_it_names() {
+    #[test]
+    fn progress_advances_the_call_it_names() {
         let (mut store, account) = seeded(InboundCallPolicy::Answer);
         let queue = FakeQueue::default();
         let CarrierOutcome::Call { call_id, .. } = handle_carrier_event(
@@ -731,7 +722,6 @@ mod tests {
             },
             NOW,
         )
-        .await
         .expect("ring") else {
             panic!("expected a call");
         };
@@ -747,7 +737,6 @@ mod tests {
             },
             NOW + 5_000,
         )
-        .await
         .expect("progress");
 
         let call = store.telecom_call(&call_id).expect("query").expect("row");

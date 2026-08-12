@@ -29,7 +29,8 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelAdapter, InboundBatch, LoadedAttachment,
+    fetch_url, load_attachments, AdapterConfig, BlobSource, ChannelAdapter, DaemonBlobs,
+    InboundBatch, LoadedAttachment,
 };
 
 const INBOUND_CHANNEL_CAPACITY: usize = 256;
@@ -102,6 +103,7 @@ pub struct MattermostAdapter {
     /// Guards the one-time spawn of the socket task. `new` itself stays
     /// side-effect-free — see the Discord adapter's module doc for why.
     started: tokio::sync::OnceCell<()>,
+    blobs: Arc<dyn BlobSource>,
 }
 
 impl MattermostAdapter {
@@ -131,6 +133,7 @@ impl MattermostAdapter {
             inbound_rx: Mutex::new(rx),
             shared: Arc::new(Shared::default()),
             started: tokio::sync::OnceCell::new(),
+            blobs: Arc::new(DaemonBlobs),
         })
     }
 
@@ -213,6 +216,13 @@ impl ChannelAdapter for MattermostAdapter {
     }
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
+        if !message.attachments.is_empty() {
+            let files = match load_attachments(self.blobs.as_ref(), message) {
+                Ok(files) => files,
+                Err(outcome) => return outcome,
+            };
+            return self.send_with_attachments(message, &files).await;
+        }
         let mut chunks = split_message(&message.text, MATTERMOST_MAX_TEXT_CHARS);
         if chunks.is_empty() {
             chunks.push(String::new());
@@ -272,6 +282,27 @@ impl ChannelAdapter for MattermostAdapter {
         }
     }
 
+    /// Mattermost serves the bytes for a post's file id straight from the API,
+    /// authenticated with the same bot token as everything else.
+    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("This Mattermost attachment has no file id.".to_string());
+        };
+        // The id is path-concatenated, and it arrives inside a post anybody in
+        // the channel can craft, so anything that could climb out of
+        // `/api/v4/files/` is refused instead of escaped.
+        if handle.is_empty() || !handle.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err("That Mattermost file id is not usable".to_string());
+        }
+        fetch_url(
+            &format!("{}/api/v4/files/{handle}", self.base_url),
+            Some(&self.token),
+        )
+        .await
+    }
+}
+
+impl MattermostAdapter {
     /// Mattermost uploads first and posts second: `/api/v4/files` returns file
     /// ids, and the post that carries them names those ids. Both halves use the
     /// same bot token.
@@ -280,9 +311,6 @@ impl ChannelAdapter for MattermostAdapter {
         message: &OutboundMessage,
         files: &[LoadedAttachment],
     ) -> SendOutcome {
-        if files.is_empty() {
-            return self.send(message).await;
-        }
         let mut form =
             reqwest::multipart::Form::new().text("channel_id", message.conversation_id.clone());
         for file in files {
@@ -373,31 +401,6 @@ impl ChannelAdapter for MattermostAdapter {
                 .ok()
                 .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_string)),
         }
-    }
-
-    /// Mattermost serves the bytes for a post's file id straight from the API,
-    /// authenticated with the same bot token as everything else.
-    async fn fetch_attachment(
-        &self,
-        attachment: &ChannelAttachment,
-        max_bytes: u64,
-    ) -> Result<Vec<u8>, String> {
-        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
-            return Err("This Mattermost attachment has no file id.".to_string());
-        };
-        // The id is path-concatenated, and it arrives inside a post anybody in
-        // the channel can craft, so anything that could climb out of
-        // `/api/v4/files/` is refused instead of escaped.
-        if handle.is_empty() || !handle.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return Err("That Mattermost file id is not usable".to_string());
-        }
-        crate::daemon::channel_adapter::download_bounded(
-            self.http
-                .get(format!("{}/api/v4/files/{handle}", self.base_url))
-                .bearer_auth(&self.token),
-            max_bytes,
-        )
-        .await
     }
 }
 
@@ -551,6 +554,9 @@ fn normalize_posted_event(
             ids.iter()
                 .filter_map(Value::as_str)
                 .map(|file_id| ChannelAttachment {
+                    stored_artifact_id: None,
+                    text_excerpt: None,
+                    fetch_error: None,
                     provider_id: Some(file_id.to_string()),
                     kind: AttachmentKind::Other,
                     filename: None,

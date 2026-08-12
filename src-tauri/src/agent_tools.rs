@@ -239,8 +239,8 @@ pub fn send_message_tool_def() -> serde_json::Value {
                     "text": { "type": "string", "description": "The message to send." },
                     "attachments": {
                         "type": "array",
-                        "description": "Optional files to send with the message, as paths inside this run's workspace. At most 4, 8 MB each.",
-                        "items": { "type": "string" }
+                        "items": { "type": "string" },
+                        "description": "Optional files to send with the message, as paths inside this run's own directory. At most 4, each under 16 MB. Not every provider can carry files."
                     }
                 },
                 "required": ["text"],
@@ -270,9 +270,10 @@ pub fn place_call_tool_def() -> serde_json::Value {
                 "type": "object",
                 "properties": {
                     "account_id": { "type": "string", "description": "The telephony account to call from." },
-                    "to_number": { "type": "string", "description": "The number to call, in international format, e.g. +15551234567." }
+                    "to_number": { "type": "string", "description": "The number to call, in international format, e.g. +15551234567." },
+                    "opening_line": { "type": "string", "description": "What to say as soon as the call connects — who is calling and why. A call cannot open with silence." }
                 },
-                "required": ["account_id", "to_number"],
+                "required": ["account_id", "to_number", "opening_line"],
                 "additionalProperties": false
             }
         }

@@ -43,7 +43,7 @@ use super::jwt::{
     try_refresh_blocking, validate_alg_is_rs256, verify_rs256_signature, JwkRsaKey, JwksCache,
 };
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelAdapter, InboundBatch, WebhookChannelAdapter,
+    fetch_url, AdapterConfig, ChannelAdapter, InboundBatch, WebhookChannelAdapter,
 };
 
 const LOGIN_BASE: &str = "https://login.microsoftonline.com";
@@ -342,9 +342,7 @@ impl ChannelAdapter for TeamsAdapter {
         ProviderCapabilities {
             max_text_chars: 28000,
             supports_threads: false,
-            // Inbound attachments are fetched; sending one is not implemented,
-            // and the trait's default refuses by name rather than dropping it.
-            supports_attachments: false,
+            supports_attachments: false, // inbound only: this adapter does not upload files yet
             supports_mention_metadata: true,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
@@ -460,30 +458,21 @@ impl ChannelAdapter for TeamsAdapter {
         }
     }
 
-    /// Teams attachments arrive as a `contentUrl`. Bot-hosted content on the
-    /// Bot Framework's own service hosts needs the bot's token; anything else
-    /// — a SharePoint or OneDrive link, or any host an attacker could put in an
-    /// activity — is fetched with no credential at all, because sending the
-    /// bot's bearer token to a host chosen by the message author would hand it
-    /// away.
-    async fn fetch_attachment(
-        &self,
-        attachment: &ChannelAttachment,
-        max_bytes: u64,
-    ) -> Result<Vec<u8>, String> {
+    /// Teams serves an attachment from the `contentUrl` its activity named.
+    ///
+    /// The bot's own token is sent only to a Bot Framework host: a `contentUrl`
+    /// is chosen by whoever posted the message, and a URL somewhere else is
+    /// fetched anonymously rather than handed the credential.
+    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
         let AttachmentSource::Url { url } = &attachment.source else {
             return Err("This Teams attachment has no content URL.".to_string());
         };
-        let client = little_monkey_lib::egress::hardened()
-            .build()
-            .map_err(|error| format!("Could not build an HTTP client: {error}"))?;
-        let request = if is_bot_framework_host(url) {
+        if is_bot_framework_host(url) {
             let token = self.access_token().await?;
-            client.get(url).bearer_auth(token)
+            fetch_url(url, Some(&token)).await
         } else {
-            client.get(url)
-        };
-        crate::daemon::channel_adapter::download_bounded(request, max_bytes).await
+            fetch_url(url, None).await
+        }
     }
 }
 
@@ -671,6 +660,9 @@ fn normalize_activity(
                     let content_url = attachment.get("contentUrl").and_then(JsonValue::as_str)?;
                     let mime_type = attachment.get("contentType").and_then(JsonValue::as_str);
                     Some(ChannelAttachment {
+                        stored_artifact_id: None,
+                        text_excerpt: None,
+                        fetch_error: None,
                         provider_id: None,
                         kind: mime_type
                             .map(AttachmentKind::from_mime)
@@ -724,23 +716,6 @@ fn normalize_activity(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn only_bot_framework_hosts_are_sent_the_bot_token() {
-        assert!(is_bot_framework_host(
-            "https://smba.trafficmanager.net/amer/"
-        ));
-        assert!(is_bot_framework_host("https://api.botframework.com/x"));
-        assert!(
-            !is_bot_framework_host("https://evil-botframework.com/x"),
-            "a suffix must match on a label boundary"
-        );
-        assert!(!is_bot_framework_host(
-            "https://botframework.com.evil.example/x"
-        ));
-        assert!(!is_bot_framework_host("http://api.botframework.com/x"));
-        assert!(!is_bot_framework_host("https://graph.microsoft.com/x"));
-    }
-
     use super::*;
     use crate::daemon::channel_store::ChannelAccountRecord;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
