@@ -275,6 +275,10 @@ pub mod run_scope;
 // but is only ever actually called from `main.rs`'s own Tauri app wiring,
 // not from `monkey-cli`.
 pub mod permissions;
+// Peer-to-peer envelopes between two paired installations: pure types and the
+// loop/bound/expiry rules, shared so the desktop can describe a peer exchange
+// without the daemon's protocol module.
+pub mod peers;
 // `pub` (not `mod`, like `sessions`/`tools`/`system` above) so `monkey-cli`
 // (slice 5) can call `read_rules_impl`/`load_impl`/`add_fact_impl` directly
 // from `little_monkey_lib`, the same way it already reuses `checkpoints`.
