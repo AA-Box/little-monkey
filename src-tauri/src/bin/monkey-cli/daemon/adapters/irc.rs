@@ -744,7 +744,7 @@ mod tests {
 
     #[test]
     fn send_splitting_accounts_for_a_long_target_name() {
-        let target = "#".to_string() + &"x".repeat(100);
+        let target = format!("#{}", "x".repeat(100));
         let text = "y".repeat(500);
         let chunks = split_privmsg_chunks(&target, &text);
         for chunk in &chunks {
