@@ -152,8 +152,8 @@ pub mod mlx_runtime;
 // Inbound OpenAI/Anthropic compatibility translations and the scoped,
 // authenticated LAN policy shared by the API server and user-owned runners.
 mod artifact_commands;
-pub mod chat_template_lab;
 pub mod channels;
+pub mod chat_template_lab;
 pub mod checkpoints;
 pub mod compatibility_hub;
 pub mod conformance;
@@ -1563,6 +1563,19 @@ pub fn run() {
             browser_worker::browser_scroll,
             browser_worker::browser_capture_evidence,
             browser_worker::browser_stop,
+            daemon_commands::channels_list,
+            daemon_commands::channels_add,
+            daemon_commands::channels_probe,
+            daemon_commands::channels_enable,
+            daemon_commands::channels_set_policy,
+            daemon_commands::channels_set_credential,
+            daemon_commands::channels_senders,
+            daemon_commands::channels_decide_sender,
+            daemon_commands::channels_routes,
+            daemon_commands::channels_add_route,
+            daemon_commands::channels_remove_route,
+            daemon_commands::channels_events,
+            daemon_commands::channels_remove,
             daemon_commands::daemon_desktop_status,
             daemon_commands::daemon_desktop_decisions,
             daemon_commands::daemon_desktop_install,

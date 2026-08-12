@@ -24,19 +24,11 @@
 //! only a `credential_ref` — the keychain account name — which is what keeps a
 //! copied database useless.
 
+use super::channel_store::ChannelAccountRecord;
 use async_trait::async_trait;
 use little_monkey_lib::channels::types::{
     ChannelEnvelope, ChannelHealth, ChannelKind, OutboundMessage, ProviderCapabilities, SendOutcome,
 };
-use std::sync::LazyLock;
-
-use super::channel_store::ChannelAccountRecord;
-
-/// Keychain service for messaging credentials. Its own service name, separate
-/// from webhook secrets and from the desktop app's connector credentials, so
-/// revoking one class of secret cannot reach another.
-static CHANNEL_KEYCHAIN_SERVICE: LazyLock<String> =
-    LazyLock::new(|| little_monkey_lib::profiles::keychain_service("com.littlemonkey.channels"));
 
 /// One batch of inbound events plus the cursor to resume from.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -119,8 +111,11 @@ pub struct KeyringChannelSecrets;
 
 impl KeyringChannelSecrets {
     fn entry(credential_ref: &str) -> Result<keyring::Entry, String> {
-        keyring::Entry::new(&CHANNEL_KEYCHAIN_SERVICE, credential_ref)
-            .map_err(|error| format!("Failed to open the messaging keychain entry: {error}"))
+        keyring::Entry::new(
+            &little_monkey_lib::channels::KEYCHAIN_SERVICE,
+            credential_ref,
+        )
+        .map_err(|error| format!("Failed to open the messaging keychain entry: {error}"))
     }
 }
 

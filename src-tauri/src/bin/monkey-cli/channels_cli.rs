@@ -118,6 +118,9 @@ pub enum ChannelsCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Record that a credential was stored for this account by the app. The
+    /// secret itself never travels through an argument.
+    MarkCredential { account_id: String },
     /// Remove an account and its stored credential.
     Remove { account_id: String },
 }
@@ -174,6 +177,7 @@ pub async fn dispatch(action: &ChannelsCmd) -> Result<(), String> {
             limit,
             json,
         } => events(account_id, *limit, *json),
+        ChannelsCmd::MarkCredential { account_id } => mark_credential(account_id),
         ChannelsCmd::Remove { account_id } => remove(account_id),
     }
 }
@@ -309,12 +313,25 @@ pub fn set_token(account_id: &str) -> Result<(), String> {
         return Err("No credential was supplied on stdin".to_string());
     }
 
-    let credential_ref = format!("channel:{account_id}");
+    let credential_ref = little_monkey_lib::channels::credential_ref(account_id);
     KeyringChannelSecrets.put(&credential_ref, secret)?;
     account.credential_ref = Some(credential_ref);
     account.updated_at_ms = now_ms();
     store.upsert_channel_account(&account)?;
     println!("Credential stored for {account_id}.");
+    Ok(())
+}
+
+/// Point the account at its keychain entry after the app stored one there.
+pub fn mark_credential(account_id: &str) -> Result<(), String> {
+    let mut store = store()?;
+    let mut account = store
+        .channel_account(account_id)?
+        .ok_or_else(|| format!("No such account '{account_id}'"))?;
+    account.credential_ref = Some(little_monkey_lib::channels::credential_ref(account_id));
+    account.updated_at_ms = now_ms();
+    store.upsert_channel_account(&account)?;
+    println!("Credential recorded for {account_id}.");
     Ok(())
 }
 

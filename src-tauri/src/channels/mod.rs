@@ -24,6 +24,23 @@
 //! properties (pairing, mention gating, loop bounds, route determinism) testable
 //! without a provider.
 
+use std::sync::LazyLock;
+
+/// Keychain service every messaging credential is stored under.
+///
+/// Defined here rather than beside the adapters because two processes write it:
+/// the daemon reads a credential to build an adapter, and the desktop stores one
+/// when the operator pastes it in. Two definitions would eventually become two
+/// different services, and the symptom would be a token that saves and can
+/// never be read back.
+pub static KEYCHAIN_SERVICE: LazyLock<String> =
+    LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.channels"));
+
+/// Keychain account name for one messaging account's credential.
+pub fn credential_ref(account_id: &str) -> String {
+    format!("channel:{account_id}")
+}
+
 pub mod ingress;
 pub mod policy;
 pub mod routing;
