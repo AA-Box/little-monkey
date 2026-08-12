@@ -1220,6 +1220,149 @@ pub async fn remote_node_label(
     command(args).await
 }
 
+// --- Paired physical devices, for the desktop -----------------------------
+
+#[tauri::command]
+pub async fn remote_device_list() -> Result<Value, String> {
+    parse_json(
+        &command(vec![
+            "daemon".into(),
+            "remote".into(),
+            "device-list".into(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Replaces one device's physical grant. The CLI refuses anything that is not
+/// a physical capability, so this cannot become a way to widen run access from
+/// the desktop.
+#[tauri::command]
+pub async fn remote_device_grant(
+    device_id: String,
+    capabilities: Vec<String>,
+) -> Result<String, String> {
+    validate_id("device id", &device_id)?;
+    let mut args = vec![
+        "daemon".into(),
+        "remote".into(),
+        "device-grant".into(),
+        device_id,
+    ];
+    for capability in capabilities {
+        validate_token("device capability", &capability, 64)?;
+        args.extend(["--capability".into(), capability]);
+    }
+    command(args).await
+}
+
+#[tauri::command]
+pub async fn remote_device_commands(device_id: String, limit: u32) -> Result<Value, String> {
+    validate_id("device id", &device_id)?;
+    if !(1..=200).contains(&limit) {
+        return Err("Command limit must be 1..=200".to_string());
+    }
+    parse_json(
+        &command(vec![
+            "daemon".into(),
+            "remote".into(),
+            "device-commands".into(),
+            device_id,
+            "--limit".into(),
+            limit.to_string(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn remote_device_cancel(command_id: String) -> Result<String, String> {
+    validate_id("command id", &command_id)?;
+    command(vec![
+        "daemon".into(),
+        "remote".into(),
+        "device-cancel".into(),
+        command_id,
+    ])
+    .await
+}
+
+/// The desktop half of the `device_action` agent tool.
+///
+/// Permission-gated here and then handed to the sidecar, which owns the queue,
+/// the capability intersection and the argument bounds — the desktop does not
+/// get a second, looser copy of any of them. Same division of labour as every
+/// other command in this file, and the reason it is a fixed argument vector
+/// rather than a passthrough: the model's arguments arrive as named parameters
+/// and are re-emitted as named flags, never as a caller-supplied argv.
+#[tauri::command(rename_all = "snake_case")]
+#[allow(clippy::too_many_arguments)]
+pub async fn tool_device_action(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::AppState>,
+    action: String,
+    device_id: Option<String>,
+    position: Option<String>,
+    duration_ms: Option<u64>,
+    accuracy: Option<String>,
+    title: Option<String>,
+    body: Option<String>,
+    text: Option<String>,
+    wait_ms: Option<u64>,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<Value, String> {
+    validate_token("device action", &action, 64)?;
+    let detail = match &device_id {
+        Some(device_id) => format!("{action} on {device_id}"),
+        None => action.clone(),
+    };
+    crate::permissions::request_permission(
+        &app,
+        state.inner(),
+        "device_action",
+        detail,
+        turn_id.as_deref(),
+        tool_call_id.as_deref(),
+        None,
+        None,
+    )
+    .await?;
+
+    let mut args = vec![
+        "daemon".into(),
+        "remote".into(),
+        "device-action".into(),
+        action,
+        "--json".into(),
+    ];
+    if let Some(device_id) = device_id {
+        validate_id("device id", &device_id)?;
+        args.extend(["--device-id".into(), device_id]);
+    }
+    for (flag, value) in [
+        ("--position", position),
+        ("--accuracy", accuracy),
+        ("--title", title),
+        ("--body", body),
+        ("--text", text),
+    ] {
+        if let Some(value) = value {
+            validate_token(flag, &value, 1_024)?;
+            args.extend([flag.into(), value]);
+        }
+    }
+    if let Some(duration_ms) = duration_ms {
+        args.extend(["--duration-ms".into(), duration_ms.to_string()]);
+    }
+    if let Some(wait_ms) = wait_ms {
+        args.extend(["--wait-ms".into(), wait_ms.to_string()]);
+    }
+    parse_json(&command(args).await?)
+}
+
 #[tauri::command]
 pub async fn remote_audit(limit: u32) -> Result<Value, String> {
     if !(1..=10_000).contains(&limit) {

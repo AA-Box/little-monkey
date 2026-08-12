@@ -11,7 +11,7 @@ pub(crate) mod channel_worker;
 mod engine;
 pub(crate) mod ingress_store;
 mod ledger;
-mod remote;
+pub(crate) mod remote;
 mod scheduler;
 mod service;
 pub(crate) mod store;

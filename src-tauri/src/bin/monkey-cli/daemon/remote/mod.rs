@@ -1,6 +1,7 @@
 pub(crate) mod api;
 mod client;
 mod desktop;
+pub(crate) mod device;
 pub(crate) mod migrate;
 mod protocol;
 mod server;
@@ -18,7 +19,9 @@ use reqwest::Method;
 
 use crate::daemon::store::{restrict_file, DaemonPaths};
 
-use self::protocol::{PairingInvitation, RemoteAction, RemoteScopes, REMOTE_PROTOCOL_VERSION};
+use self::protocol::{
+    PairingBootstrap, PairingInvitation, RemoteAction, RemoteScopes, REMOTE_PROTOCOL_VERSION,
+};
 use self::store::{KeyringRemoteSecrets, RemoteStore};
 
 #[derive(Subcommand, Debug)]
@@ -53,6 +56,32 @@ pub enum RemoteCmd {
         #[arg(long)]
         output: PathBuf,
     },
+    /// List paired physical devices with what they were granted, what they
+    /// advertise, what their operating system permits, and what is therefore
+    /// effective.
+    DeviceList {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace one device's physical capability grant. Pass no `--capability`
+    /// to withdraw every physical grant while leaving run access untouched.
+    DeviceGrant {
+        device_id: String,
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+    },
+    /// Ask a paired device to do something once, and wait for the answer.
+    DeviceAction(RemoteDeviceActionArgs),
+    /// Recent commands queued for one device.
+    DeviceCommands {
+        device_id: String,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask for a queued or running command to be cancelled.
+    DeviceCancel { command_id: String },
     /// Accept a one-time invitation on a control PC/phone client profile.
     Accept {
         invitation: PathBuf,
@@ -237,6 +266,43 @@ pub struct RemotePairCreateArgs {
     /// device even if it runs a newer client build.
     #[arg(long = "mobile", value_enum)]
     mobile_capabilities: Vec<PairMobileCapability>,
+    /// Physical capabilities to grant this device over its own hardware
+    /// (camera-capture, location-read, …). Omit for a device that is only a
+    /// controller: the runner then has no way to ask its hardware for anything,
+    /// whatever the device advertises.
+    #[arg(long = "device")]
+    device_capabilities: Vec<String>,
+    /// Also print a compact pairing code the phone can scan, instead of only
+    /// writing the invitation file.
+    #[arg(long)]
+    qr: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteDeviceActionArgs {
+    /// device_info, camera_capture, microphone_capture, location_read,
+    /// notification_post, screen_capture or audio_playback.
+    pub action: String,
+    /// Which paired device. Omit when exactly one device can do this.
+    #[arg(long = "device-id")]
+    pub device_id: Option<String>,
+    #[arg(long)]
+    pub position: Option<String>,
+    #[arg(long = "duration-ms")]
+    pub duration_ms: Option<u64>,
+    #[arg(long)]
+    pub accuracy: Option<String>,
+    #[arg(long)]
+    pub title: Option<String>,
+    #[arg(long)]
+    pub body: Option<String>,
+    /// Text for audio_playback to speak.
+    #[arg(long)]
+    pub text: Option<String>,
+    #[arg(long = "wait-ms", default_value_t = 60_000)]
+    pub wait_ms: u64,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -384,6 +450,32 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
         }
         RemoteCmd::PairCreate(args) => pair_create(&paths, args)?,
         RemoteCmd::PairList => pair_list(&paths)?,
+        RemoteCmd::DeviceList { json } => device_list(&paths, *json)?,
+        RemoteCmd::DeviceGrant {
+            device_id,
+            capabilities,
+        } => device_grant(&paths, device_id, capabilities)?,
+        RemoteCmd::DeviceAction(args) => device_action(&paths, args).await?,
+        RemoteCmd::DeviceCommands {
+            device_id,
+            limit,
+            json,
+        } => device_commands(&paths, device_id, *limit, *json)?,
+        RemoteCmd::DeviceCancel { command_id } => {
+            let record =
+                RemoteStore::open(&paths.root)?.request_device_cancel(command_id, now_ms()?)?;
+            println!(
+                "{} is now {}{}",
+                record.command_id,
+                record.state.as_str(),
+                if record.cancel_requested && !record.state.terminal() {
+                    " (cancellation requested; the device had already started, so any effect it \
+                      already had stands)"
+                } else {
+                    ""
+                }
+            );
+        }
         RemoteCmd::PairRevoke { device_id, reason } => {
             let mut store = RemoteStore::open(&paths.root)?;
             // The one-shot CLI process holds no live sessions; the resident
@@ -1007,6 +1099,7 @@ fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), S
             .copied()
             .map(protocol::DeviceCapability::from),
     );
+    capabilities.extend(device::parse_capabilities(&args.device_capabilities)?);
     protocol::validate_capabilities(&capabilities, &scopes)?;
     let invitation = RemoteStore::open(&paths.root)?.create_invitation_with_capabilities(
         &scopes,
@@ -1035,6 +1128,252 @@ fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), S
         value.expires_at_ms,
         controller_url(&value.runner_url)
     );
+    if args.qr {
+        // The same one-time token, in the form a camera can read. It pins the
+        // certificate by fingerprint rather than carrying the PEM — see
+        // `PairingBootstrap`.
+        let bootstrap = PairingBootstrap {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            runner_id: value.runner_id.clone(),
+            runner_url: value.runner_url.clone(),
+            pairing_id: value.pairing_id.clone(),
+            pairing_token: value.pairing_token.clone(),
+            certificate_sha256: value.server_certificate_sha256.clone(),
+            expires_at_ms: value.expires_at_ms,
+        };
+        println!(
+            "\nScan or paste this pairing code on the device (it expires with the invitation):\n{}",
+            bootstrap.to_uri()?
+        );
+    }
+    Ok(())
+}
+
+// --- Physical devices ------------------------------------------------------
+
+/// One device as the operator reads it: the four sets kept visibly apart,
+/// because "why can it not take a photo" has four different answers.
+fn device_rows(paths: &DaemonPaths) -> Result<Vec<serde_json::Value>, String> {
+    let store = RemoteStore::open(&paths.root)?;
+    let now = now_ms()?;
+    store
+        .devices()?
+        .into_iter()
+        .map(|device| {
+            let surface = store.device_surface(&device.device_id)?;
+            let effective =
+                protocol::effective_capabilities(&device.capabilities, surface.as_ref());
+            let commands = store.device_commands(&device.device_id, 5)?;
+            Ok(serde_json::json!({
+                "device_id": device.device_id,
+                "device_name": device.device_name,
+                "revoked": !device.active(),
+                "secret_generation": device.secret_generation,
+                "granted": device.capabilities,
+                "advertised": surface.as_ref().map(|surface| surface.capabilities.clone()),
+                "os_permissions": surface.as_ref().map(|surface| surface.permissions.clone()),
+                "effective": effective,
+                "platform": surface.as_ref().map(|surface| surface.platform.clone()),
+                "platform_version": surface.as_ref().map(|surface| surface.platform_version.clone()),
+                "app_version": surface.as_ref().map(|surface| surface.app_version.clone()),
+                "device_model": surface.as_ref().map(|surface| surface.device_model.clone()),
+                "constraints": surface.as_ref().map(|surface| surface.constraints.clone()),
+                "last_seen_at_ms": surface.as_ref().map(|surface| surface.reported_at_ms),
+                "now_ms": now,
+                "recent_commands": commands.iter().map(command_json).collect::<Vec<_>>(),
+            }))
+        })
+        .collect()
+}
+
+fn command_json(record: &self::store::DeviceCommandRecord) -> serde_json::Value {
+    serde_json::json!({
+        "command_id": record.command_id,
+        "device_id": record.device_id,
+        "capability": record.capability,
+        "state": record.state.as_str(),
+        "attempt": record.attempt,
+        "cancel_requested": record.cancel_requested,
+        "created_at_ms": record.created_at_ms,
+        "updated_at_ms": record.updated_at_ms,
+        "expires_at_ms": record.expires_at_ms,
+        "source_run_id": record.source_run_id,
+        "artifact": record.artifact.as_ref().map(|artifact| serde_json::json!({
+            "sha256": artifact.sha256,
+            "bytes": artifact.bytes,
+            "media_type": artifact.media_type,
+        })),
+        "error": record.error,
+    })
+}
+
+fn device_list(paths: &DaemonPaths, json: bool) -> Result<(), String> {
+    let rows = device_rows(paths)?;
+    if json {
+        return print_json(serde_json::json!({ "devices": rows }));
+    }
+    if rows.is_empty() {
+        println!("No paired devices.");
+        return Ok(());
+    }
+    for row in rows {
+        let names = |key: &str| match row.get(key) {
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            Some(serde_json::Value::Null) | None => "(not reported)".to_string(),
+            Some(other) => other.to_string(),
+        };
+        println!(
+            "{} \"{}\"{}\n  device: {} {} (app {})\n  granted:   {}\n  supported: {}\n  OS:        {}\n  effective: {}",
+            row["device_id"].as_str().unwrap_or_default(),
+            row["device_name"].as_str().unwrap_or_default(),
+            if row["revoked"] == serde_json::json!(true) {
+                "  [revoked]"
+            } else {
+                ""
+            },
+            row["platform"].as_str().unwrap_or("(not reported)"),
+            row["platform_version"].as_str().unwrap_or(""),
+            row["app_version"].as_str().unwrap_or("?"),
+            names("granted"),
+            names("advertised"),
+            match row["os_permissions"].as_object() {
+                Some(map) => map
+                    .iter()
+                    .map(|(key, value)| format!("{key}={}", value.as_str().unwrap_or("?")))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                None => "(not reported)".to_string(),
+            },
+            names("effective"),
+        );
+    }
+    Ok(())
+}
+
+fn device_grant(
+    paths: &DaemonPaths,
+    device_id: &str,
+    capabilities: &[String],
+) -> Result<(), String> {
+    let requested = device::parse_capabilities(capabilities)?;
+    if let Some(unsupported) = requested
+        .iter()
+        .find(|capability| !capability.is_physical())
+    {
+        return Err(format!(
+            "'{unsupported:?}' is not a physical device capability; grant it at pairing time \
+             instead"
+        ));
+    }
+    let mut store = RemoteStore::open(&paths.root)?;
+    let device = store
+        .device(device_id)?
+        .ok_or_else(|| format!("Unknown remote device '{device_id}'"))?;
+    // Only the physical half is replaced. The run-facing grants were frozen at
+    // pairing and this command must not be a way to widen them.
+    let mut next = device
+        .capabilities
+        .iter()
+        .copied()
+        .filter(|capability| !capability.is_physical())
+        .collect::<BTreeSet<_>>();
+    next.extend(requested);
+    let stored = store.set_device_capabilities(device_id, &next, now_ms()?)?;
+    println!(
+        "{device_id} now grants: {}",
+        stored
+            .iter()
+            .map(|capability| format!("{capability:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "A grant is only half the answer — the device must also advertise the capability and hold \
+         the matching operating-system permission before it becomes effective."
+    );
+    Ok(())
+}
+
+async fn device_action(paths: &DaemonPaths, args: &RemoteDeviceActionArgs) -> Result<(), String> {
+    let capability = device::capability_for_action(&args.action)?;
+    let mut arguments = serde_json::Map::new();
+    for (key, value) in [
+        ("position", args.position.clone()),
+        ("accuracy", args.accuracy.clone()),
+        ("title", args.title.clone()),
+        ("body", args.body.clone()),
+        ("text", args.text.clone()),
+    ] {
+        if let Some(value) = value {
+            arguments.insert(key.to_string(), serde_json::Value::String(value));
+        }
+    }
+    if let Some(duration_ms) = args.duration_ms {
+        arguments.insert("duration_ms".to_string(), serde_json::json!(duration_ms));
+    }
+    let record = device::dispatch(
+        paths,
+        &device::DeviceActionRequest {
+            device_id: args.device_id.clone(),
+            capability,
+            arguments: serde_json::Value::Object(arguments),
+            wait_ms: args.wait_ms,
+            source_run_id: None,
+            source_session_id: None,
+            source_tool_call_id: None,
+        },
+        now_ms()?,
+    )
+    .await?;
+    if args.json {
+        return print_json(device::result_json(&record));
+    }
+    println!("{} {}", record.command_id, record.state.as_str());
+    if let Some(error) = &record.error {
+        println!("  {error}");
+    }
+    if let Some(result) = &record.result {
+        println!("  {result}");
+    }
+    if let Some(artifact) = &record.artifact {
+        println!(
+            "  artifact: {} bytes of {} (sha256 {})",
+            artifact.bytes, artifact.media_type, artifact.sha256
+        );
+    }
+    Ok(())
+}
+
+fn device_commands(
+    paths: &DaemonPaths,
+    device_id: &str,
+    limit: u32,
+    json: bool,
+) -> Result<(), String> {
+    let store = RemoteStore::open(&paths.root)?;
+    let commands = store.device_commands(device_id, limit)?;
+    if json {
+        return print_json(serde_json::json!({
+            "commands": commands.iter().map(command_json).collect::<Vec<_>>(),
+        }));
+    }
+    for record in &commands {
+        println!(
+            "{}  {:<10} {:?}{}",
+            record.command_id,
+            record.state.as_str(),
+            record.capability,
+            record
+                .error
+                .as_ref()
+                .map(|error| format!("  — {error}"))
+                .unwrap_or_default()
+        );
+    }
     Ok(())
 }
 

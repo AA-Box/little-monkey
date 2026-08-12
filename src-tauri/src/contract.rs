@@ -45,7 +45,7 @@ use crate::http_route_registry::{
 /// * **minor**: anything additive — a new route, method, tool, or optional
 ///   parameter.
 /// * **patch**: descriptions and other non-structural wording.
-pub const CONTRACT_VERSION: &str = "1.2.0";
+pub const CONTRACT_VERSION: &str = "1.3.0";
 
 /// How long a surface stays after it is announced deprecated.
 ///
@@ -519,6 +519,10 @@ fn tool_entries() -> Vec<ToolEntry> {
     entries.push(tool_entry(
         &crate::agent_tools::task_tool_def(),
         "subagents_enabled",
+    ));
+    entries.push(tool_entry(
+        &crate::agent_tools::device_action_tool_def(),
+        "paired_device_capable",
     ));
     entries
 }
