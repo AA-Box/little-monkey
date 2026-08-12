@@ -1735,7 +1735,7 @@ impl RemoteStore {
         if token.trim().is_empty() || token.len() > 4_096 {
             return Err("A push token must be 1-4096 characters".to_string());
         }
-        if !matches!(backend, "fcm") {
+        if !matches!(backend, "web_push" | "fcm") {
             return Err(format!("Unsupported push backend '{backend}'"));
         }
         self.connection

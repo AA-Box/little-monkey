@@ -452,6 +452,12 @@
     },
     {
       "plane": "device",
+      "method": "GET",
+      "path": "/v1/remote/device/push/key",
+      "gate": "self_service"
+    },
+    {
+      "plane": "device",
       "method": "POST",
       "path": "/v1/remote/device/push",
       "gate": "self_service"

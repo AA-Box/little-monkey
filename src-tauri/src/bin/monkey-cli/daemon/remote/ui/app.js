@@ -69,6 +69,7 @@ const state = {
   // The command currently being performed, so a cancel can reach it.
   activeCommand: null,
   commandLoopRunning: false,
+  pushSubscribed: false,
   // True when the runs on screen came from the offline cache rather than the
   // runner. Every side-effecting control is disabled while this is set.
   stale: false,
@@ -129,6 +130,8 @@ const ui = Object.fromEntries(
     "deviceEffective",
     "devicePermissions",
     "staleBanner",
+    "pushButton",
+    "pushStatus",
     "connectionDot",
     "connectionText",
     "toast",
@@ -1272,6 +1275,28 @@ function bindEvents() {
       setButtonBusy(ui.confirmCancelButton, false);
     }
   });
+  ui.pushButton?.addEventListener("click", async () => {
+    setButtonBusy(ui.pushButton, true, "Working…");
+    try {
+      if (state.pushSubscribed) {
+        await unsubscribeFromPush();
+        showToast("This device will no longer be woken.");
+      } else {
+        const endpoint = await subscribeToPush();
+        showToast(
+          endpoint
+            ? "Notifications on. The runner encrypts each one to this device."
+            : "This runner does not send notifications.",
+        );
+      }
+    } catch (error) {
+      handleError(error, "Notification setting could not be changed");
+    } finally {
+      setButtonBusy(ui.pushButton, false);
+      await refreshPushState();
+    }
+  });
+
   ui.killButton.addEventListener("click", () => void engageKillSwitch());
   ui.artifactForm.addEventListener("submit", fetchArtifact);
   ui.forgetButton.addEventListener("click", async () => {
@@ -1795,6 +1820,85 @@ function markOnline() {
   applyStaleState();
 }
 
+// --- Push -----------------------------------------------------------------
+
+// Subscribes this browser to the runner's own Web Push identity.
+//
+// Nothing here is a third-party account: the runner hands over the public half
+// of a VAPID key it generated itself, the browser's own push service issues the
+// endpoint, and the runner encrypts each notification to this device before
+// that service ever carries it. A 404 for the key means this runner does not do
+// push, and the offer is simply not made.
+async function subscribeToPush() {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) return null;
+  let key;
+  try {
+    key = await signedRequest("GET", "/v1/remote/device/push/key");
+  } catch (error) {
+    if (error instanceof RemoteError && error.status === 404) return null;
+    throw error;
+  }
+  const applicationServerKey = base64UrlToBytes(key.application_server_key);
+  // Registered at the origin root, which is the scope the controller needs.
+  const registration = await navigator.serviceWorker.register("/sw.js");
+  await navigator.serviceWorker.ready;
+  // A push subscription that shows nothing to the user is not something this
+  // client asks for: `userVisibleOnly` is what makes the browser's own
+  // permission prompt honest about what it is for.
+  const existing = await registration.pushManager.getSubscription();
+  const subscription =
+    existing ||
+    (await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey,
+    }));
+  const raw = subscription.toJSON();
+  if (!raw.endpoint || !raw.keys?.p256dh || !raw.keys?.auth) {
+    throw new Error("The browser returned an incomplete push subscription");
+  }
+  await signedRequest("POST", "/v1/remote/device/push", {
+    backend: "web_push",
+    subscription: { endpoint: raw.endpoint, p256dh: raw.keys.p256dh, auth: raw.keys.auth },
+  });
+  return raw.endpoint;
+}
+
+// Stops this device being woken, on both ends: the browser subscription is
+// dropped and the runner is told to forget the address. Either half alone would
+// leave a notification path the user thought they had closed.
+async function unsubscribeFromPush() {
+  if ("serviceWorker" in navigator) {
+    const registration = await navigator.serviceWorker.getRegistration("/sw.js");
+    const subscription = await registration?.pushManager.getSubscription();
+    if (subscription) await subscription.unsubscribe();
+  }
+  await signedRequest("DELETE", "/v1/remote/device/push");
+}
+
+function base64UrlToBytes(value) {
+  const padded = String(value).replaceAll("-", "+").replaceAll("_", "/");
+  const binary = atob(padded + "=".repeat((4 - (padded.length % 4)) % 4));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+async function refreshPushState() {
+  if (!ui.pushButton) return;
+  let subscribed = false;
+  if ("serviceWorker" in navigator) {
+    const registration = await navigator.serviceWorker.getRegistration("/sw.js");
+    subscribed = Boolean(await registration?.pushManager.getSubscription());
+  }
+  state.pushSubscribed = subscribed;
+  ui.pushButton.textContent = subscribed ? "Stop notifications" : "Enable notifications";
+  if (ui.pushStatus) {
+    ui.pushStatus.textContent = subscribed
+      ? "This device can be woken for approvals and finished runs. A notification says what kind of thing happened, not what it said."
+      : "Notifications are off. This device only sees updates while the controller is open.";
+  }
+}
+
 async function initialize() {
   bindEvents();
   if (!requiredFeaturesAvailable()) {
@@ -1832,6 +1936,7 @@ async function initialize() {
   } catch (error) {
     handleError(error, "This device could not report what it can do");
   }
+  void refreshPushState();
   // Deliberately not awaited: the loop runs for the life of the page.
   void runCommandLoop();
 }

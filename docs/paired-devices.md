@@ -106,14 +106,34 @@ view the device cannot refresh would act on a run it can no longer see.
 
 ## Push
 
-Push is optional, provider-neutral, and yours. Little Monkey ships no Firebase
-project, no service account, and no relay:
+Push is optional, provider-neutral, and yours. Little Monkey ships no push
+project, no key, and no relay.
+
+The default backend is **Web Push**, and it needs no account anywhere:
+
+```bash
+monkey daemon remote push-configure --web-push
+monkey daemon remote push-status
+monkey daemon remote push-test <device-id>
+```
+
+That mints this runner's own VAPID identity, keeps the private half in the
+system keychain, and hands the public half to the browser as its
+`applicationServerKey`. Each notification is sealed to the device with RFC 8291
+before the browser's own push service carries it — that service sees ciphertext
+and an address, never a title or a body.
+
+The browser controller offers an **Enable notifications** button once the runner
+answers with a key. Turning it off unsubscribes the browser *and* tells the
+runner to forget the address; leaving either half would keep a path open that
+the user believes is closed.
+
+A native client that holds its own Firebase registration token can use FCM
+instead, against the operator's own project:
 
 ```bash
 monkey daemon remote push-configure --project-id <your-project> \
   --service-account ./your-service-account.json
-monkey daemon remote push-status
-monkey daemon remote push-test <device-id>
 ```
 
 A notification says what kind of thing happened and which id it happened to —

@@ -116,6 +116,7 @@ monkey daemon remote device-grant <device-id> [--capability <capability>]...
 monkey daemon remote device-action <action> [--device-id <id>] [--wait-ms <n>] [--json]
 monkey daemon remote device-commands <device-id> [--limit <n>] [--json]
 monkey daemon remote device-cancel <command-id>
+monkey daemon remote push-configure --web-push [--vapid-subject <url>] [--include-detail]
 monkey daemon remote push-configure --project-id <id> --service-account <file> [--include-detail]
 monkey daemon remote push-status [--json] | push-disable | push-test <device-id>
 ```

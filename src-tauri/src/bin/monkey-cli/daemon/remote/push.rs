@@ -1,16 +1,25 @@
 //! Waking a paired device up.
 //!
 //! **Provider-neutral by construction.** Everything above [`PushBackend`] knows
-//! only that a device has a token and that something happened; which service
-//! carries it is one implementation of one trait. FCM is the first backend
-//! because it is what phones actually have, not because anything here depends
-//! on Google.
+//! only that a device has an address and that something happened; which service
+//! carries it is one implementation of one trait.
 //!
-//! **The configuration is the end user's.** Little Monkey is open source and
-//! ships no Firebase project, no service account and no relay: an operator who
-//! wants push points this at *their* project and *their* service account, and a
-//! machine that has not is simply a machine without push. There is nowhere in
-//! this file for a maintainer-owned credential to live, which is the point.
+//! **Two backends, and the default is the one the bundled client can use.**
+//! The mobile controller this runner serves is a browser. It has no Firebase
+//! SDK and its own content security policy forbids loading one, so it could
+//! never hold an FCM token — a push path it cannot register for would be
+//! decoration. [`WebPushBackend`] is therefore the default: the browser's own
+//! `PushManager` gives the address, this runner mints its own VAPID identity,
+//! and the notification is sealed to the subscriber with RFC 8291 before the
+//! push service ever sees it. [`FcmBackend`] remains for a native client that
+//! does hold a registration token.
+//!
+//! **The configuration is the end user's.** Little Monkey ships no Firebase
+//! project, no service account, no VAPID key and no relay. Web Push needs no
+//! account anywhere: the keypair is generated on this machine and the only
+//! third party involved is the push service the user's own browser already
+//! chose. FCM, if an operator picks it, uses *their* project. There is nowhere
+//! in this file for a maintainer-owned credential to live, which is the point.
 //!
 //! **A push grants nothing.** It is a notification, never authority: the device
 //! still has to make an ordinary signed request to learn anything or do
@@ -147,17 +156,35 @@ pub trait PushBackend: Send + Sync {
 #[serde(deny_unknown_fields)]
 pub struct PushConfig {
     pub protocol_version: u32,
-    /// `fcm` or `none`. A closed set rather than a URL: a backend is code in
-    /// this file, and "point push at an arbitrary host" is not a feature.
+    /// `web_push`, `fcm` or `none`. A closed set rather than a URL: a backend
+    /// is code in this file, and "point push at an arbitrary host" is not a
+    /// feature.
+    ///
+    /// `web_push` is the default and the one the bundled browser client uses;
+    /// it needs no account anywhere. `fcm` exists for a native client that
+    /// holds a Firebase registration token, and then the project is the
+    /// operator's own.
     pub backend: String,
-    /// The operator's own Firebase project.
+    /// The operator's own Firebase project. Empty under `web_push`.
+    #[serde(default)]
     pub project_id: String,
     /// Where the service account JSON was copied to inside app-private state.
+    /// Empty under `web_push`.
+    #[serde(default)]
     pub service_account_path: String,
+    /// The VAPID `sub` claim: how a push service would contact whoever is
+    /// sending. A self-hosted runner has no support address, so this is its own
+    /// advertised URL.
+    #[serde(default = "default_vapid_subject")]
+    pub vapid_subject: String,
     /// Whether notifications may carry specifics. Off by default: the visible
     /// text of a push is the least private thing this system produces.
     pub include_detail: bool,
     pub enabled: bool,
+}
+
+fn default_vapid_subject() -> String {
+    "https://localhost".to_string()
 }
 
 impl PushConfig {
@@ -165,8 +192,15 @@ impl PushConfig {
         if self.protocol_version != REMOTE_PROTOCOL_VERSION {
             return Err("Unsupported push configuration version".to_string());
         }
-        if !matches!(self.backend.as_str(), "fcm" | "none") {
-            return Err("Push backend must be 'fcm' or 'none'".to_string());
+        if !matches!(self.backend.as_str(), "web_push" | "fcm" | "none") {
+            return Err("Push backend must be 'web_push', 'fcm' or 'none'".to_string());
+        }
+        if self.backend == "web_push" {
+            let subject = url::Url::parse(&self.vapid_subject)
+                .map_err(|_| "The VAPID subject must be an https: or mailto: URL".to_string())?;
+            if !matches!(subject.scheme(), "https" | "mailto") {
+                return Err("The VAPID subject must be an https: or mailto: URL".to_string());
+            }
         }
         if self.backend == "fcm" {
             if self.project_id.trim().is_empty() || self.project_id.len() > 128 {
@@ -203,6 +237,36 @@ pub fn load_config(paths: &DaemonPaths) -> Result<Option<PushConfig>, String> {
 /// The key is copied rather than referenced in place for the same reason
 /// `configure_host` copies the TLS key: a path in the user's Downloads folder
 /// is not somewhere a daemon should be reading a credential from months later.
+/// Mints this runner's own VAPID identity and enables Web Push.
+///
+/// No account, no project, no third-party console: the keypair is generated
+/// here and the private half goes straight into the platform keychain, beside
+/// every other device secret. Idempotent — an existing key is kept, because
+/// replacing it would silently invalidate every subscription already made
+/// against it.
+pub fn configure_web_push(
+    paths: &DaemonPaths,
+    subject: &str,
+    include_detail: bool,
+    secrets: &dyn super::store::RemoteSecretStore,
+) -> Result<PushConfig, String> {
+    paths.ensure()?;
+    if secrets.get(VAPID_SECRET_SLOT).is_err() {
+        secrets.set(VAPID_SECRET_SLOT, &VapidIdentity::generate()?)?;
+    }
+    let config = PushConfig {
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+        backend: "web_push".to_string(),
+        project_id: String::new(),
+        service_account_path: String::new(),
+        vapid_subject: subject.to_string(),
+        include_detail,
+        enabled: true,
+    };
+    save_config(paths, &config)?;
+    Ok(config)
+}
+
 pub fn configure(
     paths: &DaemonPaths,
     project_id: &str,
@@ -233,6 +297,7 @@ pub fn configure(
         backend: "fcm".to_string(),
         project_id: project_id.to_string(),
         service_account_path: destination.to_string_lossy().to_string(),
+        vapid_subject: default_vapid_subject(),
         include_detail,
         enabled: true,
     };
@@ -443,14 +508,37 @@ impl PushBackend for FcmBackend {
 
 /// Resolves the operator's configured backend, or `None` when this machine has
 /// no push configured — which is the ordinary case, not an error.
-pub fn backend(paths: &DaemonPaths) -> Result<Option<Box<dyn PushBackend>>, String> {
+pub fn backend(
+    paths: &DaemonPaths,
+    secrets: &dyn super::store::RemoteSecretStore,
+) -> Result<Option<Box<dyn PushBackend>>, String> {
     let Some(config) = load_config(paths)? else {
         return Ok(None);
     };
     if !config.enabled || config.backend == "none" {
         return Ok(None);
     }
-    Ok(Some(Box::new(FcmBackend::open(&config)?)))
+    Ok(Some(match config.backend.as_str() {
+        "web_push" => Box::new(WebPushBackend::open(&config, secrets)?) as Box<dyn PushBackend>,
+        _ => Box::new(FcmBackend::open(&config)?),
+    }))
+}
+
+/// The `applicationServerKey` a browser needs before it can subscribe, or
+/// `None` when this runner does not do Web Push.
+pub fn application_server_key(
+    paths: &DaemonPaths,
+    secrets: &dyn super::store::RemoteSecretStore,
+) -> Result<Option<String>, String> {
+    let Some(config) = load_config(paths)? else {
+        return Ok(None);
+    };
+    if !config.enabled || config.backend != "web_push" {
+        return Ok(None);
+    }
+    Ok(Some(
+        WebPushBackend::open(&config, secrets)?.application_server_key(),
+    ))
 }
 
 /// Wakes one device, if it has registered and this machine has push
@@ -463,11 +551,12 @@ pub async fn notify_device(
     paths: &DaemonPaths,
     device_id: &str,
     notification: &PushNotification,
+    secrets: &dyn super::store::RemoteSecretStore,
 ) -> Result<bool, String> {
     let Some(config) = load_config(paths)? else {
         return Ok(false);
     };
-    let Some(backend) = backend(paths)? else {
+    let Some(backend) = backend(paths, secrets)? else {
         return Ok(false);
     };
     let registration =
@@ -492,11 +581,12 @@ pub async fn notify_device(
 pub async fn notify_all(
     paths: &DaemonPaths,
     notification: &PushNotification,
+    secrets: &dyn super::store::RemoteSecretStore,
 ) -> Result<usize, String> {
     let Some(config) = load_config(paths)? else {
         return Ok(0);
     };
-    let Some(backend) = backend(paths)? else {
+    let Some(backend) = backend(paths, secrets)? else {
         return Ok(0);
     };
     let registrations = super::store::RemoteStore::open(&paths.root)?.push_registrations()?;
@@ -514,6 +604,365 @@ pub async fn notify_all(
     Ok(delivered)
 }
 
+// --- Web Push (RFC 8030 / 8188 / 8291 / 8292) ------------------------------
+//
+// The backend the *bundled* client can actually use. The mobile controller this
+// runner serves is a browser: it has no Firebase SDK and its own content
+// security policy forbids loading one, so it can never hold an FCM token. What
+// it does have is `PushManager.subscribe`, which yields an endpoint on whatever
+// push service the browser vendor runs, plus the two keys needed to encrypt to
+// it.
+//
+// That makes this the *more* self-service of the two backends, not the lesser
+// one: there is no account to create anywhere. The operator's runner mints its
+// own VAPID identity, and the only third party involved is the push service the
+// user's own browser already chose.
+//
+// Implemented directly on `ring` rather than pulled in as a crate: every
+// primitive RFC 8291 needs — ECDH on P-256, HKDF-SHA256, AES-128-GCM — is
+// already in this binary's dependency graph, and the whole construction is the
+// hundred lines below.
+
+/// Where the VAPID private key lives in the runner's keychain.
+pub const VAPID_SECRET_SLOT: &str = "vapid:web-push:1";
+
+/// The record size this sender advertises. A single record is always used —
+/// notifications are bounded to a few hundred bytes by `PushKind` — so this is
+/// only ever the "everything fits" value.
+const RECORD_SIZE: u32 = 4_096;
+
+/// How long a push service should hold an undelivered notification. Four hours:
+/// long enough for a phone that is asleep, short enough that nobody is woken by
+/// an approval request that was answered yesterday.
+const PUSH_TTL_SECONDS: u32 = 4 * 60 * 60;
+
+/// One browser's subscription, exactly as `PushManager.subscribe` produced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebPushSubscription {
+    pub endpoint: String,
+    /// The subscriber's uncompressed P-256 public key, base64url.
+    pub p256dh: String,
+    /// The subscriber's 16-byte authentication secret, base64url.
+    pub auth: String,
+}
+
+impl WebPushSubscription {
+    pub fn validate(&self) -> Result<(), String> {
+        let endpoint = url::Url::parse(&self.endpoint)
+            .map_err(|error| format!("Push endpoint is not a URL: {error}"))?;
+        // HTTPS only, and no credentials: this URL is stored and later posted to
+        // by a background process.
+        if endpoint.scheme() != "https"
+            || endpoint.host_str().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+        {
+            return Err("Push endpoint must be a credential-free HTTPS URL".to_string());
+        }
+        if self.endpoint.len() > 2_048 {
+            return Err("Push endpoint is too long".to_string());
+        }
+        if decode_base64url(&self.p256dh)?.len() != 65 {
+            return Err("Push subscription key must be an uncompressed P-256 point".to_string());
+        }
+        if decode_base64url(&self.auth)?.len() != 16 {
+            return Err("Push subscription auth secret must be 16 bytes".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// HKDF output length, as `ring`'s `KeyType` wants it.
+#[derive(Debug, Clone, Copy)]
+struct HkdfLength(usize);
+
+impl ring::hkdf::KeyType for HkdfLength {
+    fn len(&self) -> usize {
+        self.0
+    }
+}
+
+fn hkdf(salt: &[u8], ikm: &[u8], info: &[u8], length: usize) -> Result<Vec<u8>, String> {
+    let prk = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, salt).extract(ikm);
+    // `info` is bound to a local first: `expand` borrows the slice-of-slices,
+    // and a temporary built inline would be dropped before `fill` reads it.
+    let info = [info];
+    let okm = prk
+        .expand(&info, HkdfLength(length))
+        .map_err(|_| "HKDF expansion failed".to_string())?;
+    let mut out = vec![0u8; length];
+    okm.fill(&mut out)
+        .map_err(|_| "HKDF output could not be read".to_string())?;
+    Ok(out)
+}
+
+/// Encrypts one notification to one subscription, producing an `aes128gcm`
+/// body (RFC 8188) keyed as RFC 8291 requires.
+///
+/// The ephemeral key is generated per message, which is what makes each
+/// delivery independently sealed: the push service that carries this body — a
+/// third party, by design — sees only ciphertext.
+pub fn encrypt_web_push(
+    subscription: &WebPushSubscription,
+    plaintext: &[u8],
+    salt: [u8; 16],
+    ephemeral: ring::agreement::EphemeralPrivateKey,
+) -> Result<Vec<u8>, String> {
+    let ua_public = decode_base64url(&subscription.p256dh)?;
+    let auth_secret = decode_base64url(&subscription.auth)?;
+    let as_public = ephemeral
+        .compute_public_key()
+        .map_err(|_| "The ephemeral public key could not be computed".to_string())?
+        .as_ref()
+        .to_vec();
+
+    let peer = ring::agreement::UnparsedPublicKey::new(&ring::agreement::ECDH_P256, &ua_public);
+    let shared = ring::agreement::agree_ephemeral(ephemeral, &peer, |secret| secret.to_vec())
+        .map_err(|_| "The push key agreement failed".to_string())?;
+
+    // RFC 8291 §3.4. The key info binds the derived secret to *both* public
+    // keys, so a shared secret cannot be replayed against a different
+    // subscriber.
+    let mut key_info = b"WebPush: info\0".to_vec();
+    key_info.extend_from_slice(&ua_public);
+    key_info.extend_from_slice(&as_public);
+    let ikm = hkdf(&auth_secret, &shared, &key_info, 32)?;
+
+    // RFC 8188 §2.
+    let content_encryption_key = hkdf(&salt, &ikm, b"Content-Encoding: aes128gcm\0", 16)?;
+    let nonce = hkdf(&salt, &ikm, b"Content-Encoding: nonce\0", 12)?;
+
+    let key = ring::aead::LessSafeKey::new(
+        ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &content_encryption_key)
+            .map_err(|_| "The push content key is invalid".to_string())?,
+    );
+    // 0x02 is the last-record delimiter; there is only ever one record here.
+    let mut sealed = plaintext.to_vec();
+    sealed.push(0x02);
+    key.seal_in_place_append_tag(
+        ring::aead::Nonce::assume_unique_for_key(
+            nonce
+                .as_slice()
+                .try_into()
+                .map_err(|_| "The push nonce is the wrong length".to_string())?,
+        ),
+        ring::aead::Aad::empty(),
+        &mut sealed,
+    )
+    .map_err(|_| "The push payload could not be encrypted".to_string())?;
+
+    let mut body = Vec::with_capacity(21 + as_public.len() + sealed.len());
+    body.extend_from_slice(&salt);
+    body.extend_from_slice(&RECORD_SIZE.to_be_bytes());
+    body.push(as_public.len() as u8);
+    body.extend_from_slice(&as_public);
+    body.extend_from_slice(&sealed);
+    Ok(body)
+}
+
+/// The runner's own VAPID identity (RFC 8292).
+///
+/// Minted here and kept in the platform keychain — never a maintainer's key,
+/// and never shared between machines. The public half is what the browser is
+/// given as `applicationServerKey`, which is how a push service knows a
+/// notification for that subscription really came from this runner.
+pub struct VapidIdentity {
+    key_pair: ring::signature::EcdsaKeyPair,
+    public_key: Vec<u8>,
+    /// The `sub` claim. A push service uses it to contact whoever is sending;
+    /// for a self-hosted runner there is no support address, so this is the
+    /// runner's own advertised URL.
+    subject: String,
+}
+
+impl VapidIdentity {
+    /// Generates a new identity, returning the PKCS#8 bytes to store.
+    pub fn generate() -> Result<Vec<u8>, String> {
+        let rng = ring::rand::SystemRandom::new();
+        let document = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &rng,
+        )
+        .map_err(|_| "A VAPID key pair could not be generated".to_string())?;
+        Ok(document.as_ref().to_vec())
+    }
+
+    pub fn from_pkcs8(pkcs8: &[u8], subject: &str) -> Result<Self, String> {
+        let rng = ring::rand::SystemRandom::new();
+        let key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            pkcs8,
+            &rng,
+        )
+        .map_err(|_| "The stored VAPID key is unusable".to_string())?;
+        let public_key = ring::signature::KeyPair::public_key(&key_pair)
+            .as_ref()
+            .to_vec();
+        Ok(Self {
+            key_pair,
+            public_key,
+            subject: subject.to_string(),
+        })
+    }
+
+    /// What the browser passes to `PushManager.subscribe`.
+    pub fn application_server_key(&self) -> String {
+        base64url(&self.public_key)
+    }
+
+    /// The `Authorization: vapid t=…, k=…` header value for one endpoint.
+    ///
+    /// The audience is the endpoint's *origin*, not the endpoint: a token
+    /// scoped to the full URL would leak which subscription it was for to any
+    /// push service that logs headers, and RFC 8292 asks for the origin anyway.
+    pub fn authorization(&self, endpoint: &str, now_s: u64) -> Result<String, String> {
+        let url = url::Url::parse(endpoint)
+            .map_err(|error| format!("Push endpoint is not a URL: {error}"))?;
+        let audience = url.origin().ascii_serialization();
+        let header = base64url(
+            serde_json::json!({ "typ": "JWT", "alg": "ES256" })
+                .to_string()
+                .as_bytes(),
+        );
+        let claims = base64url(
+            serde_json::json!({
+                "aud": audience,
+                // Twelve hours. RFC 8292 caps this at 24; half of that leaves
+                // room for a slow clock at either end without minting a token
+                // that stays valid for a day.
+                "exp": now_s + 12 * 60 * 60,
+                "sub": self.subject,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let signing_input = format!("{header}.{claims}");
+        let rng = ring::rand::SystemRandom::new();
+        let signature = self
+            .key_pair
+            .sign(&rng, signing_input.as_bytes())
+            .map_err(|_| "The VAPID assertion could not be signed".to_string())?;
+        Ok(format!(
+            "vapid t={signing_input}.{}, k={}",
+            base64url(signature.as_ref()),
+            self.application_server_key()
+        ))
+    }
+}
+
+/// Delivers to a browser's own push service.
+pub struct WebPushBackend {
+    identity: VapidIdentity,
+}
+
+impl WebPushBackend {
+    pub fn open(
+        config: &PushConfig,
+        secrets: &dyn super::store::RemoteSecretStore,
+    ) -> Result<Self, String> {
+        let pkcs8 = secrets.get(VAPID_SECRET_SLOT).map_err(|error| {
+            format!("This runner has no VAPID key yet ({error}); run `remote push-configure --web-push`")
+        })?;
+        Ok(Self {
+            identity: VapidIdentity::from_pkcs8(&pkcs8, &config.vapid_subject)?,
+        })
+    }
+
+    pub fn application_server_key(&self) -> String {
+        self.identity.application_server_key()
+    }
+
+    /// The exact request this sender would put on the wire, minus the network.
+    /// Split out so the encryption, the headers and the framing are all
+    /// assertable without a push service.
+    pub fn build_request(
+        &self,
+        subscription: &WebPushSubscription,
+        payload: &PushPayload,
+        now_s: u64,
+    ) -> Result<(String, Vec<(String, String)>, Vec<u8>), String> {
+        subscription.validate()?;
+        let plaintext = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
+        let mut salt = [0u8; 16];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut salt)
+            .map_err(|_| "The operating system random generator failed".to_string())?;
+        let ephemeral = ring::agreement::EphemeralPrivateKey::generate(
+            &ring::agreement::ECDH_P256,
+            &ring::rand::SystemRandom::new(),
+        )
+        .map_err(|_| "An ephemeral push key could not be generated".to_string())?;
+        let body = encrypt_web_push(subscription, &plaintext, salt, ephemeral)?;
+        let headers = vec![
+            (
+                "Authorization".to_string(),
+                self.identity.authorization(&subscription.endpoint, now_s)?,
+            ),
+            ("Content-Encoding".to_string(), "aes128gcm".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            ),
+            ("TTL".to_string(), PUSH_TTL_SECONDS.to_string()),
+            // An approval that nobody sees is the failure this whole path
+            // exists to prevent, so these are worth waking a screen for.
+            ("Urgency".to_string(), "high".to_string()),
+        ];
+        Ok((subscription.endpoint.clone(), headers, body))
+    }
+}
+
+#[async_trait::async_trait]
+impl PushBackend for WebPushBackend {
+    fn name(&self) -> &'static str {
+        "web_push"
+    }
+
+    async fn send(&self, token: &str, payload: &PushPayload) -> Result<String, String> {
+        let subscription: WebPushSubscription = serde_json::from_str(token)
+            .map_err(|error| format!("The stored push subscription is unreadable: {error}"))?;
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "The system clock is before the epoch".to_string())?
+            .as_secs();
+        let (endpoint, headers, body) = self.build_request(&subscription, payload, now_s)?;
+        let client = little_monkey_lib::egress::hardened()
+            .build()
+            .map_err(|error| format!("Could not build the push client: {error}"))?;
+        let mut request = client.post(&endpoint).body(body);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("The push delivery failed: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            // 404/410 is the push service saying this subscription is dead. The
+            // caller deletes it rather than retrying forever.
+            return Err(format!(
+                "The push service refused the message ({}){}",
+                status,
+                if status.as_u16() == 404 || status.as_u16() == 410 {
+                    ": the subscription has expired"
+                } else {
+                    ""
+                }
+            ));
+        }
+        Ok(status.to_string())
+    }
+}
+
+fn decode_base64url(value: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    // Browsers emit unpadded base64url; some emit padded. Accept both rather
+    // than rejecting a perfectly good subscription over a trailing '='.
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value.trim_end_matches('='))
+        .map_err(|error| format!("Push subscription value is not base64url: {error}"))
+}
+
 fn base64url(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -526,6 +975,8 @@ fn bounded(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+
+    use base64::Engine;
 
     use super::*;
 
@@ -544,6 +995,212 @@ mod tests {
                 .push((token.to_string(), payload.clone()));
             Ok("projects/test/messages/1".to_string())
         }
+    }
+
+    /// **The Web Push payload really is decryptable by a real subscriber.**
+    ///
+    /// Encryption that only ever runs forwards proves nothing: a wrong info
+    /// string, a swapped salt, or a mis-ordered header would all still produce
+    /// plausible-looking ciphertext, and the failure would surface as silence on
+    /// someone's phone. So this test *is* the browser: it generates a
+    /// subscriber key pair, hands over the public half exactly as
+    /// `PushManager.subscribe` would, then performs the RFC 8291 receiver side
+    /// — parse the header, agree, derive, decrypt — and asserts the plaintext
+    /// comes back.
+    #[test]
+    fn a_web_push_body_decrypts_back_to_the_notification_for_a_real_subscriber() {
+        let rng = ring::rand::SystemRandom::new();
+        // The subscriber. `ring`'s ephemeral keys cannot be reused, so the
+        // receiver side derives the shared secret from its own private key —
+        // exactly as a browser does.
+        let ua_private =
+            ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::ECDH_P256, &rng)
+                .unwrap();
+        let ua_public = ua_private.compute_public_key().unwrap().as_ref().to_vec();
+        let mut auth_secret = [0u8; 16];
+        ring::rand::SecureRandom::fill(&rng, &mut auth_secret).unwrap();
+
+        let subscription = WebPushSubscription {
+            endpoint: "https://push.example.invalid/subscription/abc".into(),
+            p256dh: base64url(&ua_public),
+            auth: base64url(&auth_secret),
+        };
+        subscription.validate().unwrap();
+
+        let payload = PushNotification {
+            kind: PushKind::ApprovalRequested,
+            target_id: Some("run-seven".into()),
+            detail: None,
+        }
+        .payload(false);
+        let plaintext = serde_json::to_vec(&payload).unwrap();
+
+        let mut salt = [0u8; 16];
+        ring::rand::SecureRandom::fill(&rng, &mut salt).unwrap();
+        let as_private =
+            ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::ECDH_P256, &rng)
+                .unwrap();
+        let body = encrypt_web_push(&subscription, &plaintext, salt, as_private).unwrap();
+
+        // --- the receiver, from here down ---
+        assert_eq!(&body[..16], &salt, "the header must carry the salt");
+        assert_eq!(
+            u32::from_be_bytes(body[16..20].try_into().unwrap()),
+            RECORD_SIZE
+        );
+        let key_length = body[20] as usize;
+        assert_eq!(key_length, 65, "an uncompressed P-256 point is 65 bytes");
+        let as_public = &body[21..21 + key_length];
+        let ciphertext = &body[21 + key_length..];
+
+        let peer = ring::agreement::UnparsedPublicKey::new(&ring::agreement::ECDH_P256, as_public);
+        let shared =
+            ring::agreement::agree_ephemeral(ua_private, &peer, |secret| secret.to_vec()).unwrap();
+        let mut key_info = b"WebPush: info\0".to_vec();
+        key_info.extend_from_slice(&ua_public);
+        key_info.extend_from_slice(as_public);
+        let ikm = hkdf(&auth_secret, &shared, &key_info, 32).unwrap();
+        let content_encryption_key =
+            hkdf(&salt, &ikm, b"Content-Encoding: aes128gcm\0", 16).unwrap();
+        let nonce = hkdf(&salt, &ikm, b"Content-Encoding: nonce\0", 12).unwrap();
+        let key = ring::aead::LessSafeKey::new(
+            ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &content_encryption_key).unwrap(),
+        );
+        let mut opened = ciphertext.to_vec();
+        let decrypted = key
+            .open_in_place(
+                ring::aead::Nonce::assume_unique_for_key(nonce.as_slice().try_into().unwrap()),
+                ring::aead::Aad::empty(),
+                &mut opened,
+            )
+            .expect("a real subscriber must be able to decrypt this");
+        assert_eq!(
+            decrypted.last(),
+            Some(&0x02),
+            "the record must end with the last-record delimiter"
+        );
+        let received: PushPayload =
+            serde_json::from_slice(&decrypted[..decrypted.len() - 1]).unwrap();
+        assert_eq!(received, payload);
+
+        // And the seal is real: one flipped ciphertext byte must not open.
+        let mut tampered = ciphertext.to_vec();
+        tampered[0] ^= 0x01;
+        assert!(key
+            .open_in_place(
+                ring::aead::Nonce::assume_unique_for_key(nonce.as_slice().try_into().unwrap()),
+                ring::aead::Aad::empty(),
+                &mut tampered,
+            )
+            .is_err());
+    }
+
+    /// The VAPID half: a real ES256 signature, over the claims RFC 8292 asks
+    /// for, verifiable with the key the header advertises.
+    #[test]
+    fn the_vapid_header_is_a_verifiable_es256_token_scoped_to_the_endpoint_origin() {
+        let identity = VapidIdentity::from_pkcs8(
+            &VapidIdentity::generate().unwrap(),
+            "https://runner.example.invalid",
+        )
+        .unwrap();
+        let header = identity
+            .authorization(
+                "https://push.example.invalid/subscription/abc?query=1",
+                1_000,
+            )
+            .unwrap();
+        let (token, advertised_key) = header
+            .strip_prefix("vapid t=")
+            .and_then(|rest| rest.split_once(", k="))
+            .expect("the header must carry both the token and the key");
+        assert_eq!(advertised_key, identity.application_server_key());
+
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let claims: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(parts[1])
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            claims["aud"], "https://push.example.invalid",
+            "the audience is the origin, never the full subscription URL"
+        );
+        assert_eq!(claims["sub"], "https://runner.example.invalid");
+        assert_eq!(claims["exp"].as_u64().unwrap(), 1_000 + 12 * 60 * 60);
+
+        // The signature verifies against the advertised public key, which is
+        // the only thing a push service actually checks.
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[2])
+            .unwrap();
+        let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(advertised_key)
+            .unwrap();
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_FIXED,
+            &public_key,
+        )
+        .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+        .expect("a push service must be able to verify this token");
+    }
+
+    /// A subscription is checked before it is stored, so an unusable one is
+    /// refused while the device is still there to be told.
+    #[test]
+    fn a_web_push_subscription_must_be_a_credential_free_https_endpoint_with_real_keys() {
+        let good = WebPushSubscription {
+            endpoint: "https://push.example.invalid/s/1".into(),
+            p256dh: base64url(&[4u8; 65]),
+            auth: base64url(&[7u8; 16]),
+        };
+        assert!(good.validate().is_ok());
+        for broken in [
+            WebPushSubscription {
+                endpoint: "http://push.example.invalid/s/1".into(),
+                ..good.clone()
+            },
+            WebPushSubscription {
+                endpoint: "https://user:pass@push.example.invalid/s/1".into(),
+                ..good.clone()
+            },
+            WebPushSubscription {
+                p256dh: base64url(&[4u8; 32]),
+                ..good.clone()
+            },
+            WebPushSubscription {
+                auth: base64url(&[7u8; 8]),
+                ..good.clone()
+            },
+        ] {
+            assert!(
+                broken.validate().is_err(),
+                "an invalid subscription must not reach storage: {broken:?}"
+            );
+        }
+    }
+
+    /// The whole point of choosing Web Push for the bundled client: it needs no
+    /// account anywhere, and the configuration says so.
+    #[test]
+    fn web_push_needs_no_third_party_project() {
+        let config = PushConfig {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            backend: "web_push".into(),
+            project_id: String::new(),
+            service_account_path: String::new(),
+            vapid_subject: "https://runner.example.invalid".into(),
+            include_detail: false,
+            enabled: true,
+        };
+        assert!(config.validate().is_ok());
+        let unusable_subject = PushConfig {
+            vapid_subject: "not a url".into(),
+            ..config
+        };
+        assert!(unusable_subject.validate().is_err());
     }
 
     /// The privacy claim, tested rather than asserted in a doc comment: what
@@ -617,6 +1274,7 @@ mod tests {
             backend: "fcm".into(),
             project_id: String::new(),
             service_account_path: "/tmp/key.json".into(),
+            vapid_subject: default_vapid_subject(),
             include_detail: false,
             enabled: true,
         };

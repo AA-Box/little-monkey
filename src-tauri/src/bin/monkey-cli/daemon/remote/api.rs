@@ -703,6 +703,7 @@ impl RemoteApi {
             // address grants nothing — a woken device still has to make an
             // ordinary signed request — and a device must always be able to
             // stop being woken.
+            ("GET", ["v1", "remote", "device", "push", "key"]) => self.device_push_key(),
             ("POST", ["v1", "remote", "device", "push"]) => {
                 self.device_push_register(&request.body, device_id, now_ms)
             }
@@ -2079,6 +2080,28 @@ impl RemoteApi {
         ))
     }
 
+    /// The `applicationServerKey` a browser needs before it can subscribe.
+    ///
+    /// Public by construction — it is the *public* half of this runner's VAPID
+    /// identity, and a push service checks signatures against it. Answering 404
+    /// when Web Push is not configured is what tells the client not to offer
+    /// notifications at all.
+    fn device_push_key(&self) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        match super::push::application_server_key(&self.paths, self.secrets.as_ref()) {
+            Ok(Some(key)) => Ok((
+                200,
+                serde_json::json!({
+                    "protocol_version": REMOTE_PROTOCOL_VERSION,
+                    "backend": "web_push",
+                    "application_server_key": key,
+                }),
+                None,
+            )),
+            Ok(None) => Err((404, "This runner does not send Web Push".to_string())),
+            Err(error) => Err((503, error)),
+        }
+    }
+
     fn device_push_register(
         &self,
         body: &[u8],
@@ -2091,12 +2114,25 @@ impl RemoteApi {
             .get("backend")
             .and_then(|value| value.as_str())
             .ok_or((400, "A push registration needs a 'backend'".to_string()))?;
-        let token = parsed
-            .get("token")
-            .and_then(|value| value.as_str())
-            .ok_or((400, "A push registration needs a 'token'".to_string()))?;
+        // A Web Push registration is the browser's whole subscription — the
+        // endpoint plus the two keys it will be encrypted to. It is validated
+        // here, before storage, so an unusable subscription is refused at the
+        // moment the device can still be told about it.
+        let token = if backend == "web_push" {
+            let subscription: super::push::WebPushSubscription =
+                serde_json::from_value(parsed.get("subscription").cloned().unwrap_or_default())
+                    .map_err(|error| (400, format!("Invalid push subscription: {error}")))?;
+            subscription.validate().map_err(|error| (400, error))?;
+            serde_json::to_string(&subscription).map_err(internal)?
+        } else {
+            parsed
+                .get("token")
+                .and_then(|value| value.as_str())
+                .ok_or((400, "A push registration needs a 'token'".to_string()))?
+                .to_string()
+        };
         self.locked_store()?
-            .save_push_registration(device_id, backend, token, now_ms)
+            .save_push_registration(device_id, backend, &token, now_ms)
             .map_err(|error| (400, error))?;
         Ok((
             200,

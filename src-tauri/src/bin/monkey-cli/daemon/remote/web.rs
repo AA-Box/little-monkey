@@ -4,6 +4,7 @@ const INDEX_HTML: &str = include_str!("ui/index.html");
 const APP_CSS: &str = include_str!("ui/app.css");
 const APP_JS: &str = include_str!("ui/app.js");
 const MANIFEST: &str = include_str!("ui/manifest.webmanifest");
+const SERVICE_WORKER: &str = include_str!("ui/sw.js");
 const ICON: &str = include_str!("ui/icon.svg");
 
 /// Public, credential-free controller shell. All run data still flows through
@@ -19,6 +20,9 @@ pub fn asset(method: &str, path_and_query: &str) -> Option<ApiResponse> {
         "/" | "/remote" | "/remote/" => ("text/html; charset=utf-8", INDEX_HTML.as_bytes()),
         "/v1/remote/ui/app.css" => ("text/css; charset=utf-8", APP_CSS.as_bytes()),
         "/v1/remote/ui/app.js" => ("text/javascript; charset=utf-8", APP_JS.as_bytes()),
+        // At the root, not under `/v1/remote/ui/`: a worker's default scope is
+        // its own directory, and the controller it must serve lives at `/`.
+        "/sw.js" => ("text/javascript; charset=utf-8", SERVICE_WORKER.as_bytes()),
         "/v1/remote/ui/manifest.webmanifest" => (
             "application/manifest+json; charset=utf-8",
             MANIFEST.as_bytes(),
@@ -52,6 +56,7 @@ mod tests {
             "/v1/remote/ui/app.js",
             "/v1/remote/ui/manifest.webmanifest",
             "/v1/remote/ui/icon.svg",
+            "/sw.js",
         ] {
             let response = asset("GET", path).expect(path);
             assert_eq!(response.status, 200);
@@ -173,6 +178,43 @@ mod tests {
         // The fingerprint check must survive the PEM's removal.
         assert!(javascript.contains("validateSha256(invitation.server_certificate_sha256"));
         assert!(javascript.contains("runnerUrl.origin !== location.origin"));
+    }
+
+    /// The push path the *bundled* client can actually take.
+    ///
+    /// An FCM-only push implementation would have been decoration here: this
+    /// controller is a browser, its own content security policy forbids loading
+    /// a Firebase SDK, and it could therefore never hold a registration token.
+    /// These assertions pin the parts that make Web Push work end to end — the
+    /// worker at a scope that covers the controller, `userVisibleOnly` so the
+    /// browser's permission prompt is honest, and a CSP that permits a worker
+    /// at all.
+    #[test]
+    fn the_controller_can_actually_subscribe_to_the_push_it_is_offered() {
+        let worker =
+            String::from_utf8(asset("GET", "/sw.js").expect("service worker").body).unwrap();
+        assert!(worker.contains("addEventListener(\"push\""));
+        assert!(worker.contains("showNotification"));
+
+        let javascript = String::from_utf8(
+            asset("GET", "/v1/remote/ui/app.js")
+                .expect("javascript asset")
+                .body,
+        )
+        .unwrap();
+        assert!(javascript.contains("navigator.serviceWorker.register(\"/sw.js\")"));
+        assert!(javascript.contains("userVisibleOnly: true"));
+        assert!(javascript.contains("applicationServerKey"));
+        // Unsubscribing has to reach both ends; dropping only one leaves a
+        // notification path the user believes is closed.
+        assert!(javascript.contains("subscription.unsubscribe()"));
+        assert!(javascript.contains("\"DELETE\", \"/v1/remote/device/push\""));
+
+        let html = String::from_utf8(asset("GET", "/").unwrap().body).unwrap();
+        assert!(
+            html.contains("worker-src 'self'"),
+            "without worker-src the CSP's default-src 'none' blocks the service worker"
+        );
     }
 
     /// Offline means read-only. A device showing cached runs must not offer

@@ -83,17 +83,28 @@ pub enum RemoteCmd {
     },
     /// Ask for a queued or running command to be cancelled.
     DeviceCancel { command_id: String },
-    /// Point push at your own Firebase project. Little Monkey ships no project,
-    /// no service account and no relay: this is your configuration, stored in
-    /// app-private state on this machine.
+    /// Turn on push. Little Monkey ships no push project, no key and no relay:
+    /// this is your configuration, stored in app-private state on this machine.
+    ///
+    /// `--web-push` needs no account anywhere and is what the bundled browser
+    /// controller uses. The Firebase options are for a native client that holds
+    /// its own registration token.
     PushConfigure {
+        /// Mint this runner's own VAPID identity and send Web Push directly to
+        /// each browser's push service.
+        #[arg(long = "web-push", conflicts_with = "project_id")]
+        web_push: bool,
+        /// How a push service could contact whoever is sending: this runner's
+        /// own advertised HTTPS URL, or a `mailto:` address.
+        #[arg(long = "vapid-subject")]
+        vapid_subject: Option<String>,
         /// Your Firebase project id.
-        #[arg(long = "project-id")]
-        project_id: String,
+        #[arg(long = "project-id", required_unless_present = "web_push")]
+        project_id: Option<String>,
         /// Your service account JSON key, which is copied into app-private
         /// state rather than read from wherever it was downloaded.
-        #[arg(long = "service-account")]
-        service_account: PathBuf,
+        #[arg(long = "service-account", required_unless_present = "web_push")]
+        service_account: Option<PathBuf>,
         /// Allow notifications to carry specifics. Off by default: the visible
         /// text of a push is the least private thing this system produces.
         #[arg(long = "include-detail")]
@@ -488,14 +499,42 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
             json,
         } => device_commands(&paths, device_id, *limit, *json)?,
         RemoteCmd::PushConfigure {
+            web_push,
+            vapid_subject,
             project_id,
             service_account,
             include_detail,
         } => {
-            let config = push::configure(&paths, project_id, service_account, *include_detail)?;
+            let config = if *web_push {
+                // Defaults to this runner's own advertised URL: a self-hosted
+                // runner has no support address, and a push service only needs
+                // somewhere to point if it has to complain about the sender.
+                let subject = match vapid_subject {
+                    Some(subject) => subject.clone(),
+                    None => enabled_host(&paths)
+                        .map(|config| config.advertise_url)
+                        .unwrap_or_else(|_| "https://localhost".to_string()),
+                };
+                push::configure_web_push(&paths, &subject, *include_detail, &KeyringRemoteSecrets)?
+            } else {
+                push::configure(
+                    &paths,
+                    project_id.as_deref().unwrap_or_default(),
+                    service_account.as_deref().unwrap_or(Path::new("")),
+                    *include_detail,
+                )?
+            };
+            match config.backend.as_str() {
+                "web_push" => println!(
+                    "Web Push is on. This runner minted its own VAPID key (kept in the system keychain) — no account anywhere, and each notification is encrypted to the device before your browser's push service carries it."
+                ),
+                _ => println!(
+                    "Push will use your Firebase project '{}' with the key copied into app-private state.",
+                    config.project_id
+                ),
+            }
             println!(
-                "Push will use your Firebase project '{}' with the key copied into app-private state.\nNotification detail is {}.",
-                config.project_id,
+                "Notification detail is {}.",
                 if config.include_detail {
                     "included"
                 } else {
@@ -520,6 +559,7 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
                     target_id: Some(device_id.clone()),
                     detail: Some("Test notification from your own runner".to_string()),
                 },
+                &KeyringRemoteSecrets,
             )
             .await?;
             println!(
@@ -1426,6 +1466,11 @@ fn push_status(paths: &DaemonPaths, json: bool) -> Result<(), String> {
         "enabled": config.as_ref().is_some_and(|config| config.enabled),
         "backend": config.as_ref().map(|config| config.backend.clone()),
         "project_id": config.as_ref().map(|config| config.project_id.clone()),
+        // The public half only. The VAPID private key never leaves the keychain
+        // and the device tokens are addresses, not diagnostics.
+        "application_server_key": push::application_server_key(paths, &KeyringRemoteSecrets)
+            .ok()
+            .flatten(),
         "include_detail": config.as_ref().is_some_and(|config| config.include_detail),
         // Never the token itself: it is the device's address, and printing it
         // into a terminal or a support log helps nobody.
