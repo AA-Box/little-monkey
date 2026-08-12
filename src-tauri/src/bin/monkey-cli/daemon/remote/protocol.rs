@@ -86,6 +86,51 @@ pub enum DeviceCapability {
     /// scheduler to place work should not have granted, by implication, the
     /// ability to add transcripts to their own chat history.
     Migrate,
+    // --- Physical device capabilities -----------------------------------
+    //
+    // Every capability above answers "what may this device do to the runner".
+    // The eight below are the other direction: what the runner may ask of the
+    // *phone's own hardware*. They are separate variants rather than a flag on
+    // the existing ones because they invert who is acted upon — and because
+    // `legacy_capabilities` cannot produce any of them, an already-paired
+    // device gains none of them from an app update.
+    /// Read the device's own identity, platform and advertised surface.
+    /// Strictly weaker than every other physical capability and implied by
+    /// none of them: an operator who wants an inventory should not have to
+    /// grant a camera to get it.
+    DeviceInfo,
+    CameraCapture,
+    MicrophoneCapture,
+    LocationRead,
+    NotificationPost,
+    ScreenCapture,
+    AudioPlayback,
+    /// Reserved for the Talk surface. Present here so a pairing made now can
+    /// carry the grant, and so the intersection rules treat it like every
+    /// other physical capability; no command dispatches it yet.
+    VoiceStream,
+}
+
+/// The capabilities whose subject is the device's own hardware rather than the
+/// runner's state. Only these are intersected with the advertised surface and
+/// the OS permission — a legacy pairing that has never advertised anything
+/// still exercises its run-facing grants unchanged.
+pub const PHYSICAL_DEVICE_CAPABILITIES: &[DeviceCapability] = &[
+    DeviceCapability::DeviceInfo,
+    DeviceCapability::CameraCapture,
+    DeviceCapability::MicrophoneCapture,
+    DeviceCapability::LocationRead,
+    DeviceCapability::NotificationPost,
+    DeviceCapability::ScreenCapture,
+    DeviceCapability::AudioPlayback,
+    DeviceCapability::VoiceStream,
+];
+
+impl DeviceCapability {
+    /// Whether this capability acts on the device's own hardware.
+    pub fn is_physical(self) -> bool {
+        PHYSICAL_DEVICE_CAPABILITIES.contains(&self)
+    }
 }
 
 impl DeviceCapability {
@@ -154,7 +199,174 @@ pub fn validate_capabilities(
     {
         return Err("Migrating a process onto this node also requires place_runs".to_string());
     }
+    // A continuous microphone stream is a superset of one bounded recording, so
+    // it cannot be the *only* microphone grant: an operator revoking
+    // `microphone_capture` and believing the microphone is now closed would
+    // otherwise be wrong. Nothing else here implies another physical
+    // capability — a camera grant must never carry a location grant with it.
+    if capabilities.contains(&DeviceCapability::VoiceStream)
+        && !capabilities.contains(&DeviceCapability::MicrophoneCapture)
+    {
+        return Err("Streaming voice also requires microphone_capture".to_string());
+    }
     Ok(())
+}
+
+/// What the device reports about one OS permission right now.
+///
+/// `Unsupported` and `Denied` are deliberately distinct: an operator looking at
+/// a phone that cannot capture the screen at all should not be told to go turn
+/// a permission on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OsPermission {
+    Granted,
+    Denied,
+    /// The OS has not been asked yet — the device will prompt when a command
+    /// first needs it.
+    Undetermined,
+    /// This platform/build has no such facility.
+    Unsupported,
+}
+
+/// Bounds the device says it will enforce on its own, so the runner can refuse
+/// an impossible command before it ever leases one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceConstraints {
+    pub max_artifact_bytes: u64,
+    pub max_recording_ms: u64,
+    pub max_notification_chars: u32,
+    /// Camera positions this device actually has (`front`, `back`).
+    #[serde(default)]
+    pub camera_positions: BTreeSet<String>,
+}
+
+impl Default for DeviceConstraints {
+    fn default() -> Self {
+        Self {
+            max_artifact_bytes: 8 * 1024 * 1024,
+            max_recording_ms: 60_000,
+            max_notification_chars: 512,
+            camera_positions: BTreeSet::new(),
+        }
+    }
+}
+
+/// What a paired physical device says it is and can do, refreshed each time it
+/// connects.
+///
+/// Deliberately *not* folded into `node_placement::NodeDescriptor`: that
+/// describes a compute node's hardware for placement decisions (queue depth,
+/// backends, resident models), and this describes a phone's sensors and OS
+/// permissions. One table each keeps a query for "where can this run go" from
+/// having to filter out phones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceSurface {
+    pub protocol_version: u32,
+    /// `ios`, `android`, `web`, … — the device's own word for itself, only
+    /// ever displayed and never used to decide authority.
+    pub platform: String,
+    pub platform_version: String,
+    pub app_version: String,
+    pub device_model: String,
+    /// What this build can actually do, regardless of what was granted.
+    pub capabilities: BTreeSet<DeviceCapability>,
+    /// Current OS permission per capability. A capability absent from this map
+    /// is treated as [`OsPermission::Undetermined`].
+    #[serde(default)]
+    pub permissions: BTreeMap<DeviceCapability, OsPermission>,
+    #[serde(default)]
+    pub constraints: DeviceConstraints,
+    pub reported_at_ms: u64,
+}
+
+impl DeviceSurface {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.protocol_version != REMOTE_PROTOCOL_VERSION {
+            return Err(format!(
+                "Unsupported remote protocol version {}",
+                self.protocol_version
+            ));
+        }
+        for (label, value) in [
+            ("platform", &self.platform),
+            ("platform version", &self.platform_version),
+            ("app version", &self.app_version),
+            ("device model", &self.device_model),
+        ] {
+            if value.trim().is_empty() || value.len() > 128 || value.contains(['\r', '\n']) {
+                return Err(format!(
+                    "Device {label} must be a non-empty single line under 128 bytes"
+                ));
+            }
+        }
+        if self.capabilities.len() > 64 || self.permissions.len() > 64 {
+            return Err("Device surface advertises too many capabilities".to_string());
+        }
+        if self.constraints.max_artifact_bytes == 0
+            || self.constraints.max_artifact_bytes > MAX_REMOTE_ARTIFACT_BYTES
+        {
+            return Err(format!(
+                "Device artifact bound must be between 1 and {MAX_REMOTE_ARTIFACT_BYTES} bytes"
+            ));
+        }
+        if self.constraints.max_recording_ms == 0 || self.constraints.max_recording_ms > 600_000 {
+            return Err("Device recording bound must be between 1 ms and 10 minutes".to_string());
+        }
+        if self.constraints.max_notification_chars == 0
+            || self.constraints.max_notification_chars > 4_096
+        {
+            return Err(
+                "Device notification bound must be between 1 and 4096 characters".to_string(),
+            );
+        }
+        if self.constraints.camera_positions.len() > 8
+            || self
+                .constraints
+                .camera_positions
+                .iter()
+                .any(|position| !matches!(position.as_str(), "front" | "back" | "external"))
+        {
+            return Err("Camera positions must be front, back or external".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn permission(&self, capability: DeviceCapability) -> OsPermission {
+        self.permissions
+            .get(&capability)
+            .copied()
+            .unwrap_or(OsPermission::Undetermined)
+    }
+}
+
+/// `operator grant ∩ advertised support ∩ current OS permission`, evaluated for
+/// the physical capabilities and only for them.
+///
+/// A run-facing grant (`view_runs`, `chat`, `place_runs`, …) passes through
+/// untouched: those act on the runner, not on the phone, and every device
+/// paired before this existed advertises nothing at all. Without a surface, no
+/// physical capability is effective — a device that has never said it has a
+/// camera is not asked to open one.
+pub fn effective_capabilities(
+    granted: &BTreeSet<DeviceCapability>,
+    surface: Option<&DeviceSurface>,
+) -> BTreeSet<DeviceCapability> {
+    granted
+        .iter()
+        .copied()
+        .filter(|capability| {
+            if !capability.is_physical() {
+                return true;
+            }
+            surface.is_some_and(|surface| {
+                surface.capabilities.contains(capability)
+                    && surface.permission(*capability) == OsPermission::Granted
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +499,94 @@ impl PairingInvitation {
             self.capabilities.clone()
         };
         validate_capabilities(&capabilities, &self.scopes)
+    }
+}
+
+/// Everything a phone needs to reach this runner and pin it, small enough to
+/// scan.
+///
+/// The full [`PairingInvitation`] carries the server certificate as PEM, which
+/// is several kilobytes — past what a phone camera reads reliably from a screen.
+/// This carries the SHA-256 fingerprint instead. That is not weaker pinning: the
+/// fingerprint is exactly what `validate_invitation` compares the presented
+/// certificate against, and the PEM was only ever a convenience copy of the
+/// certificate the runner presents on the wire anyway. The short field names are
+/// the reason this fits — see `QR_BYTE_TARGET`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairingBootstrap {
+    #[serde(rename = "v")]
+    pub protocol_version: u32,
+    #[serde(rename = "r")]
+    pub runner_id: String,
+    #[serde(rename = "u")]
+    pub runner_url: String,
+    #[serde(rename = "p")]
+    pub pairing_id: String,
+    #[serde(rename = "t")]
+    pub pairing_token: String,
+    /// SHA-256 of the runner's DER certificate — the pin.
+    #[serde(rename = "f")]
+    pub certificate_sha256: String,
+    #[serde(rename = "e")]
+    pub expires_at_ms: u64,
+}
+
+/// What a normal compact QR must stay under, so it scans from a phone at arm's
+/// length. Enforced by a regression test rather than at runtime: an unusually
+/// long operator-chosen URL should still pair, just from a denser code.
+pub const QR_BYTE_TARGET: usize = 900;
+
+/// URI scheme for the compact code. A scheme rather than bare JSON so a phone's
+/// camera app can offer to open it, and so a scanned blob that is plainly not a
+/// pairing code is rejected before parsing.
+pub const PAIRING_URI_SCHEME: &str = "littlemonkey://pair/";
+
+impl PairingBootstrap {
+    /// The scannable string: the scheme, then URL-safe base64 of the compact
+    /// JSON. Base64 rather than raw JSON because a QR payload containing `{`,
+    /// `"` and `/` forces byte mode and a percent-encoded URI is longer still.
+    pub fn to_uri(&self) -> Result<String, String> {
+        let json = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        Ok(format!(
+            "{PAIRING_URI_SCHEME}{}",
+            URL_SAFE_NO_PAD.encode(json)
+        ))
+    }
+
+    pub fn from_uri(value: &str) -> Result<Self, String> {
+        let encoded = value
+            .trim()
+            .strip_prefix(PAIRING_URI_SCHEME)
+            .ok_or_else(|| "Not a Little Monkey pairing code".to_string())?;
+        if encoded.len() > 8 * 1024 {
+            return Err("Pairing code is too large".to_string());
+        }
+        let json = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|error| format!("Pairing code is not valid base64: {error}"))?;
+        serde_json::from_slice(&json).map_err(|error| format!("Pairing code is invalid: {error}"))
+    }
+
+    pub fn validate(&self, now_ms: u64) -> Result<(), String> {
+        if self.protocol_version != REMOTE_PROTOCOL_VERSION {
+            return Err(format!(
+                "Unsupported remote protocol version {}",
+                self.protocol_version
+            ));
+        }
+        validate_id(&self.runner_id)?;
+        validate_id(&self.pairing_id)?;
+        if self.pairing_token.len() < 32 || self.pairing_token.len() > 512 {
+            return Err("Pairing token has an invalid length".to_string());
+        }
+        if self.expires_at_ms <= now_ms {
+            return Err("Pairing invitation has expired".to_string());
+        }
+        if !self.runner_url.starts_with("https://") {
+            return Err("Remote runner URL must use HTTPS".to_string());
+        }
+        validate_sha256(&self.certificate_sha256)
     }
 }
 
@@ -519,6 +819,153 @@ pub struct MigrationReceipt {
     pub arrival_event_hash: String,
     pub caveats: Vec<String>,
 }
+
+/// Largest bounded argument object a device command may carry. Arguments are
+/// instructions to hardware, not payloads: nothing legitimate here is large,
+/// and the digest stored beside them is what makes "the device ran exactly what
+/// was queued" auditable.
+pub const MAX_DEVICE_COMMAND_ARG_BYTES: usize = 8 * 1024;
+/// Longest a device may hold a lease before the runner may hand the command to
+/// another connection. Also the ceiling on the long-poll wait.
+pub const DEVICE_LEASE_MS: u64 = 30_000;
+
+/// `queued -> leased -> running -> succeeded | failed | cancelled | expired`.
+///
+/// The `leased`/`running` split is the whole point: a lease that expires before
+/// `running` is safely requeued, because nothing physical has happened yet.
+/// After `running` the device has been told to open the camera, so a lost
+/// connection can only ever resolve to a terminal state — never to a second
+/// execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceCommandState {
+    Queued,
+    Leased,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Expired,
+}
+
+impl DeviceCommandState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Leased => "leased",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        Ok(match value {
+            "queued" => Self::Queued,
+            "leased" => Self::Leased,
+            "running" => Self::Running,
+            "succeeded" => Self::Succeeded,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            "expired" => Self::Expired,
+            other => return Err(format!("Unknown device command state '{other}'")),
+        })
+    }
+
+    pub fn terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Expired
+        )
+    }
+}
+
+/// One leased command as the device sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceCommand {
+    pub protocol_version: u32,
+    pub command_id: String,
+    pub capability: DeviceCapability,
+    pub arguments: serde_json::Value,
+    pub arguments_sha256: String,
+    pub expires_at_ms: u64,
+    pub lease_expires_at_ms: u64,
+    /// True when an operator asked for cancellation while this command was
+    /// queued or leased. The device must not begin the physical action.
+    pub cancel_requested: bool,
+}
+
+/// What the device reports back once the physical action is over.
+///
+/// `outcome` is a [`DeviceCommandState`] restricted to the terminal ones by
+/// [`DeviceCommandResult::validate`]; `unsupported` and `denied` are not extra
+/// states but ordinary `failed` results carrying an honest `error` — an
+/// operator reads why in one place rather than in two vocabularies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceCommandResult {
+    pub protocol_version: u32,
+    pub outcome: DeviceCommandState,
+    #[serde(default)]
+    pub result: Option<serde_json::Value>,
+    /// Base64 of the produced artifact (a still, a recording), stored through
+    /// the normal artifact path rather than inlined into the result.
+    #[serde(default)]
+    pub artifact_base64: Option<String>,
+    #[serde(default)]
+    pub artifact_media_type: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl DeviceCommandResult {
+    pub fn validate(&self, max_artifact_bytes: u64) -> Result<(), String> {
+        if self.protocol_version != REMOTE_PROTOCOL_VERSION {
+            return Err(format!(
+                "Unsupported remote protocol version {}",
+                self.protocol_version
+            ));
+        }
+        if !matches!(
+            self.outcome,
+            DeviceCommandState::Succeeded
+                | DeviceCommandState::Failed
+                | DeviceCommandState::Cancelled
+        ) {
+            return Err("A device may only report succeeded, failed or cancelled".to_string());
+        }
+        if let Some(result) = &self.result {
+            let encoded = serde_json::to_vec(result).map_err(|error| error.to_string())?;
+            if encoded.len() > MAX_DEVICE_COMMAND_ARG_BYTES {
+                return Err("Device command result exceeds 8 KiB".to_string());
+            }
+        }
+        if let Some(encoded) = &self.artifact_base64 {
+            // Base64 inflates by 4/3; comparing the encoded length against the
+            // budget refuses an oversized artifact before decoding it.
+            if encoded.len() as u64 > max_artifact_bytes.saturating_mul(4).div_euclid(3) + 4 {
+                return Err("Device artifact exceeds the granted budget".to_string());
+            }
+            if self.artifact_media_type.is_none() {
+                return Err("A device artifact must declare its media type".to_string());
+            }
+        }
+        if self.error.as_ref().is_some_and(|error| error.len() > 4_096) {
+            return Err("Device command error text exceeds 4 KiB".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Body of `POST /v1/remote/device/commands/{id}/start` — the device saying it
+/// is about to touch hardware. Empty on purpose: the command id in the path and
+/// the signature over it are the whole statement.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceCommandStartRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -767,6 +1214,172 @@ mod tests {
             "/v1/runs/a/cancel",
             b"{}"
         ));
+    }
+
+    fn surface(
+        capabilities: &[DeviceCapability],
+        permissions: &[(DeviceCapability, OsPermission)],
+    ) -> DeviceSurface {
+        DeviceSurface {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            platform: "ios".into(),
+            platform_version: "18.2".into(),
+            app_version: "1.3.0".into(),
+            device_model: "iPhone".into(),
+            capabilities: capabilities.iter().copied().collect(),
+            permissions: permissions.iter().copied().collect(),
+            constraints: DeviceConstraints::default(),
+            reported_at_ms: 1_000,
+        }
+    }
+
+    /// The rule the whole physical-device surface rests on: three sets have to
+    /// agree, and any one of them saying no is enough.
+    #[test]
+    fn effective_authority_is_grant_intersect_advertised_intersect_os_permission() {
+        let granted = BTreeSet::from([
+            DeviceCapability::ViewRuns,
+            DeviceCapability::CameraCapture,
+            DeviceCapability::LocationRead,
+            DeviceCapability::ScreenCapture,
+            DeviceCapability::NotificationPost,
+        ]);
+        let advertised = surface(
+            &[
+                DeviceCapability::CameraCapture,
+                DeviceCapability::LocationRead,
+                DeviceCapability::NotificationPost,
+            ],
+            &[
+                (DeviceCapability::CameraCapture, OsPermission::Granted),
+                (DeviceCapability::LocationRead, OsPermission::Denied),
+                // NotificationPost advertised but never asked for: undetermined
+                // is not permission.
+            ],
+        );
+        let effective = effective_capabilities(&granted, Some(&advertised));
+        assert_eq!(
+            effective,
+            BTreeSet::from([DeviceCapability::ViewRuns, DeviceCapability::CameraCapture]),
+            "only a capability granted, advertised and OS-permitted is effective"
+        );
+        // A capability the OS permits but the operator never granted stays out.
+        let ungranted = effective_capabilities(
+            &BTreeSet::from([DeviceCapability::ViewRuns]),
+            Some(&surface(
+                &[DeviceCapability::CameraCapture],
+                &[(DeviceCapability::CameraCapture, OsPermission::Granted)],
+            )),
+        );
+        assert_eq!(ungranted, BTreeSet::from([DeviceCapability::ViewRuns]));
+    }
+
+    /// A device paired before this feature existed advertises nothing. Its
+    /// run-facing grants must keep working, and it must not become able to open
+    /// a camera by upgrading its app.
+    #[test]
+    fn a_device_that_never_advertised_keeps_run_grants_and_gains_no_hardware() {
+        let scopes = RemoteScopes {
+            actions: BTreeSet::from([RemoteAction::ViewRuns, RemoteAction::Approve]),
+            run_ids: BTreeSet::from(["run-one".into()]),
+            workspace_ids: BTreeSet::new(),
+            max_artifact_bytes: 1_024,
+        };
+        let legacy = legacy_capabilities(&scopes);
+        assert!(
+            !legacy.iter().any(|capability| capability.is_physical()),
+            "no legacy remote action may imply a physical capability"
+        );
+        assert_eq!(effective_capabilities(&legacy, None), legacy);
+        let with_hardware_grant = {
+            let mut set = legacy.clone();
+            set.insert(DeviceCapability::CameraCapture);
+            set
+        };
+        assert_eq!(
+            effective_capabilities(&with_hardware_grant, None),
+            legacy,
+            "granted but never advertised is not effective"
+        );
+    }
+
+    #[test]
+    fn streaming_voice_cannot_be_the_only_microphone_grant() {
+        let scopes = RemoteScopes {
+            actions: BTreeSet::from([RemoteAction::ViewRuns]),
+            run_ids: BTreeSet::from(["run-one".into()]),
+            workspace_ids: BTreeSet::new(),
+            max_artifact_bytes: 1_024,
+        };
+        let mut capabilities = legacy_capabilities(&scopes);
+        capabilities.insert(DeviceCapability::VoiceStream);
+        assert!(validate_capabilities(&capabilities, &scopes).is_err());
+        capabilities.insert(DeviceCapability::MicrophoneCapture);
+        assert!(validate_capabilities(&capabilities, &scopes).is_ok());
+    }
+
+    /// The size claim the compact code exists for. A realistic runner URL,
+    /// full-length token and fingerprint must stay well inside the target, and
+    /// the PEM must not have crept back in.
+    #[test]
+    fn compact_pairing_code_round_trips_and_stays_scannable() {
+        let bootstrap = PairingBootstrap {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            runner_id: format!("runner-{}", "a".repeat(24)),
+            runner_url: "https://desktop.example-household.net:8443".into(),
+            pairing_id: format!("pair-{}", random_token(18).unwrap()),
+            pairing_token: random_token(32).unwrap(),
+            certificate_sha256: "b".repeat(64),
+            expires_at_ms: 2_000,
+        };
+        let uri = bootstrap.to_uri().unwrap();
+        assert!(
+            uri.len() <= QR_BYTE_TARGET,
+            "compact pairing code is {} bytes, over the {QR_BYTE_TARGET}-byte scan target",
+            uri.len()
+        );
+        assert!(!uri.contains("CERTIFICATE"));
+        assert_eq!(PairingBootstrap::from_uri(&uri).unwrap(), bootstrap);
+        assert!(bootstrap.validate(1_000).is_ok());
+        assert!(bootstrap.validate(3_000).is_err(), "expiry must be checked");
+        assert!(PairingBootstrap::from_uri("https://evil.test/pair").is_err());
+        let unpinned = PairingBootstrap {
+            certificate_sha256: "not-a-digest".into(),
+            ..bootstrap
+        };
+        assert!(
+            unpinned.validate(1_000).is_err(),
+            "a code without a valid pin must not pair"
+        );
+    }
+
+    #[test]
+    fn a_device_result_cannot_smuggle_an_oversized_artifact() {
+        let result = DeviceCommandResult {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            outcome: DeviceCommandState::Succeeded,
+            result: None,
+            artifact_base64: Some("A".repeat(4_096)),
+            artifact_media_type: Some("image/jpeg".into()),
+            error: None,
+        };
+        assert!(result.validate(4_096).is_ok());
+        assert!(result.validate(1_024).is_err());
+        let untyped = DeviceCommandResult {
+            artifact_media_type: None,
+            ..result.clone()
+        };
+        assert!(untyped.validate(4_096).is_err());
+        let running = DeviceCommandResult {
+            outcome: DeviceCommandState::Running,
+            artifact_base64: None,
+            artifact_media_type: None,
+            ..result
+        };
+        assert!(
+            running.validate(4_096).is_err(),
+            "a device may not report a non-terminal outcome as its result"
+        );
     }
 
     #[test]
