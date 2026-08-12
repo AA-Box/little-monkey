@@ -214,6 +214,66 @@ pub fn present_plan_tool_def() -> serde_json::Value {
     })
 }
 
+/// The agent's reply-to-the-conversation tool, offered only on a run that
+/// arrived from a messaging channel.
+///
+/// It takes a message and nothing else. There is deliberately no account,
+/// conversation, thread or provider parameter: the destination is the origin
+/// the daemon durably recorded for this run, so the model cannot redirect a
+/// reply to a different conversation, a different account or a different
+/// person — including when the message it is answering asks it to. The
+/// transport is not the model's to choose.
+///
+/// Like [`present_plan_tool_def`], excluded from [`tool_definitions`]'s base
+/// array: a run with no channel origin has nowhere to send anything, and
+/// offering the tool there would only invite a failed call.
+pub fn send_message_tool_def() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Send a message back to the conversation this run came from. The destination is fixed to that conversation — you cannot choose the account, thread, or recipient. Requires user permission.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The message to send." }
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+/// The agent's outbound call tool, offered only on a run whose telephony
+/// account permits dialing out.
+///
+/// A phone call reaches a person who did not ask to be reached and bills the
+/// operator, so this is the most tightly held tool in the set: the account is
+/// named explicitly, the number must be in international format, and the
+/// account's own outbound policy can refuse in a way no approval prompt
+/// overrides. Excluded from [`tool_definitions`] for the same reason
+/// [`send_message_tool_def`] is — a run with no telephony account has nothing
+/// to dial with.
+pub fn place_call_tool_def() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "place_call",
+            "description": "Place a phone call from one of the operator's configured numbers. Calls cost money and reach a real person; only call this when the user has asked for it. Requires user permission.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "account_id": { "type": "string", "description": "The telephony account to call from." },
+                    "to_number": { "type": "string", "description": "The number to call, in international format, e.g. +15551234567." }
+                },
+                "required": ["account_id", "to_number"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
 /// The agent's read-only knowledge-stack retrieval tool (RAG design doc
 /// slice 4, `monkey-cli` parity) — a Rust port of `src/lib/tools.ts`'s
 /// `search_docs` `ToolDef`. Like [`present_plan_tool_def`] above,

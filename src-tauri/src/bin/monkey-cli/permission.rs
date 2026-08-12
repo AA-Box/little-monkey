@@ -122,6 +122,7 @@ pub struct TerminalPermissions {
     approval_timeout_ms: u64,
     quiet: bool,
     allow_network: bool,
+    allow_external_mutations: bool,
 }
 
 #[derive(Clone)]
@@ -141,6 +142,7 @@ impl TerminalPermissions {
             approval_timeout_ms: DEFAULT_APPROVAL_TIMEOUT_MS,
             quiet: false,
             allow_network: true,
+            allow_external_mutations: false,
         }
     }
 
@@ -162,6 +164,7 @@ impl TerminalPermissions {
             approval_timeout_ms: approval_timeout_ms.clamp(60_000, DEFAULT_APPROVAL_TIMEOUT_MS),
             quiet,
             allow_network: true,
+            allow_external_mutations: false,
         }
     }
 
@@ -171,6 +174,18 @@ impl TerminalPermissions {
 
     pub fn allow_network(&self) -> bool {
         self.allow_network
+    }
+
+    /// Whether this run may cause an effect outside the machine — sending a
+    /// message, placing a call — as its immutable snapshot recorded. Default
+    /// false: an interactive session that never set it has not been granted it,
+    /// and the tools that read this refuse rather than prompt.
+    pub fn set_allow_external_mutations(&mut self, allow: bool) {
+        self.allow_external_mutations = allow;
+    }
+
+    pub fn allow_external_mutations(&self) -> bool {
+        self.allow_external_mutations
     }
 
     pub fn event_sink(&self) -> Option<Arc<dyn CliRunEventSink>> {

@@ -1641,3 +1641,233 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+// --- Messaging channels ---------------------------------------------------
+//
+// Thin, fixed-argument wrappers over `monkey channels …`. The rules live in the
+// CLI (one implementation, two front ends); these exist so the desktop can call
+// them without an arbitrary command executor, and so every identifier the UI
+// passes is validated before it reaches an argument vector.
+//
+// `channels_set_credential` is the single place a secret crosses this boundary,
+// and it writes straight to the keychain rather than through an argument
+// vector: a credential must never be visible in a process listing.
+
+const MAX_CHANNEL_ID: usize = 128;
+
+fn channel_id(label: &str, value: &str) -> Result<String, String> {
+    validate_id(label, value)?;
+    if value.len() > MAX_CHANNEL_ID || value.starts_with('-') {
+        // A value that starts with a dash would be read as a flag by the CLI's
+        // own parser even though nothing here goes through a shell.
+        return Err(format!("Invalid {label}"));
+    }
+    Ok(value.to_string())
+}
+
+#[tauri::command]
+pub async fn channels_list() -> Result<Value, String> {
+    parse_json(&command(vec!["channels".into(), "list".into(), "--json".into()]).await?)
+}
+
+#[tauri::command]
+pub async fn channels_add(
+    kind: String,
+    label: String,
+    config: Option<String>,
+) -> Result<Value, String> {
+    validate_token("provider", &kind, 32)?;
+    validate_token("label", &label, 120)?;
+    let mut args = vec!["channels".into(), "add".into(), kind, label];
+    if let Some(config) = config {
+        // Parsed here as well as in the CLI so a malformed object is refused
+        // before it becomes a process argument.
+        serde_json::from_str::<Value>(&config)
+            .map_err(|error| format!("Provider settings must be a JSON object: {error}"))?;
+        args.push("--config".into());
+        args.push(config);
+    }
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
+/// Probe an account. The only path that can move an account to `connected`.
+#[tauri::command]
+pub async fn channels_probe(account_id: String) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "channels".into(),
+            "probe".into(),
+            account_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn channels_enable(account_id: String, enabled: bool) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let mut args = vec!["channels".into(), "enable".into(), account_id];
+    if !enabled {
+        args.push("--off".into());
+    }
+    command(args).await.map(|_| ())
+}
+
+#[tauri::command]
+pub async fn channels_set_policy(
+    account_id: String,
+    direct: Option<String>,
+    group: Option<String>,
+    activation: Option<String>,
+) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let mut args = vec!["channels".into(), "policy".into(), account_id];
+    for (flag, value) in [
+        ("--direct", direct),
+        ("--group", group),
+        ("--activation", activation),
+    ] {
+        if let Some(value) = value {
+            validate_token("policy", &value, 32)?;
+            args.push(flag.into());
+            args.push(value);
+        }
+    }
+    command(args).await.map(|_| ())
+}
+
+#[tauri::command]
+pub async fn channels_senders(account_id: String) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "channels".into(),
+            "senders".into(),
+            account_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Approve or block a waiting sender.
+///
+/// Approval is the ability to send messages and nothing else — no tool, device
+/// or telephony authority follows from it.
+#[tauri::command]
+pub async fn channels_decide_sender(
+    account_id: String,
+    sender_id: String,
+    approve: bool,
+) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let sender_id = channel_id("sender id", &sender_id)?;
+    command(vec![
+        "channels".into(),
+        if approve {
+            "approve".into()
+        } else {
+            "block".into()
+        },
+        account_id,
+        sender_id,
+    ])
+    .await
+    .map(|_| ())
+}
+
+#[tauri::command]
+pub async fn channels_routes() -> Result<Value, String> {
+    parse_json(&command(vec!["channels".into(), "routes".into(), "--json".into()]).await?)
+}
+
+#[tauri::command]
+pub async fn channels_add_route(
+    recipe: String,
+    account_id: Option<String>,
+    conversation_id: Option<String>,
+    kind: Option<String>,
+    repository: Option<String>,
+) -> Result<(), String> {
+    validate_token("recipe", &recipe, 200)?;
+    let mut args = vec!["channels".into(), "add-route".into(), recipe];
+    for (flag, value) in [
+        ("--account", account_id),
+        ("--conversation", conversation_id),
+        ("--kind", kind),
+    ] {
+        if let Some(value) = value {
+            validate_token("route scope", &value, MAX_CHANNEL_ID)?;
+            args.push(flag.into());
+            args.push(value);
+        }
+    }
+    if let Some(repository) = repository {
+        args.push("--repository".into());
+        args.push(repository);
+    }
+    command(args).await.map(|_| ())
+}
+
+#[tauri::command]
+pub async fn channels_remove_route(route_id: String) -> Result<(), String> {
+    let route_id = channel_id("route id", &route_id)?;
+    command(vec!["channels".into(), "remove-route".into(), route_id])
+        .await
+        .map(|_| ())
+}
+
+#[tauri::command]
+pub async fn channels_events(account_id: String, limit: u32) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "channels".into(),
+            "events".into(),
+            account_id,
+            "--limit".into(),
+            limit.clamp(1, 200).to_string(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn channels_remove(account_id: String) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    command(vec!["channels".into(), "remove".into(), account_id])
+        .await
+        .map(|_| ())
+}
+
+/// Store an account's credential.
+///
+/// Writes to the same keychain entry the daemon's adapters read, named by the
+/// one definition both sides share, so the desktop and the CLI cannot drift
+/// into writing different entries. The value is never echoed back, never
+/// logged, and never returned — the account row only ever learns that a
+/// credential exists.
+#[tauri::command]
+pub async fn channels_set_credential(account_id: String, secret: String) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    if secret.is_empty() || secret.len() > 8192 {
+        return Err("A messaging credential must contain 1-8192 bytes".to_string());
+    }
+    let reference = crate::channels::credential_ref(&account_id);
+    keyring::Entry::new(&crate::channels::KEYCHAIN_SERVICE, &reference)
+        .map_err(|error| format!("Failed to open the messaging keychain entry: {error}"))?
+        .set_password(&secret)
+        .map_err(|error| format!("Failed to save the messaging credential: {error}"))?;
+    // The CLI owns the account row; this marks it as having a credential.
+    command(vec![
+        "channels".into(),
+        "mark-credential".into(),
+        account_id,
+    ])
+    .await
+    .map(|_| ())
+}
