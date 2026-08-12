@@ -380,7 +380,9 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
                 std::sync::Arc::new(crate::daemon::DaemonMobileChatQueue::new(paths.clone()));
             let placement =
                 std::sync::Arc::new(crate::daemon::DaemonPlacementQueue::new(paths.clone()));
-            server::serve(paths, desktop, mobile_chat, placement).await?
+            let peer_runs =
+                std::sync::Arc::new(crate::daemon::DaemonChannelQueue::new(paths.clone()));
+            server::serve(paths, desktop, mobile_chat, placement, peer_runs).await?
         }
         RemoteCmd::PairCreate(args) => pair_create(&paths, args)?,
         RemoteCmd::PairList => pair_list(&paths)?,
@@ -976,8 +978,9 @@ pub async fn spawn_if_configured(
     desktop: std::sync::Arc<DesktopControlRuntime>,
     mobile_chat: std::sync::Arc<dyn api::MobileChatQueue>,
     placement: std::sync::Arc<dyn api::PlacementQueue>,
+    peer_runs: std::sync::Arc<dyn crate::daemon::channel_worker::RunQueue>,
 ) -> Result<bool, String> {
-    server::spawn_if_configured(paths, desktop, mobile_chat, placement).await
+    server::spawn_if_configured(paths, desktop, mobile_chat, placement, peer_runs).await
 }
 
 fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), String> {

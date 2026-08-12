@@ -198,16 +198,47 @@ fn default_artifact_budget() -> u64 {
     MAX_REMOTE_ARTIFACT_BYTES
 }
 
+/// Whether a grant is peer standing and nothing else.
+///
+/// A peer is the one kind of pairing with no control-plane scope: it may not
+/// read a run, approve anything or touch the desktop, so requiring it to name
+/// an action and a run id — as every controller pairing must — would force an
+/// authority onto it that the whole design says it must not have.
+pub fn is_peer_only(capabilities: &BTreeSet<DeviceCapability>) -> bool {
+    !capabilities.is_empty()
+        && capabilities.iter().all(|capability| {
+            matches!(
+                capability,
+                DeviceCapability::PeerMessage
+                    | DeviceCapability::PeerTaskRequest
+                    | DeviceCapability::PeerArtifact
+            )
+        })
+}
+
 impl RemoteScopes {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.actions.is_empty() {
-            return Err("Remote pairing requires at least one action".to_string());
+    /// The scope rules, given what the pairing is actually for.
+    ///
+    /// Identical to [`Self::validate`] for every controller pairing. The one
+    /// difference is a peer-only grant, which is allowed to carry an entirely
+    /// empty control scope — the strongest possible restriction, not a
+    /// loosening: an empty scope reaches nothing on the control plane.
+    pub fn validate_with_capabilities(
+        &self,
+        capabilities: &BTreeSet<DeviceCapability>,
+    ) -> Result<(), String> {
+        if is_peer_only(capabilities)
+            && self.actions.is_empty()
+            && self.run_ids.is_empty()
+            && self.workspace_ids.is_empty()
+        {
+            return self.validate_bounds();
         }
-        if self.run_ids.is_empty() && self.workspace_ids.is_empty() {
-            return Err(
-                "Remote pairing requires an exact run id or declared workspace id".to_string(),
-            );
-        }
+        self.validate()
+    }
+
+    /// Bounds that hold for every pairing, peer or controller.
+    fn validate_bounds(&self) -> Result<(), String> {
         if self.run_ids.len() > 1_024 || self.workspace_ids.len() > 128 {
             return Err("Remote pairing scope is too large".to_string());
         }
@@ -219,6 +250,19 @@ impl RemoteScopes {
                 "Remote artifact budget must be between 1 and {MAX_REMOTE_ARTIFACT_BYTES} bytes"
             ));
         }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.actions.is_empty() {
+            return Err("Remote pairing requires at least one action".to_string());
+        }
+        if self.run_ids.is_empty() && self.workspace_ids.is_empty() {
+            return Err(
+                "Remote pairing requires an exact run id or declared workspace id".to_string(),
+            );
+        }
+        self.validate_bounds()?;
         if self.actions.contains(&RemoteAction::Approve)
             && !self.actions.contains(&RemoteAction::ViewRuns)
         {
@@ -301,12 +345,12 @@ impl PairingInvitation {
         {
             return Err("Pairing invitation has no valid pinned certificate".to_string());
         }
-        self.scopes.validate()?;
         let capabilities = if self.capabilities.is_empty() {
             legacy_capabilities(&self.scopes)
         } else {
             self.capabilities.clone()
         };
+        self.scopes.validate_with_capabilities(&capabilities)?;
         validate_capabilities(&capabilities, &self.scopes)
     }
 }

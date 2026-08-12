@@ -405,7 +405,7 @@ impl RemoteStore {
         now_ms: u64,
         expires_at_ms: u64,
     ) -> Result<InvitationRecord, String> {
-        scopes.validate()?;
+        scopes.validate_with_capabilities(capabilities)?;
         validate_capabilities(capabilities, scopes)?;
         if expires_at_ms <= now_ms || expires_at_ms.saturating_sub(now_ms) > 24 * 60 * 60 * 1_000 {
             return Err("Pairing invitation lifetime must be between now and 24 hours".to_string());
@@ -525,7 +525,6 @@ impl RemoteStore {
             }
             let scopes: RemoteScopes =
                 serde_json::from_slice(&invitation.1).map_err(|error| error.to_string())?;
-            scopes.validate()?;
             let invited_capabilities = invitation
                 .4
                 .as_deref()
@@ -533,6 +532,7 @@ impl RemoteStore {
                 .transpose()
                 .map_err(|error| error.to_string())?
                 .unwrap_or_else(|| legacy_capabilities(&scopes));
+            scopes.validate_with_capabilities(&invited_capabilities)?;
             validate_capabilities(&invited_capabilities, &scopes)?;
             let capabilities = requested_capabilities
                 .cloned()
@@ -1382,7 +1382,9 @@ impl RemoteStore {
         now_ms: u64,
         secrets: &dyn RemoteSecretStore,
     ) -> Result<(), String> {
-        profile.scopes.validate()?;
+        profile
+            .scopes
+            .validate_with_capabilities(&profile.capabilities)?;
         let capabilities = if profile.capabilities.is_empty() {
             legacy_capabilities(&profile.scopes)
         } else {
