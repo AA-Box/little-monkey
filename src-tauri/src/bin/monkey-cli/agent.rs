@@ -891,6 +891,29 @@ async fn execute_tool_call(
         };
     }
 
+    // `place_call` is the most consequential tool in the set: it reaches a
+    // person and it bills the operator. Same external-mutation gate as
+    // `send_message`, plus the account's own outbound policy, which can refuse
+    // in a way the approval prompt cannot override.
+    if name == "place_call" {
+        if !perms.allow_external_mutations() {
+            return serde_json::json!({
+                "error": "This run's permission snapshot does not allow placing calls."
+            })
+            .to_string();
+        }
+        let account_id = args["account_id"].as_str().unwrap_or_default().to_string();
+        let to_number = args["to_number"].as_str().unwrap_or_default().to_string();
+        let detail = format!("call {to_number} from {account_id}");
+        return match perms.request("place_call", &detail).await {
+            Ok(()) => match crate::daemon::telecom_tool::place_call(&account_id, &to_number).await {
+                Ok(value) => value.to_string(),
+                Err(error) => serde_json::json!({ "error": error }).to_string(),
+            },
+            Err(error) => serde_json::json!({ "error": error }).to_string(),
+        };
+    }
+
     if name == "present_plan" {
         return if perms.mode() != PermissionMode::Plan {
             serde_json::json!({ "error": "present_plan is only available in Plan Mode." })
@@ -1438,6 +1461,13 @@ async fn run_tool_loop(
         && crate::daemon::channel_tool::current_channel_origin().is_some()
     {
         tools_vec.push(tools_def::send_message_tool_def());
+    }
+    // `place_call` is offered only when the operator actually configured a
+    // number that may dial out. An operator whose numbers are all receive-only
+    // never sees the tool, rather than being offered one whose only possible
+    // answer is a refusal.
+    if perms.allow_external_mutations() && crate::daemon::telecom_tool::any_account_may_dial() {
+        tools_vec.push(tools_def::place_call_tool_def());
     }
     // `search_docs` is offered only when at least one `--stack` was given —
     // mirrors the desktop app's `buildTools(attachedStackNames)`, which only

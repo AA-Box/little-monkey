@@ -12,6 +12,7 @@ mod scheduler;
 mod service;
 pub(crate) mod store;
 pub(crate) mod telecom_store;
+pub(crate) mod telecom_tool;
 pub(crate) mod telecom_worker;
 pub(crate) mod telephony;
 mod trigger;

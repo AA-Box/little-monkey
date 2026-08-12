@@ -245,6 +245,35 @@ pub fn send_message_tool_def() -> serde_json::Value {
     })
 }
 
+/// The agent's outbound call tool, offered only on a run whose telephony
+/// account permits dialing out.
+///
+/// A phone call reaches a person who did not ask to be reached and bills the
+/// operator, so this is the most tightly held tool in the set: the account is
+/// named explicitly, the number must be in international format, and the
+/// account's own outbound policy can refuse in a way no approval prompt
+/// overrides. Excluded from [`tool_definitions`] for the same reason
+/// [`send_message_tool_def`] is — a run with no telephony account has nothing
+/// to dial with.
+pub fn place_call_tool_def() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "place_call",
+            "description": "Place a phone call from one of the operator's configured numbers. Calls cost money and reach a real person; only call this when the user has asked for it. Requires user permission.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "account_id": { "type": "string", "description": "The telephony account to call from." },
+                    "to_number": { "type": "string", "description": "The number to call, in international format, e.g. +15551234567." }
+                },
+                "required": ["account_id", "to_number"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
 /// The agent's read-only knowledge-stack retrieval tool (RAG design doc
 /// slice 4, `monkey-cli` parity) — a Rust port of `src/lib/tools.ts`'s
 /// `search_docs` `ToolDef`. Like [`present_plan_tool_def`] above,
