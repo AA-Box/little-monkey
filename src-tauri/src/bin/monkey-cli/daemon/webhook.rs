@@ -70,6 +70,24 @@ async fn handle(paths: DaemonPaths, request: Request<Incoming>) -> Response<Full
             None => response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
         };
     }
+    // An outbound MMS attachment: the carrier fetches it with the signed URL the
+    // SMS adapter minted. Matched before the method gates for the same reason
+    // the media socket is — it is a GET, and it is neither a handshake nor a
+    // delivery.
+    if let Some(account_id) = request
+        .uri()
+        .path()
+        .strip_prefix("/v1/telecom/")
+        .and_then(|rest| rest.strip_suffix("/file"))
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+        .map(str::to_string)
+    {
+        return serve_signed_attachment(
+            paths,
+            account_id,
+            request.uri().query().unwrap_or_default(),
+        );
+    }
     if request.method() != Method::POST {
         return response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
     }
@@ -627,4 +645,88 @@ mod tests {
             .filter(|value| !value.contains('/'))
             .is_none());
     }
+}
+
+/// The largest attachment served to a carrier. Matches the cap the SMS adapter
+/// applies when it mints the URL, so the two cannot disagree.
+const MAX_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Hand a carrier one attachment, if it presents a valid signed URL.
+///
+/// This is the only path by which a stored artifact leaves this machine
+/// unauthenticated, so it is narrow on purpose: one artifact named in the
+/// signature, an expiry, the account's own credential as the key, and no
+/// directory, listing or range semantics. Every refusal is the same "not
+/// found": the endpoint is public, and a specific error is a hint.
+fn serve_signed_attachment(
+    paths: DaemonPaths,
+    account_id: String,
+    query: &str,
+) -> Response<Full<Bytes>> {
+    let params: std::collections::BTreeMap<&str, &str> = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .collect();
+    let (Some(artifact_id), Some(expires_at_ms), Some(token)) = (
+        params.get("artifact").copied(),
+        params
+            .get("exp")
+            .and_then(|value| value.parse::<i64>().ok()),
+        params.get("sig").copied(),
+    ) else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    let Ok(now_ms) = super::now_ms()
+        .and_then(|value| i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string()))
+    else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    let Ok(store) = DaemonStore::open(&paths) else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    let Ok(Some(account)) = store.telecom_account(&account_id) else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    if !account.enabled {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    }
+    let secret = match &account.credential_ref {
+        Some(reference) => super::channel_adapter::ChannelSecrets::get(
+            &super::channel_adapter::KeyringChannelSecrets,
+            reference,
+        )
+        .unwrap_or_default(),
+        None => String::new(),
+    };
+    if super::telephony::verify_media_file_token(
+        &secret,
+        &account_id,
+        artifact_id,
+        expires_at_ms,
+        token,
+        now_ms,
+    )
+    .is_err()
+    {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    }
+    let Some(app_data) = paths.root.parent() else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    let Ok(artifacts) = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
+        app_data.join("content-v1"),
+        MAX_ATTACHMENT_BYTES,
+    ) else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    let Ok(bytes) = artifacts.read(artifact_id) else {
+        return response(StatusCode::NOT_FOUND, "not_found");
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        // The bytes are whatever the operator attached; naming a type this
+        // process did not verify would be a claim it cannot make.
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(Full::new(Bytes::from(bytes)))
+        .unwrap_or_else(|_| response(StatusCode::NOT_FOUND, "not_found"))
 }

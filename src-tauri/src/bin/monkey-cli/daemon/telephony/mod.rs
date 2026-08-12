@@ -279,6 +279,45 @@ pub fn verify_media_stream_token(
     Ok(())
 }
 
+/// Mint the token that lets a carrier fetch one attachment.
+///
+/// MMS is delivered by the carrier fetching a URL, so an outbound attachment
+/// has to be reachable from the internet for as long as that takes. This is the
+/// same construction as [`media_stream_token`] and for the same reason: the URL
+/// is the credential, it names exactly one artifact, and it expires.
+pub fn media_file_token(
+    secret: &str,
+    account_id: &str,
+    artifact_id: &str,
+    expires_at_ms: i64,
+) -> String {
+    media_stream_token(
+        secret,
+        account_id,
+        &format!("file:{artifact_id}"),
+        expires_at_ms,
+    )
+}
+
+/// Check an attachment URL's token. Same rules as the media socket's.
+pub fn verify_media_file_token(
+    secret: &str,
+    account_id: &str,
+    artifact_id: &str,
+    expires_at_ms: i64,
+    token: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    verify_media_stream_token(
+        secret,
+        account_id,
+        &format!("file:{artifact_id}"),
+        expires_at_ms,
+        token,
+        now_ms,
+    )
+}
+
 /// One carrier.
 ///
 /// Every carrier is also a [`MediaFrameCodec`], because a carrier that cannot
@@ -295,7 +334,18 @@ pub trait TelecomProvider: Send + Sync + super::call_media::MediaFrameCodec {
 
     /// Send one text. `idempotency_key` is the outbox row's, so a retry after a
     /// crash collapses at the carrier where the carrier supports it.
-    async fn send_sms(&self, to_number: &str, text: &str, idempotency_key: &str) -> SendOutcome;
+    ///
+    /// `media_urls` makes it an MMS. They are signed, expiring URLs served by
+    /// this daemon, because that is how every carrier takes media: it fetches
+    /// it. A carrier that cannot send media must refuse rather than drop the
+    /// attachment and send the text alone.
+    async fn send_sms(
+        &self,
+        to_number: &str,
+        text: &str,
+        media_urls: &[String],
+        idempotency_key: &str,
+    ) -> SendOutcome;
 
     /// Place a call. The caller has already cleared this with the approval
     /// policy; a provider must never decide for itself that a call is fine.
@@ -453,6 +503,58 @@ mod tests {
             1_000,
             "Telnyx accepts at most one payload a second, so frames are a second long"
         );
+    }
+
+    #[test]
+    fn a_media_file_token_is_bound_to_one_artifact_and_expires() {
+        let token = media_file_token("carrier-secret", "tel-1", "artifact-1", NOW + 60_000);
+
+        assert!(verify_media_file_token(
+            "carrier-secret",
+            "tel-1",
+            "artifact-1",
+            NOW + 60_000,
+            &token,
+            NOW
+        )
+        .is_ok());
+        assert!(
+            verify_media_file_token(
+                "carrier-secret",
+                "tel-1",
+                "artifact-2",
+                NOW + 60_000,
+                &token,
+                NOW
+            )
+            .is_err(),
+            "a URL for one attachment must not fetch another"
+        );
+        assert!(
+            verify_media_file_token(
+                "carrier-secret",
+                "tel-1",
+                "artifact-1",
+                NOW,
+                &token,
+                NOW + 1
+            )
+            .is_err(),
+            "an expired URL fetches nothing"
+        );
+        // A media-socket token must not open the file route either: the two are
+        // separate grants over the same credential.
+        let socket_token =
+            media_stream_token("carrier-secret", "tel-1", "artifact-1", NOW + 60_000);
+        assert!(verify_media_file_token(
+            "carrier-secret",
+            "tel-1",
+            "artifact-1",
+            NOW + 60_000,
+            &socket_token,
+            NOW
+        )
+        .is_err());
     }
 
     fn config(kind: TelecomKind) -> TelecomConfig {

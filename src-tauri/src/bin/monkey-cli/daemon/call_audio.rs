@@ -141,6 +141,21 @@ pub(crate) fn read_wav_as_call_audio(bytes: &[u8]) -> Result<Vec<i16>, String> {
         .collect())
 }
 
+/// Whether this batch of audio contains somebody talking.
+///
+/// Used for barge-in, where the question is not "has a turn ended" but "is the
+/// caller talking over us right now" — the same energy test the detector
+/// applies per sample, asked of a whole frame at once.
+pub(crate) fn contains_speech(frame: &[i16]) -> bool {
+    // The same floor `UtteranceDetector` uses, and a handful of loud samples
+    // rather than one, so a click on the line does not cut the agent off.
+    frame
+        .iter()
+        .filter(|sample| i32::from(**sample).abs() > 320)
+        .count()
+        > frame.len() / 10
+}
+
 /// Decides when the caller has finished saying something.
 ///
 /// A phone call has no "send" button, so the end of a turn is inferred from
@@ -267,6 +282,16 @@ mod tests {
         (0..samples)
             .map(|index| if index % 2 == 0 { 8_000 } else { -8_000 })
             .collect()
+    }
+
+    #[test]
+    fn speech_is_told_apart_from_a_quiet_line() {
+        assert!(contains_speech(&speech(800)));
+        assert!(!contains_speech(&vec![0; 800]));
+        // One loud click is not somebody talking.
+        let mut click = vec![0i16; 800];
+        click[10] = 20_000;
+        assert!(!contains_speech(&click));
     }
 
     #[test]

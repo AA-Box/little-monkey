@@ -180,17 +180,26 @@ impl TelecomProvider for TelnyxProvider {
         ChannelHealth::connected(now, Some(self.from_number.clone()))
     }
 
-    async fn send_sms(&self, to_number: &str, text: &str, idempotency_key: &str) -> SendOutcome {
+    async fn send_sms(
+        &self,
+        to_number: &str,
+        text: &str,
+        media_urls: &[String],
+        idempotency_key: &str,
+    ) -> SendOutcome {
         let _ = idempotency_key; // no caller-supplied dedupe key on /v2/messages
         let client = match self.client() {
             Ok(client) => client,
             Err(error) => return SendOutcome::PermanentFailure { error },
         };
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "from": self.from_number,
             "to": to_number,
             "text": text,
         });
+        if !media_urls.is_empty() {
+            body["media_urls"] = serde_json::json!(media_urls);
+        }
         let request = client
             .post(self.messages_url())
             .bearer_auth(&self.api_key)
@@ -752,7 +761,7 @@ mod tests {
     async fn send_sms_maps_a_success_response_to_sent() {
         let base = serve_once("200 OK", r#"{"data":{"id":"msg-abc"}}"#);
         let provider = provider_with_base(&base);
-        let outcome = provider.send_sms("+15551230000", "hi", "idem-1").await;
+        let outcome = provider.send_sms("+15551230000", "hi", &[], "idem-1").await;
         assert_eq!(
             outcome,
             SendOutcome::Sent {
@@ -765,7 +774,7 @@ mod tests {
     async fn send_sms_maps_429_to_retryable() {
         let base = serve_once("429 Too Many Requests", "{}");
         let provider = provider_with_base(&base);
-        match provider.send_sms("+15551230000", "hi", "idem-1").await {
+        match provider.send_sms("+15551230000", "hi", &[], "idem-1").await {
             SendOutcome::RetryableFailure { .. } => {}
             other => panic!("expected RetryableFailure, got {other:?}"),
         }
@@ -775,7 +784,7 @@ mod tests {
     async fn send_sms_maps_403_to_permanent() {
         let base = serve_once("403 Forbidden", "{}");
         let provider = provider_with_base(&base);
-        match provider.send_sms("+15551230000", "hi", "idem-1").await {
+        match provider.send_sms("+15551230000", "hi", &[], "idem-1").await {
             SendOutcome::PermanentFailure { .. } => {}
             other => panic!("expected PermanentFailure, got {other:?}"),
         }
@@ -805,7 +814,7 @@ mod tests {
             }
         });
         let provider = provider_with_base(&format!("http://127.0.0.1:{port}"));
-        match provider.send_sms("+15551230000", "hi", "idem-1").await {
+        match provider.send_sms("+15551230000", "hi", &[], "idem-1").await {
             SendOutcome::NeedsReconciliation { .. } => {}
             other => panic!("expected NeedsReconciliation, got {other:?}"),
         }
@@ -823,6 +832,14 @@ const MEDIA_FORMAT: crate::daemon::call_media::MediaStreamFormat =
 impl crate::daemon::call_media::MediaFrameCodec for TelnyxProvider {
     fn format(&self) -> crate::daemon::call_media::MediaStreamFormat {
         MEDIA_FORMAT
+    }
+
+    fn encode_clear_frame(&self, stream_id: &str) -> String {
+        serde_json::json!({
+            "event": "clear",
+            "stream_id": stream_id,
+        })
+        .to_string()
     }
 
     fn encode_media_frame(&self, payload_b64: &str, stream_id: &str) -> String {

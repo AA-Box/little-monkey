@@ -62,6 +62,8 @@ struct MockState {
 pub struct SentSms {
     pub to_number: String,
     pub text: String,
+    /// Signed URLs the carrier would fetch for an MMS.
+    pub media_urls: Vec<String>,
     pub idempotency_key: String,
 }
 
@@ -196,6 +198,14 @@ impl crate::daemon::call_media::MediaFrameCodec for MockProvider {
         MEDIA_FORMAT
     }
 
+    fn encode_clear_frame(&self, stream_id: &str) -> String {
+        serde_json::json!({
+            "event": "clear",
+            "streamSid": stream_id,
+        })
+        .to_string()
+    }
+
     fn encode_media_frame(&self, payload_b64: &str, stream_id: &str) -> String {
         serde_json::json!({
             "event": "media",
@@ -220,11 +230,18 @@ impl TelecomProvider for MockProvider {
         ChannelHealth::connected(now_ms(), Some(self.from_number.clone()))
     }
 
-    async fn send_sms(&self, to_number: &str, text: &str, idempotency_key: &str) -> SendOutcome {
+    async fn send_sms(
+        &self,
+        to_number: &str,
+        text: &str,
+        media_urls: &[String],
+        idempotency_key: &str,
+    ) -> SendOutcome {
         let mut state = self.state.lock().unwrap();
         state.sent_sms.push(SentSms {
             to_number: to_number.to_string(),
             text: text.to_string(),
+            media_urls: media_urls.to_vec(),
             idempotency_key: idempotency_key.to_string(),
         });
         if let Some(outcome) = state.sms_outcomes.pop_front() {
@@ -420,8 +437,8 @@ mod tests {
     #[tokio::test]
     async fn send_sms_returns_a_deterministic_default_when_nothing_is_queued() {
         let provider = provider();
-        let first = provider.send_sms("+1", "a", "idem-1").await;
-        let second = provider.send_sms("+1", "b", "idem-2").await;
+        let first = provider.send_sms("+1", "a", &[], "idem-1").await;
+        let second = provider.send_sms("+1", "b", &[], "idem-2").await;
         assert_eq!(
             first,
             SendOutcome::Sent {
@@ -447,10 +464,22 @@ mod tests {
         provider.queue_sms_outcome(SendOutcome::PermanentFailure {
             error: "bad number".to_string(),
         });
-        let first = provider.send_sms("+1", "a", "idem-1").await;
-        let second = provider.send_sms("+1", "b", "idem-2").await;
+        let first = provider.send_sms("+1", "a", &[], "idem-1").await;
+        let second = provider.send_sms("+1", "b", &[], "idem-2").await;
         assert!(matches!(first, SendOutcome::RetryableFailure { .. }));
         assert!(matches!(second, SendOutcome::PermanentFailure { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_attachment_is_carried_as_a_media_url() {
+        let provider = provider();
+        let urls = vec!["https://calls.example.test/v1/telecom/tel-1/file?artifact=a".to_string()];
+
+        let _ = provider
+            .send_sms("+15551230000", "here", &urls, "idem-1")
+            .await;
+
+        assert_eq!(provider.sent_messages()[0].media_urls, urls);
     }
 
     #[tokio::test]

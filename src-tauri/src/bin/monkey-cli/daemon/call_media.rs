@@ -74,6 +74,13 @@ pub(crate) trait MediaSocket: Send {
 pub(crate) trait CallSpeech: Send + Sync {
     async fn transcribe(&self, wav: Vec<u8>) -> Result<String, String>;
     async fn synthesize(&self, text: &str) -> Result<Vec<i16>, String>;
+    /// Keep the recording of what was said, returning its artifact id.
+    ///
+    /// A voicemail is the audio: a transcript of a bad line, or of a name being
+    /// spelled out, is not what the operator needs to hear back. The bytes go
+    /// to the same content-addressed store every other attachment uses, under
+    /// the same size limits.
+    async fn keep_audio(&self, wav: Vec<u8>) -> Result<String, String>;
 }
 
 /// Where a transcribed caller turn goes.
@@ -90,6 +97,10 @@ pub(crate) struct CallTurn<'a> {
     pub peer_number: &'a str,
     pub session_key: &'a str,
     pub text: &'a str,
+    /// Artifact holding the audio of this turn, when it was kept. Voicemail
+    /// keeps it; a live conversation does not, because nobody asked for every
+    /// call to be recorded.
+    pub audio_artifact_id: Option<&'a str>,
     /// Turn number within this call, which is what makes the ingress record's
     /// event id deterministic and therefore deduplicable.
     pub index: u32,
@@ -140,6 +151,10 @@ pub(crate) struct MediaSessionReport {
     pub turns_submitted: u32,
     pub utterances_transcribed: u32,
     pub frames_spoken: u32,
+    /// Times the caller talked over the agent and the rest was dropped.
+    pub interruptions: u32,
+    /// Voicemail recordings written to the artifact store.
+    pub recordings_kept: u32,
 }
 
 /// Run one call's audio until the carrier hangs up.
@@ -161,18 +176,35 @@ pub(crate) async fn run_media_session(
     let mut stream_id = String::new();
     let mut turn_index = 0;
     let mut spoke_opening = call.opening_line.is_none();
+    // Audio waiting to go out, one carrier frame each. Held here rather than
+    // written in a loop so the caller can interrupt: a sentence already handed
+    // to the socket cannot be taken back.
+    let mut pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
     loop {
         let frame = tokio::select! {
-            // Anything the agent said is spoken before more audio is read, so a
-            // reply is not queued behind a caller who keeps talking.
+            biased;
             Some(text) = to_speak.recv() => {
                 match speech.synthesize(&text).await {
-                    Ok(samples) => {
-                        report.frames_spoken +=
-                            send_audio(socket, &samples, carrier, format, &stream_id).await;
+                    Ok(samples) => queue_audio(&mut pending, &samples, carrier, format, &stream_id),
+                    Err(error) => eprintln!(
+                        "monkey daemon: could not speak on {}: {error}",
+                        call.call_id
+                    ),
+                }
+                continue;
+            }
+            // Speaking and listening happen together. One frame goes out per
+            // pass, and the loop comes straight back for whatever the caller
+            // is saying while it plays.
+            () = tokio::time::sleep(std::time::Duration::from_millis(
+                u64::from(format.outbound_chunk_ms).saturating_sub(5).max(1),
+            )), if !pending.is_empty() => {
+                if let Some(frame) = pending.pop_front() {
+                    if socket.send(frame).await.is_err() {
+                        break;
                     }
-                    Err(error) => eprintln!("monkey daemon: could not speak on {}: {error}", call.call_id),
+                    report.frames_spoken += 1;
                 }
                 continue;
             }
@@ -199,10 +231,7 @@ pub(crate) async fn run_media_session(
             spoke_opening = true;
             if let Some(line) = call.opening_line.as_deref() {
                 match speech.synthesize(line).await {
-                    Ok(samples) => {
-                        report.frames_spoken +=
-                            send_audio(socket, &samples, carrier, format, &stream_id).await;
-                    }
+                    Ok(samples) => queue_audio(&mut pending, &samples, carrier, format, &stream_id),
                     Err(error) => eprintln!(
                         "monkey daemon: could not speak the opening line on {}: {error}",
                         call.call_id
@@ -221,11 +250,45 @@ pub(crate) async fn run_media_session(
             continue;
         };
         let samples: Vec<i16> = bytes.iter().copied().map(decode_mulaw).collect();
+        // Barge-in: somebody talking over the agent means they stopped
+        // listening, so the rest of the sentence is dropped here and cleared at
+        // the carrier, which is still holding what was already sent.
+        if !pending.is_empty() && super::call_audio::contains_speech(&samples) {
+            pending.clear();
+            report.interruptions += 1;
+            if socket
+                .send(carrier.encode_clear_frame(&stream_id))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
         let UtteranceProgress::Complete(utterance) = detector.push(&samples) else {
             continue;
         };
         report.utterances_transcribed += 1;
         let wav = write_wav(&utterance, CALL_SAMPLE_RATE);
+        // Voicemail keeps the recording; a conversation does not. Kept before
+        // transcription so a message survives even when transcription fails —
+        // an unintelligible voicemail is still a voicemail.
+        let audio_artifact_id = if call.single_turn {
+            match speech.keep_audio(wav.clone()).await {
+                Ok(id) => {
+                    report.recordings_kept += 1;
+                    Some(id)
+                }
+                Err(error) => {
+                    eprintln!(
+                        "monkey daemon: could not keep the recording for {}: {error}",
+                        call.call_id
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let text = match speech.transcribe(wav).await {
             Ok(text) => text,
             Err(error) => {
@@ -233,10 +296,15 @@ pub(crate) async fn run_media_session(
                     "monkey daemon: could not transcribe a turn of {}: {error}",
                     call.call_id
                 );
-                continue;
+                // A voicemail whose audio was kept is still worth handing over,
+                // even with no words to go with it.
+                if audio_artifact_id.is_none() {
+                    continue;
+                }
+                String::new()
             }
         };
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && audio_artifact_id.is_none() {
             continue;
         }
         turn_index += 1;
@@ -246,6 +314,7 @@ pub(crate) async fn run_media_session(
             peer_number: &call.peer_number,
             session_key: &call.session_key,
             text: text.trim(),
+            audio_artifact_id: audio_artifact_id.as_deref(),
             index: turn_index,
         }) {
             Ok(_) => report.turns_submitted += 1,
@@ -292,6 +361,12 @@ pub(crate) trait MediaFrameCodec: Send + Sync {
     fn format(&self) -> MediaStreamFormat;
     /// One outbound audio frame, already base64 µ-law.
     fn encode_media_frame(&self, payload_b64: &str, stream_id: &str) -> String;
+    /// Discard whatever this side has already queued at the carrier.
+    ///
+    /// Barge-in needs both halves: stop sending, and throw away what the
+    /// carrier is still holding. Without the second one the caller interrupts
+    /// and then listens to the rest of the sentence anyway.
+    fn encode_clear_frame(&self, stream_id: &str) -> String;
 }
 
 /// Read a nested string out of an inbound frame, e.g. `["start", "streamId"]`.
@@ -303,33 +378,24 @@ fn read_path(value: &serde_json::Value, path: &[&str]) -> Option<String> {
     cursor.as_str().map(str::to_string)
 }
 
-async fn send_audio(
-    socket: &mut dyn MediaSocket,
+/// Cut synthesized speech into this carrier's frames and queue them.
+///
+/// Queued rather than sent, because a sentence written straight to the socket
+/// cannot be interrupted — and the carrier's own pacing limit (Telnyx allows
+/// one payload a second) is honoured by the loop that drains this.
+fn queue_audio(
+    pending: &mut std::collections::VecDeque<String>,
     samples: &[i16],
     carrier: &dyn MediaFrameCodec,
     format: MediaStreamFormat,
     stream_id: &str,
-) -> u32 {
-    let mut sent = 0;
+) {
     let chunk_samples =
         (CALL_SAMPLE_RATE as usize / 1_000) * format.outbound_chunk_ms.max(20) as usize;
     for chunk in samples.chunks(chunk_samples) {
         let payload: Vec<u8> = chunk.iter().copied().map(encode_mulaw).collect();
-        let frame = carrier.encode_media_frame(&STANDARD.encode(payload), stream_id);
-        if socket.send(frame).await.is_err() {
-            break;
-        }
-        sent += 1;
-        // A carrier that caps payloads per second drops anything faster, so
-        // the pacing is part of sending correctly rather than politeness.
-        if format.outbound_chunk_ms >= 1_000 {
-            tokio::time::sleep(std::time::Duration::from_millis(
-                u64::from(format.outbound_chunk_ms) - 50,
-            ))
-            .await;
-        }
+        pending.push_back(carrier.encode_media_frame(&STANDARD.encode(payload), stream_id));
     }
-    sent
 }
 
 /// Hands each caller turn to the daemon's own queue, as an ordinary run.
@@ -374,7 +440,11 @@ impl CallTurnSink for QueuedCallTurns<'_> {
                 sender_id: Some(turn.peer_number.to_string()),
                 // The transcript is the envelope: there is no provider payload
                 // behind a phone call, only what was said.
-                envelope_json: serde_json::json!({ "transcript": turn.text }).to_string(),
+                envelope_json: serde_json::json!({
+                    "transcript": turn.text,
+                    "audio_artifact_id": turn.audio_artifact_id,
+                })
+                .to_string(),
                 disposition: super::channel_store::EventDisposition::Accepted,
                 received_at_ms: now_ms,
             })?;
@@ -382,7 +452,7 @@ impl CallTurnSink for QueuedCallTurns<'_> {
                 return Err("This turn was already recorded".to_string());
             }
         }
-        let ingress = ConversationIngress::direct(
+        let mut ingress = ConversationIngress::direct(
             ConversationSource::Telephone,
             turn.account_id,
             source_event_id,
@@ -391,6 +461,22 @@ impl CallTurnSink for QueuedCallTurns<'_> {
             self.target.clone(),
             now_ms,
         );
+        if let Some(artifact_id) = turn.audio_artifact_id {
+            // The recording rides along as an attachment, so the run can play
+            // or forward it rather than only read what it was heard as.
+            ingress
+                .attachments
+                .push(little_monkey_lib::channels::types::ChannelAttachment {
+                    provider_id: None,
+                    kind: little_monkey_lib::channels::types::AttachmentKind::Audio,
+                    filename: Some(format!("{}.wav", turn.call_id)),
+                    mime_type: Some("audio/wav".to_string()),
+                    declared_size_bytes: None,
+                    source: little_monkey_lib::channels::types::AttachmentSource::ProviderHandle {
+                        handle: artifact_id.to_string(),
+                    },
+                });
+        }
         let params = super::channel_ingress::run_params_for(&self.target, &ingress);
         self.queue.submit(&ingress, params)
     }
@@ -414,6 +500,14 @@ impl CallSpeech for ConfiguredSpeech {
             little_monkey_lib::m7_companion::transcribe_call_audio(&self.app_data_dir, &path).await;
         let _ = std::fs::remove_file(&path);
         result
+    }
+
+    async fn keep_audio(&self, wav: Vec<u8>) -> Result<String, String> {
+        little_monkey_lib::artifact_store::ArtifactStore::new(self.app_data_dir.join("content-v1"))
+            .map_err(|error| error.to_string())?
+            .put(&wav)
+            .map(|blob| blob.id)
+            .map_err(|error| error.to_string())
     }
 
     async fn synthesize(&self, text: &str) -> Result<Vec<i16>, String> {
@@ -459,6 +553,10 @@ mod tests {
             })
             .to_string()
         }
+
+        fn encode_clear_frame(&self, stream_id: &str) -> String {
+            serde_json::json!({ "event": "clear", "streamSid": stream_id }).to_string()
+        }
     }
 
     struct ScriptedSocket {
@@ -475,8 +573,12 @@ mod tests {
             if let Some(frame) = self.inbound.pop() {
                 return Some(frame);
             }
-            if let Some(linger) = self.linger.take() {
+            // Borrowed rather than taken: this future is cancelled every time
+            // the session picks another branch, and a lingering line has to
+            // still be open on the next pass.
+            if let Some(linger) = self.linger.as_mut() {
                 let _ = linger.await;
+                self.linger = None;
             }
             None
         }
@@ -487,14 +589,32 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct KeptAudio(Mutex<Vec<usize>>);
+
     struct FakeSpeech {
         heard: &'static str,
+        kept: Arc<KeptAudio>,
+    }
+
+    impl FakeSpeech {
+        fn new(heard: &'static str) -> Self {
+            Self {
+                heard,
+                kept: Arc::new(KeptAudio::default()),
+            }
+        }
     }
 
     #[async_trait]
     impl CallSpeech for FakeSpeech {
         async fn transcribe(&self, _wav: Vec<u8>) -> Result<String, String> {
             Ok(self.heard.to_string())
+        }
+
+        async fn keep_audio(&self, wav: Vec<u8>) -> Result<String, String> {
+            self.kept.0.lock().unwrap().push(wav.len());
+            Ok("artifact-1".to_string())
         }
 
         async fn synthesize(&self, text: &str) -> Result<Vec<i16>, String> {
@@ -506,15 +626,16 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingSink {
-        turns: Mutex<Vec<(String, u32)>>,
+        turns: Mutex<Vec<(String, u32, Option<String>)>>,
     }
 
     impl CallTurnSink for RecordingSink {
         fn submit_turn(&self, turn: CallTurn<'_>) -> Result<String, String> {
-            self.turns
-                .lock()
-                .unwrap()
-                .push((turn.text.to_string(), turn.index));
+            self.turns.lock().unwrap().push((
+                turn.text.to_string(),
+                turn.index,
+                turn.audio_artifact_id.map(str::to_string),
+            ));
             Ok(format!("job-{}", turn.index))
         }
     }
@@ -529,12 +650,15 @@ mod tests {
         .to_string()
     }
 
-    fn identity() -> CallIdentity {
+    /// A distinct call id per test: the speaker registry is process-global, the
+    /// way live calls are, so two tests sharing an id would unregister each
+    /// other's line.
+    fn identity_for(call_id: &str) -> CallIdentity {
         CallIdentity {
             account_id: "tel-1".into(),
-            call_id: "call-1".into(),
+            call_id: call_id.into(),
             peer_number: "+15551234567".into(),
-            session_key: "call:tel-1:call-1".into(),
+            session_key: format!("call:tel-1:{call_id}"),
             opening_line: None,
             single_turn: false,
         }
@@ -563,12 +687,10 @@ mod tests {
 
         let report = run_media_session(
             &mut socket,
-            &FakeSpeech {
-                heard: "what is the deploy status",
-            },
+            &FakeSpeech::new("what is the deploy status"),
             &sink,
             &FakeCarrier,
-            identity(),
+            identity_for("call-turn"),
         )
         .await;
 
@@ -576,7 +698,7 @@ mod tests {
         assert_eq!(report.turns_submitted, 1);
         assert_eq!(
             sink.turns.lock().unwrap().as_slice(),
-            [("what is the deploy status".to_string(), 1)]
+            [("what is the deploy status".to_string(), 1, None)]
         );
     }
 
@@ -594,10 +716,10 @@ mod tests {
 
         let report = run_media_session(
             &mut socket,
-            &FakeSpeech { heard: "unused" },
+            &FakeSpeech::new("unused"),
             &sink,
             &FakeCarrier,
-            identity(),
+            identity_for("call-silent"),
         )
         .await;
 
@@ -617,10 +739,10 @@ mod tests {
         let session = async {
             run_media_session(
                 &mut socket,
-                &FakeSpeech { heard: "unused" },
+                &FakeSpeech::new("unused"),
                 &RecordingSink::default(),
                 &FakeCarrier,
-                identity(),
+                identity_for("call-reply"),
             )
             .await
         };
@@ -628,12 +750,13 @@ mod tests {
             // The session registers itself as it starts; retry briefly rather
             // than racing it.
             for _ in 0..50 {
-                if speak_on_call("call-1", "deploy finished ten minutes ago").is_ok() {
+                if speak_on_call("call-reply", "deploy finished ten minutes ago").is_ok() {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Long enough for the queued frames to drain at 20 ms each.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
             let _ = release.send(());
         };
         let (report, ()) = tokio::join!(session, speaking);
@@ -650,26 +773,26 @@ mod tests {
 
     #[tokio::test]
     async fn the_line_opens_with_the_greeting_rather_than_with_silence() {
+        let (release, linger) = tokio::sync::oneshot::channel();
         let sent = Arc::new(Mutex::new(Vec::new()));
         let mut socket = ScriptedSocket {
-            inbound: vec![
-                serde_json::json!({ "event": "stop", "streamSid": "MZ1" }).to_string(),
-                media_frame(&vec![0; 800]),
-            ],
+            inbound: vec![media_frame(&vec![0; 800])],
             sent: sent.clone(),
-            linger: None,
+            // The line stays open while the greeting plays, the way a carrier's
+            // does; the session ends when the socket closes.
+            linger: Some(linger),
         };
-        let mut call = identity();
+        let mut call = identity_for("call-greeting");
         call.opening_line = Some("Hello, this is the support line.".into());
 
-        let report = run_media_session(
-            &mut socket,
-            &FakeSpeech { heard: "unused" },
-            &RecordingSink::default(),
-            &FakeCarrier,
-            call,
-        )
-        .await;
+        let speech = FakeSpeech::new("unused");
+        let sink = RecordingSink::default();
+        let session = run_media_session(&mut socket, &speech, &sink, &FakeCarrier, call);
+        let hang_up = async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let _ = release.send(());
+        };
+        let (report, ()) = tokio::join!(session, hang_up);
 
         assert!(report.frames_spoken > 0, "the greeting was spoken");
         let first: serde_json::Value =
@@ -677,6 +800,51 @@ mod tests {
         assert_eq!(
             first["streamSid"], "MZ1",
             "frames carry the carrier's own id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_talking_over_the_agent_cuts_it_off() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut socket = ScriptedSocket {
+            inbound: vec![
+                // Read last: the caller starts talking while the greeting,
+                // which is far longer than one frame, is still playing.
+                serde_json::json!({ "event": "stop", "streamSid": "MZ1" }).to_string(),
+                media_frame(&speech_samples(1_600)),
+                media_frame(&vec![0; 160]),
+            ],
+            sent: sent.clone(),
+            linger: None,
+        };
+        let mut call = identity_for("call-bargein");
+        call.opening_line = Some("x".repeat(400));
+
+        let report = run_media_session(
+            &mut socket,
+            &FakeSpeech::new("stop"),
+            &RecordingSink::default(),
+            &FakeCarrier,
+            call,
+        )
+        .await;
+
+        assert_eq!(report.interruptions, 1, "the caller interrupted once");
+        let frames = sent.lock().unwrap().clone();
+        let cleared = frames
+            .iter()
+            .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+            .any(|frame| frame["event"] == "clear");
+        assert!(
+            cleared,
+            "the carrier is told to drop what it is still holding"
+        );
+        // 400 characters of speech is 400 frames from the fake synthesizer;
+        // being interrupted means most of them were never sent.
+        assert!(
+            report.frames_spoken < 100,
+            "the rest of the sentence was dropped, sent {}",
+            report.frames_spoken
         );
     }
 
@@ -693,23 +861,25 @@ mod tests {
             sent: Arc::new(Mutex::new(Vec::new())),
             linger: None,
         };
-        let mut call = identity();
+        let mut call = identity_for("call-voicemail");
         call.single_turn = true;
         let sink = RecordingSink::default();
+        let speech = FakeSpeech::new("please call me back");
 
-        let report = run_media_session(
-            &mut socket,
-            &FakeSpeech {
-                heard: "please call me back",
-            },
-            &sink,
-            &FakeCarrier,
-            call,
-        )
-        .await;
+        let report = run_media_session(&mut socket, &speech, &sink, &FakeCarrier, call).await;
 
         assert_eq!(report.turns_submitted, 1);
         assert_eq!(sink.turns.lock().unwrap().len(), 1);
+        assert_eq!(report.recordings_kept, 1, "a voicemail is the audio");
+        assert!(
+            !speech.kept.0.lock().unwrap().is_empty(),
+            "the recording reached the store"
+        );
+        assert_eq!(
+            sink.turns.lock().unwrap()[0].2.as_deref(),
+            Some("artifact-1"),
+            "and the turn names it"
+        );
     }
 
     #[tokio::test]

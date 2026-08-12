@@ -179,17 +179,27 @@ impl TelecomProvider for PlivoProvider {
         ChannelHealth::connected(now, Some(self.from_number.clone()))
     }
 
-    async fn send_sms(&self, to_number: &str, text: &str, idempotency_key: &str) -> SendOutcome {
+    async fn send_sms(
+        &self,
+        to_number: &str,
+        text: &str,
+        media_urls: &[String],
+        idempotency_key: &str,
+    ) -> SendOutcome {
         let _ = idempotency_key; // no caller-supplied dedupe key on Plivo's Message API
         let client = match self.client() {
             Ok(client) => client,
             Err(error) => return SendOutcome::PermanentFailure { error },
         };
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "src": self.from_number,
             "dst": to_number,
             "text": text,
         });
+        if !media_urls.is_empty() {
+            body["media_urls"] = serde_json::json!(media_urls);
+            body["type"] = serde_json::json!("mms");
+        }
         let request = client
             .post(self.message_url())
             .basic_auth(&self.auth_id, Some(&self.auth_token))
@@ -661,7 +671,7 @@ mod tests {
     async fn send_sms_maps_a_success_response_to_sent() {
         let base = serve_once("202 Accepted", r#"{"message_uuid":["msg-abc"]}"#);
         let provider = provider_with_base(&base);
-        let outcome = provider.send_sms("+15551230000", "hi", "idem-1").await;
+        let outcome = provider.send_sms("+15551230000", "hi", &[], "idem-1").await;
         assert_eq!(
             outcome,
             SendOutcome::Sent {
@@ -674,7 +684,7 @@ mod tests {
     async fn send_sms_maps_429_to_retryable() {
         let base = serve_once("429 Too Many Requests", "{}");
         let provider = provider_with_base(&base);
-        match provider.send_sms("+15551230000", "hi", "idem-1").await {
+        match provider.send_sms("+15551230000", "hi", &[], "idem-1").await {
             SendOutcome::RetryableFailure { .. } => {}
             other => panic!("expected RetryableFailure, got {other:?}"),
         }
@@ -684,7 +694,7 @@ mod tests {
     async fn send_sms_maps_401_to_permanent() {
         let base = serve_once("401 Unauthorized", "{}");
         let provider = provider_with_base(&base);
-        match provider.send_sms("+15551230000", "hi", "idem-1").await {
+        match provider.send_sms("+15551230000", "hi", &[], "idem-1").await {
             SendOutcome::PermanentFailure { .. } => {}
             other => panic!("expected PermanentFailure, got {other:?}"),
         }
@@ -714,7 +724,7 @@ mod tests {
             }
         });
         let provider = provider_with_base(&format!("http://127.0.0.1:{port}"));
-        match provider.send_sms("+15551230000", "hi", "idem-1").await {
+        match provider.send_sms("+15551230000", "hi", &[], "idem-1").await {
             SendOutcome::NeedsReconciliation { .. } => {}
             other => panic!("expected NeedsReconciliation, got {other:?}"),
         }
@@ -732,6 +742,14 @@ const MEDIA_FORMAT: crate::daemon::call_media::MediaStreamFormat =
 impl crate::daemon::call_media::MediaFrameCodec for PlivoProvider {
     fn format(&self) -> crate::daemon::call_media::MediaStreamFormat {
         MEDIA_FORMAT
+    }
+
+    fn encode_clear_frame(&self, stream_id: &str) -> String {
+        serde_json::json!({
+            "event": "clearAudio",
+            "streamId": stream_id,
+        })
+        .to_string()
     }
 
     fn encode_media_frame(&self, payload_b64: &str, stream_id: &str) -> String {

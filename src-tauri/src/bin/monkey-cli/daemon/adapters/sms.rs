@@ -29,18 +29,114 @@ const MAX_TEXT_CHARS: usize = 306;
 
 pub(crate) struct SmsAdapter {
     carrier: std::sync::Arc<dyn TelecomProvider>,
+    /// What an outbound attachment needs to become a URL a carrier can fetch:
+    /// the account it is signed for, that account's own credential, and the
+    /// operator's public base. Absent means this account cannot send media.
+    media: Option<MediaSigning>,
 }
+
+/// Everything needed to hand a carrier a fetchable attachment URL.
+struct MediaSigning {
+    account_id: String,
+    secret: String,
+    public_base_url: String,
+    app_data_dir: std::path::PathBuf,
+}
+
+/// How long a carrier has to fetch an attachment before its URL stops working.
+///
+/// Carriers fetch promptly; the window only has to cover a retry or two. Every
+/// minute past that is a minute the URL is worth stealing.
+const MEDIA_FILE_TTL_MS: i64 = 15 * 60 * 1_000;
+
+/// The largest attachment this pipeline will hand a carrier. MMS is capped far
+/// below this by every carrier anyway; the point is to refuse before reading a
+/// large blob into memory.
+const MAX_MMS_BYTES: usize = 5 * 1024 * 1024;
 
 impl SmsAdapter {
     /// Build the adapter for a telephony account. `secret` is that account's
     /// carrier credential, already read from the keychain by the caller.
-    pub(crate) fn new(account: &TelecomAccountRecord, secret: String) -> Result<Self, String> {
-        Ok(Self::with_carrier(provider_for_account(account, secret)?))
+    pub(crate) fn new(
+        account: &TelecomAccountRecord,
+        secret: String,
+        app_data_dir: std::path::PathBuf,
+    ) -> Result<Self, String> {
+        let media = account
+            .public_base_url
+            .clone()
+            .map(|public_base_url| MediaSigning {
+                account_id: account.account_id.clone(),
+                secret: secret.clone(),
+                public_base_url,
+                app_data_dir,
+            });
+        Ok(Self {
+            carrier: provider_for_account(account, secret)?,
+            media,
+        })
     }
 
     fn with_carrier(carrier: std::sync::Arc<dyn TelecomProvider>) -> Self {
-        Self { carrier }
+        Self {
+            carrier,
+            media: None,
+        }
     }
+
+    /// Turn this message's attachments into URLs the carrier can fetch.
+    ///
+    /// The artifact is read here only to confirm it exists and fits: the bytes
+    /// themselves are served later, by the daemon's own listener, to whoever
+    /// presents the signed URL.
+    fn media_urls(&self, message: &OutboundMessage) -> Result<Vec<String>, String> {
+        if message.attachments.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(media) = &self.media else {
+            return Err(
+                "This number has no public URL configured, so a carrier has nowhere to fetch an attachment from."
+                    .to_string(),
+            );
+        };
+        let store = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
+            media.app_data_dir.join("content-v1"),
+            MAX_MMS_BYTES as u64,
+        )
+        .map_err(|error| error.to_string())?;
+        let expires_at_ms = now_ms()? + MEDIA_FILE_TTL_MS;
+        let base = media.public_base_url.trim_end_matches('/');
+        let mut urls = Vec::new();
+        for attachment in &message.attachments {
+            let bytes = store
+                .read(&attachment.artifact_id)
+                .map_err(|error| format!("That attachment could not be read: {error}"))?;
+            if bytes.len() > MAX_MMS_BYTES {
+                return Err("That attachment is too large to send as MMS.".to_string());
+            }
+            let signature = super::super::telephony::media_file_token(
+                &media.secret,
+                &media.account_id,
+                &attachment.artifact_id,
+                expires_at_ms,
+            );
+            urls.push(format!(
+                "{base}/v1/telecom/{}/file?artifact={}&exp={expires_at_ms}&sig={signature}",
+                media.account_id, attachment.artifact_id
+            ));
+        }
+        Ok(urls)
+    }
+}
+
+fn now_ms() -> Result<i64, String> {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "System clock is before the Unix epoch".to_string())?
+            .as_millis(),
+    )
+    .map_err(|_| "System clock is beyond the supported range".to_string())
 }
 
 #[async_trait]
@@ -53,9 +149,9 @@ impl ChannelAdapter for SmsAdapter {
         ProviderCapabilities {
             max_text_chars: MAX_TEXT_CHARS,
             supports_threads: false,
-            // MMS is a different endpoint on every carrier and a different
-            // billing line; text only until one is actually wired.
-            supports_attachments: false,
+            // MMS, when the operator configured a public URL for the carrier to
+            // fetch the attachment from.
+            supports_attachments: self.media.is_some(),
             supports_mention_metadata: false,
             supports_idempotency_key: true,
             supports_delivery_receipts: true,
@@ -87,20 +183,19 @@ impl ChannelAdapter for SmsAdapter {
                 Err(error) => SendOutcome::PermanentFailure { error },
             };
         }
-        if !message.attachments.is_empty() {
-            // MMS needs a media URL the carrier can fetch, and this app hosts
-            // artifacts privately on purpose. Refused by name rather than sent
-            // as a text with the attachment silently dropped.
-            return SendOutcome::PermanentFailure {
-                error: "Sending media by MMS is not supported; the text was not sent".to_string(),
-            };
-        }
+        // An attachment becomes a signed, expiring URL this daemon serves; every
+        // carrier sends media by fetching one.
+        let media_urls = match self.media_urls(message) {
+            Ok(urls) => urls,
+            Err(error) => return SendOutcome::PermanentFailure { error },
+        };
         // An SMS conversation is identified by the peer's number, which is what
         // `telecom_worker` put in the envelope's conversation id.
         self.carrier
             .send_sms(
                 &message.conversation_id,
                 &message.text,
+                &media_urls,
                 &message.idempotency_key,
             )
             .await
@@ -198,15 +293,99 @@ mod tests {
 
     #[tokio::test]
     async fn a_real_account_builds_its_configured_carrier() {
-        let adapter = SmsAdapter::new(&account(), "shared-secret".into()).expect("adapter");
+        let adapter = SmsAdapter::new(&account(), "shared-secret".into(), std::env::temp_dir())
+            .expect("adapter");
 
         assert_eq!(adapter.kind(), ChannelKind::Sms);
         assert!(adapter.capabilities().supports_idempotency_key);
     }
 
     #[tokio::test]
+    async fn an_attachment_becomes_a_signed_url_the_carrier_can_fetch() {
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-mms-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let store = little_monkey_lib::artifact_store::ArtifactStore::new(root.join("content-v1"))
+            .expect("store");
+        let blob = store.put(b"a tiny png").expect("put");
+        let mut with_url = account();
+        with_url.public_base_url = Some("https://calls.example.test".into());
+        let adapter =
+            SmsAdapter::new(&with_url, "carrier-secret".into(), root.clone()).expect("adapter");
+        let mut message = reply("here it is");
+        message
+            .attachments
+            .push(little_monkey_lib::channels::types::OutboundAttachment {
+                artifact_id: blob.id.clone(),
+                filename: Some("photo.png".into()),
+                mime_type: Some("image/png".into()),
+            });
+
+        let urls = adapter.media_urls(&message).expect("urls");
+
+        assert_eq!(urls.len(), 1);
+        let url = &urls[0];
+        assert!(url.starts_with("https://calls.example.test/v1/telecom/tel-1/file?"));
+        assert!(url.contains(&format!("artifact={}", blob.id)));
+        // The signature must be the account's own, over this artifact: another
+        // artifact's URL is not accepted by the route that serves them.
+        let expires: i64 = url
+            .split("exp=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .and_then(|value| value.parse().ok())
+            .expect("expiry");
+        let signature = url.split("sig=").nth(1).expect("signature");
+        assert!(crate::daemon::telephony::verify_media_file_token(
+            "carrier-secret",
+            "tel-1",
+            &blob.id,
+            expires,
+            signature,
+            expires - 1,
+        )
+        .is_ok());
+        assert!(crate::daemon::telephony::verify_media_file_token(
+            "carrier-secret",
+            "tel-1",
+            "some-other-artifact",
+            expires,
+            signature,
+            expires - 1,
+        )
+        .is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_number_with_no_public_url_refuses_the_attachment_rather_than_dropping_it() {
+        let mut without_url = account();
+        without_url.public_base_url = None;
+        let adapter =
+            SmsAdapter::new(&without_url, "secret".into(), std::env::temp_dir()).expect("adapter");
+        let mut message = reply("here it is");
+        message
+            .attachments
+            .push(little_monkey_lib::channels::types::OutboundAttachment {
+                artifact_id: "artifact-1".into(),
+                filename: None,
+                mime_type: None,
+            });
+
+        let outcome = adapter.send(&message).await;
+
+        assert!(
+            matches!(outcome, SendOutcome::PermanentFailure { ref error } if error.contains("nowhere to fetch")),
+            "{outcome:?}"
+        );
+        assert!(!adapter.capabilities().supports_attachments);
+    }
+
+    #[tokio::test]
     async fn nothing_is_ever_polled() {
-        let adapter = SmsAdapter::new(&account(), "shared-secret".into()).expect("adapter");
+        let adapter = SmsAdapter::new(&account(), "shared-secret".into(), std::env::temp_dir())
+            .expect("adapter");
 
         let batch = adapter.poll(None).await.expect("poll");
 
