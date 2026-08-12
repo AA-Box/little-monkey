@@ -4077,8 +4077,8 @@ mod tests {
             // capabilities read, all loopback to the `sd-server` child. The
             // generation itself is not under any of them: the API is
             // submit-and-poll, so a deadline here only ever covers one round
-            // trip, and the run is bounded by `JOB_TIMEOUT` (2h) in the polling
-            // loop. The largest body is the terminal poll, which carries the
+            // trip, and the run is bounded by `JOB_STALL_TIMEOUT` (1h without
+            // any movement) in the polling loop. The largest body is the terminal poll, which carries the
             // finished media base64 inside the JSON under `MAX_MEDIA_BYTES`
             // (256 MiB) — 2.8 MB/s across a loopback socket, and fully buffered
             // by `json()`, so there is no stream for the deadline to truncate.
