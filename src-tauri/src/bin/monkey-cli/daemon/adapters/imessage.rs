@@ -1,12 +1,18 @@
-//! iMessage adapter: speaks newline-delimited JSON to a user-installed,
-//! macOS-only helper process (JSON commands in on stdin, JSON events out on
-//! stdout) — the same shape as `signal.rs`, and for the same reason. Little
-//! Monkey does not ship a Messages integration, does not bypass SIP, does
-//! not read `~/Library/Messages/chat.db` directly, does not link any
-//! private Apple framework, and never builds an AppleScript command string
-//! from message text (that would be command injection into `osascript`).
-//! Everything provider-specific lives inside the operator's own helper; this
-//! module only speaks its stdio protocol.
+//! iMessage adapter, macOS only, with two backends.
+//!
+//! **Native (the default).** With no `helper_path` configured, this account
+//! talks to the Mac it runs on: inbound is read from Messages' own SQLite
+//! database and outbound goes through Messages.app over AppleScript. That
+//! lives in [`super::imessage_native`], which documents both halves. It
+//! needs two ordinary macOS permissions — Full Disk Access to read,
+//! Automation to send — and nothing else: no SIP change, no injected dylib,
+//! no private Apple framework, and never an AppleScript command string built
+//! out of message text (that would be command injection into `osascript`).
+//!
+//! **Helper (an override).** With `helper_path` set, this module instead
+//! speaks newline-delimited JSON to that process — JSON commands in on
+//! stdin, JSON events out on stdout, the same shape as `signal.rs` — and
+//! everything provider-specific lives inside the operator's own helper.
 //!
 //! The real implementation ([`macos::ImessageAdapter`]) is
 //! `#[cfg(target_os = "macos")]`. Every other platform gets
@@ -77,7 +83,10 @@ mod macos {
     }
 
     pub struct ImessageAdapter {
+        /// Empty when this account runs natively. A path here means the
+        /// operator installed a helper and wants it driven instead.
         helper_path: String,
+        native: super::super::imessage_native::NativeConfig,
         handle: String,
         inbound_tx: mpsc::Sender<ChannelEnvelope>,
         inbound_rx: Mutex<mpsc::Receiver<ChannelEnvelope>>,
@@ -91,13 +100,17 @@ mod macos {
 
     impl ImessageAdapter {
         pub fn new(config: &AdapterConfig<'_>) -> Result<Self, String> {
+            // Optional now: with no helper configured this adapter talks to
+            // Messages itself, which is the setup that needs nothing
+            // installed. A helper path is an override for an operator who
+            // has one and prefers it.
             let helper_path = config
                 .account
                 .non_secret_config
                 .get("helper_path")
                 .and_then(Value::as_str)
                 .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| "iMessage account is missing helper_path".to_string())?
+                .unwrap_or_default()
                 .to_string();
             let handle = config
                 .account
@@ -110,6 +123,9 @@ mod macos {
             let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CHANNEL_CAPACITY);
             Ok(Self {
                 helper_path,
+                native: super::super::imessage_native::NativeConfig::resolve(
+                    &config.account.non_secret_config,
+                ),
                 handle,
                 inbound_tx,
                 inbound_rx: Mutex::new(inbound_rx),
@@ -120,6 +136,30 @@ mod macos {
                     alive: AtomicBool::new(false),
                 }),
                 last_start: Mutex::new(None),
+            })
+        }
+
+        /// Read the next batch straight out of the Messages database.
+        ///
+        /// The cursor is the last `message.ROWID` handed on. An account with
+        /// no cursor yet records the current maximum and returns nothing:
+        /// connecting an account is not a reason to replay every
+        /// conversation on the Mac through the agent.
+        async fn poll_native(&self, cursor: Option<&str>) -> Result<InboundBatch, String> {
+            let native = self.native.clone();
+            let Some(from) = cursor.and_then(|value| value.parse::<i64>().ok()) else {
+                let latest =
+                    blocking(move || super::super::imessage_native::latest_rowid(&native)).await?;
+                return Ok(InboundBatch {
+                    envelopes: Vec::new(),
+                    cursor: Some(latest.to_string()),
+                });
+            };
+            let batch =
+                blocking(move || super::super::imessage_native::poll_since(&native, from)).await?;
+            Ok(InboundBatch {
+                envelopes: batch.envelopes,
+                cursor: Some(batch.cursor.to_string()),
             })
         }
 
@@ -392,6 +432,21 @@ mod macos {
         })
     }
 
+    /// Run one SQLite read off the async runtime.
+    ///
+    /// `rusqlite` is blocking, and the Messages database is somebody else's
+    /// file on somebody else's disk — holding a runtime worker on it would
+    /// stall every other account's poll.
+    async fn blocking<T, F>(work: F) -> Result<T, String>
+    where
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::task::spawn_blocking(work)
+            .await
+            .map_err(|error| format!("Reading the Messages database panicked: {error}"))?
+    }
+
     fn now_ms() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -420,6 +475,16 @@ mod macos {
 
         async fn probe(&self) -> ChannelHealth {
             let now = now_ms();
+            if self.helper_path.is_empty() {
+                let native = self.native.clone();
+                return match blocking(move || super::super::imessage_native::probe(&native)).await {
+                    Ok(handles) => ChannelHealth::connected(
+                        now,
+                        Some(format!("{} · {handles} known handles", self.handle)),
+                    ),
+                    Err(error) => ChannelHealth::error(now, error),
+                };
+            }
             if let Some(error) = self.helper_missing() {
                 return ChannelHealth::unsupported(now, error);
             }
@@ -429,7 +494,10 @@ mod macos {
             }
         }
 
-        async fn poll(&self, _cursor: Option<&str>) -> Result<InboundBatch, String> {
+        async fn poll(&self, cursor: Option<&str>) -> Result<InboundBatch, String> {
+            if self.helper_path.is_empty() {
+                return self.poll_native(cursor).await;
+            }
             self.ensure_started().await?;
             let mut rx = self.inbound_rx.lock().await;
             let mut envelopes = Vec::new();
@@ -448,6 +516,34 @@ mod macos {
         }
 
         async fn send(&self, message: &OutboundMessage) -> SendOutcome {
+            if self.helper_path.is_empty() {
+                // A group's conversation id is the chat GUID Messages
+                // recorded; a direct one is the other party's handle. The
+                // two are told apart by the conversation the envelope came
+                // from, never by guessing at the string's shape.
+                let is_group = message.conversation_id.contains(";+;")
+                    || message.conversation_id.starts_with("chat");
+                return match super::super::imessage_native::send(
+                    &self.native,
+                    &message.conversation_id,
+                    &message.text,
+                    is_group,
+                )
+                .await
+                {
+                    super::super::imessage_native::NativeSend::Sent => SendOutcome::Sent {
+                        // AppleScript reports no identifier for what it
+                        // just sent, and inventing one would poison dedupe.
+                        provider_message_id: None,
+                    },
+                    super::super::imessage_native::NativeSend::Refused(error) => {
+                        SendOutcome::PermanentFailure { error }
+                    }
+                    super::super::imessage_native::NativeSend::Ambiguous(error) => {
+                        SendOutcome::NeedsReconciliation { error }
+                    }
+                };
+            }
             let params = json!({ "target": message.conversation_id, "text": message.text });
             match self.call("send", params).await {
                 Ok(result) => SendOutcome::Sent {

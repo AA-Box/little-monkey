@@ -68,6 +68,19 @@ describe("channels setup guidance", () => {
     expect(PROVIDER_GUIDES.find((entry) => entry.kind === "imessage")?.requiresPlatform).toBe("macos");
   });
 
+  it("does not make an iMessage helper mandatory", () => {
+    // iMessage talks to Messages on this Mac by default. Requiring a helper
+    // path would block setup on installing something that most people have
+    // no reason to run.
+    const fields = PROVIDER_GUIDES.find((guide) => guide.kind === "imessage")!.configFields;
+    expect(fields.find((field) => field.key === "helper_path")?.required).toBeFalsy();
+    expect(fields.find((field) => field.key === "handle")?.required).toBe(true);
+    // Signal is the opposite: signal-cli is the only way in, so its path is
+    // required.
+    const signal = PROVIDER_GUIDES.find((guide) => guide.kind === "signal")!.configFields;
+    expect(signal.find((field) => field.key === "helper_path")?.required).toBe(true);
+  });
+
   it("collects each server's own address rather than a hosted provider's", () => {
     const keys = (kind: string) =>
       (PROVIDER_GUIDES.find((guide) => guide.kind === kind)?.configFields ?? []).map((field) => field.key);
