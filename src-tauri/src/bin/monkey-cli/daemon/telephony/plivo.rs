@@ -31,11 +31,14 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Deserialize;
 
 use little_monkey_lib::channels::types::{
-    BoundedMetadata, ChannelConversation, ChannelEnvelope, ChannelHealth, ChannelKind,
-    ChannelSender, SendOutcome,
+    AttachmentKind, AttachmentSource, BoundedMetadata, ChannelAttachment, ChannelConversation,
+    ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender, SendOutcome,
 };
 
-use super::{CallHandle, CallState, TelecomConfig, TelecomEvent, TelecomKind, TelecomProvider};
+use super::{
+    AnswerDocument, CallHandle, CallState, TelecomConfig, TelecomEvent, TelecomKind,
+    TelecomProvider,
+};
 
 const API_BASE: &str = "https://api.plivo.com/v1";
 
@@ -123,6 +126,26 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 impl TelecomProvider for PlivoProvider {
     fn kind(&self) -> TelecomKind {
         TelecomKind::Plivo
+    }
+
+    fn media_stream(&self) -> Option<crate::daemon::call_media::MediaStreamFormat> {
+        Some(crate::daemon::call_media::MediaStreamFormat {
+            stream_id_key: "streamId",
+            outbound_event: "playAudio",
+        })
+    }
+
+    /// Plivo XML. `<Stream bidirectional="true">` is the equivalent verb, and
+    /// Plivo expects played-back audio under its own `playAudio` event rather
+    /// than the inbound `media` one.
+    fn answer_instructions(&self, media_url: &str) -> Option<AnswerDocument> {
+        Some(AnswerDocument {
+            content_type: "text/xml; charset=utf-8",
+            body: format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Stream bidirectional=\"true\" keepCallAlive=\"true\" audioTrack=\"inbound\" contentType=\"audio/x-mulaw;rate=8000\">{}</Stream></Response>",
+                crate::daemon::service::xml_escape(media_url)
+            ),
+        })
     }
 
     async fn probe(&self) -> ChannelHealth {
@@ -333,6 +356,15 @@ fn plivo_call_status_to_state(status: &str) -> Option<CallState> {
     }
 }
 
+/// One entry of Plivo's `Media` array on an inbound MMS.
+#[derive(Debug, Deserialize)]
+struct PlivoMedia {
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    media_url: String,
+}
+
 fn normalize_plivo_params(
     params: &std::collections::BTreeMap<String, String>,
     received_at_ms: i64,
@@ -344,6 +376,30 @@ fn normalize_plivo_params(
             .ok_or_else(|| "Plivo inbound SMS is missing From".to_string())?;
         let to = params.get("To").cloned().unwrap_or_default();
         let text = params.get("Text").cloned().unwrap_or_default();
+        // MMS: Plivo posts the media as a JSON array of {content_type, media_url}
+        // in `Media`. Metadata only — the bytes are fetched later under the
+        // normal egress and artifact limits, like any other provider's.
+        let attachments = params
+            .get("Media")
+            .and_then(|raw| serde_json::from_str::<Vec<PlivoMedia>>(raw).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|media| !media.media_url.is_empty())
+            .map(|media| ChannelAttachment {
+                provider_id: None,
+                kind: media
+                    .content_type
+                    .as_deref()
+                    .map(AttachmentKind::from_mime)
+                    .unwrap_or(AttachmentKind::Other),
+                filename: None,
+                mime_type: media.content_type,
+                declared_size_bytes: None,
+                source: AttachmentSource::Url {
+                    url: media.media_url,
+                },
+            })
+            .collect();
         let mut metadata = BoundedMetadata::new();
         metadata.insert("to_number", to);
         let envelope = ChannelEnvelope {
@@ -353,7 +409,7 @@ fn normalize_plivo_params(
             conversation: ChannelConversation::direct(from.clone()),
             sender: ChannelSender::new(from),
             text,
-            attachments: Vec::new(),
+            attachments,
             reply_to_provider_id: None,
             mentions_self: false,
             received_at_ms,

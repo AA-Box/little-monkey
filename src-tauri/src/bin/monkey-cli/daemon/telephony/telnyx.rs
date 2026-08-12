@@ -39,7 +39,10 @@ use little_monkey_lib::channels::types::{
     ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender, SendOutcome,
 };
 
-use super::{CallHandle, CallState, TelecomConfig, TelecomEvent, TelecomKind, TelecomProvider};
+use super::{
+    AnswerDocument, CallHandle, CallState, TelecomConfig, TelecomEvent, TelecomKind,
+    TelecomProvider,
+};
 
 const API_BASE: &str = "https://api.telnyx.com/v2";
 
@@ -123,6 +126,27 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 impl TelecomProvider for TelnyxProvider {
     fn kind(&self) -> TelecomKind {
         TelecomKind::Telnyx
+    }
+
+    fn media_stream(&self) -> Option<crate::daemon::call_media::MediaStreamFormat> {
+        Some(crate::daemon::call_media::MediaStreamFormat {
+            stream_id_key: "stream_id",
+            outbound_event: "media",
+        })
+    }
+
+    /// TeXML, Telnyx's TwiML-compatible document. Same shape, same verb names,
+    /// different host — which is why the two are written out separately rather
+    /// than shared: a compatibility layer that silently drifts is worse than two
+    /// short strings.
+    fn answer_instructions(&self, media_url: &str) -> Option<AnswerDocument> {
+        Some(AnswerDocument {
+            content_type: "text/xml; charset=utf-8",
+            body: format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Connect><Stream url=\"{}\" bidirectionalMode=\"rtp\"/></Connect></Response>",
+                crate::daemon::service::xml_escape(media_url)
+            ),
+        })
     }
 
     async fn probe(&self) -> ChannelHealth {

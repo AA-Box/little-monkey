@@ -75,6 +75,26 @@ impl ChannelAdapter for SmsAdapter {
     }
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
+        // A reply to a phone call is spoken, not texted. Call conversations are
+        // `call:<call_id>`, and the line is either still up — in which case the
+        // conversation loop synthesizes this — or it is not, which no amount of
+        // retrying fixes.
+        if let Some(call_id) = message.conversation_id.strip_prefix("call:") {
+            return match super::super::call_media::speak_on_call(call_id, &message.text) {
+                Ok(()) => SendOutcome::Sent {
+                    provider_message_id: None,
+                },
+                Err(error) => SendOutcome::PermanentFailure { error },
+            };
+        }
+        if !message.attachments.is_empty() {
+            // MMS needs a media URL the carrier can fetch, and this app hosts
+            // artifacts privately on purpose. Refused by name rather than sent
+            // as a text with the attachment silently dropped.
+            return SendOutcome::PermanentFailure {
+                error: "Sending media by MMS is not supported; the text was not sent".to_string(),
+            };
+        }
         // An SMS conversation is identified by the peer's number, which is what
         // `telecom_worker` put in the envelope's conversation id.
         self.carrier

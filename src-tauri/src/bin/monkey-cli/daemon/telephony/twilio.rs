@@ -43,7 +43,10 @@ use little_monkey_lib::channels::types::{
     ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender, SendOutcome,
 };
 
-use super::{CallHandle, CallState, TelecomConfig, TelecomEvent, TelecomKind, TelecomProvider};
+use super::{
+    AnswerDocument, CallHandle, CallState, TelecomConfig, TelecomEvent, TelecomKind,
+    TelecomProvider,
+};
 
 const API_BASE: &str = "https://api.twilio.com/2010-04-01";
 
@@ -151,6 +154,26 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 impl TelecomProvider for TwilioProvider {
     fn kind(&self) -> TelecomKind {
         TelecomKind::Twilio
+    }
+
+    fn media_stream(&self) -> Option<crate::daemon::call_media::MediaStreamFormat> {
+        Some(crate::daemon::call_media::MediaStreamFormat {
+            stream_id_key: "streamSid",
+            outbound_event: "media",
+        })
+    }
+
+    /// TwiML. `<Connect><Stream>` is bidirectional: Twilio streams the caller's
+    /// audio to the socket and plays back whatever we write to it, which is the
+    /// only Twilio verb that gives both halves of a conversation.
+    fn answer_instructions(&self, media_url: &str) -> Option<AnswerDocument> {
+        Some(AnswerDocument {
+            content_type: "text/xml; charset=utf-8",
+            body: format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Connect><Stream url=\"{}\"/></Connect></Response>",
+                crate::daemon::service::xml_escape(media_url)
+            ),
+        })
     }
 
     async fn probe(&self) -> ChannelHealth {

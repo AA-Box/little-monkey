@@ -225,6 +225,60 @@ pub enum TelecomEvent {
     Ignored,
 }
 
+/// What a carrier is answered with when it asks how to handle a ringing call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnswerDocument {
+    pub content_type: &'static str,
+    pub body: String,
+}
+
+/// Mint the token that lets one carrier media socket connect.
+///
+/// A media stream carries no signature of its own, so the URL is the
+/// credential: an HMAC over the account, the call and an expiry, keyed by the
+/// account's carrier secret. It is scoped to a single call and short-lived,
+/// which bounds what learning one URL is worth.
+pub fn media_stream_token(
+    secret: &str,
+    account_id: &str,
+    call_id: &str,
+    expires_at_ms: i64,
+) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    let signature = ring::hmac::sign(
+        &key,
+        format!("{account_id}:{call_id}:{expires_at_ms}").as_bytes(),
+    );
+    signature
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Check a media socket's token. Constant-time, expiry enforced, and bound to
+/// the exact call — a token for yesterday's call opens nothing today.
+pub fn verify_media_stream_token(
+    secret: &str,
+    account_id: &str,
+    call_id: &str,
+    expires_at_ms: i64,
+    token: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    if now_ms > expires_at_ms {
+        return Err("This media stream token has expired".to_string());
+    }
+    let expected = media_stream_token(secret, account_id, call_id, expires_at_ms);
+    if expected.len() != token.len()
+        || ring::constant_time::verify_slices_are_equal(expected.as_bytes(), token.as_bytes())
+            .is_err()
+    {
+        return Err("This media stream token is not valid for that call".to_string());
+    }
+    Ok(())
+}
+
 /// One carrier.
 #[async_trait]
 pub trait TelecomProvider: Send + Sync {
@@ -245,6 +299,23 @@ pub trait TelecomProvider: Send + Sync {
     /// End a call we placed or answered.
     async fn hangup(&self, provider_call_id: &str) -> Result<(), String>;
 
+    /// How this carrier spells its media-stream frames, when it streams audio
+    /// at all. `None` means the carrier can ring and text but cannot hand us the
+    /// audio, so a call on it is recorded and never becomes a conversation.
+    fn media_stream(&self) -> Option<super::call_media::MediaStreamFormat> {
+        None
+    }
+
+    /// What to answer the carrier's "somebody is calling, what now?" request
+    /// with, given the media socket URL it should connect to.
+    ///
+    /// Carrier-specific markup, which is why it lives with the carrier. `None`
+    /// from a provider that has no such document (the mock) leaves the call
+    /// recorded and unanswered rather than inventing one.
+    fn answer_instructions(&self, _media_url: &str) -> Option<AnswerDocument> {
+        None
+    }
+
     /// Verify a carrier callback over the exact bytes received and normalize
     /// it. An unverified body must return `Err` and leave no trace: it has not
     /// earned a durable row.
@@ -259,6 +330,82 @@ pub trait TelecomProvider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NOW: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn a_media_token_only_opens_the_call_it_was_minted_for() {
+        let token = media_stream_token("carrier-secret", "tel-1", "call-1", NOW + 60_000);
+
+        assert!(verify_media_stream_token(
+            "carrier-secret",
+            "tel-1",
+            "call-1",
+            NOW + 60_000,
+            &token,
+            NOW
+        )
+        .is_ok());
+        for (secret, account, call, label) in [
+            ("other-secret", "tel-1", "call-1", "a different credential"),
+            ("carrier-secret", "tel-2", "call-1", "a different account"),
+            ("carrier-secret", "tel-1", "call-2", "a different call"),
+        ] {
+            assert!(
+                verify_media_stream_token(secret, account, call, NOW + 60_000, &token, NOW)
+                    .is_err(),
+                "{label} must not open this socket"
+            );
+        }
+    }
+
+    #[test]
+    fn an_expired_media_token_is_refused_even_though_it_is_authentic() {
+        let token = media_stream_token("carrier-secret", "tel-1", "call-1", NOW);
+
+        let error =
+            verify_media_stream_token("carrier-secret", "tel-1", "call-1", NOW, &token, NOW + 1)
+                .expect_err("refused");
+
+        assert!(error.contains("expired"));
+    }
+
+    #[test]
+    fn every_streaming_carrier_answers_with_its_own_document() {
+        let cases = [
+            (TelecomKind::Twilio, "<Connect>", "streamSid"),
+            (TelecomKind::Telnyx, "<Connect>", "stream_id"),
+            (TelecomKind::Plivo, "<Stream", "streamId"),
+        ];
+        for (kind, expected_markup, expected_stream_key) in cases {
+            let provider = build_provider(TelecomConfig {
+                account_id: "tel-1".into(),
+                kind,
+                carrier_account_id: "carrier-1".into(),
+                from_number: "+15550000000".into(),
+                secret: "secret".into(),
+                public_base_url: Some("https://calls.example.test".into()),
+                webhook_public_key: Some(STANDARD_TEST_KEY.into()),
+            })
+            .expect("provider");
+
+            let format = provider.media_stream().expect("streams audio");
+            assert_eq!(format.stream_id_key, expected_stream_key);
+            let document = provider
+                .answer_instructions("wss://calls.example.test/v1/telecom/tel-1/media?sig=a&b=1")
+                .expect("answers");
+            assert!(document.body.contains(expected_markup), "{kind:?}");
+            assert!(
+                document.body.contains("&amp;b=1"),
+                "the URL is escaped for the markup it is placed in: {}",
+                document.body
+            );
+        }
+    }
+
+    /// A syntactically valid Ed25519 key, so the Telnyx provider can be built in
+    /// a test that is about answer documents rather than about signatures.
+    const STANDARD_TEST_KEY: &str = "MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=";
 
     #[test]
     fn carrier_tokens_round_trip() {
