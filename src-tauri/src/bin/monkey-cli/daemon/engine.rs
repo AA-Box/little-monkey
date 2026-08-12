@@ -238,6 +238,10 @@ impl ProcessAdapter for RealProcessAdapter {
             .arg("--json")
             .env_remove("LITTLE_MONKEY_TASK_QUEUE_ONLY")
             .env("LITTLE_MONKEY_DAEMON_APPROVAL_WAIT", "1")
+            // The child's own identity in the queue. `send_message` resolves
+            // the conversation to reply to from this — by reading the durable
+            // event that produced the job, never from anything the model said.
+            .env("LITTLE_MONKEY_DAEMON_JOB_ID", &job.job_id)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));

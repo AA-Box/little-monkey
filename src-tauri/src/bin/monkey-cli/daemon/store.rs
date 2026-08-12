@@ -279,7 +279,10 @@ pub struct NewDaemonJob {
 }
 
 pub struct DaemonStore {
-    connection: Connection,
+    /// Visible to the rest of `daemon` so subsystem-specific storage (see
+    /// `daemon::channel_store`) can add `impl DaemonStore` blocks in their own
+    /// file instead of growing this one without bound.
+    pub(super) connection: Connection,
 }
 
 impl DaemonStore {
@@ -1592,6 +1595,249 @@ CREATE TABLE IF NOT EXISTS daemon_job_device_reservations (
 ) STRICT;
 "#;
 
+const DAEMON_V5: i64 = 5;
+const DAEMON_V5_CHECKSUM: &str = "daemon-jobs-v5-channels";
+
+/// The messaging channel subsystem's durable state.
+///
+/// It lives in the daemon store rather than the run ledger because every writer
+/// is the daemon: an account is polled by a daemon worker, an inbound event is
+/// deduplicated before it becomes a job, and an outbox row is retried by the
+/// same loop that retries jobs. The run ledger records what a *run* did; these
+/// tables record what the outside world said and what we said back.
+///
+/// # Secrets
+///
+/// No table here has a column for a token, and none may grow one.
+/// `credential_ref` is a keychain account name — the same shape `connectors`
+/// uses — so the database is safe to copy into a support bundle and a leaked
+/// file grants nothing.
+///
+/// # Deduplication
+///
+/// `channel_events` is the durable dedupe authority for everything inbound:
+/// `UNIQUE(source, account_id, direction, provider_event_id)` means a
+/// redelivered webhook, a replayed polling window, and a provider echo of our
+/// own message all collapse onto the row that is already there. The daemon
+/// queue's `deterministic_job_id` is the second line of defense, not the first.
+///
+/// # Outbox
+///
+/// `needs_reconciliation` is a state rather than a flavor of `failed` because
+/// its meaning is the opposite: the send may have *succeeded*, so retrying
+/// risks duplicating an external effect. Nothing retries that state
+/// automatically. `UNIQUE(account_id, idempotency_key)` is what makes a
+/// crash between "row queued" and "row sent" recoverable at all.
+///
+/// # Cursors
+///
+/// Transport resume state (a Telegram update offset, a Slack cursor, a Matrix
+/// sync token) is bounded and per-account. `CHECK (length(cursor_value) <=
+/// 4096)` keeps a provider from turning a resume token into unbounded storage.
+const DAEMON_V5_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS channel_accounts (
+    account_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (length(kind) > 0),
+    label TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+    non_secret_config_json TEXT NOT NULL,
+    credential_ref TEXT,
+    access_policy_json TEXT NOT NULL,
+    health TEXT NOT NULL CHECK (health IN (
+        'unconfigured','disconnected','connecting','connected','degraded','unsupported','error'
+    )),
+    health_detail TEXT,
+    last_error TEXT,
+    last_probe_at_ms INTEGER,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS channel_accounts_kind_idx ON channel_accounts(kind, enabled);
+
+CREATE TABLE IF NOT EXISTS channel_sender_authorizations (
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    sender_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending','approved','blocked')),
+    pairing_code_digest TEXT,
+    requested_at_ms INTEGER NOT NULL CHECK (requested_at_ms > 0),
+    expires_at_ms INTEGER,
+    approved_at_ms INTEGER,
+    blocked_at_ms INTEGER,
+    display_label TEXT,
+    metadata_json TEXT NOT NULL,
+    PRIMARY KEY(account_id, sender_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS channel_sender_pending_idx
+    ON channel_sender_authorizations(account_id, state, requested_at_ms);
+
+CREATE TABLE IF NOT EXISTS channel_routes (
+    route_id TEXT PRIMARY KEY,
+    scope_json TEXT NOT NULL UNIQUE,
+    target_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS channel_session_map (
+    session_key TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL,
+    thread_id TEXT,
+    session_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    last_used_at_ms INTEGER NOT NULL CHECK (last_used_at_ms > 0)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS channel_session_account_idx
+    ON channel_session_map(account_id, conversation_id);
+
+CREATE TABLE IF NOT EXISTS channel_events (
+    event_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    source TEXT NOT NULL CHECK (source IN (
+        'desktop','mobile','messaging_channel','peer','voice','telephone'
+    )),
+    direction TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
+    provider_event_id TEXT NOT NULL CHECK (length(provider_event_id) > 0),
+    conversation_id TEXT NOT NULL,
+    thread_id TEXT,
+    sender_id TEXT,
+    envelope_json TEXT NOT NULL,
+    disposition TEXT NOT NULL CHECK (disposition IN (
+        'accepted','challenged','ignored','duplicate','failed'
+    )),
+    ignore_reason TEXT,
+    job_id TEXT,
+    received_at_ms INTEGER NOT NULL CHECK (received_at_ms > 0),
+    UNIQUE(source, account_id, direction, provider_event_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS channel_events_recent_idx
+    ON channel_events(account_id, received_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS channel_outbox (
+    outbox_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL,
+    thread_id TEXT,
+    reply_to_provider_id TEXT,
+    state TEXT NOT NULL CHECK (state IN (
+        'queued','sending','sent','failed','needs_reconciliation','cancelled'
+    )),
+    payload_json TEXT NOT NULL,
+    payload_digest TEXT NOT NULL CHECK (length(payload_digest) > 0),
+    idempotency_key TEXT NOT NULL CHECK (length(idempotency_key) > 0),
+    provider_message_id TEXT,
+    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts BETWEEN 1 AND 100),
+    next_attempt_at_ms INTEGER,
+    last_error TEXT,
+    job_id TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    sent_at_ms INTEGER,
+    UNIQUE(account_id, idempotency_key)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS channel_outbox_ready_idx
+    ON channel_outbox(state, next_attempt_at_ms, created_at_ms);
+
+CREATE TABLE IF NOT EXISTS channel_cursors (
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    cursor_key TEXT NOT NULL CHECK (length(cursor_key) > 0),
+    cursor_value TEXT NOT NULL CHECK (length(cursor_value) <= 4096),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    PRIMARY KEY(account_id, cursor_key)
+) STRICT;
+"#;
+
+const DAEMON_V6: i64 = 6;
+const DAEMON_V6_CHECKSUM: &str = "daemon-jobs-v6-telephony";
+
+/// Telephony state: the carrier accounts an operator owns and the calls that
+/// went through them.
+///
+/// SMS deliberately has no tables here. An inbound text is a `ChannelEnvelope`
+/// and lives in `channel_events` like every other message, which is the whole
+/// point of routing SMS through the messaging subsystem rather than beside it.
+/// What telephony adds that messaging has no concept of is a *call*.
+///
+/// # Two separate powers
+///
+/// `inbound_policy` and `outbound_approval` are separate columns because they
+/// are separate decisions. An operator who lets Little Monkey answer the phone
+/// has not agreed to let it dial out, and a schema that stored one flag would
+/// make that distinction impossible to express.
+///
+/// # Money
+///
+/// Every row here can cost the operator money at their carrier, which is why
+/// `telecom_calls` keeps `needs_reconciliation` as a state of its own: a call
+/// that may already have been placed is never retried automatically, and the
+/// row stays for a human to settle.
+const DAEMON_V6_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS telecom_accounts (
+    account_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('twilio','telnyx','plivo','mock')),
+    label TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+    carrier_account_id TEXT NOT NULL,
+    from_number TEXT NOT NULL CHECK (length(from_number) > 0),
+    credential_ref TEXT,
+    public_base_url TEXT,
+    non_secret_config_json TEXT NOT NULL,
+    inbound_policy TEXT NOT NULL CHECK (inbound_policy IN ('reject','voicemail','answer')),
+    outbound_approval TEXT NOT NULL CHECK (outbound_approval IN ('never','approval','allow')),
+    health TEXT NOT NULL CHECK (health IN (
+        'unconfigured','disconnected','connecting','connected','degraded','unsupported','error'
+    )),
+    health_detail TEXT,
+    last_error TEXT,
+    last_probe_at_ms INTEGER,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS telecom_calls (
+    call_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES telecom_accounts(account_id) ON DELETE CASCADE,
+    provider_call_id TEXT,
+    direction TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
+    peer_number TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'queued','ringing','in_progress','completed','failed','needs_reconciliation'
+    )),
+    session_key TEXT,
+    job_id TEXT,
+    idempotency_key TEXT NOT NULL,
+    last_error TEXT,
+    started_at_ms INTEGER,
+    ended_at_ms INTEGER,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    UNIQUE(account_id, idempotency_key)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS telecom_calls_live_idx
+    ON telecom_calls(account_id, state, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS telecom_calls_provider_idx
+    ON telecom_calls(account_id, provider_call_id);
+
+CREATE TABLE IF NOT EXISTS telecom_events (
+    event_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES telecom_accounts(account_id) ON DELETE CASCADE,
+    provider_event_id TEXT NOT NULL CHECK (length(provider_event_id) > 0),
+    kind TEXT NOT NULL,
+    call_id TEXT,
+    payload_digest TEXT NOT NULL,
+    received_at_ms INTEGER NOT NULL CHECK (received_at_ms > 0),
+    UNIQUE(account_id, provider_event_id)
+) STRICT;
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -1607,12 +1853,14 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V2, DAEMON_V2_CHECKSUM, DAEMON_V2_SQL),
     (DAEMON_V3, DAEMON_V3_CHECKSUM, DAEMON_V3_SQL),
     (DAEMON_V4, DAEMON_V4_CHECKSUM, DAEMON_V4_SQL),
+    (DAEMON_V5, DAEMON_V5_CHECKSUM, DAEMON_V5_SQL),
+    (DAEMON_V6, DAEMON_V6_CHECKSUM, DAEMON_V6_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V4;
+const DAEMON_LATEST: i64 = DAEMON_V6;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,

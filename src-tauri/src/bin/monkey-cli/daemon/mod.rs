@@ -1,10 +1,20 @@
+pub(crate) mod adapters;
 mod admission;
+pub(crate) mod channel_adapter;
+pub(crate) mod channel_ingress;
+pub(crate) mod channel_store;
+pub(crate) mod channel_tool;
+pub(crate) mod channel_worker;
 mod engine;
 mod ledger;
 mod remote;
 mod scheduler;
 mod service;
 pub(crate) mod store;
+pub(crate) mod telecom_store;
+pub(crate) mod telecom_tool;
+pub(crate) mod telecom_worker;
+pub(crate) mod telephony;
 mod trigger;
 mod webhook;
 mod workflow_trigger;
@@ -736,12 +746,28 @@ fn mobile_chat_job_id(client_key: &str) -> String {
 /// same conservative posture as `queue_client_recipe`.
 pub(crate) fn queue_mobile_chat_recipe(
     paths: &DaemonPaths,
+    session_id: &str,
     client_key: &str,
     prompt: &str,
 ) -> Result<QueuedRun, String> {
     if client_key.is_empty() || client_key.len() > 256 {
         return Err("Mobile chat queue key is invalid".to_string());
     }
+    // The same durable description every other external turn is built as. The
+    // queue options below are unchanged — a mobile turn keeps its own job id,
+    // its own frozen recipe contract and its own runtime budget — but the text
+    // now travels as a `ConversationIngress`, which is what decides that a
+    // paired phone's words are the operator's instructions rather than
+    // untrusted data. See `ConversationSource::author_is_operator`.
+    let ingress = little_monkey_lib::channels::ingress::ConversationIngress::direct(
+        little_monkey_lib::channels::ingress::ConversationSource::Mobile,
+        session_id,
+        client_key,
+        format!("mobile:{session_id}"),
+        prompt,
+        little_monkey_lib::channels::routing::RouteTarget::new(MOBILE_CHAT_RECIPE),
+        i64::try_from(now_ms()?).unwrap_or(i64::MAX),
+    );
     let config = DaemonConfig::load(paths).map_err(|error| {
         format!(
             "The Little Monkey background runner is not configured. Install it from the app or run `monkey daemon install`: {error}"
@@ -754,7 +780,10 @@ pub(crate) fn queue_mobile_chat_recipe(
     let mut shared = SharedLedger::open(&paths.ledger_db)?;
     let options = QueueOptions {
         recipe: MOBILE_CHAT_RECIPE.to_string(),
-        params: vec![format!("prompt={prompt}")],
+        params: vec![format!(
+            "prompt={}",
+            channel_ingress::message_param(&ingress, "a paired mobile device")
+        )],
         origin: QueueOrigin::Remote {
             request_id: client_key.to_string(),
         },
@@ -789,6 +818,50 @@ pub(crate) fn queue_mobile_chat_recipe(
     )
 }
 
+/// Production implementation of the channel worker's run seam.
+///
+/// Opens its own handles per submission rather than holding them, because the
+/// inbound loop can sit idle for hours between messages and a long-lived
+/// connection to the ledger buys nothing over that interval.
+pub(crate) struct DaemonChannelQueue {
+    paths: DaemonPaths,
+}
+
+impl DaemonChannelQueue {
+    pub(crate) fn new(paths: DaemonPaths) -> Self {
+        Self { paths }
+    }
+}
+
+impl channel_worker::RunQueue for DaemonChannelQueue {
+    fn submit(
+        &self,
+        ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
+        params: Vec<String>,
+    ) -> Result<String, String> {
+        let config = DaemonConfig::load(&self.paths).map_err(|error| {
+            format!("The Little Monkey background runner is not configured: {error}")
+        })?;
+        let mut store = DaemonStore::open(&self.paths)?;
+        if store.kill_switch()? {
+            return Err("Global kill switch is engaged; the message was not run".to_string());
+        }
+        let mut shared = SharedLedger::open(&self.paths.ledger_db)?;
+        let options = channel_ingress::queue_options_for(ingress, params);
+        let global_config_roots = global_config_roots_for_paths(&self.paths)?;
+        enqueue(
+            None,
+            &self.paths,
+            &global_config_roots,
+            &config,
+            &mut store,
+            &mut shared,
+            options,
+        )
+        .map(|queued| queued.job_id)
+    }
+}
+
 /// Production implementation of the remote API's mobile chat seam.
 pub(crate) struct DaemonMobileChatQueue {
     paths: DaemonPaths,
@@ -801,8 +874,14 @@ impl DaemonMobileChatQueue {
 }
 
 impl remote::api::MobileChatQueue for DaemonMobileChatQueue {
-    fn queue_chat(&self, client_key: &str, prompt: &str) -> Result<String, String> {
-        queue_mobile_chat_recipe(&self.paths, client_key, prompt).map(|queued| queued.run_id)
+    fn queue_chat(
+        &self,
+        session_id: &str,
+        client_key: &str,
+        prompt: &str,
+    ) -> Result<String, String> {
+        queue_mobile_chat_recipe(&self.paths, session_id, client_key, prompt)
+            .map(|queued| queued.run_id)
     }
 
     fn chat_run_id(&self, client_key: &str) -> Result<Option<String>, String> {
@@ -2238,6 +2317,10 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
     )
     .await?;
     spawn_knowledge_refresh_scheduler()?;
+    // Messaging channels. Its own task rather than a step in the loop below: a
+    // long-polling provider blocks for half a minute at a time, and the queue
+    // must keep ticking while it does.
+    channel_worker::spawn_channel_runtime(paths.clone());
     spawn_webdav_backup_scheduler()?;
     if let Some(port) = config.webhook_port {
         webhook::spawn_local_listener(paths.clone(), port).await?;
