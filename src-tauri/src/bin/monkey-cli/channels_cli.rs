@@ -15,7 +15,7 @@ use little_monkey_lib::channels::routing::{ChannelRoute, RouteScope, RouteTarget
 use little_monkey_lib::channels::types::{ChannelHealth, ChannelKind, HealthState};
 
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelSecrets, KeyringChannelSecrets, MemoryChannelSecrets,
+    credential_required, AdapterConfig, ChannelSecrets, KeyringChannelSecrets, MemoryChannelSecrets,
 };
 use crate::daemon::channel_store::{ChannelAccountRecord, StoredSenderAuthorization};
 use crate::daemon::store::{DaemonPaths, DaemonStore};
@@ -205,6 +205,7 @@ fn account_json(account: &ChannelAccountRecord) -> serde_json::Value {
         "label": account.label,
         "enabled": account.enabled,
         "has_credential": account.credential_ref.is_some(),
+        "credential_required": credential_required(account),
         "access_policy": account.access_policy,
         "health": account.health.state.as_str(),
         "health_detail": account.health.detail,
@@ -340,7 +341,7 @@ pub fn enable(account_id: &str, enabled: bool) -> Result<(), String> {
     let mut account = store
         .channel_account(account_id)?
         .ok_or_else(|| format!("No such account '{account_id}'"))?;
-    if enabled && account.credential_ref.is_none() {
+    if enabled && account.credential_ref.is_none() && credential_required(&account) {
         return Err(format!(
             "Account '{account_id}' has no credential yet; run `monkey channels set-token {account_id}` first"
         ));

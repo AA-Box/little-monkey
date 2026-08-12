@@ -27,7 +27,8 @@
 use super::channel_store::ChannelAccountRecord;
 use async_trait::async_trait;
 use little_monkey_lib::channels::types::{
-    ChannelEnvelope, ChannelHealth, ChannelKind, OutboundMessage, ProviderCapabilities, SendOutcome,
+    ChannelEnvelope, ChannelHealth, ChannelKind, DeliveryReceipt, OutboundMessage,
+    ProviderCapabilities, SendOutcome,
 };
 
 /// One batch of inbound events plus the cursor to resume from.
@@ -94,6 +95,51 @@ pub trait WebhookChannelAdapter: Send + Sync {
         public_base_url: Option<&str>,
         now_ms: i64,
     ) -> Result<Vec<ChannelEnvelope>, String>;
+
+    /// Delivery progress this same body reports for messages already sent.
+    ///
+    /// Separate from the envelopes because a receipt is not a turn: nobody is
+    /// speaking, so nothing runs. It is only ever called on a body whose
+    /// signature already verified, and the default is empty for providers that
+    /// report nothing.
+    fn delivery_receipts(&self, _body: &[u8], _now_ms: i64) -> Vec<DeliveryReceipt> {
+        Vec::new()
+    }
+
+    /// Answer this provider's webhook-registration handshake, if it has one.
+    ///
+    /// Meta will not save a callback URL until the endpoint echoes the
+    /// `hub.challenge` it sends, so without an answer here an operator cannot
+    /// finish WhatsApp setup at all. `query` is the raw query string of a GET
+    /// to the account's callback path.
+    ///
+    /// `None` refuses, which is both the default and the right answer for
+    /// every provider that has no such handshake — the route turns it into a
+    /// flat 403 rather than a hint about what would have worked.
+    fn verification_challenge(&self, _query: &str) -> Option<String> {
+        None
+    }
+}
+
+/// Whether this account cannot work until a credential is stored.
+///
+/// True for every provider Little Monkey authenticates to itself. It is false
+/// for the two helper providers — Signal and iMessage authenticate through a
+/// helper the operator installs and registers, which owns the account's own
+/// keys — and for IRC unless SASL is turned on. Demanding a credential from
+/// those would make them impossible to enable, so `channels enable` asks this
+/// rather than assuming, and the answer is reported to the UI so the panel
+/// stops showing a credential box nobody can fill.
+pub fn credential_required(account: &ChannelAccountRecord) -> bool {
+    match account.kind {
+        ChannelKind::Signal | ChannelKind::IMessage => false,
+        ChannelKind::Irc => account
+            .non_secret_config
+            .get("use_sasl")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        _ => true,
+    }
 }
 
 /// Keychain-backed credential storage for messaging accounts.
@@ -175,5 +221,65 @@ impl ChannelSecrets for MemoryChannelSecrets {
             .map_err(|_| "channel secret store poisoned".to_string())?
             .remove(credential_ref);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use little_monkey_lib::channels::types::{ChannelHealth, HealthState};
+
+    fn account(kind: ChannelKind, config: serde_json::Value) -> ChannelAccountRecord {
+        ChannelAccountRecord {
+            account_id: "acct-1".into(),
+            kind,
+            label: "Test".into(),
+            enabled: false,
+            non_secret_config: config,
+            credential_ref: None,
+            access_policy: Default::default(),
+            health: ChannelHealth {
+                state: HealthState::Unconfigured,
+                detail: None,
+                last_error: None,
+                probed_at_ms: 0,
+            },
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn the_helper_providers_need_no_credential_of_our_own() {
+        // The helper holds the account; there is no token to demand, and
+        // demanding one would make these two impossible to enable at all.
+        for kind in [ChannelKind::Signal, ChannelKind::IMessage] {
+            assert!(!credential_required(&account(kind, serde_json::json!({}))));
+        }
+    }
+
+    #[test]
+    fn irc_needs_a_password_only_when_sasl_is_on() {
+        assert!(!credential_required(&account(
+            ChannelKind::Irc,
+            serde_json::json!({"server": "irc.example.org", "nick": "monkey"})
+        )));
+        assert!(credential_required(&account(
+            ChannelKind::Irc,
+            serde_json::json!({"server": "irc.example.org", "nick": "monkey", "use_sasl": true})
+        )));
+    }
+
+    #[test]
+    fn every_other_provider_still_needs_one() {
+        for kind in [
+            ChannelKind::Telegram,
+            ChannelKind::Slack,
+            ChannelKind::Matrix,
+            ChannelKind::Mattermost,
+            ChannelKind::WhatsApp,
+        ] {
+            assert!(credential_required(&account(kind, serde_json::json!({}))));
+        }
     }
 }
