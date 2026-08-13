@@ -352,6 +352,15 @@ mod tests {
     }
 
     impl RunQueue for FakeQueue {
+        fn freeze_execution(
+            &self,
+            ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
+        ) -> Result<little_monkey_lib::channels::ingress::FrozenExecutionContext, String> {
+            Ok(crate::daemon::channel_worker::test_frozen_execution(
+                ingress,
+            ))
+        }
+
         fn submit(
             &self,
             ingress: &ConversationIngress,

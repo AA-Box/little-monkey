@@ -1335,6 +1335,13 @@ async fn run_inner(
         }
     };
 
+    // The turn's frozen workspace-mutation contract, read from the immutable
+    // snapshot rather than re-derived from the prompt: whether this turn
+    // promised a file would change was decided when it was accepted.
+    let mutation_required = recipe
+        .desktop_turn
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.workspace_mutation_required);
     let turn_future = async {
         if recipe.desktop_turn.is_some() {
             crate::agent::run_prepared_turn_with_max_iterations(
@@ -1348,6 +1355,7 @@ async fn run_inner(
                 &mcp_entries,
                 &attached_stacks,
                 Some(max_iterations),
+                mutation_required,
             )
             .await
         } else {

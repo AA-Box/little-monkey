@@ -1581,6 +1581,8 @@ pub fn run() {
             daemon_commands::channels_events,
             daemon_commands::channels_remove,
             daemon_commands::ingress_turns,
+            daemon_commands::ingress_turn_show,
+            daemon_commands::ingress_turn_resume,
             daemon_commands::peers_list,
             daemon_commands::peers_invite,
             daemon_commands::peers_accept,

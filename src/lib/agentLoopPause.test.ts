@@ -21,9 +21,11 @@ const mocks = vi.hoisted(() => ({
   reconcileProcess: vi.fn(),
 }));
 
+// A browser/dev profile: no Tauri bridge, so no resident runner can exist and
+// the in-process loop — the one with the pause checkpoints — is what runs.
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => mocks.invoke(...args),
-  isTauri: () => true,
+  isTauri: () => false,
 }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock("./turnEngine", async (importOriginal) => {
@@ -33,12 +35,6 @@ vi.mock("./turnEngine", async (importOriginal) => {
     attemptStream: (...args: unknown[]) => mocks.attemptStream(...args),
     executeToolCall: (...args: unknown[]) => mocks.executeToolCall(...args),
   };
-});
-// The turn must take the in-process loop, not the resident runner — that's
-// the path with the pause checkpoints.
-vi.mock("./daemonDesktopTurn", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./daemonDesktopTurn")>();
-  return { ...actual, daemonDesktopRoute: async () => "fallback" as const };
 });
 // A null recorder is a supported state (`durable.recorder` is optional
 // throughout); this keeps the durable ledger out of a pause test.

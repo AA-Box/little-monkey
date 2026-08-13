@@ -2217,21 +2217,26 @@ impl RemoteStore {
     /// Mobile chat message ids from the recent past, so the watcher can tell a
     /// finished chat turn from a finished workflow and say "new response"
     /// rather than "run finished".
+    /// Recent mobile turns as `(session_id, message_id)`.
+    ///
+    /// The session comes back with the message because the durable turn's job
+    /// id is derived from both, and a digest cannot be inverted — so the only
+    /// way to recognize a chat job is to rebuild the identity forwards.
     pub fn recent_mobile_message_ids(
         &self,
         since_ms: u64,
         limit: u32,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<(String, String)>, String> {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT message_id FROM remote_mobile_messages
+                "SELECT session_id, message_id FROM remote_mobile_messages
                  WHERE created_at_ms >= ?1 ORDER BY created_at_ms DESC LIMIT ?2",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map(params![to_i64(since_ms)?, i64::from(limit)], |row| {
-                row.get::<_, String>(0)
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()

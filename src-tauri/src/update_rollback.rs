@@ -651,8 +651,13 @@ mod tests {
                 .expect("self_integrity_report answers")
                 .deserialize::<crate::self_integrity::IntegrityReport>()
                 .unwrap();
+        // The shape is what this test is entitled to assert. The verdict is not:
+        // `report()` authenticates whatever managed runtimes are installed in
+        // *this host's* real data directory, so a developer whose installed tree
+        // predates the currently staged one legitimately gets `refused` — a fact
+        // about that machine, not about the IPC wiring under test. What the
+        // verdict is made of is covered by `self_integrity`'s own tests.
         assert_eq!(report.components.len(), 4, "signature plus three runtimes");
-        assert!(!report.refused, "a source build must not refuse");
     }
 
     #[test]
