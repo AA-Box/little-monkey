@@ -563,7 +563,25 @@ pub(crate) fn submit_conversation_turn(
                 })
             }
             IngressState::Failed => return Ok(SubmitOutcome::Parked { ingress_id }),
-            IngressState::Accepted => ingress_id,
+            // Accepted before, never queued — the first attempt was refused and
+            // this is a redelivery arriving before recovery got to it. What
+            // runs is what was frozen *then*, read back from the row, not the
+            // context this call just resolved: otherwise a recipe edited in
+            // between would execute under a message accepted before the edit.
+            IngressState::Accepted => {
+                if let Some(pending) = store.pending_ingress_turn(&ingress_id)? {
+                    return Ok(finish_submission(
+                        store,
+                        queue,
+                        &pending.ingress,
+                        &pending.params,
+                        &ingress_id,
+                        pending.attempts,
+                        now_ms,
+                    ));
+                }
+                ingress_id
+            }
         },
     };
     Ok(finish_submission(

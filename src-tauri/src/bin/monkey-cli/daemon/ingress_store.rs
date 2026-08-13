@@ -268,6 +268,38 @@ impl DaemonStore {
         Ok(pending)
     }
 
+    /// One accepted-but-unqueued turn, with everything it was accepted with.
+    ///
+    /// The single-row form of [`Self::pending_ingress_turns`], for the case a
+    /// turn is re-submitted before the first submission succeeded: what runs
+    /// has to be what was frozen then, not what the caller is holding now.
+    pub fn pending_ingress_turn(
+        &self,
+        ingress_id: &str,
+    ) -> Result<Option<PendingIngressTurn>, String> {
+        let row: Option<(String, String, i64)> = self
+            .connection
+            .query_row(
+                "SELECT ingress_json, params_json, attempts
+                 FROM ingress_turns WHERE ingress_id=?1 AND state='accepted'",
+                [ingress_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((ingress_json, params_json, attempts)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(PendingIngressTurn {
+            ingress_id: ingress_id.to_string(),
+            ingress: serde_json::from_str(&ingress_json)
+                .map_err(|error| format!("Stored turn is unreadable: {error}"))?,
+            params: serde_json::from_str(&params_json)
+                .map_err(|error| format!("Stored turn parameters are unreadable: {error}"))?,
+            attempts: u32::try_from(attempts).unwrap_or(u32::MAX),
+        }))
+    }
+
     /// Recent turns across every origin, newest first. The read model behind
     /// the typed bridge: identifiers and status, never message text.
     pub fn recent_ingress_turns(&self, limit: u32) -> Result<Vec<StoredIngressTurn>, String> {

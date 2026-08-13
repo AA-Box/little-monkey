@@ -529,6 +529,61 @@ fn a_recovered_turn_runs_the_configuration_it_was_accepted_under() {
     assert_eq!(recovered.as_v1().recipe_ref, "chat");
 }
 
+/// The narrow window the frozen context is easiest to lose in.
+///
+/// A turn is accepted, the queue refuses it, the operator edits the recipe, and
+/// *then* the provider redelivers — before recovery got to the row. The
+/// redelivery arrives holding a context resolved against the new recipe, and
+/// the turn that runs has to be the one already on the row.
+#[test]
+fn a_redelivery_that_races_recovery_still_runs_the_original_configuration() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::failing();
+    let (ingress, params) = mobile_turn("mm-1");
+
+    submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
+    let accepted_digest = store.pending_ingress_turns(10).unwrap()[0]
+        .ingress
+        .execution
+        .as_ref()
+        .expect("frozen context")
+        .digest()
+        .to_string();
+
+    // The same turn again, this time carrying a context resolved against a
+    // recipe that says something else.
+    let mut edited = ingress.clone();
+    let mut rewritten = test_frozen_execution(&ingress);
+    match &mut rewritten {
+        FrozenExecutionContext::V1(context) => {
+            context.recipe_json = context
+                .recipe_json
+                .replace("{{message}}", "do something else");
+            *context = context.clone().seal();
+        }
+    }
+    edited.execution = Some(rewritten.clone());
+    assert_ne!(rewritten.digest(), accepted_digest);
+
+    queue.recover();
+    submit_conversation_turn(
+        &mut store,
+        &queue,
+        &edited,
+        &["prompt=other".into()],
+        NOW + 5_000,
+    )
+    .expect("redelivery");
+
+    let (ran, ran_params) = queue.only_run();
+    assert_eq!(
+        ran.execution.as_ref().expect("frozen context").digest(),
+        accepted_digest
+    );
+    assert_eq!(ran_params, params);
+    assert_eq!(store.recent_ingress_turns(10).unwrap().len(), 1);
+}
+
 #[test]
 fn a_frozen_context_names_its_credential_and_never_carries_one() {
     let mut store = DaemonStore::open_in_memory().expect("open");
