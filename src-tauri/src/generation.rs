@@ -3274,19 +3274,30 @@ mod tests {
             .unwrap();
         }
 
-        let mut request = video_request(GenerationTask::TextToVideo);
-        request.loras = ["a", "b"]
+        // Built once and reused: the staged name is keyed on the path as the
+        // request spells it, and `a/file` and `a\file` are two spellings of one
+        // file on Windows.
+        let sources: Vec<String> = ["a", "b"]
             .iter()
-            .map(|parent| LoraSelection {
-                path: library
+            .map(|parent| {
+                library
                     .join(parent)
                     .join("pytorch_lora_weights.safetensors")
                     .to_string_lossy()
-                    .to_string(),
+                    .to_string()
+            })
+            .collect();
+        let selections: Vec<LoraSelection> = sources
+            .iter()
+            .map(|path| LoraSelection {
+                path: path.clone(),
                 multiplier: 1.0,
                 is_high_noise: false,
             })
             .collect();
+
+        let mut request = video_request(GenerationTask::TextToVideo);
+        request.loras = selections.clone();
         stage_loras(&root, &mut request).unwrap();
 
         let dir = lora_dir(&root);
@@ -3309,15 +3320,7 @@ mod tests {
         // Staging the same request again is a no-op, not a second link.
         let names: Vec<String> = request.loras.iter().map(|lora| lora.path.clone()).collect();
         let mut again = video_request(GenerationTask::TextToVideo);
-        again.loras = request.loras.clone();
-        again.loras[0].path = library
-            .join("a/pytorch_lora_weights.safetensors")
-            .to_string_lossy()
-            .to_string();
-        again.loras[1].path = library
-            .join("b/pytorch_lora_weights.safetensors")
-            .to_string_lossy()
-            .to_string();
+        again.loras = selections;
         stage_loras(&root, &mut again).unwrap();
         assert_eq!(
             again
