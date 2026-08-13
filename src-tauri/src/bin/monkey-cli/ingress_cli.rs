@@ -476,4 +476,71 @@ mod tests {
             .expect_err("unknown source")
             .contains("carrier pigeon"));
     }
+
+    /// The desktop reaches this command as a process, so the flag names are a
+    /// contract between two files that cannot import each other — the argv
+    /// `daemon_commands::ingress_turn_resume` builds, and what clap accepts.
+    ///
+    /// The request id is the part worth pinning: a rename here would leave the
+    /// bridge passing a flag clap rejects, and a Resume that cannot be submitted
+    /// at all is at least loud. One that clap accepted under a *default* would
+    /// not be, which is why the flag is also required.
+    #[test]
+    fn the_resume_command_takes_the_callers_request_id() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            command: Outer,
+        }
+        #[derive(clap::Subcommand)]
+        enum Outer {
+            Ingress {
+                #[command(subcommand)]
+                command: IngressCmd,
+            },
+        }
+
+        let parsed = Harness::try_parse_from([
+            "monkey",
+            "ingress",
+            "resume",
+            "--source",
+            "desktop",
+            "--account",
+            "session-1",
+            "--event",
+            "turn-1",
+            "--json",
+            "--request-id",
+            "cp-1",
+        ])
+        .expect("the argv the desktop bridge builds");
+        let Outer::Ingress { command } = parsed.command;
+        let IngressCmd::Resume {
+            request_id, json, ..
+        } = command
+        else {
+            panic!("expected the resume subcommand");
+        };
+        assert_eq!(request_id, "cp-1");
+        assert!(json);
+
+        // A resume that does not say which action it is cannot be made
+        // idempotent, so it does not parse.
+        assert!(Harness::try_parse_from([
+            "monkey",
+            "ingress",
+            "resume",
+            "--source",
+            "desktop",
+            "--account",
+            "session-1",
+            "--event",
+            "turn-1",
+            "--json",
+        ])
+        .is_err());
+    }
 }
