@@ -17,7 +17,9 @@
 
 use std::collections::BTreeSet;
 
-use little_monkey_lib::channels::ingress::{ConversationIngress, ConversationSource};
+use little_monkey_lib::channels::ingress::{
+    ConversationIngress, ConversationSource, MAX_LISTED_ATTACHMENTS,
+};
 use little_monkey_lib::channels::routing::RouteTarget;
 use little_monkey_lib::channels::types::{AttachmentKind, AttachmentSource, ChannelAttachment};
 use little_monkey_lib::peers::{PeerCapability, PeerEnvelope, PeerRejection};
@@ -159,10 +161,11 @@ pub(crate) fn accept_peer_envelope(
         channel_ingress::message_param(
             &ingress,
             &format!("a paired Little Monkey peer ({})", context.device_id),
+            MAX_LISTED_ATTACHMENTS,
         )
     )];
 
-    match channel_ingress::submit_ingress(store, queue, &ingress, &params, now_ms)? {
+    match channel_ingress::submit_conversation_turn(store, queue, &ingress, &params, now_ms)? {
         SubmitOutcome::Queued { ingress_id, job_id }
         | SubmitOutcome::AlreadyQueued { ingress_id, job_id } => {
             store.attach_peer_message_run(&message_row_id, Some(&ingress_id), Some(&job_id))?;
@@ -271,6 +274,15 @@ mod tests {
     }
 
     impl RunQueue for FakeQueue {
+        fn freeze_execution(
+            &self,
+            ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
+        ) -> Result<little_monkey_lib::channels::ingress::FrozenExecutionContext, String> {
+            Ok(crate::daemon::channel_worker::test_frozen_execution(
+                ingress,
+            ))
+        }
+
         fn submit(
             &self,
             ingress: &ConversationIngress,

@@ -101,6 +101,10 @@ export interface DaemonQueueRequest {
 export interface DaemonTurnSubmitRequest {
   turnId: string;
   recipe: unknown;
+  /** Which of the operator's own surfaces this turn came from. Both take the
+   * same durable ingress path; the difference is what the ingress listing
+   * shows. Omitted means the chat composer. */
+  source?: "desktop" | "voice";
 }
 
 export interface DaemonTurnSubmitResponse {

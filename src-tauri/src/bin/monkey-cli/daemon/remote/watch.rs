@@ -166,7 +166,7 @@ fn mobile_chat_job_ids(
     Ok(store
         .recent_mobile_message_ids(since, 256)?
         .iter()
-        .map(|message_id| crate::daemon::mobile_chat_job_id(message_id))
+        .map(|(session_id, message_id)| crate::daemon::mobile_chat_job_id(session_id, message_id))
         .collect())
 }
 
@@ -358,7 +358,7 @@ mod tests {
                 created_at_ms: 4_000,
             })
             .unwrap();
-        let chat_job = crate::daemon::mobile_chat_job_id(&message_id);
+        let chat_job = crate::daemon::mobile_chat_job_id("session-one", &message_id);
         let raised = pending_notifications(
             &mut store,
             &[(chat_job, JobState::Succeeded, Some("run-chat".into()))],

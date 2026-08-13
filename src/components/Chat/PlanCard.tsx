@@ -71,7 +71,12 @@ export function PlanCard({ sessionId, notice, messageIndex }: PlanCardProps) {
       useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
         content: formatPlanNotice({ ...notice, status: "approved" }),
       });
-      void runAgentTurn(sessionId, PLAN_APPROVED_INSTRUCTION);
+      // The follow-up turn can be refused before it starts — an unavailable
+      // resident runner is the usual reason — and the card is the only place
+      // that failure has to land, since nothing was added to the transcript.
+      void runAgentTurn(sessionId, PLAN_APPROVED_INSTRUCTION).catch((err: unknown) => {
+        setError(t("PlanCard.approveFailed", { error: errorMessage(err) }));
+      });
     } catch (err) {
       const message = errorMessage(err);
       setError(t("PlanCard.approveFailed", { error: message }));

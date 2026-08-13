@@ -965,8 +965,18 @@ pub enum Restorability {
 /// none of it is knowable from the manifest alone.
 #[derive(Debug, Clone, Default)]
 pub struct RestoreEnvironment<'a> {
-    /// Models resident right now.
-    pub resident_models: &'a [String],
+    /// Models resident right now, when this host is the one that decides what
+    /// the restored process runs against.
+    ///
+    /// `None` says it is not — the image belongs to a turn a durable backend
+    /// accepted, and the model that turn executes under is the one frozen into
+    /// its execution context, not one this process could resolve. Comparing the
+    /// frozen model against what is loaded *here, now* would make the currently
+    /// selected model the authority over a turn accepted long before it, which
+    /// is the coupling freezing exists to remove. Whether the frozen model and
+    /// its credential are still usable is then the accepting backend's question
+    /// to answer, and it refuses the resume outright when they are not.
+    pub resident_models: Option<&'a [String]>,
     /// `request_id`s whose approval is still valid — an outstanding approval
     /// absent from this list has expired.
     pub live_approvals: &'a [String],
@@ -994,12 +1004,8 @@ pub fn restorability(
     if resume.workspace.is_some() && !environment.workspace_exists {
         blockers.push(RestoreBlocker::WorkspaceGone);
     }
-    if let Some(model) = resume.model.as_ref() {
-        if !environment
-            .resident_models
-            .iter()
-            .any(|entry| entry == model)
-        {
+    if let (Some(model), Some(resident)) = (resume.model.as_ref(), environment.resident_models) {
+        if !resident.iter().any(|entry| entry == model) {
             blockers.push(RestoreBlocker::ModelNotResident);
         }
     }
@@ -2450,11 +2456,14 @@ pub struct RestoreReport {
     pub blocker_explanations: Vec<String>,
 }
 
+/// `resident_models` is omitted by the durable Resume path and supplied by the
+/// migration one — see [`RestoreEnvironment::resident_models`] for which
+/// question each is asking.
 #[tauri::command]
 pub fn checkpoint_restorability(
     app: tauri::AppHandle,
     id: String,
-    resident_models: Vec<String>,
+    resident_models: Option<Vec<String>>,
     live_approvals: Vec<String>,
 ) -> Result<RestoreReport, String> {
     let manifest = read_manifest(&checkpoints_base_dir(&app)?, &id)?;
@@ -2468,7 +2477,7 @@ pub fn checkpoint_restorability(
     let restorability = restorability(
         &manifest,
         &RestoreEnvironment {
-            resident_models: &resident_models,
+            resident_models: resident_models.as_deref(),
             live_approvals: &live_approvals,
             workspace_exists,
         },
@@ -2532,9 +2541,19 @@ mod tests {
         workspace_exists: bool,
     ) -> RestoreEnvironment<'a> {
         RestoreEnvironment {
-            resident_models: resident,
+            resident_models: Some(resident),
             live_approvals: approvals,
             workspace_exists,
+        }
+    }
+
+    /// What the durable Resume path asks: the same image, with no claim about
+    /// which models this host has loaded.
+    fn durable_environment<'a>(approvals: &'a [String]) -> RestoreEnvironment<'a> {
+        RestoreEnvironment {
+            resident_models: None,
+            live_approvals: approvals,
+            workspace_exists: true,
         }
     }
 
@@ -2581,6 +2600,39 @@ mod tests {
                 RestoreBlocker::ModelNotResident,
                 RestoreBlocker::ApprovalExpired,
             ]
+        );
+    }
+
+    /// The image-level verdict says nothing about the model when the model is
+    /// not this host's to decide.
+    ///
+    /// A durable Resume continues a turn under the context frozen when that turn
+    /// was *accepted*. What is loaded here now is a different question, and
+    /// letting it block the restore is exactly how the operator's current model
+    /// selection would come to govern a turn accepted before they changed it.
+    #[test]
+    fn a_durable_resume_is_not_blocked_by_what_this_host_has_loaded() {
+        let approvals = vec!["req-1".to_string()];
+        assert_eq!(
+            restorability(
+                &frozen(Some(resume_state())),
+                &durable_environment(&approvals)
+            ),
+            Restorability::Resumable {
+                process_id: "p-frozen".to_string()
+            }
+        );
+    }
+
+    /// …and the rest of the image's own verdict is unchanged by that: a freeze
+    /// with an expired approval is still refused when nobody supplies residency.
+    #[test]
+    fn a_durable_resume_still_answers_to_the_image_itself() {
+        assert_eq!(
+            restorability(&frozen(Some(resume_state())), &durable_environment(&[])),
+            Restorability::Blocked {
+                blockers: vec![RestoreBlocker::ApprovalExpired]
+            }
         );
     }
 

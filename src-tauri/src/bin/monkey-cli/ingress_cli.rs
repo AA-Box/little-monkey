@@ -27,6 +27,47 @@ pub enum IngressCmd {
         #[arg(long)]
         json: bool,
     },
+    /// One turn, by the identity its origin submitted it under, with every
+    /// continuation it produced.
+    Show {
+        #[arg(long)]
+        source: String,
+        /// Account, device, session or line the turn arrived on.
+        #[arg(long)]
+        account: String,
+        /// The origin's own event id for the turn.
+        #[arg(long)]
+        event: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Continue an already accepted turn that was frozen at a tool boundary.
+    ///
+    /// The continuation inherits the accepted turn's frozen execution context
+    /// verbatim, so a recipe, model or permission mode changed since then does
+    /// not affect it. Nothing here re-resolves configuration, and nothing here
+    /// can invent a turn: a request to continue something that was never
+    /// accepted is refused.
+    Resume {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        account: String,
+        /// The accepted turn's own event id — the parent, not a new one.
+        #[arg(long)]
+        event: String,
+        /// The caller's own id for this Resume, minted once before the first
+        /// attempt and repeated verbatim by every retry of it.
+        ///
+        /// Required, and deliberately not defaulted to something fresh: a
+        /// generated id would make a retried request a second resume, which is
+        /// the duplicate run this identity exists to prevent. Two intentional
+        /// resumes of one turn are two ids.
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn dispatch(command: &IngressCmd) -> Result<(), String> {
@@ -36,7 +77,249 @@ pub fn dispatch(command: &IngressCmd) -> Result<(), String> {
             limit,
             json,
         } => list(source.as_deref(), *limit, *json),
+        IngressCmd::Show {
+            source,
+            account,
+            event,
+            json,
+        } => show(source, account, event, *json),
+        IngressCmd::Resume {
+            source,
+            account,
+            event,
+            request_id,
+            json,
+        } => resume(source, account, event, request_id, *json),
     }
+}
+
+/// Parse an origin token, or refuse before anything is opened.
+fn parse_source(value: &str) -> Result<ConversationSource, String> {
+    ConversationSource::parse(value).ok_or_else(|| format!("Unknown conversation source '{value}'"))
+}
+
+/// One turn and its continuations, as the desktop reads them while a turn runs.
+///
+/// The continuations are what make an unmet workspace-mutation contract visible
+/// to whoever is watching: the run that answers the operator may be the
+/// continuation's, not the one they submitted, and the only way to find it
+/// without the UI owning execution is to ask.
+pub fn show(source: &str, account: &str, event: &str, json: bool) -> Result<(), String> {
+    let source = parse_source(source)?;
+    let store = DaemonStore::open(&DaemonPaths::resolve()?)?;
+    let key = little_monkey_lib::channels::ingress::dedupe_key_for(source, account, event);
+    let Some(turn) = store.ingress_turn_by_dedupe_key(&key)? else {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "turn": null, "continuations": [] })
+            );
+        } else {
+            println!("No turn recorded for {key}.");
+        }
+        return Ok(());
+    };
+    let continuations: Vec<serde_json::Value> = store
+        .ingress_continuations(&turn.ingress_id)?
+        .iter()
+        .map(|child| turn_json(&store, child))
+        .collect::<Result<_, String>>()?;
+    let row = turn_json(&store, &turn)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "turn": row, "continuations": continuations })
+        );
+    } else {
+        println!("{row}");
+        for child in &continuations {
+            println!("  continuation: {child}");
+        }
+    }
+    Ok(())
+}
+
+/// What resuming an accepted turn produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResumedTurn {
+    pub ingress_id: String,
+    pub parent_ingress_id: String,
+    pub job_id: String,
+}
+
+/// What one Resume request became, split by whether asking again could ever
+/// change the answer.
+///
+/// The split is the whole point of the type. A caller that loses the response to
+/// a Resume has to retry, and it must retry under the same request id — so it
+/// needs to know whether "this failed" means *the message did not get through*
+/// or *the backend considered this and said no*. Collapsing both into an error
+/// forces the caller to guess: guess "transport" and a refusal is retried
+/// forever in silence, guess "refusal" and a momentary blip destroys a frozen
+/// image that was still recoverable.
+///
+/// So a [`Refused`] is exactly the set of answers that are re-derived from
+/// durable state and therefore identical on every retry, and everything else
+/// stays an `Err` for the caller to try again.
+///
+/// [`Refused`]: ResumeOutcome::Refused
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResumeOutcome {
+    /// Durably accepted — or already was, and this is the row that exists.
+    Accepted(ResumedTurn),
+    /// The backend read the durable state and will not continue this turn.
+    /// Final: the caller shows the reason rather than asking again.
+    Refused(String),
+}
+
+/// Submit a durable resume of an accepted turn.
+///
+/// Separate from the CLI wrapper so the two properties that matter — the
+/// continuation runs what the *parent* was accepted with whatever the machine
+/// says now, and one Resume is one continuation however many times the request
+/// arrives — are testable against an in-memory store rather than only through a
+/// process.
+pub(crate) fn resume_accepted_turn(
+    store: &mut DaemonStore,
+    queue: &dyn crate::daemon::channel_worker::RunQueue,
+    source: ConversationSource,
+    account: &str,
+    event: &str,
+    request_id: &str,
+    now_ms: i64,
+) -> Result<ResumeOutcome, String> {
+    use little_monkey_lib::channels::ingress::ConversationIngress;
+
+    if request_id.trim().is_empty() {
+        return Ok(ResumeOutcome::Refused(
+            "A resume must carry the caller's own request id, or a retry cannot be told from a second resume"
+                .to_string(),
+        ));
+    }
+    if store.kill_switch()? {
+        return Ok(ResumeOutcome::Refused(
+            "Global kill switch is engaged; nothing can be resumed".to_string(),
+        ));
+    }
+    let key = little_monkey_lib::channels::ingress::dedupe_key_for(source, account, event);
+    let Some(parent) = store.ingress_turn_by_dedupe_key(&key)? else {
+        return Ok(ResumeOutcome::Refused(format!(
+            "No accepted turn '{key}' to continue"
+        )));
+    };
+    let Some(accepted) = store.accepted_ingress_turn(&parent.ingress_id)? else {
+        return Ok(ResumeOutcome::Refused(format!(
+            "Accepted turn '{}' is unreadable",
+            parent.ingress_id
+        )));
+    };
+    // Refused rather than resolved. A turn accepted before execution contexts
+    // were frozen has no snapshot to replay, and continuing it would mean
+    // silently running whatever the machine is configured with now — which is
+    // exactly the thing freezing exists to prevent.
+    let Some(execution) = accepted.ingress.execution.as_ref() else {
+        return Ok(ResumeOutcome::Refused(format!(
+            "Turn '{key}' was accepted without a frozen execution context and cannot be continued; start a new turn instead"
+        )));
+    };
+    // The other half of the same rule. Inheriting the frozen context is what
+    // stops a resume from running under a configuration the turn was never
+    // accepted with; this is what stops it from running under *no* configuration
+    // — a model whose credential has since been deleted. Refused by name rather
+    // than re-resolved, because the only thing re-resolution could produce here
+    // is whatever the operator happens to have selected now.
+    if let Some(reason) = queue.frozen_context_unusable(execution.as_v1()) {
+        return Ok(ResumeOutcome::Refused(reason));
+    }
+    // The caller's request id, not a count of what is already here: resuming a
+    // turn twice is two continuations because it is two ids, and a retry of one
+    // request is one continuation because it is one id. Counting could not tell
+    // those apart — the second press and the retry look identical from here.
+    let continuation =
+        ConversationIngress::resume_of(&accepted.ingress, &parent.ingress_id, request_id);
+
+    let outcome = crate::daemon::channel_ingress::submit_conversation_turn(
+        store,
+        queue,
+        &continuation,
+        &accepted.params,
+        now_ms,
+    )?;
+    let (ingress_id, job_id) = match outcome {
+        crate::daemon::channel_ingress::SubmitOutcome::Queued { ingress_id, job_id }
+        | crate::daemon::channel_ingress::SubmitOutcome::AlreadyQueued { ingress_id, job_id } => {
+            (ingress_id, job_id)
+        }
+        // Accepted durably, not queued yet. An error rather than a refusal on
+        // purpose: the continuation now exists under this request id, and the
+        // caller retrying reaches *it* — either queued by then, or deferred
+        // again — instead of being told no about a turn the backend took.
+        crate::daemon::channel_ingress::SubmitOutcome::Deferred { error, .. } => return Err(error),
+        // Out of attempts. Re-reading the row reaches the same failed state on
+        // every retry, so this is an answer rather than a wait.
+        crate::daemon::channel_ingress::SubmitOutcome::Parked { .. } => {
+            return Ok(ResumeOutcome::Refused(
+                "This resumed turn could not be queued and was parked".to_string(),
+            ))
+        }
+    };
+    Ok(ResumeOutcome::Accepted(ResumedTurn {
+        ingress_id,
+        parent_ingress_id: parent.ingress_id,
+        job_id,
+    }))
+}
+
+fn resume(
+    source: &str,
+    account: &str,
+    event: &str,
+    request_id: &str,
+    json: bool,
+) -> Result<(), String> {
+    let source = parse_source(source)?;
+    let paths = DaemonPaths::resolve()?;
+    let mut store = DaemonStore::open(&paths)?;
+    let queue = crate::daemon::DaemonChannelQueue::new(paths.clone());
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
+    let resumed =
+        match resume_accepted_turn(&mut store, &queue, source, account, event, request_id, now)? {
+            ResumeOutcome::Accepted(resumed) => resumed,
+            // Printed as an answer rather than raised as a failure, and only in
+            // `--json`: a caller reading structured output has to be able to
+            // tell "the backend said no" from "the command did not run", and a
+            // non-zero exit with a message on stderr is indistinguishable from
+            // the second. A human at a terminal has no such problem.
+            ResumeOutcome::Refused(reason) if json => {
+                println!("{}", serde_json::json!({ "refused": reason }));
+                return Ok(());
+            }
+            ResumeOutcome::Refused(reason) => return Err(reason),
+        };
+    let run_id = store
+        .get_job(&resumed.job_id)?
+        .and_then(|job| job.run_id)
+        .ok_or_else(|| format!("Resumed turn '{}' is still preparing", resumed.job_id))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ingress_id": resumed.ingress_id,
+                "parent_ingress_id": resumed.parent_ingress_id,
+                "job_id": resumed.job_id,
+                "run_id": run_id,
+            })
+        );
+    } else {
+        println!("Resumed as {run_id}");
+    }
+    Ok(())
 }
 
 pub fn list(source: Option<&str>, limit: u32, json: bool) -> Result<(), String> {
@@ -67,13 +350,27 @@ pub fn list(source: Option<&str>, limit: u32, json: bool) -> Result<(), String> 
         return Ok(());
     }
     for turn in &turns {
+        // Enough to answer "did this arrive, what did it become, and under
+        // which configuration" without reaching for --json. The frozen-context
+        // digest is truncated the way a commit hash is: long enough to compare
+        // two turns by eye, short enough to fit on the line.
         println!(
-            "{}  {}  {}  {}  {}",
+            "{}  {}  {}  {}  {}  {}  attempts={}  {}{}",
             turn.created_at_ms,
             turn.source.as_str(),
+            turn.source_account_id,
+            turn.source_event_id,
             turn.state.as_str(),
             turn.job_id.as_deref().unwrap_or("-"),
-            turn.session_key
+            turn.attempts,
+            match (&turn.execution_version, &turn.execution_digest) {
+                (Some(version), Some(digest)) => format!("cfg=v{version}:{}", &digest[..12]),
+                _ => "cfg=-".to_string(),
+            },
+            match &turn.last_error {
+                Some(error) => format!("  {error}"),
+                None => String::new(),
+            }
         );
     }
     Ok(())
@@ -105,6 +402,22 @@ fn turn_json(store: &DaemonStore, turn: &StoredIngressTurn) -> Result<serde_json
         "state": turn.state.as_str(),
         "attempts": turn.attempts,
         "last_error": turn.last_error,
+        // Which configuration this turn was accepted under. The digest is what
+        // an operator compares when a recovered run behaves like a different
+        // one; the definition behind it is deliberately not exposed here.
+        "execution_version": turn.execution_version,
+        "execution_digest": turn.execution_digest,
+        // The workspace-mutation contract: what the turn promised, where that
+        // promise ended up, and what the run reported about it. Never message
+        // text — the detail is a file count and, at most, a tool's own error.
+        "mutation_required": turn.mutation_required,
+        "mutation_state": turn.mutation_state.map(|state| state.as_str()),
+        "mutation_detail": turn.mutation_detail,
+        // Lineage, so a correction or a resume is never mistaken for a second
+        // thing the operator asked for.
+        "parent_ingress_id": turn.parent_ingress_id,
+        "continuation_kind": turn.continuation_kind,
+        "continuation_attempt": turn.continuation_attempt,
         "job_id": turn.job_id,
         "run_id": job.as_ref().and_then(|job| job.run_id.clone()),
         "run_state": job.as_ref().map(|job| job.state.token()),
@@ -223,5 +536,72 @@ mod tests {
         assert!(list(Some("carrier pigeon"), 10, true)
             .expect_err("unknown source")
             .contains("carrier pigeon"));
+    }
+
+    /// The desktop reaches this command as a process, so the flag names are a
+    /// contract between two files that cannot import each other — the argv
+    /// `daemon_commands::ingress_turn_resume` builds, and what clap accepts.
+    ///
+    /// The request id is the part worth pinning: a rename here would leave the
+    /// bridge passing a flag clap rejects, and a Resume that cannot be submitted
+    /// at all is at least loud. One that clap accepted under a *default* would
+    /// not be, which is why the flag is also required.
+    #[test]
+    fn the_resume_command_takes_the_callers_request_id() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            command: Outer,
+        }
+        #[derive(clap::Subcommand)]
+        enum Outer {
+            Ingress {
+                #[command(subcommand)]
+                command: IngressCmd,
+            },
+        }
+
+        let parsed = Harness::try_parse_from([
+            "monkey",
+            "ingress",
+            "resume",
+            "--source",
+            "desktop",
+            "--account",
+            "session-1",
+            "--event",
+            "turn-1",
+            "--json",
+            "--request-id",
+            "cp-1",
+        ])
+        .expect("the argv the desktop bridge builds");
+        let Outer::Ingress { command } = parsed.command;
+        let IngressCmd::Resume {
+            request_id, json, ..
+        } = command
+        else {
+            panic!("expected the resume subcommand");
+        };
+        assert_eq!(request_id, "cp-1");
+        assert!(json);
+
+        // A resume that does not say which action it is cannot be made
+        // idempotent, so it does not parse.
+        assert!(Harness::try_parse_from([
+            "monkey",
+            "ingress",
+            "resume",
+            "--source",
+            "desktop",
+            "--account",
+            "session-1",
+            "--event",
+            "turn-1",
+            "--json",
+        ])
+        .is_err());
     }
 }

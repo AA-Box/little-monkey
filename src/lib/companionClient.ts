@@ -119,6 +119,11 @@ export interface CompanionComposePayload {
   text: string;
   imageDataUrl: string | null;
   source: string;
+  /** Set only for a finalized hands-free utterance. The chat sends that turn
+   * immediately, as a voice turn, using this as its stable id — so a retried
+   * submission collapses onto the run the first attempt made. Null means the
+   * text lands in the composer for the operator to read and send. */
+  utteranceId: string | null;
 }
 
 export interface ImageProgressPayload {
@@ -130,8 +135,12 @@ export interface ImageProgressPayload {
 export const companionClient = {
   showOverlay: () => invoke<void>("m7_overlay_show"),
   hideOverlay: () => invoke<void>("m7_overlay_hide"),
-  submitOverlay: (text: string, source: string, imageDataUrl: string | null = null) =>
-    invoke<void>("m7_overlay_submit", { text, source, imageDataUrl }),
+  submitOverlay: (
+    text: string,
+    source: string,
+    imageDataUrl: string | null = null,
+    utteranceId: string | null = null,
+  ) => invoke<void>("m7_overlay_submit", { text, source, imageDataUrl, utteranceId }),
   config: () => invoke<CompanionConfig>("m7_config_get"),
   saveConfig: (config: CompanionConfig) => invoke<CompanionConfig>("m7_config_save", { config }),
   grant: (kind: CaptureKind, lifetimeMs = 15 * 60_000, applicationId: string | null = null) =>
