@@ -173,7 +173,12 @@ describe("the provider configuration contract", () => {
     );
     const matchBody = body.slice(body.indexOf("match kind {"));
     const schema = new Map<string, BackendField[]>();
-    for (const arm of matchBody.matchAll(/((?:ChannelKind::\w+\s*\|?\s*)+)=>\s*\{?\s*([A-Z_]+)/g)) {
+    // The or-list is spelled out (`A | B | C =>`) rather than repeated with
+    // an optional separator: the separator being mandatory between variants
+    // is what keeps this regex linear instead of exponentially backtracking.
+    for (const arm of matchBody.matchAll(
+      /(ChannelKind::\w+(?:\s*\|\s*ChannelKind::\w+)*)\s*=>\s*\{?\s*([A-Z_]+)/g,
+    )) {
       const fields = consts.get(arm[2]);
       // `Sms => return Err(...)` in build_adapter is outside this slice; an
       // arm naming an unknown const would be a parse failure worth failing on.
