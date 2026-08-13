@@ -784,28 +784,34 @@ pub(crate) fn settle_mutation_contracts(
                 }
             }
             MutationAction::Correct => {
-                // Settled *first*, and only the winner continues. A second pass
-                // racing this one finds the row already settled and submits
-                // nothing, so one unmet contract cannot become two corrections.
-                if !store.settle_mutation_contract(
-                    &contract.ingress_id,
-                    IngressMutationState::Corrected,
-                    &outcome.summary(),
-                    now_ms,
-                )? {
-                    continue;
-                }
                 let correction = ConversationIngress::continuation_of(
                     &contract.ingress,
                     &contract.ingress_id,
                     ContinuationKind::MutationCorrection,
                     contract.ingress.continuation_attempt().saturating_add(1),
                 );
-                // A submission failure is not lost: the continuation's own row
-                // is durable the moment `accept_ingress_turn` returns, and
-                // `recover_pending_ingress` owns it from then on.
+                // The correction is made durable *before* the parent is settled,
+                // and in that order for a reason. Settling first would leave a
+                // failed write here as a contract marked corrected with no
+                // correction behind it — lost, because a settled row is off the
+                // work list. This way the worst case is a tick that did nothing
+                // and tries again.
+                //
+                // Submitting the same correction twice is not a risk that has to
+                // be traded for that: its identity is derived from the parent's,
+                // so a racing pass, a retry and a recovery all land on the one
+                // row and the one job. A submission that could not reach the
+                // queue is durable too — `recover_pending_ingress` owns it from
+                // the moment `accept_ingress_turn` returns.
                 submit_conversation_turn(store, queue, &correction, &contract.params, now_ms)?;
-                sweep.corrected += 1;
+                if store.settle_mutation_contract(
+                    &contract.ingress_id,
+                    IngressMutationState::Corrected,
+                    &outcome.summary(),
+                    now_ms,
+                )? {
+                    sweep.corrected += 1;
+                }
             }
         }
     }

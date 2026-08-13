@@ -1050,6 +1050,48 @@ fn a_correction_survives_a_restart_without_being_made_twice() {
     assert_eq!(queue.run_count(), 2);
 }
 
+/// The ordering inside one settle pass, which is the difference between a lost
+/// correction and a repeated tick.
+///
+/// The correction is made durable before the contract is marked corrected. If it
+/// were the other way round, a failure between the two would leave a contract
+/// settled — and therefore off the work list — with no correction behind it.
+#[test]
+fn a_correction_is_durable_before_its_contract_is_marked_corrected() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress_id, job_id) = queued_mutating_desktop_turn(&mut store, &queue, "turn-1");
+    let outcomes = ContractOutcomes::default();
+    outcomes.changed_nothing(&job_id);
+
+    channel_ingress::settle_mutation_contracts(&mut store, &queue, &outcomes, NOW + 10_000)
+        .expect("settle");
+
+    // Both facts, or neither. A settled parent must always have a child.
+    let parent = store.ingress_turn(&ingress_id).unwrap().expect("row");
+    assert_eq!(parent.mutation_state, Some(MutationState::Corrected));
+    assert_eq!(store.ingress_continuations(&ingress_id).unwrap().len(), 1);
+
+    // And the reverse of the trade the old order bought: two passes that both
+    // reach the submission still produce one correction, because its identity is
+    // derived from the parent's rather than minted.
+    let replayed = ConversationIngress::continuation_of(
+        &store
+            .accepted_ingress_turn(&ingress_id)
+            .unwrap()
+            .expect("accepted")
+            .ingress,
+        &ingress_id,
+        ContinuationKind::MutationCorrection,
+        1,
+    );
+    let again = submit_conversation_turn(&mut store, &queue, &replayed, &[], NOW + 11_000)
+        .expect("resubmit");
+    assert!(matches!(again, SubmitOutcome::AlreadyQueued { .. }));
+    assert_eq!(store.ingress_continuations(&ingress_id).unwrap().len(), 1);
+    assert_eq!(queue.run_count(), 2);
+}
+
 /// The other half of Crash H: the correction was decided but the queue was down
 /// when it was submitted. The correction is a durable accepted turn from the
 /// moment it is decided, so ordinary ingress recovery owns it.
