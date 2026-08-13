@@ -125,7 +125,27 @@ export function IngressTurnsSection() {
                     {turn.execution_version === null ? "—" : `v${turn.execution_version} ${shortDigest(turn.execution_digest)}`}
                   </dd>
                 </div>
+                {turn.mutation_required && (
+                  <div>
+                    <dt className="inline">{t("IngressTurns.contract")}: </dt>
+                    <dd className="inline">
+                      {turn.mutation_state === null
+                        ? t("IngressTurns.contractPending")
+                        : t(`IngressTurns.contractState.${turn.mutation_state}`)}
+                    </dd>
+                  </div>
+                )}
+                {turn.continuation_kind !== null && (
+                  <div>
+                    <dt className="inline">{t("IngressTurns.continuation")}: </dt>
+                    <dd className="inline">
+                      {t(`IngressTurns.continuationKind.${turn.continuation_kind}`)}
+                      {` #${turn.continuation_attempt} · ${turn.parent_ingress_id ?? "—"}`}
+                    </dd>
+                  </div>
+                )}
               </dl>
+              {turn.mutation_detail && <p className="mt-1 text-muted">{turn.mutation_detail}</p>}
               {reason && <p className="mt-1 text-danger">{reason}</p>}
             </li>
           );

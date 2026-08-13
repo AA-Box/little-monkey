@@ -741,6 +741,14 @@ fn queue_conversation_turn(
         args,
         target,
         &recipe.prompt,
+        // Read from the frozen snapshot rather than taken as a flag on the
+        // command line: whether this turn promised a file would change is part
+        // of what was accepted, and a value that could disagree with the
+        // snapshot would be a second source of truth.
+        recipe
+            .desktop_turn
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.workspace_mutation_required),
         execution,
         i64::try_from(now_ms()?).unwrap_or(i64::MAX),
     );
@@ -781,6 +789,7 @@ fn bridge_turn_ingress(
     args: &DaemonRunArgs,
     target: little_monkey_lib::channels::routing::RouteTarget,
     prompt: &str,
+    mutation_required: bool,
     execution: little_monkey_lib::channels::ingress::FrozenExecutionContext,
     now_ms: i64,
 ) -> little_monkey_lib::channels::ingress::ConversationIngress {
@@ -796,6 +805,7 @@ fn bridge_turn_ingress(
         target,
         now_ms,
     )
+    .with_mutation_contract(mutation_required)
     .with_execution(execution)
 }
 
@@ -1395,6 +1405,7 @@ impl remote::api::PlacementQueue for DaemonPlacementQueue {
             parent_run_id: None,
             snapshot_is_frozen: true,
             frozen_execution: None,
+            appended_system: None,
         };
         let global_config_roots = global_config_roots_for_paths(&self.paths)?;
         let queued = enqueue(
@@ -1489,6 +1500,16 @@ struct QueueOptions {
     /// a recipe file an operator edited between acceptance and execution must
     /// not change what an already-accepted message runs.
     frozen_execution: Option<little_monkey_lib::channels::ingress::FrozenExecutionContextV1>,
+    /// One instruction appended to this job's system prompt, and to nothing
+    /// else.
+    ///
+    /// Set only for a durable continuation of an already accepted turn — the
+    /// corrective nudge for an unmet workspace-mutation contract, or the note a
+    /// resumed turn is given. It is applied *after* the frozen recipe is read,
+    /// so the accepted turn's own frozen context and digest are untouched: the
+    /// continuation provably ran the parent's configuration, plus one sentence
+    /// that belongs to this attempt.
+    appended_system: Option<String>,
 }
 
 impl QueueOptions {
@@ -1521,6 +1542,7 @@ impl QueueOptions {
             origin: QueueOrigin::Local,
             snapshot_is_frozen: false,
             frozen_execution: None,
+            appended_system: None,
         }
     }
 }
@@ -1744,7 +1766,15 @@ fn enqueue(
 
     let mut snapshot = recipe;
     snapshot.prompt = rendered.prompt;
-    snapshot.system = effective_system;
+    // A continuation's own instruction goes on last, after the frozen system
+    // prompt and after any rules merging, and only into this job's snapshot.
+    snapshot.system = match &options.appended_system {
+        Some(appended) => Some(match effective_system {
+            Some(system) if !system.trim().is_empty() => format!("{system}\n\n{appended}"),
+            _ => appended.clone(),
+        }),
+        None => effective_system,
+    };
     snapshot.params.clear();
     snapshot.workspace = Some(
         workspace
@@ -2077,6 +2107,7 @@ fn retry(cli: &crate::Cli, run_id: &str, acknowledge: bool) -> Result<(), String
         parent_run_id: prior.run_id,
         snapshot_is_frozen: true,
         frozen_execution: None,
+        appended_system: None,
     };
     let queued = enqueue(
         Some(cli),
@@ -2871,6 +2902,7 @@ fn process_one_pending_delivery(
         parent_run_id: None,
         snapshot_is_frozen: false,
         frozen_execution: None,
+        appended_system: None,
     };
     if let TriggerConfig::Github {
         local_repository,

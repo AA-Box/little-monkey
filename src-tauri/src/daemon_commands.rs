@@ -2216,6 +2216,66 @@ pub async fn ingress_turns(source: Option<String>, limit: u32) -> Result<Value, 
     args.push("--json".into());
     parse_json(&command(args).await?)
 }
+
+/// The three arguments that name one turn, validated once.
+///
+/// The origin is parsed against the enum rather than pattern-checked, so the only
+/// strings that reach an argument vector are the six the durable contract
+/// defines; the account and event are the identity a surface submitted under, and
+/// they are already constrained to that shape by the bridge that accepted them.
+fn ingress_turn_args(
+    action: &str,
+    source: &str,
+    account: &str,
+    event: &str,
+) -> Result<Vec<String>, String> {
+    let source = crate::channels::ingress::ConversationSource::parse(source)
+        .ok_or_else(|| format!("Unknown conversation source '{source}'"))?;
+    validate_id("ingress account", account)?;
+    validate_id("ingress event id", event)?;
+    Ok(vec![
+        "ingress".into(),
+        action.into(),
+        "--source".into(),
+        source.as_str().to_string(),
+        "--account".into(),
+        account.to_string(),
+        "--event".into(),
+        event.to_string(),
+        "--json".into(),
+    ])
+}
+
+/// One turn and every continuation it produced.
+///
+/// What a desktop surface asks while it is watching a turn it submitted: an
+/// unmet workspace-mutation contract is answered by a *continuation's* run, and
+/// this is how the UI finds that run without ever executing anything itself.
+#[tauri::command]
+pub async fn ingress_turn_show(
+    source: String,
+    account: String,
+    event: String,
+) -> Result<Value, String> {
+    let args = ingress_turn_args("show", &source, &account, &event)?;
+    parse_json(&command(args).await?)
+}
+
+/// Continue an accepted turn that was frozen at a tool boundary.
+///
+/// The daemon inherits the accepted turn's frozen execution context verbatim, so
+/// nothing about the machine's current configuration can change what the resumed
+/// turn runs. A turn that was never accepted, or was accepted without a frozen
+/// context, is refused there rather than reconstructed here.
+#[tauri::command]
+pub async fn ingress_turn_resume(
+    source: String,
+    account: String,
+    event: String,
+) -> Result<Value, String> {
+    let args = ingress_turn_args("resume", &source, &account, &event)?;
+    parse_json(&command(args).await?)
+}
 // --- Telephony ------------------------------------------------------------
 //
 // The same arrangement as the messaging channel commands above: fixed-argument

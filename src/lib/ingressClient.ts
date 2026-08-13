@@ -48,6 +48,19 @@ export interface IngressTurn {
    * what proves two runs of the same turn used the same configuration. */
   execution_version: number | null;
   execution_digest: string | null;
+  /** Whether the accepted turn promised the workspace would be different
+   * afterwards. Only a surface that can ask for file edits ever sets it. */
+  mutation_required: boolean;
+  /** Where that promise ended up, or null while the run is still going. */
+  mutation_state: MutationState | null;
+  /** What the run reported about the workspace, or why nothing could be read.
+   * A file count and at most a tool's own error — never message text. */
+  mutation_detail: string | null;
+  /** The accepted turn this one continues. Null for a turn a person asked for
+   * directly. */
+  parent_ingress_id: string | null;
+  continuation_kind: ContinuationKind | null;
+  continuation_attempt: number;
   job_id: string | null;
   run_id: string | null;
   run_state: string | null;
@@ -55,6 +68,23 @@ export interface IngressTurn {
   run_error: string | null;
   created_at_ms: number;
   updated_at_ms: number;
+}
+
+/** How an accepted turn's workspace-mutation contract was settled.
+ * `corrected` means a durable corrective continuation was submitted;
+ * `interrupted` means the run stopped before it could report, and nothing is
+ * replayed automatically. */
+export type MutationState = "satisfied" | "corrected" | "unmet" | "interrupted";
+
+/** Why a turn exists that no person typed. Both kinds inherit their parent's
+ * frozen execution context, so neither can run a configuration the original
+ * turn was not accepted under. */
+export type ContinuationKind = "mutation_correction" | "resume";
+
+/** One turn with every continuation it produced, oldest first. */
+export interface IngressTurnDetail {
+  turn: IngressTurn | null;
+  continuations: IngressTurn[];
 }
 
 export const SOURCE_LABELS: Record<ConversationSource, string> = {
@@ -68,6 +98,21 @@ export const SOURCE_LABELS: Record<ConversationSource, string> = {
 
 export const ingressTurns = (source: ConversationSource | null = null, limit = 20) =>
   invoke<{ turns: IngressTurn[] }>("ingress_turns", { source, limit });
+
+/** One turn, by the identity its origin submitted it under, with its
+ * continuations. How a surface watching a turn learns that the run answering
+ * the operator is a continuation's rather than the one it submitted. */
+export const ingressTurnShow = (source: ConversationSource, account: string, event: string) =>
+  invoke<IngressTurnDetail>("ingress_turn_show", { source, account, event });
+
+/** Asks the durable backend to continue an accepted turn that was frozen at a
+ * tool boundary. The backend inherits the turn's frozen execution context; the
+ * caller only gets the run to watch. */
+export const ingressTurnResume = (source: ConversationSource, account: string, event: string) =>
+  invoke<{ ingress_id: string; parent_ingress_id: string; job_id: string; run_id: string }>(
+    "ingress_turn_resume",
+    { source, account, event },
+  );
 
 /** How this turn is doing, in one word an operator can act on.
  *

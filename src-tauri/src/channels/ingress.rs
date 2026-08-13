@@ -236,6 +236,55 @@ fn hex_digest(parts: &[&[u8]]) -> String {
         .collect()
 }
 
+/// Why a turn exists that no person typed.
+///
+/// Both kinds are continuations of an *already accepted* turn, and that is the
+/// whole point of the type: a continuation inherits its parent's frozen
+/// execution context verbatim, so a recipe, route, model or permission mode
+/// edited between the parent's acceptance and the continuation's execution
+/// cannot change what runs. Neither kind is ever a second user message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationKind {
+    /// The parent promised a workspace change and its run did not make one.
+    /// Carries the corrective instruction; see [`crate::channels::mutation`].
+    MutationCorrection,
+    /// The parent's turn was frozen at a tool boundary and the operator asked
+    /// for it to carry on.
+    Resume,
+}
+
+impl ContinuationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContinuationKind::MutationCorrection => "mutation_correction",
+            ContinuationKind::Resume => "resume",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<ContinuationKind> {
+        match value {
+            "mutation_correction" => Some(ContinuationKind::MutationCorrection),
+            "resume" => Some(ContinuationKind::Resume),
+            _ => None,
+        }
+    }
+}
+
+/// The accepted turn a continuation belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnContinuation {
+    /// Durable id of the parent's accepted row, so the lineage is diagnosable
+    /// without re-deriving anything.
+    pub parent_ingress_id: String,
+    /// The parent's own origin event id, which is what the derived event id is
+    /// built from.
+    pub parent_source_event_id: String,
+    pub kind: ContinuationKind,
+    /// Which continuation of the parent this is, starting at 1.
+    pub attempt: u32,
+}
+
 /// A durable, deduplicated, route-frozen external turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationIngress {
@@ -280,6 +329,15 @@ pub struct ConversationIngress {
     /// Carried through to audit state.
     #[serde(default)]
     pub automation_origin: bool,
+    /// Whether the accepted turn promised the workspace would be different
+    /// afterwards — see [`crate::channels::mutation`]. Decided by the origin
+    /// that took the turn, frozen here, and checked against what the run did.
+    #[serde(default)]
+    pub mutation_required: bool,
+    /// Set only on a derived continuation of an already accepted turn. Absent
+    /// means a person asked for this directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<TurnContinuation>,
     pub received_at_ms: i64,
     /// Diagnostic-only. Never model input.
     #[serde(default, skip_serializing_if = "BoundedMetadata::is_empty")]
@@ -303,6 +361,8 @@ impl ConversationIngress {
             execution: None,
             reply_depth: 0,
             automation_origin: false,
+            mutation_required: false,
+            continuation: None,
             received_at_ms: envelope.received_at_ms,
             metadata: envelope.metadata.clone(),
         }
@@ -332,6 +392,8 @@ impl ConversationIngress {
             execution: None,
             reply_depth: 0,
             automation_origin: false,
+            mutation_required: false,
+            continuation: None,
             received_at_ms,
             metadata: BoundedMetadata::new(),
         }
@@ -341,6 +403,59 @@ impl ConversationIngress {
     pub fn with_execution(mut self, execution: FrozenExecutionContext) -> Self {
         self.execution = Some(execution);
         self
+    }
+
+    /// Record that this turn promised a workspace change.
+    pub fn with_mutation_contract(mut self, required: bool) -> Self {
+        self.mutation_required = required;
+        self
+    }
+
+    /// The durable continuation of an already accepted turn.
+    ///
+    /// Everything that decides *how* this executes is inherited, not resolved:
+    /// the frozen execution context, the route digest, the target, the text and
+    /// the attachments all come from the parent row. Only the identity changes,
+    /// and it changes deterministically — `<parent event>#<kind>-<attempt>` —
+    /// so submitting the same continuation twice, from a retry or from a
+    /// recovery pass, collapses onto one row and one job.
+    ///
+    /// The corrective *instruction* is deliberately not here. It belongs to the
+    /// queued job's snapshot, not to the accepted turn: putting it in the
+    /// frozen context would change the parent's digest, and putting it in the
+    /// text would fabricate a message the operator never sent.
+    pub fn continuation_of(
+        parent: &ConversationIngress,
+        parent_ingress_id: impl Into<String>,
+        kind: ContinuationKind,
+        attempt: u32,
+    ) -> Self {
+        let parent_source_event_id = parent.source_event_id.clone();
+        Self {
+            source_event_id: format!(
+                "{parent_source_event_id}#{}-{attempt}",
+                kind.as_str().replace('_', "-")
+            ),
+            // A continuation is machine-originated even when a person asked for
+            // it, and it is one reply deeper than what it continues: the same
+            // two facts that bound an automated messaging loop bound this.
+            automation_origin: true,
+            reply_depth: parent.reply_depth.saturating_add(1),
+            continuation: Some(TurnContinuation {
+                parent_ingress_id: parent_ingress_id.into(),
+                parent_source_event_id,
+                kind,
+                attempt,
+            }),
+            ..parent.clone()
+        }
+    }
+
+    /// How many continuations of this turn's own lineage precede it.
+    pub fn continuation_attempt(&self) -> u32 {
+        self.continuation
+            .as_ref()
+            .map_or(0, |continuation| continuation.attempt)
     }
 
     /// Mark this turn as automation-originated at the given reply depth.
@@ -353,12 +468,7 @@ impl ConversationIngress {
     /// Identity for the durable dedupe: source, account, event id. No timestamp,
     /// so a redelivery or a replayed polling window collapses onto the same row.
     pub fn dedupe_key(&self) -> String {
-        format!(
-            "{}:{}:{}",
-            self.source.as_str(),
-            self.source_account_id,
-            self.source_event_id
-        )
+        dedupe_key_for(self.source, &self.source_account_id, &self.source_event_id)
     }
 
     /// Deterministic job id for the daemon queue, matching the webhook trigger
@@ -464,6 +574,20 @@ impl ConversationIngress {
         }
         body
     }
+}
+
+/// The durable dedupe identity of a turn, built from its parts.
+///
+/// Spelled once, here, because it is a persisted key: a surface that knows the
+/// identity it submitted under (a desktop turn id, a phone's message id) asks
+/// about its turn with this, and a second definition of the format would read
+/// back rows that do not exist.
+pub fn dedupe_key_for(
+    source: ConversationSource,
+    source_account_id: &str,
+    source_event_id: &str,
+) -> String {
+    format!("{}:{source_account_id}:{source_event_id}", source.as_str())
 }
 
 /// How many attachments are described before the rest are counted instead. A
@@ -856,6 +980,146 @@ mod tests {
             restored.deterministic_job_id(),
             ConversationIngress::from_channel(&envelope(), &route()).deterministic_job_id()
         );
+    }
+
+    /// The pre-continuation shape has to keep loading, and it has to keep
+    /// meaning "a person asked for this, and it promised nothing".
+    #[test]
+    fn a_turn_stored_before_continuations_existed_is_neither_derived_nor_contracted() {
+        let stored = serde_json::json!({
+            "source": "desktop",
+            "source_account_id": "session-1",
+            "source_event_id": "turn-1",
+            "session_key": "desktop:session-1",
+            "text": "ship it",
+            "target": RouteTarget::new("chat"),
+            "route_digest": RouteTarget::new("chat").digest(),
+            "received_at_ms": 1_700_000_000_000_i64,
+        });
+        let restored: ConversationIngress = serde_json::from_value(stored).expect("deserialize");
+        assert!(!restored.mutation_required);
+        assert!(restored.continuation.is_none());
+        assert_eq!(restored.continuation_attempt(), 0);
+    }
+
+    fn desktop_turn() -> ConversationIngress {
+        ConversationIngress::direct(
+            ConversationSource::Desktop,
+            "session-1",
+            "turn-1",
+            "desktop:session-1",
+            "fix the failing test",
+            RouteTarget::new("chat"),
+            1_700_000_000_000,
+        )
+        .with_mutation_contract(true)
+        .with_execution(FrozenExecutionContext::V1(
+            FrozenExecutionContextV1 {
+                recipe_ref: "chat".into(),
+                recipe_json: "{\"version\":1,\"name\":\"chat\"}".into(),
+                model_target: "ollama:qwen".into(),
+                permission_mode: "acceptEdits".into(),
+                ..Default::default()
+            }
+            .seal(),
+        ))
+    }
+
+    /// The property Crash J turns on: a continuation must run what the parent
+    /// was accepted with, not what the machine is configured with now.
+    #[test]
+    fn a_continuation_inherits_the_parents_frozen_context_verbatim() {
+        let parent = desktop_turn();
+        let correction = ConversationIngress::continuation_of(
+            &parent,
+            "ingr-parent",
+            ContinuationKind::MutationCorrection,
+            1,
+        );
+
+        assert_eq!(correction.execution, parent.execution);
+        assert_eq!(correction.route_digest, parent.route_digest);
+        assert_eq!(correction.target, parent.target);
+        assert_eq!(
+            correction.text.as_untrusted_str(),
+            parent.text.as_untrusted_str()
+        );
+        assert_eq!(correction.session_key, parent.session_key);
+        assert!(correction.mutation_required);
+    }
+
+    #[test]
+    fn a_continuation_is_its_own_durable_turn_with_a_deterministic_identity() {
+        let parent = desktop_turn();
+        let first = ConversationIngress::continuation_of(
+            &parent,
+            "ingr-parent",
+            ContinuationKind::MutationCorrection,
+            1,
+        );
+        let again = ConversationIngress::continuation_of(
+            &parent,
+            "ingr-parent",
+            ContinuationKind::MutationCorrection,
+            1,
+        );
+
+        // Re-derived by a recovery pass: same identity, so the queue collapses.
+        assert_eq!(first.dedupe_key(), again.dedupe_key());
+        assert_eq!(first.deterministic_job_id(), again.deterministic_job_id());
+        // Never the parent's, or the correction would be the same job.
+        assert_ne!(first.dedupe_key(), parent.dedupe_key());
+        assert_ne!(
+            first.deterministic_job_id(),
+            parent.deterministic_job_id(),
+            "a correction must be its own job"
+        );
+        assert_eq!(first.source_event_id, "turn-1#mutation-correction-1");
+        assert_eq!(first.continuation_attempt(), 1);
+
+        // A resume of the same parent is a different continuation again.
+        let resume = ConversationIngress::continuation_of(
+            &parent,
+            "ingr-parent",
+            ContinuationKind::Resume,
+            1,
+        );
+        assert_ne!(resume.dedupe_key(), first.dedupe_key());
+        assert_eq!(resume.source_event_id, "turn-1#resume-1");
+    }
+
+    #[test]
+    fn a_continuation_is_machine_originated_and_one_reply_deeper() {
+        let correction = ConversationIngress::continuation_of(
+            &desktop_turn(),
+            "ingr-parent",
+            ContinuationKind::MutationCorrection,
+            1,
+        );
+        assert!(correction.automation_origin);
+        assert_eq!(correction.reply_depth, 1);
+        let second = ConversationIngress::continuation_of(
+            &correction,
+            "ingr-correction",
+            ContinuationKind::MutationCorrection,
+            2,
+        );
+        assert_eq!(second.reply_depth, 2);
+        assert_eq!(
+            second.continuation.as_ref().unwrap().parent_source_event_id,
+            "turn-1#mutation-correction-1"
+        );
+    }
+
+    #[test]
+    fn continuation_kind_strings_round_trip() {
+        for kind in [
+            ContinuationKind::MutationCorrection,
+            ContinuationKind::Resume,
+        ] {
+            assert_eq!(ContinuationKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(ContinuationKind::parse("whatever"), None);
     }
 
     #[test]

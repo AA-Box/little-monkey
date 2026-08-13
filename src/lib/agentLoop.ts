@@ -129,6 +129,7 @@ import {
   type DesktopTurnSource,
   type FrozenAttachmentInput,
 } from './daemonDesktopTurn';
+import { ingressTurnResume } from './ingressClient';
 import {
   canRetryWithoutTools,
   mutationAttemptFailureMessage,
@@ -167,6 +168,15 @@ export interface ResumedTurn {
   /** `checkpoint_restorability`'s statement of what a resume does *not*
    * reproduce, written into the transcript beside the continuation. */
   determinismCaveats: string[];
+  /** The turn the frozen image belongs to — the `chat_turn` process's own
+   * external id.
+   *
+   * This is what makes a resume a *continuation* rather than a new turn: it is
+   * half of the accepted turn's durable identity, so the backend can find the
+   * row and inherit the execution context frozen when the turn was first
+   * accepted. Absent only for an image written before turns were durable, which
+   * is refused rather than resolved afresh. */
+  parentTurnId: string | null;
 }
 
 export function isSwitchNotice(message: ChatMessage): boolean {
@@ -1571,16 +1581,41 @@ export async function runAgentTurn(
     }
 
     const route = await daemonDesktopRoute();
-    // The resident runner has its own natural-exit loop and cannot yet prove
-    // that a requested write happened. Keep explicit mutation turns on the
-    // in-process desktop loop, where the bounded corrective retry and
-    // mutation-success guard below are enforced.
-    // A resumed turn stays on the in-process loop whatever the route says: the
-    // image it is continuing was written by this loop's own checkpoint, and the
-    // daemon path composes its history Rust-side from a task string it was never
-    // given here.
-    if (route === 'daemon' && !mutationRequired && resume === null) {
-      await runDaemonAgentTurn(sessionId, userText, attachments, controller.signal, turnId, skillInvocations, origin);
+    // Every conversational turn this surface accepts becomes a durable ingress
+    // turn before any agent runs — whatever the turn is.
+    //
+    // There used to be two exceptions here, and both were execution bypasses
+    // rather than features. A turn classified as workspace-mutating stayed local
+    // because only this loop could tell whether a write happened; that proof now
+    // comes from the runtime, and the corrective attempt it justified is a
+    // durable continuation the backend owns (`workspace_mutation_required` in
+    // `daemonDesktopTurn.ts`, and `channels::mutation` on the Rust side). A
+    // resumed turn stayed local because its image was written here; a resume is
+    // now a durable continuation of the accepted turn the image belongs to,
+    // executed from the context frozen when that turn was accepted rather than
+    // from whatever this process is configured with at resume time.
+    //
+    // `fallback` is not an exception to that rule: it is the configuration in
+    // which no durable execution authority exists on this machine at all — a
+    // browser/dev profile with no Tauri bridge, or a desktop with no resident
+    // runner installed. There is nothing to hand the turn to, so the in-process
+    // loop is the only thing that can run it, and `runTurnGuarded` refuses to be
+    // entered on any other route.
+    if (route === 'daemon') {
+      if (resume !== null) {
+        await resumeDurableDesktopTurn(sessionId, resume, controller, origin);
+      } else {
+        await runDaemonAgentTurn(
+          sessionId,
+          userText,
+          attachments,
+          controller.signal,
+          turnId,
+          skillInvocations,
+          origin,
+          mutationRequired,
+        );
+      }
     } else {
       await runTurnGuarded(
         sessionId,
@@ -1593,6 +1628,7 @@ export async function runAgentTurn(
         ultracode,
         mutationRequired,
         resume,
+        route,
       );
     }
   } catch (error) {
@@ -1674,6 +1710,65 @@ async function attachDaemonTurnToChat(
   }
 }
 
+/**
+ * Resume a turn frozen at a tool boundary, through the durable backend.
+ *
+ * Nothing here resolves configuration, and nothing here executes: the backend
+ * finds the accepted turn the image belongs to and submits a continuation that
+ * inherits the execution context frozen when that turn was *accepted* — the
+ * recipe, model, workspace and permission mode of then, not of now. This process
+ * only learns which run to watch.
+ *
+ * An image whose turn was never durably accepted is refused rather than run. It
+ * is the one case where re-resolving the current configuration would look like
+ * working and would silently continue someone's conversation in another model's
+ * voice.
+ */
+async function resumeDurableDesktopTurn(
+  sessionId: string,
+  resume: ResumedTurn,
+  controller: AbortController,
+  origin: DesktopTurnSource,
+): Promise<void> {
+  if (!resume.parentTurnId) {
+    throw new Error(
+      'This frozen turn predates durable turn identity, so it cannot be continued with the configuration it was accepted under. Ask again in a new turn.',
+    );
+  }
+  const store = useSessionStore.getState();
+  // The caveats are the whole reason `checkpoint_restorability` returns them: a
+  // resumed turn is a fresh generation from the frozen point, not a replay, and
+  // the transcript is where the person reading the continuation will be.
+  store.addMessage(sessionId, {
+    role: 'system',
+    content: [`${RESUME_NOTE_PREFIX} Resumed from a frozen image.`, ...resume.determinismCaveats].join('\n'),
+  });
+  const resumed = await ingressTurnResume(origin, sessionId, resume.parentTurnId);
+  void reconcileProcess({
+    kind: 'daemon_job',
+    externalId: resumed.job_id,
+    state: 'admitted',
+    parentKind: 'chat_turn',
+    parentExternalId: resume.parentTurnId,
+  });
+  const assistantIndex = sessionMessages(sessionId).length;
+  store.addMessage(sessionId, { role: 'assistant', content: '⏳ Continuing the frozen turn…' });
+  const link: ActiveDaemonDesktopTurn = {
+    sessionId,
+    // The continuation's own identity is the backend's; what this link needs is
+    // the accepted turn it belongs to, so a reconnect asks about the same turn.
+    turnId: resume.parentTurnId,
+    runId: resumed.run_id,
+    assistantIndex,
+    lastSequence: 0,
+    output: '',
+    source: origin,
+  };
+  saveActiveDaemonTurn(link);
+  registerDurableController(resumed.run_id, controller);
+  await attachDaemonTurnToChat(link, controller);
+}
+
 async function runDaemonAgentTurn(
   sessionId: string,
   userText: string,
@@ -1682,6 +1777,7 @@ async function runDaemonAgentTurn(
   turnId: string,
   skillInvocations: SkillInvocationSnapshot[],
   origin: DesktopTurnSource,
+  mutationRequired: boolean,
 ): Promise<void> {
   const store = useSessionStore.getState();
   const priorMessages = sessionMessages(sessionId);
@@ -1888,6 +1984,7 @@ async function runDaemonAgentTurn(
     attachedStackIds,
     attachedStackNames: attachedStacks.map((stack) => stack.name),
     attachments: frozenAttachments,
+    workspaceMutationRequired: mutationRequired,
   });
   const queued = await submitDaemonDesktopTurn(turnId, recipe, origin);
   // Create the daemon job's process record here, with this turn as its parent.
@@ -1924,6 +2021,7 @@ async function runDaemonAgentTurn(
     assistantIndex,
     lastSequence: 0,
     output: '',
+    source: origin,
   };
   saveActiveDaemonTurn(link);
   const controller = turnControllers.get(sessionId);
@@ -1992,7 +2090,14 @@ export function maybeAutoPreviewNewestArtifact(sessionId: string, anchorIndex: n
 }
 
 /** `runAgentTurn` minus the per-session turn registration — the checkpoint
- * lifecycle half of the wrapper. */
+ * lifecycle half of the wrapper.
+ *
+ * This is the in-process conversational loop, and `route` is the guard that keeps
+ * it from being one. It runs a user's turn inside the webview, which is only
+ * defensible where nothing else on the machine can: a profile with no Tauri
+ * bridge, or a desktop whose resident runner is not installed. The moment a
+ * durable execution authority exists, every accepted turn belongs to it, and
+ * entering here would be an execution bypass — so it throws instead. */
 async function runTurnGuarded(
   sessionId: string,
   userText: string,
@@ -2004,7 +2109,13 @@ async function runTurnGuarded(
   ultracode = false,
   mutationRequired = false,
   resume: ResumedTurn | null = null,
+  route: 'fallback' | 'daemon' = 'fallback',
 ): Promise<void> {
+  if (route !== 'fallback') {
+    throw new Error(
+      'A conversational turn cannot be executed in the app process while a resident runner owns execution.',
+    );
+  }
   // The index this turn's user message will land at — captured before
   // `addMessage` so it can anchor a later "Rewind conversation" back to the
   // state just before this turn.

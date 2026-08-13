@@ -25,12 +25,13 @@ import {
   permissionPolicyForRun,
   workspaceToRunWire,
 } from "./durableRun";
+import { ingressTurnShow } from "./ingressClient";
 import type { ModelTargetSnapshot } from "./modelTargets";
 import type { PermissionMode } from "../store/permissionStore";
 import type { WorkspaceRootInfo } from "../store/workspaceStore";
 import type { McpServerInfo } from "../store/mcpStore";
 
-export const DAEMON_DESKTOP_TURN_SCHEMA_VERSION = 2 as const;
+export const DAEMON_DESKTOP_TURN_SCHEMA_VERSION = 3 as const;
 const ACTIVE_TURNS_KEY = "little-monkey-daemon-desktop-turns-v1";
 const POLL_INTERVAL_MS = 150;
 
@@ -118,6 +119,11 @@ interface DesktopTurnRecipe {
     attached_stack_ids: string[];
     attached_stack_names: string[];
     attachments: FrozenAttachmentWire[];
+    /** Whether this turn promised the workspace would be different afterwards.
+     * Frozen here so the runtime checks the promise the turn was accepted with
+     * — not one re-derived from the prompt at execution time — and so the
+     * durable policy, not this process, owns what happens when it is unmet. */
+    workspace_mutation_required: boolean;
   };
 }
 
@@ -143,6 +149,7 @@ export interface BuildDaemonDesktopRecipeOptions {
   attachedStackIds: readonly string[];
   attachedStackNames: readonly string[];
   attachments: FrozenAttachmentInput[];
+  workspaceMutationRequired: boolean;
 }
 
 export interface ActiveDaemonDesktopTurn {
@@ -152,6 +159,10 @@ export interface ActiveDaemonDesktopTurn {
   assistantIndex: number;
   lastSequence: number;
   output: string;
+  /** Which of the operator's own surfaces submitted the turn — the origin half
+   * of its durable identity, needed to ask the backend about it. Absent on a
+   * link stored by an older build, which was always the composer. */
+  source?: DesktopTurnSource;
 }
 
 export interface DaemonTurnProjection {
@@ -354,6 +365,7 @@ export async function buildDaemonDesktopRecipe(
       attached_stack_ids: [...options.attachedStackIds],
       attached_stack_names: [...options.attachedStackNames],
       attachments,
+      workspace_mutation_required: options.workspaceMutationRequired,
     },
   };
 }
@@ -519,6 +531,60 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * How long the UI waits for the durable policy to settle a turn's
+ * workspace-mutation contract before showing what it already has.
+ *
+ * The daemon settles a contract on its own tick, so the decision arrives shortly
+ * after the run ends rather than with it. Bounded because this is a wait for a
+ * *display* — the contract is settled and any correction is submitted whether or
+ * not anything is watching, so timing out here loses nothing but the live view.
+ */
+const CONTRACT_SETTLE_TIMEOUT_MS = 60_000;
+
+/** What the durable backend says should happen after one attempt ends. */
+interface DurableFollowUp {
+  /** A continuation the backend submitted. The UI watches it; it never starts
+   * it — see the ownership boundary in `agentLoop.ts`. */
+  runId?: string;
+  /** The contract's own verdict, to be shown in place of an answer that claimed
+   * a change it did not make. */
+  failure?: string;
+}
+
+/**
+ * Ask the durable backend what became of this turn once an attempt ended.
+ *
+ * This is the whole of the UI's part in the workspace-mutation contract: it
+ * reads. Whether a correction was needed, whether one was submitted, and what it
+ * runs under were all decided by the policy against durable state.
+ */
+async function durableFollowUp(
+  link: ActiveDaemonDesktopTurn,
+  watched: ReadonlySet<string>,
+): Promise<DurableFollowUp | null> {
+  const deadline = Date.now() + CONTRACT_SETTLE_TIMEOUT_MS;
+  for (;;) {
+    const detail = await ingressTurnShow(link.source ?? "desktop", link.sessionId, link.turnId)
+      .catch(() => null);
+    const turn = detail?.turn ?? null;
+    // No durable row (an older daemon, or a turn that never reached ingress)
+    // and nothing that promised a change: there is nothing to follow.
+    if (!turn || !turn.mutation_required) return null;
+    const unwatched = (detail?.continuations ?? []).filter(
+      (child) => child.run_id !== null && !watched.has(child.run_id),
+    );
+    const continuation = unwatched[unwatched.length - 1];
+    if (continuation?.run_id) return { runId: continuation.run_id };
+    if (turn.mutation_state === "unmet" || turn.mutation_state === "interrupted") {
+      return { failure: turn.mutation_detail ?? undefined };
+    }
+    if (turn.mutation_state !== null) return null;
+    if (Date.now() >= deadline) return null;
+    await wait(POLL_INTERVAL_MS);
+  }
+}
+
 export async function watchDaemonDesktopTurn(
   initialLink: ActiveDaemonDesktopTurn,
   signal: AbortSignal,
@@ -526,6 +592,7 @@ export async function watchDaemonDesktopTurn(
 ): Promise<DaemonTurnProjection> {
   let link = { ...initialLink };
   let projection = emptyProjection(link);
+  const watched = new Set<string>([link.runId]);
   let cancelSent = false;
   const requestCancel = () => {
     if (cancelSent) return;
@@ -545,7 +612,39 @@ export async function watchDaemonDesktopTurn(
       saveActiveDaemonTurn(link);
       callbacks.onLinkChanged?.(link);
       callbacks.onProjection(projection);
-      if (projection.terminal) return projection;
+      if (projection.terminal) {
+        // The operator asked to stop; a stopped turn is not corrected.
+        if (signal.aborted) return projection;
+        const followUp = await durableFollowUp(link, watched);
+        if (followUp?.runId) {
+          // The durable backend is running a continuation of this same accepted
+          // turn. Its answer replaces the one that claimed a change it did not
+          // make, exactly as the in-process loop used to discard that answer —
+          // except that the attempt is a durable run this only watches.
+          const finished = link.runId;
+          watched.add(followUp.runId);
+          link = { ...link, runId: followUp.runId, lastSequence: 0, output: "" };
+          removeActiveDaemonTurn(finished);
+          projection = {
+            ...emptyProjection(link),
+            status: "Making the requested workspace change…",
+          };
+          saveActiveDaemonTurn(link);
+          callbacks.onLinkChanged?.(link);
+          callbacks.onProjection(projection);
+          continue;
+        }
+        if (followUp?.failure) {
+          projection = {
+            ...projection,
+            output: "",
+            error: followUp.failure,
+            terminalStatus: "failed",
+          };
+          callbacks.onProjection(projection);
+        }
+        return projection;
+      }
       await wait(POLL_INTERVAL_MS);
     }
   } finally {

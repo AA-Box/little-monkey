@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   daemonDesktopTurnSubmit: vi.fn(),
   loadRunEvents: vi.fn(),
   getRun: vi.fn(),
+  ingressTurnShow: vi.fn(),
 }));
 
 vi.mock("./daemonClient", async (importOriginal) => ({
@@ -19,6 +20,12 @@ vi.mock("./runProtocol", async (importOriginal) => ({
   getRun: mocks.getRun,
 }));
 
+vi.mock("./ingressClient", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./ingressClient")>()),
+  ingressTurnShow: mocks.ingressTurnShow,
+}));
+
+import type { IngressTurn } from "./ingressClient";
 import type { ChatMessage } from "./llamaClient";
 import type { ModelTargetSnapshot } from "./modelTargets";
 import type { RunEventEnvelopeWire, RunRecord } from "./runProtocol";
@@ -90,12 +97,16 @@ describe("daemon desktop turn snapshot", () => {
       attachedStackIds: ["stack-one"],
       attachedStackNames: ["Docs"],
       attachments: [{ path: "/workspace/project/a.txt", kind: "file", mediaType: "text/plain", content: "exact bytes" }],
+      workspaceMutationRequired: true,
     });
 
     expect(recipe.desktop_turn).toMatchObject({
       session_id: "session-one",
       turn_id: "turn-one",
       submitted_at_ms: 123,
+      // The promise the turn was accepted with, frozen alongside everything
+      // else it will execute under. The runtime checks this, not the prompt.
+      workspace_mutation_required: true,
       history,
       target: { kind: "provider", endpoint: "https://api.example.test/v1", model: "gpt-test" },
       // Derived, not the raw root id: `WorkspaceRootInfo.id` is a path in
@@ -271,6 +282,175 @@ describe("daemon desktop routing and event replay", () => {
     expect(mocks.daemonCancel).toHaveBeenCalledWith("r", "Stopped from desktop chat");
     expect(final).toMatchObject({ terminal: true, terminalStatus: "cancelled", lastSequence: 2 });
     expect(projections).toHaveLength(1);
+  });
+});
+
+/**
+ * What the surface does when a turn's workspace-mutation contract is not met.
+ *
+ * It reads. The correction is a durable run the backend decided on and submitted;
+ * the only thing here is which run to display, which is the whole of the
+ * ownership boundary this file is on the wrong side of if it ever grows an
+ * `attemptStream`.
+ */
+describe("following the durable correction of an unmet contract", () => {
+  const memory = new Map<string, string>();
+
+  const contracted = (overrides: Partial<IngressTurn> = {}): IngressTurn => ({
+    ingress_id: "ingr-1",
+    source: "desktop",
+    source_account_id: "s",
+    account_label: null,
+    source_event_id: "t",
+    session_key: "desktop:s",
+    state: "queued",
+    attempts: 1,
+    last_error: null,
+    execution_version: 1,
+    execution_digest: "d".repeat(64),
+    mutation_required: true,
+    mutation_state: null,
+    mutation_detail: null,
+    parent_ingress_id: null,
+    continuation_kind: null,
+    continuation_attempt: 0,
+    job_id: "ingress-1",
+    run_id: "r",
+    run_state: "succeeded",
+    run_error: null,
+    created_at_ms: 1,
+    updated_at_ms: 1,
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    memory.clear();
+    mocks.loadRunEvents.mockReset();
+    mocks.getRun.mockReset();
+    mocks.ingressTurnShow.mockReset();
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => memory.get(key) ?? null,
+      setItem: (key: string, value: string) => { memory.set(key, value); },
+      removeItem: (key: string) => { memory.delete(key); },
+      clear: () => memory.clear(),
+      key: () => null,
+      length: 0,
+    });
+  });
+
+  /** Terminal runs whose output is whatever each run id is mapped to. */
+  function terminalRuns(outputs: Record<string, string>): void {
+    mocks.loadRunEvents.mockImplementation(async (runId: string, after: number) =>
+      after > 0
+        ? []
+        : [{
+            sequence: 1,
+            event: {
+              type: "model_delta",
+              payload: {
+                message_id: runId,
+                channel: "assistant",
+                text: outputs[runId] ?? `output of ${runId}`,
+              },
+            },
+          } as RunEventEnvelopeWire],
+    );
+    mocks.getRun.mockResolvedValue({ status: "succeeded" } as RunRecord);
+  }
+
+  it("switches to the corrective run and replaces the answer that changed nothing", async () => {
+    terminalRuns({
+      r: "here is a code block instead",
+      "r-correction": "edited src/lib/a.ts",
+    });
+    mocks.ingressTurnShow
+      .mockResolvedValueOnce({
+        turn: contracted({ mutation_state: "corrected" }),
+        continuations: [
+          contracted({
+            ingress_id: "ingr-2",
+            parent_ingress_id: "ingr-1",
+            continuation_kind: "mutation_correction",
+            continuation_attempt: 1,
+            mutation_state: null,
+            run_id: "r-correction",
+          }),
+        ],
+      })
+      // The correction's own run reports a satisfied contract, so nothing
+      // follows it.
+      .mockResolvedValue({
+        turn: contracted({ mutation_state: "satisfied" }),
+        continuations: [],
+      });
+
+    const projections: DaemonTurnProjection[] = [];
+    const final = await watchDaemonDesktopTurn(
+      { sessionId: "s", turnId: "t", runId: "r", assistantIndex: 1, lastSequence: 0, output: "", source: "desktop" },
+      new AbortController().signal,
+      { onProjection: (projection) => projections.push(projection) },
+    );
+
+    // The corrective run's output is what the operator ends up with; the
+    // chat-only answer is gone rather than left looking like a completed edit.
+    expect(final.output).not.toContain("code block");
+    // And exactly one link is retained, pointing at the run being watched.
+    expect(loadActiveDaemonTurns()).toEqual([
+      expect.objectContaining({ runId: "r-correction", turnId: "t" }),
+    ]);
+    expect(projections.some((projection) => projection.status.includes("workspace change"))).toBe(true);
+  });
+
+  it("reports an unmet contract in place of an answer that claimed a change", async () => {
+    terminalRuns({ r: "done! I updated the file." });
+    mocks.ingressTurnShow.mockResolvedValue({
+      turn: contracted({
+        mutation_state: "unmet",
+        mutation_detail: "No files changed. A requested file edit was not applied: Permission denied",
+      }),
+      continuations: [],
+    });
+
+    const final = await watchDaemonDesktopTurn(
+      { sessionId: "s", turnId: "t", runId: "r", assistantIndex: 1, lastSequence: 0, output: "", source: "desktop" },
+      new AbortController().signal,
+      { onProjection: () => {} },
+    );
+
+    expect(final.output).toBe("");
+    expect(final.error).toContain("Permission denied");
+    expect(final.terminalStatus).toBe("failed");
+  });
+
+  it("leaves a turn that promised nothing exactly as its run left it", async () => {
+    terminalRuns({ r: "here is the explanation" });
+    mocks.ingressTurnShow.mockResolvedValue({
+      turn: contracted({ mutation_required: false }),
+      continuations: [],
+    });
+
+    const final = await watchDaemonDesktopTurn(
+      { sessionId: "s", turnId: "t", runId: "r", assistantIndex: 1, lastSequence: 0, output: "", source: "desktop" },
+      new AbortController().signal,
+      { onProjection: () => {} },
+    );
+
+    expect(final.output).toBe("here is the explanation");
+    expect(final.error).toBeNull();
+  });
+
+  it("does not chase a correction for a turn the operator stopped", async () => {
+    terminalRuns({ r: "partial" });
+    const controller = new AbortController();
+    controller.abort();
+
+    await watchDaemonDesktopTurn(
+      { sessionId: "s", turnId: "t", runId: "r", assistantIndex: 1, lastSequence: 0, output: "", source: "desktop" },
+      controller.signal,
+      { onProjection: () => {} },
+    );
+
+    expect(mocks.ingressTurnShow).not.toHaveBeenCalled();
   });
 });
 

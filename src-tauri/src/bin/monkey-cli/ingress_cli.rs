@@ -27,6 +27,38 @@ pub enum IngressCmd {
         #[arg(long)]
         json: bool,
     },
+    /// One turn, by the identity its origin submitted it under, with every
+    /// continuation it produced.
+    Show {
+        #[arg(long)]
+        source: String,
+        /// Account, device, session or line the turn arrived on.
+        #[arg(long)]
+        account: String,
+        /// The origin's own event id for the turn.
+        #[arg(long)]
+        event: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Continue an already accepted turn that was frozen at a tool boundary.
+    ///
+    /// The continuation inherits the accepted turn's frozen execution context
+    /// verbatim, so a recipe, model or permission mode changed since then does
+    /// not affect it. Nothing here re-resolves configuration, and nothing here
+    /// can invent a turn: a request to continue something that was never
+    /// accepted is refused.
+    Resume {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        account: String,
+        /// The accepted turn's own event id — the parent, not a new one.
+        #[arg(long)]
+        event: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn dispatch(command: &IngressCmd) -> Result<(), String> {
@@ -36,7 +68,183 @@ pub fn dispatch(command: &IngressCmd) -> Result<(), String> {
             limit,
             json,
         } => list(source.as_deref(), *limit, *json),
+        IngressCmd::Show {
+            source,
+            account,
+            event,
+            json,
+        } => show(source, account, event, *json),
+        IngressCmd::Resume {
+            source,
+            account,
+            event,
+            json,
+        } => resume(source, account, event, *json),
     }
+}
+
+/// Parse an origin token, or refuse before anything is opened.
+fn parse_source(value: &str) -> Result<ConversationSource, String> {
+    ConversationSource::parse(value).ok_or_else(|| format!("Unknown conversation source '{value}'"))
+}
+
+/// One turn and its continuations, as the desktop reads them while a turn runs.
+///
+/// The continuations are what make an unmet workspace-mutation contract visible
+/// to whoever is watching: the run that answers the operator may be the
+/// continuation's, not the one they submitted, and the only way to find it
+/// without the UI owning execution is to ask.
+pub fn show(source: &str, account: &str, event: &str, json: bool) -> Result<(), String> {
+    let source = parse_source(source)?;
+    let store = DaemonStore::open(&DaemonPaths::resolve()?)?;
+    let key = little_monkey_lib::channels::ingress::dedupe_key_for(source, account, event);
+    let Some(turn) = store.ingress_turn_by_dedupe_key(&key)? else {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "turn": null, "continuations": [] })
+            );
+        } else {
+            println!("No turn recorded for {key}.");
+        }
+        return Ok(());
+    };
+    let continuations: Vec<serde_json::Value> = store
+        .ingress_continuations(&turn.ingress_id)?
+        .iter()
+        .map(|child| turn_json(&store, child))
+        .collect::<Result<_, String>>()?;
+    let row = turn_json(&store, &turn)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "turn": row, "continuations": continuations })
+        );
+    } else {
+        println!("{row}");
+        for child in &continuations {
+            println!("  continuation: {child}");
+        }
+    }
+    Ok(())
+}
+
+/// What resuming an accepted turn produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResumedTurn {
+    pub ingress_id: String,
+    pub parent_ingress_id: String,
+    pub job_id: String,
+}
+
+/// Submit a durable resume of an accepted turn.
+///
+/// Separate from the CLI wrapper so the property that matters — the continuation
+/// runs what the *parent* was accepted with, whatever the machine says now — is
+/// testable against an in-memory store rather than only through a process.
+pub(crate) fn resume_accepted_turn(
+    store: &mut DaemonStore,
+    queue: &dyn crate::daemon::channel_worker::RunQueue,
+    source: ConversationSource,
+    account: &str,
+    event: &str,
+    now_ms: i64,
+) -> Result<ResumedTurn, String> {
+    use little_monkey_lib::channels::ingress::{ContinuationKind, ConversationIngress};
+
+    if store.kill_switch()? {
+        return Err("Global kill switch is engaged; nothing can be resumed".to_string());
+    }
+    let key = little_monkey_lib::channels::ingress::dedupe_key_for(source, account, event);
+    let parent = store
+        .ingress_turn_by_dedupe_key(&key)?
+        .ok_or_else(|| format!("No accepted turn '{key}' to continue"))?;
+    let accepted = store
+        .accepted_ingress_turn(&parent.ingress_id)?
+        .ok_or_else(|| format!("Accepted turn '{}' is unreadable", parent.ingress_id))?;
+    // Refused rather than resolved. A turn accepted before execution contexts
+    // were frozen has no snapshot to replay, and continuing it would mean
+    // silently running whatever the machine is configured with now — which is
+    // exactly the thing freezing exists to prevent.
+    if accepted.ingress.execution.is_none() {
+        return Err(format!(
+            "Turn '{key}' was accepted without a frozen execution context and cannot be continued; start a new turn instead"
+        ));
+    }
+    // The next resume of this turn: resuming a turn twice is two continuations,
+    // and a retried request for the *same* resume is one, because the attempt
+    // number is part of the continuation's deterministic identity.
+    let attempt = u32::try_from(
+        store
+            .ingress_continuations(&parent.ingress_id)?
+            .iter()
+            .filter(|child| child.continuation_kind.as_deref() == Some("resume"))
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
+    .saturating_add(1);
+    let continuation = ConversationIngress::continuation_of(
+        &accepted.ingress,
+        &parent.ingress_id,
+        ContinuationKind::Resume,
+        attempt,
+    );
+
+    let outcome = crate::daemon::channel_ingress::submit_conversation_turn(
+        store,
+        queue,
+        &continuation,
+        &accepted.params,
+        now_ms,
+    )?;
+    let (ingress_id, job_id) = match outcome {
+        crate::daemon::channel_ingress::SubmitOutcome::Queued { ingress_id, job_id }
+        | crate::daemon::channel_ingress::SubmitOutcome::AlreadyQueued { ingress_id, job_id } => {
+            (ingress_id, job_id)
+        }
+        crate::daemon::channel_ingress::SubmitOutcome::Deferred { error, .. } => return Err(error),
+        crate::daemon::channel_ingress::SubmitOutcome::Parked { .. } => {
+            return Err("This resumed turn could not be queued and was parked".to_string())
+        }
+    };
+    Ok(ResumedTurn {
+        ingress_id,
+        parent_ingress_id: parent.ingress_id,
+        job_id,
+    })
+}
+
+fn resume(source: &str, account: &str, event: &str, json: bool) -> Result<(), String> {
+    let source = parse_source(source)?;
+    let paths = DaemonPaths::resolve()?;
+    let mut store = DaemonStore::open(&paths)?;
+    let queue = crate::daemon::DaemonChannelQueue::new(paths.clone());
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
+    let resumed = resume_accepted_turn(&mut store, &queue, source, account, event, now)?;
+    let run_id = store
+        .get_job(&resumed.job_id)?
+        .and_then(|job| job.run_id)
+        .ok_or_else(|| format!("Resumed turn '{}' is still preparing", resumed.job_id))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ingress_id": resumed.ingress_id,
+                "parent_ingress_id": resumed.parent_ingress_id,
+                "job_id": resumed.job_id,
+                "run_id": run_id,
+            })
+        );
+    } else {
+        println!("Resumed as {run_id}");
+    }
+    Ok(())
 }
 
 pub fn list(source: Option<&str>, limit: u32, json: bool) -> Result<(), String> {
@@ -124,6 +332,17 @@ fn turn_json(store: &DaemonStore, turn: &StoredIngressTurn) -> Result<serde_json
         // one; the definition behind it is deliberately not exposed here.
         "execution_version": turn.execution_version,
         "execution_digest": turn.execution_digest,
+        // The workspace-mutation contract: what the turn promised, where that
+        // promise ended up, and what the run reported about it. Never message
+        // text — the detail is a file count and, at most, a tool's own error.
+        "mutation_required": turn.mutation_required,
+        "mutation_state": turn.mutation_state.map(|state| state.as_str()),
+        "mutation_detail": turn.mutation_detail,
+        // Lineage, so a correction or a resume is never mistaken for a second
+        // thing the operator asked for.
+        "parent_ingress_id": turn.parent_ingress_id,
+        "continuation_kind": turn.continuation_kind,
+        "continuation_attempt": turn.continuation_attempt,
         "job_id": turn.job_id,
         "run_id": job.as_ref().and_then(|job| job.run_id.clone()),
         "run_state": job.as_ref().map(|job| job.state.token()),

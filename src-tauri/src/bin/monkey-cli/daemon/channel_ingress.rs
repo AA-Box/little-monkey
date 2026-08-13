@@ -22,7 +22,9 @@
 
 use std::path::PathBuf;
 
-use little_monkey_lib::channels::ingress::{ConversationIngress, ConversationSource};
+use little_monkey_lib::channels::ingress::{
+    ContinuationKind, ConversationIngress, ConversationSource,
+};
 use little_monkey_lib::channels::policy::{
     decide_access, generate_pairing_code, pairing_challenge_reply, AccessContext, AccessDecision,
     IgnoreReason, SenderAuthorization, SenderState,
@@ -35,7 +37,9 @@ use super::channel_store::{
     ChannelAccountRecord, EventDirection, EventDisposition, EventRecording, NewChannelEvent,
     NewOutboxMessage, StoredSenderAuthorization,
 };
-use super::ingress_store::{IngressAcceptance, IngressState};
+use super::ingress_store::{
+    IngressAcceptance, IngressState, MutationState as IngressMutationState,
+};
 use super::store::DaemonStore;
 use super::trigger::sha256_hex;
 use super::QueueOrigin;
@@ -461,8 +465,33 @@ pub(super) fn queue_options_for(
             .execution
             .as_ref()
             .map(|execution| execution.as_v1().clone()),
+        appended_system: continuation_instruction(ingress),
     }
 }
+
+/// The instruction a continuation's *queued job* carries.
+///
+/// Deliberately not part of the frozen execution context: the context is
+/// inherited from the parent byte for byte, digest included, which is what proves
+/// a correction ran the configuration the original turn was accepted under. The
+/// nudge belongs to this one job's snapshot and to nothing else — not to the
+/// accepted turn, not to the session transcript, not to the next turn.
+fn continuation_instruction(ingress: &ConversationIngress) -> Option<String> {
+    match ingress.continuation.as_ref()?.kind {
+        ContinuationKind::MutationCorrection => {
+            Some(little_monkey_lib::channels::mutation::WORKSPACE_MUTATION_CORRECTION.to_string())
+        }
+        ContinuationKind::Resume => Some(RESUME_CONTINUATION_INSTRUCTION.to_string()),
+    }
+}
+
+/// What a resumed turn is told about its own resumption.
+///
+/// A resume is not a new question: the conversation in the frozen context is
+/// already whole. What the model does not otherwise know is that time passed and
+/// that nothing it did before the boundary is guaranteed to still hold, which is
+/// exactly what the desktop loop wrote into the transcript as a resume note.
+const RESUME_CONTINUATION_INSTRUCTION: &str = "[Resumed turn] This turn was frozen at a tool boundary and is being continued. Nothing observed before the boundary is guaranteed to still be true: re-read any file or command output you are about to rely on before acting on it. Continue the work already in progress rather than restarting it, and do not ask the user to repeat their request.";
 
 /// How long a turn runs when its recipe does not say. Half an hour: a
 /// conversation nobody is watching should not hold a slot indefinitely.
@@ -652,6 +681,135 @@ pub(crate) fn recover_pending_ingress(
         }
     }
     Ok(recovery)
+}
+
+/// How many contracts one policy pass settles. Bounded for the same reason
+/// [`RECOVERY_BATCH`] is: a tick must not be able to spend unbounded time.
+const CONTRACT_BATCH: u32 = 32;
+
+/// What a run said about the workspace, in the two-level shape the policy needs.
+///
+/// The outer `None` is "still running", so the contract is not settleable yet.
+/// The inner `None` is "over, and reported nothing" — an interrupted run, which
+/// is deliberately not the same answer as "changed nothing".
+pub(crate) type ReportedMutationOutcome =
+    Option<Option<little_monkey_lib::channels::mutation::MutationOutcome>>;
+
+/// What the run belonging to one accepted turn ended up doing.
+///
+/// The seam exists because the policy is a decision about durable state and
+/// nothing else: the caller supplies the two facts (is the run over, and what
+/// did it report), and the decision, the continuation and the record are all
+/// here where they can be tested against an in-memory database.
+pub(crate) trait RunOutcomeSource {
+    fn terminal_outcome(&self, job_id: &str) -> Result<ReportedMutationOutcome, String>;
+}
+
+/// What one policy pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ContractSweep {
+    /// Contracts the run met.
+    pub satisfied: u32,
+    /// Contracts that produced a durable corrective continuation.
+    pub corrected: u32,
+    /// Contracts reported as unmet.
+    pub unmet: u32,
+    /// Runs that stopped before reporting. Nothing is replayed for these.
+    pub interrupted: u32,
+}
+
+/// Settle the workspace-mutation contract of every accepted turn whose run is
+/// over.
+///
+/// This is where "the workspace did not change" stops being something a webview
+/// noticed in memory and becomes something the durable architecture owns. It is
+/// a pure function of stored state — the accepted turn's contract, and the run's
+/// own reported outcome — so running it again after a crash reaches the same
+/// conclusion, and [`DaemonStore::settle_mutation_contract`] is write-once, so
+/// only the pass that wins the settle submits the continuation.
+pub(crate) fn settle_mutation_contracts(
+    store: &mut DaemonStore,
+    queue: &dyn super::channel_worker::RunQueue,
+    outcomes: &dyn RunOutcomeSource,
+    now_ms: i64,
+) -> Result<ContractSweep, String> {
+    use little_monkey_lib::channels::mutation::{
+        mutation_action, mutation_failure_message, MutationAction,
+    };
+
+    let mut sweep = ContractSweep::default();
+    for contract in store.unsettled_mutation_contracts(CONTRACT_BATCH)? {
+        let Some(reported) = outcomes.terminal_outcome(&contract.job_id)? else {
+            continue;
+        };
+        let Some(outcome) = reported else {
+            // The run is over and said nothing. Its workspace may have been
+            // half-written, so a correction — another agent over the same files
+            // — is exactly what must not happen automatically. The daemon's own
+            // interrupted-run handling already refuses to replay these; this
+            // records the same verdict for the turn.
+            if store.settle_mutation_contract(
+                &contract.ingress_id,
+                IngressMutationState::Interrupted,
+                "The run stopped before it could report what it changed.",
+                now_ms,
+            )? {
+                sweep.interrupted += 1;
+            }
+            continue;
+        };
+        match mutation_action(
+            contract.ingress.mutation_required,
+            &outcome,
+            contract.ingress.continuation_attempt(),
+        ) {
+            MutationAction::Accept => {
+                if store.settle_mutation_contract(
+                    &contract.ingress_id,
+                    IngressMutationState::Satisfied,
+                    &outcome.summary(),
+                    now_ms,
+                )? {
+                    sweep.satisfied += 1;
+                }
+            }
+            MutationAction::Fail => {
+                if store.settle_mutation_contract(
+                    &contract.ingress_id,
+                    IngressMutationState::Unmet,
+                    &mutation_failure_message(&outcome),
+                    now_ms,
+                )? {
+                    sweep.unmet += 1;
+                }
+            }
+            MutationAction::Correct => {
+                // Settled *first*, and only the winner continues. A second pass
+                // racing this one finds the row already settled and submits
+                // nothing, so one unmet contract cannot become two corrections.
+                if !store.settle_mutation_contract(
+                    &contract.ingress_id,
+                    IngressMutationState::Corrected,
+                    &outcome.summary(),
+                    now_ms,
+                )? {
+                    continue;
+                }
+                let correction = ConversationIngress::continuation_of(
+                    &contract.ingress,
+                    &contract.ingress_id,
+                    ContinuationKind::MutationCorrection,
+                    contract.ingress.continuation_attempt().saturating_add(1),
+                );
+                // A submission failure is not lost: the continuation's own row
+                // is durable the moment `accept_ingress_turn` returns, and
+                // `recover_pending_ingress` owns it from then on.
+                submit_conversation_turn(store, queue, &correction, &contract.params, now_ms)?;
+                sweep.corrected += 1;
+            }
+        }
+    }
+    Ok(sweep)
 }
 
 /// What one recovery pass did.

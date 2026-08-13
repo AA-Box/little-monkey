@@ -2032,6 +2032,39 @@ ALTER TABLE ingress_turns ADD COLUMN execution_version INTEGER;
 ALTER TABLE ingress_turns ADD COLUMN execution_digest TEXT;
 "#;
 
+const DAEMON_V12: i64 = 12;
+const DAEMON_V12_CHECKSUM: &str = "daemon-jobs-v12-ingress-mutation-contract";
+
+/// The workspace-mutation contract and the continuation lineage.
+///
+/// Both are already inside `ingress_json` — the contract is a field on the
+/// accepted turn, and a continuation carries its parent's id — so these columns
+/// exist because the *policy* has to find rows by them. "Which accepted turns
+/// promised a file would change and have not been settled yet" is the query that
+/// runs on every daemon tick, and it cannot be a scan of every stored turn's
+/// JSON.
+///
+/// `mutation_state` is NULL until the run is terminal and its outcome has been
+/// read; from then on it is one of `satisfied`, `corrected` (a continuation was
+/// submitted), `unmet` (reported), or `interrupted` (the run stopped before it
+/// could say, so nothing is replayed).
+///
+/// Every column is nullable or defaulted, so turns accepted by an earlier build
+/// keep working: no contract, no lineage, nothing to settle.
+const DAEMON_V12_SQL: &str = r#"
+ALTER TABLE ingress_turns ADD COLUMN mutation_required INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE ingress_turns ADD COLUMN mutation_state TEXT;
+ALTER TABLE ingress_turns ADD COLUMN mutation_detail TEXT;
+ALTER TABLE ingress_turns ADD COLUMN parent_ingress_id TEXT;
+ALTER TABLE ingress_turns ADD COLUMN continuation_kind TEXT;
+ALTER TABLE ingress_turns ADD COLUMN continuation_attempt INTEGER NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS ingress_turns_contract_idx
+    ON ingress_turns(mutation_required, mutation_state, created_at_ms);
+CREATE INDEX IF NOT EXISTS ingress_turns_parent_idx
+    ON ingress_turns(parent_ingress_id);
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -2054,12 +2087,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V9, DAEMON_V9_CHECKSUM, DAEMON_V9_SQL),
     (DAEMON_V10, DAEMON_V10_CHECKSUM, DAEMON_V10_SQL),
     (DAEMON_V11, DAEMON_V11_CHECKSUM, DAEMON_V11_SQL),
+    (DAEMON_V12, DAEMON_V12_CHECKSUM, DAEMON_V12_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V11;
+const DAEMON_LATEST: i64 = DAEMON_V12;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
@@ -2206,6 +2240,68 @@ mod tests {
         );
         assert_eq!(turn.execution_version, None);
         assert_eq!(turn.execution_digest, None);
+        // V12's columns default rather than backfill: a turn accepted before the
+        // workspace-mutation contract existed promised nothing and continues
+        // nothing, which is exactly what it meant when it was written.
+        assert!(!turn.mutation_required);
+        assert!(turn.mutation_state.is_none());
+        assert!(turn.mutation_detail.is_none());
+        assert!(turn.parent_ingress_id.is_none());
+        assert!(turn.continuation_kind.is_none());
+        assert_eq!(turn.continuation_attempt, 0);
+        // And it is not work the contract policy will pick up, because there is
+        // no contract on it to settle.
+        assert!(store.unsettled_mutation_contracts(10).unwrap().is_empty());
+    }
+
+    /// The V11 file is the one most installations are upgrading from, so the
+    /// contract columns have to land on a database that already has the
+    /// execution snapshot without disturbing it.
+    #[test]
+    fn an_ingress_row_written_before_the_contract_columns_keeps_its_frozen_snapshot() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE daemon_migrations (
+                    version INTEGER PRIMARY KEY,
+                    checksum TEXT NOT NULL,
+                    applied_at_ms INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        for &(version, checksum, sql) in DAEMON_MIGRATIONS {
+            if version > DAEMON_V11 {
+                break;
+            }
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO daemon_migrations(version, checksum, applied_at_ms)
+                     VALUES (?1, ?2, 1)",
+                    rusqlite::params![version, checksum],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO ingress_turns (
+                    ingress_id, dedupe_key, source, source_account_id, source_event_id,
+                    session_key, state, ingress_json, params_json, job_id, attempts,
+                    execution_version, execution_digest, created_at_ms, updated_at_ms
+                 ) VALUES ('ingr-v11', 'desktop:session-1:turn-1', 'desktop', 'session-1',
+                           'turn-1', 'desktop:session-1', 'queued', '{}', '[]',
+                           'ingress-abc', 1, 1, 'deadbeef', 1, 1);",
+            )
+            .unwrap();
+
+        apply_daemon_migrations(&connection).unwrap();
+
+        let store = DaemonStore { connection };
+        let turn = &store.recent_ingress_turns(10).unwrap()[0];
+        assert_eq!(turn.execution_version, Some(1));
+        assert_eq!(turn.execution_digest.as_deref(), Some("deadbeef"));
+        assert!(!turn.mutation_required);
+        assert!(turn.mutation_state.is_none());
     }
 
     /// Re-running the loop is a no-op, and a checksum that no longer matches its

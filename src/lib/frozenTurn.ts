@@ -132,9 +132,15 @@ export async function resumeFrozenTurn(record: ProcessRecord): Promise<FrozenRes
   // continuing rather than being asked something new. `runAgentTurn` rejects a
   // second turn in a session on its own, so a resume racing a live turn is
   // refused there rather than guarded again here.
+  //
+  // `parentTurnId` is the frozen row's own `externalId` — the id the turn was
+  // durably accepted under. It is what lets the backend continue *that* turn,
+  // with the execution context frozen when it was accepted, instead of starting
+  // something new against the machine's current configuration.
   await runAgentTurn(image.sessionId, '', [], undefined, undefined, [], [], false, {
     resumedFromCheckpointId: image.id,
     determinismCaveats: report.determinismCaveats,
+    parentTurnId: record.externalId || null,
   });
   return 'resumed';
 }

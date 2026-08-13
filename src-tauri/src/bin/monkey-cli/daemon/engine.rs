@@ -15,6 +15,7 @@ use little_monkey_lib::runtime_adapter::MemoryRequirement;
 use crate::durable_run::{bounded_text, CliRunEventSink, DurableRunRecorder};
 
 use super::admission::{self, Fit, Reservation};
+use super::channel_ingress::{self, ReportedMutationOutcome, RunOutcomeSource};
 use super::ledger::{LeaseToken, SharedLedger};
 use super::scheduler::{self, Candidate, ProcessClass, Running};
 use super::store::{
@@ -23,6 +24,65 @@ use super::store::{
 };
 use super::worktree::OwnedWorktree;
 use little_monkey_lib::profiles::ProfileLimits;
+
+/// How many of a run's events are scanned for its reported outcome.
+///
+/// The contract's verification event is written at the very end of a turn, so
+/// this only has to be larger than one turn's event count. A run that somehow
+/// exceeds it reads as "reported nothing", which routes to the safe verdict.
+const MAX_OUTCOME_EVENTS: usize = 10_000;
+
+/// The workspace-mutation outcome of a finished run, read from its own durable
+/// event stream.
+///
+/// Its own handles rather than the engine's, because the policy needs the store
+/// mutably at the same time. Opened only on a tick that actually has an
+/// unsettled contract.
+struct LedgerRunOutcomes {
+    store: DaemonStore,
+    shared: SharedLedger,
+}
+
+impl LedgerRunOutcomes {
+    fn open(paths: &DaemonPaths) -> Result<Self, String> {
+        Ok(Self {
+            store: DaemonStore::open(paths)?,
+            shared: SharedLedger::open(&paths.ledger_db)?,
+        })
+    }
+}
+
+impl RunOutcomeSource for LedgerRunOutcomes {
+    fn terminal_outcome(&self, job_id: &str) -> Result<ReportedMutationOutcome, String> {
+        use little_monkey_lib::channels::mutation::{MutationOutcome, MUTATION_VERIFICATION_NAME};
+
+        // A job that is gone cannot be waited on. Reported as "over, said
+        // nothing", which is the verdict that replays nothing.
+        let Some(job) = self.store.get_job(job_id)? else {
+            return Ok(Some(None));
+        };
+        if !job.state.is_terminal() {
+            return Ok(None);
+        }
+        let Some(run_id) = job.run_id.as_deref() else {
+            return Ok(Some(None));
+        };
+        for envelope in self.shared.events(run_id, 0, MAX_OUTCOME_EVENTS)? {
+            if let RunEvent::VerificationFinished {
+                name,
+                passed,
+                summary,
+                ..
+            } = &envelope.event
+            {
+                if name == MUTATION_VERIFICATION_NAME {
+                    return Ok(Some(Some(MutationOutcome::from_summary(*passed, summary))));
+                }
+            }
+        }
+        Ok(Some(None))
+    }
+}
 
 /// How the engine learns what this machine has.
 ///
@@ -1041,9 +1101,47 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         // daemon restart converges instead of forking a second record.
         self.sync_process_table(now)?;
 
+        // Settled per tick from durable state rather than at each place a job
+        // finishes, for the same reason and with the same payoff: a crash
+        // between a run ending and its contract being settled is just a tick
+        // that did not happen yet. Fail-soft — a turn whose contract could not
+        // be read this tick is read again next tick.
+        if let Err(error) = self.settle_conversation_contracts(now) {
+            eprintln!("monkey daemon: could not settle a conversation contract: {error}");
+        }
+
         if now.saturating_sub(self.last_retention_ms) >= 60 * 60 * 1_000 {
             self.apply_retention(now)?;
             self.last_retention_ms = now;
+        }
+        Ok(())
+    }
+
+    /// Settle the workspace-mutation contract of every accepted conversational
+    /// turn whose run is over.
+    ///
+    /// The decision, the corrective continuation and the record all live in
+    /// [`channel_ingress::settle_mutation_contracts`]; this only supplies the
+    /// two handles it needs and gets out of the way. The indexed emptiness check
+    /// comes first so an idle daemon pays one query per tick rather than opening
+    /// a second connection to the ledger for nothing.
+    fn settle_conversation_contracts(&mut self, now: u64) -> Result<(), String> {
+        if self.store.unsettled_mutation_contracts(1)?.is_empty() {
+            return Ok(());
+        }
+        let outcomes = LedgerRunOutcomes::open(&self.paths)?;
+        let queue = super::DaemonChannelQueue::new(self.paths.clone());
+        let sweep = channel_ingress::settle_mutation_contracts(
+            &mut self.store,
+            &queue,
+            &outcomes,
+            i64::try_from(now).unwrap_or(i64::MAX),
+        )?;
+        if sweep.corrected > 0 || sweep.unmet > 0 || sweep.interrupted > 0 {
+            eprintln!(
+                "monkey daemon: workspace-mutation contracts settled: {} satisfied, {} corrected, {} unmet, {} interrupted",
+                sweep.satisfied, sweep.corrected, sweep.unmet, sweep.interrupted
+            );
         }
         Ok(())
     }

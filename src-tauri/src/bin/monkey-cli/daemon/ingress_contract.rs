@@ -18,8 +18,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use little_monkey_lib::channels::ingress::{
-    ConversationIngress, ConversationSource, FrozenExecutionContext, MAX_LISTED_ATTACHMENTS,
+    ContinuationKind, ConversationIngress, ConversationSource, FrozenExecutionContext,
+    MAX_LISTED_ATTACHMENTS,
 };
+use little_monkey_lib::channels::mutation::MutationOutcome;
 use little_monkey_lib::channels::policy::{AccessPolicy, ChannelAccessPolicy, GroupActivation};
 use little_monkey_lib::channels::routing::{ChannelRoute, RouteScope, RouteTarget};
 use little_monkey_lib::channels::types::{
@@ -28,11 +30,12 @@ use little_monkey_lib::channels::types::{
 };
 
 use super::channel_ingress::{
-    self, recover_pending_ingress, submit_conversation_turn, PlannedDecision, SubmitOutcome,
+    self, recover_pending_ingress, submit_conversation_turn, PlannedDecision,
+    ReportedMutationOutcome, RunOutcomeSource, SubmitOutcome,
 };
 use super::channel_store::ChannelAccountRecord;
 use super::channel_worker::{test_frozen_execution, RunQueue};
-use super::ingress_store::IngressState;
+use super::ingress_store::{IngressState, MutationState};
 use super::store::DaemonStore;
 
 const NOW: i64 = 1_700_000_000_000;
@@ -215,6 +218,15 @@ fn mobile_turn(message_id: &str) -> (ConversationIngress, Vec<String>) {
 
 /// A desktop or voice turn, built by the production bridge builder.
 fn bridge_turn(source: ConversationSource, event_id: &str) -> (ConversationIngress, Vec<String>) {
+    bridge_turn_with_contract(source, event_id, false)
+}
+
+/// The same, with the workspace-mutation contract the surface decided on.
+fn bridge_turn_with_contract(
+    source: ConversationSource,
+    event_id: &str,
+    mutation_required: bool,
+) -> (ConversationIngress, Vec<String>) {
     let mut args = super::DaemonRunArgs {
         name_or_path: "chat".into(),
         param: Vec::new(),
@@ -256,6 +268,7 @@ fn bridge_turn(source: ConversationSource, event_id: &str) -> (ConversationIngre
         &args,
         target,
         "rerun the failing test and tell me why",
+        mutation_required,
         execution,
         NOW,
     );
@@ -647,6 +660,757 @@ fn a_desktop_or_mobile_client_retrying_one_send_gets_one_run() {
 
     assert_eq!(queue.run_count(), 3);
     assert_eq!(store.recent_ingress_turns(10).unwrap().len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// The workspace-mutation contract, and the crashes around it.
+//
+// These cover what used to be the desktop loop's own business: a turn that asked
+// for a file to change, the proof that one did, and the one corrective attempt
+// when it did not. All three are now durable objects, so all three are things a
+// restart can be asked about.
+// ---------------------------------------------------------------------------
+
+/// What the runs behind these turns reported, as durable state would have it.
+///
+/// A job absent from the map is still running — the contract is not settleable.
+/// A job mapped to `None` is over and reported nothing, which is what a crash
+/// mid-turn looks like from the outside.
+#[derive(Default)]
+struct ContractOutcomes {
+    reported: Mutex<BTreeMap<String, Option<MutationOutcome>>>,
+}
+
+impl ContractOutcomes {
+    fn changed(&self, job_id: &str, paths: &[&str]) {
+        self.report(
+            job_id,
+            Some(MutationOutcome {
+                mutated: true,
+                changed_paths: paths.iter().map(|path| path.to_string()).collect(),
+                unresolved_failure: None,
+            }),
+        );
+    }
+
+    fn changed_nothing(&self, job_id: &str) {
+        self.report(job_id, Some(MutationOutcome::default()));
+    }
+
+    fn refused(&self, job_id: &str, reason: &str) {
+        self.report(
+            job_id,
+            Some(MutationOutcome {
+                mutated: false,
+                changed_paths: Vec::new(),
+                unresolved_failure: Some(reason.to_string()),
+            }),
+        );
+    }
+
+    /// Over, and said nothing at all.
+    fn said_nothing(&self, job_id: &str) {
+        self.report(job_id, None);
+    }
+
+    fn report(&self, job_id: &str, outcome: Option<MutationOutcome>) {
+        self.reported
+            .lock()
+            .expect("lock")
+            .insert(job_id.to_string(), outcome);
+    }
+}
+
+impl RunOutcomeSource for ContractOutcomes {
+    fn terminal_outcome(&self, job_id: &str) -> Result<ReportedMutationOutcome, String> {
+        Ok(self.reported.lock().expect("lock").get(job_id).cloned())
+    }
+}
+
+/// A desktop Send the surface classified as workspace-mutating, accepted and
+/// queued through the one durable service.
+fn queued_mutating_desktop_turn(
+    store: &mut DaemonStore,
+    queue: &ContractQueue,
+    event_id: &str,
+) -> (String, String) {
+    let (ingress, params) = bridge_turn_with_contract(ConversationSource::Desktop, event_id, true);
+    let outcome = submit_conversation_turn(store, queue, &ingress, &params, NOW).expect("submit");
+    let SubmitOutcome::Queued { ingress_id, job_id } = outcome else {
+        panic!("expected the mutating turn to queue, got {outcome:?}");
+    };
+    (ingress_id, job_id)
+}
+
+/// A workspace-mutating Send is a durable turn like any other, and its promise
+/// is part of what was accepted rather than something re-derived later.
+#[test]
+fn a_workspace_mutating_desktop_send_is_an_accepted_ingress_turn() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress_id, job_id) = queued_mutating_desktop_turn(&mut store, &queue, "turn-1");
+
+    let stored = store.ingress_turn(&ingress_id).unwrap().expect("row");
+    assert_eq!(stored.source, ConversationSource::Desktop);
+    assert_eq!(stored.state, IngressState::Queued);
+    assert_eq!(stored.job_id.as_deref(), Some(job_id.as_str()));
+    assert!(stored.mutation_required);
+    assert!(
+        stored.mutation_state.is_none(),
+        "not settled until the run is"
+    );
+    assert!(
+        stored.parent_ingress_id.is_none(),
+        "a person asked for this"
+    );
+    assert_eq!(queue.run_count(), 1);
+    // And it is the policy's work list from the moment it is queued.
+    let unsettled = store.unsettled_mutation_contracts(10).unwrap();
+    assert_eq!(unsettled.len(), 1);
+    assert_eq!(unsettled[0].job_id, job_id);
+}
+
+#[test]
+fn a_run_that_changed_a_file_settles_its_contract_and_starts_nothing_else() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress_id, job_id) = queued_mutating_desktop_turn(&mut store, &queue, "turn-1");
+    let outcomes = ContractOutcomes::default();
+    outcomes.changed(&job_id, &["src/lib.rs"]);
+
+    let sweep =
+        channel_ingress::settle_mutation_contracts(&mut store, &queue, &outcomes, NOW + 10_000)
+            .expect("settle");
+
+    assert_eq!(sweep.satisfied, 1);
+    assert_eq!(sweep.corrected, 0);
+    assert_eq!(queue.run_count(), 1, "nothing else was started");
+    let stored = store.ingress_turn(&ingress_id).unwrap().expect("row");
+    assert_eq!(stored.mutation_state, Some(MutationState::Satisfied));
+    assert!(stored
+        .mutation_detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("src/lib.rs")));
+}
+
+/// The rule the desktop loop had: a chat-only answer to "change this file" is
+/// discarded and the same turn gets exactly one more tool-capable attempt. What
+/// changed is who owns that attempt.
+#[test]
+fn a_chat_only_answer_becomes_one_durable_corrective_continuation() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress_id, job_id) = queued_mutating_desktop_turn(&mut store, &queue, "turn-1");
+    let parent = store
+        .accepted_ingress_turn(&ingress_id)
+        .unwrap()
+        .expect("accepted");
+    let outcomes = ContractOutcomes::default();
+    outcomes.changed_nothing(&job_id);
+
+    let sweep =
+        channel_ingress::settle_mutation_contracts(&mut store, &queue, &outcomes, NOW + 10_000)
+            .expect("settle");
+
+    assert_eq!(sweep.corrected, 1);
+    assert_eq!(
+        queue.run_count(),
+        2,
+        "the correction is its own durable run"
+    );
+    assert_eq!(
+        store
+            .ingress_turn(&ingress_id)
+            .unwrap()
+            .unwrap()
+            .mutation_state,
+        Some(MutationState::Corrected)
+    );
+
+    let children = store.ingress_continuations(&ingress_id).expect("children");
+    assert_eq!(children.len(), 1);
+    let child = &children[0];
+    assert_eq!(
+        child.parent_ingress_id.as_deref(),
+        Some(ingress_id.as_str())
+    );
+    assert_eq!(
+        child.continuation_kind.as_deref(),
+        Some("mutation_correction")
+    );
+    assert_eq!(child.continuation_attempt, 1);
+    assert_eq!(child.state, IngressState::Queued);
+    assert!(child.mutation_required, "the promise is still outstanding");
+
+    // The correction runs the configuration the *original* turn was accepted
+    // under. This is the whole reason it is a continuation rather than a new
+    // turn: an operator who switched models between the answer and the
+    // correction has not changed what the correction runs.
+    let corrective = store
+        .accepted_ingress_turn(&child.ingress_id)
+        .unwrap()
+        .expect("accepted correction");
+    assert_eq!(corrective.ingress.execution, parent.ingress.execution);
+    assert_eq!(
+        corrective.ingress.text.as_untrusted_str(),
+        parent.ingress.text.as_untrusted_str(),
+        "no second user message is fabricated"
+    );
+    assert_eq!(corrective.params, parent.params);
+    assert!(
+        corrective.ingress.automation_origin,
+        "not a person's own turn"
+    );
+    assert_eq!(corrective.ingress.reply_depth, 1);
+
+    // And the *job* it queues carries the correction, so the nudge exists in
+    // exactly one attempt's snapshot and nowhere in the accepted turn.
+    let options =
+        channel_ingress::queue_options_for(&corrective.ingress, corrective.params.clone());
+    assert_eq!(
+        options.appended_system.as_deref(),
+        Some(little_monkey_lib::channels::mutation::WORKSPACE_MUTATION_CORRECTION)
+    );
+    assert!(
+        channel_ingress::queue_options_for(&parent.ingress, parent.params.clone())
+            .appended_system
+            .is_none(),
+        "the accepted turn is never nudged"
+    );
+}
+
+/// The desktop loop reported a denied or failed write instead of retrying it,
+/// because a second attempt produces a second denial. That order is preserved.
+#[test]
+fn a_refused_write_is_reported_rather_than_corrected() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress_id, job_id) = queued_mutating_desktop_turn(&mut store, &queue, "turn-1");
+    let outcomes = ContractOutcomes::default();
+    outcomes.refused(&job_id, "Permission denied: write_file");
+
+    let sweep =
+        channel_ingress::settle_mutation_contracts(&mut store, &queue, &outcomes, NOW + 10_000)
+            .expect("settle");
+
+    assert_eq!(sweep.unmet, 1);
+    assert_eq!(sweep.corrected, 0);
+    assert_eq!(queue.run_count(), 1);
+    let stored = store.ingress_turn(&ingress_id).unwrap().expect("row");
+    assert_eq!(stored.mutation_state, Some(MutationState::Unmet));
+    assert!(stored
+        .mutation_detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("Permission denied")));
+}
+
+#[test]
+fn the_correction_is_bounded_at_one_and_then_reported() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress_id, job_id) = queued_mutating_desktop_turn(&mut store, &queue, "turn-1");
+    let outcomes = ContractOutcomes::default();
+    outcomes.changed_nothing(&job_id);
+    channel_ingress::settle_mutation_contracts(&mut store, &queue, &outcomes, NOW + 10_000)
+        .expect("first settle");
+
+    let child = store.ingress_continuations(&ingress_id).unwrap()[0].clone();
+    outcomes.changed_nothing(child.job_id.as_deref().expect("the correction has a job"));
+    let sweep =
+        channel_ingress::settle_mutation_contracts(&mut store, &queue, &outcomes, NOW + 20_000)
+            .expect("second settle");
+
+    assert_eq!(sweep.unmet, 1);
+    assert_eq!(sweep.corrected, 0, "one correction, not a loop");
+    assert_eq!(queue.run_count(), 2);
+    let settled = store.ingress_turn(&child.ingress_id).unwrap().expect("row");
+    assert_eq!(settled.mutation_state, Some(MutationState::Unmet));
+    assert!(settled
+        .mutation_detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("No files changed")));
+    // Nothing further, however many passes run.
+    assert_eq!(
+        channel_ingress::settle_mutation_contracts(&mut store, &queue, &outcomes, NOW + 30_000)
+            .expect("third settle"),
+        Default::default()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Crash F: a workspace-mutating turn is persisted and the process dies before
+// it executes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_mutating_turn_persisted_before_the_crash_recovers_as_one_run_with_its_contract() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::failing();
+    let (ingress, params) = bridge_turn_with_contract(ConversationSource::Desktop, "turn-1", true);
+
+    let outcome =
+        submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
+    assert!(matches!(outcome, SubmitOutcome::Deferred { .. }));
+    assert_eq!(queue.run_count(), 0);
+    let accepted = store.pending_ingress_turns(10).unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert!(accepted[0].ingress.mutation_required);
+    let frozen = accepted[0]
+        .ingress
+        .execution
+        .as_ref()
+        .expect("frozen context")
+        .digest()
+        .to_string();
+
+    // The daemon comes back.
+    queue.recover();
+    let recovery = recover_pending_ingress(&mut store, &queue, NOW + 60_000).expect("recover");
+    assert_eq!(recovery.resubmitted, 1);
+
+    let (ran, ran_params) = queue.only_run();
+    assert!(ran.mutation_required, "the promise survived the crash");
+    assert_eq!(
+        ran.execution.as_ref().expect("frozen context").digest(),
+        frozen
+    );
+    assert_eq!(ran_params, params);
+    assert_eq!(store.recent_ingress_turns(10).unwrap().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Crash G: the run executed but its outcome was never committed.
+// ---------------------------------------------------------------------------
+
+/// A run that stopped mid-flight may have written half of what it was asked to.
+/// Sending another agent over the same files is precisely what must not happen
+/// on its own, so the contract is settled as interrupted and left for a person.
+#[test]
+fn a_run_that_died_before_reporting_is_not_corrected_and_not_replayed() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress_id, job_id) = queued_mutating_desktop_turn(&mut store, &queue, "turn-1");
+    let outcomes = ContractOutcomes::default();
+    outcomes.said_nothing(&job_id);
+
+    let sweep =
+        channel_ingress::settle_mutation_contracts(&mut store, &queue, &outcomes, NOW + 10_000)
+            .expect("settle");
+
+    assert_eq!(sweep.interrupted, 1);
+    assert_eq!(sweep.corrected, 0);
+    assert_eq!(queue.run_count(), 1, "nothing was replayed");
+    assert!(store.ingress_continuations(&ingress_id).unwrap().is_empty());
+    let stored = store.ingress_turn(&ingress_id).unwrap().expect("row");
+    assert_eq!(stored.mutation_state, Some(MutationState::Interrupted));
+    // One logical user turn, still: the crash did not duplicate the request.
+    assert_eq!(store.recent_ingress_turns(10).unwrap().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Crash H: a correction is required and the process dies before it happens.
+// ---------------------------------------------------------------------------
+
+/// The settle pass is a pure function of durable state, so a crash before it is
+/// simply a pass that has not run yet — and a crash *after* it cannot repeat it,
+/// because settling is write-once.
+#[test]
+fn a_correction_survives_a_restart_without_being_made_twice() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress_id, job_id) = queued_mutating_desktop_turn(&mut store, &queue, "turn-1");
+    let outcomes = ContractOutcomes::default();
+    outcomes.changed_nothing(&job_id);
+
+    // The pass that would have submitted the correction never ran: the contract
+    // is still on the work list after the "restart", because nothing about it
+    // lived in a process.
+    assert_eq!(store.unsettled_mutation_contracts(10).unwrap().len(), 1);
+
+    let first =
+        channel_ingress::settle_mutation_contracts(&mut store, &queue, &outcomes, NOW + 10_000)
+            .expect("settle");
+    assert_eq!(first.corrected, 1);
+
+    // Every later pass — the next tick, the next restart, two daemons racing —
+    // finds the work already done.
+    for tick in 1..4 {
+        assert_eq!(
+            channel_ingress::settle_mutation_contracts(
+                &mut store,
+                &queue,
+                &outcomes,
+                NOW + 10_000 + tick * 1_000,
+            )
+            .expect("settle again"),
+            Default::default()
+        );
+    }
+    assert_eq!(store.ingress_continuations(&ingress_id).unwrap().len(), 1);
+    assert_eq!(queue.run_count(), 2);
+}
+
+/// The other half of Crash H: the correction was decided but the queue was down
+/// when it was submitted. The correction is a durable accepted turn from the
+/// moment it is decided, so ordinary ingress recovery owns it.
+#[test]
+fn a_correction_that_could_not_be_queued_is_recovered_like_any_accepted_turn() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress_id, job_id) = queued_mutating_desktop_turn(&mut store, &queue, "turn-1");
+    let outcomes = ContractOutcomes::default();
+    outcomes.changed_nothing(&job_id);
+
+    // The queue goes down between the parent's run ending and the correction
+    // being submitted.
+    queue.failing.store(true, Ordering::SeqCst);
+    channel_ingress::settle_mutation_contracts(&mut store, &queue, &outcomes, NOW + 10_000)
+        .expect("settle");
+    assert_eq!(queue.run_count(), 1, "the correction has no run yet");
+    let pending = store.pending_ingress_turns(10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0]
+            .ingress
+            .continuation
+            .as_ref()
+            .expect("continuation")
+            .parent_ingress_id,
+        ingress_id
+    );
+
+    queue.recover();
+    assert_eq!(
+        recover_pending_ingress(&mut store, &queue, NOW + 70_000)
+            .expect("recover")
+            .resubmitted,
+        1
+    );
+    assert_eq!(queue.run_count(), 2);
+    // Exactly one correction, and it still carries the parent's frozen context.
+    let children = store.ingress_continuations(&ingress_id).unwrap();
+    assert_eq!(children.len(), 1);
+    let corrective = store
+        .accepted_ingress_turn(&children[0].ingress_id)
+        .unwrap()
+        .expect("accepted");
+    let parent = store
+        .accepted_ingress_turn(&ingress_id)
+        .unwrap()
+        .expect("accepted parent");
+    assert_eq!(corrective.ingress.execution, parent.ingress.execution);
+}
+
+// ---------------------------------------------------------------------------
+// Crash I: the UI disappears while a run is active.
+// ---------------------------------------------------------------------------
+
+/// Nothing about a live run depends on something watching it, and a surface that
+/// comes back cannot start a second one: its Send is idempotent on the turn id it
+/// already minted.
+#[test]
+fn a_ui_that_disappears_and_reconnects_does_not_produce_a_second_run() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress, params) = bridge_turn_with_contract(ConversationSource::Desktop, "turn-1", true);
+    let first = submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("send");
+    let SubmitOutcome::Queued { ingress_id, job_id } = first else {
+        panic!("expected the send to queue");
+    };
+    let outcomes = ContractOutcomes::default();
+
+    // The run is still going while nothing is attached. The contract stays
+    // unsettled rather than being decided in the dark.
+    assert_eq!(
+        channel_ingress::settle_mutation_contracts(&mut store, &queue, &outcomes, NOW + 5_000)
+            .expect("settle"),
+        Default::default()
+    );
+    assert_eq!(store.unsettled_mutation_contracts(10).unwrap().len(), 1);
+
+    // The window comes back and re-sends the same turn, which is what a
+    // reconnect after a lost response looks like.
+    let reconnect = submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW + 6_000)
+        .expect("reconnect");
+    assert_eq!(
+        reconnect,
+        SubmitOutcome::AlreadyQueued {
+            ingress_id: ingress_id.clone(),
+            job_id: job_id.clone()
+        }
+    );
+    assert_eq!(queue.run_count(), 1);
+
+    // The run finishes with nobody watching, and the correction is still made.
+    outcomes.changed_nothing(&job_id);
+    assert_eq!(
+        channel_ingress::settle_mutation_contracts(&mut store, &queue, &outcomes, NOW + 9_000)
+            .expect("settle")
+            .corrected,
+        1
+    );
+    assert_eq!(store.ingress_continuations(&ingress_id).unwrap().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Crash J: a frozen turn is resumed after the configuration changed.
+// ---------------------------------------------------------------------------
+
+/// Accepted at T1, configuration rewritten at T2, resumed at T3. What runs at T3
+/// is what was frozen at T1 — and the resume is the production path's own, not a
+/// hand-built continuation.
+#[test]
+fn a_resumed_turn_runs_the_context_frozen_when_it_was_accepted() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress, params) = bridge_turn_with_contract(ConversationSource::Desktop, "turn-1", true);
+    submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
+    let accepted_digest = ingress
+        .execution
+        .as_ref()
+        .expect("frozen context")
+        .digest()
+        .to_string();
+
+    // T2: everything the turn would resolve against is different now. The turn
+    // never re-resolves any of it, so the only way this could leak in is a path
+    // that resolves configuration for an already accepted turn — which is what
+    // this test exists to catch.
+    let resumed = crate::ingress_cli::resume_accepted_turn(
+        &mut store,
+        &queue,
+        ConversationSource::Desktop,
+        "session-1",
+        "turn-1",
+        NOW + 3_600_000,
+    )
+    .expect("resume");
+
+    assert_eq!(queue.run_count(), 2);
+    let continuation = store
+        .accepted_ingress_turn(&resumed.ingress_id)
+        .unwrap()
+        .expect("accepted");
+    assert_eq!(
+        continuation
+            .ingress
+            .execution
+            .as_ref()
+            .expect("frozen context")
+            .digest(),
+        accepted_digest,
+        "a resume must not re-resolve the recipe, route, model or permission mode"
+    );
+    assert_eq!(continuation.params, params);
+    assert_eq!(
+        continuation
+            .ingress
+            .continuation
+            .as_ref()
+            .expect("lineage")
+            .kind,
+        ContinuationKind::Resume
+    );
+    assert_eq!(
+        continuation
+            .ingress
+            .continuation
+            .as_ref()
+            .expect("lineage")
+            .parent_ingress_id,
+        resumed.parent_ingress_id
+    );
+    // The resumed job carries the resume note and nothing about a correction.
+    let options =
+        channel_ingress::queue_options_for(&continuation.ingress, continuation.params.clone());
+    let appended = options.appended_system.expect("a resume note");
+    assert!(appended.contains("Resumed turn"), "{appended}");
+    assert!(
+        !appended.contains("Workspace mutation required"),
+        "{appended}"
+    );
+}
+
+/// Two presses of Resume are two continuations; one press retried is one.
+#[test]
+fn resuming_the_same_turn_twice_in_one_press_produces_one_continuation() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress, params) = bridge_turn(ConversationSource::Desktop, "turn-1");
+    submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
+
+    let resume_once = |store: &mut DaemonStore, at: i64| {
+        crate::ingress_cli::resume_accepted_turn(
+            store,
+            &queue,
+            ConversationSource::Desktop,
+            "session-1",
+            "turn-1",
+            at,
+        )
+        .expect("resume")
+    };
+    let first = resume_once(&mut store, NOW + 1_000);
+    // A second press, after the first continuation exists, is a second resume.
+    let second = resume_once(&mut store, NOW + 2_000);
+
+    assert_ne!(first.ingress_id, second.ingress_id);
+    assert_eq!(queue.run_count(), 3);
+    assert_eq!(
+        store
+            .ingress_continuations(&first.parent_ingress_id)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+/// A frozen image from before turns were durable has no context to inherit.
+/// Refusing is the only honest answer: resolving the current configuration would
+/// continue the conversation in whatever voice the machine has now.
+#[test]
+fn a_turn_with_no_frozen_context_is_refused_rather_than_resumed_against_current_config() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress, _) = bridge_turn(ConversationSource::Desktop, "turn-1");
+    let mut contextless = ingress.clone();
+    contextless.execution = None;
+    store
+        .accept_ingress_turn(&contextless, &[], NOW)
+        .expect("accept");
+
+    let error = crate::ingress_cli::resume_accepted_turn(
+        &mut store,
+        &queue,
+        ConversationSource::Desktop,
+        "session-1",
+        "turn-1",
+        NOW + 1_000,
+    )
+    .expect_err("refused");
+
+    assert!(error.contains("frozen execution context"), "{error}");
+    assert_eq!(queue.run_count(), 0);
+}
+
+#[test]
+fn a_turn_nobody_accepted_cannot_be_resumed_into_existence() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let error = crate::ingress_cli::resume_accepted_turn(
+        &mut store,
+        &queue,
+        ConversationSource::Desktop,
+        "session-1",
+        "never-sent",
+        NOW,
+    )
+    .expect_err("refused");
+    assert!(error.contains("No accepted turn"), "{error}");
+    assert_eq!(queue.run_count(), 0);
+}
+
+/// An attachment belongs to the accepted turn, so every attempt at that turn has
+/// it — including one the daemon generated to correct the first.
+#[test]
+fn a_correction_can_still_reach_the_attachments_of_the_turn_it_corrects() {
+    let mut store = store_with_channel_account();
+    let queue = ContractQueue::default();
+    let mut envelope = telegram_dm("apply this patch", "1");
+    envelope.attachments.push(ChannelAttachment {
+        stored_artifact_id: Some("blob-1".into()),
+        text_excerpt: Some("--- a/src/lib.rs".into()),
+        fetch_error: None,
+        provider_id: Some("file-1".into()),
+        kind: AttachmentKind::Document,
+        filename: Some("fix.patch".into()),
+        mime_type: Some("text/x-patch".into()),
+        declared_size_bytes: Some(64),
+        source: AttachmentSource::ProviderHandle {
+            handle: "file-1".into(),
+        },
+    });
+    let (planned, params) = messaging_turn(&mut store, &envelope);
+    let ingress = planned.with_mutation_contract(true);
+    let outcome =
+        submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
+    let SubmitOutcome::Queued { ingress_id, job_id } = outcome else {
+        panic!("expected the turn to queue");
+    };
+
+    let outcomes = ContractOutcomes::default();
+    outcomes.changed_nothing(&job_id);
+    channel_ingress::settle_mutation_contracts(&mut store, &queue, &outcomes, NOW + 10_000)
+        .expect("settle");
+
+    let child = &store.ingress_continuations(&ingress_id).unwrap()[0];
+    let corrective = store
+        .accepted_ingress_turn(&child.ingress_id)
+        .unwrap()
+        .expect("accepted");
+    assert_eq!(corrective.ingress.attachments, ingress.attachments);
+    assert_eq!(
+        corrective.ingress.attachments[0]
+            .stored_artifact_id
+            .as_deref(),
+        Some("blob-1"),
+        "the same accepted artifact reference, not a path rebuilt from text"
+    );
+    // The parameters carry the attachment manifest the parent was submitted
+    // with, so nothing has to be reconstructed from the message either.
+    assert_eq!(corrective.params, params);
+}
+
+/// The listing is the only place an operator can see any of this, so it has to
+/// carry the contract and the lineage — and still no message text.
+#[test]
+fn the_listing_shows_the_contract_and_the_lineage_without_showing_the_message() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress_id, job_id) = queued_mutating_desktop_turn(&mut store, &queue, "turn-1");
+    let outcomes = ContractOutcomes::default();
+    outcomes.changed_nothing(&job_id);
+    channel_ingress::settle_mutation_contracts(&mut store, &queue, &outcomes, NOW + 10_000)
+        .expect("settle");
+
+    let listed = store.recent_ingress_turns(10).expect("listing");
+    assert_eq!(listed.len(), 2);
+    let parent = listed
+        .iter()
+        .find(|turn| turn.ingress_id == ingress_id)
+        .expect("parent");
+    let child = listed
+        .iter()
+        .find(|turn| turn.parent_ingress_id.is_some())
+        .expect("continuation");
+
+    assert!(parent.mutation_required);
+    assert_eq!(parent.mutation_state, Some(MutationState::Corrected));
+    assert_eq!(
+        child.parent_ingress_id.as_deref(),
+        Some(ingress_id.as_str())
+    );
+    assert_eq!(
+        child.continuation_kind.as_deref(),
+        Some("mutation_correction")
+    );
+    assert_eq!(child.continuation_attempt, 1);
+    assert!(child.job_id.is_some());
+    let serialized = serde_json::to_string(&(listed
+        .iter()
+        .map(|turn| {
+            (
+                turn.session_key.clone(),
+                turn.mutation_detail.clone(),
+                turn.continuation_kind.clone(),
+            )
+        })
+        .collect::<Vec<_>>(),))
+    .expect("serialize");
+    assert!(
+        !serialized.contains("rerun the failing test"),
+        "{serialized}"
+    );
 }
 
 // ---------------------------------------------------------------------------
