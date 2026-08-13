@@ -1,5 +1,5 @@
 {
-  "contract_version": "1.2.0",
+  "contract_version": "1.4.0",
   "support_window_days": 180,
   "http_routes": [
     {
@@ -421,6 +421,66 @@
       "gate": "self_service"
     },
     {
+      "plane": "device",
+      "method": "POST",
+      "path": "/v1/remote/device/surface",
+      "gate": "self_service"
+    },
+    {
+      "plane": "device",
+      "method": "GET",
+      "path": "/v1/remote/device/state",
+      "gate": "self_service"
+    },
+    {
+      "plane": "device",
+      "method": "GET",
+      "path": "/v1/remote/device/commands/next",
+      "gate": "self_service"
+    },
+    {
+      "plane": "device",
+      "method": "POST",
+      "path": "/v1/remote/device/commands/{command_id}/start",
+      "gate": "self_service"
+    },
+    {
+      "plane": "device",
+      "method": "POST",
+      "path": "/v1/remote/device/commands/{command_id}/result",
+      "gate": "self_service"
+    },
+    {
+      "plane": "device",
+      "method": "POST",
+      "path": "/v1/remote/device/voice/{session_id}/chunk",
+      "gate": "capability:VoiceStream"
+    },
+    {
+      "plane": "device",
+      "method": "POST",
+      "path": "/v1/remote/device/voice/{session_id}/close",
+      "gate": "capability:VoiceStream"
+    },
+    {
+      "plane": "device",
+      "method": "GET",
+      "path": "/v1/remote/device/push/key",
+      "gate": "self_service"
+    },
+    {
+      "plane": "device",
+      "method": "POST",
+      "path": "/v1/remote/device/push",
+      "gate": "self_service"
+    },
+    {
+      "plane": "device",
+      "method": "DELETE",
+      "path": "/v1/remote/device/push",
+      "gate": "self_service"
+    },
+    {
       "plane": "node",
       "method": "GET",
       "path": "/v1/remote/node",
@@ -781,6 +841,81 @@
           "description",
           "prompt",
           "profile"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "device_action",
+      "description": "Ask a paired phone or tablet to do one bounded thing with its own hardware and return the result. Every action needs the operator's grant, the device's support, and the device's OS permission; anything else is refused with a reason. The device shows what it is doing. Requires user permission.",
+      "availability": "paired_device_capable",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "accuracy": {
+            "description": "location_read only. Defaults to coarse.",
+            "enum": [
+              "coarse",
+              "precise"
+            ],
+            "type": "string"
+          },
+          "action": {
+            "description": "device_info reads the device's own platform and capabilities. camera_capture takes one still. microphone_capture records for a bounded time. location_read takes one fix (never continuous tracking). notification_post shows a notification. screen_capture captures the screen, and needs the device to have armed screen sharing first. audio_playback either plays a stored run artifact on the device or speaks text aloud.",
+            "enum": [
+              "device_info",
+              "camera_capture",
+              "microphone_capture",
+              "location_read",
+              "notification_post",
+              "screen_capture",
+              "audio_playback"
+            ],
+            "type": "string"
+          },
+          "artifact_id": {
+            "description": "audio_playback only: which audio artifact of that run to play.",
+            "type": "string"
+          },
+          "body": {
+            "description": "notification_post only: up to 512 characters.",
+            "type": "string"
+          },
+          "device_id": {
+            "description": "Which paired device. Omit when exactly one device can perform this action; if several can, the call fails and lists them.",
+            "type": "string"
+          },
+          "duration_ms": {
+            "description": "microphone_capture only: how long to record, 1-300000 ms. Defaults to 10000.",
+            "type": "integer"
+          },
+          "position": {
+            "description": "camera_capture only. Defaults to back.",
+            "enum": [
+              "front",
+              "back"
+            ],
+            "type": "string"
+          },
+          "run_id": {
+            "description": "audio_playback only: the run an audio artifact belongs to. The device fetches it over its own paired connection, so it also needs the read_artifacts grant.",
+            "type": "string"
+          },
+          "text": {
+            "description": "audio_playback only: what to speak, up to 1024 characters. Use this or run_id + artifact_id, never both.",
+            "type": "string"
+          },
+          "title": {
+            "description": "notification_post only: up to 128 characters.",
+            "type": "string"
+          },
+          "wait_ms": {
+            "description": "How long to wait for the device before returning, 1000-120000 ms (default 60000). A device that is asleep may answer later; the result then says the command is still queued or running rather than that it failed.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "action"
         ],
         "type": "object"
       }

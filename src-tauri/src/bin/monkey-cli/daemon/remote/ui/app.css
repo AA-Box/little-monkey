@@ -1115,3 +1115,45 @@ dialog p:not(.eyebrow) {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* The offline banner and the device card. Both are plain blocks on purpose:
+   they carry state, not decoration, and must stay legible at the smallest
+   breakpoint the rest of this sheet supports. */
+.stale-banner {
+  margin: 0 0 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--warning-border, #b45309);
+  border-radius: 0.75rem;
+  background: var(--warning-surface, rgba(180, 83, 9, 0.12));
+  color: var(--warning-text, #fbbf24);
+  font-size: 0.9rem;
+}
+
+.device-panel {
+  margin-bottom: 1rem;
+}
+
+.device-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  margin: 0;
+}
+
+.device-grid dt {
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.75;
+}
+
+.device-grid dd {
+  margin: 0.25rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 680px) {
+  .device-grid {
+    grid-template-columns: 1fr;
+  }
+}

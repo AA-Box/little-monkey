@@ -296,6 +296,11 @@ fn read_attachments(
             mime_type,
             declared_size_bytes: total_bytes.and_then(|bytes| u64::try_from(bytes).ok()),
             source: AttachmentSource::ProviderHandle { handle: path },
+            // Filled by ingest once the bytes are actually fetched; nothing has
+            // been read yet at the point this row is turned into an envelope.
+            stored_artifact_id: None,
+            fetch_error: None,
+            text_excerpt: None,
         });
     }
     Ok(attachments)
