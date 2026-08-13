@@ -70,13 +70,13 @@ impl TelegramAdapter {
     }
 
     #[cfg(test)]
-    fn with_base_url(mut self, base: &str) -> Self {
+    pub(crate) fn with_base_url(mut self, base: &str) -> Self {
         self.api_base = base.to_string();
         self
     }
 
     #[cfg(test)]
-    fn with_blobs(
+    pub(crate) fn with_blobs(
         mut self,
         blobs: std::sync::Arc<dyn crate::daemon::channel_adapter::BlobSource>,
     ) -> Self {
@@ -294,6 +294,16 @@ impl ChannelAdapter for TelegramAdapter {
     }
 
     async fn poll(&self, cursor: Option<&str>) -> Result<InboundBatch, String> {
+        // `is_self` and `mentions_self` are only meaningful once the bot knows
+        // who it is, and nothing in the daemon's inbound loop calls `probe`.
+        // Resolved here, once, so a group configured to answer on mention works
+        // from the first poll rather than from whenever an operator happens to
+        // run `channels probe`. A failure leaves the identity unknown, which is
+        // the conservative answer — never a claim of self it cannot back.
+        let identity_known = self.self_id.lock().map(|id| id.is_some()).unwrap_or(false);
+        if !identity_known {
+            let _ = self.probe().await;
+        }
         let offset = cursor.and_then(|value| value.parse::<i64>().ok());
         let client = self.client()?;
         let mut query = vec![
@@ -639,6 +649,11 @@ fn normalize_update(
     let mut metadata = little_monkey_lib::channels::types::BoundedMetadata::new();
     metadata.insert("chat_type", message.chat.kind.clone());
     metadata.insert("update_kind", update_kind);
+    // The envelope's provider_event_id is the update_id, which is what the
+    // poll stream dedupes by — but a reply must be addressed to the chat-scoped
+    // message_id, a different number. Recorded here so the reply-building side
+    // anchors to the message Telegram can actually find.
+    metadata.insert("provider_message_id", message.message_id.to_string());
 
     Some(ChannelEnvelope {
         account_id: String::new(),

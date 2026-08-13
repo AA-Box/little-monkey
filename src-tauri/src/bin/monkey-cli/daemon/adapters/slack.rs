@@ -17,14 +17,29 @@
 //!
 //! # Shape
 //!
-//! A single task (spawned in [`SlackAdapter::new`]) resolves our own bot
-//! identity once via `auth.test`, then owns the Socket Mode connection for the
-//! adapter's lifetime: every incoming envelope is acknowledged immediately
-//! (Slack redelivers an unacknowledged envelope), and `events_api` envelopes
-//! carrying a `message` event are normalized and pushed into a bounded
-//! channel. [`ChannelAdapter::poll`] only drains that channel. The envelope
-//! framing is [`handle_socket_frame`], a pure function so it is testable
-//! without a socket.
+//! A single task (spawned lazily on the first `poll`) resolves our own bot
+//! identity via `auth.test`, then owns the Socket Mode connection for the
+//! adapter's lifetime. `events_api` envelopes carrying a `message` event are
+//! normalized and pushed into a bounded channel; [`ChannelAdapter::poll`] only
+//! drains that channel. The envelope framing is [`handle_socket_frame`], a
+//! pure function so it is testable without a socket.
+//!
+//! # The ACK is earned, not automatic
+//!
+//! Slack redelivers an envelope until it is acknowledged — that redelivery is
+//! the only at-least-once guarantee this transport has, and acknowledging
+//! before the event is durably recorded trades it away: a crash between the
+//! ACK and the insert loses the message forever, and Slack will never send it
+//! again. So an envelope that carries a message is *not* acknowledged by the
+//! socket reader. Its id is parked, the message flows through `poll` into the
+//! durable event log, and only [`ChannelAdapter::commit_batch`] — called by
+//! the worker strictly after the insert (or its dedupe) succeeded — releases
+//! the ACK back to the socket. Envelopes that carry nothing durable (a
+//! `disconnect` warning, an event type this adapter does not ingest, a body
+//! that does not parse into a message) are acknowledged immediately: there is
+//! nothing to lose, and redelivery of the unparseable is just noise. The
+//! reader never waits on agent execution — durable acceptance is a local
+//! SQLite insert.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,9 +98,18 @@ fn parse_secret(secret: &str) -> Result<SlackSecret, String> {
     })
 }
 
-#[derive(Default)]
 struct Shared {
     permanent_error: Mutex<Option<String>>,
+    /// Envelope ids waiting for durable receipt, keyed by the normalized
+    /// event's `provider_event_id`. A redelivered event parks a second id
+    /// under the same key, and the one durable insert releases them all.
+    pending_acks: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    /// Hands released envelope ids back to whichever socket connection is
+    /// current, which is the only place an ACK frame can be written.
+    ack_tx: mpsc::Sender<String>,
+    /// True between a successful WebSocket connect and its loss, for a probe
+    /// that reports the transport rather than the credential.
+    socket_connected: std::sync::atomic::AtomicBool,
 }
 
 pub struct SlackAdapter {
@@ -95,11 +119,17 @@ pub struct SlackAdapter {
     inbound_tx: mpsc::Sender<ChannelEnvelope>,
     inbound_rx: Mutex<mpsc::Receiver<ChannelEnvelope>>,
     shared: Arc<Shared>,
+    /// Owned here until the socket task takes it at first start.
+    ack_rx: std::sync::Mutex<Option<mpsc::Receiver<String>>>,
     /// Guards the one-time spawn of the socket task. `new` itself stays
     /// side-effect-free — see [`DiscordAdapter`](super::discord::DiscordAdapter)'s
     /// module doc for why.
     started: tokio::sync::OnceCell<()>,
     blobs: Arc<dyn BlobSource>,
+    /// The Web API origin. Always [`API_BASE`] in production; swappable in
+    /// tests so the whole Socket Mode handshake can run against a loopback
+    /// fixture.
+    api_base: String,
 }
 
 impl SlackAdapter {
@@ -109,26 +139,48 @@ impl SlackAdapter {
             .build()
             .map_err(|error| format!("Failed to build the Slack HTTP client: {error}"))?;
         let (tx, rx) = mpsc::channel(INBOUND_CHANNEL_CAPACITY);
+        let (ack_tx, ack_rx) = mpsc::channel(INBOUND_CHANNEL_CAPACITY);
         Ok(Self {
             account_id: config.account.account_id.clone(),
             secret,
             http,
             inbound_tx: tx,
             inbound_rx: Mutex::new(rx),
-            shared: Arc::new(Shared::default()),
+            shared: Arc::new(Shared {
+                permanent_error: Mutex::new(None),
+                pending_acks: std::sync::Mutex::new(std::collections::HashMap::new()),
+                ack_tx,
+                socket_connected: std::sync::atomic::AtomicBool::new(false),
+            }),
+            ack_rx: std::sync::Mutex::new(Some(ack_rx)),
             started: tokio::sync::OnceCell::new(),
             blobs: Arc::new(DaemonBlobs),
+            api_base: API_BASE.to_string(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_base_url(mut self, base: &str) -> Self {
+        self.api_base = base.to_string();
+        self
     }
 
     async fn ensure_started(&self) {
         self.started
             .get_or_init(|| async {
+                let ack_rx = self
+                    .ack_rx
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+                    .expect("the ack receiver is taken exactly once, here");
                 tokio::spawn(run_socket_loop(
                     self.account_id.clone(),
                     self.secret.clone(),
+                    self.api_base.clone(),
                     self.http.clone(),
                     self.inbound_tx.clone(),
+                    ack_rx,
                     self.shared.clone(),
                 ));
             })
@@ -157,16 +209,37 @@ impl ChannelAdapter for SlackAdapter {
     }
 
     async fn probe(&self) -> ChannelHealth {
-        self.ensure_started().await;
         let now = now_ms();
         if let Some(error) = self.shared.permanent_error.lock().await.clone() {
             return ChannelHealth::error(now, error);
         }
-        match auth_test(&self.http, &self.secret.bot_token).await {
-            Ok(identity) if identity.ok => ChannelHealth::connected(
-                now,
-                Some(format!("Connected to Slack as {}", identity.user_id)),
-            ),
+        match auth_test(&self.http, &self.api_base, &self.secret.bot_token).await {
+            Ok(identity) if identity.ok => {
+                // The Web API proves the bot token; the socket is what proves
+                // events can actually arrive. An authenticated token with a
+                // down socket is degraded, not connected.
+                let started = self.started.get().is_some();
+                let socket_up = self
+                    .shared
+                    .socket_connected
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if started && !socket_up {
+                    ChannelHealth {
+                        state: little_monkey_lib::channels::types::HealthState::Degraded,
+                        detail: Some(format!(
+                            "Authenticated to Slack as {}; the Socket Mode connection is down",
+                            identity.user_id
+                        )),
+                        last_error: None,
+                        probed_at_ms: now,
+                    }
+                } else {
+                    ChannelHealth::connected(
+                        now,
+                        Some(format!("Connected to Slack as {}", identity.user_id)),
+                    )
+                }
+            }
             Ok(identity) => ChannelHealth::error(
                 now,
                 scrub(
@@ -186,8 +259,12 @@ impl ChannelAdapter for SlackAdapter {
 
     async fn poll(&self, _cursor: Option<&str>) -> Result<InboundBatch, String> {
         // Socket Mode has no page or offset to resume from; the socket task
-        // pushes as it receives, so cursor is always ignored.
+        // pushes as it receives, so cursor is always ignored. Durability is
+        // carried by the deferred ACK instead — see the module doc.
         self.ensure_started().await;
+        if let Some(error) = self.shared.permanent_error.lock().await.clone() {
+            return Err(error);
+        }
         let mut rx = self.inbound_rx.lock().await;
         let mut envelopes = Vec::new();
         match tokio::time::timeout(POLL_WAIT, rx.recv()).await {
@@ -208,6 +285,29 @@ impl ChannelAdapter for SlackAdapter {
             envelopes,
             cursor: None,
         })
+    }
+
+    /// The worker has durably recorded (or deduplicated) these envelopes;
+    /// their parked Socket Mode acknowledgements may now be released. This is
+    /// the second half of the handshake the module doc describes — an ACK
+    /// sent any earlier would convert Slack's at-least-once redelivery into
+    /// at-most-once.
+    async fn commit_batch(&self, envelopes: &[ChannelEnvelope]) {
+        for envelope in envelopes {
+            let released = self
+                .shared
+                .pending_acks
+                .lock()
+                .ok()
+                .and_then(|mut pending| pending.remove(&envelope.provider_event_id))
+                .unwrap_or_default();
+            for envelope_id in released {
+                // try_send, never a blocking send: a dead socket task must
+                // not wedge the worker. A dropped ACK is always safe — Slack
+                // redelivers and the event log deduplicates.
+                let _ = self.shared.ack_tx.try_send(envelope_id);
+            }
+        }
     }
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
@@ -234,7 +334,7 @@ impl ChannelAdapter for SlackAdapter {
             }
             let request = self
                 .http
-                .post(format!("{API_BASE}/chat.postMessage"))
+                .post(format!("{}/chat.postMessage", self.api_base))
                 .header("Authorization", format!("Bearer {}", self.secret.bot_token))
                 .json(&body);
             let response = match little_monkey_lib::egress::send(request).await {
@@ -304,7 +404,7 @@ impl ChannelAdapter for SlackAdapter {
         };
         let info = little_monkey_lib::egress::send(
             self.http
-                .get(format!("{API_BASE}/files.info"))
+                .get(format!("{}/files.info", self.api_base))
                 .bearer_auth(&self.secret.bot_token)
                 .query(&[("file", handle.as_str())]),
         )
@@ -316,7 +416,7 @@ impl ChannelAdapter for SlackAdapter {
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown_error");
-            return Err(format!("Slack refused files.info: {reason}"));
+            return Err(missing_scope_error(reason));
         }
         let url = body
             .get("file")
@@ -344,7 +444,7 @@ impl SlackAdapter {
         for file in files {
             let request = self
                 .http
-                .get(format!("{API_BASE}/files.getUploadURLExternal"))
+                .get(format!("{}/files.getUploadURLExternal", self.api_base))
                 .header("Authorization", format!("Bearer {}", self.secret.bot_token))
                 .query(&[
                     ("filename", file.filename.as_str()),
@@ -359,16 +459,19 @@ impl SlackAdapter {
                     }
                 }
             };
+            let status = response.status().as_u16();
+            let retry_after_ms = parse_retry_after_seconds(
+                response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|value| value.to_str().ok()),
+            );
             let body: Value = response.json().await.unwrap_or(Value::Null);
-            if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-                return SendOutcome::PermanentFailure {
-                    error: format!(
-                        "Slack refused the upload URL: {}",
-                        body.get("error")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown_error")
-                    ),
-                };
+            // Nothing has been sent yet, so a rate limit or a server error
+            // here is a plain retry — only a refusal is permanent.
+            if let Some(outcome) = upload_step_failure(status, retry_after_ms, &body, "upload URL")
+            {
+                return outcome;
             }
             let (Some(upload_url), Some(file_id)) = (
                 body.get("upload_url").and_then(Value::as_str),
@@ -425,7 +528,7 @@ impl SlackAdapter {
         }
         let request = self
             .http
-            .post(format!("{API_BASE}/files.completeUploadExternal"))
+            .post(format!("{}/files.completeUploadExternal", self.api_base))
             .header("Authorization", format!("Bearer {}", self.secret.bot_token))
             .json(&body);
         let response = match little_monkey_lib::egress::send(request).await {
@@ -438,16 +541,20 @@ impl SlackAdapter {
                 };
             }
         };
+        let status = response.status().as_u16();
+        let retry_after_ms = parse_retry_after_seconds(
+            response
+                .headers()
+                .get("Retry-After")
+                .and_then(|value| value.to_str().ok()),
+        );
         let body: Value = response.json().await.unwrap_or(Value::Null);
-        if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            return SendOutcome::PermanentFailure {
-                error: format!(
-                    "Slack refused to complete the upload: {}",
-                    body.get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown_error")
-                ),
-            };
+        // A rate-limited completion provably posted nothing — the bytes wait
+        // in Slack's store under their file ids and the whole send retries.
+        if let Some(outcome) =
+            upload_step_failure(status, retry_after_ms, &body, "upload completion")
+        {
+            return outcome;
         }
         SendOutcome::Sent {
             provider_message_id: body
@@ -490,6 +597,62 @@ fn split_message(text: &str, limit: usize) -> Vec<String> {
 fn parse_retry_after_seconds(header_value: Option<&str>) -> Option<i64> {
     let seconds: f64 = header_value?.parse().ok()?;
     Some((seconds * 1000.0).round() as i64)
+}
+
+/// Why a `files.info` lookup was refused, said in terms an operator can act on.
+///
+/// `missing_scope` is the one worth translating: it is not a broken file or a
+/// transient failure but a permission this app was never granted, and the fix
+/// is a specific scope in a specific place. The error travels onto the
+/// attachment, so whoever sent the file is told why it did not arrive.
+fn missing_scope_error(reason: &str) -> String {
+    match reason {
+        "missing_scope" | "not_allowed_token_type" => "Slack refused the download: this app is \
+             missing the files:read scope. Add it under OAuth & Permissions in the Slack app \
+             settings and reinstall the app to the workspace"
+            .to_string(),
+        other => format!("Slack refused files.info: {other}"),
+    }
+}
+
+/// The failure outcome for one step of the upload flow, or `None` when the
+/// step succeeded. Rate limits and server errors are retries — nothing has
+/// posted yet at either step, so retrying cannot duplicate a message — and
+/// only an explicit refusal is permanent.
+fn upload_step_failure(
+    http_status: u16,
+    retry_after_ms: Option<i64>,
+    body: &Value,
+    step: &str,
+) -> Option<SendOutcome> {
+    if http_status == 429 {
+        return Some(SendOutcome::RetryableFailure {
+            error: format!("Slack rate limited the {step}"),
+            retry_after_ms,
+        });
+    }
+    if (500..600).contains(&http_status) {
+        return Some(SendOutcome::RetryableFailure {
+            error: format!("Slack returned HTTP {http_status} for the {step}"),
+            retry_after_ms: None,
+        });
+    }
+    if body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let error = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown_error");
+    Some(match error {
+        "ratelimited" => SendOutcome::RetryableFailure {
+            error: format!("Slack rate limited the {step} (ok:false)"),
+            retry_after_ms,
+        },
+        other => SendOutcome::PermanentFailure {
+            error: format!("Slack refused the {step}: {other}"),
+        },
+    })
 }
 
 /// Maps one `chat.postMessage` response — the transport-level HTTP status plus
@@ -541,15 +704,24 @@ fn map_send_response(http_status: u16, retry_after_ms: Option<i64>, body: &Value
 
 #[derive(Debug, Clone, PartialEq)]
 enum Action {
+    /// Acknowledge now: this envelope carries nothing that must first become
+    /// durable (a warning frame, an event type we do not ingest, a message
+    /// that does not parse). Redelivery would change nothing.
     Ack(String),
-    Envelope(Box<ChannelEnvelope>),
+    /// A message to ingest. When `envelope_id` is present its ACK is parked
+    /// until the worker reports durable receipt via `commit_batch`.
+    Envelope {
+        envelope: Box<ChannelEnvelope>,
+        envelope_id: Option<String>,
+    },
     Reconnect,
 }
 
-/// Handles one Socket Mode text frame. Every envelope that carries an
-/// `envelope_id` is acknowledged first and unconditionally — Slack redelivers
-/// otherwise — independent of whether the payload turns into a
-/// [`ChannelEnvelope`].
+/// Handles one Socket Mode text frame.
+///
+/// An envelope carrying a message is *not* acknowledged here: its id rides
+/// the `Envelope` action so the I/O loop can park it until durable receipt —
+/// see the module doc. Every other envelope is acknowledged immediately.
 fn handle_socket_frame(
     account_id: &str,
     text: &str,
@@ -560,10 +732,11 @@ fn handle_socket_frame(
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return Vec::new();
     };
+    let envelope_id = value
+        .get("envelope_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let mut actions = Vec::new();
-    if let Some(envelope_id) = value.get("envelope_id").and_then(Value::as_str) {
-        actions.push(Action::Ack(envelope_id.to_string()));
-    }
     match value
         .get("type")
         .and_then(Value::as_str)
@@ -573,7 +746,13 @@ fn handle_socket_frame(
         // down. ponytail: reconnect-then-drop rather than the overlap-two-
         // sockets dance Slack's docs describe; costs a few seconds of gap
         // per reconnect, upgrade if that gap starts mattering.
-        "disconnect" => actions.push(Action::Reconnect),
+        "disconnect" => {
+            if let Some(envelope_id) = envelope_id {
+                actions.push(Action::Ack(envelope_id));
+            }
+            actions.push(Action::Reconnect);
+            return actions;
+        }
         "events_api" => {
             if let Some(event) = value
                 .get("payload")
@@ -583,12 +762,21 @@ fn handle_socket_frame(
                     if let Some(envelope) =
                         normalize_message_event(account_id, event, our_user_id, our_bot_id, now_ms)
                     {
-                        actions.push(Action::Envelope(Box::new(envelope)));
+                        actions.push(Action::Envelope {
+                            envelope: Box::new(envelope),
+                            envelope_id,
+                        });
+                        return actions;
                     }
                 }
             }
         }
         _ => {}
+    }
+    // Nothing durable came out of this frame; acknowledge so Slack stops
+    // redelivering something that will never parse differently.
+    if let Some(envelope_id) = envelope_id {
+        actions.push(Action::Ack(envelope_id));
     }
     actions
 }
@@ -712,9 +900,13 @@ struct Identity {
     error: String,
 }
 
-async fn auth_test(http: &reqwest::Client, bot_token: &str) -> Result<Identity, String> {
+async fn auth_test(
+    http: &reqwest::Client,
+    api_base: &str,
+    bot_token: &str,
+) -> Result<Identity, String> {
     let request = http
-        .post(format!("{API_BASE}/auth.test"))
+        .post(format!("{api_base}/auth.test"))
         .header("Authorization", format!("Bearer {bot_token}"));
     let response = little_monkey_lib::egress::send(request)
         .await
@@ -743,9 +935,13 @@ async fn auth_test(http: &reqwest::Client, bot_token: &str) -> Result<Identity, 
     })
 }
 
-async fn open_socket_url(http: &reqwest::Client, app_token: &str) -> Result<String, String> {
+async fn open_socket_url(
+    http: &reqwest::Client,
+    api_base: &str,
+    app_token: &str,
+) -> Result<String, String> {
     let request = http
-        .post(format!("{API_BASE}/apps.connections.open"))
+        .post(format!("{api_base}/apps.connections.open"))
         .header("Authorization", format!("Bearer {app_token}"));
     let response = little_monkey_lib::egress::send(request)
         .await
@@ -772,26 +968,31 @@ async fn open_socket_url(http: &reqwest::Client, app_token: &str) -> Result<Stri
 async fn run_socket_loop(
     account_id: String,
     secret: SlackSecret,
+    api_base: String,
     http: reqwest::Client,
     tx: mpsc::Sender<ChannelEnvelope>,
+    mut ack_rx: mpsc::Receiver<String>,
     shared: Arc<Shared>,
 ) {
-    let identity = match auth_test(&http, &secret.bot_token).await {
-        Ok(identity) if identity.ok => identity,
-        Ok(identity) => {
-            *shared.permanent_error.lock().await =
-                Some(format!("Slack rejected the bot token: {}", identity.error));
-            return;
-        }
-        Err(_) => {
-            // Network failure resolving our own identity: keep retrying
-            // rather than giving up, same as a connect failure below.
-            Identity {
-                ok: false,
-                user_id: String::new(),
-                bot_id: String::new(),
-                error: String::new(),
+    // Our own identity, retried until the network answers: giving up here
+    // would silently disable is_self/mentions_self for the daemon's lifetime,
+    // and a rejected token — the one permanent answer — is reported instead.
+    let mut identity_backoff = MIN_BACKOFF;
+    let identity = loop {
+        match auth_test(&http, &api_base, &secret.bot_token).await {
+            Ok(identity) if identity.ok => break identity,
+            Ok(identity) => {
+                *shared.permanent_error.lock().await =
+                    Some(format!("Slack rejected the bot token: {}", identity.error));
+                return;
             }
+            Err(_) => {
+                tokio::time::sleep(identity_backoff).await;
+                identity_backoff = (identity_backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+        if tx.is_closed() {
+            return;
         }
     };
     let our_user_id = (!identity.user_id.is_empty()).then_some(identity.user_id);
@@ -799,7 +1000,7 @@ async fn run_socket_loop(
 
     let mut backoff = MIN_BACKOFF;
     loop {
-        let socket_url = match open_socket_url(&http, &secret.app_token).await {
+        let socket_url = match open_socket_url(&http, &api_base, &secret.app_token).await {
             Ok(url) => url,
             Err(_) => {
                 tokio::time::sleep(backoff).await;
@@ -807,63 +1008,126 @@ async fn run_socket_loop(
                 continue;
             }
         };
-        let reconnected = run_one_connection(
+        // Parked ACKs and queued releases belong to the previous connection;
+        // their envelope ids mean nothing on this one. Slack redelivers the
+        // events themselves, and the event log deduplicates.
+        if let Ok(mut pending) = shared.pending_acks.lock() {
+            pending.clear();
+        }
+        while ack_rx.try_recv().is_ok() {}
+        let established = run_one_connection(
             &account_id,
             &socket_url,
             our_user_id.as_deref(),
             our_bot_id.as_deref(),
             &tx,
+            &mut ack_rx,
+            &shared,
         )
         .await;
+        shared
+            .socket_connected
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         if tx.is_closed() {
             return;
         }
-        if reconnected {
-            backoff = MIN_BACKOFF;
-        }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(MAX_BACKOFF);
+        // Backoff resets only after a connection that actually delivered a
+        // frame — resetting on every attempt turns a flapping socket into a
+        // once-a-second hammer.
+        backoff = if established {
+            MIN_BACKOFF
+        } else {
+            (backoff * 2).min(MAX_BACKOFF)
+        };
+        tokio::time::sleep(backoff + Duration::from_millis(reconnect_jitter_ms())).await;
     }
 }
 
-/// Runs one Socket Mode connection until it drops or asks us to reconnect.
-/// Always returns to the caller for a fresh `apps.connections.open` URL — a
-/// Socket Mode URL is single-use.
+/// Sub-second wall-clock nanos folded into 0..500, so a fleet of reconnecting
+/// clients does not thunder in step. Not cryptographic; does not need to be.
+fn reconnect_jitter_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::from(duration.subsec_nanos()))
+        .unwrap_or(0)
+        % 500
+}
+
+/// Runs one Socket Mode connection until it drops or asks us to reconnect,
+/// returning whether it ever delivered a frame. Always returns to the caller
+/// for a fresh `apps.connections.open` URL — a Socket Mode URL is single-use.
 async fn run_one_connection(
     account_id: &str,
     socket_url: &str,
     our_user_id: Option<&str>,
     our_bot_id: Option<&str>,
     tx: &mpsc::Sender<ChannelEnvelope>,
+    ack_rx: &mut mpsc::Receiver<String>,
+    shared: &Shared,
 ) -> bool {
     let (mut ws, _) = match tokio_tungstenite::connect_async(socket_url).await {
         Ok(pair) => pair,
         Err(_) => return false,
     };
+    shared
+        .socket_connected
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut got_frame = false;
     loop {
-        match ws.next().await {
-            Some(Ok(Message::Text(text))) => {
-                for action in
-                    handle_socket_frame(account_id, &text, our_user_id, our_bot_id, now_ms())
-                {
-                    match action {
-                        Action::Ack(envelope_id) => {
-                            let payload = serde_json::json!({ "envelope_id": envelope_id });
-                            let _ = ws.send(Message::Text(payload.to_string().into())).await;
-                        }
-                        Action::Envelope(envelope) => {
-                            let _ = tx.send(*envelope).await;
-                        }
-                        Action::Reconnect => return true,
-                    }
+        tokio::select! {
+            // The adapter handle was dropped (account disabled, credential
+            // rotated). Hang up now rather than lingering as a second socket
+            // consumer beside the replacement adapter's connection.
+            _ = tx.closed() => {
+                let _ = ws.close(None).await;
+                return got_frame;
+            }
+            // A durable receipt released this envelope id; the ACK finally
+            // goes on the wire.
+            released = ack_rx.recv() => {
+                if let Some(envelope_id) = released {
+                    let payload = serde_json::json!({ "envelope_id": envelope_id });
+                    let _ = ws.send(Message::Text(payload.to_string().into())).await;
                 }
             }
-            Some(Ok(Message::Ping(payload))) => {
-                let _ = ws.send(Message::Pong(payload)).await;
+            frame = ws.next() => {
+                match frame {
+                    Some(Ok(Message::Text(text))) => {
+                        got_frame = true;
+                        for action in
+                            handle_socket_frame(account_id, &text, our_user_id, our_bot_id, now_ms())
+                        {
+                            match action {
+                                Action::Ack(envelope_id) => {
+                                    let payload = serde_json::json!({ "envelope_id": envelope_id });
+                                    let _ = ws.send(Message::Text(payload.to_string().into())).await;
+                                }
+                                Action::Envelope { envelope, envelope_id } => {
+                                    // Park the ACK first, then hand the message
+                                    // on; the reverse order could commit the
+                                    // batch before the id is parked.
+                                    if let Some(envelope_id) = envelope_id {
+                                        if let Ok(mut pending) = shared.pending_acks.lock() {
+                                            pending
+                                                .entry(envelope.provider_event_id.clone())
+                                                .or_default()
+                                                .push(envelope_id);
+                                        }
+                                    }
+                                    let _ = tx.send(*envelope).await;
+                                }
+                                Action::Reconnect => return got_frame,
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        let _ = ws.send(Message::Pong(payload)).await;
+                    }
+                    Some(Ok(Message::Close(_))) => return got_frame,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => return got_frame,
+                }
             }
-            Some(Ok(Message::Close(_))) => return true,
-            Some(Ok(_)) => {}
-            Some(Err(_)) | None => return true,
         }
     }
 }
@@ -1018,7 +1282,7 @@ mod tests {
     // -- socket framing -----------------------------------------------------
 
     #[test]
-    fn envelope_with_id_is_always_acked() {
+    fn a_message_envelope_parks_its_ack_for_durable_receipt() {
         let text = serde_json::json!({
             "envelope_id": "env-1",
             "type": "events_api",
@@ -1026,8 +1290,44 @@ mod tests {
         })
         .to_string();
         let actions = handle_socket_frame("acct", &text, Some("BOT1"), None, 500);
-        assert!(matches!(&actions[0], Action::Ack(id) if id == "env-1"));
-        assert!(matches!(&actions[1], Action::Envelope(_)));
+        // No immediate Ack: the id rides the envelope so the ACK can wait for
+        // the durable insert. Acknowledging here would trade Slack's
+        // redelivery guarantee for nothing.
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::Envelope {
+                envelope,
+                envelope_id,
+            } => {
+                assert_eq!(envelope_id.as_deref(), Some("env-1"));
+                assert_eq!(envelope.provider_event_id, "cmid-1");
+            }
+            other => panic!("expected a deferred envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_envelope_with_nothing_durable_is_acked_immediately() {
+        // An events_api envelope whose payload is not a message we ingest:
+        // redelivery would never parse differently, so it is acknowledged now.
+        let text = serde_json::json!({
+            "envelope_id": "env-2",
+            "type": "events_api",
+            "payload": { "event": { "type": "reaction_added" } },
+        })
+        .to_string();
+        let actions = handle_socket_frame("acct", &text, None, None, 500);
+        assert_eq!(actions, vec![Action::Ack("env-2".to_string())]);
+
+        // A slash-command envelope this adapter does not handle at all.
+        let text = serde_json::json!({
+            "envelope_id": "env-3",
+            "type": "slash_commands",
+            "payload": {},
+        })
+        .to_string();
+        let actions = handle_socket_frame("acct", &text, None, None, 500);
+        assert_eq!(actions, vec![Action::Ack("env-3".to_string())]);
     }
 
     #[test]
@@ -1035,6 +1335,46 @@ mod tests {
         let text = serde_json::json!({ "type": "disconnect", "reason": "warning" }).to_string();
         let actions = handle_socket_frame("acct", &text, None, None, 500);
         assert!(matches!(actions.last(), Some(Action::Reconnect)));
+    }
+
+    #[test]
+    fn a_rate_limited_upload_step_is_a_retry_not_a_permanent_failure() {
+        // HTTP 429 with a Retry-After.
+        match upload_step_failure(429, Some(2_000), &Value::Null, "upload URL") {
+            Some(SendOutcome::RetryableFailure { retry_after_ms, .. }) => {
+                assert_eq!(retry_after_ms, Some(2_000))
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Slack's 200-with-ok:false convention for the same thing.
+        let body = serde_json::json!({ "ok": false, "error": "ratelimited" });
+        assert!(matches!(
+            upload_step_failure(200, None, &body, "upload URL"),
+            Some(SendOutcome::RetryableFailure { .. })
+        ));
+        // Server errors retry; explicit refusals stay permanent; success is None.
+        assert!(matches!(
+            upload_step_failure(503, None, &Value::Null, "upload completion"),
+            Some(SendOutcome::RetryableFailure { .. })
+        ));
+        let refused = serde_json::json!({ "ok": false, "error": "invalid_auth" });
+        assert!(matches!(
+            upload_step_failure(200, None, &refused, "upload URL"),
+            Some(SendOutcome::PermanentFailure { .. })
+        ));
+        let ok = serde_json::json!({ "ok": true });
+        assert!(upload_step_failure(200, None, &ok, "upload URL").is_none());
+    }
+
+    #[test]
+    fn a_missing_scope_is_named_rather_than_echoed() {
+        let error = missing_scope_error("missing_scope");
+        assert!(error.contains("files:read"), "{error}");
+        // Anything else is passed through as Slack said it, not guessed at.
+        assert_eq!(
+            missing_scope_error("file_not_found"),
+            "Slack refused files.info: file_not_found"
+        );
     }
 
     // -- outbound mapping ---------------------------------------------------

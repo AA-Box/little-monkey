@@ -956,17 +956,34 @@ impl DaemonStore {
     pub fn channel_origin_for_job(&self, job_id: &str) -> Result<Option<ChannelOrigin>, String> {
         self.connection
             .query_row(
-                "SELECT account_id, conversation_id, thread_id, provider_event_id
+                "SELECT account_id, conversation_id, thread_id, provider_event_id, envelope_json
                  FROM channel_events
                  WHERE job_id=?1 AND direction='inbound'
                  ORDER BY received_at_ms DESC LIMIT 1",
                 [job_id],
                 |row| {
+                    let event_id: String = row.get(3)?;
+                    // The id a reply anchors to is not always the id the log
+                    // dedupes by: Telegram polls by update_id but addresses
+                    // replies by chat-scoped message_id. An adapter whose two
+                    // ids differ records the reply anchor in envelope metadata.
+                    let envelope_json: Option<String> = row.get(4)?;
+                    let anchor = envelope_json
+                        .as_deref()
+                        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                        .and_then(|envelope| {
+                            envelope
+                                .get("metadata")?
+                                .get("provider_message_id")?
+                                .as_str()
+                                .map(str::to_string)
+                        })
+                        .unwrap_or(event_id);
                     Ok(ChannelOrigin {
                         account_id: row.get(0)?,
                         conversation_id: row.get(1)?,
                         thread_id: row.get(2)?,
-                        provider_event_id: row.get(3)?,
+                        provider_event_id: anchor,
                     })
                 },
             )

@@ -309,6 +309,15 @@ fn queue_outbound(
     job_id: Option<String>,
     now_ms: i64,
 ) -> Result<(), String> {
+    // The id a reply must anchor to is not always the id the event log dedupes
+    // by: Telegram numbers its poll stream with update_ids but addresses
+    // replies by chat-scoped message_ids. An adapter whose two ids differ says
+    // so in metadata; for everyone else the event id is the message id.
+    let reply_anchor = envelope
+        .metadata
+        .get("provider_message_id")
+        .unwrap_or(&envelope.provider_event_id)
+        .to_string();
     let payload = OutboxPayload {
         message: OutboundMessage {
             account_id: account.account_id.clone(),
@@ -317,7 +326,7 @@ fn queue_outbound(
             thread_id: envelope.conversation.thread_id.clone(),
             text,
             attachments: Vec::new(),
-            reply_to_provider_id: Some(envelope.provider_event_id.clone()),
+            reply_to_provider_id: Some(reply_anchor.clone()),
             idempotency_key: idempotency_key.clone(),
         },
         reply_depth,
@@ -327,7 +336,7 @@ fn queue_outbound(
         account_id: account.account_id.clone(),
         conversation_id: envelope.conversation.conversation_id.clone(),
         thread_id: envelope.conversation.thread_id.clone(),
-        reply_to_provider_id: Some(envelope.provider_event_id.clone()),
+        reply_to_provider_id: Some(reply_anchor),
         payload_digest: sha256_hex(payload_json.as_bytes()),
         payload_json,
         idempotency_key,

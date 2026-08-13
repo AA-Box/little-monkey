@@ -5,6 +5,8 @@ pub(crate) mod call_media;
 pub(crate) mod call_socket;
 pub(crate) mod channel_adapter;
 pub(crate) mod channel_ingress;
+#[cfg(test)]
+mod channel_restart_tests;
 pub(crate) mod channel_store;
 pub(crate) mod channel_tool;
 pub(crate) mod channel_worker;
@@ -14,6 +16,8 @@ mod engine;
 mod ingress_contract;
 pub(crate) mod ingress_store;
 mod ledger;
+#[cfg(test)]
+mod live_smoke;
 pub(crate) mod peer_audit;
 pub(crate) mod peer_ingress;
 pub(crate) mod peer_store;

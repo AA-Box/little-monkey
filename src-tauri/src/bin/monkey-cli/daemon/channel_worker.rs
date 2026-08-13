@@ -138,6 +138,12 @@ pub(crate) struct InboundReport {
     /// Turns that are durably accepted but did not reach the queue this pass.
     /// Not lost — the next recovery pass re-submits them.
     pub deferred: u32,
+    /// Envelopes that never reached the durable event log at all (a storage
+    /// failure inside planning). Tracked separately from `failed` because the
+    /// cursor must not advance past them: everything in `failed` has a durable
+    /// row a human can see, these have nothing, and only redelivery from the
+    /// provider can bring them back.
+    pub unrecorded: u32,
 }
 
 /// Feed one adapter batch through the ingress gate.
@@ -211,7 +217,9 @@ pub(crate) fn ingest_batch(
                 PlannedDecision::Ignore(_) => report.ignored += 1,
                 PlannedDecision::Duplicate => report.duplicates += 1,
             },
-            Err(_) => report.failed += 1,
+            // Planning failed before anything was recorded. Not `failed`:
+            // that bucket has a durable row, this one has nothing at all.
+            Err(_) => report.unrecorded += 1,
         }
     }
     report
@@ -227,6 +235,12 @@ pub(crate) async fn poll_account_once(
 ) -> Result<InboundReport, String> {
     let cursor = store.channel_cursor(account_id, POLL_CURSOR_KEY)?;
     let mut batch = adapter.poll(cursor.as_deref()).await?;
+    // The worker knows which account it polled; the adapter does not get a
+    // vote. This both fills the field for adapters that leave it blank and
+    // stops a confused adapter from writing into another account's event log.
+    for envelope in &mut batch.envelopes {
+        envelope.account_id = account_id.to_string();
+    }
     // Files are fetched before the turn becomes durable, so the stored event is
     // the turn as the agent will see it rather than a promise to look later.
     let limits = store
@@ -245,8 +259,17 @@ pub(crate) async fn poll_account_once(
     )
     .await;
     let report = ingest_batch(store, queue, &batch.envelopes, now_ms);
-    if let Some(next) = batch.cursor {
-        store.set_channel_cursor(account_id, POLL_CURSOR_KEY, &next, now_ms)?;
+    // An envelope that never reached the event log has no durable trace, so
+    // the cursor holds and the provider redelivers the whole batch; the rows
+    // that did land collapse as duplicates. Advancing here would skip the
+    // unrecorded message forever.
+    if report.unrecorded == 0 {
+        if let Some(next) = batch.cursor {
+            store.set_channel_cursor(account_id, POLL_CURSOR_KEY, &next, now_ms)?;
+        }
+        // Only now — events recorded, cursor persisted — may a transport with
+        // its own delivery handshake acknowledge the batch to the provider.
+        adapter.commit_batch(&batch.envelopes).await;
     }
     Ok(report)
 }
@@ -364,13 +387,32 @@ fn recover_accepted_turns(paths: &super::store::DaemonPaths, queue: &dyn RunQueu
     }
 }
 
+/// One account's inbound worker: the live adapter plus the task polling it.
+///
+/// The fingerprint is what makes a reload cheap and safe: an unchanged account
+/// keeps its adapter — and therefore its gateway/socket session — instead of
+/// being torn down and rebuilt every [`RELOAD_INTERVAL_MS`], which for a
+/// socket transport would mean a fresh provider session every thirty seconds
+/// and a lingering old one beside it.
+struct AccountWorker {
+    fingerprint: String,
+    adapter: Arc<dyn ChannelAdapter>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AccountWorker {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// Run the channel subsystem for as long as the daemon lives.
 ///
-/// One task for every account rather than one per account: polling is a
-/// blocking wait, not a busy loop, and a handful of accounts cost a handful of
-/// awaits.
-// ponytail: sequential per-account polling. If one slow provider starves the
-// others, give each account its own task and keep this as the supervisor.
+/// One inbound task per account: a long-polling adapter blocks inside `poll`
+/// for its own window (Telegram waits 25 seconds on a quiet chat), and in a
+/// shared loop that wait would also be the latency ceiling for every other
+/// account's acknowledgements. The supervisor task keeps the account list
+/// fresh, drains the outbox, and re-submits accepted-but-unqueued turns.
 pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
     tokio::spawn(async move {
         // A send that was in flight when the process died cannot be retried
@@ -389,7 +431,7 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
 
         let queue: Arc<dyn RunQueue> = Arc::new(super::DaemonChannelQueue::new(paths.clone()));
 
-        let mut adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::new();
+        let mut workers: BTreeMap<String, AccountWorker> = BTreeMap::new();
         let mut next_reload_ms = 0_u64;
         // Zero, so the first pass through the loop is the startup recovery.
         let mut next_recovery_ms = 0_u64;
@@ -423,7 +465,7 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
             if now_u64 >= next_reload_ms {
                 next_reload_ms = now_u64.saturating_add(RELOAD_INTERVAL_MS);
                 match DaemonStore::open(&paths) {
-                    Ok(store) => adapters = load_adapters(&paths, &store),
+                    Ok(store) => reconcile_workers(&paths, &store, &queue, &mut workers),
                     Err(error) => eprintln!("monkey daemon: channels paused: {error}"),
                 }
             }
@@ -437,26 +479,11 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
                 }
             };
 
+            let adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = workers
+                .iter()
+                .map(|(account_id, worker)| (account_id.clone(), worker.adapter.clone()))
+                .collect();
             let mut worked = false;
-            for (account_id, adapter) in &adapters {
-                match poll_account_once(
-                    &mut store,
-                    queue.as_ref(),
-                    account_id,
-                    adapter.as_ref(),
-                    now,
-                )
-                .await
-                {
-                    Ok(report) => {
-                        worked |= report.accepted + report.challenged + report.duplicates > 0
-                    }
-                    // One provider being unreachable must not stop the others,
-                    // and must not stop the outbox either.
-                    Err(error) => eprintln!("monkey daemon: channel {account_id} poll: {error}"),
-                }
-            }
-
             match drain_outbox_once(&mut store, &adapters, now).await {
                 Ok(report) => worked |= report.sent + report.retrying > 0,
                 Err(error) => eprintln!("monkey daemon: channel outbox: {error}"),
@@ -469,66 +496,219 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
     });
 }
 
-/// Build an adapter for every enabled account, resolving each credential from
-/// the keychain at load time so no adapter ever reads it itself.
-fn load_adapters(
+/// How often a running account's health is re-derived from its transport.
+const HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Ask the provider what is actually true and record it on the account.
+///
+/// The health an operator reads has to come from the transport, not from the
+/// fact that a credential was saved: only [`ChannelAdapter::probe`] talks to
+/// the provider, and each adapter's own probe folds in whatever its transport
+/// knows — Telegram's `getMe`, Discord's REST identity plus gateway session
+/// state, Slack's `auth.test` plus its Socket Mode connection. Nothing else in
+/// the daemon calls it, so without this the panel would show whatever was
+/// written the last time somebody ran `channels probe` by hand.
+///
+/// Best effort: a health row that cannot be written must not disturb polling.
+pub(crate) async fn record_account_health(
+    store: &mut DaemonStore,
+    account_id: &str,
+    adapter: &dyn ChannelAdapter,
+) {
+    let health = adapter.probe().await;
+    if let Ok(now) = current_ms() {
+        if let Err(error) = store.set_channel_account_health(account_id, &health, now) {
+            eprintln!("monkey daemon: channel {account_id} health: {error}");
+        }
+    }
+}
+
+/// One account's inbound loop: poll, ingest, repeat until aborted.
+///
+/// Poll failures back off exponentially per account — a provider outage or a
+/// rate-limited `getUpdates` must not turn into a hammer — and recover to full
+/// speed on the first success.
+async fn run_account_inbound(
+    paths: super::store::DaemonPaths,
+    queue: Arc<dyn RunQueue>,
+    account_id: String,
+    adapter: Arc<dyn ChannelAdapter>,
+) {
+    const MIN_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+    const MAX_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut error_backoff = MIN_ERROR_BACKOFF;
+    let mut last_health: Option<std::time::Instant> = None;
+    loop {
+        let Ok(now) = current_ms() else {
+            tokio::time::sleep(std::time::Duration::from_millis(IDLE_TICK_MS)).await;
+            continue;
+        };
+        let mut store = match DaemonStore::open(&paths) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("monkey daemon: channel {account_id} paused: {error}");
+                tokio::time::sleep(std::time::Duration::from_millis(IDLE_TICK_MS)).await;
+                continue;
+            }
+        };
+        let started = std::time::Instant::now();
+        match poll_account_once(
+            &mut store,
+            queue.as_ref(),
+            &account_id,
+            adapter.as_ref(),
+            now,
+        )
+        .await
+        {
+            Ok(_) => {
+                error_backoff = MIN_ERROR_BACKOFF;
+                // A long-polling adapter paces this loop itself by blocking
+                // inside `poll`. One that returns immediately forever — a
+                // webhook adapter, or a broken one — must not busy-spin.
+                if started.elapsed() < std::time::Duration::from_millis(500) {
+                    tokio::time::sleep(std::time::Duration::from_millis(IDLE_TICK_MS)).await;
+                }
+            }
+            Err(error) => {
+                eprintln!("monkey daemon: channel {account_id} poll: {error}");
+                tokio::time::sleep(error_backoff).await;
+                error_backoff = (error_backoff * 2).min(MAX_ERROR_BACKOFF);
+            }
+        }
+        // After the poll rather than before it: a socket transport reports its
+        // connection honestly only once something has asked it to connect, and
+        // `poll` is what does that. A failed poll still gets a probe — that is
+        // exactly when an operator most wants to know why.
+        if last_health.map_or(true, |at| at.elapsed() >= HEALTH_INTERVAL) {
+            last_health = Some(std::time::Instant::now());
+            record_account_health(&mut store, &account_id, adapter.as_ref()).await;
+        }
+    }
+}
+
+/// Bring the worker set in line with the enabled accounts, touching only what
+/// changed.
+///
+/// The fingerprint covers the account row and the resolved secret, so editing
+/// a label or rotating a token rebuilds that one adapter while every other
+/// account keeps its live session. Removing (or disabling) an account aborts
+/// its task and drops its adapter, which is what tells a socket adapter's
+/// background task to hang up.
+fn reconcile_workers(
     paths: &super::store::DaemonPaths,
     store: &DaemonStore,
-) -> BTreeMap<String, Arc<dyn ChannelAdapter>> {
+    queue: &Arc<dyn RunQueue>,
+    workers: &mut BTreeMap<String, AccountWorker>,
+) {
     use super::channel_adapter::{AdapterConfig, ChannelSecrets, KeyringChannelSecrets};
 
     let secrets = KeyringChannelSecrets;
-    let mut adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::new();
     let accounts = match store.channel_accounts() {
         Ok(accounts) => accounts,
         Err(error) => {
             eprintln!("monkey daemon: could not read channel accounts: {error}");
-            return adapters;
+            return;
         }
     };
+    let mut desired = std::collections::BTreeSet::new();
     for account in accounts.into_iter().filter(|account| account.enabled) {
+        let is_sms = account.kind == little_monkey_lib::channels::types::ChannelKind::Sms;
         // An SMS account's carrier credential lives on the telephony account of
-        // the same id, not on this row, so it is built from there.
-        if account.kind == little_monkey_lib::channels::types::ChannelKind::Sms {
-            match build_sms_adapter(paths, store, &secrets, &account.account_id) {
-                Ok(adapter) => {
-                    adapters.insert(account.account_id.clone(), adapter);
-                }
-                Err(error) => eprintln!(
-                    "monkey daemon: SMS account {} cannot send: {error}",
-                    account.account_id
-                ),
+        // the same id, not on this row, so it is resolved from there.
+        let secret = if is_sms {
+            match store
+                .telecom_account(&account.account_id)
+                .ok()
+                .flatten()
+                .and_then(|telecom| telecom.credential_ref)
+            {
+                Some(reference) => match secrets.get(&reference) {
+                    Ok(secret) => secret,
+                    Err(error) => {
+                        eprintln!(
+                            "monkey daemon: SMS account {} cannot send: {error}",
+                            account.account_id
+                        );
+                        continue;
+                    }
+                },
+                None => String::new(),
             }
+        } else {
+            match &account.credential_ref {
+                Some(reference) => match secrets.get(reference) {
+                    Ok(secret) => secret,
+                    Err(error) => {
+                        eprintln!(
+                            "monkey daemon: channel account {} has no usable credential: {error}",
+                            account.account_id
+                        );
+                        continue;
+                    }
+                },
+                None => String::new(),
+            }
+        };
+        // A digest rather than the secret itself: the fingerprint is held for
+        // the daemon's lifetime and compared every reload, and there is no
+        // reason for a copy of the token to sit in it.
+        let fingerprint = super::trigger::sha256_hex(
+            format!(
+                "{}|{:?}|{}|{}",
+                account.account_id,
+                account.kind,
+                account.updated_at_ms,
+                super::trigger::sha256_hex(secret.as_bytes()),
+            )
+            .as_bytes(),
+        );
+        desired.insert(account.account_id.clone());
+        if workers
+            .get(&account.account_id)
+            .map(|worker| worker.fingerprint.as_str())
+            == Some(fingerprint.as_str())
+        {
             continue;
         }
-        let secret = match &account.credential_ref {
-            Some(reference) => match secrets.get(reference) {
-                Ok(secret) => secret,
-                Err(error) => {
-                    eprintln!(
-                        "monkey daemon: channel account {} has no usable credential: {error}",
-                        account.account_id
-                    );
-                    continue;
-                }
-            },
-            None => String::new(),
+        let built = if is_sms {
+            build_sms_adapter(paths, store, &secrets, &account.account_id)
+        } else {
+            super::adapters::build_adapter(&AdapterConfig {
+                account: &account,
+                secret,
+            })
         };
-        let config = AdapterConfig {
-            account: &account,
-            secret,
-        };
-        match super::adapters::build_adapter(&config) {
-            Ok(adapter) => {
-                adapters.insert(account.account_id.clone(), adapter);
+        let adapter = match built {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                eprintln!(
+                    "monkey daemon: channel account {} is not runnable: {error}",
+                    account.account_id
+                );
+                // A broken replacement must not keep the stale adapter running
+                // on the old credential.
+                workers.remove(&account.account_id);
+                continue;
             }
-            Err(error) => eprintln!(
-                "monkey daemon: channel account {} is not runnable: {error}",
-                account.account_id
-            ),
-        }
+        };
+        let handle = tokio::spawn(run_account_inbound(
+            paths.clone(),
+            queue.clone(),
+            account.account_id.clone(),
+            adapter.clone(),
+        ));
+        // Dropping the replaced worker aborts its task via `Drop`.
+        workers.insert(
+            account.account_id.clone(),
+            AccountWorker {
+                fingerprint,
+                adapter,
+                handle,
+            },
+        );
     }
-    adapters
+    workers.retain(|account_id, _| desired.contains(account_id));
 }
 
 /// Build the adapter that answers texts for one telephony account.
@@ -910,6 +1090,25 @@ mod tests {
             .expect("drain");
         assert_eq!(report.sent, 1);
         assert_eq!(adapter.sent.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_running_daemon_writes_health_from_the_transport_not_from_the_config() {
+        use little_monkey_lib::channels::types::HealthState;
+        let mut store = seeded_store();
+        // A stored credential on its own proves nothing, so the account starts
+        // out in the state a fresh configuration leaves it in.
+        store
+            .set_channel_account_health("acct-1", &ChannelHealth::error(NOW, "never probed"), NOW)
+            .expect("seed health");
+
+        record_account_health(&mut store, "acct-1", &FakeAdapter::new()).await;
+
+        let account = store
+            .channel_account("acct-1")
+            .expect("read")
+            .expect("account");
+        assert_eq!(account.health.state, HealthState::Connected);
     }
 
     #[tokio::test]

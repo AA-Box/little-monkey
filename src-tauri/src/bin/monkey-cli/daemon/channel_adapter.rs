@@ -72,6 +72,16 @@ pub trait ChannelAdapter: Send + Sync {
     /// `NeedsReconciliation` rather than `RetryableFailure`.
     async fn send(&self, message: &OutboundMessage) -> SendOutcome;
 
+    /// Called once the envelopes of a batch are durably recorded (and the
+    /// cursor persisted), so a transport with its own delivery handshake can
+    /// acknowledge them to the provider. Slack's Socket Mode is the customer:
+    /// an envelope acknowledged before this point can be lost in a crash,
+    /// one acknowledged here at worst gets redelivered and deduplicated.
+    ///
+    /// The default does nothing, which is correct for every transport whose
+    /// resume token is the cursor itself.
+    async fn commit_batch(&self, _envelopes: &[ChannelEnvelope]) {}
+
     /// Download one inbound attachment.
     ///
     /// The default handles [`AttachmentSource::Url`], which is what most
