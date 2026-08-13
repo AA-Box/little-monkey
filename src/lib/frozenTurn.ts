@@ -137,10 +137,25 @@ export async function resumeFrozenTurn(record: ProcessRecord): Promise<FrozenRes
   // durably accepted under. It is what lets the backend continue *that* turn,
   // with the execution context frozen when it was accepted, instead of starting
   // something new against the machine's current configuration.
+  //
+  // The image's own id is this Resume's identity, and it is the right one for
+  // the same reason it identifies the image: it was minted when the turn froze,
+  // long before anything was submitted, and every route back to this point —
+  // a re-delivered resume signal from the process sweep, a retry after the
+  // command timed out, a second press while the first is in flight — finds the
+  // same image and therefore sends the same id. The daemon collapses those onto
+  // one continuation. A minted-per-call id would make each of them a separate
+  // run of the work, and a resume that continues a turn twice is the one
+  // outcome nothing downstream can undo.
+  //
+  // The next Resume of this conversation is a different image (this one is
+  // cleared above, and a turn that freezes again writes a new one), so an
+  // intentional second resume is a different id and its own continuation.
   await runAgentTurn(image.sessionId, '', [], undefined, undefined, [], [], false, {
     resumedFromCheckpointId: image.id,
     determinismCaveats: report.determinismCaveats,
     parentTurnId: record.externalId || null,
+    resumeRequestId: image.id,
   });
   return 'resumed';
 }

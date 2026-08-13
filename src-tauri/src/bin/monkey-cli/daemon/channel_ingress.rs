@@ -828,7 +828,19 @@ pub(crate) struct IngressRecovery {
     pub parked: u32,
 }
 
+/// What is recorded against a turn that cannot be executed as itself.
+///
+/// Written into `last_error`, so it reaches an operator through the ingress
+/// listing and the desktop's turn detail without a field of its own.
+const NO_FROZEN_CONTEXT_REASON: &str =
+    "This turn was accepted by a version that did not persist its execution context, and it cannot be \
+     run now without executing it against configuration it was never accepted under. Ask again in a new turn.";
+
 /// Queue an already-accepted turn and record what happened to it.
+///
+/// The one place a conversational turn reaches the queue, which is why the
+/// frozen-context invariant is enforced here rather than at each caller: a turn
+/// executes what was frozen when it was accepted, or it does not execute.
 fn finish_submission(
     store: &mut DaemonStore,
     queue: &dyn super::channel_worker::RunQueue,
@@ -838,6 +850,44 @@ fn finish_submission(
     attempts: u32,
     now_ms: i64,
 ) -> SubmitOutcome {
+    // A row written before turns carried their execution context. Submitting it
+    // would reach `enqueue` with no frozen recipe, and `enqueue`'s honest
+    // behavior for everything else — resolve the operator's current recipe file
+    // — is exactly wrong here: the turn would run today's recipe, today's model
+    // and today's workspace under a message accepted long before any of them.
+    //
+    // The one trustworthy historical alternative is a job that already exists
+    // under this turn's deterministic id, from a submission that crashed before
+    // it could annotate the row. That job carries its own immutable snapshot and
+    // `enqueue` returns it without resolving anything, so the turn is bound to
+    // the run it already has. Absent that, there is nothing from then to run,
+    // and the turn is parked with the reason rather than quietly modernized.
+    if ingress.execution.is_none() {
+        return match store.get_job(&ingress.deterministic_job_id()) {
+            Ok(Some(job)) => {
+                let _ = store.mark_ingress_queued(ingress_id, &job.job_id, now_ms);
+                SubmitOutcome::AlreadyQueued {
+                    ingress_id: ingress_id.to_string(),
+                    job_id: job.job_id,
+                }
+            }
+            Ok(None) => {
+                let _ = store.mark_ingress_submit_failed(
+                    ingress_id,
+                    NO_FROZEN_CONTEXT_REASON,
+                    true,
+                    now_ms,
+                );
+                SubmitOutcome::Parked {
+                    ingress_id: ingress_id.to_string(),
+                }
+            }
+            // "There is no job" and "the store could not say" are different
+            // facts. Retiring the turn on the second would spend a permanent
+            // verdict on a transient read, so this one is only ever deferred.
+            Err(error) => record_failed_submission(store, ingress_id, &error, attempts, now_ms),
+        };
+    }
     match queue.submit(ingress, params.to_vec()) {
         Ok(job_id) => {
             // The run exists. Failing to annotate the row must not undo it —
@@ -849,19 +899,32 @@ fn finish_submission(
                 job_id,
             }
         }
-        Err(error) => {
-            let terminal = attempts.saturating_add(1) >= MAX_SUBMIT_ATTEMPTS;
-            let _ = store.mark_ingress_submit_failed(ingress_id, &error, terminal, now_ms);
-            if terminal {
-                SubmitOutcome::Parked {
-                    ingress_id: ingress_id.to_string(),
-                }
-            } else {
-                SubmitOutcome::Deferred {
-                    ingress_id: ingress_id.to_string(),
-                    error,
-                }
-            }
+        Err(error) => record_failed_submission(store, ingress_id, &error, attempts, now_ms),
+    }
+}
+
+/// Record a submission that did not happen, and say whether anything will try
+/// again.
+///
+/// Shared by the two ways that can be true — the queue refused, or the store
+/// could not be read — so the attempt budget is spent the same way for both.
+fn record_failed_submission(
+    store: &mut DaemonStore,
+    ingress_id: &str,
+    error: &str,
+    attempts: u32,
+    now_ms: i64,
+) -> SubmitOutcome {
+    let terminal = attempts.saturating_add(1) >= MAX_SUBMIT_ATTEMPTS;
+    let _ = store.mark_ingress_submit_failed(ingress_id, error, terminal, now_ms);
+    if terminal {
+        SubmitOutcome::Parked {
+            ingress_id: ingress_id.to_string(),
+        }
+    } else {
+        SubmitOutcome::Deferred {
+            ingress_id: ingress_id.to_string(),
+            error: error.to_string(),
         }
     }
 }

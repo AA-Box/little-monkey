@@ -2267,13 +2267,22 @@ pub async fn ingress_turn_show(
 /// nothing about the machine's current configuration can change what the resumed
 /// turn runs. A turn that was never accepted, or was accepted without a frozen
 /// context, is refused there rather than reconstructed here.
+///
+/// `request_id` is the caller's identity for the Resume action itself, and this
+/// command is a pure conduit for it: no id is minted here, so a caller that
+/// retries after a lost response — which is what a timed-out `invoke` is —
+/// reaches the same continuation instead of starting a second one.
 #[tauri::command]
 pub async fn ingress_turn_resume(
     source: String,
     account: String,
     event: String,
+    request_id: String,
 ) -> Result<Value, String> {
-    let args = ingress_turn_args("resume", &source, &account, &event)?;
+    validate_id("ingress resume request id", &request_id)?;
+    let mut args = ingress_turn_args("resume", &source, &account, &event)?;
+    args.push("--request-id".into());
+    args.push(request_id);
     parse_json(&command(args).await?)
 }
 // --- Telephony ------------------------------------------------------------

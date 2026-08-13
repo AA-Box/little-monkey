@@ -283,6 +283,18 @@ pub struct TurnContinuation {
     pub kind: ContinuationKind,
     /// Which continuation of the parent this is, starting at 1.
     pub attempt: u32,
+    /// The caller's own identity for the *action* that asked for this
+    /// continuation, when a caller asked rather than the daemon deciding.
+    ///
+    /// Present on a resume and absent on a mutation correction, and the
+    /// difference is who owns the retry. A correction is derived from durable
+    /// state the daemon already holds, so replaying the decision reaches the
+    /// same continuation on its own. A resume comes from outside over a
+    /// transport that can lose the *response* to a request that was accepted —
+    /// and a retry of that request is the same action, not a second one. This
+    /// is what makes the two distinguishable; see [`ConversationIngress::resume_of`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 /// A durable, deduplicated, route-frozen external turn.
@@ -446,9 +458,51 @@ impl ConversationIngress {
                 parent_source_event_id,
                 kind,
                 attempt,
+                request_id: None,
             }),
             ..parent.clone()
         }
+    }
+
+    /// The durable continuation of an accepted turn that someone asked to
+    /// continue, identified by *their* id for the asking.
+    ///
+    /// A resume is the one continuation a caller requests over a transport, and
+    /// that is what makes an ordinal wrong for it. Counting the resumes that
+    /// already exist answers "how many are there", not "is this one of them": a
+    /// request that was accepted and whose response was lost comes back as a
+    /// second press, and counting turns it into a second continuation, a second
+    /// job and a second run of the same work.
+    ///
+    /// So identity comes from the caller instead. `request_id` is minted once
+    /// per logical Resume — before the first attempt, reused by every retry of
+    /// it — and the continuation's event id is derived from the parent's plus a
+    /// digest of it. A retry lands on the row that exists; a genuinely new
+    /// Resume carries a new id and gets its own row. Nothing here reads a clock
+    /// or a count.
+    ///
+    /// `attempt` is descriptive only — depth in the lineage, for the listing —
+    /// and deliberately not part of the identity.
+    pub fn resume_of(
+        parent: &ConversationIngress,
+        parent_ingress_id: impl Into<String>,
+        request_id: &str,
+    ) -> Self {
+        let mut resumed = Self::continuation_of(
+            parent,
+            parent_ingress_id,
+            ContinuationKind::Resume,
+            parent.continuation_attempt().saturating_add(1),
+        );
+        resumed.source_event_id = format!(
+            "{}#resume-{}",
+            parent.source_event_id,
+            &hex_digest(&[request_id.as_bytes()])[..16]
+        );
+        if let Some(continuation) = resumed.continuation.as_mut() {
+            continuation.request_id = Some(request_id.to_string());
+        }
+        resumed
     }
 
     /// How many continuations of this turn's own lineage precede it.
@@ -1078,14 +1132,44 @@ mod tests {
         assert_eq!(first.continuation_attempt(), 1);
 
         // A resume of the same parent is a different continuation again.
-        let resume = ConversationIngress::continuation_of(
-            &parent,
-            "ingr-parent",
-            ContinuationKind::Resume,
-            1,
-        );
+        let resume = ConversationIngress::resume_of(&parent, "ingr-parent", "req-a");
         assert_ne!(resume.dedupe_key(), first.dedupe_key());
-        assert_eq!(resume.source_event_id, "turn-1#resume-1");
+        assert_ne!(resume.dedupe_key(), parent.dedupe_key());
+    }
+
+    /// A resume is identified by the request that asked for it, so a retry of
+    /// that request is the same continuation and a new request is a new one.
+    #[test]
+    fn a_resume_takes_its_identity_from_the_request_and_nothing_else() {
+        let parent = desktop_turn();
+
+        let first = ConversationIngress::resume_of(&parent, "ingr-parent", "req-a");
+        let retried = ConversationIngress::resume_of(&parent, "ingr-parent", "req-a");
+        let other = ConversationIngress::resume_of(&parent, "ingr-parent", "req-b");
+
+        assert_eq!(first.dedupe_key(), retried.dedupe_key());
+        assert_eq!(first.deterministic_job_id(), retried.deterministic_job_id());
+        assert_ne!(first.dedupe_key(), other.dedupe_key());
+        assert_ne!(first.deterministic_job_id(), other.deterministic_job_id());
+
+        // Two resumes of one parent sit at the same depth, which is why the
+        // ordinal cannot be the identity: only the request id separates them.
+        assert_eq!(first.continuation_attempt(), other.continuation_attempt());
+        assert_eq!(
+            first.continuation.as_ref().unwrap().request_id.as_deref(),
+            Some("req-a")
+        );
+        // Nothing about when it was asked for enters into it.
+        let mut later = parent.clone();
+        later.received_at_ms += 86_400_000;
+        assert_eq!(
+            ConversationIngress::resume_of(&later, "ingr-parent", "req-a").dedupe_key(),
+            first.dedupe_key()
+        );
+        // And it inherits the parent's frozen context like any continuation.
+        assert_eq!(first.execution, parent.execution);
+        assert!(first.automation_origin);
+        assert_eq!(first.reply_depth, 1);
     }
 
     #[test]

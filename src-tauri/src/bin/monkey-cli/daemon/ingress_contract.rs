@@ -1224,6 +1224,7 @@ fn a_resumed_turn_runs_the_context_frozen_when_it_was_accepted() {
         ConversationSource::Desktop,
         "session-1",
         "turn-1",
+        "resume-a",
         NOW + 3_600_000,
     )
     .expect("resume");
@@ -1273,30 +1274,21 @@ fn a_resumed_turn_runs_the_context_frozen_when_it_was_accepted() {
     );
 }
 
-/// Two presses of Resume are two continuations; one press retried is one.
+/// Two presses of Resume are two continuations, because they are two request
+/// ids — not because two calls were counted.
 #[test]
-fn resuming_the_same_turn_twice_in_one_press_produces_one_continuation() {
+fn two_intentional_resumes_carry_two_request_ids_and_produce_two_continuations() {
     let mut store = DaemonStore::open_in_memory().expect("open");
     let queue = ContractQueue::default();
     let (ingress, params) = bridge_turn(ConversationSource::Desktop, "turn-1");
     submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
 
-    let resume_once = |store: &mut DaemonStore, at: i64| {
-        crate::ingress_cli::resume_accepted_turn(
-            store,
-            &queue,
-            ConversationSource::Desktop,
-            "session-1",
-            "turn-1",
-            at,
-        )
-        .expect("resume")
-    };
-    let first = resume_once(&mut store, NOW + 1_000);
-    // A second press, after the first continuation exists, is a second resume.
-    let second = resume_once(&mut store, NOW + 2_000);
+    let first = resume_request(&mut store, &queue, "resume-a", NOW + 1_000);
+    // A second press. Its own id, minted when the operator asked for it.
+    let second = resume_request(&mut store, &queue, "resume-b", NOW + 2_000);
 
     assert_ne!(first.ingress_id, second.ingress_id);
+    assert_ne!(first.job_id, second.job_id);
     assert_eq!(queue.run_count(), 3);
     assert_eq!(
         store
@@ -1305,6 +1297,117 @@ fn resuming_the_same_turn_twice_in_one_press_produces_one_continuation() {
             .len(),
         2
     );
+}
+
+/// The race the attempt count could not survive: the backend accepted the
+/// resume, the response never arrived, and the caller sent the same request
+/// again.
+///
+/// Counting the resumes already stored answers "how many are there", which is
+/// two different things here — a second press and a retry look identical from
+/// the store. The request id is what tells them apart, so the retry lands on the
+/// continuation, the job and the run that already exist.
+#[test]
+fn a_resume_request_retried_after_a_lost_response_produces_one_continuation() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress, params) = bridge_turn(ConversationSource::Desktop, "turn-1");
+    submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
+
+    let accepted = resume_request(&mut store, &queue, "resume-a", NOW + 1_000);
+    // The response is lost here. The caller has no way to know the backend took
+    // it, so it retries the same request — same id, later clock, and (as a
+    // recovery pass would) twice more.
+    let retried = resume_request(&mut store, &queue, "resume-a", NOW + 2_000);
+    let again = resume_request(&mut store, &queue, "resume-a", NOW + 9_000);
+
+    assert_eq!(retried, accepted);
+    assert_eq!(again, accepted);
+    // One continuation row, one deterministic job, one run — and the clock did
+    // not enter into any of it.
+    let children = store
+        .ingress_continuations(&accepted.parent_ingress_id)
+        .unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].ingress_id, accepted.ingress_id);
+    assert_eq!(
+        children[0].job_id.as_deref(),
+        Some(accepted.job_id.as_str())
+    );
+    assert_eq!(queue.run_count(), 2, "the parent's run and one resume");
+    // Three resume requests reached the backend and the queue was asked once:
+    // the retries collapsed on the durable row, before the queue's own
+    // deterministic-id defense was needed at all.
+    assert_eq!(
+        queue.call_count(),
+        2,
+        "the parent's submission and one resume"
+    );
+
+    // And the continuation is the parent's, executed under the parent's frozen
+    // context: a retry cannot smuggle in a re-resolution either.
+    let parent = store
+        .accepted_ingress_turn(&accepted.parent_ingress_id)
+        .unwrap()
+        .expect("parent");
+    let child = store
+        .accepted_ingress_turn(&accepted.ingress_id)
+        .unwrap()
+        .expect("continuation");
+    assert_eq!(child.ingress.execution, parent.ingress.execution);
+    assert_eq!(
+        child
+            .ingress
+            .continuation
+            .as_ref()
+            .expect("lineage")
+            .request_id
+            .as_deref(),
+        Some("resume-a")
+    );
+}
+
+/// A resume with no request id cannot be made idempotent, so it is refused
+/// rather than run under an identity the backend invented for it.
+#[test]
+fn a_resume_without_a_request_id_is_refused() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let (ingress, params) = bridge_turn(ConversationSource::Desktop, "turn-1");
+    submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
+
+    let error = crate::ingress_cli::resume_accepted_turn(
+        &mut store,
+        &queue,
+        ConversationSource::Desktop,
+        "session-1",
+        "turn-1",
+        "  ",
+        NOW + 1_000,
+    )
+    .expect_err("refused");
+
+    assert!(error.contains("request id"), "{error}");
+    assert_eq!(queue.run_count(), 1);
+}
+
+/// One Resume request, submitted the way the production path submits it.
+fn resume_request(
+    store: &mut DaemonStore,
+    queue: &ContractQueue,
+    request_id: &str,
+    at: i64,
+) -> crate::ingress_cli::ResumedTurn {
+    crate::ingress_cli::resume_accepted_turn(
+        store,
+        queue,
+        ConversationSource::Desktop,
+        "session-1",
+        "turn-1",
+        request_id,
+        at,
+    )
+    .expect("resume")
 }
 
 /// A frozen image from before turns were durable has no context to inherit.
@@ -1327,6 +1430,7 @@ fn a_turn_with_no_frozen_context_is_refused_rather_than_resumed_against_current_
         ConversationSource::Desktop,
         "session-1",
         "turn-1",
+        "resume-a",
         NOW + 1_000,
     )
     .expect_err("refused");
@@ -1345,6 +1449,7 @@ fn a_turn_nobody_accepted_cannot_be_resumed_into_existence() {
         ConversationSource::Desktop,
         "session-1",
         "never-sent",
+        "resume-a",
         NOW,
     )
     .expect_err("refused");
@@ -1564,8 +1669,20 @@ fn each_origin_deduplicates_on_its_own_identity() {
     }
 }
 
+/// A row from before turns carried their execution context has nothing from
+/// then to run, and there is no second copy of it anywhere: the frozen context
+/// lives only in `ingress_json`, and a turn that never reached the queue has no
+/// job snapshot either. So it is parked, with the reason where an operator will
+/// see it.
+///
+/// Recovering it "successfully" was the quiet version of the bug freezing exists
+/// to prevent. Nothing about the row says which recipe, model or workspace it
+/// was accepted under, so the only way to run it is to resolve those now — and a
+/// message taken weeks ago would answer in whatever voice the machine has today,
+/// against whatever files it points at today, with no sign that anything was
+/// substituted.
 #[test]
-fn a_turn_accepted_before_execution_contexts_existed_still_recovers() {
+fn a_turn_accepted_before_execution_contexts_existed_is_parked_rather_than_run() {
     let mut store = DaemonStore::open_in_memory().expect("open");
     let queue = ContractQueue::default();
 
@@ -1591,19 +1708,104 @@ fn a_turn_accepted_before_execution_contexts_existed_still_recovers() {
     assert_eq!(listed.execution_version, None);
     assert_eq!(listed.execution_digest, None);
 
-    // It recovers, and it recovers as itself: nothing invents a frozen context
-    // for a turn that was accepted without one, because that context would be
-    // today's configuration wearing yesterday's date.
-    assert_eq!(
-        recover_pending_ingress(&mut store, &queue, NOW + 1_000)
-            .expect("recover")
-            .resubmitted,
-        1
+    // The configuration is rewritten between acceptance and recovery — the case
+    // the whole freeze exists for. It has no effect, because nothing executes.
+    store
+        .insert_channel_route(&ChannelRoute {
+            route_id: "route-new".into(),
+            scope: RouteScope::account("tel-1"),
+            target: RouteTarget::new("something-else"),
+            enabled: true,
+            created_at_ms: NOW + 500,
+            updated_at_ms: NOW + 500,
+        })
+        .expect("a route the operator added since");
+
+    let recovery = recover_pending_ingress(&mut store, &queue, NOW + 1_000).expect("recover");
+    assert_eq!(recovery.parked, 1);
+    assert_eq!(recovery.resubmitted, 0);
+    // Never offered to the queue at all: no run, and no call that could have
+    // resolved a recipe on the way.
+    assert_eq!(queue.run_count(), 0);
+    assert_eq!(queue.call_count(), 0);
+
+    // Parked, not silently dropped, and the reason is in the listing the
+    // operator reads.
+    let parked = &store.recent_ingress_turns(10).unwrap()[0];
+    assert_eq!(parked.state, IngressState::Failed);
+    assert!(parked.job_id.is_none());
+    let reason = parked.last_error.as_deref().expect("a reason");
+    assert!(
+        reason.contains("did not persist its execution context"),
+        "{reason}"
     );
-    let (ran, _) = queue.only_run();
-    assert!(ran.execution.is_none());
-    assert_eq!(ran.dedupe_key(), "telephone:tel-1:call-9:turn:0");
-    assert_eq!(queue.run_count(), 1);
+    assert!(reason.contains("new turn"), "{reason}");
+
+    // And it stays parked. A later pass does not pick it up and try again with
+    // that day's configuration either.
+    assert_eq!(
+        recover_pending_ingress(&mut store, &queue, NOW + 90_000).expect("recover again"),
+        Default::default()
+    );
+    assert_eq!(queue.call_count(), 0);
+}
+
+/// The one legacy row that can still run: its submission reached the queue and
+/// crashed before the row was annotated, so a job already exists under its
+/// deterministic id.
+///
+/// That job carries the snapshot it was created with, and `enqueue` returns an
+/// existing job before it resolves anything — so binding the row to it uses only
+/// what was frozen then. This is recovery finishing the write it was interrupted
+/// in, not a turn being run against today's configuration.
+#[test]
+fn a_legacy_turn_whose_job_already_exists_is_bound_to_that_job_rather_than_parked() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = ContractQueue::default();
+    let stored = serde_json::json!({
+        "source": "telephone",
+        "source_account_id": "tel-1",
+        "source_event_id": "call-9:turn:0",
+        "session_key": "telephone:+15550100",
+        "text": "please call me back",
+        "target": RouteTarget::new("chat"),
+        "route_digest": RouteTarget::new("chat").digest(),
+        "received_at_ms": NOW,
+    });
+    let legacy: ConversationIngress = serde_json::from_value(stored).expect("deserialize");
+    store
+        .accept_ingress_turn(&legacy, &["message=please call me back".into()], NOW)
+        .expect("accept");
+    let job_id = legacy.deterministic_job_id();
+    store
+        .insert_preparing(
+            &super::store::NewDaemonJob {
+                job_id: job_id.clone(),
+                recipe_snapshot: "/snapshots/call-9.json".into(),
+                priority: 0,
+                max_attempts: 1,
+                created_at_ms: NOW as u64,
+                max_runtime_ms: 60_000,
+                max_memory_bytes: None,
+                max_log_bytes: 1_000_000,
+                repository_policy_json: None,
+                worktree_json: None,
+                parent_run_id: None,
+            },
+            10,
+        )
+        .expect("the job its interrupted submission created");
+
+    let recovery = recover_pending_ingress(&mut store, &queue, NOW + 1_000).expect("recover");
+
+    assert_eq!(recovery.resubmitted, 1);
+    assert_eq!(recovery.parked, 0);
+    // Nothing was submitted again, so nothing resolved a recipe: the row was
+    // pointed at the run it already had.
+    assert_eq!(queue.call_count(), 0);
+    let bound = &store.recent_ingress_turns(10).unwrap()[0];
+    assert_eq!(bound.state, IngressState::Queued);
+    assert_eq!(bound.job_id.as_deref(), Some(job_id.as_str()));
 }
 
 /// The production call sink, driven end to end.

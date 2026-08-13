@@ -178,6 +178,17 @@ export interface ResumedTurn {
    * accepted. Absent only for an image written before turns were durable, which
    * is refused rather than resolved afresh. */
   parentTurnId: string | null;
+  /** This Resume action's own identity, minted by whoever decided to resume and
+   * carried unchanged from there to the daemon.
+   *
+   * It is what makes a Resume idempotent end to end. The backend derives the
+   * continuation, its job and its run from the parent turn plus this id, so a
+   * retried request — a timed-out `invoke`, a re-delivered resume signal, a
+   * component that re-renders mid-flight — reaches the continuation that
+   * already exists instead of starting a second run of the same work. Minting
+   * one here per call would defeat exactly that, which is why this is passed in
+   * and never generated on the way past. */
+  resumeRequestId: string;
 }
 
 export function isSwitchNotice(message: ChatMessage): boolean {
@@ -1745,7 +1756,12 @@ async function resumeDurableDesktopTurn(
     role: 'system',
     content: [`${RESUME_NOTE_PREFIX} Resumed from a frozen image.`, ...resume.determinismCaveats].join('\n'),
   });
-  const resumed = await ingressTurnResume(origin, sessionId, resume.parentTurnId);
+  const resumed = await ingressTurnResume(
+    origin,
+    sessionId,
+    resume.parentTurnId,
+    resume.resumeRequestId,
+  );
   void reconcileProcess({
     kind: 'daemon_job',
     externalId: resumed.job_id,

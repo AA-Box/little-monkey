@@ -56,6 +56,15 @@ pub enum IngressCmd {
         /// The accepted turn's own event id — the parent, not a new one.
         #[arg(long)]
         event: String,
+        /// The caller's own id for this Resume, minted once before the first
+        /// attempt and repeated verbatim by every retry of it.
+        ///
+        /// Required, and deliberately not defaulted to something fresh: a
+        /// generated id would make a retried request a second resume, which is
+        /// the duplicate run this identity exists to prevent. Two intentional
+        /// resumes of one turn are two ids.
+        #[arg(long)]
+        request_id: String,
         #[arg(long)]
         json: bool,
     },
@@ -78,8 +87,9 @@ pub fn dispatch(command: &IngressCmd) -> Result<(), String> {
             source,
             account,
             event,
+            request_id,
             json,
-        } => resume(source, account, event, *json),
+        } => resume(source, account, event, request_id, *json),
     }
 }
 
@@ -139,19 +149,28 @@ pub(crate) struct ResumedTurn {
 
 /// Submit a durable resume of an accepted turn.
 ///
-/// Separate from the CLI wrapper so the property that matters — the continuation
-/// runs what the *parent* was accepted with, whatever the machine says now — is
-/// testable against an in-memory store rather than only through a process.
+/// Separate from the CLI wrapper so the two properties that matter — the
+/// continuation runs what the *parent* was accepted with whatever the machine
+/// says now, and one Resume is one continuation however many times the request
+/// arrives — are testable against an in-memory store rather than only through a
+/// process.
 pub(crate) fn resume_accepted_turn(
     store: &mut DaemonStore,
     queue: &dyn crate::daemon::channel_worker::RunQueue,
     source: ConversationSource,
     account: &str,
     event: &str,
+    request_id: &str,
     now_ms: i64,
 ) -> Result<ResumedTurn, String> {
-    use little_monkey_lib::channels::ingress::{ContinuationKind, ConversationIngress};
+    use little_monkey_lib::channels::ingress::ConversationIngress;
 
+    if request_id.trim().is_empty() {
+        return Err(
+            "A resume must carry the caller's own request id, or a retry cannot be told from a second resume"
+                .to_string(),
+        );
+    }
     if store.kill_switch()? {
         return Err("Global kill switch is engaged; nothing can be resumed".to_string());
     }
@@ -171,24 +190,12 @@ pub(crate) fn resume_accepted_turn(
             "Turn '{key}' was accepted without a frozen execution context and cannot be continued; start a new turn instead"
         ));
     }
-    // The next resume of this turn: resuming a turn twice is two continuations,
-    // and a retried request for the *same* resume is one, because the attempt
-    // number is part of the continuation's deterministic identity.
-    let attempt = u32::try_from(
-        store
-            .ingress_continuations(&parent.ingress_id)?
-            .iter()
-            .filter(|child| child.continuation_kind.as_deref() == Some("resume"))
-            .count(),
-    )
-    .unwrap_or(u32::MAX)
-    .saturating_add(1);
-    let continuation = ConversationIngress::continuation_of(
-        &accepted.ingress,
-        &parent.ingress_id,
-        ContinuationKind::Resume,
-        attempt,
-    );
+    // The caller's request id, not a count of what is already here: resuming a
+    // turn twice is two continuations because it is two ids, and a retry of one
+    // request is one continuation because it is one id. Counting could not tell
+    // those apart — the second press and the retry look identical from here.
+    let continuation =
+        ConversationIngress::resume_of(&accepted.ingress, &parent.ingress_id, request_id);
 
     let outcome = crate::daemon::channel_ingress::submit_conversation_turn(
         store,
@@ -214,7 +221,13 @@ pub(crate) fn resume_accepted_turn(
     })
 }
 
-fn resume(source: &str, account: &str, event: &str, json: bool) -> Result<(), String> {
+fn resume(
+    source: &str,
+    account: &str,
+    event: &str,
+    request_id: &str,
+    json: bool,
+) -> Result<(), String> {
     let source = parse_source(source)?;
     let paths = DaemonPaths::resolve()?;
     let mut store = DaemonStore::open(&paths)?;
@@ -226,7 +239,8 @@ fn resume(source: &str, account: &str, event: &str, json: bool) -> Result<(), St
             .as_millis(),
     )
     .unwrap_or(i64::MAX);
-    let resumed = resume_accepted_turn(&mut store, &queue, source, account, event, now)?;
+    let resumed =
+        resume_accepted_turn(&mut store, &queue, source, account, event, request_id, now)?;
     let run_id = store
         .get_job(&resumed.job_id)?
         .and_then(|job| job.run_id)

@@ -202,9 +202,17 @@ describe("every desktop send is a durable ingress turn", () => {
       resumedFromCheckpointId: "ckpt-1",
       determinismCaveats: ["Tool output is not replayed."],
       parentTurnId: "turn-original",
+      resumeRequestId: "resume-req-1",
     });
 
-    expect(mocks.ingressTurnResume).toHaveBeenCalledWith("desktop", "s-1", "turn-original");
+    // The caller's own id for the Resume action goes across untouched: this
+    // layer minting one would make a retried request a second run.
+    expect(mocks.ingressTurnResume).toHaveBeenCalledWith(
+      "desktop",
+      "s-1",
+      "turn-original",
+      "resume-req-1",
+    );
     // A resume is not a new send, and it is not a webview execution either.
     expect(mocks.submitDaemonDesktopTurn).not.toHaveBeenCalled();
     expect(streamed).toEqual([]);
@@ -221,6 +229,7 @@ describe("every desktop send is a durable ingress turn", () => {
         resumedFromCheckpointId: "ckpt-1",
         determinismCaveats: [],
         parentTurnId: null,
+        resumeRequestId: "resume-req-1",
       }),
     ).rejects.toThrow(/cannot be continued/i);
 

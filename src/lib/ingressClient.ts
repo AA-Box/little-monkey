@@ -107,11 +107,22 @@ export const ingressTurnShow = (source: ConversationSource, account: string, eve
 
 /** Asks the durable backend to continue an accepted turn that was frozen at a
  * tool boundary. The backend inherits the turn's frozen execution context; the
- * caller only gets the run to watch. */
-export const ingressTurnResume = (source: ConversationSource, account: string, event: string) =>
+ * caller only gets the run to watch.
+ *
+ * `requestId` identifies the Resume *action*, not this call. It must be minted
+ * once — before the first attempt — and repeated by every retry: an `invoke`
+ * that times out may already have been accepted, and the backend derives the
+ * continuation from this id, so a retry lands on the run that exists rather than
+ * starting a second one. A new id means a new, intentional Resume. */
+export const ingressTurnResume = (
+  source: ConversationSource,
+  account: string,
+  event: string,
+  requestId: string,
+) =>
   invoke<{ ingress_id: string; parent_ingress_id: string; job_id: string; run_id: string }>(
     "ingress_turn_resume",
-    { source, account, event },
+    { source, account, event, requestId },
   );
 
 /** How this turn is doing, in one word an operator can act on.

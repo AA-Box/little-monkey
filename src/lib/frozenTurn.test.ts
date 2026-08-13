@@ -83,6 +83,29 @@ describe("resumeFrozenTurn", () => {
   });
 
   /**
+   * The identity that makes a Resume idempotent, and the reason it is the
+   * image's own id rather than a fresh one: every route back here — the process
+   * sweep re-delivering the resume signal, a retry after the command timed out,
+   * a second press while the first is in flight — reads the same image, so the
+   * daemon sees one request rather than several, and runs the turn once.
+   */
+  it("identifies the resume by the image, so a re-delivered signal is one resume", async () => {
+    respond({
+      restorability: { state: "resumable", processId: "proc-frozen" },
+      determinismCaveats: [],
+      blockerExplanations: [],
+    });
+
+    await resumeFrozenTurn(record());
+    await resumeFrozenTurn(record());
+
+    const ids = runAgentTurnMock.mock.calls.map(
+      (call) => (call[8] as { resumeRequestId: string }).resumeRequestId,
+    );
+    expect(ids).toEqual(["cp-1", "cp-1"]);
+  });
+
+  /**
    * Ordering, not tidiness: an image cleared *after* the loop starts describes a
    * turn that is already running, and the next restart would offer to resume it
    * a second time.
