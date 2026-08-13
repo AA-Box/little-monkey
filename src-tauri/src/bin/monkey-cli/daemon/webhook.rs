@@ -207,6 +207,16 @@ async fn handle_channel_delivery(
         Ok(pair) => pair,
         Err(refusal) => return *refusal,
     };
+    // What this account allows an attachment to cost, which the operator may
+    // have tuned. Read once per delivery rather than per file.
+    let limits = store
+        .channel_account(&account_id)
+        .ok()
+        .flatten()
+        .map(|account| {
+            super::channel_adapter::AttachmentLimits::for_account(&account.non_secret_config)
+        })
+        .unwrap_or_default();
 
     let mut envelopes = match adapter.verify_and_normalize(&headers, &body, None, now_ms) {
         Ok(envelopes) => envelopes,
@@ -227,6 +237,7 @@ async fn handle_channel_delivery(
             super::channel_adapter::hydrate_attachments(
                 fetcher,
                 &super::channel_adapter::DaemonBlobs,
+                limits,
                 &mut envelopes,
             )
             .await;

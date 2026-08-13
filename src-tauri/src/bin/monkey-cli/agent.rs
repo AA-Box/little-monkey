@@ -1265,14 +1265,27 @@ async fn build_user_message(
     user_text: &str,
 ) -> Result<serde_json::Value, String> {
     let plain = serde_json::json!({ "role": "user", "content": user_text });
-    if !target.is_native() && !options.attach_images {
-        return Ok(plain);
-    }
-    let (clean, images) = chat::extract_image_paths(user_text);
+
+    // Files this turn's own inbound message carried, resolved from the durable
+    // event rather than from the text. A stranger writes the text; letting it
+    // name a path would let them have the model read any image on this machine
+    // back to them.
+    let carried = crate::daemon::channel_tool::current_turn_images();
+    // Paths the operator typed. Only looked for where they were already looked
+    // for — a native vision model, or `--attach-images` on an OpenAI-compat
+    // target — because this scan trusts the text.
+    let (clean, mut images) = if target.is_native() || options.attach_images {
+        chat::extract_image_paths(user_text)
+    } else {
+        (user_text.to_string(), Vec::new())
+    };
+    images.extend(carried);
     if images.is_empty() {
         return Ok(plain);
     }
     if target.is_native() && !supports_vision(client, target).await {
+        // Nothing is stripped: the text still names what arrived, so the model
+        // can say it cannot see the photo rather than ignore it.
         return Ok(plain);
     }
     for path in &images {

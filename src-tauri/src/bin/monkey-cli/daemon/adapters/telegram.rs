@@ -347,6 +347,7 @@ impl ChannelAdapter for TelegramAdapter {
     async fn fetch_attachment(
         &self,
         attachment: &little_monkey_lib::channels::types::ChannelAttachment,
+        limits: crate::daemon::channel_adapter::AttachmentLimits,
     ) -> Result<Vec<u8>, String> {
         let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
             return crate::daemon::channel_adapter::fetch_url(
@@ -355,6 +356,7 @@ impl ChannelAdapter for TelegramAdapter {
                     AttachmentSource::ProviderHandle { .. } => unreachable!(),
                 },
                 None,
+                limits.max_bytes,
             )
             .await;
         };
@@ -388,6 +390,7 @@ impl ChannelAdapter for TelegramAdapter {
         crate::daemon::channel_adapter::fetch_url(
             &format!("{}/file/bot{}/{file_path}", self.api_base, self.token),
             None,
+            limits.max_bytes,
         )
         .await
         .map_err(|error| self.redact(error))
@@ -996,7 +999,7 @@ mod tests {
         };
 
         let bytes = adapter
-            .fetch_attachment(&attachment)
+            .fetch_attachment(&attachment, Default::default())
             .await
             .expect("downloaded");
         assert_eq!(bytes, b"error: nope");
@@ -1063,6 +1066,7 @@ mod tests {
         crate::daemon::channel_adapter::hydrate_attachments(
             &adapter,
             &crate::daemon::channel_adapter::test_http::FixtureBlobs(Vec::new()),
+            Default::default(),
             &mut envelopes,
         )
         .await;
@@ -1113,6 +1117,7 @@ mod tests {
         crate::daemon::channel_adapter::hydrate_attachments(
             &adapter,
             &crate::daemon::channel_adapter::test_http::FixtureBlobs(Vec::new()),
+            Default::default(),
             &mut envelopes,
         )
         .await;

@@ -284,7 +284,11 @@ impl ChannelAdapter for WhatsAppAdapter {
     /// Meta hands out a media id, not a URL. The id is exchanged for a
     /// short-lived download URL on the Graph API, and that URL still needs the
     /// same bearer token — an unauthenticated GET of it returns nothing.
-    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        limits: crate::daemon::channel_adapter::AttachmentLimits,
+    ) -> Result<Vec<u8>, String> {
         let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
             return Err("That WhatsApp attachment carries no media id".to_string());
         };
@@ -311,7 +315,8 @@ impl ChannelAdapter for WhatsAppAdapter {
             .get("url")
             .and_then(JsonValue::as_str)
             .ok_or_else(|| "WhatsApp named no download URL for that media id".to_string())?;
-        crate::daemon::channel_adapter::fetch_url(url, Some(&self.access_token)).await
+        crate::daemon::channel_adapter::fetch_url(url, Some(&self.access_token), limits.max_bytes)
+            .await
     }
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {

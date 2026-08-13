@@ -217,7 +217,9 @@ pub(crate) fn plan_channel_ingress_with(
             if depth > 0 {
                 ingress = ingress.with_automation(depth);
             }
-            let params = run_params(&route.target, envelope, &ingress);
+            let limits =
+                super::channel_adapter::AttachmentLimits::for_account(&account.non_secret_config);
+            let params = run_params(&route.target, envelope, &ingress, limits.max_listed);
             store.bind_channel_session(
                 &ingress.session_key,
                 &envelope.account_id,
@@ -342,6 +344,7 @@ fn run_params(
     target: &RouteTarget,
     envelope: &ChannelEnvelope,
     ingress: &ConversationIngress,
+    max_listed: usize,
 ) -> Vec<String> {
     let mut params: Vec<String> = target
         .params
@@ -360,7 +363,7 @@ fn run_params(
         );
         params.push(format!(
             "{MESSAGE_PARAM}={}",
-            message_param(ingress, &source)
+            message_param(ingress, &source, max_listed)
         ));
     }
     params
@@ -381,7 +384,11 @@ pub(crate) fn run_params_for(target: &RouteTarget, ingress: &ConversationIngress
         let source = format!("a phone call on {}", ingress.source_account_id);
         params.push(format!(
             "{MESSAGE_PARAM}={}",
-            message_param(ingress, &source)
+            message_param(
+                ingress,
+                &source,
+                little_monkey_lib::channels::ingress::MAX_LISTED_ATTACHMENTS
+            )
         ));
     }
     params
@@ -394,8 +401,12 @@ pub(crate) fn run_params_for(target: &RouteTarget, ingress: &ConversationIngress
 /// belongs to the source rather than to the call site: a paired phone is the
 /// operator, and wrapping their words as untrusted data would tell the model to
 /// ignore its own owner.
-pub(super) fn message_param(ingress: &ConversationIngress, source: &str) -> String {
-    let body = ingress.body_for_model();
+pub(super) fn message_param(
+    ingress: &ConversationIngress,
+    source: &str,
+    max_listed: usize,
+) -> String {
+    let body = ingress.body_for_model(max_listed);
     if ingress.needs_untrusted_wrapping() {
         crate::agent::wrap_untrusted_content(source, &body)
     } else {
