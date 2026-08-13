@@ -25,7 +25,7 @@ import {
   permissionPolicyForRun,
   workspaceToRunWire,
 } from "./durableRun";
-import { ingressTurnShow } from "./ingressClient";
+import { ingressTurnResume, ingressTurnShow, isRefusedResume } from "./ingressClient";
 import type { ModelTargetSnapshot } from "./modelTargets";
 import type { PermissionMode } from "../store/permissionStore";
 import type { WorkspaceRootInfo } from "../store/workspaceStore";
@@ -460,6 +460,73 @@ export async function submitDaemonDesktopTurn(
     }
   }
   throw lastError;
+}
+
+/** The durable continuation one Resume produced, once the backend has it. */
+export interface AcceptedResume {
+  /** The continuation's own accepted-turn id. */
+  ingressId: string;
+  /** The accepted turn it continues. */
+  parentIngressId: string;
+  jobId: string;
+  runId: string;
+}
+
+/** What a Resume submission settled on, from the caller's point of view.
+ *
+ * `pending` is the answer that matters: nothing here can say whether the backend
+ * took the request, so nothing downstream may act as though it did — the frozen
+ * image stays, the suspended process stays, and the same request id is sent
+ * again later. */
+export type ResumeSubmissionOutcome =
+  | { state: "accepted"; accepted: AcceptedResume }
+  | { state: "refused"; reason: string }
+  | { state: "pending"; error: unknown };
+
+/**
+ * Asks the durable backend to continue a frozen turn, retrying the transport
+ * under the SAME request id.
+ *
+ * The retry is safe for the reason {@link submitDaemonDesktopTurn}'s is: the id
+ * is the continuation's identity, so a bridge call that timed out *after* the
+ * backend accepted is answered on the next attempt with the continuation that
+ * already exists rather than a second one. Minting an id per attempt would turn
+ * one Resume into several runs of the same work, which is the one outcome
+ * nothing downstream can undo.
+ *
+ * Every failure that survives the retries is reported as `pending`, never as a
+ * failure: this side cannot distinguish "never arrived" from "arrived, answer
+ * lost", and only the backend's own refusal — which comes back as a value —
+ * settles anything. A caller therefore keeps everything it would need to ask
+ * again.
+ */
+export async function submitDurableResume(
+  source: DesktopTurnSource,
+  sessionKey: string,
+  parentTurnId: string,
+  requestId: string,
+): Promise<ResumeSubmissionOutcome> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < SUBMIT_ATTEMPTS; attempt += 1) {
+    try {
+      const submission = await ingressTurnResume(source, sessionKey, parentTurnId, requestId);
+      return isRefusedResume(submission)
+        ? { state: "refused", reason: submission.refused }
+        : {
+          state: "accepted",
+          accepted: {
+            ingressId: submission.ingress_id,
+            parentIngressId: submission.parent_ingress_id,
+            jobId: submission.job_id,
+            runId: submission.run_id,
+          },
+        };
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < SUBMIT_ATTEMPTS) await wait(POLL_INTERVAL_MS * (attempt + 1));
+    }
+  }
+  return { state: "pending", error: lastError };
 }
 
 function emptyProjection(link: ActiveDaemonDesktopTurn): DaemonTurnProjection {

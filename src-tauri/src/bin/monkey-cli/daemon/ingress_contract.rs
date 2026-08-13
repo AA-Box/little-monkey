@@ -1218,16 +1218,7 @@ fn a_resumed_turn_runs_the_context_frozen_when_it_was_accepted() {
     // never re-resolves any of it, so the only way this could leak in is a path
     // that resolves configuration for an already accepted turn — which is what
     // this test exists to catch.
-    let resumed = crate::ingress_cli::resume_accepted_turn(
-        &mut store,
-        &queue,
-        ConversationSource::Desktop,
-        "session-1",
-        "turn-1",
-        "resume-a",
-        NOW + 3_600_000,
-    )
-    .expect("resume");
+    let resumed = resume_request(&mut store, &queue, "resume-a", NOW + 3_600_000);
 
     assert_eq!(queue.run_count(), 2);
     let continuation = store
@@ -1376,28 +1367,33 @@ fn a_resume_without_a_request_id_is_refused() {
     let (ingress, params) = bridge_turn(ConversationSource::Desktop, "turn-1");
     submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
 
-    let error = crate::ingress_cli::resume_accepted_turn(
-        &mut store,
-        &queue,
-        ConversationSource::Desktop,
-        "session-1",
-        "turn-1",
-        "  ",
-        NOW + 1_000,
-    )
-    .expect_err("refused");
+    let reason = resume_refusal(&mut store, &queue, "  ", NOW + 1_000);
 
-    assert!(error.contains("request id"), "{error}");
+    assert!(reason.contains("request id"), "{reason}");
     assert_eq!(queue.run_count(), 1);
 }
 
 /// One Resume request, submitted the way the production path submits it.
 fn resume_request(
     store: &mut DaemonStore,
-    queue: &ContractQueue,
+    queue: &dyn RunQueue,
     request_id: &str,
     at: i64,
 ) -> crate::ingress_cli::ResumedTurn {
+    match resume_outcome(store, queue, request_id, at) {
+        crate::ingress_cli::ResumeOutcome::Accepted(resumed) => resumed,
+        crate::ingress_cli::ResumeOutcome::Refused(reason) => {
+            panic!("expected the resume to be accepted, got a refusal: {reason}")
+        }
+    }
+}
+
+fn resume_outcome(
+    store: &mut DaemonStore,
+    queue: &dyn RunQueue,
+    request_id: &str,
+    at: i64,
+) -> crate::ingress_cli::ResumeOutcome {
     crate::ingress_cli::resume_accepted_turn(
         store,
         queue,
@@ -1408,6 +1404,25 @@ fn resume_request(
         at,
     )
     .expect("resume")
+}
+
+/// The reason a Resume was refused — the answer the operator is shown, as
+/// opposed to a transport failure the caller should retry.
+fn resume_refusal(
+    store: &mut DaemonStore,
+    queue: &dyn RunQueue,
+    request_id: &str,
+    at: i64,
+) -> String {
+    match resume_outcome(store, queue, request_id, at) {
+        crate::ingress_cli::ResumeOutcome::Refused(reason) => reason,
+        crate::ingress_cli::ResumeOutcome::Accepted(resumed) => {
+            panic!(
+                "expected a refusal, got continuation {}",
+                resumed.ingress_id
+            )
+        }
+    }
 }
 
 /// A frozen image from before turns were durable has no context to inherit.
@@ -1424,26 +1439,83 @@ fn a_turn_with_no_frozen_context_is_refused_rather_than_resumed_against_current_
         .accept_ingress_turn(&contextless, &[], NOW)
         .expect("accept");
 
-    let error = crate::ingress_cli::resume_accepted_turn(
-        &mut store,
-        &queue,
-        ConversationSource::Desktop,
-        "session-1",
-        "turn-1",
-        "resume-a",
-        NOW + 1_000,
-    )
-    .expect_err("refused");
+    let reason = resume_refusal(&mut store, &queue, "resume-a", NOW + 1_000);
 
-    assert!(error.contains("frozen execution context"), "{error}");
+    assert!(reason.contains("frozen execution context"), "{reason}");
     assert_eq!(queue.run_count(), 0);
+}
+
+/// The other half of the same rule: a frozen context whose credential has since
+/// been deleted is refused by name, rather than continued against whatever
+/// model the operator has selected by now.
+#[test]
+fn a_resume_whose_frozen_credential_is_gone_is_refused_rather_than_re_resolved() {
+    let mut store = DaemonStore::open_in_memory().expect("open");
+    let queue = RevokedCredentialQueue::default();
+    let (ingress, params) = bridge_turn(ConversationSource::Desktop, "turn-1");
+    submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
+
+    let reason = resume_refusal(&mut store, &queue, "resume-a", NOW + 1_000);
+
+    assert!(reason.contains("no longer available"), "{reason}");
+    // Nothing was continued, and nothing was queued under a substitute.
+    assert_eq!(queue.run_count(), 1);
+    assert!(store
+        .ingress_continuations(
+            &store
+                .ingress_turn_by_dedupe_key(&little_monkey_lib::channels::ingress::dedupe_key_for(
+                    ConversationSource::Desktop,
+                    "session-1",
+                    "turn-1",
+                ))
+                .unwrap()
+                .expect("parent")
+                .ingress_id,
+        )
+        .unwrap()
+        .is_empty());
+}
+
+/// A queue whose operator deleted the credential the accepted turn was frozen
+/// with. Accepts the original turn — the credential was there then — and reports
+/// the loss only when asked to continue it.
+#[derive(Default)]
+struct RevokedCredentialQueue(ContractQueue);
+
+impl RunQueue for RevokedCredentialQueue {
+    fn freeze_execution(
+        &self,
+        ingress: &ConversationIngress,
+    ) -> Result<FrozenExecutionContext, String> {
+        self.0.freeze_execution(ingress)
+    }
+
+    fn submit(&self, ingress: &ConversationIngress, params: Vec<String>) -> Result<String, String> {
+        self.0.submit(ingress, params)
+    }
+
+    fn frozen_context_unusable(
+        &self,
+        context: &little_monkey_lib::channels::ingress::FrozenExecutionContextV1,
+    ) -> Option<String> {
+        Some(format!(
+            "The credential for {} is no longer available.",
+            context.model_target
+        ))
+    }
+}
+
+impl RevokedCredentialQueue {
+    fn run_count(&self) -> usize {
+        self.0.run_count()
+    }
 }
 
 #[test]
 fn a_turn_nobody_accepted_cannot_be_resumed_into_existence() {
     let mut store = DaemonStore::open_in_memory().expect("open");
     let queue = ContractQueue::default();
-    let error = crate::ingress_cli::resume_accepted_turn(
+    let reason = crate::ingress_cli::resume_accepted_turn(
         &mut store,
         &queue,
         ConversationSource::Desktop,
@@ -1452,8 +1524,11 @@ fn a_turn_nobody_accepted_cannot_be_resumed_into_existence() {
         "resume-a",
         NOW,
     )
-    .expect_err("refused");
-    assert!(error.contains("No accepted turn"), "{error}");
+    .expect("resume");
+    let crate::ingress_cli::ResumeOutcome::Refused(reason) = reason else {
+        panic!("expected a refusal");
+    };
+    assert!(reason.contains("No accepted turn"), "{reason}");
     assert_eq!(queue.run_count(), 0);
 }
 

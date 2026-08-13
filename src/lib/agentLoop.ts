@@ -125,12 +125,12 @@ import {
   saveActiveDaemonTurn,
   submitDaemonDesktopTurn,
   watchDaemonDesktopTurn,
+  type AcceptedResume,
   type ActiveDaemonDesktopTurn,
   type ConversationRoute,
   type DesktopTurnSource,
   type FrozenAttachmentInput,
 } from './daemonDesktopTurn';
-import { ingressTurnResume } from './ingressClient';
 import {
   canRetryWithoutTools,
   mutationAttemptFailureMessage,
@@ -161,10 +161,17 @@ export const SWITCH_NOTE_PREFIX = '[Model switch]';
 export const RESUME_NOTE_PREFIX = '[Resume]';
 
 /** A re-entry into a turn frozen at a tool boundary (roadmap K13), passed to
- * {@link runAgentTurn} by `frozenTurn.ts` and by nothing else. */
+ * {@link runAgentTurn} by `frozenTurn.ts` and by nothing else.
+ *
+ * Every field describes something that has *already happened*. Nothing in this
+ * type is a request to submit a Resume — by the time one of these exists, the
+ * backend holds the continuation durably, and the only thing left is to watch
+ * it. That ordering is the whole point: submission has to be the step the frozen
+ * image outlives, so it cannot be the step this loop performs. */
 export interface ResumedTurn {
-  /** The image being continued. Already cleared by the caller — held here for
-   * the transcript notice and for anything that later wants to name it. */
+  /** The image that was continued. Cleared by the caller once the continuation
+   * below was durably accepted — held here for the transcript notice and for
+   * anything that later wants to name it. */
   resumedFromCheckpointId: string;
   /** `checkpoint_restorability`'s statement of what a resume does *not*
    * reproduce, written into the transcript beside the continuation. */
@@ -173,22 +180,13 @@ export interface ResumedTurn {
    * external id.
    *
    * This is what makes a resume a *continuation* rather than a new turn: it is
-   * half of the accepted turn's durable identity, so the backend can find the
-   * row and inherit the execution context frozen when the turn was first
-   * accepted. Absent only for an image written before turns were durable, which
-   * is refused rather than resolved afresh. */
-  parentTurnId: string | null;
-  /** This Resume action's own identity, minted by whoever decided to resume and
-   * carried unchanged from there to the daemon.
-   *
-   * It is what makes a Resume idempotent end to end. The backend derives the
-   * continuation, its job and its run from the parent turn plus this id, so a
-   * retried request — a timed-out `invoke`, a re-delivered resume signal, a
-   * component that re-renders mid-flight — reaches the continuation that
-   * already exists instead of starting a second run of the same work. Minting
-   * one here per call would defeat exactly that, which is why this is passed in
-   * and never generated on the way past. */
-  resumeRequestId: string;
+   * half of the accepted turn's durable identity, and it is what the backend
+   * found the row by. A watcher reconnects by asking about *this* turn, because
+   * the continuation's own id is the backend's business. */
+  parentTurnId: string;
+  /** The continuation the backend accepted, as it answered. Its run is what
+   * this loop attaches the transcript to. */
+  accepted: AcceptedResume;
 }
 
 export function isSwitchNotice(message: ChatMessage): boolean {
@@ -1556,6 +1554,15 @@ export async function runAgentTurn(
   }
   let turnError: unknown;
   try {
+    // A resume is settled before it gets here: the backend already holds the
+    // continuation, so there is nothing left to route, gate or preflight. Asking
+    // `daemonDesktopRoute` again would only add a way for an accepted
+    // continuation to go unwatched because the runner's health changed in the
+    // second between accepting it and attaching to it.
+    if (resume !== null) {
+      await watchResumedDesktopTurn(sessionId, resume, controller, origin);
+      return;
+    }
     const mutationRequired = requiresWorkspaceMutation(
       userText,
       usePermissionStore.getState().mode,
@@ -1615,20 +1622,16 @@ export async function runAgentTurn(
     // rather than routing a turn away from a runner that is missing, stopped,
     // stale or kill-switched, and `runTurnGuarded` refuses again on its own.
     if (route === 'daemon') {
-      if (resume !== null) {
-        await resumeDurableDesktopTurn(sessionId, resume, controller, origin);
-      } else {
-        await runDaemonAgentTurn(
-          sessionId,
-          userText,
-          attachments,
-          controller.signal,
-          turnId,
-          skillInvocations,
-          origin,
-          mutationRequired,
-        );
-      }
+      await runDaemonAgentTurn(
+        sessionId,
+        userText,
+        attachments,
+        controller.signal,
+        turnId,
+        skillInvocations,
+        origin,
+        mutationRequired,
+      );
     } else {
       await runTurnGuarded(
         sessionId,
@@ -1640,7 +1643,6 @@ export async function runAgentTurn(
         availableSkills,
         ultracode,
         mutationRequired,
-        resume,
         route,
       );
     }
@@ -1724,30 +1726,24 @@ async function attachDaemonTurnToChat(
 }
 
 /**
- * Resume a turn frozen at a tool boundary, through the durable backend.
+ * Attach the transcript to a resumed turn the backend has already accepted.
  *
- * Nothing here resolves configuration, and nothing here executes: the backend
- * finds the accepted turn the image belongs to and submits a continuation that
- * inherits the execution context frozen when that turn was *accepted* — the
- * recipe, model, workspace and permission mode of then, not of now. This process
- * only learns which run to watch.
- *
- * An image whose turn was never durably accepted is refused rather than run. It
- * is the one case where re-resolving the current configuration would look like
- * working and would silently continue someone's conversation in another model's
- * voice.
+ * Nothing here resolves configuration, nothing here executes, and — since the
+ * lifecycle was straightened out — nothing here *submits* either. The
+ * continuation was accepted before its caller retired anything, because a turn
+ * this loop had to reach the backend for would be a turn whose frozen image had
+ * to be destroyed first to know whether the resume worked. So the submission
+ * belongs to `frozenTurn.ts`, which owns the image, and what is left here is
+ * watching: the run inherits the execution context frozen when the *parent* turn
+ * was accepted — the recipe, model, workspace and permission mode of then, not
+ * of now — and this process only learns which run that is.
  */
-async function resumeDurableDesktopTurn(
+async function watchResumedDesktopTurn(
   sessionId: string,
   resume: ResumedTurn,
   controller: AbortController,
   origin: DesktopTurnSource,
 ): Promise<void> {
-  if (!resume.parentTurnId) {
-    throw new Error(
-      'This frozen turn predates durable turn identity, so it cannot be continued with the configuration it was accepted under. Ask again in a new turn.',
-    );
-  }
   const store = useSessionStore.getState();
   // The caveats are the whole reason `checkpoint_restorability` returns them: a
   // resumed turn is a fresh generation from the frozen point, not a replay, and
@@ -1756,15 +1752,9 @@ async function resumeDurableDesktopTurn(
     role: 'system',
     content: [`${RESUME_NOTE_PREFIX} Resumed from a frozen image.`, ...resume.determinismCaveats].join('\n'),
   });
-  const resumed = await ingressTurnResume(
-    origin,
-    sessionId,
-    resume.parentTurnId,
-    resume.resumeRequestId,
-  );
   void reconcileProcess({
     kind: 'daemon_job',
-    externalId: resumed.job_id,
+    externalId: resume.accepted.jobId,
     state: 'admitted',
     parentKind: 'chat_turn',
     parentExternalId: resume.parentTurnId,
@@ -1776,14 +1766,14 @@ async function resumeDurableDesktopTurn(
     // The continuation's own identity is the backend's; what this link needs is
     // the accepted turn it belongs to, so a reconnect asks about the same turn.
     turnId: resume.parentTurnId,
-    runId: resumed.run_id,
+    runId: resume.accepted.runId,
     assistantIndex,
     lastSequence: 0,
     output: '',
     source: origin,
   };
   saveActiveDaemonTurn(link);
-  registerDurableController(resumed.run_id, controller);
+  registerDurableController(resume.accepted.runId, controller);
   await attachDaemonTurnToChat(link, controller);
 }
 
@@ -2130,7 +2120,6 @@ async function runTurnGuarded(
   availableSkills: SlashSkill[] = [],
   ultracode = false,
   mutationRequired = false,
-  resume: ResumedTurn | null = null,
   route: ConversationRoute = 'browser',
 ): Promise<void> {
   if (route !== 'browser' || isTauri()) {
@@ -2147,20 +2136,11 @@ async function runTurnGuarded(
   // in the turn body does async file/image reads) — if there's at least one
   // image, it's promoted in place, right after, to a `ChatContentPart[]` so
   // the chat UI actually shows what was attached, not just what was typed.
-  if (resume === null) {
-    useSessionStore.getState().addMessage(sessionId, { role: 'user', content: userText });
-  } else {
-    // The caveats are the whole reason `checkpoint_restorability` returns them
-    // rather than a doc holding them: a resumed turn is a fresh generation from
-    // the frozen point, not a replay of the one that was interrupted, and the
-    // transcript is where the person reading the continuation will be.
-    useSessionStore.getState().addMessage(sessionId, {
-      role: 'system',
-      content: [`${RESUME_NOTE_PREFIX} Resumed from a frozen image.`, ...resume.determinismCaveats].join(
-        '\n',
-      ),
-    });
-  }
+  // No resume arm here, and that absence is load-bearing: a resumed turn is a
+  // continuation of one the durable backend accepted, so it is watched
+  // (`watchResumedDesktopTurn`) and never executed in this process. This
+  // function is only reachable where no durable authority can exist at all.
+  useSessionStore.getState().addMessage(sessionId, { role: 'user', content: userText });
 
   // Open a per-turn file checkpoint (see src-tauri/src/checkpoints.rs) so
   // every write_file/edit_file this turn makes can be reverted in one click.

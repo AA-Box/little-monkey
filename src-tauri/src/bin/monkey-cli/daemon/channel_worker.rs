@@ -20,7 +20,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use little_monkey_lib::channels::ingress::{ConversationIngress, FrozenExecutionContext};
+use little_monkey_lib::channels::ingress::{
+    ConversationIngress, FrozenExecutionContext, FrozenExecutionContextV1,
+};
 use little_monkey_lib::channels::types::{ChannelEnvelope, SendOutcome};
 
 use super::channel_adapter::ChannelAdapter;
@@ -57,6 +59,22 @@ pub(crate) trait RunQueue: Send + Sync {
 
     /// Queues one accepted turn. Returns the daemon job id.
     fn submit(&self, ingress: &ConversationIngress, params: Vec<String>) -> Result<String, String>;
+
+    /// Why the resources an *already frozen* context names can no longer be
+    /// reached, if they cannot.
+    ///
+    /// Asked before continuing a turn that was accepted earlier, and deliberately
+    /// not a re-resolution: the question is whether the model and credential this
+    /// turn was frozen with are still there, never what the operator would pick
+    /// today. A `Some` here is final — the continuation is refused and the reason
+    /// shown — because the only alternatives are running under a credential
+    /// nobody chose or failing later with a stranger error.
+    ///
+    /// Defaults to "nothing to check" so a test double that queues turns without
+    /// an operator's keychain behind it does not have to lie about one.
+    fn frozen_context_unusable(&self, _context: &FrozenExecutionContextV1) -> Option<String> {
+        None
+    }
 }
 
 /// A frozen execution context for the test doubles that stand in for the

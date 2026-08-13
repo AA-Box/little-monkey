@@ -197,41 +197,54 @@ describe("every desktop send is a durable ingress turn", () => {
     expect(turnId).toMatch(/[0-9a-f-]{36}/);
   });
 
-  it("continues a frozen turn through the backend, under the turn it belongs to", async () => {
+  it("watches the continuation a resume was already accepted as, under the turn it belongs to", async () => {
     await runAgentTurn("s-1", "", [], undefined, undefined, [], [], false, {
       resumedFromCheckpointId: "ckpt-1",
       determinismCaveats: ["Tool output is not replayed."],
       parentTurnId: "turn-original",
-      resumeRequestId: "resume-req-1",
+      accepted: {
+        ingressId: "ingr-2",
+        parentIngressId: "ingr-1",
+        jobId: "job-2",
+        runId: "run-2",
+      },
     });
 
-    // The caller's own id for the Resume action goes across untouched: this
-    // layer minting one would make a retried request a second run.
-    expect(mocks.ingressTurnResume).toHaveBeenCalledWith(
-      "desktop",
-      "s-1",
-      "turn-original",
-      "resume-req-1",
-    );
     // A resume is not a new send, and it is not a webview execution either.
     expect(mocks.submitDaemonDesktopTurn).not.toHaveBeenCalled();
     expect(streamed).toEqual([]);
     expect(mocks.watchDaemonDesktopTurn).toHaveBeenCalledTimes(1);
+    // The link reconnects by the *accepted turn*, not the continuation: that is
+    // the identity a later restart can still ask about.
+    const link = mocks.watchDaemonDesktopTurn.mock.calls[0][0] as {
+      turnId: string;
+      runId: string;
+    };
+    expect(link).toMatchObject({ turnId: "turn-original", runId: "run-2" });
     const caveat = useSessionStore
       .getState()
       .sessions[0].messages.find((message) => message.role === "system");
     expect(caveat?.content).toContain("Tool output is not replayed.");
   });
 
-  it("refuses to resume an image with no durable turn rather than resolving fresh config", async () => {
-    await expect(
-      runAgentTurn("s-1", "", [], undefined, undefined, [], [], false, {
-        resumedFromCheckpointId: "ckpt-1",
-        determinismCaveats: [],
-        parentTurnId: null,
-        resumeRequestId: "resume-req-1",
-      }),
-    ).rejects.toThrow(/cannot be continued/i);
+  /**
+   * The ownership boundary, stated as an absence: this loop cannot submit a
+   * Resume, so it cannot be the thing a frozen image has to be destroyed to
+   * reach. `frozenTurn.ts` submits, and only hands a `ResumedTurn` here once the
+   * backend already holds the continuation.
+   */
+  it("never submits a resume of its own — it is handed one already accepted", async () => {
+    await runAgentTurn("s-1", "", [], undefined, undefined, [], [], false, {
+      resumedFromCheckpointId: "ckpt-1",
+      determinismCaveats: [],
+      parentTurnId: "turn-original",
+      accepted: {
+        ingressId: "ingr-2",
+        parentIngressId: "ingr-1",
+        jobId: "job-2",
+        runId: "run-2",
+      },
+    });
 
     expect(mocks.ingressTurnResume).not.toHaveBeenCalled();
     expect(streamed).toEqual([]);

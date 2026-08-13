@@ -105,6 +105,22 @@ export const ingressTurns = (source: ConversationSource | null = null, limit = 2
 export const ingressTurnShow = (source: ConversationSource, account: string, event: string) =>
   invoke<IngressTurnDetail>("ingress_turn_show", { source, account, event });
 
+/** The continuation a Resume produced, or the backend's reason for not making
+ * one.
+ *
+ * A refusal arrives as a *value* rather than a rejected `invoke` because the
+ * caller has to act on the difference: a rejection means the request may never
+ * have arrived and must be retried under the same id, while a refusal is the
+ * backend's considered answer and asking again reaches it unchanged. Only the
+ * second is safe to show and stop on. */
+export type ResumeSubmission =
+  | { ingress_id: string; parent_ingress_id: string; job_id: string; run_id: string }
+  | { refused: string };
+
+export const isRefusedResume = (
+  submission: ResumeSubmission,
+): submission is { refused: string } => "refused" in submission;
+
 /** Asks the durable backend to continue an accepted turn that was frozen at a
  * tool boundary. The backend inherits the turn's frozen execution context; the
  * caller only gets the run to watch.
@@ -120,10 +136,7 @@ export const ingressTurnResume = (
   event: string,
   requestId: string,
 ) =>
-  invoke<{ ingress_id: string; parent_ingress_id: string; job_id: string; run_id: string }>(
-    "ingress_turn_resume",
-    { source, account, event, requestId },
-  );
+  invoke<ResumeSubmission>("ingress_turn_resume", { source, account, event, requestId });
 
 /** How this turn is doing, in one word an operator can act on.
  *

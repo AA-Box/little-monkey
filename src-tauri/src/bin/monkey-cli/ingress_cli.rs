@@ -147,6 +147,31 @@ pub(crate) struct ResumedTurn {
     pub job_id: String,
 }
 
+/// What one Resume request became, split by whether asking again could ever
+/// change the answer.
+///
+/// The split is the whole point of the type. A caller that loses the response to
+/// a Resume has to retry, and it must retry under the same request id — so it
+/// needs to know whether "this failed" means *the message did not get through*
+/// or *the backend considered this and said no*. Collapsing both into an error
+/// forces the caller to guess: guess "transport" and a refusal is retried
+/// forever in silence, guess "refusal" and a momentary blip destroys a frozen
+/// image that was still recoverable.
+///
+/// So a [`Refused`] is exactly the set of answers that are re-derived from
+/// durable state and therefore identical on every retry, and everything else
+/// stays an `Err` for the caller to try again.
+///
+/// [`Refused`]: ResumeOutcome::Refused
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResumeOutcome {
+    /// Durably accepted — or already was, and this is the row that exists.
+    Accepted(ResumedTurn),
+    /// The backend read the durable state and will not continue this turn.
+    /// Final: the caller shows the reason rather than asking again.
+    Refused(String),
+}
+
 /// Submit a durable resume of an accepted turn.
 ///
 /// Separate from the CLI wrapper so the two properties that matter — the
@@ -162,33 +187,49 @@ pub(crate) fn resume_accepted_turn(
     event: &str,
     request_id: &str,
     now_ms: i64,
-) -> Result<ResumedTurn, String> {
+) -> Result<ResumeOutcome, String> {
     use little_monkey_lib::channels::ingress::ConversationIngress;
 
     if request_id.trim().is_empty() {
-        return Err(
+        return Ok(ResumeOutcome::Refused(
             "A resume must carry the caller's own request id, or a retry cannot be told from a second resume"
                 .to_string(),
-        );
+        ));
     }
     if store.kill_switch()? {
-        return Err("Global kill switch is engaged; nothing can be resumed".to_string());
+        return Ok(ResumeOutcome::Refused(
+            "Global kill switch is engaged; nothing can be resumed".to_string(),
+        ));
     }
     let key = little_monkey_lib::channels::ingress::dedupe_key_for(source, account, event);
-    let parent = store
-        .ingress_turn_by_dedupe_key(&key)?
-        .ok_or_else(|| format!("No accepted turn '{key}' to continue"))?;
-    let accepted = store
-        .accepted_ingress_turn(&parent.ingress_id)?
-        .ok_or_else(|| format!("Accepted turn '{}' is unreadable", parent.ingress_id))?;
+    let Some(parent) = store.ingress_turn_by_dedupe_key(&key)? else {
+        return Ok(ResumeOutcome::Refused(format!(
+            "No accepted turn '{key}' to continue"
+        )));
+    };
+    let Some(accepted) = store.accepted_ingress_turn(&parent.ingress_id)? else {
+        return Ok(ResumeOutcome::Refused(format!(
+            "Accepted turn '{}' is unreadable",
+            parent.ingress_id
+        )));
+    };
     // Refused rather than resolved. A turn accepted before execution contexts
     // were frozen has no snapshot to replay, and continuing it would mean
     // silently running whatever the machine is configured with now — which is
     // exactly the thing freezing exists to prevent.
-    if accepted.ingress.execution.is_none() {
-        return Err(format!(
+    let Some(execution) = accepted.ingress.execution.as_ref() else {
+        return Ok(ResumeOutcome::Refused(format!(
             "Turn '{key}' was accepted without a frozen execution context and cannot be continued; start a new turn instead"
-        ));
+        )));
+    };
+    // The other half of the same rule. Inheriting the frozen context is what
+    // stops a resume from running under a configuration the turn was never
+    // accepted with; this is what stops it from running under *no* configuration
+    // — a model whose credential has since been deleted. Refused by name rather
+    // than re-resolved, because the only thing re-resolution could produce here
+    // is whatever the operator happens to have selected now.
+    if let Some(reason) = queue.frozen_context_unusable(execution.as_v1()) {
+        return Ok(ResumeOutcome::Refused(reason));
     }
     // The caller's request id, not a count of what is already here: resuming a
     // turn twice is two continuations because it is two ids, and a retry of one
@@ -209,16 +250,24 @@ pub(crate) fn resume_accepted_turn(
         | crate::daemon::channel_ingress::SubmitOutcome::AlreadyQueued { ingress_id, job_id } => {
             (ingress_id, job_id)
         }
+        // Accepted durably, not queued yet. An error rather than a refusal on
+        // purpose: the continuation now exists under this request id, and the
+        // caller retrying reaches *it* — either queued by then, or deferred
+        // again — instead of being told no about a turn the backend took.
         crate::daemon::channel_ingress::SubmitOutcome::Deferred { error, .. } => return Err(error),
+        // Out of attempts. Re-reading the row reaches the same failed state on
+        // every retry, so this is an answer rather than a wait.
         crate::daemon::channel_ingress::SubmitOutcome::Parked { .. } => {
-            return Err("This resumed turn could not be queued and was parked".to_string())
+            return Ok(ResumeOutcome::Refused(
+                "This resumed turn could not be queued and was parked".to_string(),
+            ))
         }
     };
-    Ok(ResumedTurn {
+    Ok(ResumeOutcome::Accepted(ResumedTurn {
         ingress_id,
         parent_ingress_id: parent.ingress_id,
         job_id,
-    })
+    }))
 }
 
 fn resume(
@@ -240,7 +289,19 @@ fn resume(
     )
     .unwrap_or(i64::MAX);
     let resumed =
-        resume_accepted_turn(&mut store, &queue, source, account, event, request_id, now)?;
+        match resume_accepted_turn(&mut store, &queue, source, account, event, request_id, now)? {
+            ResumeOutcome::Accepted(resumed) => resumed,
+            // Printed as an answer rather than raised as a failure, and only in
+            // `--json`: a caller reading structured output has to be able to
+            // tell "the backend said no" from "the command did not run", and a
+            // non-zero exit with a message on stderr is indistinguishable from
+            // the second. A human at a terminal has no such problem.
+            ResumeOutcome::Refused(reason) if json => {
+                println!("{}", serde_json::json!({ "refused": reason }));
+                return Ok(());
+            }
+            ResumeOutcome::Refused(reason) => return Err(reason),
+        };
     let run_id = store
         .get_job(&resumed.job_id)?
         .and_then(|job| job.run_id)

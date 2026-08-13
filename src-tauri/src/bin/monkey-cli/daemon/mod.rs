@@ -1122,6 +1122,25 @@ impl channel_worker::RunQueue for DaemonChannelQueue {
         )
         .map(|queued| queued.job_id)
     }
+
+    fn frozen_context_unusable(
+        &self,
+        context: &little_monkey_lib::channels::ingress::FrozenExecutionContextV1,
+    ) -> Option<String> {
+        // Only a cloud provider names a credential; an Ollama model, a local
+        // origin and the managed runtime authenticate with nothing, so there is
+        // nothing about them that can have been revoked. Mirrors
+        // `credential_ref_for`, which is what wrote this reference.
+        let reference = context.credential_ref.as_deref()?;
+        let provider = reference.strip_prefix("provider:")?;
+        if little_monkey_lib::providers::read_key_with_env(provider).is_ok() {
+            return None;
+        }
+        Some(format!(
+            "This turn was accepted to run on {}, and the credential it named ('{reference}') is no longer available. Restore it and resume again, or ask the question afresh in a new turn — continuing it on a different model would answer in a voice the conversation never had.",
+            context.model_target,
+        ))
+    }
 }
 
 /// Production implementation of the remote API's mobile chat seam.

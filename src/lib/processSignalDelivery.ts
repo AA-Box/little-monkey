@@ -340,11 +340,24 @@ async function deliverResumeFromImage(
   record: ProcessRecord,
 ): Promise<ProcessSignalDelivery> {
   if (record.kind !== "chat_turn") return "no-live-target";
-  const outcome = await resumeFrozenTurn(record).catch(() => "no-image" as const);
+  const outcome = await resumeFrozenTurn(record).catch(() => "deferred" as const);
   // A blocked restore counts as delivered: the refusal and its reasons are in
   // the transcript, the user has been answered, and re-delivering every two
   // seconds would append the same refusal forever.
-  return outcome === "no-image" ? "no-live-target" : "resumed";
+  //
+  // `deferred` is the opposite case and must NOT count: the durable backend was
+  // never reached, so the frozen image, the suspended row and the Resume's own
+  // request id are all still intact and the next read sends the identical
+  // request. Reporting it as delivered would be this module's own version of the
+  // lie it exists to have stopped telling.
+  switch (outcome) {
+    case "no-image":
+      return "no-live-target";
+    case "deferred":
+      return "deferred";
+    default:
+      return "resumed";
+  }
 }
 
 /**
