@@ -1,5 +1,5 @@
 {
-  "contract_version": "1.4.0",
+  "contract_version": "1.5.0",
   "support_window_days": 180,
   "http_routes": [
     {
@@ -515,6 +515,18 @@
       "method": "POST",
       "path": "/v1/remote/node/migration/accept",
       "gate": "capability:Migrate"
+    },
+    {
+      "plane": "peer",
+      "method": "POST",
+      "path": "/v1/remote/peer/messages",
+      "gate": "peer_standing"
+    },
+    {
+      "plane": "peer",
+      "method": "GET",
+      "path": "/v1/remote/peer/threads/{thread_id}",
+      "gate": "peer_standing"
     }
   ],
   "acp": {

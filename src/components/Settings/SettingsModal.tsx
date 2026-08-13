@@ -19,6 +19,7 @@ import {
   Lock,
   MessageSquare,
   MessagesSquare,
+  Network,
   PhoneCall,
   MonitorCheck,
   MousePointerClick,
@@ -65,6 +66,7 @@ import { RuntimeHubPanel } from "./RuntimeHubPanel";
 import { BrowserVerificationPanel } from "./BrowserVerificationPanel";
 import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel";
 import { ChannelsPanel } from "./ChannelsPanel";
+import { PeersPanel } from "./PeersPanel";
 import { TelephonyPanel } from "./TelephonyPanel";
 import { ResourceLedgerPanel } from "./ResourceLedgerPanel";
 import { GitDeliveryPanel } from "./GitDeliveryPanel";
@@ -99,7 +101,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-type StaticSettingsTab = "local" | "ollama" | "providers" | "automation" | "rules" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "channels" | "telephony" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "profiles" | "approvalchains" | "localapps" | "comparelab" | "resources" | "updates";
+type StaticSettingsTab = "local" | "ollama" | "providers" | "automation" | "rules" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "channels" | "telephony" | "peers" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "profiles" | "approvalchains" | "localapps" | "comparelab" | "resources" | "updates";
 export type SettingsTab = StaticSettingsTab | ProviderSettingsTab;
 
 const ICONS: Record<StaticSettingsTab, LucideIcon> = {
@@ -123,6 +125,7 @@ const ICONS: Record<StaticSettingsTab, LucideIcon> = {
   gitdelivery: GitPullRequest,
   background: Bot,
   channels: MessagesSquare,
+  peers: Network,
   telephony: PhoneCall,
   companion: Sparkles,
   security: ShieldCheck,
@@ -144,7 +147,7 @@ const GROUPS: { labelKey: string; ids: StaticSettingsTab[] }[] = [
   { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "updates", "security", "privacy", "diagnostics", "approvalchains", "profiles", "team", "companion", "desktopcontrol", "shortcuts", "usage", "resources", "portability"] },
   { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers", "comparelab"] },
   { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "memorystudio", "tasks", "localapps"] },
-  { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "triage", "background", "connectors", "channels", "telephony", "prompts", "apiserver"] },
+  { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "triage", "background", "connectors", "channels", "telephony", "peers", "prompts", "apiserver"] },
 ];
 
 const LABEL_KEYS: Record<StaticSettingsTab, string> = {
@@ -168,6 +171,7 @@ const LABEL_KEYS: Record<StaticSettingsTab, string> = {
   gitdelivery: "SettingsModal.tabGitDelivery",
   background: "SettingsModal.tabBackgroundAgents",
   channels: "SettingsModal.tabChannels",
+  peers: "SettingsModal.tabPeers",
   telephony: "SettingsModal.tabTelephony",
   companion: "SettingsModal.tabCompanion",
   security: "SettingsModal.tabSecurityDoctor",
@@ -460,6 +464,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "approvalchains" && <ApprovalChainsPanel />}
               {tab === "background" && <BackgroundAgentsPanel />}
               {tab === "channels" && <ChannelsPanel />}
+              {tab === "peers" && <PeersPanel />}
               {tab === "telephony" && <TelephonyPanel />}
               {tab === "companion" && <CompanionPanel />}
               {tab === "updates" && <UpdatesPanel />}

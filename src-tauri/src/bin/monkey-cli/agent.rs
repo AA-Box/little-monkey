@@ -906,6 +906,39 @@ async fn execute_tool_call(
         };
     }
 
+    // `peer_message` reaches another installation the operator paired with.
+    // Same external-mutation gate as `send_message` — it leaves this machine
+    // and cannot be taken back — plus the destination being an alias that must
+    // already exist, so there is nothing here for a model to redirect.
+    if name == "peer_message" {
+        if !perms.allow_external_mutations() {
+            return serde_json::json!({
+                "error": "This run's permission snapshot does not allow contacting other installations."
+            })
+            .to_string();
+        }
+        let peer = args["peer"].as_str().unwrap_or_default().to_string();
+        let text = args["text"].as_str().unwrap_or_default().to_string();
+        let thread = args["thread"].as_str().map(str::to_string);
+        let task = args["task"].as_bool().unwrap_or(false);
+        let preview: String = text.chars().take(120).collect();
+        let summary = format!("{} {peer}: {preview}", if task { "ask" } else { "message" });
+        return match perms.request("peer_message", &summary).await {
+            Ok(()) => match crate::daemon::peer_tool::send_peer_message(
+                &peer,
+                &text,
+                thread.as_deref(),
+                task,
+            )
+            .await
+            {
+                Ok(value) => value.to_string(),
+                Err(error) => serde_json::json!({ "error": error }).to_string(),
+            },
+            Err(error) => serde_json::json!({ "error": error }).to_string(),
+        };
+    }
+
     // `place_call` is the most consequential tool in the set: it reaches a
     // person and it bills the operator. Same external-mutation gate as
     // `send_message`, plus the account's own outbound policy, which can refuse
@@ -1539,6 +1572,17 @@ async fn run_tool_loop(
         && crate::daemon::channel_tool::current_channel_origin().is_some()
     {
         tools_vec.push(tools_def::send_message_tool_def());
+    }
+    // `peer_message` is offered only when this installation is paired with
+    // another as a peer. Nothing to reach, nothing to offer.
+    if perms.allow_external_mutations() {
+        let peers: Vec<String> = crate::daemon::peer_tool::reachable_peers()
+            .into_iter()
+            .map(|(alias, _)| alias)
+            .collect();
+        if !peers.is_empty() {
+            tools_vec.push(tools_def::peer_message_tool_def(&peers));
+        }
     }
     // `place_call` is offered only when the operator actually configured a
     // number that may dial out. An operator whose numbers are all receive-only

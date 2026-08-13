@@ -75,6 +75,27 @@ pub enum DeviceCapability {
     /// its nearest neighbour and is not the same thing: that launches a workflow
     /// this node already holds, under this node's own policy.
     PlaceRuns,
+    /// Exchange bounded messages with this installation as a paired *peer*
+    /// rather than as a controller (roadmap: peer agents).
+    ///
+    /// Peer standing is its own grant and implies nothing else in this enum: a
+    /// peer that may talk cannot read runs, cannot approve, cannot place work
+    /// and cannot reach the desktop. `legacy_capabilities` never produces any
+    /// of the three, so an existing pairing does not silently become a peer
+    /// when this build ships.
+    PeerMessage,
+    /// Ask this installation to do something as a paired peer. The request
+    /// becomes an ordinary durable turn under this node's own recipe and
+    /// permission policy — it is a request, never an instruction.
+    ///
+    /// Separate from [`Self::PeerMessage`] because saying something and asking
+    /// for work are different acts, and an operator who allowed the first has
+    /// not agreed to the second.
+    PeerTaskRequest,
+    /// Attach artifact references to a peer thread. Separate again: handing
+    /// content over is not the same as talking, and it is the grant that
+    /// decides whether this node will fetch what a peer offers.
+    PeerArtifact,
     /// Hand this node a *frozen process image* from another owned node and let
     /// it resume the run (roadmap K18).
     ///
@@ -392,16 +413,47 @@ fn default_artifact_budget() -> u64 {
     MAX_REMOTE_ARTIFACT_BYTES
 }
 
+/// Whether a grant is peer standing and nothing else.
+///
+/// A peer is the one kind of pairing with no control-plane scope: it may not
+/// read a run, approve anything or touch the desktop, so requiring it to name
+/// an action and a run id — as every controller pairing must — would force an
+/// authority onto it that the whole design says it must not have.
+pub fn is_peer_only(capabilities: &BTreeSet<DeviceCapability>) -> bool {
+    !capabilities.is_empty()
+        && capabilities.iter().all(|capability| {
+            matches!(
+                capability,
+                DeviceCapability::PeerMessage
+                    | DeviceCapability::PeerTaskRequest
+                    | DeviceCapability::PeerArtifact
+            )
+        })
+}
+
 impl RemoteScopes {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.actions.is_empty() {
-            return Err("Remote pairing requires at least one action".to_string());
+    /// The scope rules, given what the pairing is actually for.
+    ///
+    /// Identical to [`Self::validate`] for every controller pairing. The one
+    /// difference is a peer-only grant, which is allowed to carry an entirely
+    /// empty control scope — the strongest possible restriction, not a
+    /// loosening: an empty scope reaches nothing on the control plane.
+    pub fn validate_with_capabilities(
+        &self,
+        capabilities: &BTreeSet<DeviceCapability>,
+    ) -> Result<(), String> {
+        if is_peer_only(capabilities)
+            && self.actions.is_empty()
+            && self.run_ids.is_empty()
+            && self.workspace_ids.is_empty()
+        {
+            return self.validate_bounds();
         }
-        if self.run_ids.is_empty() && self.workspace_ids.is_empty() {
-            return Err(
-                "Remote pairing requires an exact run id or declared workspace id".to_string(),
-            );
-        }
+        self.validate()
+    }
+
+    /// Bounds that hold for every pairing, peer or controller.
+    fn validate_bounds(&self) -> Result<(), String> {
         if self.run_ids.len() > 1_024 || self.workspace_ids.len() > 128 {
             return Err("Remote pairing scope is too large".to_string());
         }
@@ -413,6 +465,19 @@ impl RemoteScopes {
                 "Remote artifact budget must be between 1 and {MAX_REMOTE_ARTIFACT_BYTES} bytes"
             ));
         }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.actions.is_empty() {
+            return Err("Remote pairing requires at least one action".to_string());
+        }
+        if self.run_ids.is_empty() && self.workspace_ids.is_empty() {
+            return Err(
+                "Remote pairing requires an exact run id or declared workspace id".to_string(),
+            );
+        }
+        self.validate_bounds()?;
         if self.actions.contains(&RemoteAction::Approve)
             && !self.actions.contains(&RemoteAction::ViewRuns)
         {
@@ -495,12 +560,12 @@ impl PairingInvitation {
         {
             return Err("Pairing invitation has no valid pinned certificate".to_string());
         }
-        self.scopes.validate()?;
         let capabilities = if self.capabilities.is_empty() {
             legacy_capabilities(&self.scopes)
         } else {
             self.capabilities.clone()
         };
+        self.scopes.validate_with_capabilities(&capabilities)?;
         validate_capabilities(&capabilities, &self.scopes)
     }
 }

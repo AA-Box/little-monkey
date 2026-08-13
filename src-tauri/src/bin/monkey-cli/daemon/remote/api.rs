@@ -228,6 +228,10 @@ pub struct RemoteApi {
     /// answers the placement route with an explicit refusal rather than
     /// accepting a spec it cannot run.
     placement: Option<Arc<dyn PlacementQueue>>,
+    /// Run seam for `/v1/remote/peer/messages`. `None` (bare unit tests, and
+    /// any build without a configured daemon) refuses peer traffic outright
+    /// rather than recording envelopes it could never act on.
+    peer_runs: Option<Arc<dyn crate::daemon::channel_worker::RunQueue>>,
     /// Where remote requests land in the unified subsystem event stream
     /// (roadmap K12).
     ///
@@ -249,6 +253,7 @@ impl Clone for RemoteApi {
             desktop: self.desktop.clone(),
             mobile_chat: self.mobile_chat.clone(),
             placement: self.placement.clone(),
+            peer_runs: self.peer_runs.clone(),
             audit: self.audit.clone(),
         }
     }
@@ -261,6 +266,7 @@ impl RemoteApi {
         desktop: Arc<DesktopControlRuntime>,
         mobile_chat: Arc<dyn MobileChatQueue>,
         placement: Arc<dyn PlacementQueue>,
+        peer_runs: Arc<dyn crate::daemon::channel_worker::RunQueue>,
     ) -> Result<Self, String> {
         let store = RemoteStore::open(&paths.root)?;
         let audit = audit_for(&paths);
@@ -272,6 +278,7 @@ impl RemoteApi {
             desktop: Some(desktop),
             mobile_chat: Some(mobile_chat),
             placement: Some(placement),
+            peer_runs: Some(peer_runs),
             audit,
         })
     }
@@ -292,6 +299,7 @@ impl RemoteApi {
             desktop: None,
             mobile_chat: None,
             placement: None,
+            peer_runs: None,
             audit,
         }
     }
@@ -309,6 +317,17 @@ impl RemoteApi {
     #[cfg(test)]
     pub fn with_placement(mut self, placement: Arc<dyn PlacementQueue>) -> Self {
         self.placement = Some(placement);
+        self
+    }
+
+    /// Test builder: the injected API plus a fake run queue, so the peer
+    /// contract is exercisable without a configured daemon.
+    #[cfg(test)]
+    pub fn with_peer_runs(
+        mut self,
+        peer_runs: Arc<dyn crate::daemon::channel_worker::RunQueue>,
+    ) -> Self {
+        self.peer_runs = Some(peer_runs);
         self
     }
 
@@ -754,6 +773,18 @@ impl RemoteApi {
             ("POST", ["v1", "remote", "node", "migration", "accept"]) => {
                 require_capability(device, DeviceCapability::Migrate)
                     .and_then(|_| self.migration_accept(&request.body, now_ms))
+            }
+            // --- Versioned `/v1/remote/peer/*` peer plane.
+            // A third plane. The control plane acts on this node's runs, the
+            // placement plane accepts a spec another owned node authored, and
+            // this one accepts *words* from a peer that then run under this
+            // node's own recipe. Peer standing implies nothing on the other
+            // two: none of these arms consults `scopes`.
+            ("POST", ["v1", "remote", "peer", "messages"]) => require_any_peer_capability(device)
+                .and_then(|_| self.peer_message_post(device, &request.body, now_ms)),
+            ("GET", ["v1", "remote", "peer", "threads", thread_id]) => {
+                require_any_peer_capability(device)
+                    .and_then(|_| self.peer_thread_get(device, thread_id, now_ms))
             }
             // Self-revocation needs no extra capability: a device may always
             // sever itself. The store path force-stops any live desktop
@@ -2417,6 +2448,222 @@ impl RemoteApi {
     /// not exist here, a target this node cannot execute). Nothing is recorded
     /// until the queue has accepted, so a refused placement leaves no row
     /// claiming the node took work it did not.
+    // --- `/v1/remote/peer/*` -----------------------------------------------
+
+    /// Take one envelope from a paired peer.
+    ///
+    /// Everything that decides *whether* it runs lives in the gate; this is the
+    /// transport half — parse, refuse to act while the kill switch is on, and
+    /// turn the gate's verdict into a status code the sender can act on.
+    fn peer_message_post(
+        &self,
+        device: &DeviceRecord,
+        body: &[u8],
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let Some(queue) = self.peer_runs.as_ref() else {
+            return Err((
+                501,
+                "This node build does not accept peer messages".to_string(),
+            ));
+        };
+        let envelope: little_monkey_lib::peers::PeerEnvelope = serde_json::from_slice(body)
+            .map_err(|error| (400, format!("Invalid peer envelope: {error}")))?;
+        let mut store = DaemonStore::open(&self.paths).map_err(internal)?;
+        if store.kill_switch().map_err(internal)? {
+            return Err((409, "Global kill switch is engaged".to_string()));
+        }
+        let granted = granted_capabilities(device);
+        let context = crate::daemon::peer_ingress::PeerContext {
+            device_id: &device.device_id,
+            granted: &granted,
+            revoked: !device.active(),
+            local_instance_id: &self.host.runner_id,
+        };
+        let accepted = crate::daemon::peer_ingress::accept_peer_envelope(
+            &mut store,
+            queue.as_ref(),
+            &envelope,
+            &context,
+            i64::try_from(now_ms).unwrap_or(i64::MAX),
+        )
+        .map_err(internal)?;
+
+        use crate::daemon::peer_ingress::PeerAcceptance;
+        match accepted {
+            PeerAcceptance::Accepted {
+                thread_id, job_id, ..
+            } => Ok((
+                202,
+                serde_json::json!({
+                    "accepted": true,
+                    "thread_id": thread_id,
+                    "message_id": envelope.message_id,
+                    // The peer's own handle for correlating a result later. The
+                    // local job id is deliberately not returned: it is this
+                    // node's business, and a peer that knew it would learn
+                    // nothing it can use.
+                    "correlation_id": envelope.correlation_id,
+                    "state": "queued",
+                    "queued": !job_id.is_empty(),
+                }),
+                Some(thread_id_target(&envelope.thread_id)),
+            )),
+            PeerAcceptance::AcceptedPending { thread_id, .. } => Ok((
+                202,
+                serde_json::json!({
+                    "accepted": true,
+                    "thread_id": thread_id,
+                    "message_id": envelope.message_id,
+                    "correlation_id": envelope.correlation_id,
+                    // Durably taken, not yet queued. Saying "accepted" is the
+                    // honest answer: a retry would be refused as a duplicate,
+                    // and this node will finish the submission itself.
+                    "state": "accepted",
+                    "queued": false,
+                }),
+                Some(thread_id_target(&envelope.thread_id)),
+            )),
+            PeerAcceptance::Duplicate {
+                thread_id,
+                accepted,
+                ..
+            } => Ok((
+                200,
+                serde_json::json!({
+                    "accepted": accepted,
+                    "thread_id": thread_id,
+                    "message_id": envelope.message_id,
+                    "correlation_id": envelope.correlation_id,
+                    "state": "duplicate",
+                    "queued": false,
+                }),
+                Some(thread_id_target(&envelope.thread_id)),
+            )),
+            PeerAcceptance::Rejected { reason, .. } => {
+                use little_monkey_lib::peers::PeerRejection;
+                let status = match reason {
+                    PeerRejection::MissingCapability | PeerRejection::PeerRevoked => 403,
+                    PeerRejection::Duplicate => 409,
+                    _ => 400,
+                };
+                Err((status, reason.message().to_string()))
+            }
+        }
+    }
+
+    /// What a thread looks like now, including results for finished work.
+    ///
+    /// The peer polls this rather than being called back. That is not a
+    /// shortcut: a callback would mean every receiving node holding an
+    /// outbound pairing to every peer that ever wrote to it, and a peer that
+    /// went away leaving retries behind. Polling keeps the trust one-way per
+    /// direction, the same shape the mobile path already uses.
+    fn peer_thread_get(
+        &self,
+        device: &DeviceRecord,
+        thread_id: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let mut store = DaemonStore::open(&self.paths).map_err(internal)?;
+        let Some(thread) = store.peer_thread(thread_id).map_err(internal)? else {
+            return Err((404, "Unknown peer thread".to_string()));
+        };
+        // A peer reads its own threads and nobody else's. Same 404 as a thread
+        // that does not exist, so probing cannot enumerate other peers.
+        if thread.peer_device_id != device.device_id {
+            return Err((404, "Unknown peer thread".to_string()));
+        }
+        self.materialize_peer_results(&mut store, &thread, now_ms)?;
+
+        let messages = store.peer_messages(thread_id, 200).map_err(internal)?;
+        let rows: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|message| {
+                serde_json::json!({
+                    "message_id": message.message_id,
+                    "direction": message.direction.as_str(),
+                    "kind": message.kind,
+                    "correlation_id": message.correlation_id,
+                    "disposition": message.disposition.as_str(),
+                    "rejection": message.rejection,
+                    // A result row's payload is what this node produced and is
+                    // meant to travel; an inbound row's is the peer's own
+                    // envelope, echoed back unchanged.
+                    "payload": serde_json::from_str::<serde_json::Value>(&message.envelope_json)
+                        .unwrap_or(serde_json::Value::Null),
+                    "created_at_ms": message.created_at_ms,
+                })
+            })
+            .collect();
+        Ok((
+            200,
+            serde_json::json!({
+                "thread_id": thread.thread_id,
+                "created_at_ms": thread.created_at_ms,
+                "last_activity_at_ms": thread.last_activity_at_ms,
+                "messages": rows,
+            }),
+            Some(thread_id_target(thread_id)),
+        ))
+    }
+
+    /// Turn finished runs into result rows the peer can read.
+    ///
+    /// Runs when the peer polls rather than on a timer: nothing needs the
+    /// answer until someone asks for it, and doing it here means a result is
+    /// written exactly once, by the same idempotent insert, whether the peer
+    /// polls once or fifty times.
+    fn materialize_peer_results(
+        &self,
+        store: &mut DaemonStore,
+        thread: &crate::daemon::peer_store::PeerThreadRecord,
+        now_ms: u64,
+    ) -> Result<(), (u16, String)> {
+        let awaiting = store
+            .peer_messages_awaiting_result(&thread.thread_id)
+            .map_err(internal)?;
+        if awaiting.is_empty() {
+            return Ok(());
+        }
+        let ledger = self.run_ledger()?;
+        for message in awaiting {
+            let Some(job_id) = message.job_id.as_deref() else {
+                continue;
+            };
+            let Some(job) = store.get_job(job_id).map_err(internal)? else {
+                continue;
+            };
+            let Some(run_id) = job.run_id.as_deref() else {
+                continue; // Queued but not started yet.
+            };
+            let Ok(events) = ledger.load_events(run_id, 0, 1_000) else {
+                continue; // Not recorded yet — the next poll tries again.
+            };
+            let Some(outcome) = terminal_outcome(&events) else {
+                continue; // Still running.
+            };
+            store
+                .record_peer_result(
+                    &thread.thread_id,
+                    &thread.peer_device_id,
+                    &self.host.runner_id,
+                    &format!("result-{}", message.message_id),
+                    message.correlation_id.as_deref(),
+                    job_id,
+                    &serde_json::json!({
+                        "in_reply_to": message.message_id,
+                        "state": outcome.state,
+                        "text": outcome.text,
+                    })
+                    .to_string(),
+                    i64::try_from(now_ms).unwrap_or(i64::MAX),
+                )
+                .map_err(internal)?;
+        }
+        Ok(())
+    }
+
     fn place_run(
         &self,
         body: &[u8],
@@ -2679,6 +2926,113 @@ fn require_capability(
     }
 }
 
+/// A peer needs at least one of the three peer grants to reach the peer plane
+/// at all. Which one a given envelope needs is decided per envelope, inside the
+/// gate, because that depends on what the envelope contains — but a pairing
+/// with no peer standing whatsoever never gets that far, and never gets to
+/// create a thread row.
+/// The grants recorded for this device, resolving the legacy empty-set
+/// convention the same way `require_capability` does.
+///
+/// Not [`protocol::effective_capabilities`], which additionally drops a
+/// physical capability the device's own surface cannot serve: a peer grant is
+/// never physical, and a peer has no surface to ask.
+fn granted_capabilities(device: &DeviceRecord) -> std::collections::BTreeSet<DeviceCapability> {
+    if device.capabilities.is_empty() {
+        legacy_capabilities(&device.scopes)
+    } else {
+        device.capabilities.clone()
+    }
+}
+
+/// What the audit trail records a peer request against. The thread, never the
+/// message text.
+fn thread_id_target(thread_id: &str) -> String {
+    format!("peer-thread:{thread_id}")
+}
+
+/// One finished run, as a peer result.
+struct PeerRunOutcome {
+    state: &'static str,
+    text: String,
+}
+
+/// Read a run's events and, if it ended, say how.
+///
+/// The assistant's own output is the answer when there is one; a summary is
+/// the fallback, and a failure or a cancellation is reported as such rather
+/// than as an empty success. A run still going produces `None`, which is how
+/// the caller knows to leave the request waiting.
+fn terminal_outcome(
+    events: &[little_monkey_lib::run_protocol::RunEventEnvelope],
+) -> Option<PeerRunOutcome> {
+    let mut assistant_text = String::new();
+    let mut summary: Option<String> = None;
+    let mut failure: Option<String> = None;
+    let mut cancelled = false;
+    let mut completed = false;
+    for envelope in events {
+        match &envelope.event {
+            RunEvent::ModelDelta { channel, text, .. } => {
+                if matches!(channel, OutputChannel::Assistant) {
+                    assistant_text.push_str(text);
+                }
+            }
+            RunEvent::Completed { summary: value, .. } => {
+                completed = true;
+                summary = value.clone();
+            }
+            RunEvent::Failed { message, .. } => failure = Some(message.clone()),
+            RunEvent::Cancelled { .. } => cancelled = true,
+            _ => {}
+        }
+    }
+    if let Some(reason) = failure {
+        return Some(PeerRunOutcome {
+            state: "failed",
+            text: bounded_text(&reason, 2_048),
+        });
+    }
+    if cancelled {
+        return Some(PeerRunOutcome {
+            state: "cancelled",
+            text: "The run was cancelled on the receiving installation.".to_string(),
+        });
+    }
+    if !completed {
+        return None;
+    }
+    let text = if assistant_text.trim().is_empty() {
+        summary.unwrap_or_else(|| "(The run completed without any output.)".to_string())
+    } else {
+        assistant_text
+    };
+    Some(PeerRunOutcome {
+        state: "succeeded",
+        text: bounded_text(&text, 16 * 1024),
+    })
+}
+
+fn require_any_peer_capability(device: &DeviceRecord) -> Result<(), (u16, String)> {
+    let effective = if device.capabilities.is_empty() {
+        legacy_capabilities(&device.scopes)
+    } else {
+        device.capabilities.clone()
+    };
+    let has_peer_standing = [
+        DeviceCapability::PeerMessage,
+        DeviceCapability::PeerTaskRequest,
+        DeviceCapability::PeerArtifact,
+    ]
+    .iter()
+    .any(|capability| effective.contains(capability));
+    if has_peer_standing {
+        Ok(())
+    } else {
+        Err((403, "This pairing is not a peer".to_string()))
+    }
+}
+
 fn summarize(run: &StoredRun, shared: &SharedLedger) -> Result<RunSummary, String> {
     let label = match &run.spec.target {
         ModelTargetSnapshot::ManagedLlama { label, .. }
@@ -2840,14 +3194,19 @@ mod tests {
             // lines is enough for every arm rustfmt produces here; an arm that
             // grew past it would fail as `self_service` and be noticed.
             let arm = lines[index..(index + 3).min(lines.len())].join(" ");
-            let gate = arm
-                .split_once("RemoteAction::")
-                .map(|(_, tail)| format!("action:{}", variant(tail)))
-                .or_else(|| {
-                    arm.split_once("DeviceCapability::")
-                        .map(|(_, tail)| format!("capability:{}", variant(tail)))
-                })
-                .unwrap_or_else(|| "self_service".to_string());
+            let gate = if arm.contains("require_any_peer_capability") {
+                // The peer plane's gate is "any of the three peer grants",
+                // which no single `DeviceCapability::` token can name.
+                "peer_standing".to_string()
+            } else {
+                arm.split_once("RemoteAction::")
+                    .map(|(_, tail)| format!("action:{}", variant(tail)))
+                    .or_else(|| {
+                        arm.split_once("DeviceCapability::")
+                            .map(|(_, tail)| format!("capability:{}", variant(tail)))
+                    })
+                    .unwrap_or_else(|| "self_service".to_string())
+            };
             dispatched.insert((method.to_string(), path, gate));
         }
 
@@ -2864,6 +3223,7 @@ mod tests {
                             format!("capability:{capability}")
                         }
                         contract::RemoteGate::SelfService => "self_service".to_string(),
+                        contract::RemoteGate::PeerStanding => "peer_standing".to_string(),
                         contract::RemoteGate::Unauthenticated => unreachable!("filtered above"),
                     },
                 )
@@ -3757,6 +4117,413 @@ mod tests {
         let secret = accepted.device_secret.as_bytes().to_vec();
         let api = RemoteApi::injected(paths, host, store, secrets);
         (root, api, accepted.device_id, secret)
+    }
+
+    /// Two installations, in one process: this node, and a peer paired into it
+    /// with the grants named. No second machine, no network — the signature
+    /// path and the gate are the same ones a real pairing uses.
+    fn peer_fixture(
+        capabilities: BTreeSet<DeviceCapability>,
+    ) -> (PathBuf, RemoteApi, String, Vec<u8>) {
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-remote-peer-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = DaemonPaths::under(&root);
+        paths.ensure().unwrap();
+        DaemonConfig::default().save(&paths).unwrap();
+        let host = RemoteHostConfig {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            runner_id: "runner-local".into(),
+            listen: "127.0.0.1:1".into(),
+            advertise_url: "https://runner.invalid".into(),
+            certificate_path: "/tmp/cert".into(),
+            private_key_path: "/tmp/key".into(),
+            certificate_sha256: "a".repeat(64),
+            enabled: true,
+        };
+        let mut store = RemoteStore::open(&paths.root).unwrap();
+        let scopes = RemoteScopes {
+            actions: BTreeSet::new(),
+            run_ids: BTreeSet::new(),
+            workspace_ids: BTreeSet::new(),
+            max_artifact_bytes: 1_024,
+        };
+        let secrets = Arc::new(FakeSecrets::default());
+        let invite = store
+            .create_invitation_with_capabilities(&scopes, &capabilities, 1_000, 3_000)
+            .unwrap();
+        let accepted = store
+            .accept_invitation_with_capabilities(
+                &invite.pairing_id,
+                &invite.token,
+                "peer-two",
+                "runner-local",
+                None,
+                1_100,
+                secrets.as_ref(),
+            )
+            .unwrap();
+        let secret = accepted.device_secret.as_bytes().to_vec();
+        let api = RemoteApi::injected(paths, host, store, secrets);
+        (root, api, accepted.device_id, secret)
+    }
+
+    fn every_peer_grant() -> BTreeSet<DeviceCapability> {
+        BTreeSet::from([
+            DeviceCapability::PeerMessage,
+            DeviceCapability::PeerTaskRequest,
+            DeviceCapability::PeerArtifact,
+        ])
+    }
+
+    fn peer_body(message_id: &str, kind: little_monkey_lib::peers::PeerMessageKind) -> Vec<u8> {
+        let mut envelope = little_monkey_lib::peers::PeerEnvelope::new(
+            message_id,
+            "thread-1",
+            kind,
+            "instance-peer-two",
+            "summarize the failing nightly build",
+            2_000,
+            600_000,
+        );
+        envelope.correlation_id = Some("corr-1".into());
+        serde_json::to_vec(&envelope).unwrap()
+    }
+
+    #[derive(Default)]
+    struct FakePeerRuns {
+        submitted: std::sync::Mutex<Vec<little_monkey_lib::channels::ingress::ConversationIngress>>,
+    }
+
+    impl crate::daemon::channel_worker::RunQueue for FakePeerRuns {
+        fn submit(
+            &self,
+            ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
+            _params: Vec<String>,
+        ) -> Result<String, String> {
+            self.submitted.lock().unwrap().push(ingress.clone());
+            Ok(ingress.deterministic_job_id())
+        }
+    }
+
+    /// Peer standing is its own thing. A pairing without any of the three peer
+    /// grants cannot reach the peer plane at all — which is what keeps every
+    /// pairing that existed before this build from becoming a peer.
+    #[test]
+    fn a_pairing_without_peer_grants_cannot_reach_the_peer_plane() {
+        // An ordinary controller pairing — the shape every pairing that
+        // existed before peers shipped still has.
+        let (root, api, _secrets, device, secret) = fixture();
+        let api = api.with_peer_runs(Arc::new(FakePeerRuns::default()));
+        for (index, (method, path, body)) in [
+            (
+                "POST",
+                "/v1/remote/peer/messages",
+                peer_body("msg-1", little_monkey_lib::peers::PeerMessageKind::Message),
+            ),
+            ("GET", "/v1/remote/peer/threads/thread-1", Vec::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = api.handle(
+                signed(
+                    &device,
+                    &secret,
+                    index as u64 + 1,
+                    &format!("cmd-peer-{index}"),
+                    method,
+                    path,
+                    &body,
+                ),
+                2_000,
+            );
+            assert_eq!(
+                response.status, 403,
+                "{method} {path} must need a peer grant"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_peer_task_request_becomes_a_turn_and_the_result_comes_back_on_the_thread() {
+        let (root, api, device, secret) = peer_fixture(every_peer_grant());
+        let runs = Arc::new(FakePeerRuns::default());
+        let api = api.with_peer_runs(runs.clone());
+
+        let accepted = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-peer-send",
+                "POST",
+                "/v1/remote/peer/messages",
+                &peer_body(
+                    "msg-1",
+                    little_monkey_lib::peers::PeerMessageKind::TaskRequest,
+                ),
+            ),
+            2_000,
+        );
+        assert_eq!(accepted.status, 202);
+        let body: serde_json::Value = serde_json::from_slice(&accepted.body).unwrap();
+        assert_eq!(body["accepted"], true);
+        assert_eq!(body["thread_id"], "thread-1");
+        assert_eq!(body["correlation_id"], "corr-1");
+
+        // It reached the ordinary durable path, as a peer turn.
+        let submitted = runs.submitted.lock().unwrap().clone();
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(
+            submitted[0].source,
+            little_monkey_lib::channels::ingress::ConversationSource::Peer
+        );
+
+        // Nothing has finished, so the thread carries the request and no result.
+        let thread = api.handle(
+            signed(
+                &device,
+                &secret,
+                2,
+                "cmd-peer-poll",
+                "GET",
+                "/v1/remote/peer/threads/thread-1",
+                b"",
+            ),
+            2_100,
+        );
+        assert_eq!(thread.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&thread.body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["direction"], "inbound");
+        assert_eq!(messages[0]["disposition"], "accepted");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_retried_delivery_is_answered_with_the_first_decision_and_runs_once() {
+        let (root, api, device, secret) = peer_fixture(every_peer_grant());
+        let runs = Arc::new(FakePeerRuns::default());
+        let api = api.with_peer_runs(runs.clone());
+        let body = peer_body(
+            "msg-1",
+            little_monkey_lib::peers::PeerMessageKind::TaskRequest,
+        );
+
+        let first = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-peer-a",
+                "POST",
+                "/v1/remote/peer/messages",
+                &body,
+            ),
+            2_000,
+        );
+        let second = api.handle(
+            signed(
+                &device,
+                &secret,
+                2,
+                "cmd-peer-b",
+                "POST",
+                "/v1/remote/peer/messages",
+                &body,
+            ),
+            2_050,
+        );
+
+        assert_eq!(first.status, 202);
+        assert_eq!(second.status, 200);
+        let repeated: serde_json::Value = serde_json::from_slice(&second.body).unwrap();
+        assert_eq!(repeated["state"], "duplicate");
+        assert_eq!(repeated["accepted"], true);
+        assert_eq!(runs.submitted.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_peer_granted_only_conversation_cannot_ask_for_work() {
+        let (root, api, device, secret) =
+            peer_fixture(BTreeSet::from([DeviceCapability::PeerMessage]));
+        let runs = Arc::new(FakePeerRuns::default());
+        let api = api.with_peer_runs(runs.clone());
+
+        let refused = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-peer-task",
+                "POST",
+                "/v1/remote/peer/messages",
+                &peer_body(
+                    "msg-1",
+                    little_monkey_lib::peers::PeerMessageKind::TaskRequest,
+                ),
+            ),
+            2_000,
+        );
+        assert_eq!(refused.status, 403);
+        assert!(runs.submitted.lock().unwrap().is_empty());
+
+        // The same peer may still talk.
+        let allowed = api.handle(
+            signed(
+                &device,
+                &secret,
+                2,
+                "cmd-peer-msg",
+                "POST",
+                "/v1/remote/peer/messages",
+                &peer_body("msg-2", little_monkey_lib::peers::PeerMessageKind::Message),
+            ),
+            2_010,
+        );
+        assert_eq!(allowed.status, 202);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_peer_cannot_read_another_peers_thread() {
+        let (root, api, device, secret) = peer_fixture(every_peer_grant());
+        let api = api.with_peer_runs(Arc::new(FakePeerRuns::default()));
+        api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-peer-seed",
+                "POST",
+                "/v1/remote/peer/messages",
+                &peer_body("msg-1", little_monkey_lib::peers::PeerMessageKind::Message),
+            ),
+            2_000,
+        );
+
+        // A second peer, paired into the same node, asks for the first one's
+        // thread by name. It gets the same answer a thread that does not exist
+        // gets, so probing cannot enumerate anyone.
+        let mut store = RemoteStore::open(&api.paths.root).unwrap();
+        let scopes = RemoteScopes {
+            actions: BTreeSet::new(),
+            run_ids: BTreeSet::new(),
+            workspace_ids: BTreeSet::new(),
+            max_artifact_bytes: 1_024,
+        };
+        let secrets = Arc::new(FakeSecrets::default());
+        let invite = store
+            .create_invitation_with_capabilities(&scopes, &every_peer_grant(), 1_000, 3_000)
+            .unwrap();
+        let intruder = store
+            .accept_invitation_with_capabilities(
+                &invite.pairing_id,
+                &invite.token,
+                "peer-three",
+                "runner-local",
+                None,
+                1_100,
+                secrets.as_ref(),
+            )
+            .unwrap();
+        drop(store);
+        let api = RemoteApi::injected(
+            api.paths.clone(),
+            api.host.clone(),
+            RemoteStore::open(&api.paths.root).unwrap(),
+            secrets,
+        )
+        .with_peer_runs(Arc::new(FakePeerRuns::default()));
+
+        let response = api.handle(
+            signed(
+                &intruder.device_id,
+                intruder.device_secret.as_bytes(),
+                1,
+                "cmd-peer-peek",
+                "GET",
+                "/v1/remote/peer/threads/thread-1",
+                b"",
+            ),
+            2_100,
+        );
+        assert_eq!(response.status, 404);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_envelope_that_loops_back_here_is_refused_before_it_is_stored() {
+        let (root, api, device, secret) = peer_fixture(every_peer_grant());
+        let runs = Arc::new(FakePeerRuns::default());
+        let api = api.with_peer_runs(runs.clone());
+        let mut looped = little_monkey_lib::peers::PeerEnvelope::new(
+            "msg-1",
+            "thread-1",
+            little_monkey_lib::peers::PeerMessageKind::Message,
+            "instance-peer-two",
+            "round and round",
+            2_000,
+            600_000,
+        );
+        // This node is already in the chain: the message has been here before.
+        looped.origin_chain.push("runner-local".into());
+
+        let response = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-peer-loop",
+                "POST",
+                "/v1/remote/peer/messages",
+                &serde_json::to_vec(&looped).unwrap(),
+            ),
+            2_000,
+        );
+        assert_eq!(response.status, 400);
+        assert!(runs.submitted.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_expired_request_is_refused_rather_than_run_late() {
+        let (root, api, device, secret) = peer_fixture(every_peer_grant());
+        let runs = Arc::new(FakePeerRuns::default());
+        let api = api.with_peer_runs(runs.clone());
+
+        // A one-second life, so the request can arrive after it expired and
+        // still be well inside the signature's own skew window: this has to
+        // fail as expired, not as unauthorized.
+        let stale = little_monkey_lib::peers::PeerEnvelope::new(
+            "msg-1",
+            "thread-1",
+            little_monkey_lib::peers::PeerMessageKind::TaskRequest,
+            "instance-peer-two",
+            "summarize the failing nightly build",
+            2_000,
+            1_000,
+        );
+        let response = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-peer-stale",
+                "POST",
+                "/v1/remote/peer/messages",
+                &serde_json::to_vec(&stale).unwrap(),
+            ),
+            120_000,
+        );
+        assert_eq!(response.status, 400);
+        assert!(runs.submitted.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn placement_body(

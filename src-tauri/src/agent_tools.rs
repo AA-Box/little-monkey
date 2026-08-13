@@ -250,6 +250,38 @@ pub fn send_message_tool_def() -> serde_json::Value {
     })
 }
 
+/// The agent's peer tool, offered only when the operator has paired this
+/// installation with at least one other as a peer.
+///
+/// Excluded from [`tool_definitions`] for the same reason
+/// [`send_message_tool_def`] is: an installation with no peers has nowhere to
+/// send anything. The destination is an alias the operator chose — there is no
+/// parameter for an address, so the set of places this tool can reach is
+/// exactly the set the operator already paired with.
+pub fn peer_message_tool_def(aliases: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "peer_message",
+            "description": format!(
+                "Send a message or a task request to another Little Monkey installation the operator paired with. Available peers: {}. The peer decides what to do with it under its own permissions. Requires user permission.",
+                aliases.join(", ")
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "peer": { "type": "string", "description": "The peer's alias.", "enum": aliases },
+                    "text": { "type": "string", "description": "What to say or ask for." },
+                    "thread": { "type": "string", "description": "An existing thread id to continue. Omit to start a new one." },
+                    "task": { "type": "boolean", "description": "True to ask the peer to do work rather than just saying something." }
+                },
+                "required": ["peer", "text"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
 /// The agent's outbound call tool, offered only on a run whose telephony
 /// account permits dialing out.
 ///
