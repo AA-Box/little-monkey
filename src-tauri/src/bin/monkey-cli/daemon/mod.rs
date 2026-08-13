@@ -790,7 +790,11 @@ pub(crate) fn queue_mobile_chat_recipe(
         recipe: MOBILE_CHAT_RECIPE.to_string(),
         params: vec![format!(
             "prompt={}",
-            channel_ingress::message_param(&ingress, "a paired mobile device")
+            channel_ingress::message_param(
+                &ingress,
+                "a paired mobile device",
+                little_monkey_lib::channels::ingress::MAX_LISTED_ATTACHMENTS,
+            )
         )],
         origin: QueueOrigin::Remote {
             request_id: client_key.to_string(),

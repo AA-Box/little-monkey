@@ -510,7 +510,11 @@ impl ChannelAdapter for SignalAdapter {
     ///
     /// A helper too old to know the method answers with a JSON-RPC error,
     /// which surfaces as a refusal rather than an empty file.
-    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        limits: crate::daemon::channel_adapter::AttachmentLimits,
+    ) -> Result<Vec<u8>, String> {
         let max_bytes = MAX_ATTACHMENT_BYTES;
         let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
             return Err("This Signal attachment has no id.".to_string());

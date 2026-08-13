@@ -294,7 +294,11 @@ impl ChannelAdapter for SlackAdapter {
     ///
     /// Needs the `files:read` scope; without it Slack answers
     /// `missing_scope` and the attachment is refused by name.
-    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        limits: crate::daemon::channel_adapter::AttachmentLimits,
+    ) -> Result<Vec<u8>, String> {
         let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
             return Err("This Slack attachment has no file id.".to_string());
         };
@@ -319,7 +323,7 @@ impl ChannelAdapter for SlackAdapter {
             .and_then(|file| file.get("url_private"))
             .and_then(Value::as_str)
             .ok_or_else(|| "Slack returned no private URL for that file".to_string())?;
-        fetch_url(url, Some(&self.secret.bot_token)).await
+        fetch_url(url, Some(&self.secret.bot_token), limits.max_bytes).await
     }
 }
 

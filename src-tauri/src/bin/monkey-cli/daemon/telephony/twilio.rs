@@ -408,7 +408,7 @@ fn normalize_twilio_params(
                     .unwrap_or(AttachmentKind::Other);
                 attachments.push(ChannelAttachment {
                     stored_artifact_id: None,
-            text_excerpt: None,
+                    text_excerpt: None,
                     fetch_error: None,
                     provider_id: None,
                     kind,

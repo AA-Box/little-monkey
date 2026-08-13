@@ -410,7 +410,11 @@ impl ChannelAdapter for GoogleChatAdapter {
     /// Google Chat serves an uploaded file through its media endpoint, named by
     /// the `resourceName` the message carried, with the same service-account
     /// token the send path uses.
-    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        limits: crate::daemon::channel_adapter::AttachmentLimits,
+    ) -> Result<Vec<u8>, String> {
         let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
             return Err("This Google Chat attachment has no resource name.".to_string());
         };
@@ -423,6 +427,7 @@ impl ChannelAdapter for GoogleChatAdapter {
         crate::daemon::channel_adapter::fetch_url(
             &format!("{}/v1/media/{handle}?alt=media", self.chat_api_base),
             Some(&token),
+            limits.max_bytes,
         )
         .await
     }
