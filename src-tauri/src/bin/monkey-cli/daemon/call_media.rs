@@ -542,6 +542,13 @@ impl CallTurnSink for QueuedCallTurns<'_> {
                     source: little_monkey_lib::channels::types::AttachmentSource::ProviderHandle {
                         handle: artifact_id.to_string(),
                     },
+                    // The recording is already in the content store — this
+                    // handle names it — but the ingest-side fields belong to
+                    // ingest, and inventing one here would claim a fetch that
+                    // did not happen.
+                    stored_artifact_id: None,
+                    fetch_error: None,
+                    text_excerpt: None,
                 });
         }
         let params = super::channel_ingress::run_params_for(&self.target, &ingress);

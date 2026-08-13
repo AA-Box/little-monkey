@@ -881,9 +881,24 @@ async fn execute_tool_call(
             .to_string();
         }
         let text = args["text"].as_str().unwrap_or_default().to_string();
-        let preview: String = text.chars().take(120).collect();
+        let attachments: Vec<String> = args["attachments"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Attaching a file sends its contents to someone outside this machine,
+        // so the approval prompt names every file. A preview of the text alone
+        // would ask the operator to approve the one part that is not the risk.
+        let mut preview: String = text.chars().take(120).collect();
+        if !attachments.is_empty() {
+            preview.push_str(&format!(" [files: {}]", attachments.join(", ")));
+        }
         return match perms.request("send_message", &preview).await {
-            Ok(()) => match crate::daemon::channel_tool::send_message(&text) {
+            Ok(()) => match crate::daemon::channel_tool::send_message(&text, &attachments) {
                 Ok(value) => value.to_string(),
                 Err(error) => serde_json::json!({ "error": error }).to_string(),
             },
@@ -1125,6 +1140,55 @@ async fn execute_tool_call(
                         })
                 }
                 Err(e) => Err(e),
+            }
+        }
+        // A physical action on someone's phone always prompts — it is the one
+        // tool whose effect happens on a different machine, in a room the
+        // operator may not be in. Same `perms.request` choke point as every
+        // other gated tool, with the device and the action in the prompt so the
+        // person approving sees which phone is about to do what.
+        "device_action" => {
+            let action = args["action"].as_str().unwrap_or_default().to_string();
+            let capability = match crate::daemon::remote::device::capability_for_action(&action) {
+                Ok(capability) => capability,
+                Err(error) => return serde_json::json!({ "error": error }).to_string(),
+            };
+            let paths = match crate::daemon::store::DaemonPaths::resolve() {
+                Ok(paths) => paths,
+                Err(error) => return serde_json::json!({ "error": error }).to_string(),
+            };
+            let detail = match args["device_id"].as_str() {
+                Some(device_id) => format!("{action} on {device_id}"),
+                None => action.clone(),
+            };
+            match perms.request("device_action", &detail).await {
+                Ok(()) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|value| value.as_millis() as u64)
+                        .unwrap_or_default();
+                    crate::daemon::remote::device::dispatch(
+                        &paths,
+                        &crate::daemon::remote::device::DeviceActionRequest {
+                            device_id: args["device_id"].as_str().map(str::to_string),
+                            capability,
+                            arguments: args.clone(),
+                            wait_ms: args["wait_ms"].as_u64().unwrap_or(60_000),
+                            // The interactive CLI turn has no durable run or
+                            // session id in scope — the queue records the
+                            // provenance it is actually given rather than
+                            // inventing one. Callers that do run inside a
+                            // durable run (the daemon's own dispatch) pass it.
+                            source_run_id: None,
+                            source_session_id: None,
+                            source_tool_call_id: None,
+                        },
+                        now,
+                    )
+                    .await
+                    .map(|record| crate::daemon::remote::device::result_json(&record))
+                }
+                Err(error) => Err(error),
             }
         }
         // Read-only, so — like `read_file`/`grep`/`list_dir` above — never
@@ -1496,6 +1560,14 @@ async fn run_tool_loop(
     // See `execute_tool_call`'s `"task"` arm for the dispatch and depth cap.
     if options.subagents {
         tools_vec.push(tools_def::task_tool_def());
+    }
+    // `device_action` is offered only when this machine actually has a paired
+    // device with at least one effective physical capability — the same
+    // offer-only-when-usable rule as `search_docs` above, and for a sharper
+    // reason: a model told it has a camera will try to use one, and "no paired
+    // device can do this" is a worse answer than never having been offered it.
+    if crate::daemon::remote::device::any_device_is_capable() {
+        tools_vec.push(tools_def::device_action_tool_def());
     }
     let native = target.is_native();
 
