@@ -435,7 +435,12 @@ export function TelephonyPanel() {
                         : t("TelephonyPanel.outbound")}{" "}
                       {call.peer_number}
                     </span>
-                    <span className="text-faint">{call.state}</span>
+                    {/* Why a call ended is the whole story of a call that
+                        ended badly — a dropped media stream reads as an
+                        ordinary "completed" without it. */}
+                    <span className="text-faint" title={call.last_error ?? undefined}>
+                      {call.state}
+                    </span>
                   </li>
                 ))}
               </ul>
