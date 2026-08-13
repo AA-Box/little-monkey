@@ -79,9 +79,13 @@ pub trait ChannelAdapter: Send + Sync {
     /// uses. A provider that instead gives an opaque handle has to resolve it
     /// itself — that is a second authenticated call only the adapter knows how
     /// to make — and says so rather than pretending it cannot be done.
-    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        limits: AttachmentLimits,
+    ) -> Result<Vec<u8>, String> {
         match &attachment.source {
-            AttachmentSource::Url { url } => fetch_url(url, None).await,
+            AttachmentSource::Url { url } => fetch_url(url, None, limits.max_bytes).await,
             AttachmentSource::ProviderHandle { .. } => Err(format!(
                 "Little Monkey cannot download {} attachments yet",
                 self.kind().label()
@@ -96,7 +100,7 @@ pub trait ChannelAdapter: Send + Sync {
 /// a handle into a URL. The body is read in chunks and abandoned the moment it
 /// crosses the cap, so an oversized file costs the cap and not its own size —
 /// a `Content-Length` cannot be trusted to be the truth about what follows.
-pub async fn fetch_url(url: &str, bearer: Option<&str>) -> Result<Vec<u8>, String> {
+pub async fn fetch_url(url: &str, bearer: Option<&str>, max_bytes: u64) -> Result<Vec<u8>, String> {
     let client = little_monkey_lib::egress::hardened()
         .build()
         .map_err(|error| format!("Failed to build the download client: {error}"))?;
@@ -120,9 +124,9 @@ pub async fn fetch_url(url: &str, bearer: Option<&str>) -> Result<Vec<u8>, Strin
         .await
         .map_err(|_| "The attachment download was interrupted".to_string())?
     {
-        if bytes.len() as u64 + chunk.len() as u64 > MAX_ATTACHMENT_BYTES {
+        if bytes.len() as u64 + chunk.len() as u64 > max_bytes {
             return Err(format!(
-                "The attachment is larger than the {MAX_ATTACHMENT_BYTES}-byte limit"
+                "The attachment is larger than the {max_bytes}-byte limit"
             ));
         }
         bytes.extend_from_slice(&chunk);
@@ -136,18 +140,79 @@ pub async fn fetch_url(url: &str, bearer: Option<&str>) -> Result<Vec<u8>, Strin
 /// one file cannot crowd out the conversation it arrived in.
 const MAX_TEXT_EXCERPT_CHARS: usize = 4_000;
 
+/// How many attachments are downloaded at once.
+///
+/// Bounded rather than unbounded: a message with ten files should not open ten
+/// sockets to a provider that is already rate-limiting this account, and an
+/// unbounded fan-out is how a poll loop turns one chatty conversation into a
+/// burst the provider answers with 429s.
+const CONCURRENT_DOWNLOADS: usize = 4;
+
+/// What one account allows an inbound attachment to cost.
+///
+/// Per account rather than global: a Telegram bot on a home connection and a
+/// WhatsApp number on a server have no reason to share a limit, and an operator
+/// who wants a 64 MB cap on one of them should not have to raise it everywhere.
+/// Read from the account's own non-secret config, which is why these are plain
+/// numbers rather than a type the UI has to learn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachmentLimits {
+    pub max_bytes: u64,
+    pub max_excerpt_chars: usize,
+    pub max_listed: usize,
+}
+
+impl Default for AttachmentLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: MAX_ATTACHMENT_BYTES,
+            max_excerpt_chars: MAX_TEXT_EXCERPT_CHARS,
+            max_listed: little_monkey_lib::channels::ingress::MAX_LISTED_ATTACHMENTS,
+        }
+    }
+}
+
+impl AttachmentLimits {
+    /// The limits an account configured, falling back to the defaults for
+    /// anything it did not set.
+    ///
+    /// Each value is clamped to a ceiling no account may raise: these bound
+    /// what a stranger's message can make this machine spend, so an operator
+    /// can lower them freely and can only raise them so far.
+    pub fn for_account(config: &serde_json::Value) -> Self {
+        const CEILING_BYTES: u64 = 64 * 1024 * 1024;
+        const CEILING_EXCERPT: usize = 32_000;
+        const CEILING_LISTED: usize = 50;
+        let default = Self::default();
+        let number = |key: &str| config.get(key).and_then(serde_json::Value::as_u64);
+        Self {
+            max_bytes: number("max_attachment_bytes")
+                .unwrap_or(default.max_bytes)
+                .clamp(1, CEILING_BYTES),
+            max_excerpt_chars: number("max_attachment_excerpt_chars")
+                .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+                .unwrap_or(default.max_excerpt_chars)
+                .clamp(0, CEILING_EXCERPT),
+            max_listed: number("max_listed_attachments")
+                .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+                .unwrap_or(default.max_listed)
+                .clamp(1, CEILING_LISTED),
+        }
+    }
+}
+
 /// The beginning of a file's text, when the bytes are text at all.
 ///
 /// A file that is not valid UTF-8 has no excerpt rather than a mangled one —
 /// lossy decoding of a JPEG produces thousands of replacement characters and
 /// answers no question anybody asked.
-fn text_excerpt(bytes: &[u8]) -> Option<String> {
+fn text_excerpt(bytes: &[u8], max_chars: usize) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?;
-    if text.trim().is_empty() {
+    if text.trim().is_empty() || max_chars == 0 {
         return None;
     }
-    let mut excerpt: String = text.chars().take(MAX_TEXT_EXCERPT_CHARS).collect();
-    if text.chars().count() > MAX_TEXT_EXCERPT_CHARS {
+    let mut excerpt: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
         excerpt.push('…');
     }
     Some(excerpt)
@@ -163,25 +228,66 @@ fn text_excerpt(bytes: &[u8]) -> Option<String> {
 pub async fn hydrate_attachments(
     adapter: &dyn ChannelAdapter,
     blobs: &dyn BlobSource,
+    limits: AttachmentLimits,
     envelopes: &mut [ChannelEnvelope],
 ) {
-    for envelope in envelopes.iter_mut() {
-        for attachment in envelope.attachments.iter_mut() {
-            if attachment.stored_artifact_id.is_some() {
-                continue;
-            }
-            match adapter.fetch_attachment(attachment).await {
+    // Downloads run a few at a time across the whole batch. Serially, one slow
+    // 16 MB file holds up every other message in the same poll, including the
+    // ones carrying no files at all — ingest waits for the batch, not for one
+    // envelope.
+    let pending: Vec<(usize, usize)> = envelopes
+        .iter()
+        .enumerate()
+        .flat_map(|(envelope_index, envelope)| {
+            envelope
+                .attachments
+                .iter()
+                .enumerate()
+                .filter(|(_, attachment)| attachment.stored_artifact_id.is_none())
+                .map(move |(attachment_index, _)| (envelope_index, attachment_index))
+        })
+        .collect();
+
+    for window in pending.chunks(CONCURRENT_DOWNLOADS) {
+        let fetches = window.iter().map(|(envelope_index, attachment_index)| {
+            let attachment = &envelopes[*envelope_index].attachments[*attachment_index];
+            async move { adapter.fetch_attachment(attachment, limits).await }
+        });
+        let results = futures_util::future::join_all(fetches).await;
+        for ((envelope_index, attachment_index), result) in window.iter().zip(results) {
+            let attachment = &mut envelopes[*envelope_index].attachments[*attachment_index];
+            match result {
                 Ok(bytes) => match blobs.write(&bytes) {
                     Ok(artifact_id) => {
-                        attachment.stored_artifact_id = Some(artifact_id);
                         attachment.declared_size_bytes = Some(bytes.len() as u64);
-                        attachment.text_excerpt = text_excerpt(&bytes);
+                        attachment.text_excerpt = text_excerpt(&bytes, limits.max_excerpt_chars);
+                        // Given a name a vision model can be pointed at, while
+                        // the bytes are known to be on disk — a failure here is
+                        // visible now rather than silent at prompt time.
+                        if let Some(extension) = vision_extension(attachment.mime_type.as_deref()) {
+                            blobs.image_path(&artifact_id, extension);
+                        }
+                        attachment.stored_artifact_id = Some(artifact_id);
                     }
                     Err(error) => attachment.fetch_error = Some(error),
                 },
                 Err(error) => attachment.fetch_error = Some(error),
             }
         }
+    }
+}
+
+/// The image types this tree's encoders can name a MIME type for.
+///
+/// A file whose type is not one of these is stored but never offered to a
+/// vision model, because the encoder would have to guess — and it guesses
+/// `image/jpeg`, which is wrong for everything else.
+pub fn vision_extension(mime: Option<&str>) -> Option<&'static str> {
+    match mime? {
+        "image/png" => Some("png"),
+        "image/jpeg" | "image/jpg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        _ => None,
     }
 }
 
@@ -254,6 +360,16 @@ pub trait BlobSource: Send + Sync {
     /// inbound hydration, which has bytes and needs somewhere durable to put
     /// them before the turn is queued.
     fn write(&self, bytes: &[u8]) -> Result<String, String>;
+
+    /// Give a stored image a name a vision model can be pointed at.
+    ///
+    /// The content store names blobs by digest and gives them no extension,
+    /// and this tree's image encoders read the extension to decide the MIME
+    /// type. Rather than keep a second copy, the blob is hard-linked under a
+    /// name that carries one, falling back to a copy where links are refused.
+    fn image_path(&self, _artifact_id: &str, _extension: &str) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// The production source: the daemon's own content store.
@@ -265,12 +381,46 @@ impl BlobSource for DaemonBlobs {
         read_blob(&paths, artifact_id)
     }
 
+    fn image_path(&self, artifact_id: &str, extension: &str) -> Option<std::path::PathBuf> {
+        let paths = super::store::DaemonPaths::resolve().ok()?;
+        image_path_in(&paths, artifact_id, extension)
+    }
+
     fn write(&self, bytes: &[u8]) -> Result<String, String> {
         let paths = super::store::DaemonPaths::resolve()?;
         content_store(&paths)?
             .put(bytes)
             .map(|blob| blob.id)
             .map_err(|error| format!("Failed to store the attachment: {error}"))
+    }
+}
+
+/// Where a stored image is given a name a vision model can be pointed at.
+///
+/// Deterministic, so the same blob resolves to the same path on every call and
+/// a second turn about the same photo does not copy it again. Public because
+/// the agent process resolves the same path when it builds a prompt, without
+/// having to be told it.
+pub fn image_path_in(
+    paths: &super::store::DaemonPaths,
+    artifact_id: &str,
+    extension: &str,
+) -> Option<std::path::PathBuf> {
+    let directory = paths.root.join("attachments");
+    let linked = directory.join(format!("{artifact_id}.{extension}"));
+    if linked.is_file() {
+        return Some(linked);
+    }
+    let blob = content_store(paths).ok()?.blob_path(artifact_id).ok()?;
+    if !blob.is_file() {
+        return None;
+    }
+    std::fs::create_dir_all(&directory).ok()?;
+    match std::fs::hard_link(&blob, &linked) {
+        Ok(()) => Some(linked),
+        // Links are refused across volumes, and by some filesystems entirely.
+        // A copy costs the bytes twice but is never wrong.
+        Err(_) => std::fs::copy(&blob, &linked).ok().map(|_| linked),
     }
 }
 
@@ -479,6 +629,241 @@ impl ChannelSecrets for MemoryChannelSecrets {
 
 #[cfg(test)]
 mod tests {
+    use little_monkey_lib::channels::types::{AttachmentKind, AttachmentSource};
+
+    #[test]
+    fn an_account_that_configures_nothing_gets_the_defaults() {
+        let limits = AttachmentLimits::for_account(&serde_json::json!({}));
+        assert_eq!(limits, AttachmentLimits::default());
+    }
+
+    #[test]
+    fn an_account_can_tune_all_three_limits() {
+        let limits = AttachmentLimits::for_account(&serde_json::json!({
+            "max_attachment_bytes": 1024,
+            "max_attachment_excerpt_chars": 50,
+            "max_listed_attachments": 2
+        }));
+        assert_eq!(limits.max_bytes, 1024);
+        assert_eq!(limits.max_excerpt_chars, 50);
+        assert_eq!(limits.max_listed, 2);
+    }
+
+    #[test]
+    fn an_account_cannot_raise_a_limit_past_its_ceiling() {
+        // These bound what a stranger's message can make this machine spend,
+        // so lowering is free and raising stops somewhere.
+        let limits = AttachmentLimits::for_account(&serde_json::json!({
+            "max_attachment_bytes": 999_999_999_999u64,
+            "max_attachment_excerpt_chars": 10_000_000,
+            "max_listed_attachments": 10_000
+        }));
+        assert_eq!(limits.max_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.max_excerpt_chars, 32_000);
+        assert_eq!(limits.max_listed, 50);
+    }
+
+    #[test]
+    fn a_nonsense_value_falls_back_rather_than_disabling_the_limit() {
+        let limits = AttachmentLimits::for_account(&serde_json::json!({
+            "max_attachment_bytes": "lots",
+            "max_listed_attachments": 0
+        }));
+        assert_eq!(limits.max_bytes, AttachmentLimits::default().max_bytes);
+        // Zero would list nothing at all; one is the smallest honest answer.
+        assert_eq!(limits.max_listed, 1);
+    }
+
+    #[test]
+    fn an_excerpt_stops_at_the_configured_length() {
+        let long = "x".repeat(100);
+        let excerpt = text_excerpt(long.as_bytes(), 10).expect("text");
+        assert_eq!(
+            excerpt.chars().count(),
+            11,
+            "ten characters plus the ellipsis"
+        );
+        assert!(excerpt.ends_with('…'));
+        assert!(
+            text_excerpt(&[0xff, 0xfe], 10).is_none(),
+            "not UTF-8, no excerpt"
+        );
+        assert!(
+            text_excerpt(b"hello", 0).is_none(),
+            "an account may turn excerpts off"
+        );
+    }
+
+    #[test]
+    fn only_the_image_types_the_encoder_can_name_are_offered_to_a_vision_model() {
+        assert_eq!(vision_extension(Some("image/png")), Some("png"));
+        assert_eq!(vision_extension(Some("image/jpeg")), Some("jpg"));
+        assert_eq!(vision_extension(Some("image/webp")), Some("webp"));
+        // The encoder would guess image/jpeg for these, which is wrong.
+        assert_eq!(vision_extension(Some("image/gif")), None);
+        assert_eq!(vision_extension(Some("image/svg+xml")), None);
+        assert_eq!(vision_extension(Some("application/pdf")), None);
+        assert_eq!(vision_extension(None), None);
+    }
+
+    /// A daemon layout under a fresh temp dir, so the content store and the
+    /// attachments directory are this test's own.
+    fn temp_paths() -> super::super::store::DaemonPaths {
+        let root =
+            std::env::temp_dir().join(format!("lm-vision-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(root.join("state")).expect("root");
+        super::super::store::DaemonPaths {
+            config: root.join("config.json"),
+            state_db: root.join("state.db"),
+            ledger_db: root.join("ledger.db"),
+            snapshots: root.join("snapshots"),
+            logs: root.join("logs"),
+            worktrees: root.join("worktrees"),
+            lock: root.join("lock"),
+            root,
+        }
+    }
+
+    #[test]
+    fn a_stored_image_gets_a_name_that_carries_its_type() {
+        let paths = temp_paths();
+        let store = content_store(&paths).expect("store");
+        let blob = store.put(b"\x89PNG pretend").expect("stored");
+
+        let first = image_path_in(&paths, &blob.id, "png").expect("linked");
+        assert_eq!(first.extension().and_then(|e| e.to_str()), Some("png"));
+        assert_eq!(std::fs::read(&first).expect("read"), b"\x89PNG pretend");
+
+        // Deterministic: a second turn about the same photo resolves to the
+        // same path rather than making another copy.
+        let second = image_path_in(&paths, &blob.id, "png").expect("resolved again");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn an_image_that_was_never_stored_has_no_path() {
+        let paths = temp_paths();
+        assert!(image_path_in(&paths, "sha256-nothing", "png").is_none());
+    }
+
+    /// An adapter that answers every fetch with the bytes it was built with,
+    /// counting the calls so a test can prove they overlapped.
+    struct CountingAdapter {
+        bytes: Vec<u8>,
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ChannelAdapter for CountingAdapter {
+        fn kind(&self) -> ChannelKind {
+            ChannelKind::Telegram
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::minimal(
+                ChannelKind::Telegram,
+                little_monkey_lib::channels::types::InboundTransport::LongPoll,
+            )
+        }
+        async fn probe(&self) -> ChannelHealth {
+            ChannelHealth::error(1, "unused".to_string())
+        }
+        async fn poll(&self, _cursor: Option<&str>) -> Result<InboundBatch, String> {
+            Ok(InboundBatch::default())
+        }
+        async fn send(&self, _message: &OutboundMessage) -> SendOutcome {
+            SendOutcome::PermanentFailure {
+                error: "unused".to_string(),
+            }
+        }
+        async fn fetch_attachment(
+            &self,
+            _attachment: &ChannelAttachment,
+            _limits: AttachmentLimits,
+        ) -> Result<Vec<u8>, String> {
+            use std::sync::atomic::Ordering;
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(self.bytes.clone())
+        }
+    }
+
+    fn envelope_with(count: usize) -> ChannelEnvelope {
+        use little_monkey_lib::channels::types::{ChannelConversation, ChannelSender};
+        ChannelEnvelope {
+            account_id: "acct-1".into(),
+            kind: ChannelKind::Telegram,
+            provider_event_id: "1".into(),
+            conversation: ChannelConversation::direct("chat-1"),
+            sender: ChannelSender::new("user-1"),
+            text: String::new(),
+            attachments: (0..count)
+                .map(|index| ChannelAttachment {
+                    provider_id: Some(format!("f{index}")),
+                    kind: AttachmentKind::Document,
+                    filename: Some(format!("file-{index}.txt")),
+                    mime_type: Some("text/plain".into()),
+                    declared_size_bytes: None,
+                    source: AttachmentSource::ProviderHandle {
+                        handle: format!("f{index}"),
+                    },
+                    stored_artifact_id: None,
+                    text_excerpt: None,
+                    fetch_error: None,
+                })
+                .collect(),
+            reply_to_provider_id: None,
+            mentions_self: false,
+            received_at_ms: 1,
+            metadata: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_downloads_several_files_at_once_and_never_more_than_the_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let adapter = CountingAdapter {
+            bytes: b"hello".to_vec(),
+            in_flight: in_flight.clone(),
+            peak: peak.clone(),
+        };
+        let mut envelopes = vec![envelope_with(5), envelope_with(4)];
+
+        hydrate_attachments(
+            &adapter,
+            &test_http::FixtureBlobs(Vec::new()),
+            AttachmentLimits::default(),
+            &mut envelopes,
+        )
+        .await;
+
+        assert!(
+            peak.load(Ordering::SeqCst) > 1,
+            "downloads ran one at a time"
+        );
+        assert!(
+            peak.load(Ordering::SeqCst) <= CONCURRENT_DOWNLOADS,
+            "more sockets than the cap allows: {}",
+            peak.load(Ordering::SeqCst)
+        );
+        // Every attachment on both envelopes, and each one's own result.
+        for envelope in &envelopes {
+            for attachment in &envelope.attachments {
+                assert_eq!(
+                    attachment.stored_artifact_id.as_deref(),
+                    Some("fixture-blob")
+                );
+                assert_eq!(attachment.text_excerpt.as_deref(), Some("hello"));
+                assert!(attachment.fetch_error.is_none());
+            }
+        }
+    }
+
     use super::*;
     use little_monkey_lib::channels::types::{ChannelHealth, HealthState};
 

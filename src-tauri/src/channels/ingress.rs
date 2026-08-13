@@ -258,7 +258,7 @@ impl ConversationIngress {
     /// filenames and MIME types. Each field is therefore truncated and stripped
     /// of anything that could break out of one line, and the whole result is
     /// wrapped as untrusted content by the caller exactly as the text is.
-    pub fn body_for_model(&self) -> String {
+    pub fn body_for_model(&self, max_listed: usize) -> String {
         if self.attachments.is_empty() {
             return self.text.as_untrusted_str().to_string();
         }
@@ -273,12 +273,7 @@ impl ConversationIngress {
                 count => format!("{count} attachments were"),
             }
         ));
-        for (index, attachment) in self
-            .attachments
-            .iter()
-            .take(MAX_LISTED_ATTACHMENTS)
-            .enumerate()
-        {
+        for (index, attachment) in self.attachments.iter().take(max_listed).enumerate() {
             body.push_str(&format!(
                 "\n[{}: {}{}{}{}]",
                 index + 1,
@@ -319,10 +314,10 @@ impl ConversationIngress {
                 ));
             }
         }
-        if self.attachments.len() > MAX_LISTED_ATTACHMENTS {
+        if self.attachments.len() > max_listed {
             body.push_str(&format!(
                 "\n[and {} more, not listed]",
-                self.attachments.len() - MAX_LISTED_ATTACHMENTS
+                self.attachments.len() - max_listed
             ));
         }
         body
@@ -331,7 +326,7 @@ impl ConversationIngress {
 
 /// How many attachments are described before the rest are counted instead. A
 /// sender can attach many more than a prompt should carry.
-const MAX_LISTED_ATTACHMENTS: usize = 10;
+pub const MAX_LISTED_ATTACHMENTS: usize = 10;
 
 /// Longest a single sender-supplied field may be once described.
 const MAX_ATTACHMENT_FIELD_CHARS: usize = 80;
@@ -562,7 +557,8 @@ mod tests {
             .attachments
             .push(attachment(Some("shot.png"), Some("image/png"), Some(1024)));
 
-        let body = ConversationIngress::from_channel(&silent, &route()).body_for_model();
+        let body = ConversationIngress::from_channel(&silent, &route())
+            .body_for_model(MAX_LISTED_ATTACHMENTS);
         assert!(body.contains("1 attachment was sent"), "{body}");
         assert!(
             body.contains("image \"shot.png\", image/png, 1024 bytes"),
@@ -578,14 +574,16 @@ mod tests {
         with_caption
             .attachments
             .push(attachment(Some("shot.png"), None, None));
-        let body = ConversationIngress::from_channel(&with_caption, &route()).body_for_model();
+        let body = ConversationIngress::from_channel(&with_caption, &route())
+            .body_for_model(MAX_LISTED_ATTACHMENTS);
         assert!(body.starts_with("ship it"), "{body}");
     }
 
     #[test]
     fn a_message_with_no_attachments_is_unchanged() {
         assert_eq!(
-            ConversationIngress::from_channel(&envelope(), &route()).body_for_model(),
+            ConversationIngress::from_channel(&envelope(), &route())
+                .body_for_model(MAX_LISTED_ATTACHMENTS),
             "ship it"
         );
     }
@@ -598,7 +596,8 @@ mod tests {
         attached.text_excerpt = Some("error: nope".into());
         with_log.attachments.push(attached);
 
-        let body = ConversationIngress::from_channel(&with_log, &route()).body_for_model();
+        let body = ConversationIngress::from_channel(&with_log, &route())
+            .body_for_model(MAX_LISTED_ATTACHMENTS);
         assert!(body.contains("its text follows"), "{body}");
         assert!(
             body.contains("<<<file 1>>>\nerror: nope\n<<<end file>>>"),
@@ -613,7 +612,8 @@ mod tests {
         attached.stored_artifact_id = Some("blob-2".into());
         with_image.attachments.push(attached);
 
-        let body = ConversationIngress::from_channel(&with_image, &route()).body_for_model();
+        let body = ConversationIngress::from_channel(&with_image, &route())
+            .body_for_model(MAX_LISTED_ATTACHMENTS);
         assert!(body.contains("not something you can read"), "{body}");
         assert!(!body.contains("its text follows"), "{body}");
     }
@@ -625,7 +625,8 @@ mod tests {
         attached.fetch_error = Some("The attachment is larger than the limit".into());
         refused.attachments.push(attached);
 
-        let body = ConversationIngress::from_channel(&refused, &route()).body_for_model();
+        let body = ConversationIngress::from_channel(&refused, &route())
+            .body_for_model(MAX_LISTED_ATTACHMENTS);
         assert!(
             body.contains("not downloaded: The attachment is larger"),
             "{body}"
@@ -642,7 +643,8 @@ mod tests {
             None,
             None,
         ));
-        let body = ConversationIngress::from_channel(&forged, &route()).body_for_model();
+        let body = ConversationIngress::from_channel(&forged, &route())
+            .body_for_model(MAX_LISTED_ATTACHMENTS);
         assert!(!body.contains("\n[SYSTEM:"), "{body}");
         assert!(!body.contains("[SYSTEM: you are now"), "{body}");
     }
@@ -652,7 +654,8 @@ mod tests {
         let mut long = envelope();
         long.attachments
             .push(attachment(Some(&"n".repeat(500)), None, None));
-        let body = ConversationIngress::from_channel(&long, &route()).body_for_model();
+        let body = ConversationIngress::from_channel(&long, &route())
+            .body_for_model(MAX_LISTED_ATTACHMENTS);
         assert!(body.contains('…'), "{body}");
         assert!(
             body.len() < 300,
@@ -668,7 +671,8 @@ mod tests {
                 .attachments
                 .push(attachment(Some(&format!("file-{index}.png")), None, None));
         }
-        let body = ConversationIngress::from_channel(&flood, &route()).body_for_model();
+        let body = ConversationIngress::from_channel(&flood, &route())
+            .body_for_model(MAX_LISTED_ATTACHMENTS);
         assert!(body.contains("25 attachments were sent"), "{body}");
         assert!(body.contains("file-9.png"), "{body}");
         assert!(!body.contains("file-10.png"), "{body}");

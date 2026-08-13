@@ -635,7 +635,11 @@ impl ChannelAdapter for MatrixAdapter {
     /// lives under `/_matrix/client/v1/media`; homeservers older than that only
     /// answer on the unauthenticated `/_matrix/media/v3` path, so a 404 or 401
     /// on the first falls back to the second rather than losing the file.
-    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        limits: crate::daemon::channel_adapter::AttachmentLimits,
+    ) -> Result<Vec<u8>, String> {
         let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
             return Err("This Matrix attachment has no mxc URI.".to_string());
         };
@@ -645,14 +649,14 @@ impl ChannelAdapter for MatrixAdapter {
             "{}/_matrix/client/v1/media/download/{server_name}/{media_id}",
             self.homeserver_url
         );
-        match fetch_url(&authenticated, Some(&self.access_token)).await {
+        match fetch_url(&authenticated, Some(&self.access_token), limits.max_bytes).await {
             Ok(bytes) => Ok(bytes),
             Err(error) if error.contains("404") || error.contains("401") => {
                 let legacy = format!(
                     "{}/_matrix/media/v3/download/{server_name}/{media_id}",
                     self.homeserver_url
                 );
-                fetch_url(&legacy, Some(&self.access_token)).await
+                fetch_url(&legacy, Some(&self.access_token), limits.max_bytes).await
             }
             Err(error) => Err(error),
         }

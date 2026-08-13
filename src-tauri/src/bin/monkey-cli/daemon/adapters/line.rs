@@ -238,6 +238,7 @@ impl ChannelAdapter for LineAdapter {
     async fn fetch_attachment(
         &self,
         attachment: &ChannelAttachment,
+        limits: crate::daemon::channel_adapter::AttachmentLimits,
     ) -> Result<Vec<u8>, String> {
         let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
             return Err("This LINE attachment has no message id.".to_string());
@@ -250,6 +251,7 @@ impl ChannelAdapter for LineAdapter {
         crate::daemon::channel_adapter::fetch_url(
             &format!("{}/v2/bot/message/{handle}/content", self.content_base),
             Some(&self.channel_access_token),
+            limits.max_bytes,
         )
         .await
     }

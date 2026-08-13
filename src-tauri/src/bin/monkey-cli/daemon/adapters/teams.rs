@@ -463,15 +463,19 @@ impl ChannelAdapter for TeamsAdapter {
     /// The bot's own token is sent only to a Bot Framework host: a `contentUrl`
     /// is chosen by whoever posted the message, and a URL somewhere else is
     /// fetched anonymously rather than handed the credential.
-    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+        limits: crate::daemon::channel_adapter::AttachmentLimits,
+    ) -> Result<Vec<u8>, String> {
         let AttachmentSource::Url { url } = &attachment.source else {
             return Err("This Teams attachment has no content URL.".to_string());
         };
         if is_bot_framework_host(url) {
             let token = self.access_token().await?;
-            fetch_url(url, Some(&token)).await
+            fetch_url(url, Some(&token), limits.max_bytes).await
         } else {
-            fetch_url(url, None).await
+            fetch_url(url, None, limits.max_bytes).await
         }
     }
 }
