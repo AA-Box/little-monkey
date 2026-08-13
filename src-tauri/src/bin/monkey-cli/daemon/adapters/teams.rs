@@ -43,7 +43,7 @@ use super::jwt::{
     try_refresh_blocking, validate_alg_is_rs256, verify_rs256_signature, JwkRsaKey, JwksCache,
 };
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelAdapter, InboundBatch, WebhookChannelAdapter,
+    fetch_url, AdapterConfig, ChannelAdapter, InboundBatch, WebhookChannelAdapter,
 };
 
 const LOGIN_BASE: &str = "https://login.microsoftonline.com";
@@ -457,6 +457,45 @@ impl ChannelAdapter for TeamsAdapter {
             error: error_message,
         }
     }
+
+    /// Teams serves an attachment from the `contentUrl` its activity named.
+    ///
+    /// The bot's own token is sent only to a Bot Framework host: a `contentUrl`
+    /// is chosen by whoever posted the message, and a URL somewhere else is
+    /// fetched anonymously rather than handed the credential.
+    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+        let AttachmentSource::Url { url } = &attachment.source else {
+            return Err("This Teams attachment has no content URL.".to_string());
+        };
+        if is_bot_framework_host(url) {
+            let token = self.access_token().await?;
+            fetch_url(url, Some(&token)).await
+        } else {
+            fetch_url(url, None).await
+        }
+    }
+}
+
+/// Whether a URL is on a Bot Framework service host, and so may be sent the
+/// bot's own token.
+///
+/// Host suffixes are matched on a label boundary — `evil-botframework.com`
+/// must not pass as `botframework.com`, and neither must
+/// `botframework.com.attacker.example`.
+fn is_bot_framework_host(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    ["botframework.com", "trafficmanager.net"]
+        .iter()
+        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
 }
 
 /// `https` on a Microsoft-owned Bot Framework host. Bot Framework
